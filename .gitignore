@@ -1,0 +1,8 @@
+/target/
+.env
+/runtime/data/
+/runtime/logs/
+/runtime/state/
+*.swp
+.DS_Store
+Thumbs.db

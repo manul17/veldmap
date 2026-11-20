@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/veldmap-core",
+    "crates/veldmap-app",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui = "0.37.0"
+egui-wgpu = "0.37.0"
+thiserror = "2.0.21"
+wgpu = "30.0.1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

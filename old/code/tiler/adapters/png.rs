@@ -1,0 +1,61 @@
+//! PNG: one zlib stream, no random access — only a full pass.
+//! Rows go into the cascade as they are decoded, so level tiles appear
+//! top to bottom, and memory does not depend on the file height.
+
+use std::io::{BufRead, Seek};
+
+use super::super::cascade::{Cascade, Emit};
+use super::radiometry::Pixel;
+use super::{frame_fits, to_rgba, Info, Kind, FULL_DECODE_BUDGET};
+
+pub fn describe<R: BufRead + Seek>(reader: R) -> Result<Info, String> {
+    let decoder = png::Decoder::new(reader);
+    let reader = decoder.read_info().map_err(|e| format!("png: {}", e))?;
+    let info = reader.info();
+    Ok(Info::plain(info.width, info.height, Kind::Png { interlaced: info.interlaced }))
+}
+
+pub fn produce_pass<R: BufRead + Seek>(reader: R, info: &Info, emit: Emit) -> Result<(), String> {
+    let mut decoder = png::Decoder::new(reader);
+    // The palette is expanded, 1/2/4 bits are padded up, 16 bits are shrunk to
+    // 8 — only four channel combinations remain below.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(|e| format!("png: {}", e))?;
+
+    let (w, h, interlaced) = {
+        let i = reader.info();
+        (i.width, i.height, i.interlaced)
+    };
+    if (w, h) != (info.width, info.height) {
+        return Err("png: dimensions disagree with the header".to_string());
+    }
+
+    let mut cascade = Cascade::new(0, w, h);
+
+    // An interlaced PNG rows go in Adam7 order, not top to bottom:
+    // there is no streaming path, the frame is decoded whole — hence the budget.
+    if interlaced {
+        if !frame_fits(w, h) {
+            return Err(format!(
+                "png (Adam7) {}×{}: the whole frame does not fit the budget ({} MB)",
+                w, h, FULL_DECODE_BUDGET / (1024 * 1024)
+            ));
+        }
+        let size = reader
+            .output_buffer_size()
+            .ok_or_else(|| "png: the frame does not fit the address space".to_string())?;
+        let mut buf = vec![0u8; size];
+        let out = reader.next_frame(&mut buf).map_err(|e| format!("png: {}", e))?;
+        let channels = usize::from(out.color_type.samples());
+        let rgba = to_rgba(&buf, Pixel::named(channels), (w as usize) * (h as usize));
+        cascade.push_rows(&rgba, h, emit)?;
+        return cascade.finish(emit);
+    }
+
+    let channels = usize::from(reader.output_color_type().0.samples());
+    while let Some(row) = reader.next_row().map_err(|e| format!("png: {}", e))? {
+        let rgba = to_rgba(row.data(), Pixel::named(channels), w as usize);
+        cascade.push_rows(&rgba, 1, emit)?;
+    }
+    cascade.finish(emit)
+}

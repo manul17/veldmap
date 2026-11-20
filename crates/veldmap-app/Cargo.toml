@@ -1,0 +1,21 @@
+[package]
+name = "veldmap-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "veldmap"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+thiserror.workspace = true
+veldmap-core = { path = "../veldmap-core" }
+wgpu.workspace = true
+
+[lints]
+workspace = true
