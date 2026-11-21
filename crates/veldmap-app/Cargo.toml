@@ -11,9 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 eframe.workspace = true
-egui.workspace = true
-egui-wgpu.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 wgpu.workspace = true
 

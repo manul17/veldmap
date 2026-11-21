@@ -1,4 +1,5 @@
-use egui_wgpu::{CallbackResources, CallbackTrait};
+use eframe::egui;
+use eframe::egui_wgpu::{CallbackResources, CallbackTrait};
 
 pub struct ViewportPipeline {
     pipeline: wgpu::RenderPipeline,

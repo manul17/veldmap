@@ -48,7 +48,7 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
    - Add traits only where there is a real second implementation (`ByteSource`, `Signer`, raster decoders, tile providers).
 
 5. **Reuse from `old/`, rewrite glue cleanly, retire incrementally:**
-   - Tag pre-deletion state as `legacy-reference-snapshot` in Phase 0.5 and track all 78 files in `old/README.md` with `Consumer Slices` and `Delete After Slice` (always the *last* consumer slice).
+   - Tag pre-deletion state as `legacy-reference-snapshot` in Phase 0.5 and track all 79 reference files in `old/README.md` with `Consumer Slices` and `Delete After Slice` (always the *last* consumer slice).
    - Port proven algorithms and curated tests, stripping `!Send` `Rc`/`RefCell` assumptions and splitting monoliths (`overlay.rs`, `tiles_pipeline.rs`). Never link from `docs/` into `old/`; delete `old/` completely at Slice 6.
 
 6. **Code hygiene (every slice):**
@@ -65,15 +65,15 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 
 ---
 
-### Phase 0.5 — Slim Pre-Slice 1 Hygiene, Licensing & CI `[ ]`
-- [ ] **Toolchain & dev ergonomics:** Fix `rust-version = "1.95"` in `Cargo.toml` (matching `egui 0.37` / `wgpu 30`), pin `rust-toolchain.toml`, add `.gitattributes` (LF endings, `old/** linguist-vendored`), and add `[profile.dev.package."*"] opt-level = 2`.
-- [ ] **Scaffold fixes in `veldmap-app`:** Pass `response.rect` guarded by `is_positive()`, drop redundant direct `egui`/`egui-wgpu` deps in favor of `eframe` re-exports, honor `WGPU_BACKEND` (excluding GL) / `WGPU_POWER_PREF`, initialize `tracing`, and hook `device.on_uncaptured_error`.
-- [ ] **Remove mixed-license font bloat:** Delete unused `assets/fonts/*.ttf` (~6.3 MiB, closing the OFL + Nerd Fonts license gap) and keep `eframe`'s `default_fonts` until UI polish.
-- [ ] **Repo & `old/` manifest cleanup:** Update `README.md`, `.env.example` (remove `data-provider` wording), `.gitignore` (`.env*` + `!.env.example`, drop `/runtime/*`), and `old/README.md` (remove personal Windows path, list omitted `network/download.rs` and `viewer/`, fix Cyrillic note across 27 files, add full 78-file `Consumer Slices` / `Delete After Slice` manifest). Create annotated tag `legacy-reference-snapshot`.
-- [ ] **Workspace lints & lean Linux CI:**
+### Phase 0.5 — Slim Pre-Slice 1 Hygiene, Licensing & CI `[x]` ([ADR 0001](docs/decisions/0001-native-workspace-and-threading.md))
+- [x] **Toolchain & dev ergonomics:** Fix `rust-version = "1.95"` in `Cargo.toml` (matching `egui 0.37` / `wgpu 30`), pin `rust-toolchain.toml`, add `.gitattributes` (LF endings, `old/** linguist-vendored`), and add `[profile.dev.package."*"] opt-level = 2`.
+- [x] **Scaffold fixes in `veldmap-app`:** Pass `response.rect` guarded by `is_positive()`, drop redundant direct `egui`/`egui-wgpu` deps in favor of `eframe` re-exports, honor `WGPU_BACKEND` (excluding GL) / `WGPU_POWER_PREF`, initialize `tracing`, and hook `device.on_uncaptured_error`.
+- [x] **Remove mixed-license font bloat:** Delete unused `assets/fonts/*.ttf` (~6.3 MiB, closing the OFL + Nerd Fonts license gap) and keep `eframe`'s `default_fonts` until UI polish.
+- [x] **Repo & `old/` manifest cleanup:** Update `README.md`, `.env.example` (remove `data-provider` wording), `.gitignore` (`.env*` + `!.env.example`, drop `/runtime/*`), and `old/README.md` (remove personal Windows path, list omitted `network/download.rs` and `viewer/`, fix Cyrillic note across 28 files, add full 79-file `Consumer Slices` / `Delete After Slice` manifest). Create annotated tag `legacy-reference-snapshot`.
+- [x] **Workspace lints & lean Linux CI:**
   - Add workspace lints: `unwrap_used`/`expect_used` as `"warn"` (with `clippy.toml` test exemptions; denied in CI via `-D warnings`), `allow_attributes_without_reason`, `undocumented_unsafe_blocks`, `unimplemented`, `large_futures` (standardize on `#[expect(..., reason = "INVARIANT: ...")]`).
   - Add Linux `hygiene-and-dag` GitHub Actions job (`Swatinem/rust-cache`, `fmt`, `clippy -D warnings`, `test`, `cargo-deny` for licenses/RUSTSEC/banned crates, no-Cyrillic check, offline `lychee --offline` `docs/` link check).
-- [ ] **Seed minimal docs:** Create `CONTRIBUTING.md`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`, `docs/README.md`, `docs/building.md`, `docs/decisions/README.md`, `docs/decisions/0001-native-workspace-and-threading.md` (workspace DAG, exclusions, frame-driven loop & shutdown order only), `docs/glossary.md`, and `docs/limitations.md`.
+- [x] **Seed minimal docs:** Create `CONTRIBUTING.md`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`, `docs/README.md`, `docs/building.md`, `docs/decisions/README.md`, `docs/decisions/0001-native-workspace-and-threading.md` (workspace DAG, exclusions, frame-driven loop & shutdown order only), `docs/glossary.md`, and `docs/limitations.md`.
 - **Exit criteria:**
   - *Automated CI:* Green Linux workflow (`fmt`, `clippy`, `test`, `cargo-deny`, no-Cyrillic, offline `docs/` links).
   - *Manual QA:* `cargo run -p veldmap-app` launches cleanly with `tracing` logs; `legacy-reference-snapshot` tag exists; zero unlicensed font binaries remain; `plan.md` `Next Step` updated.
@@ -241,5 +241,5 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 
 ## Next Step
 
-- **Current state:** Phase 0 is complete on `main`; `plan.md` has been refined with deduplicated guardrails, fixed module/cache/rendering/migration contracts, PR-sized checkboxes, split mega-slices (`3A-1`/`3A-2`, `4A`/`4B`, `5B-1`/`5B-2`), zero-auth STAC/COG + band math pulled ahead of `openjp2`/CDSE, and NetCDF-4 scheduled cleanly in Slice 6 (v1.1).
-- **Immediate task:** Start **Phase 0.5** (fix `rust-version = "1.95"` + `rust-toolchain.toml`, `.gitattributes`, dev profile opt-level, `veldmap-app` scaffold fixes, delete unused `assets/fonts/*.ttf`, clean up `README.md`/`.env.example`/`.gitignore`/`old/README.md` + `legacy-reference-snapshot` tag, add workspace lints + lean Linux CI with `cargo-deny`, and seed minimal foundational docs).
+- **Current state:** Phase 0.5 is complete on `main` (toolchain pinned to `1.95.0`, `veldmap-app` scaffold hardened, unused mixed-license fonts removed, 79-file `old/README.md` retirement manifest and `legacy-reference-snapshot` tag created, workspace lints + `deny.toml` + Linux CI added, and foundational docs/ADR 0001 seeded).
+- **Immediate task:** Start **Slice 1 — Core Geodesy & Interactive 3D WGS84 Globe**.

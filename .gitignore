@@ -1,8 +1,6 @@
 /target/
-.env
-/runtime/data/
-/runtime/logs/
-/runtime/state/
+.env*
+!.env.example
 *.swp
 .DS_Store
 Thumbs.db
