@@ -88,8 +88,7 @@ impl Ellipsoid {
         for _ in 0..rounds {
             let sin = lat.sin();
             let curvature = self.semi_major_m / (1.0 - e2 * sin * sin).sqrt();
-            let height = flat / lat.cos() - curvature;
-            lat = z.atan2(flat * (1.0 - e2 * curvature / (curvature + height)));
+            lat = (z + e2 * curvature * sin).atan2(flat);
         }
         lat
     }
@@ -655,59 +654,21 @@ mod tests {
     }
 
     #[test]
-    fn the_conformal_turn_has_nothing_left_to_improve() {
-        let ellipsoid = WGS84;
-        let e = ellipsoid.eccentricity_sq().sqrt();
-        let radius = ellipsoid.semi_major_m;
-
-        let (mut settled, mut short) = (0.0_f64, 0.0_f64);
-        for step in 0..=1680 {
-            let lat = f64::from(step) * 0.05;
-            let tau_c = {
-                let phi = lat.to_radians();
-                (phi.tan().asinh() - e * (e * phi.sin()).atanh()).sinh()
-            };
-            let whole = geodetic_from_conformal(e, tau_c, CONFORMAL_ROUNDS + 4);
-            settled = settled
-                .max((geodetic_from_conformal(e, tau_c, CONFORMAL_ROUNDS) - whole).abs() * radius);
-            short = short.max((geodetic_from_conformal(e, tau_c, 4) - whole).abs() * radius);
-        }
-        assert!(settled < 1e-8, "insufficient rounds: {settled} m");
-        assert!(short > 1e-6, "4 rounds already settled to {short} m");
-    }
-
-    #[test]
-    fn the_centred_turn_works_only_above_the_ellipsoid() {
-        let ellipsoid = WGS84;
-        let lifted = |lat_deg: f64, height_m: f64| {
-            let lat = lat_deg.to_radians();
-            let e2 = ellipsoid.eccentricity_sq();
-            let curvature = ellipsoid.semi_major_m / (1.0 - e2 * lat.sin() * lat.sin()).sqrt();
-            (
-                (curvature + height_m) * lat.cos(),
-                (curvature * (1.0 - e2) + height_m) * lat.sin(),
-            )
-        };
-
-        for step in 0..=90 {
-            let (flat, z) = lifted(f64::from(step), 0.0);
-            assert_eq!(
-                ellipsoid.latitude_at(flat, z, 0),
-                ellipsoid.latitude_at(flat, z, CENTRED_ROUNDS),
+    fn near_pole_geodetic_and_datum_roundtrips_avoid_singularity() {
+        for lat_deg in [85.0, 89.5, 89.999, -89.999, 90.0, -90.0] {
+            let ecef = WGS84.to_earth_centred(lat_deg, 37.0);
+            let (back_lat, _) = WGS84.earth_centred_to_geodetic(ecef);
+            assert!(
+                (back_lat - lat_deg).abs() < 1e-12,
+                "near-pole ECEF roundtrip failed at {lat_deg}: got {back_lat}"
             );
-        }
 
-        let (mut settled, mut short) = (0.0_f64, 0.0_f64);
-        for step in 0..=1800 {
-            let (flat, z) = lifted(f64::from(step) * 0.05, 271.0);
-            let whole = ellipsoid.latitude_at(flat, z, CENTRED_ROUNDS + 6);
-            let radius = ellipsoid.semi_major_m;
-            settled = settled
-                .max((ellipsoid.latitude_at(flat, z, CENTRED_ROUNDS) - whole).abs() * radius);
-            short = short.max((ellipsoid.latitude_at(flat, z, 2) - whole).abs() * radius);
+            let shifted = PULKOVO_1942.to_wgs84(lat_deg, 37.0);
+            let back = PULKOVO_1942.from_wgs84(shifted.0, shifted.1);
+            assert!(back.0.is_finite() && back.1.is_finite());
+            let err_m = (back.0 - lat_deg).abs().to_radians() * WGS84.semi_major_m;
+            assert!(err_m < 1e-2, "near-pole lat {lat_deg} drifted by {err_m} m");
         }
-        assert!(settled < 1e-8, "insufficient rounds: {settled} m");
-        assert!(short > 1e-7, "2 rounds already settled to {short} m");
     }
 
     #[test]

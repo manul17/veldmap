@@ -7,8 +7,12 @@ If you discover a security vulnerability in VeldMap—including credential leaka
 - Use GitHub Security Advisories ("Report a vulnerability") on the repository, or contact the maintainer directly.
 - Include reproduction steps, affected commit/version, and any crafted test input needed to verify the fix.
 
-## Security & Privacy Practices
+## Active Protections (Enforced Today)
 
-- **Credentials:** CDSE S3 keys live in user-local `.env` files (git-ignored; `0600` permissions on Unix when created via settings) and are never committed or logged. Credential headers and SigV4 signatures are redacted from logs and error messages.
-- **Native Memory Safety:** `unsafe_op_in_unsafe_fn` is denied workspace-wide and `undocumented_unsafe_blocks` is enforced in CI. `memmap2` and C codec/TLS libraries (`openssl`, `gdal`, `proj`) are banned via `deny.toml`.
-- **Untrusted Inputs:** Raster decoders enforce explicit dimension, IFD, padding, and memory-budget limits; remote downloads validate S3 path safety, HTTP `Content-Range`, and `ETag` integrity.
+- **Native Memory & Dependency Hygiene:** `unsafe_op_in_unsafe_fn` is denied workspace-wide, and `undocumented_unsafe_blocks`, `unwrap_used`, and `expect_used` are enforced via Clippy `-D warnings` in CI. `memmap2` (outside Wayland SHM wrappers) and C codec/TLS libraries (`openssl`, `gdal`, `proj`) are banned in [deny.toml](deny.toml).
+- **Secret Exclusion:** `.env*` files (except `.env.example`) are excluded by `.gitignore` so credentials are never accidentally committed.
+
+## Planned Security Controls (Upcoming Slices)
+
+- **Credentials & Redaction (Slice 4B):** CDSE S3 keys will live in user-local `.env` files (`0600` permissions on Unix when written via the settings UI), with mandatory redaction of credential headers and SigV4 signatures in `tracing` logs and errors.
+- **Untrusted Inputs & Downloads (Slices 3A-1, 3C-1, 4A, 4B, 6):** Pure-Rust raster decoders will enforce explicit dimension, IFD, padding, and `MemoryBudget` limits with worker panic isolation; remote range readers and downloads will validate S3 path safety, HTTP `Content-Range`, and strong `ETag` integrity.

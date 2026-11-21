@@ -101,7 +101,13 @@ fn inside(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
         let Some((centre_lat, centre_lon)) = middle(ring.iter().copied()) else {
             return true;
         };
-        return turned.signum() == turn(&traced, centre_lat, centre_lon).signum();
+        let centre_turn = turn(&traced, centre_lat, centre_lon);
+        if centre_turn.abs() > 180.0 {
+            return turned.signum() == centre_turn.signum();
+        }
+        // Concave ring whose spherical centroid falls outside: reject the
+        // antipodal image by requiring the same hemisphere as the centroid.
+        return geodesy::unit(lat, lon).dot(geodesy::unit(centre_lat, centre_lon)) > 0.0;
     }
 
     geodesy::encircles(&traced) && {
@@ -281,5 +287,24 @@ mod tests {
         let f = frame(&[ring(&around)]).expect("ring has geometry");
         assert!(f.lat > 89.9);
         assert!((f.radius_deg - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn covers_a_concave_clockwise_ring_whose_centroid_is_outside() {
+        // Clockwise C-shaped ring around (10, 10); centroid falls in the notch at ~(10, 10).
+        let c_shape = [ring(&[
+            (0.0, 0.0),
+            (20.0, 0.0),
+            (20.0, 20.0),
+            (16.0, 20.0),
+            (16.0, 4.0),
+            (4.0, 4.0),
+            (4.0, 20.0),
+            (0.0, 20.0),
+        ])];
+        assert!(covers(&c_shape, 10.0, 2.0));
+        assert!(covers(&c_shape, 18.0, 15.0));
+        assert!(!covers(&c_shape, 10.0, 12.0)); // inside notch
+        assert!(!covers(&c_shape, -10.0, -178.0)); // antipode
     }
 }

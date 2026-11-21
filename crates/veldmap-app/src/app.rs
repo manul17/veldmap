@@ -92,15 +92,23 @@ impl eframe::App for VeldmapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Advance active quaternion camera flights.
-        let dt_s = f64::from(ctx.input(|i| i.unstable_dt)).clamp(0.0, 0.1);
+        // Advance active quaternion camera flights (cap dt to 50 ms so a
+        // frame hitch never jumps abruptly through a 0.6 s flight).
+        let dt_s = f64::from(ctx.input(|i| i.unstable_dt)).clamp(0.0, 0.05);
         if self.camera.advance(dt_s) {
             self.mark_dirty();
         }
 
-        // Global shortcut `N` resets North when no text field owns keyboard focus.
-        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::N)) {
-            self.camera.reset_north();
+        // Global shortcut `N` (without modifiers) resets North when no text
+        // field owns keyboard focus.
+        let reset_north_key = !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| {
+                i.key_pressed(egui::Key::N)
+                    && !i.modifiers.command
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+            });
+        if reset_north_key && self.camera.reset_north() {
             self.mark_dirty();
         }
 
@@ -124,7 +132,8 @@ impl eframe::App for VeldmapApp {
                     self.trigger_goto();
                 }
                 if let Some(err) = &self.goto_error {
-                    ui.colored_label(egui::Color32::from_rgb(235, 110, 95), err);
+                    ui.colored_label(egui::Color32::from_rgb(235, 110, 95), "Invalid")
+                        .on_hover_text(err);
                 }
 
                 ui.separator();
@@ -137,6 +146,16 @@ impl eframe::App for VeldmapApp {
                 });
             });
         });
+
+        // Snapshot status-bar inputs before CentralPanel processes this frame's
+        // pointer/scroll/resize updates so we can request one cheap UI-only
+        // follow-up repaint whenever a displayed status value changes.
+        let status_before = (
+            self.cursor_geo,
+            self.camera.center(),
+            self.camera.height_m().to_bits(),
+            self.last_viewport_height_px.to_bits(),
+        );
 
         // Bottom GIS status bar: Cursor Lat/Lon, Center Lat/Lon, Altitude, m/px.
         egui::Panel::bottom("gis_status_bar").show(ui, |ui| {
@@ -164,6 +183,7 @@ impl eframe::App for VeldmapApp {
         });
 
         // Central 3D WGS84 globe viewport.
+        let mut viewport_rect = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
@@ -173,10 +193,11 @@ impl eframe::App for VeldmapApp {
                 let rect = response.rect;
 
                 if rect.is_positive() {
+                    viewport_rect = Some(rect);
                     let ppp = f64::from(ctx.pixels_per_point());
-                    let width_pt = f64::from(rect.width());
-                    let height_pt = f64::from(rect.height());
-                    let aspect = width_pt / height_pt.max(1.0);
+                    let width_pt = f64::from(rect.width()).max(1.0);
+                    let height_pt = f64::from(rect.height()).max(1.0);
+                    let aspect = width_pt / height_pt;
                     self.last_viewport_height_px = (height_pt * ppp).max(1.0);
 
                     // Left-drag orbit.
@@ -199,8 +220,8 @@ impl eframe::App for VeldmapApp {
                             let steps = f64::from(scroll_y) / 48.0;
                             let (hold_x, hold_y) = match hover_pos {
                                 Some(pos) => (
-                                    (f64::from(pos.x - rect.center().x)) / height_pt,
-                                    (f64::from(pos.y - rect.center().y)) / height_pt,
+                                    f64::from(pos.x - rect.center().x) / height_pt,
+                                    f64::from(pos.y - rect.center().y) / height_pt,
                                 ),
                                 None => (0.0, 0.0),
                             };
@@ -228,17 +249,27 @@ impl eframe::App for VeldmapApp {
                         },
                     ));
 
-                    // Floating HUD overlays: dynamic scale bar & North compass.
+                    // Floating dynamic metric scale bar.
                     let m_per_pt = self.camera.metres_per_pixel(height_pt);
                     hud::paint_scale_bar(&painter, rect, m_per_pt);
-                    if hud::show_north_compass(ui, rect, self.camera.heading_deg()) {
-                        self.camera.reset_north();
-                        self.mark_dirty();
-                    }
                 }
             });
 
-        if self.camera.is_flying() {
+        // Floating North compass in its own foreground Area (no pointer bleed).
+        if let Some(rect) = viewport_rect
+            && hud::show_north_compass(&ctx, rect, self.camera.heading_deg())
+            && self.camera.reset_north()
+        {
+            self.mark_dirty();
+        }
+
+        let status_after = (
+            self.cursor_geo,
+            self.camera.center(),
+            self.camera.height_m().to_bits(),
+            self.last_viewport_height_px.to_bits(),
+        );
+        if self.camera.is_flying() || status_after != status_before {
             ctx.request_repaint();
         }
     }

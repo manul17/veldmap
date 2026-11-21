@@ -2,18 +2,17 @@
 
 Fast, purely native Rust desktop **Analytical Earth-Observation & Precision-Imagery Workstation** built on a **Precision Nadir 3D WGS84 Globe**.
 
-## Overview
+## Current Status & Roadmap
 
-VeldMap is designed for:
+VeldMap is built in vertical slices tracked in [plan.md](plan.md):
 
-- Interactive nadir 3D WGS84 planetary viewing from global basemaps down to centimetre-scale local orthophotos.
-- Multi-format satellite imagery inspection (GeoTIFF/BigTIFF/COG, PNG/JPEG, Sentinel-2 JPEG 2000; NetCDF-4/HDF5 in v1.1), both locally and streamed in-place over HTTP Range from zero-auth STAC/COG catalogs, public COG URLs, and Copernicus Data Space Ecosystem (CDSE).
-- Interactive GPU band math (NDVI, NDWI, false-color with metadata-driven radiometric scaling and cloud masking), analytical terrain relief (hillshade, slope, aspect), multi-temporal timeline scrubbing, and pixel time-series inspection.
+- **Implemented (Slice 1):** Pure-Rust WGS84 geodesy, map projections, MGRS/DD/DMS coordinate navigation, `f64` infinite Reverse-Z nadir camera & oblate horizon culling, decoupled offscreen `wgpu` WGS84 globe renderer with exact linear-to-sRGB compositing, and baseline GIS HUD (cursor/center readout, altitude, GSD, dynamic scale bar, North compass, Go-To bar).
+- **Planned (Slices 2–6):** Global WGS84 tile quadtree with bundled and live satellite basemaps, local GeoTIFF/BigTIFF/COG/PNG/JPEG and Sentinel-2 JP2 streaming, `R32Float` scientific band math (NDVI/NDWI/false-color + cloud masking), analytical DEM relief, multi-temporal timeline diffing, and NetCDF-4 (v1.1).
 
 ## Workspace Layout
 
-- `crates/veldmap-core` — Pure, UI-free, GPU-free domain logic with a strict acyclic internal module DAG (`geo`, `tile`, `io`/`mem`, plus optional `fs`, `codecs`, and `net` features).
-- `crates/veldmap-app` — Native `eframe`/`egui` + `wgpu` desktop workstation (offscreen 3D globe renderer, 2D inspector, GPU tile cache, background workers, and UI).
+- `crates/veldmap-core` — Pure domain logic (zero `egui`, `eframe`, or `wgpu` dependencies). Currently provides `geo`; `tile`, `io`/`mem`, and feature-gated `fs`/`codecs`/`net` modules land in upcoming slices ([ADR 0001](docs/decisions/0001-native-workspace-and-threading.md)).
+- `crates/veldmap-app` — Native `eframe`/`egui` + `wgpu` desktop application (`[lib]` + `[[bin]]` so rendering and shader tests run headlessly).
 - `docs/` — Architecture notes, build guide, glossary, limitations, and Architectural Decision Records ([docs/README.md](docs/README.md)).
 - `plan.md` — Executable vertical-slice roadmap and exit-criteria tracker ([plan.md](plan.md)).
 - `old/` — Temporary legacy migration reference, retired incrementally by slice ([old/README.md](old/README.md)).
@@ -29,12 +28,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-## Credentials
+## Credentials (Planned — Slice 4B)
 
-Zero-auth STAC/COG catalogs and local files work without credentials. For authenticated Copernicus Data Space Ecosystem (CDSE) S3 access, copy `.env.example` to `.env` (git-ignored) and set `COPERNICUS_ACCESS_KEY` and `COPERNICUS_ACCESS_SECRET`.
+Local files and zero-auth STAC/COG catalogs require no credentials. Authenticated Copernicus Data Space Ecosystem (CDSE) S3 access will read `COPERNICUS_ACCESS_KEY` and `COPERNICUS_ACCESS_SECRET` from a git-ignored `.env` file (template in [.env.example](.env.example)) once CDSE support lands in Slice 4B.
 
 ## Contributing & Security
 
 - Contribution workflow and code hygiene rules: [CONTRIBUTING.md](CONTRIBUTING.md)
-- Vulnerability reporting and credential handling: [SECURITY.md](SECURITY.md)
+- Vulnerability reporting and security posture: [SECURITY.md](SECURITY.md)
 - License and third-party attributions: [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)

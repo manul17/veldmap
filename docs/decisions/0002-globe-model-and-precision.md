@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (supersedes legacy `0006` and the 800 m camera floor in legacy `0007`)
 - **Date:** 2026-11-21
-- **Scope:** Committed v1 WGS84 ellipsoid model, octant-RTC + high/low coordinate precision, infinite Reverse-Z depth, depth-less draped lines with horizon discard, exact sRGB compositing, and overlay accuracy tolerances.
+- **Scope:** Committed v1 WGS84 ellipsoid model, double-single RTE / per-tile RTC coordinate precision, infinite Reverse-Z depth, depth-less draped lines with ellipsoidal horizon discard, exact sRGB compositing, and overlay accuracy tolerances.
 
 ## Context
 
@@ -25,19 +25,19 @@ VeldMap serves both planetary Earth observation (Sentinel-2, Landsat, global mos
 
 - `Camera` computes view-projection matrices in `f64` (`DMat4`) using right-handed infinite Reverse-Z (`near -> 1.0`, `infinity -> 0.0`) with `near = (height_m * 0.5) / SEMI_MAJOR_M` and `Depth32Float` (`CompareFunction::GreaterEqual`, clear `0.0`).
 - Camera internals (`at`, `up`, `height_m`, `flight`) are private behind view-agnostic queries (`center()`, `height_m()`, `heading_deg()`, `eye_ecef()`, `view_projection()`, `project()`, `frustum()`, `probe()`, `metres_per_pixel()`).
-- `Camera::project()`, `cull::Frame`, and `cull::Ball` operate strictly in `f64` (`DVec3`/`DMat4`).
+- `Camera::project()`, `cull::Frame`, and `cull::Ball` operate strictly in `f64` (`DVec3`/`DMat4`). `cull::Frame` uses the exact oblate WGS84 ellipsoidal tangent horizon plane `p · (A · eye) >= 1` (`A = diag(1, 1, 1 / (1 - f)^2)`), eliminating false poleward horizon culling.
 - `MIN_HEIGHT_M = 2.0` m yields ~1.86 mm/px on a 1000-row viewport at 50° vertical FOV—more than 10× finer than 2 cm drone orthophotos.
 
-### 3. Octant-RTC Geometry & Depth-Less Draped Lines
+### 3. Double-Single RTE Fallback Mesh, Per-Tile RTC Quadtree, and Depth-Less Draped Lines
 
-- The untextured WGS84 ellipsoid mesh (also serving as Slice 2's "Ellipsoid-only" fallback) is partitioned into 8 octants, each carrying an `f64` ECEF origin (`origin_ecef`). Vertices store `(pos_hi, pos_lo)` relative to their octant origin, and each frame uploads `(origin_ecef - eye_ecef)` split into `(hi, lo)` `f32` halves. By Sterbenz's lemma, `(pos_hi + orig_hi) + (pos_lo + orig_lo)` yields sub-millimetre precision even at 2 m altitude.
-- Draped graticule and outline primitives sit directly on `height = 0.0` and render depth-less (`depth_write_enabled: false`, `depth_compare: Always`), eliminating Z-fighting and the need for `SURFACE_LIFT_M`. Back-hemisphere fragments are rejected cleanly in the fragment shader via exact ellipsoidal-normal horizon discard: `dot(N_ellipsoid(P), normalize(E - P)) > 0.0`.
-- Screen-space ribbon width (`RIBBON_PX`) and hatch spacing (`HATCH_PX`) scale by `pixels_per_point` for crisp HiDPI rendering.
+- The untextured WGS84 ellipsoid fallback mesh (96×192 watertight grid) and draped 15° graticule store `(pos_hi, pos_lo)` double-single ECEF coordinates relative to `DVec3::ZERO`, paired with a per-frame `ChunkUniform` carrying `(-eye_ecef)` split into `(hi, lo)` `f32` halves. By Sterbenz's lemma, `(pos_hi + orig_hi) + (pos_lo + orig_lo)` yields sub-millimetre precision at 2 m altitude in a single watertight draw call (avoiding the inter-octant seam divergence of 90° octants, whose ~1.0 Earth-radius span adds no precision benefit over `DVec3::ZERO`).
+- Starting in Slice 2A, quadtree basemap and raster warp-mesh tiles use **per-tile RTC** (`tile_origin - eye` in `f64` on CPU), where small tile extents fit cleanly in single `f32` vertices without relying on GPU fast-math non-reassociation.
+- Draped graticule primitives (and scene outlines/ribbons/hatches when wired in Slice 4A) sit directly on `height = 0.0` and render depth-less (`depth_write_enabled: false`, `depth_compare: Always`), eliminating Z-fighting and the need for `SURFACE_LIFT_M`. Back-hemisphere fragments are rejected cleanly in the fragment shader via exact ellipsoidal-normal horizon discard: `dot(N_ellipsoid(P), normalize(E - P)) > 0.0`.
 
 ### 4. Exact 1:1 sRGB Offscreen Compositing
 
 - The offscreen globe target uses `Rgba8UnormSrgb` with `view_formats: &[Rgba8Unorm]` and `Depth32Float`. All shader palette constants are exact IEC 61966-2-1 linear RGB values with zero manual `encode_srgb` shader hacks.
-- Compositing into `egui_wgpu` uses `FilterMode::Nearest` with a texture view matching `target_format.is_srgb()` (`Rgba8UnormSrgb` for sRGB swapchains, `Rgba8Unorm` for UNORM swapchains), preserving exact sRGB bytes on all backends (Vulkan, DX12, Metal).
+- Compositing into `egui_wgpu` uses `FilterMode::Nearest` with a texture view matching the swapchain's color space (`Rgba8UnormSrgb` for sRGB and linear float swapchains, `Rgba8Unorm` for non-sRGB 8-bit swapchains), preserving exact sRGB bytes on all backends (Vulkan, DX12, Metal).
 
 ### 5. Authoritative Overlay Accuracy Contract (Retained from Legacy ADR `0007`)
 
@@ -57,4 +57,4 @@ Surface drift tolerances (including `f32` vertex splitting):
 ## Consequences
 
 - Centimetre-scale orthophotos can be inspected down to 2 m altitude with zero vertex jitter, zero depth fighting, zero horizon bleed, and zero surface-lift parallax.
-- Both CPU-only `naga` validation (SPIR-V, HLSL SM 5.1, MSL 2.1) and headless `wgpu` smoke tests verify Reverse-Z close-up rendering and exact sRGB/UNORM compositing parity on every CI run.
+- Both CPU-only `naga` validation (SPIR-V, HLSL SM 5.1, MSL 2.1) and headless `wgpu` smoke tests verify Reverse-Z close-up rendering directly above a mesh vertex at 2 m altitude and exact sRGB/UNORM compositing parity on every CI run.

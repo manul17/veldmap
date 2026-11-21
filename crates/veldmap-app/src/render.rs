@@ -1,10 +1,12 @@
 //! Offscreen `wgpu` WGS84 globe renderer decoupled from `egui`.
 //!
-//! Renders the octant-RTC WGS84 ellipsoid and depth-less draped graticule into
-//! an offscreen `Rgba8UnormSrgb` + `Depth32Float` Reverse-Z target, then
+//! Renders the WGS84 ellipsoid and depth-less draped graticule into an
+//! offscreen `Rgba8UnormSrgb` + `Depth32Float` Reverse-Z target, then
 //! composites 1:1 with `FilterMode::Nearest` onto `egui_wgpu`'s target format
-//! via `view_formats` (`Rgba8UnormSrgb` when `target_format.is_srgb()`,
-//! `Rgba8Unorm` otherwise).
+//! via `view_formats` (`Rgba8UnormSrgb` when the target expects linear output,
+//! `Rgba8Unorm` for non-sRGB 8-bit swapchains).
+
+use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use eframe::egui;
@@ -16,7 +18,7 @@ use wgpu::util::DeviceExt;
 
 use crate::mesh::{GlobeMesh, GlobeVertex};
 
-/// Embedded WGSL source for the globe body, graticule, outlines, ribbons, and hatch.
+/// Embedded WGSL source for the globe body and draped graticule.
 pub const GLOBE_WGSL: &str = include_str!("shaders/globe.wgsl");
 /// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.
 pub const COMPOSITE_WGSL: &str = include_str!("shaders/composite.wgsl");
@@ -33,9 +35,6 @@ pub const CLEAR_COLOR_LINEAR: wgpu::Color = wgpu::Color {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
-    viewport_px: [f32; 2],
-    pixels_per_point: f32,
-    _pad: f32,
 }
 
 #[repr(C)]
@@ -47,22 +46,28 @@ struct ChunkUniform {
     _pad1: f32,
 }
 
-/// Total chunk uniform slots: 8 octants + 1 zero-origin slot for draped geometry.
-const CHUNK_SLOTS: usize = 9;
-const DRAPED_CHUNK_SLOT: usize = 8;
+/// Parameters for a single offscreen globe frame.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderParams<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub camera: &'a Camera,
+    pub show_graticule: bool,
+    pub generation: u64,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RenderKey {
     width: u32,
     height: u32,
-    ppp_bits: u32,
+    show_graticule: bool,
     generation: u64,
 }
 
 struct OffscreenTarget {
     width: u32,
     height: u32,
-    color_texture: wgpu::Texture,
+    _color_texture: wgpu::Texture,
     color_srgb_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     composite_bind_group: wgpu::BindGroup,
@@ -71,13 +76,13 @@ struct OffscreenTarget {
 /// Standalone offscreen `wgpu` WGS84 globe renderer.
 pub struct GlobeRenderer {
     target_format: wgpu::TextureFormat,
-    mesh: GlobeMesh,
+    body_indices: Range<u32>,
+    graticule_indices: Range<u32>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_buffer: wgpu::Buffer,
-    chunk_stride: u32,
     chunk_bind_group: wgpu::BindGroup,
     body_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
@@ -93,6 +98,8 @@ impl GlobeRenderer {
     /// composite pass targeting `target_format`.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let mesh = GlobeMesh::build();
+        let body_indices = mesh.body;
+        let graticule_indices = mesh.graticule;
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globe vertex buffer"),
@@ -116,7 +123,7 @@ impl GlobeRenderer {
             label: Some("globe camera bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -137,13 +144,9 @@ impl GlobeRenderer {
             }],
         });
 
-        let align = device.limits().min_uniform_buffer_offset_alignment.max(1);
-        let chunk_size = std::mem::size_of::<ChunkUniform>() as u32;
-        let chunk_stride = chunk_size.div_ceil(align) * align;
-
         let chunk_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globe octant chunk uniforms"),
-            size: u64::from(chunk_stride) * CHUNK_SLOTS as u64,
+            label: Some("globe chunk origin uniform"),
+            size: std::mem::size_of::<ChunkUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -155,8 +158,10 @@ impl GlobeRenderer {
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(u64::from(chunk_size)),
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<ChunkUniform>() as u64
+                    ),
                 },
                 count: None,
             }],
@@ -167,11 +172,7 @@ impl GlobeRenderer {
             layout: &chunk_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &chunk_buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(u64::from(chunk_size)),
-                }),
+                resource: chunk_buffer.as_entire_binding(),
             }],
         });
 
@@ -329,13 +330,13 @@ impl GlobeRenderer {
 
         Self {
             target_format,
-            mesh,
+            body_indices,
+            graticule_indices,
             vertex_buffer,
             index_buffer,
             camera_buffer,
             camera_bind_group,
             chunk_buffer,
-            chunk_stride,
             chunk_bind_group,
             body_pipeline,
             grid_pipeline,
@@ -347,37 +348,29 @@ impl GlobeRenderer {
         }
     }
 
-    /// Ensure the offscreen target matches `(width, height)` clamped to device
-    /// limits and re-render the globe if the target or scene generation is
-    /// dirty. Returns `true` if a new offscreen frame was rendered.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "INVARIANT: explicit headless-friendly render arguments avoid coupling GlobeRenderer to egui"
-    )]
+    /// Ensure the offscreen target matches `(params.width, params.height)`
+    /// clamped to device limits and re-render the globe if the target or scene
+    /// parameters changed. Returns `true` if a new offscreen frame was
+    /// rendered.
     pub fn render_if_dirty(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        width: u32,
-        height: u32,
-        pixels_per_point: f32,
-        camera: &Camera,
-        show_graticule: bool,
-        generation: u64,
+        params: RenderParams<'_>,
     ) -> bool {
-        if width == 0 || height == 0 {
+        if params.width == 0 || params.height == 0 {
             return false;
         }
         let max_dim = device.limits().max_texture_dimension_2d;
-        let width = width.clamp(1, max_dim);
-        let height = height.clamp(1, max_dim);
+        let width = params.width.clamp(1, max_dim);
+        let height = params.height.clamp(1, max_dim);
 
         let key = RenderKey {
             width,
             height,
-            ppp_bits: pixels_per_point.to_bits(),
-            generation,
+            show_graticule: params.show_graticule,
+            generation: params.generation,
         };
         if self.last_render == Some(key)
             && self
@@ -389,8 +382,8 @@ impl GlobeRenderer {
         }
 
         self.ensure_offscreen(device, width, height);
-        self.upload_uniforms(queue, width, height, pixels_per_point, camera);
-        self.record_offscreen_pass(encoder, show_graticule);
+        self.upload_uniforms(queue, width, height, params.camera);
+        self.record_offscreen_pass(encoder, params.show_graticule);
         self.last_render = Some(key);
         true
     }
@@ -404,12 +397,6 @@ impl GlobeRenderer {
         render_pass.set_pipeline(&self.composite_pipeline);
         render_pass.set_bind_group(0, &target.composite_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
-    }
-
-    /// Access the offscreen `Rgba8UnormSrgb` color texture (used by headless
-    /// GPU readback tests).
-    pub fn offscreen_color_texture(&self) -> Option<&wgpu::Texture> {
-        self.offscreen.as_ref().map(|t| &t.color_texture)
     }
 
     fn ensure_offscreen(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -434,9 +421,7 @@ impl GlobeRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
         });
 
@@ -446,20 +431,23 @@ impl GlobeRenderer {
             ..Default::default()
         });
 
-        // Match swapchain color space via view_formats so compositing is exact 1:1.
-        let composite_view = if self.target_format.is_srgb() {
-            color_texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("globe composite srgb view"),
-                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-                ..Default::default()
-            })
-        } else {
+        // Match swapchain color space via view_formats so compositing is exact 1:1:
+        // sRGB and linear float targets expect linear shader output (sample via
+        // `Rgba8UnormSrgb`); non-sRGB 8-bit targets expect raw sRGB-encoded bytes
+        // (sample via `Rgba8Unorm`).
+        let target_expects_linear = self.target_format.is_srgb()
+            || matches!(
+                self.target_format,
+                wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rgba32Float
+            );
+        let unorm_view = (!target_expects_linear).then(|| {
             color_texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("globe composite unorm view"),
                 format: Some(wgpu::TextureFormat::Rgba8Unorm),
                 ..Default::default()
             })
-        };
+        });
+        let composite_view = unorm_view.as_ref().unwrap_or(&color_srgb_view);
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("globe offscreen depth (Depth32Float Reverse-Z)"),
@@ -479,7 +467,7 @@ impl GlobeRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&composite_view),
+                    resource: wgpu::BindingResource::TextureView(composite_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -491,59 +479,28 @@ impl GlobeRenderer {
         self.offscreen = Some(OffscreenTarget {
             width,
             height,
-            color_texture,
+            _color_texture: color_texture,
             color_srgb_view,
             depth_view,
             composite_bind_group,
         });
     }
 
-    fn upload_uniforms(
-        &self,
-        queue: &wgpu::Queue,
-        width: u32,
-        height: u32,
-        pixels_per_point: f32,
-        camera: &Camera,
-    ) {
+    fn upload_uniforms(&self, queue: &wgpu::Queue, width: u32, height: u32, camera: &Camera) {
         let aspect = width as f32 / height.max(1) as f32;
         let cam_uniform = CameraUniform {
             view_proj: camera.view_projection_f32(aspect).to_cols_array_2d(),
-            viewport_px: [width as f32, height as f32],
-            pixels_per_point,
-            _pad: 0.0,
         };
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uniform));
 
-        let eye = camera.eye_ecef();
-        let stride = self.chunk_stride as usize;
-        let mut staging = vec![0u8; stride * CHUNK_SLOTS];
-
-        for (i, octant) in self.mesh.octants.iter().enumerate() {
-            let (hi, lo) = geodesy::parts(octant.origin_ecef - eye);
-            let uniform = ChunkUniform {
-                origin_minus_eye_hi: hi,
-                _pad0: 0.0,
-                origin_minus_eye_lo: lo,
-                _pad1: 0.0,
-            };
-            let bytes = bytemuck::bytes_of(&uniform);
-            staging[i * stride..i * stride + bytes.len()].copy_from_slice(bytes);
-        }
-
-        // Slot 8: zero-origin draped primitives (`0 - eye = -eye`).
-        let (hi, lo) = geodesy::parts(DVec3::ZERO - eye);
-        let draped = ChunkUniform {
+        let (hi, lo) = geodesy::parts(DVec3::ZERO - camera.eye_ecef());
+        let chunk = ChunkUniform {
             origin_minus_eye_hi: hi,
             _pad0: 0.0,
             origin_minus_eye_lo: lo,
             _pad1: 0.0,
         };
-        let bytes = bytemuck::bytes_of(&draped);
-        staging[DRAPED_CHUNK_SLOT * stride..DRAPED_CHUNK_SLOT * stride + bytes.len()]
-            .copy_from_slice(bytes);
-
-        queue.write_buffer(&self.chunk_buffer, 0, &staging);
+        queue.write_buffer(&self.chunk_buffer, 0, bytemuck::bytes_of(&chunk));
     }
 
     fn record_offscreen_pass(&self, encoder: &mut wgpu::CommandEncoder, show_graticule: bool) {
@@ -579,19 +536,14 @@ impl GlobeRenderer {
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.chunk_bind_group, &[]);
 
         pass.set_pipeline(&self.body_pipeline);
-        for (i, octant) in self.mesh.octants.iter().enumerate() {
-            let dynamic_offset = i as u32 * self.chunk_stride;
-            pass.set_bind_group(1, &self.chunk_bind_group, &[dynamic_offset]);
-            pass.draw_indexed(octant.indices.clone(), 0, 0..1);
-        }
+        pass.draw_indexed(self.body_indices.clone(), 0, 0..1);
 
         if show_graticule {
             pass.set_pipeline(&self.grid_pipeline);
-            let dynamic_offset = DRAPED_CHUNK_SLOT as u32 * self.chunk_stride;
-            pass.set_bind_group(1, &self.chunk_bind_group, &[dynamic_offset]);
-            pass.draw_indexed(self.mesh.graticule.clone(), 0, 0..1);
+            pass.draw_indexed(self.graticule_indices.clone(), 0, 0..1);
         }
     }
 }
@@ -631,12 +583,13 @@ impl CallbackTrait for GlobePaintCallback {
                 device,
                 queue,
                 egui_encoder,
-                vp.width_px as u32,
-                vp.height_px as u32,
-                screen_descriptor.pixels_per_point,
-                &self.camera,
-                self.show_graticule,
-                self.generation,
+                RenderParams {
+                    width: vp.width_px as u32,
+                    height: vp.height_px as u32,
+                    camera: &self.camera,
+                    show_graticule: self.show_graticule,
+                    generation: self.generation,
+                },
             );
         }
         Vec::new()

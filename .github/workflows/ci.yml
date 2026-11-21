@@ -80,10 +80,30 @@ jobs:
           print("English-only hygiene check passed.")
           EOF
 
-      - name: Check offline markdown links in docs/
+      - name: Forbid links from docs/ into old/
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re, sys
+
+          pattern = re.compile(r"\]\([^)]*(?:^|/)old(?:/|\))")
+          offenders = []
+          for path in sorted(pathlib.Path("docs").rglob("*.md")):
+              for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                  if pattern.search(line):
+                      offenders.append(f"{path}:{lineno}: {line.strip()}")
+
+          if offenders:
+              print("Forbidden links from docs/ into old/:", file=sys.stderr)
+              for item in offenders:
+                  print(f"  {item}", file=sys.stderr)
+              sys.exit(1)
+          print("No docs/ -> old/ links found.")
+          EOF
+
+      - name: Check offline markdown links in docs/ and root markdown
         uses: lycheeverse/lychee-action@v2
         with:
-          args: --offline --no-progress docs/ README.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md
+          args: --offline --no-progress docs/ README.md plan.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md
           fail: true
 
   build-and-test:

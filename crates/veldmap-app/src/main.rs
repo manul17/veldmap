@@ -4,8 +4,11 @@ use tracing_subscriber::EnvFilter;
 use veldmap_app::app::VeldmapApp;
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,veldmap=debug,wgpu_core=warn,wgpu_hal=warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "info,veldmap=debug,veldmap_app=debug,veldmap_core=debug,wgpu_core=warn,wgpu_hal=warn",
+        )
+    });
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 

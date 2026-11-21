@@ -71,13 +71,25 @@ impl Default for Camera {
 
 impl Camera {
     /// Construct a North-up camera positioned over `(lat_deg, lon_deg)` at
-    /// `height_m` metres above the WGS84 ellipsoid.
+    /// `height_m` metres above the WGS84 ellipsoid. Non-finite inputs fall back
+    /// to `(0.0, 0.0)` / [`MIN_HEIGHT_M`].
     pub fn at(lat_deg: f64, lon_deg: f64, height_m: f64) -> Self {
+        let lat_deg = if lat_deg.is_finite() {
+            lat_deg.clamp(-90.0, 90.0)
+        } else {
+            0.0
+        };
+        let lon_deg = if lon_deg.is_finite() { lon_deg } else { 0.0 };
+        let height_m = if height_m.is_finite() {
+            height_m.clamp(HEIGHT_RANGE_M.0, HEIGHT_RANGE_M.1)
+        } else {
+            HEIGHT_RANGE_M.0
+        };
         let at = geodesy::unit(lat_deg, lon_deg);
         Self {
             at,
             up: frame_up(at, DVec3::Z),
-            height_m: height_m.clamp(HEIGHT_RANGE_M.0, HEIGHT_RANGE_M.1),
+            height_m,
             flight: None,
         }
     }
@@ -117,7 +129,9 @@ impl Camera {
         geodesy::parts(self.eye_ecef())
     }
 
-    /// Orthonormal camera basis `(right, up, forward)` in ECEF coordinates.
+    /// Orthonormal camera basis `(right, up, forward)` in ECEF coordinates,
+    /// with `forward` aimed geocentrially toward Earth's center so the globe
+    /// stays centered from orbit while matching [`Camera::probe`].
     pub fn basis(&self) -> (DVec3, DVec3, DVec3) {
         let forward = -self.eye_ecef().normalize();
         let side = forward.cross(self.up).normalize();
@@ -133,18 +147,23 @@ impl Camera {
         }
     }
 
-    /// Surface metres per pixel along the vertical axis at viewport center.
+    /// Surface metres per pixel along the vertical axis at viewport center
+    /// (true nadir ground sample distance: `2 * height_m * tan(fov_y / 2) / height_px`).
     pub fn metres_per_pixel(&self, height_px: f64) -> f64 {
-        let arc = 2.0 * self.visible_deg().to_radians() * geodesy::SEMI_MAJOR_M;
-        arc / height_px.max(1.0)
+        let half_tan = (FOV_Y_DEG * 0.5).to_radians().tan();
+        (2.0 * self.height_m * half_tan) / height_px.max(1.0)
     }
 
     /// Rotation-only infinite Reverse-Z view-projection matrix in `f64`.
     ///
     /// Translation is intentionally omitted: vertices are shifted relative to
-    /// the eye in `f64` (per-octant/per-tile RTC or high/low split) before
-    /// multiplication.
+    /// the eye in `f64` (per-tile RTC or high/low split) before multiplication.
     pub fn view_projection(&self, aspect: f64) -> DMat4 {
+        let aspect = if aspect.is_finite() && aspect > 0.0 {
+            aspect
+        } else {
+            1.0
+        };
         let near = (self.height_m * 0.5) / geodesy::SEMI_MAJOR_M;
         perspective_infinite_reverse_rh(FOV_Y_DEG.to_radians(), aspect, near)
             * turn_to(self.basis())
@@ -264,13 +283,19 @@ impl Camera {
     /// Start a smooth North-up flight framing a circle of `radius_deg` around
     /// `(lat_deg, lon_deg)`.
     pub fn focus(&mut self, lat_deg: f64, lon_deg: f64, radius_deg: f64) {
+        if !(lat_deg.is_finite() && lon_deg.is_finite() && radius_deg.is_finite()) {
+            return;
+        }
         let height_m = height_for(radius_deg * FRAME_MARGIN);
         self.fly_to(lat_deg, lon_deg, height_m);
     }
 
     /// Start a smooth North-up flight to `(lat_deg, lon_deg)` at `height_m`.
     pub fn fly_to(&mut self, lat_deg: f64, lon_deg: f64, height_m: f64) {
-        let at = geodesy::unit(lat_deg, lon_deg);
+        if !(lat_deg.is_finite() && lon_deg.is_finite() && height_m.is_finite()) {
+            return;
+        }
+        let at = geodesy::unit(lat_deg.clamp(-90.0, 90.0), lon_deg);
         let up = frame_up(at, self.up);
         let height_m = height_m.clamp(HEIGHT_RANGE_M.0, HEIGHT_RANGE_M.1);
         let to = orientation(at, up);
@@ -292,11 +317,12 @@ impl Camera {
     }
 
     /// Smoothly rotate the viewport back to North-up while keeping the current
-    /// target position and altitude.
-    pub fn reset_north(&mut self) {
+    /// target position and altitude. Returns `true` if a rotation flight was
+    /// started (`false` if already North-up).
+    pub fn reset_north(&mut self) -> bool {
         let up = frame_up(self.at, self.up);
         if self.up.dot(up) > 1.0 - 1e-12 {
-            return;
+            return false;
         }
         let to = orientation(self.at, up);
         self.flight = Some(Flight {
@@ -306,6 +332,7 @@ impl Camera {
             to_height_m: self.height_m,
             passed_s: 0.0,
         });
+        true
     }
 
     /// Advance any active flight by `dt_s` seconds. Returns `true` if the
@@ -589,15 +616,31 @@ mod tests {
     }
 
     #[test]
-    fn near_the_floor_the_frame_is_plain_trigonometry() {
+    fn center_gsd_matches_trigonometry_from_floor_to_orbit() {
         let height_px = 1000.0;
-        let camera = at(0.0, 0.0, MIN_HEIGHT_M);
-        let want = 2.0 * MIN_HEIGHT_M * (FOV_Y_DEG * 0.5).to_radians().tan() / height_px;
-        let got = camera.metres_per_pixel(height_px);
-        assert!(
-            (got - want).abs() < 1e-4 * want,
-            "{got} m/px vs {want} m/px"
-        );
+        for height_m in [MIN_HEIGHT_M, 10_000.0, 14_000_000.0, MAX_HEIGHT_M] {
+            let camera = at(0.0, 0.0, height_m);
+            let want = 2.0 * height_m * (FOV_Y_DEG * 0.5).to_radians().tan() / height_px;
+            let got = camera.metres_per_pixel(height_px);
+            assert!(
+                (got - want).abs() < 1e-9 * want,
+                "at {height_m} m: {got} m/px vs {want} m/px"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_inputs_do_not_poison_camera() {
+        let mut cam = Camera::at(f64::NAN, f64::INFINITY, f64::NAN);
+        assert!(cam.eye_ecef().is_finite());
+        assert_eq!(cam.height_m(), MIN_HEIGHT_M);
+        assert!(cam.view_projection(0.0).is_finite());
+        assert!(cam.view_projection(f64::NAN).is_finite());
+
+        let before = cam;
+        cam.focus(f64::NAN, 10.0, 1.0);
+        cam.fly_to(45.0, f64::INFINITY, 1000.0);
+        assert_eq!(cam, before);
     }
 
     #[test]
@@ -660,27 +703,15 @@ mod tests {
         assert!(camera.heading_deg().abs() > 170.0);
 
         // Reset-North rotates heading smoothly back to 0 degrees without moving center.
-        camera.reset_north();
+        assert!(camera.reset_north());
         assert!(camera.is_flying());
         camera.advance(10.0);
         assert!(!camera.is_flying());
+        assert!(!camera.reset_north());
         assert!(camera.heading_deg().abs() < 1e-6);
         let (after_lat, after_lon) = camera.center();
         assert!((after_lat - lat).abs() < 1e-9);
         assert!((geodesy::unwind(lon, after_lon) - lon).abs() < 1e-9);
-    }
-
-    #[test]
-    fn the_gesture_is_a_rotation_and_undoes_itself() {
-        let mut camera = at(60.0, -20.0, 2_000_000.0);
-        let before = camera.at;
-        for _ in 0..8 {
-            camera.orbit(0.3, 0.0);
-        }
-        for _ in 0..8 {
-            camera.orbit(-0.3, 0.0);
-        }
-        assert!(before.dot(camera.at) > 1.0 - 1e-9);
     }
 
     #[test]

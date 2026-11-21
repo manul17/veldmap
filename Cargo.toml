@@ -20,7 +20,7 @@ pollster = "1.0.3"
 thiserror = "2.0.21"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wgpu = "30.0.1"
+wgpu = "30.0.2"
 
 [profile.dev.package."*"]
 opt-level = 2
@@ -33,6 +33,7 @@ dbg_macro = "deny"
 todo = "deny"
 unwrap_used = "warn"
 expect_used = "warn"
+allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 undocumented_unsafe_blocks = "warn"
 unimplemented = "warn"

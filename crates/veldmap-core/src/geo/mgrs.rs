@@ -130,7 +130,7 @@ fn square_origin(
 /// 5-character tile code such as `"40WFC"`.
 pub fn frame(tile: &str) -> Result<Frame, MgrsError> {
     let bytes = tile.as_bytes();
-    if bytes.len() != 5 {
+    if !tile.is_ascii() || bytes.len() != 5 {
         return Err(MgrsError::InvalidFormat(tile.to_owned()));
     }
     let zone: u32 = tile[..2]
@@ -167,6 +167,10 @@ pub fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> {
         .strip_prefix('T')
         .filter(|rest| rest.bytes().next().is_some_and(|b| b.is_ascii_digit()))
         .unwrap_or(&compact);
+
+    if !stripped.is_ascii() {
+        return Err(MgrsError::InvalidFormat(input.to_owned()));
+    }
 
     let bytes = stripped.as_bytes();
     let zone_digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
@@ -301,6 +305,10 @@ mod tests {
         assert!(frame("00WFC").is_err());
         assert!(frame("4WFC").is_err());
         assert!(frame("40ZFC").is_err());
+        // Non-ASCII 5-byte and multi-byte UTF-8 inputs must error, never panic on char boundaries.
+        assert!(frame("a\u{00E9}bc").is_err());
+        assert!(parse_to_wgs84("37UD\u{0419}").is_err());
+        assert!(parse_to_wgs84("37UD\u{00E9}").is_err());
     }
 
     #[test]

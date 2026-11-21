@@ -1,8 +1,10 @@
 //! Headless offscreen `wgpu` smoke tests verifying:
-//! 1. Reverse-Z depth rendering from orbit (14,000 km) down to 2 m altitude.
+//! 1. Reverse-Z rendering from orbit (14,000 km) down to 2 m altitude directly
+//!    above a mesh vertex (`near = 1 m` vs surface at `2 m`).
 //! 2. Exact 1:1 sRGB compositing onto both `Rgba8UnormSrgb` and `Rgba8Unorm`
 //!    targets via `view_formats` (zero double-gamma shift).
-//! 3. Dirty-flag redraw skipping.
+//! 3. Dirty-flag redraw skipping, `show_graticule` invalidation, resize
+//!    recreation, and `0x0` viewport safety.
 //!
 //! Set `VELDMAP_REQUIRE_GPU_TEST=1` (enabled on Linux Lavapipe and Windows WARP
 //! CI) to fail loudly if no `Backends::PRIMARY` adapter is available.
@@ -12,12 +14,16 @@
     reason = "INVARIANT: integration test helpers panic on headless GPU harness failure"
 )]
 
-use veldmap_app::render::GlobeRenderer;
+use veldmap_app::render::{GlobeRenderer, RenderParams};
 use veldmap_core::geo::camera::{Camera, MIN_HEIGHT_M};
 
 fn request_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance =
-        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    desc.backends &= wgpu::Backends::PRIMARY;
+    if desc.backends.is_empty() {
+        desc.backends = wgpu::Backends::PRIMARY;
+    }
+    let instance = wgpu::Instance::new(desc);
 
     let adapter = pollster::block_on(async {
         if let Ok(adapter) = instance
@@ -45,9 +51,9 @@ fn request_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 
     let Some(adapter) = adapter else {
         if std::env::var("VELDMAP_REQUIRE_GPU_TEST").as_deref() == Ok("1") {
-            panic!("VELDMAP_REQUIRE_GPU_TEST=1 is set, but no wgpu adapter was found");
+            panic!("VELDMAP_REQUIRE_GPU_TEST=1 is set, but no Backends::PRIMARY adapter was found");
         }
-        eprintln!("Skipping headless GPU smoke test: no wgpu adapter available");
+        eprintln!("Skipping headless GPU smoke test: no Backends::PRIMARY adapter available");
         return None;
     };
 
@@ -139,51 +145,26 @@ fn readback_rgba8(
     pixels
 }
 
-fn render_and_composite(
+fn render_with(
+    renderer: &mut GlobeRenderer,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     target_format: wgpu::TextureFormat,
-    camera: &Camera,
-    width: u32,
-    height: u32,
+    params: RenderParams<'_>,
+    expect_rendered: bool,
 ) -> Vec<u8> {
-    let mut renderer = GlobeRenderer::new(device, target_format);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("smoke render encoder"),
     });
 
-    let rendered = renderer.render_if_dirty(
-        device,
-        queue,
-        &mut encoder,
-        width,
-        height,
-        1.0,
-        camera,
-        true,
-        1,
-    );
-    assert!(rendered, "initial frame must render");
-
-    // Second call with identical key must skip redraw via dirty flag.
-    let rendered_again = renderer.render_if_dirty(
-        device,
-        queue,
-        &mut encoder,
-        width,
-        height,
-        1.0,
-        camera,
-        true,
-        1,
-    );
-    assert!(!rendered_again, "unchanged frame must skip redraw");
+    let rendered = renderer.render_if_dirty(device, queue, &mut encoder, params);
+    assert_eq!(rendered, expect_rendered);
 
     let composite_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("composite target"),
         size: wgpu::Extent3d {
-            width,
-            height,
+            width: params.width,
+            height: params.height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -216,7 +197,7 @@ fn render_and_composite(
     }
 
     queue.submit(Some(encoder.finish()));
-    readback_rgba8(device, queue, &composite_tex, width, height)
+    readback_rgba8(device, queue, &composite_tex, params.width, params.height)
 }
 
 fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
@@ -235,25 +216,62 @@ fn headless_reverse_z_and_exact_srgb_compositing() {
         return;
     };
 
-    let (w, h) = (128, 128);
+    // Odd viewport size places NDC (0, 0) cleanly at the center of pixel (64, 64),
+    // avoiding cross-driver line tie-break ambiguity on even boundaries.
+    let (w, h) = (129, 129);
     let orbital_cam = Camera::default();
 
+    let mut srgb_renderer = GlobeRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut unorm_renderer = GlobeRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+
+    // 0x0 viewport must skip cleanly without panicking.
+    let mut zero_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    assert!(!srgb_renderer.render_if_dirty(
+        &device,
+        &queue,
+        &mut zero_enc,
+        RenderParams {
+            width: 0,
+            height: 0,
+            camera: &orbital_cam,
+            show_graticule: true,
+            generation: 1,
+        },
+    ));
+
+    let orbital_params = RenderParams {
+        width: w,
+        height: h,
+        camera: &orbital_cam,
+        show_graticule: true,
+        generation: 1,
+    };
+
     // 1. Composite onto BOTH sRGB and UNORM targets and verify exact 1:1 parity.
-    let srgb_pixels = render_and_composite(
+    let srgb_pixels = render_with(
+        &mut srgb_renderer,
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
-        &orbital_cam,
-        w,
-        h,
+        orbital_params,
+        true,
     );
-    let unorm_pixels = render_and_composite(
+    // Identical key must skip offscreen redraw via dirty-key cache.
+    let _ = render_with(
+        &mut srgb_renderer,
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        orbital_params,
+        false,
+    );
+    let unorm_pixels = render_with(
+        &mut unorm_renderer,
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8Unorm,
-        &orbital_cam,
-        w,
-        h,
+        orbital_params,
+        true,
     );
 
     assert_eq!(srgb_pixels.len(), unorm_pixels.len());
@@ -284,26 +302,46 @@ fn headless_reverse_z_and_exact_srgb_compositing() {
         "orbital center pixel did not match exact draped graticule sRGB #A8B99B: {center:?}"
     );
 
-    // Slightly off the 45/60 graticule lines must hit the bright lit ellipsoid body.
-    let body_px = pixel_at(&srgb_pixels, w, w / 2 + 5, h / 2 + 5);
-    assert!(
-        body_px[0] > 180 && body_px[1] > 170 && body_px[2] > 150,
-        "orbital body pixel did not render lit ellipsoid in sRGB: {body_px:?}"
-    );
-
-    // 2. Reverse-Z close-up at 2 m altitude: surface must fill the viewport with
-    // zero near-plane clipping and zero background bleed.
-    let close_cam = Camera::at(47.2357, 39.7015, MIN_HEIGHT_M);
-    let close_pixels = render_and_composite(
+    // 2. Toggling show_graticule MUST re-render even with unchanged generation,
+    // replacing the center graticule intersection with the lit ellipsoid body.
+    let no_grid_pixels = render_with(
+        &mut srgb_renderer,
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
-        &close_cam,
-        w,
-        h,
+        RenderParams {
+            show_graticule: false,
+            ..orbital_params
+        },
+        true,
     );
-    for (x, y) in [(w / 2, h / 2), (8, 8), (w - 8, h - 8), (8, h - 8)] {
-        let px = pixel_at(&close_pixels, w, x, y);
+    let body_center = pixel_at(&no_grid_pixels, w, w / 2, h / 2);
+    assert!(
+        body_center[0] > 180 && body_center[1] > 170 && body_center[2] > 150,
+        "center pixel without graticule did not render lit ellipsoid in sRGB: {body_center:?}"
+    );
+
+    // 3. Resize existing renderer and verify Reverse-Z close-up at 2 m altitude
+    // directly over an exact ellipsoid mesh vertex (45 N, 45 E -> 2.0 m from eye,
+    // 1.0 m past the near plane) fills the viewport with zero near-plane clipping.
+    let close_cam = Camera::at(45.0, 45.0, MIN_HEIGHT_M);
+    let (rw, rh) = (65, 65);
+    let close_pixels = render_with(
+        &mut srgb_renderer,
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width: rw,
+            height: rh,
+            camera: &close_cam,
+            show_graticule: false,
+            generation: 2,
+        },
+        true,
+    );
+    for (x, y) in [(rw / 2, rh / 2), (4, 4), (rw - 5, rh - 5), (4, rh - 5)] {
+        let px = pixel_at(&close_pixels, rw, x, y);
         assert!(
             px[0] > 150 && px[1] > 140 && px[2] > 120,
             "2 m altitude Reverse-Z pixel at ({x},{y}) clipped or missed surface: {px:?}"

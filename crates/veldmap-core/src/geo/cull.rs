@@ -1,8 +1,9 @@
 //! High-precision `f64` bounding-ball frustum and horizon culling.
 //!
 //! Performs conservative one-sided rejection against the four side planes of
-//! the Reverse-Z `DMat4` view-projection matrix and the conservative polar
-//! horizon plane without any transcendental calls per tested ball.
+//! the Reverse-Z `DMat4` view-projection matrix and the exact WGS84
+//! ellipsoidal tangent horizon plane without any transcendental calls per
+//! tested ball.
 
 use glam::{DMat4, DVec3};
 
@@ -57,19 +58,24 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Extract the four side frustum planes and conservative polar horizon
-    /// from a rotation-only `DMat4` view-projection matrix and `f64` eye.
+    /// Extract the four side frustum planes and the exact WGS84 ellipsoidal
+    /// tangent horizon plane from a rotation-only `DMat4` view-projection
+    /// matrix and `f64` eye.
     pub fn new(view_proj: &DMat4, eye: DVec3) -> Self {
         let (row0, row1, row3) = (view_proj.row(0), view_proj.row(1), view_proj.row(3));
         let inward = [row3 + row0, row3 - row0, row3 + row1, row3 - row1]
             .map(|plane| plane.truncate().normalize());
-        let towards = eye.normalize();
+        // For WGS84 ellipsoid `p^T A p = 1` with `A = diag(1, 1, 1/b^2)`, a
+        // surface point `p` is front-facing iff `(A p) · (eye - p) >= 0`,
+        // equivalently `p · (A eye) >= 1`.
         let polar = 1.0 - geodesy::FLATTENING;
+        let a_eye = DVec3::new(eye.x, eye.y, eye.z / (polar * polar));
+        let len = a_eye.length();
         Self {
             inward,
             eye,
-            towards,
-            horizon: polar * polar / eye.length(),
+            towards: a_eye / len,
+            horizon: 1.0 / len,
         }
     }
 
@@ -157,28 +163,40 @@ mod tests {
     }
 
     #[test]
-    fn the_horizon_is_measured_by_the_smallest_radius_the_earth_has() {
-        let (view_proj, eye) = looking(0.0, 0.0, 70.0);
-        let frame = Frame::new(&view_proj, eye);
-        let polar = at(90.0, 0.0, 0.0).z;
-        let away = DVec3::Z;
-        let (towards, distance) = (eye.normalize(), eye.length());
-        let along = polar * polar / distance;
-        let across = polar * (1.0 - (polar / distance).powi(2)).sqrt();
-        let side = towards.cross(away).cross(towards).normalize();
-        let grazing = towards * along + side * across;
-        let touching = Ball {
-            centre: grazing,
-            radius: 0.0,
-        };
-        assert!(frame.admits(&touching));
+    fn the_horizon_matches_the_oblate_wgs84_ellipsoid_tangent_plane() {
+        for (lat_cam, height_m) in [
+            (0.0, 14_000_000.0),
+            (45.0, 14_000_000.0),
+            (45.0, 80_000_000.0),
+        ] {
+            let cam = Camera::at(lat_cam, 0.0, height_m);
+            let vp = cam.view_projection(1.5);
+            let eye = cam.eye_ecef();
+            let frame = Frame::new(&vp, eye);
 
-        let squashed = polar * polar - at(0.0, 0.0, 0.0).x.powi(2);
-        let beyond = towards * (along + squashed * 0.2 / distance) + side * across;
-        assert!(!frame.admits(&Ball {
-            centre: beyond,
-            radius: 0.0
-        }));
+            // Check points across all latitudes and longitudes: every strictly
+            // visible ellipsoid surface point (`dot(N, eye - P) > 0`) must clear
+            // the horizon plane, and every strictly occluded point must be rejected.
+            for lat in (-89..=89).step_by(2) {
+                for lon in [0.0, 90.0, 180.0, -90.0] {
+                    let p = at(f64::from(lat), lon, 0.0);
+                    let n = geodesy::unit(f64::from(lat), lon);
+                    let facing = n.dot(eye - p);
+                    let clears_horizon = p.dot(frame.towards) >= frame.horizon;
+                    if facing > 1e-9 {
+                        assert!(
+                            clears_horizon,
+                            "visible surface point ({lat}, {lon}) at cam ({lat_cam}, {height_m} m) was falsely culled"
+                        );
+                    } else if facing < -1e-9 {
+                        assert!(
+                            !clears_horizon,
+                            "back-side surface point ({lat}, {lon}) at cam ({lat_cam}, {height_m} m) was not culled"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

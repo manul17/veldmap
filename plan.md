@@ -15,45 +15,13 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 
 ## Architectural Guardrails
 
-1. **Simple 2-crate native workspace with an enforced internal module DAG:**
-   - `crates/veldmap-core`: pure domain logic organized as a strict acyclic internal DAG, enforced in CI via isolated feature-matrix builds (`--no-default-features`, `--features fs`, `--features codecs`, `--features net`, `--all-features`) plus a lightweight intra-feature import check (`cache ↛ library`, `net ↛ provider`):
-     - **Leaf (`--no-default-features`; `glam`, `thiserror`, `blake3` only):**
-       - `geo`: WGS84 geodesy, projections/datums, `mgrs`, `DMat4`/`DVec3` camera & frustum culling, warp/georef math, geodesic measurements.
-       - `tile`: `TileKey` (`Copy + Eq + Hash`), `TileScheme` (`WebMercator | Geodetic | RasterPyramid { max_level: u8 }`), `BandKey`, `PixelFormat`, `pyramid`, generic GPU-free O(1) LRU `TileCache<K, V>`, pure `TileScheduler`.
-       - `io` / `mem`: strictly sync caller-buffered `ByteSource` trait, `Signer` trait, zero-dep async-waking `CancelToken`, lock-free `MemoryBudget` + `Shrinkable`, pure `StoragePaths`.
-     - **Orthogonal mid-layer (depend only on leaf):**
-       - `cache` (`fs`): raw-byte tile disk store, two-tier atomic writes, incremental LRU eviction.
-       - `raster` (`codecs`): pure-Rust decoders (`tiff`, `png`, `jpeg`, `openjp2`, later `hdf5_pure`), `table`, `grid`, `cascade`, `resample`, `radiometry`, pure sync range-planners.
-       - `net` (`net`; `tokio` + `reqwest` over `rustls`): `HttpRange` (`ByteSource` + `prefetch_pinned()` + `Shrinkable` 64 KiB LRU block pool), retry/ETag/range helpers.
-       - `provider` (`net`): STAC/COG discovery, CDSE OData/S3/SigV4 (`Signer` impl), manifests.
-     - **Upper layer (`fs`, optional `net`):**
-       - `library`: local catalog & storage layout (`fs`) plus resumable downloader (`fs + net`) parameterized over `Signer`.
-     - Default desktop features enable `codecs`, `fs`, and `net`. Zero `egui`, `eframe`, `wgpu`, or `memmap2` in `veldmap-core`.
-   - `crates/veldmap-app`: native `eframe`/`egui` + `wgpu` desktop application (offscreen 3D globe renderer decoupled from `egui`, 2D inspector, `GpuTileCache`, background workers, UI).
-   - Re-evaluate extracting `veldmap-raster` at **Slice 3C-1** if codec compile times degrade inner-loop speed.
+Authoritative contracts are maintained in [ADR 0001](docs/decisions/0001-native-workspace-and-threading.md) (workspace layout, `veldmap-core` acyclic module DAG, dependency exclusions, frame-driven loop, custom bounded `std::thread` decode pools, and shutdown order) and [ADR 0002](docs/decisions/0002-globe-model-and-precision.md) (committed v1 smooth nadir WGS84 ellipsoid, `MIN_HEIGHT_M = 2.0` m, Reverse-Z `f64`, double-single RTE / per-tile RTC, exact sRGB compositing, and overlay accuracy tolerances). Key cross-slice invariants:
 
-2. **Committed v1 planetary model — Precision Nadir Analytical Globe:**
-   - v1 renders a smooth WGS84 ellipsoid (`height = 0.0`, no 3D DEM mesh displacement or camera tilt/pitch). Relief is delivered as quantitative GPU layers (hillshade, slope, aspect) over DEM COGs in Slice 5B-1. This guarantees zero parallax for orthophoto alignment, swipe, and temporal diffing while keeping `Geodetic.height_m`, `DMat4` Reverse-Z, and tile LOD ready for any v2 3D terrain mode.
-
-3. **Frame-driven streaming engine (no internal pub/sub bus):**
-   - **Main thread (`eframe` + `wgpu`):** owns `AppState`, camera, timeline, `GpuTileCache` (directly on `VeldmapApp`, outside `CallbackResources`), and `PendingUploads`. Never blocks on disk, network, or decoding; passes immutable `Arc<GpuTile>` draw snapshots to 3D/2D `CallbackTrait` renderers.
-   - **`GpuTile` hygiene:** owns only `Texture`, `TextureView`, `PixelFormat`, dimensions, true byte size (including mips), and monotonic `tile_id: u64` — never pipeline-specific `BindGroup`s or `view_formats`.
-   - **Background workers & shutdown:** `tokio` multi-threaded runtime for HTTP/STAC/CDSE/downloads and Stage 1 async preflight (producing pinned memory-only `PreparedBatch`es), isolated from separate bounded **local CPU** vs **blocking remote** decode pools. Shutdown order: cancel root `CancelToken` → drop completion receiver (or use unbounded channel) & join decode pools → drop `tokio::Runtime`.
-   - **Deadlock-free memory & deduplication:** Lock-free `AtomicU64` `MemoryBudget` (FIFO slow-path waiter queue; never call while holding cache locks; snapshot `Vec<Arc<dyn Shrinkable>>` before shrinking); caches only use `try_acquire()` + self-eviction; decode jobs reserve upfront private working-set `Peak` atomically; singleflight is waiter-refcounted under its map mutex with a leader `Drop` guard.
-
-4. **Explicit exclusions, codec safety & two-tier durability:**
-   - No WASI, Wasmtime, ConnectRPC, protobuf, browser WASM shims, Emscripten, SQLite/ORM, `memmap2`, GDAL/PROJ C deps, or OpenSSL C deps in `veldmap-core` (use safe positioned I/O and `reqwest` with `rustls`).
-   - Pure-Rust codecs with explicit memory/IFD/padding/shift/varint limits, panic isolation, FFI soundness fixes on `openjp2`, and thread-safety audits before multi-threaded decode.
-   - Injected `StoragePaths` with two-tier atomic writes (`write_atomic_durable()` with `sync_all()` + synchronous handle drop before rename vs `write_atomic_cached()` without `sync_all()` + read validation; both using per-boot `.<boot_id>.<seq>.tmp` files).
-   - Add traits only where there is a real second implementation (`ByteSource`, `Signer`, raster decoders, tile providers).
-
-5. **Reuse from `old/`, rewrite glue cleanly, retire incrementally:**
-   - Tag pre-deletion state as `legacy-reference-snapshot` in Phase 0.5 and track all 79 reference files in `old/README.md` with `Consumer Slices` and `Delete After Slice` (always the *last* consumer slice).
-   - Port proven algorithms and curated tests, stripping `!Send` `Rc`/`RefCell` assumptions and splitting monoliths (`overlay.rs`, `tiles_pipeline.rs`). Never link from `docs/` into `old/`; delete `old/` completely at Slice 6.
-
-6. **Code hygiene (every slice):**
-   - English only across `crates/`, `docs/`, `README.md`, `plan.md`, `.env.example`, `.github/`, UI, comments, and commits (CI-enforced; remove `old/` exclusion at Slice 6).
-   - Rust 2024; verified by `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo-deny`, `naga` SPV/HLSL/MSL codegen, headless offscreen `wgpu` smoke tests, `veldmap-core` DAG checks, and offline `docs/` link checks.
+1. **Deadlock-free memory & deduplication:** Lock-free `AtomicU64` `MemoryBudget` (FIFO slow-path waiter queue; never call while holding cache locks; snapshot `Vec<Arc<dyn Shrinkable>>` before shrinking); caches only use `try_acquire()` + self-eviction; decode jobs reserve upfront private working-set `Peak` atomically; singleflight is waiter-refcounted under its map mutex with a leader `Drop` guard.
+2. **Pure-Rust codec safety & two-tier durability:** Pure-Rust decoders with explicit memory/IFD/padding/shift/varint limits, panic isolation, FFI soundness fixes on `openjp2`, and thread-safety audits before multi-threaded decode. Injected `StoragePaths` with two-tier atomic writes (`write_atomic_durable()` with `sync_all()` + synchronous handle drop before rename vs `write_atomic_cached()` without `sync_all()` + read validation; both using per-boot `.<boot_id>.<seq>.tmp` files). Add traits only where there is a real second implementation (`ByteSource`, `Signer`, raster decoders, tile providers).
+3. **`GpuTile` hygiene:** Owns only `Texture`, `TextureView`, `PixelFormat`, dimensions, true byte size (including mips), and monotonic `tile_id: u64` — never pipeline-specific `BindGroup`s or `view_formats`.
+4. **Reuse from `old/`, rewrite glue cleanly, retire incrementally:** Pre-deletion state is tagged `legacy-reference-snapshot`; remaining files are tracked in `old/README.md` with `Consumer Slices` and `Delete After Slice` (always the *last* consumer slice). Never link from `docs/` into `old/`; delete `old/` completely at Slice 6.
+5. **Code hygiene (every slice):** English only across repository files outside `old/` (CI-enforced; remove `old/` exclusion at Slice 6). Rust 2024; verified by `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo-deny`, `naga` SPV/HLSL/MSL codegen, headless offscreen `wgpu` smoke tests, `veldmap-core` DAG checks, forbidden `docs/ -> old/` link guard, and offline `lychee` link checks.
 
 ---
 
@@ -84,9 +52,9 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 - [x] **Port core geodesy & MGRS (`veldmap-core::geo`):** Port `geodesy`, `projection`, `camera`, `cull`, `outlines`, `footprint`, `wheel`, sag helpers, and **`mgrs`** (from `old/code/provider/mgrs.rs` into leaf `--no-default-features`) along with curated `old/tests/geo/` and `mgrs_tests.rs` (untextured ellipsoid mesh lives in `veldmap-app` as Slice 2's "Ellipsoid-only" fallback).
 - [x] **High-precision camera & culling:** Upgrade `Camera` to `DMat4` infinite Reverse-Z (`perspective_infinite_reverse_rh`), `height = 0.0`, `MIN_HEIGHT_M` (2–10 m), private internals behind view-agnostic queries, and `f64`/`DVec3` `Camera::project()`, `cull::Frame`, and `cull::Ball`.
 - [x] **Offscreen `wgpu` WGS84 globe renderer (`veldmap-app`):**
-  - Own `Rgba8UnormSrgb` + `Depth32Float` Reverse-Z target, sized in `CallbackTrait::prepare()` by constructing `PaintCallbackInfo` from stored `rect`/`clip_rect` + `screen_descriptor` (`viewport_in_pixels()`, clamped `[1, max_texture_dimension_2d]`, skipped on `0×0`, dirty-flag redraw skipping).
-  - Composite 1:1 with `FilterMode::Nearest` via `view_formats` branching on `target_format.is_srgb()` (linear RGB palette constants, no `encode_srgb` hacks).
-  - Precision-safe globe geometry (octant-RTC) + depth-less draped graticule (`depth_write: false`, `depth_compare: Always`, fragment ellipsoidal-normal horizon discard `dot(N_ellipsoid(P), E - P) >= 0`, HiDPI-scaled `RIBBON_PX`/`HATCH_PX`).
+  - Own `Rgba8UnormSrgb` + `Depth32Float` Reverse-Z target, sized in `CallbackTrait::prepare()` by constructing `PaintCallbackInfo` from stored `rect`/`clip_rect` + `screen_descriptor` (`viewport_in_pixels()`, clamped `[1, max_texture_dimension_2d]`, skipped on `0×0`, dirty-key redraw skipping covering viewport size, `show_graticule`, and `scene_generation`).
+  - Composite 1:1 with `FilterMode::Nearest` via `view_formats` matching target color space (linear RGB palette constants, no `encode_srgb` hacks).
+  - Watertight double-single RTE globe geometry (`DVec3::ZERO` + `(hi, lo)` split in a single draw call) + depth-less draped 15° graticule (`depth_write: false`, `depth_compare: Always`, fragment ellipsoidal-normal horizon discard `dot(N_ellipsoid(P), normalize(E - P)) > 0.0`). Scene outline/ribbon/hatch pipelines land with scene outlines in Slice 4A.
   - Mouse orbit, zoom-at-cursor, and smooth quaternion flights.
 - [x] **Baseline GIS HUD:** Cursor Lat/Lon, altitude & m/px, dynamic scale bar, North compass / Reset-North (`N`), and Go-To Coordinates (DD/DMS) or MGRS jump.
 - [x] **3-OS CI, `naga` & headless GPU tests:**
@@ -99,24 +67,29 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 
 ---
 
-### Slice 2 — Planetary Base Map (Global Tile Quadtree, Unified GPU & Disk Caches) `[ ]`
+### Slice 2A — Offline Planetary Quadtree, `TileKey`/`GpuTileCache` & Bundled Basemap `[ ]`
 - [ ] **Global WGS84 tile quadtree:** Implement `z/x/y` quadtree over `TileScheme` (`WebMercator | Geodetic | RasterPyramid { max_level: u8 }`) with **per-tile RTC** meshes (`tile_origin - eye` in `f64` on CPU, shared static index buffer), polar cap extensions attached directly to `y = 0` / `y = max` tiles (zero T-junctions across mixed LODs), sagitta skirts, and HiDPI-aware SSE subdivision.
 - [ ] **Unified `TileKey`, `TileCache` & `GpuTileCache`:**
   - Define `TileKey: Copy + Eq + Hash` (`SourceId`, `BandKey`, `TileScheme`, `PixelFormat`, `DecodeRev`, `Level`, `X`, `Y`) with deterministic `Copy` `BandKey` (`Display | Index(u16) | NamedHash(u64)`) and implement pure O(1) LRU `TileCache<K, V>` in `veldmap-core::tile` (scheme-aware ancestor touch, `<50%` byte appetite cap per pyramid).
-  - Own `GpuTileCache` and `PendingUploads` directly on `VeldmapApp` (cloning `Arc`-backed `device`/`queue`, passing `Arc<GpuTile>` draw snapshots to callbacks + small per-pipeline `BindGroup` LRU keyed by `[tile_id; N]`). Drain the full completion channel each frame (unbounded channel or drop-rx before shutdown join), prune stale entries, upload coarsest-first (4–8 MiB / ~2 ms cap, ≥ 1 tile/frame), request repaint while non-empty, and trigger redraws via injected `Wakeup`.
+  - Own `GpuTileCache` and `PendingUploads` directly on `VeldmapApp` (cloning `Arc`-backed `device`/`queue`, passing `Arc<GpuTile>` draw snapshots to callbacks + small per-pipeline `BindGroup` LRU keyed by `[tile_id; N]`). Drain the full completion channel each frame, prune stale entries, upload coarsest-first (4–8 MiB / ~2 ms cap, ≥ 1 tile/frame), request repaint while non-empty, and trigger redraws via injected `Wakeup`.
+- [ ] **Bundled offline basemap & basemap switcher:** Bundle a public-domain low-res global texture (z0–z4 NASA Blue Marble Next Gen or Natural Earth, ~1–3 MiB; document provenance in `THIRD_PARTY_NOTICES.md` and `assets/README.md`) and wire the **Satellite / Ellipsoid-only** switcher.
+- [ ] **CI DAG check & ADR 0003:** Add `veldmap-core` feature-matrix scaffolding (`--no-default-features`, `--all-features`) to CI; write `docs/decisions/0003-tile-identity-and-gpu-cache.md` and seed `docs/architecture/viewing-pipeline.md`.
+- **Exit criteria:**
+  - *Automated CI:* `TileCache<K, V>` (both `WebMercator` and `RasterPyramid { max_level }`), quadtree subdivision/polar-cap tests, and headless GPU tile-upload smoke test pass.
+  - *Manual QA:* Offline planet zooms smoothly from orbit to street scale with zero T-junctions or polar seams and bounded VRAM; `plan.md` `Next Step` updated.
+
+---
+
+### Slice 2B — Async Tile Streaming, Disk Cache & Live Satellite Basemaps `[ ]`
 - [ ] **Async-waking `CancelToken` & tile fetcher (`veldmap-core::io`, `veldmap-core::net`):**
   - Implement leaf `CancelToken` (`AtomicBool` + zero-dep `std::task::Waker` / listener hook so `tokio::select!` aborts immediately on pan/shutdown).
   - Implement `tokio` + `reqwest` (`rustls`) tile fetcher with per-host concurrency limits, compliant `User-Agent`, replaceable visible-first queue, and immediate cancellation.
 - [ ] **Disk cache & LRU eviction (`veldmap-core::cache`):** Port `old/code/cache/` (`store`, `layout`, `tile`, `evict`) and `evict_tests.rs` using injected `StoragePaths`, two-tier atomic writes (`write_atomic_cached()` with no `sync_all()` + read validation and `write_atomic_durable()` with `sync_all()` + synchronous `into_std().await` drop before rename; both using `.<boot_id>.<seq>.tmp` and Windows sharing-violation handling), and foreign-UUID startup sweep.
-- [ ] **Legally clean basemap stack & geodesic tools:**
-  - Bundle a public-domain low-res global texture (z0–z4 NASA Blue Marble Next Gen or Natural Earth, ~1–3 MiB; document provenance in `THIRD_PARTY_NOTICES.md` and `assets/README.md`).
-  - Wire NASA GIBS + EOX Sentinel-2 Cloudless (CC BY 4.0) with visible attribution, basemap switcher (**Satellite / Ellipsoid-only** + Custom XYZ/TMS URL & API-key settings; defer a default street "Map" layer unless a legally compliant tile source is chosen), graceful offline fallback, and WGS84 geodesic distance/area tools.
-- [ ] **CI DAG check, docs & `old/` cleanup:**
-  - Add `veldmap-core` feature-matrix & intra-feature import checks (`--no-default-features`, `fs`, `net`, `--all-features`) to CI.
-  - Write `docs/decisions/0003-tile-identity-and-gpu-cache.md`, `docs/decisions/0004-two-tier-atomic-durability.md`, and seed `docs/architecture/viewing-pipeline.md`; delete `old/code/cache/` and `old/tests/cache/evict_tests.rs`.
+- [ ] **Legally clean live basemaps:** Wire NASA GIBS + EOX Sentinel-2 Cloudless (CC BY 4.0) with visible attribution, Custom XYZ/TMS URL & API-key settings (defer a default street "Map" layer unless a legally compliant tile source is chosen), and graceful offline fallback to the bundled Slice 2A basemap.
+- [ ] **CI DAG feature matrix, ADR 0004 & `old/` cleanup:** Enforce `--no-default-features`, `fs`, `net`, `--all-features` and intra-feature import checks in CI; write `docs/decisions/0004-two-tier-atomic-durability.md`; delete `old/code/cache/` and `old/tests/cache/evict_tests.rs`.
 - **Exit criteria:**
-  - *Automated CI:* `TileCache<K, V>` (both `WebMercator` and `RasterPyramid { max_level }`), geodesic math, `evict_tests`, atomic-write/temp-sweep, and `veldmap-core` DAG checks pass.
-  - *Manual QA:* Planet zooms cleanly from orbit to street scale with zero T-junctions or polar seams, bounded VRAM & disk usage, visible attribution, and offline fallback; `plan.md` `Next Step` updated.
+  - *Automated CI:* `evict_tests`, atomic-write/temp-sweep, `CancelToken`, and `veldmap-core` DAG checks pass.
+  - *Manual QA:* Live NASA GIBS / EOX tiles stream smoothly with visible attribution, bounded disk cache, and clean offline fallback; `plan.md` `Next Step` updated.
 
 ---
 
@@ -142,7 +115,7 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 
 ### Slice 3A-2 — Local Workstation UX, Expanded Pure-Rust CRS & GeoJSON Overlay `[ ]`
 - [ ] **Expanded pure-Rust CRS & world files:** Extend `veldmap-core::geo::projection` with `ETRS89/UTM` (`258xx`), `NAD83/UTM` (`269xx`), `LAEA Europe` (`3035`), Polar Stereographic (`3413`/`3031`), `GeoKey 3072 == 32767` user-defined TM parameters, wire existing `Datum::to_wgs84` into geographic bindings (preventing NAD83/Pulkovo-42 shifts), read `.tfw`/`.jgw`/`.pgw` world files in `fs`/`app` (injected as external `Option<Placement>`), and show visible UI warnings for unshifted foreign datums.
-- [ ] **Local workstation UX:** Native file picker + drag-and-drop + CLI file argument, Layer Manager (visibility, reorder, opacity, zoom-to-binding, CRS/radiometry metadata inspector), searchable CRS picker with presets & custom TM parameters (unlocking all MSK-xx zones), **read-only GeoJSON overlay (stroke-only or earcut triangulation — never convex fan fills)**, and diagnostic banners (fatal vs partial error, detail-limit caption, loading shimmer).
+- [ ] **Local workstation UX & geodesic tools:** Native file picker + drag-and-drop + CLI file argument, Layer Manager (visibility, reorder, opacity, zoom-to-binding, CRS/radiometry metadata inspector), searchable CRS picker with presets & custom TM parameters (unlocking all MSK-xx zones), WGS84 geodesic distance/area measurement tools, **read-only GeoJSON overlay (stroke-only or earcut triangulation — never convex fan fills)**, and diagnostic banners (fatal vs partial error, detail-limit caption, loading shimmer).
 - [ ] **Docs:** Write `docs/decisions/0006-pure-rust-georeferencing-and-crs.md` and seed `docs/architecture/georeference.md` (**retain** `old/docs/georeference.md` until NetCDF sections migrate in Slice 6).
 - **Exit criteria:**
   - *Automated CI:* Expanded CRS/datum round-trip tests and GeoJSON parsing/stroke tests pass.
@@ -170,7 +143,7 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 ### Slice 4A — Zero-Auth Cloud EO Streaming (HTTP Range + STAC / Public COGs) `[ ]`
 - [ ] **HTTP Range `ByteSource` (`veldmap-core::net`):** Port `old/code/network/range.rs` core over `reqwest` (`rustls`)/`tokio`: 64 KiB O(1) LRU `HttpBlockPool` (`Shrinkable` under `MemoryBudget`), combined open-probe + `0..64 KiB` head read + concurrent `mid_64k`/`tail_64k` `ContentId` reads (`416`-safe on 0-byte files), consumed-only readahead, atomic waiter-refcounted multi-block singleflight, auto-decompression disabled, `Content-Range` + strong-ETag `If-Match` validation, `CancelToken` async abort, and `Handle::try_current().is_err()` guard on blocking reads.
 - [ ] **Two-stage pinned remote decode:** Add pure sync chunk range-planners in `raster` and `HttpRange::prefetch_pinned()` in `net` returning memory-only `PinnedByteSource` (`PreparedBatch` under upfront `MemoryPermit`) routed to the fast CPU decode lane, isolating un-prefetched blocking reads to a separate capped remote lane.
-- [ ] **Zero-auth STAC & public COG provider (`veldmap-core::provider`):** Implement STAC API search (e.g., AWS Earth Search Sentinel-2 L2A COGs + COP-DEM GLO-30) and direct public HTTP COG URLs, multi-band Sentinel-2 asset discovery + STAC `raster:bands` scale/offset metadata, AOI search (viewport / drawn box / GeoJSON polygon + GeoJSON/WKT export), scene outlines on globe, and built-in zero-auth sample scenes for 15-second onboarding.
+- [ ] **Zero-auth STAC & public COG provider (`veldmap-core::provider`):** Implement STAC API search (e.g., AWS Earth Search Sentinel-2 L2A COGs + COP-DEM GLO-30) and direct public HTTP COG URLs, multi-band Sentinel-2 asset discovery + STAC `raster:bands` scale/offset metadata, AOI search (viewport / drawn box / GeoJSON polygon + GeoJSON/WKT export), scene outlines on globe (wiring HiDPI-scaled outline/ribbon/hatch pipelines in `veldmap-app` and resolving `bytemuck` vs `veldmap-app` vertex packing for `veldmap-core::geo::outlines`), and built-in zero-auth sample scenes for 15-second onboarding.
 - [ ] **Mock HTTP harness & docs:** Build offline local mock HTTP Range harness (`206`, `200` rejection, `416`, strong/weak `ETag`, delivered-byte ceilings); write `docs/decisions/0008-network-streaming-and-stac.md` and `docs/configuration.md`.
 - **Exit criteria:**
   - *Automated CI:* Offline mock HTTP Range/STAC/singleflight tests pass in CI.
@@ -222,7 +195,7 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 #### Slice 5B-2 — Multi-Temporal Timeline, Dual-Epoch Diffing & Time-Series Plot
 - [ ] **Multi-temporal timeline scrubber:** Reuse unified `TileKey` for epoch ingestion from STAC/CDSE AOI search (grouped by MGRS tile + AOI coverage, defaulting to L2A) or local dated folders, cloud-cover filtering, adjacent-date prefetch, and instant stale-request cancellation.
 - [ ] **Unified offscreen dual-epoch cross-fade & diffing:** Render each epoch to an offscreen target and run fullscreen cross-fade (`mix`) or physical reflectance diffing (`Date B − Date A`) — cleanly supporting multi-band + `SCL`, mismatched carrier levels, and non-co-registered swaths without expanding `VisualLayer`.
-- [ ] **1D pixel time-series plot:** Add a lightweight `egui_plot` panel showing reflectance/NDVI over time at a clicked location (skipping cloud-masked dates).
+- [ ] **1D pixel time-series plot:** Add a lightweight 1D time-series panel (custom `egui::Painter` chart to avoid pinning bleeding-edge `egui` upgrades to `egui_plot`, or `egui_plot` if version-aligned) showing reflectance/NDVI over time at a clicked location (skipping cloud-masked dates).
 - **Exit criteria:**
   - *Automated CI:* Analytical relief (Jacobian/gutter/NaN) and temporal diffing shaders pass `naga` SPV/HLSL/MSL + headless GPU smoke tests.
   - *Manual QA:* End-to-end multi-temporal EO workflow (local + STAC/CDSE, band math, swipe/diff, pixel time-series plot, analytical DEM relief) persists cleanly across sessions; `plan.md` `Next Step` updated.
@@ -241,5 +214,5 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 
 ## Next Step
 
-- **Current state:** Phase 0.5 and Slice 1 are complete on `main` (`veldmap-core::geo` + MGRS + DD/DMS Go-To parser with 115 passing leaf tests; `veldmap-app` octant-RTC Reverse-Z WGS84 globe renderer, depth-less horizon-discarded graticule, exact `view_formats` sRGB compositing, GIS HUD, `naga` SPV/HLSL/MSL codegen tests, headless Lavapipe GPU smoke tests, 3-OS CI, ADR 0002, and 20 legacy `old/` files retired).
-- **Immediate task:** Start **Slice 2 — Planetary Base Map (Global Tile Quadtree, Unified GPU & Disk Caches)** (`TileKey`/`TileScheme`/`BandKey`/`TileCache<K, V>`, per-tile RTC quadtree + polar cap extensions + skirts, `GpuTileCache` + `PendingUploads` on `VeldmapApp`, async-waking `CancelToken` + `tokio`/`reqwest` tile fetcher, `veldmap-core::cache` two-tier atomic writes & LRU eviction, bundled public-domain z0–z4 basemap + NASA GIBS / EOX Sentinel-2 Cloudless with attribution, geodesic distance/area tools, and CI DAG feature-matrix checks).
+- **Current state:** Phase 0.5 and Slice 1 are complete and polished on `main` (`veldmap-core::geo` + MGRS + DD/DMS Go-To parser with 113 passing leaf tests and exact oblate WGS84 horizon culling; `veldmap-app` watertight double-single RTE Reverse-Z WGS84 globe renderer, depth-less horizon-discarded graticule, exact `view_formats` sRGB compositing, synchronized GIS HUD, `naga` SPV/HLSL/MSL codegen tests, headless Lavapipe GPU smoke tests, 3-OS CI with `docs/ -> old/` link guard, ADR 0002, and 20 legacy `old/` files retired).
+- **Immediate task:** Start **Slice 2A — Offline Planetary Quadtree, `TileKey`/`GpuTileCache` & Bundled Basemap** (`TileKey`/`TileScheme`/`BandKey`/`TileCache<K, V>`, per-tile RTC quadtree + polar cap extensions + skirts, `GpuTileCache` + `PendingUploads` on `VeldmapApp`, bundled public-domain z0–z4 basemap + Satellite/Ellipsoid-only switcher, ADR 0003, and CI DAG feature-matrix scaffolding).

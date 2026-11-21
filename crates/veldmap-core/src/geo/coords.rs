@@ -42,8 +42,7 @@ pub fn parse_location(input: &str) -> Result<ParsedLocation, ParseLocationError>
         return Err(ParseLocationError::Empty);
     }
 
-    // 1. Try MGRS first when the string contains no lat/lon separators and starts
-    // with digits or `T` + digits (e.g. `37UDQ`, `T40WFC`, `4Q FJ 12345 67890`).
+    // 1. Try MGRS first (e.g. `37UDQ`, `T40WFC`, `4Q FJ 12345 67890`).
     if let Ok((lat_deg, lon_deg, radius_deg)) = mgrs::parse_to_wgs84(trimmed) {
         return Ok(ParsedLocation {
             lat_deg,
@@ -150,16 +149,87 @@ fn parse_lat_lon(input: &str) -> Result<ParsedLocation, ParseLocationError> {
     })
 }
 
+fn parse_hemisphere_char(ch: char) -> Option<Hemisphere> {
+    match ch {
+        'N' | 'n' => Some(Hemisphere::North),
+        'S' | 's' => Some(Hemisphere::South),
+        'E' | 'e' => Some(Hemisphere::East),
+        'W' | 'w' => Some(Hemisphere::West),
+        _ => None,
+    }
+}
+
+fn contains_dms_marker(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            c,
+            '°' | 'º' | '\'' | '′' | '"' | '″' | ':' | 'd' | 'D' | 'm' | 'M'
+        )
+    })
+}
+
+fn is_prefix_hemisphere_start(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if parse_hemisphere_char(first).is_none() {
+        return false;
+    }
+    chars.next().is_some_and(|next| {
+        next.is_whitespace() || next.is_ascii_digit() || matches!(next, '+' | '-' | '.')
+    })
+}
+
 fn split_by_hemisphere(input: &str) -> Option<(&str, &str)> {
-    for (idx, ch) in input.char_indices() {
-        if matches!(ch, 'N' | 'S' | 'E' | 'W' | 'n' | 's' | 'e' | 'w') {
-            let after = idx + ch.len_utf8();
-            let left = input[..after].trim();
-            let right = input[after..].trim();
-            if !left.is_empty() && !right.is_empty() {
-                return Some((left, right));
+    // Case 1: Leading hemisphere prefixes, e.g. `N47.2357 E39.7015` or
+    // `S 33°52'07.7" E 151°12'33.5"`. Split before the second prefix.
+    if is_prefix_hemisphere_start(input) {
+        let mut prev_ws = false;
+        for (idx, ch) in input.char_indices().skip(1) {
+            if prev_ws && is_prefix_hemisphere_start(&input[idx..]) {
+                let left = input[..idx].trim();
+                let right = input[idx..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    return Some((left, right));
+                }
             }
+            prev_ws = ch.is_whitespace();
         }
+        return None;
+    }
+
+    // Case 2: Trailing hemisphere suffixes, e.g. `47°14'08.5"N 39°42'05.4"E`,
+    // `47d 14m 8.5s N 39d 42m 5.4s E`, or `33.8688S 151.2093E`.
+    for (idx, ch) in input.char_indices() {
+        if parse_hemisphere_char(ch).is_none() {
+            continue;
+        }
+        let after = idx + ch.len_utf8();
+        let rest = &input[after..];
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let before = &input[..idx];
+        let right = rest.trim();
+        if before.trim().is_empty() || right.is_empty() {
+            continue;
+        }
+        // Do not split on a seconds suffix (`8.5s`) before a real hemisphere or
+        // inside a DMS clause.
+        if matches!(ch, 's' | 'S')
+            && before.ends_with(|c: char| c.is_ascii_digit())
+            && contains_dms_marker(before)
+            && (ch == 's'
+                || right
+                    .chars()
+                    .next()
+                    .and_then(parse_hemisphere_char)
+                    .is_some())
+        {
+            continue;
+        }
+        return Some((input[..after].trim(), right));
     }
     None
 }
@@ -168,57 +238,51 @@ fn parse_angle(
     clause: &str,
     original: &str,
 ) -> Result<(f64, Option<Hemisphere>, bool), ParseLocationError> {
+    let mut rest = clause.trim();
     let mut hemisphere = None;
-    let mut cleaned = String::with_capacity(clause.len());
-    let mut has_dms_markers = false;
 
-    for ch in clause.chars() {
+    // 1. Optional leading hemisphere (`N 47.2`, `S33.8688`).
+    if is_prefix_hemisphere_start(rest)
+        && let Some(first) = rest.chars().next()
+        && let Some(h) = parse_hemisphere_char(first)
+    {
+        hemisphere = Some(h);
+        rest = rest[first.len_utf8()..].trim();
+    }
+
+    // 2. Optional trailing hemisphere (`33°52'07.7"S`, `33d 52m 7.7s S`, `33.8688S`).
+    if hemisphere.is_none()
+        && let Some(last) = rest.chars().next_back()
+        && let Some(h) = parse_hemisphere_char(last)
+    {
+        let before = &rest[..rest.len() - last.len_utf8()];
+        let is_seconds_suffix = matches!(last, 's' | 'S')
+            && before.ends_with(|c: char| c.is_ascii_digit())
+            && contains_dms_marker(before)
+            && (last == 's' || before.chars().any(|c| matches!(c, 'd' | 'D' | 'm' | 'M')));
+        if !is_seconds_suffix {
+            hemisphere = Some(h);
+            rest = before.trim();
+        }
+    }
+
+    let mut cleaned = String::with_capacity(rest.len());
+    let mut has_dms_markers = false;
+    let mut prev_char: Option<char> = None;
+
+    for ch in rest.chars() {
         match ch {
-            'N' | 'n' => {
-                if hemisphere.replace(Hemisphere::North).is_some() {
-                    return Err(ParseLocationError::Unrecognized(original.to_owned()));
-                }
-                cleaned.push(' ');
-            }
-            'S' | 's' if !cleaned.trim_end().ends_with(|c: char| c.is_ascii_digit()) => {
-                if hemisphere.replace(Hemisphere::South).is_some() {
-                    return Err(ParseLocationError::Unrecognized(original.to_owned()));
-                }
-                cleaned.push(' ');
-            }
-            'E' | 'e' => {
-                if hemisphere.replace(Hemisphere::East).is_some() {
-                    return Err(ParseLocationError::Unrecognized(original.to_owned()));
-                }
-                cleaned.push(' ');
-            }
-            'W' | 'w' => {
-                if hemisphere.replace(Hemisphere::West).is_some() {
-                    return Err(ParseLocationError::Unrecognized(original.to_owned()));
-                }
-                cleaned.push(' ');
-            }
             '°' | 'º' | 'd' | 'D' | '\'' | '′' | 'm' | 'M' | '"' | '″' | ':' => {
                 has_dms_markers = true;
                 cleaned.push(' ');
             }
-            's' | 'S' => {
-                // `s` directly following a digit is either seconds (`8.5s`) or
-                // hemisphere (`33.8688S`). If there are already DMS markers or
-                // at least 2 numeric tokens before it, treat as seconds;
-                // otherwise treat as South hemisphere.
-                let token_count = cleaned.split_whitespace().count();
-                if has_dms_markers && token_count >= 2 {
-                    cleaned.push(' ');
-                } else {
-                    if hemisphere.replace(Hemisphere::South).is_some() {
-                        return Err(ParseLocationError::Unrecognized(original.to_owned()));
-                    }
-                    cleaned.push(' ');
-                }
+            's' | 'S' if prev_char.is_some_and(|c| c.is_ascii_digit()) => {
+                has_dms_markers = true;
+                cleaned.push(' ');
             }
             _ => cleaned.push(ch),
         }
+        prev_char = Some(ch);
     }
 
     let nums: Vec<f64> = cleaned
@@ -228,6 +292,10 @@ fn parse_angle(
         .map_err(|_| ParseLocationError::Unrecognized(original.to_owned()))?;
 
     if nums.is_empty() || nums.len() > 3 {
+        return Err(ParseLocationError::Unrecognized(original.to_owned()));
+    }
+
+    if hemisphere.is_some() && nums[0].is_sign_negative() {
         return Err(ParseLocationError::Unrecognized(original.to_owned()));
     }
 
@@ -244,18 +312,7 @@ fn parse_angle(
     }
 
     let mag = deg + min / 60.0 + sec / 3600.0;
-    let sign = match hemisphere {
-        Some(h) => {
-            h.sign()
-                * if nums[0].is_sign_negative() {
-                    -1.0
-                } else {
-                    1.0
-                }
-        }
-        None => sign_from_deg,
-    };
-
+    let sign = hemisphere.map_or(sign_from_deg, Hemisphere::sign);
     let is_dms = nums.len() > 1 || has_dms_markers;
     Ok((sign * mag, hemisphere, is_dms))
 }
@@ -278,10 +335,23 @@ mod tests {
         let loc3 = parse_location("33.8688S, 151.2093E").unwrap();
         assert!((loc3.lat_deg + 33.8688).abs() < 1e-9);
         assert!((loc3.lon_deg - 151.2093).abs() < 1e-9);
+
+        // Space-separated suffix and prefix hemispheres, plus lon-first order.
+        let loc4 = parse_location("33.8688S 151.2093E").unwrap();
+        assert!((loc4.lat_deg + 33.8688).abs() < 1e-9);
+        assert!((loc4.lon_deg - 151.2093).abs() < 1e-9);
+
+        let loc5 = parse_location("N47.2357 E39.7015").unwrap();
+        assert!((loc5.lat_deg - 47.2357).abs() < 1e-9);
+        assert!((loc5.lon_deg - 39.7015).abs() < 1e-9);
+
+        let loc6 = parse_location("39.7015E 47.2357N").unwrap();
+        assert!((loc6.lat_deg - 47.2357).abs() < 1e-9);
+        assert!((loc6.lon_deg - 39.7015).abs() < 1e-9);
     }
 
     #[test]
-    fn parses_dms_formats() {
+    fn parses_dms_formats_in_both_hemispheres() {
         let loc = parse_location("47°14'08.5\"N 39°42'05.4\"E").unwrap();
         assert_eq!(loc.kind, LocationKind::DegreesMinutesSeconds);
         assert!((loc.lat_deg - (47.0 + 14.0 / 60.0 + 8.5 / 3600.0)).abs() < 1e-7);
@@ -291,9 +361,40 @@ mod tests {
         assert!((loc2.lat_deg - loc.lat_deg).abs() < 1e-7);
         assert!((loc2.lon_deg - loc.lon_deg).abs() < 1e-7);
 
-        let loc3 = parse_location("-33° 52' 07.7\", 151° 12' 33.5\"").unwrap();
-        assert!((loc3.lat_deg + (33.0 + 52.0 / 60.0 + 7.7 / 3600.0)).abs() < 1e-7);
-        assert!((loc3.lon_deg - (151.0 + 12.0 / 60.0 + 33.5 / 3600.0)).abs() < 1e-7);
+        // Space-separated `d/m/s` without comma.
+        let loc_space = parse_location("47d 14m 8.5s N 39d 42m 5.4s E").unwrap();
+        assert!((loc_space.lat_deg - loc.lat_deg).abs() < 1e-7);
+        assert!((loc_space.lon_deg - loc.lon_deg).abs() < 1e-7);
+
+        // Southern hemisphere DMS and DM with `S` must produce negative latitude.
+        let sydney_lat = -(33.0 + 52.0 / 60.0 + 7.7 / 3600.0);
+        let sydney_lon = 151.0 + 12.0 / 60.0 + 33.5 / 3600.0;
+        for input in [
+            "33°52'07.7\"S, 151°12'33.5\"E",
+            "33°52'07.7\"S 151°12'33.5\"E",
+            "33d 52m 7.7s S, 151d 12m 33.5s E",
+            "33d 52m 7.7s S 151d 12m 33.5s E",
+            "33d52m7.7sS 151d12m33.5sE",
+            "S 33°52'07.7\" E 151°12'33.5\"",
+            "-33° 52' 07.7\", 151° 12' 33.5\"",
+        ] {
+            let parsed = parse_location(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(parsed.kind, LocationKind::DegreesMinutesSeconds, "{input}");
+            assert!(
+                (parsed.lat_deg - sydney_lat).abs() < 1e-7,
+                "{input} -> lat {}",
+                parsed.lat_deg
+            );
+            assert!(
+                (parsed.lon_deg - sydney_lon).abs() < 1e-7,
+                "{input} -> lon {}",
+                parsed.lon_deg
+            );
+        }
+
+        let dm_south = parse_location("33° 52' S, 151° 12' E").unwrap();
+        assert!((dm_south.lat_deg + (33.0 + 52.0 / 60.0)).abs() < 1e-7);
+        assert!((dm_south.lon_deg - (151.0 + 12.0 / 60.0)).abs() < 1e-7);
     }
 
     #[test]
@@ -315,9 +416,20 @@ mod tests {
             parse_location("10.0, 190.0"),
             Err(ParseLocationError::LongitudeOutOfRange(_))
         ));
-        assert!(matches!(
-            parse_location("not a coordinate"),
-            Err(ParseLocationError::Unrecognized(_))
-        ));
+        for bad in [
+            "not a coordinate",
+            "-33.8688S, 151.2093E",
+            "N 45 S, 10 E",
+            "37UD\u{0419}",
+            "37UD\u{00E9}",
+        ] {
+            assert!(
+                matches!(
+                    parse_location(bad),
+                    Err(ParseLocationError::Unrecognized(_))
+                ),
+                "expected Unrecognized for '{bad}'"
+            );
+        }
     }
 }

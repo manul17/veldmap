@@ -12,10 +12,10 @@ Each reference file is deleted only after its **last** consumer slice closes and
 
 | File | Consumer Slices | Delete After Slice |
 |---|---|---|
-| `code/cache/evict.rs` | Slice 2 | Slice 2 |
-| `code/cache/layout.rs` | Slice 2 | Slice 2 |
-| `code/cache/store.rs` | Slice 2 | Slice 2 |
-| `code/cache/tile.rs` | Slice 2 | Slice 2 |
+| `code/cache/evict.rs` | Slice 2B | Slice 2B |
+| `code/cache/layout.rs` | Slice 2B | Slice 2B |
+| `code/cache/store.rs` | Slice 2B | Slice 2B |
+| `code/cache/tile.rs` | Slice 2B | Slice 2B |
 | `code/geo/overlay.rs` | Slice 3A-1 | Slice 3A-1 |
 | `code/library/catalog.rs` | Slice 4B | Slice 4B |
 | `code/library/download.rs` | Slice 4B | Slice 4B |
@@ -57,8 +57,8 @@ Each reference file is deleted only after its **last** consumer slice closes and
 | `docs/glossary.md` | Phase 0.5, Slice 1–6 | Slice 6 |
 | `docs/imagery.md` | Slice 3C-1, Slice 4B | Slice 4B |
 | `docs/limitations.md` | Phase 0.5, Slice 1–6 | Slice 6 |
-| `docs/viewing-pipeline.md` | Slice 2, Slice 3A-1 | Slice 3A-1 |
-| `tests/cache/evict_tests.rs` | Slice 2 | Slice 2 |
+| `docs/viewing-pipeline.md` | Slice 2A, Slice 3A-1 | Slice 3A-1 |
+| `tests/cache/evict_tests.rs` | Slice 2B | Slice 2B |
 | `tests/provider/imagery_tests.rs` | Slice 4B | Slice 4B |
 | `tests/provider/manifest_tests.rs` | Slice 4B | Slice 4B |
 | `tests/provider/s3_tests.rs` | Slice 4B | Slice 4B |

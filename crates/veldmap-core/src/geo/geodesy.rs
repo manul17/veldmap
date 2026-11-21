@@ -135,7 +135,9 @@ pub fn intersect_at(origin: DVec3, direction: DVec3, height_m: f64) -> Option<DV
 /// Convert a surface point in ECEF world coordinates back to geodetic
 /// `(lat_deg, lon_deg)`.
 pub fn surface_at(point: DVec3) -> (f64, f64) {
-    let lat = (point.z / ((1.0 - ECCENTRICITY_SQ) * point.x.hypot(point.y))).atan();
+    let lat = point
+        .z
+        .atan2((1.0 - ECCENTRICITY_SQ) * point.x.hypot(point.y));
     (lat.to_degrees(), point.y.atan2(point.x).to_degrees())
 }
 
@@ -176,8 +178,8 @@ pub fn between(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
 
 /// Minimum longitude span treated as a full circle around the globe.
 ///
-/// Global grids may be written half a pixel short of 360 degrees
-/// (for example `-180.0125 -> 179.9875`).
+/// Pixel-centered global grids may fall half a pixel short of 360 degrees
+/// (for example `-179.9875 -> 179.9875`).
 pub const FULL_CIRCLE_DEG: f64 = 359.0;
 
 /// One full turn of longitude in degrees.
@@ -352,24 +354,15 @@ mod tests {
     }
 
     #[test]
-    fn two_halves_tell_apart_what_one_half_cannot() {
-        let step_m = 0.01;
+    fn two_halves_preserve_sub_millimetre_offsets() {
         let here = world(Geodetic::surface(45.0, 60.0));
-        let there = here + DVec3::Z * (step_m / SEMI_MAJOR_M);
-
-        let (near, far) = (parts(here), parts(there));
-        assert_eq!(near.0, far.0, "high half alone cannot resolve 1 cm");
-
-        let moved = f64::from(Vec3::from(offset(far, near)).length()) * SEMI_MAJOR_M;
-        assert!(
-            (moved - step_m).abs() < 1e-6,
-            "{moved} m instead of {step_m}"
+        let cm_step = here + DVec3::Z * (0.01 / SEMI_MAJOR_M);
+        assert_eq!(
+            parts(here).0,
+            parts(cm_step).0,
+            "high half alone cannot resolve 1 cm"
         );
-    }
 
-    #[test]
-    fn the_offset_keeps_what_one_half_would_drop() {
-        let here = world(Geodetic::surface(45.0, 60.0));
         for step_m in [0.01, 0.1, 1.0, 100.0, 10_000.0] {
             let there = here + DVec3::Z * (step_m / SEMI_MAJOR_M);
             let step = Vec3::from(offset(parts(there), parts(here)));

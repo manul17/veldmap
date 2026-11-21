@@ -263,7 +263,8 @@ fn seam_cuts(places: &[(f64, f64)], sweeps: &[f64]) -> Vec<usize> {
             continue;
         };
         let (opens, closes) = (places[first], places[(last + 1) % places.len()]);
-        if opens.0 != closes.0 || (opens.1 - closes.1).rem_euclid(360.0) != 0.0 {
+        let lon_gap = geodesy::unwind(opens.1, closes.1) - opens.1;
+        if opens.0 != closes.0 || lon_gap.abs() > (geodesy::TURN_DEG - geodesy::FULL_CIRCLE_DEG) {
             return Vec::new();
         }
         let span: f64 = run.iter().map(|index| sweeps[*index]).sum();
@@ -279,6 +280,9 @@ fn seam_cuts(places: &[(f64, f64)], sweeps: &[f64]) -> Vec<usize> {
 }
 
 fn edge(ring: &mut Vec<OutlineVertex>, from: (f64, f64), to: (f64, f64)) {
+    if from == to {
+        return;
+    }
     let edge_deg = max_edge_deg();
     let most = (geodesy::TURN_DEG / edge_deg).ceil();
     let raw = (geodesy::edge_span(from, to) / edge_deg).ceil();

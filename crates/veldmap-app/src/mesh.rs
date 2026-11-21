@@ -1,5 +1,9 @@
-//! Precision-safe octant-RTC WGS84 ellipsoid mesh (Slice 2 "Ellipsoid-only"
-//! fallback) and depth-less draped 15-degree graticule at `height_m = 0.0`.
+//! Precision-safe untextured WGS84 ellipsoid mesh and depth-less draped
+//! 15-degree graticule at `height_m = 0.0`.
+//!
+//! Uses a single watertight WGS84 grid with `(pos_hi, pos_lo)` double-single
+//! ECEF vertex splitting (sub-millimetre precision relative to the eye down to
+//! 2 m altitude via Sterbenz's lemma, with zero inter-octant seams).
 
 use std::ops::Range;
 
@@ -7,13 +11,13 @@ use bytemuck::{Pod, Zeroable};
 use glam::DVec3;
 use veldmap_core::geo::geodesy::{self, Geodetic, World};
 
-/// Vertex layout shared by the octant-RTC ellipsoid body and draped graticule.
+/// Vertex layout shared by the WGS84 ellipsoid body and draped graticule.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GlobeVertex {
-    /// High half of `(vertex_ecef - chunk_origin_ecef)`.
+    /// High half of `(vertex_ecef - origin_ecef)`.
     pub pos_hi: World,
-    /// Low half of `(vertex_ecef - chunk_origin_ecef)`.
+    /// Low half of `(vertex_ecef - origin_ecef)`.
     pub pos_lo: World,
     /// Outward unit WGS84 ellipsoidal normal.
     pub normal: World,
@@ -43,30 +47,22 @@ impl GlobeVertex {
     }
 }
 
-/// One of 8 WGS84 ellipsoid octants with its own `f64` RTC origin.
-#[derive(Clone, Debug)]
-pub struct OctantChunk {
-    /// Centroid anchor of this octant in `f64` ECEF world units.
-    pub origin_ecef: DVec3,
-    /// Triangle index range inside [`GlobeMesh::indices`].
-    pub indices: Range<u32>,
-}
-
-/// Complete untextured WGS84 ellipsoid (8 octant-RTC chunks) plus draped
-/// graticule line segments on `height_m = 0.0`.
+/// Complete untextured WGS84 ellipsoid plus draped graticule line segments on
+/// `height_m = 0.0`.
 #[derive(Clone, Debug)]
 pub struct GlobeMesh {
     pub vertices: Vec<GlobeVertex>,
     pub indices: Vec<u32>,
-    pub octants: [OctantChunk; 8],
-    /// Line-list index range inside [`GlobeMesh::indices`] (uses `DVec3::ZERO`
-    /// origin with high/low ECEF split).
+    /// Triangle-list index range for the watertight WGS84 ellipsoid body.
+    pub body: Range<u32>,
+    /// Line-list index range for the draped 15-degree graticule.
     pub graticule: Range<u32>,
 }
 
-/// Subdivision per octant (90 deg lat x 90 deg lon -> 48 x 48 quads = 1.875 deg).
-const OCTANT_LAT_CELLS: u32 = 48;
-const OCTANT_LON_CELLS: u32 = 48;
+/// Global ellipsoid grid resolution (`96 x 192` quads = exact `1.875 deg` cells,
+/// placing vertices cleanly on every 15-degree graticule intersection).
+const LAT_CELLS: u32 = 96;
+const LON_CELLS: u32 = 192;
 
 /// Graticule spacing in degrees (every 15 degrees).
 const GRID_STEP_DEG: i32 = 15;
@@ -74,36 +70,13 @@ const GRID_STEP_DEG: i32 = 15;
 const GRID_SEGMENTS: u32 = 672;
 
 impl GlobeMesh {
-    /// Build the 8 octant-RTC ellipsoid chunks and the draped 15-degree
-    /// graticule directly on `height_m = 0.0`.
+    /// Build the watertight WGS84 ellipsoid and draped 15-degree graticule
+    /// directly on `height_m = 0.0`.
     pub fn build() -> Self {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
 
-        let octant_bounds = [
-            // Northern hemisphere (lat 0..90)
-            (0.0, 90.0, -180.0, -90.0),
-            (0.0, 90.0, -90.0, 0.0),
-            (0.0, 90.0, 0.0, 90.0),
-            (0.0, 90.0, 90.0, 180.0),
-            // Southern hemisphere (lat -90..0)
-            (-90.0, 0.0, -180.0, -90.0),
-            (-90.0, 0.0, -90.0, 0.0),
-            (-90.0, 0.0, 0.0, 90.0),
-            (-90.0, 0.0, 90.0, 180.0),
-        ];
-
-        let octants = octant_bounds.map(|(lat_min, lat_max, lon_min, lon_max)| {
-            build_octant(
-                &mut vertices,
-                &mut indices,
-                lat_min,
-                lat_max,
-                lon_min,
-                lon_max,
-            )
-        });
-
+        let body = build_ellipsoid(&mut vertices, &mut indices);
         let grid_start = indices.len() as u32;
         build_graticule(&mut vertices, &mut indices);
         let graticule = grid_start..indices.len() as u32;
@@ -111,44 +84,32 @@ impl GlobeMesh {
         Self {
             vertices,
             indices,
-            octants,
+            body,
             graticule,
         }
     }
 }
 
-fn build_octant(
-    vertices: &mut Vec<GlobeVertex>,
-    indices: &mut Vec<u32>,
-    lat_min: f64,
-    lat_max: f64,
-    lon_min: f64,
-    lon_max: f64,
-) -> OctantChunk {
-    let origin_ecef = geodesy::world(Geodetic::surface(
-        (lat_min + lat_max) * 0.5,
-        (lon_min + lon_max) * 0.5,
-    ));
-
+fn build_ellipsoid(vertices: &mut Vec<GlobeVertex>, indices: &mut Vec<u32>) -> Range<u32> {
     let base = vertices.len() as u32;
     let index_start = indices.len() as u32;
-    let stride = OCTANT_LON_CELLS + 1;
+    let stride = LON_CELLS + 1;
 
-    for row in 0..=OCTANT_LAT_CELLS {
-        let t_lat = f64::from(row) / f64::from(OCTANT_LAT_CELLS);
-        let lat = lat_max - (lat_max - lat_min) * t_lat;
-        for col in 0..=OCTANT_LON_CELLS {
-            let t_lon = f64::from(col) / f64::from(OCTANT_LON_CELLS);
-            let lon = lon_min + (lon_max - lon_min) * t_lon;
+    for row in 0..=LAT_CELLS {
+        let t_lat = f64::from(row) / f64::from(LAT_CELLS);
+        let lat = 90.0 - 180.0 * t_lat;
+        for col in 0..=LON_CELLS {
+            let t_lon = f64::from(col) / f64::from(LON_CELLS);
+            let lon = -180.0 + 360.0 * t_lon;
             vertices.push(GlobeVertex::relative_to(
                 Geodetic::surface(lat, lon),
-                origin_ecef,
+                DVec3::ZERO,
             ));
         }
     }
 
-    for row in 0..OCTANT_LAT_CELLS {
-        for col in 0..OCTANT_LON_CELLS {
+    for row in 0..LAT_CELLS {
+        for col in 0..LON_CELLS {
             let top = base + row * stride + col;
             let bottom = top + stride;
             indices.extend_from_slice(&[top, bottom, top + 1]);
@@ -156,10 +117,7 @@ fn build_octant(
         }
     }
 
-    OctantChunk {
-        origin_ecef,
-        indices: index_start..indices.len() as u32,
-    }
+    index_start..indices.len() as u32
 }
 
 fn build_graticule(vertices: &mut Vec<GlobeVertex>, indices: &mut Vec<u32>) {
@@ -206,42 +164,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn octant_rtc_preserves_sub_millimetre_precision_at_2m_altitude() {
-        let origin = geodesy::world(Geodetic::surface(45.0, 45.0));
+    fn high_low_split_preserves_sub_millimetre_precision_at_2m_altitude() {
         let eye = geodesy::world(Geodetic {
             lat_deg: 47.2357,
             lon_deg: 39.7015,
             height_m: 2.0,
         });
-        let (orig_hi, orig_lo) = geodesy::parts(origin - eye);
+        let (neg_eye_hi, neg_eye_lo) = geodesy::parts(DVec3::ZERO - eye);
 
         let p0 = Geodetic::surface(47.2357, 39.7015);
         let step_m = 0.01;
         let p1 = Geodetic::surface(47.2357 + step_m / 111_320.0, 39.7015);
 
-        let v0 = GlobeVertex::relative_to(p0, origin);
-        let v1 = GlobeVertex::relative_to(p1, origin);
+        let v0 = GlobeVertex::relative_to(p0, DVec3::ZERO);
+        let v1 = GlobeVertex::relative_to(p1, DVec3::ZERO);
 
         let rel = |v: GlobeVertex| {
-            (Vec3::from(v.pos_hi) + Vec3::from(orig_hi))
-                + (Vec3::from(v.pos_lo) + Vec3::from(orig_lo))
+            (Vec3::from(v.pos_hi) + Vec3::from(neg_eye_hi))
+                + (Vec3::from(v.pos_lo) + Vec3::from(neg_eye_lo))
         };
         let d_gpu = f64::from((rel(v1) - rel(v0)).length()) * geodesy::SEMI_MAJOR_M;
         let d_exact = (geodesy::world(p1) - geodesy::world(p0)).length() * geodesy::SEMI_MAJOR_M;
         assert!(
             (d_gpu - d_exact).abs() < 1e-4,
-            "octant-RTC 1 cm step error: gpu={d_gpu} m vs exact={d_exact} m"
+            "1 cm step error at 2 m altitude: gpu={d_gpu} m vs exact={d_exact} m"
         );
     }
 
     #[test]
-    fn globe_mesh_has_eight_octants_and_surface_graticule() {
+    fn globe_mesh_is_watertight_and_graticule_sits_on_ellipsoid() {
         let mesh = GlobeMesh::build();
-        assert_eq!(mesh.octants.len(), 8);
-        for chunk in &mesh.octants {
-            assert!(!chunk.indices.is_empty());
-            assert_eq!((chunk.indices.end - chunk.indices.start) % 3, 0);
-        }
+        assert!(!mesh.body.is_empty());
+        assert_eq!((mesh.body.end - mesh.body.start) % 3, 0);
         assert!(!mesh.graticule.is_empty());
         assert_eq!((mesh.graticule.end - mesh.graticule.start) % 2, 0);
 

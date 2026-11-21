@@ -1,4 +1,4 @@
-//! Pure, UI-free and GPU-free domain logic for VeldMap.
+//! Pure domain logic for VeldMap (zero `egui`, `eframe`, or `wgpu` dependencies).
 
 pub const APP_NAME: &str = "VeldMap";
 
