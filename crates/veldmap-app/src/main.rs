@@ -1,9 +1,7 @@
-mod app;
-mod render;
-
 use eframe::egui;
 use eframe::egui_wgpu;
 use tracing_subscriber::EnvFilter;
+use veldmap_app::app::VeldmapApp;
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
@@ -91,6 +89,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         veldmap_core::APP_NAME,
         options,
-        Box::new(|cc| Ok(Box::new(app::VeldmapApp::new(cc)?))),
+        Box::new(|cc| Ok(Box::new(VeldmapApp::new(cc)?))),
     )
 }

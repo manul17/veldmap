@@ -80,19 +80,19 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 
 ---
 
-### Slice 1 — Core Geodesy & Interactive 3D WGS84 Globe `[ ]`
-- [ ] **Port core geodesy & MGRS (`veldmap-core::geo`):** Port `geodesy`, `projection`, `camera`, `cull`, `outlines`, `footprint`, `wheel`, sag helpers, and **`mgrs`** (from `old/code/provider/mgrs.rs` into leaf `--no-default-features`) along with curated `old/tests/geo/` and `mgrs_tests.rs` (untextured ellipsoid mesh lives in `veldmap-app` as Slice 2's "Ellipsoid-only" fallback).
-- [ ] **High-precision camera & culling:** Upgrade `Camera` to `DMat4` infinite Reverse-Z (`perspective_infinite_reverse_rh`), `height = 0.0`, `MIN_HEIGHT_M` (2–10 m), private internals behind view-agnostic queries, and `f64`/`DVec3` `Camera::project()`, `cull::Frame`, and `cull::Ball`.
-- [ ] **Offscreen `wgpu` WGS84 globe renderer (`veldmap-app`):**
+### Slice 1 — Core Geodesy & Interactive 3D WGS84 Globe `[x]` ([ADR 0002](docs/decisions/0002-globe-model-and-precision.md))
+- [x] **Port core geodesy & MGRS (`veldmap-core::geo`):** Port `geodesy`, `projection`, `camera`, `cull`, `outlines`, `footprint`, `wheel`, sag helpers, and **`mgrs`** (from `old/code/provider/mgrs.rs` into leaf `--no-default-features`) along with curated `old/tests/geo/` and `mgrs_tests.rs` (untextured ellipsoid mesh lives in `veldmap-app` as Slice 2's "Ellipsoid-only" fallback).
+- [x] **High-precision camera & culling:** Upgrade `Camera` to `DMat4` infinite Reverse-Z (`perspective_infinite_reverse_rh`), `height = 0.0`, `MIN_HEIGHT_M` (2–10 m), private internals behind view-agnostic queries, and `f64`/`DVec3` `Camera::project()`, `cull::Frame`, and `cull::Ball`.
+- [x] **Offscreen `wgpu` WGS84 globe renderer (`veldmap-app`):**
   - Own `Rgba8UnormSrgb` + `Depth32Float` Reverse-Z target, sized in `CallbackTrait::prepare()` by constructing `PaintCallbackInfo` from stored `rect`/`clip_rect` + `screen_descriptor` (`viewport_in_pixels()`, clamped `[1, max_texture_dimension_2d]`, skipped on `0×0`, dirty-flag redraw skipping).
   - Composite 1:1 with `FilterMode::Nearest` via `view_formats` branching on `target_format.is_srgb()` (linear RGB palette constants, no `encode_srgb` hacks).
   - Precision-safe globe geometry (octant-RTC) + depth-less draped graticule (`depth_write: false`, `depth_compare: Always`, fragment ellipsoidal-normal horizon discard `dot(N_ellipsoid(P), E - P) >= 0`, HiDPI-scaled `RIBBON_PX`/`HATCH_PX`).
   - Mouse orbit, zoom-at-cursor, and smooth quaternion flights.
-- [ ] **Baseline GIS HUD:** Cursor Lat/Lon, altitude & m/px, dynamic scale bar, North compass / Reset-North (`N`), and Go-To Coordinates (DD/DMS) or MGRS jump.
-- [ ] **3-OS CI, `naga` & headless GPU tests:**
+- [x] **Baseline GIS HUD:** Cursor Lat/Lon, altitude & m/px, dynamic scale bar, North compass / Reset-North (`N`), and Go-To Coordinates (DD/DMS) or MGRS jump.
+- [x] **3-OS CI, `naga` & headless GPU tests:**
   - Add CPU-only `naga` (pinned to `wgpu` major) WGSL validation + SPV/HLSL/MSL codegen test (with realistic HLSL/MSL options).
   - Add 3-OS `build-and-test` CI matrix (`ubuntu`/`windows`/`macos`) with headless offscreen `wgpu` smoke test verifying Reverse-Z depth precision and exact sRGB compositing (`VELDMAP_REQUIRE_GPU_TEST=1` on Linux Lavapipe w/ `mesa-vulkan-drivers` & Windows WARP, retrying `force_fallback_adapter: true`; graceful skip on macOS VMs).
-- [ ] **Docs & `old/` cleanup:** Write `docs/decisions/0002-globe-model-and-precision.md` (recording v1 flat nadir ellipsoid from legacy `0006` and superseding `0007`'s 800 m floor with all 5 benchmark bindings & drift tolerances) and `docs/architecture/globe.md`; update `docs/glossary.md` & `docs/limitations.md`; delete ported `old/code/geo/*` (keeping `overlay.rs`), `old/code/provider/mgrs.rs`, `old/tests/geo/`, `old/tests/provider/mgrs_tests.rs`, `old/docs/globe.md`, and `old/docs/decisions/0006-terrain-on-the-globe.md` (**retain** `0007-overlay-accuracy.md` until Slice 3A-1).
+- [x] **Docs & `old/` cleanup:** Write `docs/decisions/0002-globe-model-and-precision.md` (recording v1 flat nadir ellipsoid from legacy `0006` and superseding `0007`'s 800 m floor with all 5 benchmark bindings & drift tolerances) and `docs/architecture/globe.md`; update `docs/glossary.md` & `docs/limitations.md`; delete ported `old/code/geo/*` (keeping `overlay.rs`), `old/code/provider/mgrs.rs`, `old/tests/geo/`, `old/tests/provider/mgrs_tests.rs`, `old/docs/globe.md`, and `old/docs/decisions/0006-terrain-on-the-globe.md` (**retain** `0007-overlay-accuracy.md` until Slice 3A-1).
 - **Exit criteria:**
   - *Automated CI:* Green 3-OS CI, `naga` SPV/HLSL/MSL codegen, `veldmap-core::geo` + MGRS tests, and headless Reverse-Z/sRGB GPU smoke test.
   - *Manual QA:* Smooth 60 fps zoom from orbit to 2 m altitude with zero jitter, horizon bleed, or resize panic; Go-To Lat/Lon & MGRS lands accurately; `plan.md` `Next Step` updated.
@@ -241,5 +241,5 @@ A simplified browser/mobile companion is intentionally deferred to a separate pr
 
 ## Next Step
 
-- **Current state:** Phase 0.5 is complete on `main` (toolchain pinned to `1.95.0`, `veldmap-app` scaffold hardened, unused mixed-license fonts removed, 79-file `old/README.md` retirement manifest and `legacy-reference-snapshot` tag created, workspace lints + `deny.toml` + Linux CI added, and foundational docs/ADR 0001 seeded).
-- **Immediate task:** Start **Slice 1 — Core Geodesy & Interactive 3D WGS84 Globe**.
+- **Current state:** Phase 0.5 and Slice 1 are complete on `main` (`veldmap-core::geo` + MGRS + DD/DMS Go-To parser with 115 passing leaf tests; `veldmap-app` octant-RTC Reverse-Z WGS84 globe renderer, depth-less horizon-discarded graticule, exact `view_formats` sRGB compositing, GIS HUD, `naga` SPV/HLSL/MSL codegen tests, headless Lavapipe GPU smoke tests, 3-OS CI, ADR 0002, and 20 legacy `old/` files retired).
+- **Immediate task:** Start **Slice 2 — Planetary Base Map (Global Tile Quadtree, Unified GPU & Disk Caches)** (`TileKey`/`TileScheme`/`BandKey`/`TileCache<K, V>`, per-tile RTC quadtree + polar cap extensions + skirts, `GpuTileCache` + `PendingUploads` on `VeldmapApp`, async-waking `CancelToken` + `tokio`/`reqwest` tile fetcher, `veldmap-core::cache` two-tier atomic writes & LRU eviction, bundled public-domain z0–z4 basemap + NASA GIBS / EOX Sentinel-2 Cloudless with attribution, geodesic distance/area tools, and CI DAG feature-matrix checks).

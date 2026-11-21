@@ -5,17 +5,27 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "veldmap_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "veldmap"
 path = "src/main.rs"
 
 [dependencies]
+bytemuck.workspace = true
 eframe.workspace = true
+glam.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 wgpu.workspace = true
+
+[dev-dependencies]
+naga.workspace = true
+pollster.workspace = true
 
 [lints]
 workspace = true
