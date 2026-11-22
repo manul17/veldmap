@@ -38,11 +38,21 @@ fn tile_scheme_parent_respects_level_direction_without_inverting() {
 
     let pyr = TileScheme::RasterPyramid { max_level: 5 };
     assert!(!pyr.is_coarsest_zero());
+    assert!(pyr.as_planetary().is_none());
+    assert!(pyr.as_globe().is_none());
     assert_eq!(pyr.parent(5, 0, 0), None);
     assert_eq!(pyr.parent(6, 0, 0), None);
     assert_eq!(pyr.parent(0, 5, 7), Some((1, 2, 3)));
     assert_eq!(pyr.parent(4, 1, 1), Some((5, 0, 0)));
     assert!(pyr.coarseness_rank(5) < pyr.coarseness_rank(0));
+
+    // RasterPyramid keys never convert to planetary QuadTileId and reject
+    // out-of-range levels (`level > max_level`) as pinned roots.
+    let pyr_root = make_key(pyr, 5, 0, 0);
+    let pyr_oob = make_key(pyr, 6, 0, 0);
+    assert!(pyr_root.quad_id().is_none());
+    assert!(pyr_root.is_root_of(SourceId::BUNDLED_BASEMAP));
+    assert!(!pyr_oob.is_root_of(SourceId::BUNDLED_BASEMAP));
 }
 
 #[test]

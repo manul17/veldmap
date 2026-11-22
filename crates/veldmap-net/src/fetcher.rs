@@ -1,33 +1,40 @@
 //! Asynchronous HTTP tile fetcher with two-stage disk/HTTP scheduling,
 //! per-host concurrency & rate-limit cooldowns, replaceable visible-first
-//! queues, end-to-end `CancelToken` abort through CPU decode, and deterministic
-//! shutdown (`CancelToken` -> join decode pool -> drop `tokio::Runtime`).
+//! queues, end-to-end `CancelToken` abort through an injected
+//! [`TileDecodeExecutor`], and deterministic shutdown.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Notify, OwnedSemaphorePermit};
-use veldmap_core::io::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{DecodedTile, TileKey, TileScheme};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use veldmap_core::io::{CancelToken, Wakeup, lock_unpoisoned};
+use veldmap_core::tile::{PlanetaryScheme, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
-use crate::decode_pool::{DecodeJob, DecodePool, DecodePoolHandle, Wakeup};
 use crate::http::{
     DEFAULT_MAX_CONCURRENT_PER_HOST, DEFAULT_MAX_TILE_RESPONSE_BYTES, FetchFailure, FetchOutcome,
     HostLimiters, HttpClientConfig, build_http_client, default_user_agent, download_capped,
     extract_host,
 };
-use crate::{NetError, TileBlobStore};
+use crate::{DecodeRequest, NetError, TileBlobStore, TileDecodeExecutor};
 
 /// Default backoff duration after transient HTTP / network errors before
 /// retrying a tile.
 const DEFAULT_TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 
+/// Short silent cooldown before re-attempting a tile whose decode submission
+/// was rejected under CPU decode-pool backpressure.
+const DECODE_BACKPRESSURE_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Maximum concurrent blocking disk-cache lookup tasks so cached tiles stay
 /// responsive and never starve behind slow HTTP hosts.
 const MAX_CONCURRENT_DISK_LOOKUPS: usize = 4;
+
+/// Maximum concurrent blocking disk-cache write tasks (`cache.put()`) so burst
+/// completions never pile up unbounded Tokio blocking threads on SQLite's
+/// writer mutex.
+const MAX_CONCURRENT_DISK_WRITES: usize = 4;
 
 /// Upper bound on retained per-tile failure/empty markers to prevent unbounded
 /// memory growth on sparse 404 layers over long sessions.
@@ -41,23 +48,17 @@ pub struct FetcherConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub max_tile_bytes: usize,
-    pub decode_threads: usize,
     pub transient_retry_backoff: Duration,
 }
 
 impl Default for FetcherConfig {
     fn default() -> Self {
-        let decode_threads = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(2)
-            .clamp(2, 4);
         Self {
             user_agent: default_user_agent(),
             max_concurrent_per_host: DEFAULT_MAX_CONCURRENT_PER_HOST,
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(20),
             max_tile_bytes: DEFAULT_MAX_TILE_RESPONSE_BYTES,
-            decode_threads,
             transient_retry_backoff: DEFAULT_TRANSIENT_RETRY_BACKOFF,
         }
     }
@@ -80,7 +81,10 @@ enum FailureState {
     Terminal,
     /// HTTP `204 No Content`: suppresses infinite refetch without flagging an error.
     Empty,
-    BackoffUntil(Instant),
+    BackoffUntil {
+        until: Instant,
+        retry_disk: bool,
+    },
 }
 
 #[derive(Default)]
@@ -97,7 +101,7 @@ struct PipelineState {
     /// Active blocking disk-lookup tasks (bounded by `MAX_CONCURRENT_DISK_LOOKUPS`).
     disk_in_flight: usize,
     /// Tracks active `(generation, CancelToken)` from dispatch all the way
-    /// through `DecodePool` completion so stale guards never clobber a newer
+    /// through CPU decode completion so stale guards never clobber a newer
     /// spawn and pan/switch cancels queued decode jobs immediately.
     in_flight: HashMap<TileKey, (u64, CancelToken)>,
     next_gen: u64,
@@ -124,7 +128,7 @@ impl PipelineState {
     fn insert_failure(&mut self, key: TileKey, failure: FailureState, now: Instant) {
         if self.failures.len() >= MAX_FAILURE_ENTRIES && !self.failures.contains_key(&key) {
             self.failures.retain(|_, f| match f {
-                FailureState::BackoffUntil(until) => *until > now,
+                FailureState::BackoffUntil { until, .. } => *until > now,
                 FailureState::Terminal | FailureState::Empty => true,
             });
             if self.failures.len() >= MAX_FAILURE_ENTRIES {
@@ -141,38 +145,47 @@ impl PipelineState {
     }
 
     /// Prune all expired `BackoffUntil <= now` markers and re-enqueue any that
-    /// are still in `last_wanted` into `pending_http`. Returns whether new work
-    /// was queued.
+    /// are still in `last_wanted` into `pending_disk` or `pending_http`.
+    /// Returns whether new work was queued.
     fn prune_expired_backoffs(&mut self, now: Instant) -> bool {
         let Some(spec) = self.active_spec.as_ref() else {
             self.failures.clear();
             return false;
         };
-        let active_source = spec.source_id;
-        let mut requeued = false;
+        let active_source = spec.source_id();
+        let mut requeued_disk = false;
+        let mut requeued_http = false;
         let mut expired = Vec::new();
         self.failures.retain(|&key, f| match f {
-            FailureState::BackoffUntil(until) if *until <= now => {
-                expired.push(key);
+            FailureState::BackoffUntil { until, retry_disk } if *until <= now => {
+                expired.push((key, *retry_disk));
                 false
             }
             _ => true,
         });
-        for key in expired {
+        for (key, retry_disk) in expired {
             if key.source == active_source
                 && self.last_wanted.contains(&key)
                 && !self.in_flight.contains_key(&key)
                 && !self.pending_disk.contains(&key)
                 && !self.pending_http.contains(&key)
             {
-                self.pending_http.push(key);
-                requeued = true;
+                if retry_disk {
+                    self.pending_disk.push(key);
+                    requeued_disk = true;
+                } else {
+                    self.pending_http.push(key);
+                    requeued_http = true;
+                }
             }
         }
-        if requeued {
+        if requeued_disk {
+            Self::sort_queue_coarsest_at_end(&mut self.pending_disk);
+        }
+        if requeued_http {
             Self::sort_queue_coarsest_at_end(&mut self.pending_http);
         }
-        requeued
+        requeued_disk || requeued_http
     }
 
     /// Earliest `BackoffUntil` timestamp among currently wanted tiles (used by
@@ -181,7 +194,7 @@ impl PipelineState {
         self.failures
             .iter()
             .filter_map(|(k, f)| match f {
-                FailureState::BackoffUntil(until)
+                FailureState::BackoffUntil { until, .. }
                     if *until > now && self.last_wanted.contains(k) =>
                 {
                     Some(*until)
@@ -200,7 +213,8 @@ struct PipelineContext {
     client: reqwest::Client,
     host_limiters: Arc<HostLimiters>,
     disk_cache: Option<Arc<dyn TileBlobStore>>,
-    decode_handle: DecodePoolHandle,
+    disk_put_sem: Arc<Semaphore>,
+    decoder: Arc<dyn TileDecodeExecutor>,
     wakeup: Wakeup,
     rt_handle: tokio::runtime::Handle,
     max_tile_bytes: usize,
@@ -208,7 +222,7 @@ struct PipelineContext {
 }
 
 /// Generation-checked RAII guard keeping `key` registered in `state.in_flight`
-/// across async fetch, disk lookup/delete, and CPU decode in `DecodePool`.
+/// across async fetch, disk lookup/delete, and CPU decode submission.
 struct InFlightGuard {
     state: Arc<Mutex<PipelineState>>,
     key: TileKey,
@@ -294,27 +308,26 @@ impl Drop for PermitGuard {
 
 /// Complete live HTTP tile streaming pipeline owning:
 /// 1. `CancelToken` (`shutdown`)
-/// 2. Bounded `std::thread` [`DecodePool`]
-/// 3. Dedicated `tokio::runtime::Runtime` running HTTP fetches
+/// 2. Dedicated `tokio::runtime::Runtime` running HTTP fetches
 ///
-/// Shuts down deterministically via [`Self::signal_shutdown`] / `Drop`:
-/// `CancelToken` -> close/join decode pool -> shutdown `tokio::Runtime`.
+/// Decodes encoded tile payloads via the caller-injected [`TileDecodeExecutor`],
+/// keeping `veldmap-net` free of `veldmap-raster` and image codecs.
+/// Shuts down deterministically via [`Self::signal_shutdown`] / [`Self::shutdown`].
 pub struct LiveTilePipeline {
     shutdown: CancelToken,
     state: Arc<Mutex<PipelineState>>,
     host_limiters: Arc<HostLimiters>,
     notify: Arc<Notify>,
-    decode_pool: Option<DecodePool>,
     runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl LiveTilePipeline {
-    /// Spawn a live tile pipeline pushing decoded, mipmapped tiles to `done_tx`
-    /// and invoking `wakeup` on tile arrival or status changes.
+    /// Spawn a live tile pipeline forwarding encoded tile payloads to `decoder`
+    /// and invoking `wakeup` on status changes.
     pub fn spawn(
         config: FetcherConfig,
         disk_cache: Option<Arc<dyn TileBlobStore>>,
-        done_tx: Sender<(TileKey, DecodedTile)>,
+        decoder: Arc<dyn TileDecodeExecutor>,
         wakeup: Wakeup,
     ) -> Result<Self, NetError> {
         let client = build_http_client(&HttpClientConfig {
@@ -324,13 +337,6 @@ impl LiveTilePipeline {
             max_concurrent_per_host: config.max_concurrent_per_host,
         })?;
         let shutdown = CancelToken::new();
-        let decode_pool = DecodePool::spawn(
-            config.decode_threads,
-            done_tx,
-            Arc::clone(&wakeup),
-            shutdown.clone(),
-        );
-        let decode_handle = decode_pool.handle();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -349,7 +355,8 @@ impl LiveTilePipeline {
             client,
             host_limiters: Arc::clone(&host_limiters),
             disk_cache,
-            decode_handle,
+            disk_put_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_DISK_WRITES)),
+            decoder,
             wakeup,
             rt_handle: runtime.handle().clone(),
             max_tile_bytes: config.max_tile_bytes,
@@ -365,7 +372,6 @@ impl LiveTilePipeline {
             state,
             host_limiters,
             notify,
-            decode_pool: Some(decode_pool),
             runtime: Some(runtime),
         })
     }
@@ -403,7 +409,7 @@ impl LiveTilePipeline {
     ///
     /// Preserves already-checked tiles waiting in `pending_http` so they never
     /// bounce back to SQLite disk lookups on every frame/upload. Strictly
-    /// filters out `PolarCap` keys and any `level > spec.max_level`.
+    /// filters out `PolarCap` keys and any `level > spec.max_level()`.
     pub fn reconcile_wanted<F>(&self, wanted: &HashSet<TileKey>, is_ready: F)
     where
         F: Fn(&TileKey) -> bool,
@@ -417,7 +423,7 @@ impl LiveTilePipeline {
                 st.pending_http.clear();
                 return;
             };
-            let active_source = spec.source_id;
+            let active_source = spec.source_id();
 
             let mut cancelled = Vec::new();
             st.in_flight.retain(|key, (_, tok)| {
@@ -433,7 +439,7 @@ impl LiveTilePipeline {
             // Prune expired backoff markers before rebuilding queues.
             st.failures.retain(|_, f| match f {
                 FailureState::Terminal | FailureState::Empty => true,
-                FailureState::BackoffUntil(until) => *until > now,
+                FailureState::BackoffUntil { until, .. } => *until > now,
             });
 
             // Track strictly unready, active-source, contract-valid wanted keys.
@@ -441,7 +447,9 @@ impl LiveTilePipeline {
             for &key in wanted {
                 if key.source == active_source
                     && !is_ready(&key)
-                    && spec.validate_tile(key.quad_id()).is_ok()
+                    && key
+                        .quad_id()
+                        .is_some_and(|id| spec.validate_tile(id).is_ok())
                 {
                     st.last_wanted.insert(key);
                 }
@@ -505,7 +513,7 @@ impl LiveTilePipeline {
             self.host_limiters.clear_cooldowns();
 
             if let Some(spec) = st.active_spec.as_ref() {
-                let active_source = spec.source_id;
+                let active_source = spec.source_id();
                 let mut added = false;
                 for key in cleared {
                     if key.source == active_source
@@ -526,16 +534,6 @@ impl LiveTilePipeline {
         self.notify.notify_one();
     }
 
-    /// Return current number of in-flight + queued tiles for appetite
-    /// budgeting.
-    pub fn active_work_count(&self) -> usize {
-        let st = lock_unpoisoned(&self.state);
-        st.in_flight
-            .len()
-            .saturating_add(st.pending_disk.len())
-            .saturating_add(st.pending_http.len())
-    }
-
     /// Snapshot observable status counters for the GIS UI.
     pub fn status(&self) -> NetworkStatus {
         let st = lock_unpoisoned(&self.state);
@@ -551,7 +549,8 @@ impl LiveTilePipeline {
     }
 
     /// Trigger global and per-tile `CancelToken`s immediately (Phase 1 of
-    /// deterministic shutdown, called BEFORE dropping the completion rx).
+    /// deterministic shutdown, called BEFORE closing the upload channel or
+    /// joining the caller-owned decode pool).
     pub fn signal_shutdown(&self) {
         self.shutdown.cancel();
         let active_tokens: Vec<CancelToken> = {
@@ -567,21 +566,14 @@ impl LiveTilePipeline {
         self.notify.notify_waiters();
     }
 
-    /// Deterministically shut down the pipeline in exact order:
-    /// 1. Cancel `CancelToken` (aborts all in-flight `tokio::select!` fetches)
-    /// 2. Close & join the bounded CPU `DecodePool`
-    /// 3. Shut down `tokio::Runtime`
+    /// Deterministically shut down the async runtime after signalling
+    /// cancellation (`CancelToken` -> `runtime.shutdown_timeout`).
     pub fn shutdown(mut self) {
         self.shutdown_inner();
     }
 
     fn shutdown_inner(&mut self) {
         self.signal_shutdown();
-
-        if let Some(pool) = self.decode_pool.take() {
-            pool.shutdown();
-        }
-
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(2));
         }
@@ -620,16 +612,27 @@ async fn dispatcher_loop(ctx: Arc<PipelineContext>) {
             st.prune_expired_backoffs(now);
 
             if let Some(spec) = st.active_spec.clone() {
-                // Stage 1: Pop from `pending_disk` (or move straight to `pending_http`
-                // when no disk cache is configured).
+                let active_source = spec.source_id();
+                // Stage 1: Pop from `pending_disk` (or batch-move straight to
+                // `pending_http` when no disk cache is configured).
                 if ctx.disk_cache.is_none() {
-                    let drained: Vec<TileKey> = st.pending_disk.drain(..).collect();
-                    for key in drained {
-                        if key.source == spec.source_id
-                            && !st.in_flight.contains_key(&key)
-                            && !st.failures.contains_key(&key)
-                        {
-                            st.insert_pending_http(key);
+                    if !st.pending_disk.is_empty() {
+                        let drained: Vec<TileKey> = st.pending_disk.drain(..).collect();
+                        let mut existing: HashSet<TileKey> =
+                            st.pending_http.iter().copied().collect();
+                        let mut added = false;
+                        for key in drained {
+                            if key.source == active_source
+                                && !st.in_flight.contains_key(&key)
+                                && !st.failures.contains_key(&key)
+                                && existing.insert(key)
+                            {
+                                st.pending_http.push(key);
+                                added = true;
+                            }
+                        }
+                        if added {
+                            PipelineState::sort_queue_coarsest_at_end(&mut st.pending_http);
                         }
                     }
                 } else {
@@ -637,7 +640,7 @@ async fn dispatcher_loop(ctx: Arc<PipelineContext>) {
                         let Some(key) = st.pending_disk.pop() else {
                             break;
                         };
-                        if key.source != spec.source_id
+                        if key.source != active_source
                             || st.in_flight.contains_key(&key)
                             || st.failures.contains_key(&key)
                         {
@@ -654,18 +657,22 @@ async fn dispatcher_loop(ctx: Arc<PipelineContext>) {
 
                 // Stage 2: Pop from `pending_http` ONLY when a per-host permit
                 // is immediately available and the host is not cooling down.
-                // This keeps unstarted HTTP tiles sorted coarsest-first instead
-                // of parked FIFO on a semaphore, and never starves Stage 1.
+                // Short-circuits immediately once a single-host spec (no `{s}`)
+                // is saturated or cooling down so remaining queued tiles are
+                // preserved without redundant URL resolution or re-sorting.
+                let multi_host = spec.uses_subdomains();
                 let mut deferred_http = Vec::new();
                 while let Some(key) = st.pending_http.pop() {
-                    if key.source != spec.source_id
+                    if key.source != active_source
                         || st.in_flight.contains_key(&key)
                         || st.failures.contains_key(&key)
                     {
                         continue;
                     }
-                    let id = key.quad_id();
-                    if matches!(id.scheme, TileScheme::PolarCap { .. }) {
+                    let Some(id) = key.quad_id() else {
+                        continue;
+                    };
+                    if matches!(id.scheme, PlanetaryScheme::PolarCap { .. }) {
                         continue;
                     }
                     let Ok(url) = spec.resolve_url(id) else {
@@ -679,6 +686,9 @@ async fn dispatcher_loop(ctx: Arc<PipelineContext>) {
                             _ => until,
                         });
                         deferred_http.push(key);
+                        if !multi_host {
+                            break;
+                        }
                         continue;
                     }
                     let sem = ctx.host_limiters.semaphore_for_host(&host);
@@ -700,14 +710,23 @@ async fn dispatcher_loop(ctx: Arc<PipelineContext>) {
                         }
                         Err(_) => {
                             deferred_http.push(key);
-                            // If single-host (typical) and saturated, stop scanning
-                            // only after checking other potential `{s}` subdomains.
+                            if !multi_host {
+                                break;
+                            }
                         }
                     }
                 }
                 if !deferred_http.is_empty() {
-                    st.pending_http = deferred_http;
-                    PipelineState::sort_queue_coarsest_at_end(&mut st.pending_http);
+                    // `deferred_http` was popped coarsest-first from the back of
+                    // `st.pending_http`; reversing restores ascending-priority
+                    // order (coarsest at the end) cleanly without a full sort
+                    // for single-host short-circuits, and sorting when mixed.
+                    if multi_host {
+                        st.pending_http.extend(deferred_http);
+                        PipelineState::sort_queue_coarsest_at_end(&mut st.pending_http);
+                    } else {
+                        st.pending_http.extend(deferred_http.into_iter().rev());
+                    }
                 }
             } else {
                 st.pending_disk.clear();
@@ -784,6 +803,49 @@ async fn dispatcher_loop(ctx: Arc<PipelineContext>) {
     }
 }
 
+/// Submit `request` to the injected [`TileDecodeExecutor`]; if rejected under
+/// backpressure while still active and uncancelled, schedule a short silent
+/// backoff (`DECODE_BACKPRESSURE_BACKOFF`) routing back to `pending_disk`
+/// (when `retry_disk` is `true`, avoiding unnecessary HTTP traffic for cached
+/// tiles) or `pending_http` so rejected tiles neither vanish nor spin in a
+/// tight retry loop while the decode pool drains.
+fn submit_or_requeue(ctx: &PipelineContext, request: DecodeRequest, retry_disk: bool) {
+    let key = request.key;
+    let cancel = request.cancel.clone();
+    if ctx.decoder.submit(request) {
+        return;
+    }
+    if cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
+        return;
+    }
+    let mut should_notify = false;
+    {
+        let now = Instant::now();
+        let mut st = lock_unpoisoned(&ctx.state);
+        if st
+            .active_spec
+            .as_ref()
+            .is_some_and(|s| s.source_id() == key.source)
+            && st.last_wanted.contains(&key)
+            && !st.in_flight.contains_key(&key)
+            && !st.failures.contains_key(&key)
+        {
+            st.insert_failure(
+                key,
+                FailureState::BackoffUntil {
+                    until: now + DECODE_BACKPRESSURE_BACKOFF,
+                    retry_disk,
+                },
+                now,
+            );
+            should_notify = true;
+        }
+    }
+    if should_notify {
+        ctx.notify.notify_one();
+    }
+}
+
 async fn run_disk_lookup(
     ctx: Arc<PipelineContext>,
     key: TileKey,
@@ -799,8 +861,10 @@ async fn run_disk_lookup(
         promote_to_http(&ctx, key, &cancel, &mut guard);
         return;
     };
-    let id = key.quad_id();
-    let source_key = spec.cache_key.clone();
+    let Some(id) = key.quad_id() else {
+        return;
+    };
+    let source_key = spec.cache_key().to_owned();
     let cache_for_read = Arc::clone(&cache);
     let disk_res = tokio::select! {
         _ = cancel.cancelled() => return,
@@ -818,7 +882,7 @@ async fn run_disk_lookup(
             let cb_ctx = Arc::clone(&ctx);
             let cb_cancel = cancel.clone();
             let cb_spec = Arc::clone(&spec);
-            let job = DecodeJob {
+            let req = DecodeRequest {
                 key,
                 bytes,
                 cancel,
@@ -829,7 +893,7 @@ async fn run_disk_lookup(
                         if st
                             .active_spec
                             .as_ref()
-                            .is_some_and(|s| s.source_id == key.source)
+                            .is_some_and(|s| s.source_id() == key.source)
                         {
                             st.last_wanted.remove(&key);
                             st.completed_from_disk = st.completed_from_disk.saturating_add(1);
@@ -847,7 +911,7 @@ async fn run_disk_lookup(
                         // `reconcile_wanted` races).
                         let del_ctx = Arc::clone(&cb_ctx);
                         let del_cache = Arc::clone(&cache);
-                        let del_source_key = cb_spec.cache_key.clone();
+                        let del_source_key = cb_spec.cache_key().to_owned();
                         cb_ctx.rt_handle.spawn_blocking(move || {
                             let _ = del_cache.delete(&del_source_key, id);
                             let mut guard = guard;
@@ -856,7 +920,7 @@ async fn run_disk_lookup(
                     }
                 }),
             };
-            cb_ctx_submit(&ctx, job);
+            submit_or_requeue(&ctx, req, true);
         }
         _ => {
             // Disk miss (or transient read error): move to HTTP stage cleanly.
@@ -887,7 +951,7 @@ fn promote_to_http(
                 && st
                     .active_spec
                     .as_ref()
-                    .is_some_and(|s| s.source_id == key.source)
+                    .is_some_and(|s| s.source_id() == key.source)
                 && !st.failures.contains_key(&key)
             {
                 st.insert_pending_http(key);
@@ -897,10 +961,6 @@ fn promote_to_http(
     if should_notify {
         ctx.notify.notify_one();
     }
-}
-
-fn cb_ctx_submit(ctx: &PipelineContext, job: DecodeJob) {
-    let _ = ctx.decode_handle.submit(job);
 }
 
 #[expect(
@@ -921,9 +981,11 @@ async fn run_http_fetch(
         return;
     }
 
-    let id = key.quad_id();
+    let Some(id) = key.quad_id() else {
+        return;
+    };
     // Final defense-in-depth contract check: never touch PolarCap.
-    if matches!(id.scheme, TileScheme::PolarCap { .. }) {
+    if matches!(id.scheme, PlanetaryScheme::PolarCap { .. }) {
         return;
     }
 
@@ -944,7 +1006,7 @@ async fn run_http_fetch(
             let cb_ctx = Arc::clone(&ctx);
             let cb_cancel = cancel.clone();
             let cb_spec = Arc::clone(&spec);
-            let job = DecodeJob {
+            let req = DecodeRequest {
                 key,
                 bytes,
                 cancel,
@@ -955,13 +1017,14 @@ async fn run_http_fetch(
                             // Update stats synchronously (nanoseconds, race-free
                             // even if UI `reconcile_wanted` already cancelled
                             // `cb_cancel` after receiving the tile), and persist
-                            // validated bytes off the decode thread.
+                            // validated bytes off the decode thread under a
+                            // bounded write semaphore.
                             {
                                 let mut st = lock_unpoisoned(&cb_ctx.state);
                                 if st
                                     .active_spec
                                     .as_ref()
-                                    .is_some_and(|s| s.source_id == key.source)
+                                    .is_some_and(|s| s.source_id() == key.source)
                                 {
                                     st.last_wanted.remove(&key);
                                     st.completed_from_net = st.completed_from_net.saturating_add(1);
@@ -970,14 +1033,22 @@ async fn run_http_fetch(
                                 }
                             }
                             if let Some(cache) = cb_ctx.disk_cache.clone() {
-                                let source_key = cb_spec.cache_key.clone();
-                                cb_ctx.rt_handle.spawn_blocking(move || {
-                                    if let Err(err) = cache.put(&source_key, id, &valid_bytes) {
-                                        tracing::debug!(
-                                            error = %err,
-                                            "Failed to persist validated live tile to disk cache"
-                                        );
-                                    }
+                                let source_key = cb_spec.cache_key().to_owned();
+                                let put_sem = Arc::clone(&cb_ctx.disk_put_sem);
+                                let rt = cb_ctx.rt_handle.clone();
+                                rt.spawn(async move {
+                                    let Ok(_permit) = put_sem.acquire_owned().await else {
+                                        return;
+                                    };
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        if let Err(err) = cache.put(&source_key, id, &valid_bytes) {
+                                            tracing::debug!(
+                                                error = %err,
+                                                "Failed to persist validated live tile to disk cache"
+                                            );
+                                        }
+                                    })
+                                    .await;
                                 });
                             }
                         }
@@ -995,7 +1066,7 @@ async fn run_http_fetch(
                     }
                 }),
             };
-            cb_ctx_submit(&ctx, job);
+            submit_or_requeue(&ctx, req, false);
         }
         Ok(FetchOutcome::Empty204) => {
             // Valid empty/nodata tile: suppress infinite refetch without
@@ -1006,7 +1077,7 @@ async fn run_http_fetch(
                 && st
                     .active_spec
                     .as_ref()
-                    .is_some_and(|s| s.source_id == key.source)
+                    .is_some_and(|s| s.source_id() == key.source)
             {
                 st.last_wanted.remove(&key);
                 st.insert_failure(key, FailureState::Empty, now);
@@ -1047,7 +1118,10 @@ async fn run_http_fetch(
                 &ctx,
                 &cancel,
                 key,
-                FailureState::BackoffUntil(until),
+                FailureState::BackoffUntil {
+                    until,
+                    retry_disk: false,
+                },
                 offline,
                 Some(safe_msg),
             );
@@ -1073,7 +1147,7 @@ fn record_failure(
             && st
                 .active_spec
                 .as_ref()
-                .is_some_and(|s| s.source_id == key.source)
+                .is_some_and(|s| s.source_id() == key.source)
         {
             st.insert_failure(key, failure, now);
             st.failed_count = st.failed_count.saturating_add(1);
@@ -1097,16 +1171,21 @@ mod tests {
 
     use super::*;
 
+    fn wm_key(spec: &LiveBasemapSpec, level: u8, x: u32, y: u32) -> TileKey {
+        spec.tile_key(QuadTileId {
+            scheme: PlanetaryScheme::WebMercator,
+            level,
+            x,
+            y,
+        })
+    }
+
     #[test]
     fn stale_inflight_guard_never_removes_newer_generation() {
         let state = Arc::new(Mutex::new(PipelineState::default()));
         let notify = Arc::new(Notify::new());
-        let key = LiveBasemapSpec::eox_sentinel2_cloudless().tile_key(QuadTileId {
-            scheme: TileScheme::WebMercator,
-            level: 0,
-            x: 0,
-            y: 0,
-        });
+        let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
+        let key = wm_key(&spec, 0, 0, 0);
 
         let tok1 = CancelToken::new();
         let tok2 = CancelToken::new();
@@ -1127,5 +1206,47 @@ mod tests {
             Some(2),
             "stale generation 1 guard must not remove generation 2 entry"
         );
+    }
+
+    #[test]
+    fn pipeline_state_enforces_failure_cap_and_requeues_expired_backoffs() {
+        let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
+        let mut st = PipelineState {
+            active_spec: Some(Arc::clone(&spec)),
+            ..PipelineState::default()
+        };
+        let now = Instant::now();
+        let http_key = wm_key(&spec, 4, 1, 2);
+        let disk_key = wm_key(&spec, 4, 2, 2);
+        st.last_wanted.insert(http_key);
+        st.last_wanted.insert(disk_key);
+        st.insert_failure(
+            http_key,
+            FailureState::BackoffUntil {
+                until: now - Duration::from_secs(1),
+                retry_disk: false,
+            },
+            now,
+        );
+        st.insert_failure(
+            disk_key,
+            FailureState::BackoffUntil {
+                until: now - Duration::from_secs(1),
+                retry_disk: true,
+            },
+            now,
+        );
+        assert!(st.prune_expired_backoffs(now));
+        assert!(st.pending_http.contains(&http_key));
+        assert!(!st.pending_disk.contains(&http_key));
+        assert!(st.pending_disk.contains(&disk_key));
+        assert!(!st.pending_http.contains(&disk_key));
+
+        // Filling beyond MAX_FAILURE_ENTRIES prunes non-wanted entries without exceeding cap.
+        for i in 0..(MAX_FAILURE_ENTRIES as u32 + 16) {
+            let k = wm_key(&spec, 12, i, 0);
+            st.insert_failure(k, FailureState::Terminal, now);
+        }
+        assert!(st.failures.len() <= MAX_FAILURE_ENTRIES);
     }
 }

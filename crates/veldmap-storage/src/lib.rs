@@ -1,24 +1,24 @@
-//! Durable atomic state persistence, injectable storage paths, user settings,
-//! and crash-safe SQLite WAL LRU tile disk caching for VeldMap.
+//! Durable atomic state persistence, injectable storage paths, and crash-safe
+//! SQLite WAL LRU tile disk caching for VeldMap.
+//!
+//! Focused strictly on storage mechanics: application-level preference and
+//! session schemas live in `veldmap-app` and persist through
+//! [`read_json_or_default_with_backup`] / [`write_json_durable_private`].
 
 use thiserror::Error;
 
 pub mod atomic;
 pub mod paths;
-pub mod settings;
 pub mod tile_cache;
 
 pub use atomic::{
-    read_json_or_default, write_atomic_durable, write_atomic_durable_private, write_json_durable,
-    write_json_durable_private,
+    read_json_or_default, read_json_or_default_with_backup, write_atomic_durable,
+    write_atomic_durable_private, write_json_durable, write_json_durable_private,
 };
 pub use paths::StoragePaths;
-pub use settings::{
-    AppSettings, BasemapSelection, CustomXyzSettings, DEFAULT_DISK_CACHE_MAX_MB, DEFAULT_GIBS_DATE,
-    MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB,
-};
 pub use tile_cache::{
-    DEFAULT_DISK_CACHE_BYTES, DiskCacheStats, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES,
+    DEFAULT_DISK_CACHE_BYTES, DEFAULT_DISK_CACHE_MAX_MB, DiskCacheStats, DiskTileKey,
+    EvictionReport, MAX_CACHED_TILE_BYTES, MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB,
     TileBlobEncoding, TileDiskCache, valid_source_key,
 };
 

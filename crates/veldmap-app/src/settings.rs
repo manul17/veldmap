@@ -1,13 +1,23 @@
 //! Persistent user application settings (active basemap, NASA GIBS date,
-//! Custom XYZ/TMS template & API key, disk cache budget) stored via durable
-//! atomic JSON writes.
+//! Custom XYZ/TMS template & API key, disk cache budget, graticule toggle)
+//! stored via `veldmap-storage`'s durable private atomic JSON I/O.
+//!
+//! Kept in `veldmap-app` rather than `veldmap-storage` so the low-level
+//! persistence crate stays free of UI and basemap domain schemas while
+//! settings normalization shares `veldmap-net`'s canonical constants and URL
+//! redaction helpers directly.
 
 use std::fmt;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::{StorageError, StoragePaths, read_json_or_default, write_json_durable_private};
+use veldmap_net::{
+    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, LiveBasemapSpec, NetError,
+    sanitize_url_for_display,
+};
+use veldmap_storage::{
+    DEFAULT_DISK_CACHE_MAX_MB, MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB, StorageError,
+    StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
+};
 
 /// Current JSON schema version for [`AppSettings`].
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
@@ -15,15 +25,6 @@ pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 /// Default explicit UTC date (`YYYY-MM-DD`) for NASA GIBS daily reflectance
 /// layers.
 pub const DEFAULT_GIBS_DATE: &str = "2024-07-01";
-
-/// Default disk cache cap in mebibytes (`512 MiB`).
-pub const DEFAULT_DISK_CACHE_MAX_MB: u64 = 512;
-
-/// Minimum configurable disk cache cap in mebibytes (`16 MiB`).
-pub const MIN_DISK_CACHE_MAX_MB: u64 = 16;
-
-/// Maximum configurable disk cache cap in mebibytes (`16 GiB`).
-pub const MAX_DISK_CACHE_MAX_MB: u64 = 16 * 1024;
 
 /// Active planetary basemap selection persisted across sessions.
 ///
@@ -85,15 +86,6 @@ impl BasemapSelection {
     }
 }
 
-/// Redact query-string values from a URL template before debug formatting so
-/// inline tokens (`?token=...`) are never printed verbatim in logs.
-fn redact_url_query(url: &str) -> String {
-    match url.split_once('?') {
-        Some((base, _)) => format!("{base}?<redacted>"),
-        None => url.to_owned(),
-    }
-}
-
 /// User-configured Custom XYZ / TMS basemap settings.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -119,11 +111,33 @@ impl Default for CustomXyzSettings {
     }
 }
 
+impl CustomXyzSettings {
+    /// Borrow fields as a [`CustomBasemapConfig`] for `veldmap-net`.
+    pub fn as_basemap_config(&self) -> CustomBasemapConfig<'_> {
+        CustomBasemapConfig {
+            name: &self.name,
+            url_template: &self.url_template,
+            api_key: &self.api_key,
+            tms_flip_y: self.tms_flip_y,
+            max_level: self.max_level,
+            attribution: &self.attribution,
+        }
+    }
+
+    /// Validate and construct a [`LiveBasemapSpec`] directly from these settings.
+    pub fn to_live_spec(&self) -> Result<LiveBasemapSpec, NetError> {
+        LiveBasemapSpec::custom(self.as_basemap_config())
+    }
+}
+
 impl fmt::Debug for CustomXyzSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CustomXyzSettings")
             .field("name", &self.name)
-            .field("url_template", &redact_url_query(&self.url_template))
+            .field(
+                "url_template",
+                &sanitize_url_for_display(&self.url_template),
+            )
             .field(
                 "api_key",
                 &if self.api_key.is_empty() {
@@ -168,7 +182,10 @@ impl AppSettings {
     /// Clamp numeric settings and sanitize fields loaded from disk.
     pub fn normalize(&mut self) {
         self.version = SETTINGS_SCHEMA_VERSION;
-        self.custom_xyz.max_level = self.custom_xyz.max_level.clamp(1, 20);
+        self.custom_xyz.max_level = self
+            .custom_xyz
+            .max_level
+            .clamp(CUSTOM_MAX_LEVEL_MIN, CUSTOM_MAX_LEVEL_MAX);
         self.disk_cache_max_mb = self
             .disk_cache_max_mb
             .clamp(MIN_DISK_CACHE_MAX_MB, MAX_DISK_CACHE_MAX_MB);
@@ -188,41 +205,14 @@ impl AppSettings {
     }
 
     /// Load settings from `paths.settings_path()`, falling back to defaults if
-    /// missing or malformed. On JSON parse failure, preserves the corrupt file
-    /// as `settings.json.corrupt` (preserving permissions via rename) so a
-    /// subsequent save never permanently destroys a hand-edited config.
+    /// missing or malformed (backing up corrupt JSON to `settings.json.corrupt`).
     pub fn load_or_default(paths: &StoragePaths) -> Self {
-        let path = paths.settings_path();
-        match read_json_or_default::<Self>(&path) {
-            Ok(mut settings) => {
-                settings.normalize();
-                settings
-            }
-            Err(StorageError::Json(err)) => {
-                let mut backup_os = path.as_os_str().to_os_string();
-                backup_os.push(".corrupt");
-                let backup = PathBuf::from(backup_os);
-                let _ = std::fs::rename(&path, &backup);
-                tracing::warn!(
-                    path = %path.display(),
-                    backup = %backup.display(),
-                    error = %err,
-                    "Failed to parse user settings JSON; backed up corrupt file and using defaults"
-                );
-                Self::default()
-            }
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "Failed to read user settings; using defaults"
-                );
-                Self::default()
-            }
-        }
+        let mut settings: Self = read_json_or_default_with_backup(&paths.settings_path());
+        settings.normalize();
+        settings
     }
 
-    /// Persist settings durably via `write_atomic_durable_private` (`0600` on
+    /// Persist settings durably via `write_json_durable_private` (`0600` on
     /// Unix so optional Custom XYZ API keys are owner-readable only).
     pub fn save(&self, paths: &StoragePaths) -> Result<(), StorageError> {
         let mut normalized = self.clone();
@@ -234,11 +224,11 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestTempDir;
+    use crate::storage::tests_support::TempTestRoot;
 
     #[test]
-    fn settings_round_trip_and_redact_api_key_and_query_in_debug() {
-        let dir = TestTempDir::new("settings-rt");
+    fn settings_round_trip_and_redact_api_key_userinfo_and_query_in_debug() {
+        let dir = TempTestRoot::new("settings-rt");
         let paths = StoragePaths::with_root(dir.path());
 
         let mut settings = AppSettings {
@@ -246,11 +236,12 @@ mod tests {
             gibs_date: " 2024-08-15 ".to_owned(),
             custom_xyz: CustomXyzSettings {
                 name: "My Tile Server".to_owned(),
-                url_template: "https://tiles.example.com/{z}/{x}/{y}.png?inline=leak-me&key={key}"
-                    .to_owned(),
+                url_template:
+                    "https://alice:pw@tiles.example.com/{z}/{x}/{y}.png?inline=leak-me&key={key}"
+                        .to_owned(),
                 api_key: "super-secret-token-123".to_owned(),
                 tms_flip_y: true,
-                max_level: 99, // clamped to 20
+                max_level: 99, // clamped to CUSTOM_MAX_LEVEL_MAX (20)
                 attribution: "Example".to_owned(),
             },
             disk_cache_max_mb: 256,
@@ -260,6 +251,7 @@ mod tests {
 
         let dbg = format!("{settings:?}");
         assert!(!dbg.contains("super-secret-token-123"));
+        assert!(!dbg.contains("alice:pw"));
         assert!(!dbg.contains("leak-me"));
         assert!(dbg.contains("<redacted>"));
 
@@ -268,17 +260,16 @@ mod tests {
         settings.normalize();
         assert_eq!(loaded, settings);
         assert_eq!(loaded.gibs_date, "2024-08-15");
-        assert_eq!(loaded.custom_xyz.max_level, 20);
+        assert_eq!(loaded.custom_xyz.max_level, CUSTOM_MAX_LEVEL_MAX);
     }
 
     #[test]
     fn corrupt_json_backs_up_file_and_unknown_basemap_variant_is_forward_compatible() {
-        let dir = TestTempDir::new("settings-recovery");
+        let dir = TempTestRoot::new("settings-recovery");
         let paths = StoragePaths::with_root(dir.path());
         let settings_path = paths.settings_path();
         std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
 
-        // 1. Corrupt JSON is backed up to settings.json.corrupt before returning defaults.
         std::fs::write(&settings_path, b"{not valid json").expect("write corrupt");
         let loaded = AppSettings::load_or_default(&paths);
         assert_eq!(loaded, AppSettings::default());
@@ -288,7 +279,6 @@ mod tests {
             b"{not valid json"
         );
 
-        // 2. Partial JSON + unknown future basemap variant keeps all other user settings.
         std::fs::write(
             &settings_path,
             br#"{"active_basemap":"future_provider_v9","disk_cache_max_mb":999999,"gibs_date":"   "}"#,

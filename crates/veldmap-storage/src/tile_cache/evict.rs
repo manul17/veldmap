@@ -1,0 +1,120 @@
+//! Batched O(log N) SQLite LRU eviction and incremental vacuum / WAL
+//! reclamation helpers for [`super::TileDiskCache`].
+
+use rusqlite::{Connection, Params, Statement, Transaction, params};
+
+use super::EvictionReport;
+
+/// Eviction headroom divisor (`10` => evict down to `90%` of budget so
+/// subsequent inserts do not trigger eviction on every single tile).
+const EVICT_HEADROOM_DIVISOR: u64 = 10;
+
+/// Maximum SQLite pages reclaimed per incremental eviction pass.
+const INCREMENTAL_VACUUM_PAGES: i64 = 128;
+
+/// Maximum batch size pulled per SQLite LRU eviction iteration.
+pub(super) const EVICT_BATCH_ROWS: i64 = 128;
+
+pub(super) fn reclaim_space(conn: &Connection, is_file_backed: bool, full_vacuum: bool) {
+    if full_vacuum {
+        let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
+        if is_file_backed {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+    } else {
+        let _ = conn.execute_batch(&format!(
+            "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES});"
+        ));
+    }
+}
+
+fn collect_eviction_batch<P: Params>(
+    stmt: &mut Statement<'_>,
+    query_params: P,
+) -> Result<Vec<(i64, u64)>, rusqlite::Error> {
+    let mut batch = Vec::with_capacity(EVICT_BATCH_ROWS as usize);
+    let rows = stmt.query_map(query_params, |r| {
+        let tile_id: i64 = r.get(0)?;
+        let sz: i64 = r.get(1)?;
+        Ok((tile_id, sz.max(0) as u64))
+    })?;
+    for row in rows {
+        batch.push(row?);
+    }
+    Ok(batch)
+}
+
+pub(super) fn evict_in_tx(
+    tx: &Transaction<'_>,
+    mut total_bytes: u64,
+    mut tile_count: u64,
+    max_bytes: u64,
+    protect_id: Option<i64>,
+) -> Result<EvictionReport, rusqlite::Error> {
+    if total_bytes <= max_bytes {
+        return Ok(EvictionReport {
+            evicted_tiles: 0,
+            evicted_bytes: 0,
+            total_bytes_after: total_bytes,
+        });
+    }
+
+    let target = max_bytes.saturating_sub(max_bytes / EVICT_HEADROOM_DIVISOR);
+    let mut evicted_tiles = 0usize;
+    let mut evicted_bytes = 0u64;
+
+    // `ORDER BY last_used_ms ASC` (without `, tile_id ASC`) lets SQLite satisfy
+    // the query directly from covering index `idx_tile_meta_lru (last_used_ms,
+    // byte_size)` with zero temp B-tree sorting and zero table lookups.
+    let mut select_stmt = match protect_id {
+        Some(_) => tx.prepare(
+            "SELECT tile_id, byte_size FROM tile_meta
+             WHERE tile_id != ?2
+             ORDER BY last_used_ms ASC
+             LIMIT ?1",
+        )?,
+        None => tx.prepare(
+            "SELECT tile_id, byte_size FROM tile_meta
+             ORDER BY last_used_ms ASC
+             LIMIT ?1",
+        )?,
+    };
+    let mut delete_stmt = tx.prepare("DELETE FROM tile_meta WHERE tile_id = ?1")?;
+
+    loop {
+        if total_bytes <= target {
+            break;
+        }
+        let batch = match protect_id {
+            Some(protected) => {
+                collect_eviction_batch(&mut select_stmt, params![EVICT_BATCH_ROWS, protected])?
+            }
+            None => collect_eviction_batch(&mut select_stmt, params![EVICT_BATCH_ROWS])?,
+        };
+        if batch.is_empty() {
+            break;
+        }
+
+        for (tile_id, sz) in batch {
+            if total_bytes <= target {
+                break;
+            }
+            delete_stmt.execute(params![tile_id])?;
+            total_bytes = total_bytes.saturating_sub(sz);
+            tile_count = tile_count.saturating_sub(1);
+            evicted_bytes = evicted_bytes.saturating_add(sz);
+            evicted_tiles += 1;
+        }
+    }
+
+    tx.execute(
+        "UPDATE cache_meta SET total_bytes = ?1, tile_count = ?2 WHERE id = 1",
+        params![total_bytes as i64, tile_count as i64],
+    )?;
+
+    Ok(EvictionReport {
+        evicted_tiles,
+        evicted_bytes,
+        total_bytes_after: total_bytes,
+    })
+}

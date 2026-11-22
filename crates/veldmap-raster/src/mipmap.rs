@@ -125,46 +125,41 @@ fn downsample_rgba8_srgb_2x(
 /// padded partial-edge tiles are left untouched with `mips` cleared so 2x box
 /// filtering never shifts gutters or bleeds padding into valid pixels.
 pub fn generate_linear_mipmaps(tile: &mut DecodedTile) {
-    tile.mips.clear();
-    if tile.format != PixelFormat::Rgba8UnormSrgb
-        || tile.width == 0
-        || tile.height == 0
-        || tile.gutter != 0
-        || tile.valid_w != tile.width
-        || tile.valid_h != tile.height
+    tile.clear_mips();
+    let width = tile.width();
+    let height = tile.height();
+    if tile.format() != PixelFormat::Rgba8UnormSrgb
+        || tile.gutter() != 0
+        || tile.valid_w() != width
+        || tile.valid_h() != height
     {
         return;
     }
-    let expected_base = (tile.width as usize)
-        .checked_mul(tile.height as usize)
-        .and_then(|px| px.checked_mul(4));
-    if expected_base != Some(tile.data.len()) {
-        return;
-    }
 
-    let total_levels = max_mip_levels(tile.width, tile.height);
+    let total_levels = max_mip_levels(width, height);
     if total_levels <= 1 {
         return;
     }
 
     let to_lin = srgb_to_linear_lut();
     let to_srgb = linear_to_srgb_lut();
-    tile.mips.reserve((total_levels - 1) as usize);
+    let mut mips: Vec<Vec<u8>> = Vec::with_capacity((total_levels - 1) as usize);
 
-    let mut prev_w = tile.width;
-    let mut prev_h = tile.height;
+    let mut prev_w = width;
+    let mut prev_h = height;
     for level in 1..total_levels {
-        let (dst_w, dst_h) = mip_dimensions(tile.width, tile.height, level);
+        let (dst_w, dst_h) = mip_dimensions(width, height, level);
         let src = if level == 1 {
-            tile.data.as_slice()
+            tile.data()
         } else {
-            tile.mips[(level - 2) as usize].as_slice()
+            mips[(level - 2) as usize].as_slice()
         };
         let next = downsample_rgba8_srgb_2x(src, prev_w, prev_h, dst_w, dst_h, to_lin, to_srgb);
-        tile.mips.push(next);
+        mips.push(next);
         prev_w = dst_w;
         prev_h = dst_h;
     }
+    let _ = tile.try_set_mips(mips);
 }
 
 #[cfg(test)]
@@ -182,10 +177,10 @@ mod tests {
                 data.extend_from_slice(&[v, v, v, 255]);
             }
         }
-        let mut tile = DecodedTile::new(4, 4, PixelFormat::Rgba8UnormSrgb, data);
+        let mut tile =
+            DecodedTile::try_new(4, 4, PixelFormat::Rgba8UnormSrgb, data).expect("valid tile");
         generate_linear_mipmaps(&mut tile);
 
-        assert!(tile.validate());
         assert_eq!(tile.mip_level_count(), 3);
         assert_eq!(tile.mip_dims(1), (2, 2));
         assert_eq!(tile.mip_dims(2), (1, 1));
@@ -211,9 +206,9 @@ mod tests {
             0, 255, 0, 255, 0, 0, 0, 0, //
             0, 0, 0, 0, 0, 0, 0, 0,
         ];
-        let mut tile = DecodedTile::new(2, 2, PixelFormat::Rgba8UnormSrgb, data);
+        let mut tile =
+            DecodedTile::try_new(2, 2, PixelFormat::Rgba8UnormSrgb, data).expect("valid tile");
         generate_linear_mipmaps(&mut tile);
-        assert!(tile.validate());
         let mip1 = tile.mip_data(1).expect("mip 1");
         assert_eq!(mip1[0], 0);
         assert_eq!(mip1[1], 255, "RGB must stay pure green without black halo");
@@ -221,18 +216,20 @@ mod tests {
         assert!(mip1[3].abs_diff(64) <= 1, "alpha={}", mip1[3]);
 
         // Non-power-of-two 5x3 tile produces valid 5x3 -> 2x1 -> 1x1 chain.
-        let mut npot = DecodedTile::new(5, 3, PixelFormat::Rgba8UnormSrgb, vec![200u8; 5 * 3 * 4]);
+        let mut npot =
+            DecodedTile::try_new(5, 3, PixelFormat::Rgba8UnormSrgb, vec![200u8; 5 * 3 * 4])
+                .expect("valid npot");
         generate_linear_mipmaps(&mut npot);
-        assert!(npot.validate());
         assert_eq!(npot.mip_level_count(), 3);
 
         // Scientific R32Float tiles do not get sRGB mipmaps.
-        let mut sci = DecodedTile::new(4, 4, PixelFormat::R32Float, vec![0u8; 4 * 4 * 4]);
+        let mut sci =
+            DecodedTile::try_new(4, 4, PixelFormat::R32Float, vec![0u8; 4 * 4 * 4]).expect("sci");
         generate_linear_mipmaps(&mut sci);
         assert_eq!(sci.mip_level_count(), 1);
 
         // Padded partial-edge and guttered sRGB tiles skip mip generation.
-        let mut padded = DecodedTile::with_valid_region(
+        let mut padded = DecodedTile::try_with_valid_region(
             4,
             4,
             3,
@@ -240,12 +237,12 @@ mod tests {
             0,
             PixelFormat::Rgba8UnormSrgb,
             vec![255u8; 4 * 4 * 4],
-        );
+        )
+        .expect("padded");
         generate_linear_mipmaps(&mut padded);
         assert_eq!(padded.mip_level_count(), 1);
-        assert!(padded.validate());
 
-        let mut guttered = DecodedTile::with_valid_region(
+        let mut guttered = DecodedTile::try_with_valid_region(
             6,
             6,
             4,
@@ -253,9 +250,9 @@ mod tests {
             1,
             PixelFormat::Rgba8UnormSrgb,
             vec![255u8; 6 * 6 * 4],
-        );
+        )
+        .expect("guttered");
         generate_linear_mipmaps(&mut guttered);
         assert_eq!(guttered.mip_level_count(), 1);
-        assert!(guttered.validate());
     }
 }

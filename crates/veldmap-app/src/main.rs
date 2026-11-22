@@ -2,6 +2,7 @@ use eframe::egui;
 use eframe::egui_wgpu;
 use tracing_subscriber::EnvFilter;
 use veldmap_app::app::VeldmapApp;
+use veldmap_app::render::clamp_to_primary_backends;
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -10,33 +11,6 @@ fn init_tracing() {
         )
     });
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-}
-
-/// Supported native desktop backends (Vulkan, DX12, Metal), excluding
-/// OpenGL/GLES and `BROWSER_WEBGPU` (which `wgpu::Backends::PRIMARY` includes).
-const NATIVE_PRIMARY_BACKENDS: wgpu::Backends =
-    wgpu::Backends::PRIMARY.difference(wgpu::Backends::BROWSER_WEBGPU);
-
-/// Restrict `egui_wgpu`'s environment-resolved backends to native desktop
-/// primary backends (Vulkan, DX12, Metal), explicitly excluding OpenGL/GLES
-/// and WebGPU.
-fn clamp_to_primary_backends(backends: wgpu::Backends) -> wgpu::Backends {
-    let unsupported = backends - NATIVE_PRIMARY_BACKENDS;
-    if !unsupported.is_empty() {
-        tracing::warn!(
-            ?unsupported,
-            "Ignoring unsupported WGPU_BACKEND entries (only Vulkan, DX12, and Metal are supported)"
-        );
-    }
-    let primary = backends & NATIVE_PRIMARY_BACKENDS;
-    if primary.is_empty() {
-        tracing::warn!(
-            "WGPU_BACKEND selected no supported backends; falling back to native primary backends"
-        );
-        NATIVE_PRIMARY_BACKENDS
-    } else {
-        primary
-    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -65,29 +39,4 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(VeldmapApp::new(cc)?))),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{NATIVE_PRIMARY_BACKENDS, clamp_to_primary_backends};
-
-    #[test]
-    fn clamps_backends_to_primary_and_falls_back_when_empty() {
-        assert_eq!(
-            clamp_to_primary_backends(wgpu::Backends::VULKAN),
-            wgpu::Backends::VULKAN
-        );
-        assert_eq!(
-            clamp_to_primary_backends(wgpu::Backends::VULKAN | wgpu::Backends::GL),
-            wgpu::Backends::VULKAN
-        );
-        assert_eq!(
-            clamp_to_primary_backends(wgpu::Backends::GL | wgpu::Backends::BROWSER_WEBGPU),
-            NATIVE_PRIMARY_BACKENDS
-        );
-        assert_eq!(
-            clamp_to_primary_backends(wgpu::Backends::empty()),
-            NATIVE_PRIMARY_BACKENDS
-        );
-    }
 }

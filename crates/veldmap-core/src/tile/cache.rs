@@ -123,28 +123,24 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
             evicted.push(victim);
         }
 
-        let slot = self.alloc_slot(Node {
-            key,
-            value,
-            byte_size,
-            prev: None,
-            next: None,
-        });
-        self.attach_front(slot);
+        let slot = self.insert_front_node(key, value, byte_size);
         self.index.insert(key, slot);
         self.total_bytes += byte_size;
         Ok(evicted)
     }
 
-    /// Return whether inserting or replacing `key` of `byte_size` can succeed
-    /// within `max_bytes` without evicting any entry where `is_protected(&k)`
-    /// returns `true`.
-    pub fn can_admit_protecting<F>(&self, key: &K, byte_size: usize, is_protected: F) -> bool
+    fn plan_protected_evictions<F>(
+        &self,
+        key: &K,
+        byte_size: usize,
+        is_protected: &F,
+        collect_slots: bool,
+    ) -> Option<Vec<usize>>
     where
         F: Fn(&K) -> bool,
     {
         if self.max_bytes == 0 || byte_size > self.max_bytes {
-            return false;
+            return None;
         }
         let existing_bytes = self
             .index
@@ -154,25 +150,40 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         let bytes_without_key = self.total_bytes.saturating_sub(existing_bytes);
         let target_before_insert = self.max_bytes - byte_size;
         if bytes_without_key <= target_before_insert {
-            return true;
+            return Some(Vec::new());
         }
+
         let need_to_free = bytes_without_key - target_before_insert;
+        let mut victim_slots = Vec::new();
         let mut reclaimable = 0usize;
         let mut cursor = self.tail;
         while let Some(slot) = cursor {
-            if let Some(node) = self.nodes[slot].as_ref() {
-                if node.key != *key && !is_protected(&node.key) {
-                    reclaimable = reclaimable.saturating_add(node.byte_size);
-                    if reclaimable >= need_to_free {
-                        return true;
-                    }
-                }
-                cursor = node.prev;
-            } else {
+            let Some(node) = self.nodes[slot].as_ref() else {
                 break;
+            };
+            if node.key != *key && !is_protected(&node.key) {
+                if collect_slots {
+                    victim_slots.push(slot);
+                }
+                reclaimable = reclaimable.saturating_add(node.byte_size);
+                if reclaimable >= need_to_free {
+                    return Some(victim_slots);
+                }
             }
+            cursor = node.prev;
         }
-        false
+        None
+    }
+
+    /// Return whether inserting or replacing `key` of `byte_size` can succeed
+    /// within `max_bytes` without evicting any entry where `is_protected(&k)`
+    /// returns `true`.
+    pub fn can_admit_protecting<F>(&self, key: &K, byte_size: usize, is_protected: F) -> bool
+    where
+        F: Fn(&K) -> bool,
+    {
+        self.plan_protected_evictions(key, byte_size, &is_protected, false)
+            .is_some()
     }
 
     /// Insert or replace `key` with `value` occupying `byte_size` bytes while
@@ -193,42 +204,11 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     where
         F: Fn(&K) -> bool,
     {
-        if self.max_bytes == 0 || byte_size > self.max_bytes {
+        let Some(victim_slots) =
+            self.plan_protected_evictions(&key, byte_size, &is_protected, true)
+        else {
             return Err((key, value));
-        }
-
-        let existing_bytes = self
-            .index
-            .get(&key)
-            .and_then(|&slot| self.nodes[slot].as_ref())
-            .map_or(0, |n| n.byte_size);
-        let bytes_without_key = self.total_bytes.saturating_sub(existing_bytes);
-        let target_before_insert = self.max_bytes - byte_size;
-
-        // Collect victim slots in one O(P + E) tail-to-head walk before
-        // mutating the cache so refusal remains atomic.
-        let mut victim_slots = Vec::new();
-        if bytes_without_key > target_before_insert {
-            let need_to_free = bytes_without_key - target_before_insert;
-            let mut reclaimable = 0usize;
-            let mut cursor = self.tail;
-            while let Some(slot) = cursor {
-                let Some(node) = self.nodes[slot].as_ref() else {
-                    break;
-                };
-                if node.key != key && !is_protected(&node.key) {
-                    victim_slots.push(slot);
-                    reclaimable = reclaimable.saturating_add(node.byte_size);
-                    if reclaimable >= need_to_free {
-                        break;
-                    }
-                }
-                cursor = node.prev;
-            }
-            if reclaimable < need_to_free {
-                return Err((key, value));
-            }
-        }
+        };
 
         let mut evicted = Vec::with_capacity(victim_slots.len() + 1);
         if let Some((old_val, _)) = self.remove(&key) {
@@ -240,14 +220,7 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
             }
         }
 
-        let slot = self.alloc_slot(Node {
-            key,
-            value,
-            byte_size,
-            prev: None,
-            next: None,
-        });
-        self.attach_front(slot);
+        let slot = self.insert_front_node(key, value, byte_size);
         self.index.insert(key, slot);
         self.total_bytes += byte_size;
         Ok(evicted)
@@ -351,6 +324,18 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.proportional_pyramid_byte_cap(pyramid_weight, total_weight) / tile_bytes
     }
 
+    fn insert_front_node(&mut self, key: K, value: V, byte_size: usize) -> usize {
+        let slot = self.alloc_slot(Node {
+            key,
+            value,
+            byte_size,
+            prev: None,
+            next: None,
+        });
+        self.attach_front(slot);
+        slot
+    }
+
     fn alloc_slot(&mut self, node: Node<K, V>) -> usize {
         if let Some(slot) = self.free.pop() {
             self.nodes[slot] = Some(node);
@@ -427,17 +412,6 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
 }
 
 impl<V> TileCache<TileKey, V> {
-    /// Touch `key` and every cached coarser ancestor along
-    /// [`TileKey::parent`] up to the root so coarse fallback tiles never age
-    /// out while their descendants are visible.
-    pub fn touch_with_ancestors(&mut self, key: &TileKey) {
-        let mut cursor = Some(*key);
-        while let Some(cur) = cursor {
-            self.touch(&cur);
-            cursor = cur.parent();
-        }
-    }
-
     fn find_carrier_slot(&self, key: &TileKey) -> Option<(TileKey, usize)> {
         let mut cursor = Some(*key);
         while let Some(cur) = cursor {

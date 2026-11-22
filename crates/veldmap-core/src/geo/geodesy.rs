@@ -385,11 +385,6 @@ pub fn unwind(base: f64, lon_deg: f64) -> f64 {
     lon_deg - turns * TURN_DEG
 }
 
-/// Outward unit normal to the WGS84 ellipsoid in `f32` vertex layout.
-pub fn normal(lat_deg: f64, lon_deg: f64) -> [f32; 3] {
-    unit(lat_deg, lon_deg).as_vec3().to_array()
-}
-
 /// Convert a unit ECEF direction vector back into `(lat_deg, lon_deg)`.
 pub fn angles(unit: DVec3) -> (f64, f64) {
     (

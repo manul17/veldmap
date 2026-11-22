@@ -5,24 +5,31 @@
 
 use std::fmt;
 
-use veldmap_core::tile::{QuadTileId, SourceId, TileKey, TileScheme, fnv1a_64};
+use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey, fnv1a_64};
 
 use crate::NetError;
+use crate::http::{parse_url_authority, sanitize_url_for_display, sanitize_urls_in_text};
+
+/// Minimum allowed custom XYZ/TMS maximum zoom level.
+pub const CUSTOM_MAX_LEVEL_MIN: u8 = 1;
+
+/// Maximum allowed custom XYZ/TMS maximum zoom level.
+pub const CUSTOM_MAX_LEVEL_MAX: u8 = 20;
 
 /// NASA GIBS Blue Marble Shaded Relief + Bathymetry (`GoogleMapsCompatible_Level8`,
 /// static WebMercator layer, Public Domain).
-pub const GIBS_BLUE_MARBLE_URL_TEMPLATE: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_ShadedRelief_Bathymetry/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpg";
-pub const GIBS_BLUE_MARBLE_MAX_LEVEL: u8 = 8;
+const GIBS_BLUE_MARBLE_URL_TEMPLATE: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_ShadedRelief_Bathymetry/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpg";
+const GIBS_BLUE_MARBLE_MAX_LEVEL: u8 = 8;
 
 /// NASA GIBS VIIRS SNPP Corrected Reflectance True Color
 /// (`GoogleMapsCompatible_Level9`, explicit `{time}` WebMercator layer, Public Domain).
-pub const GIBS_VIIRS_URL_TEMPLATE: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/{time}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg";
-pub const GIBS_VIIRS_MAX_LEVEL: u8 = 9;
+const GIBS_VIIRS_URL_TEMPLATE: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/{time}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg";
+const GIBS_VIIRS_MAX_LEVEL: u8 = 9;
 
 /// EOX Sentinel-2 Cloudless 2023 (`WebMercator`, CC BY 4.0, `max_level = 14`).
-pub const EOX_S2_URL_TEMPLATE: &str =
+const EOX_S2_URL_TEMPLATE: &str =
     "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/g/{z}/{y}/{x}.jpg";
-pub const EOX_S2_MAX_LEVEL: u8 = 14;
+const EOX_S2_MAX_LEVEL: u8 = 14;
 
 /// Standard `{s}` subdomain pool for custom XYZ/TMS templates.
 const SUBDOMAINS: [&str; 3] = ["a", "b", "c"];
@@ -81,16 +88,9 @@ fn percent_encode_variants(secret: &str) -> (String, String) {
     (upper, lower)
 }
 
-fn redact_url_query(url: &str) -> String {
-    match url.split_once('?') {
-        Some((base, _)) => format!("{base}?<redacted>"),
-        None => url.to_owned(),
-    }
-}
-
 /// Pure networking configuration for constructing a Custom XYZ / TMS
-/// [`LiveBasemapSpec`] without coupling `veldmap-net` to `veldmap-storage`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// [`LiveBasemapSpec`] without coupling `veldmap-net` to application settings.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CustomBasemapConfig<'a> {
     pub name: &'a str,
     pub url_template: &'a str,
@@ -100,19 +100,42 @@ pub struct CustomBasemapConfig<'a> {
     pub attribution: &'a str,
 }
 
-/// Complete specification of an HTTP(S) live tile basemap source.
+impl fmt::Debug for CustomBasemapConfig<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomBasemapConfig")
+            .field("name", &self.name)
+            .field("url_template", &sanitize_url_for_display(self.url_template))
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("tms_flip_y", &self.tms_flip_y)
+            .field("max_level", &self.max_level)
+            .field("attribution", &self.attribution)
+            .finish()
+    }
+}
+
+/// Validated, immutable specification of an HTTP(S) live tile basemap source.
+///
+/// All fields are encapsulated behind read-only accessors so contract
+/// invariants (non-`PolarCap` scheme, clamped `max_level`, secret-free ASCII
+/// `cache_key`, validated `url_template`) cannot be broken after construction.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LiveBasemapSpec {
-    pub source_id: SourceId,
+    source_id: SourceId,
     /// Safe ASCII key used inside [`crate::TileBlobStore`] (never contains `api_key`).
-    pub cache_key: String,
-    pub label: String,
-    pub attribution: String,
-    pub scheme: TileScheme,
-    pub max_level: u8,
-    pub url_template: String,
-    pub tms_flip_y: bool,
-    pub api_key: Option<String>,
+    cache_key: String,
+    attribution: String,
+    scheme: GlobeScheme,
+    max_level: u8,
+    url_template: String,
+    tms_flip_y: bool,
+    api_key: Option<String>,
 }
 
 impl fmt::Debug for LiveBasemapSpec {
@@ -120,10 +143,12 @@ impl fmt::Debug for LiveBasemapSpec {
         f.debug_struct("LiveBasemapSpec")
             .field("source_id", &self.source_id)
             .field("cache_key", &self.cache_key)
-            .field("label", &self.label)
             .field("scheme", &self.scheme)
             .field("max_level", &self.max_level)
-            .field("url_template", &redact_url_query(&self.url_template))
+            .field(
+                "url_template",
+                &sanitize_url_for_display(&self.url_template),
+            )
             .field("tms_flip_y", &self.tms_flip_y)
             .field(
                 "api_key",
@@ -138,6 +163,36 @@ impl fmt::Debug for LiveBasemapSpec {
 }
 
 impl LiveBasemapSpec {
+    /// Stable [`SourceId`] derived from [`Self::cache_key`].
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    /// Safe ASCII disk-cache key (never contains secrets or `max_level`).
+    pub fn cache_key(&self) -> &str {
+        &self.cache_key
+    }
+
+    /// Required data-provider attribution string.
+    pub fn attribution(&self) -> &str {
+        &self.attribution
+    }
+
+    /// Active non-polar planetary scheme (`GlobeScheme::WebMercator`).
+    pub const fn scheme(&self) -> GlobeScheme {
+        self.scheme
+    }
+
+    /// Maximum zoom level offered by this source (`0` HTTP requests above this).
+    pub const fn max_level(&self) -> u8 {
+        self.max_level
+    }
+
+    /// Whether the URL template expands `{s}` across multiple subdomain hosts.
+    pub(crate) fn uses_subdomains(&self) -> bool {
+        self.url_template.contains("{s}")
+    }
+
     /// NASA GIBS Blue Marble Shaded Relief + Bathymetry (`GoogleMapsCompatible_Level8`,
     /// static, Public Domain).
     pub fn nasa_gibs_blue_marble() -> Self {
@@ -145,9 +200,8 @@ impl LiveBasemapSpec {
         Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
-            label: "NASA GIBS Blue Marble".to_owned(),
             attribution: "Imagery: NASA GIBS / Blue Marble (Public Domain)".to_owned(),
-            scheme: TileScheme::WebMercator,
+            scheme: GlobeScheme::WebMercator,
             max_level: GIBS_BLUE_MARBLE_MAX_LEVEL,
             url_template: GIBS_BLUE_MARBLE_URL_TEMPLATE.to_owned(),
             tms_flip_y: false,
@@ -166,9 +220,8 @@ impl LiveBasemapSpec {
         Ok(Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
-            label: format!("NASA GIBS VIIRS ({trimmed})"),
             attribution: format!("Imagery: NASA GIBS / VIIRS SNPP {trimmed} (Public Domain)"),
-            scheme: TileScheme::WebMercator,
+            scheme: GlobeScheme::WebMercator,
             max_level: GIBS_VIIRS_MAX_LEVEL,
             url_template: GIBS_VIIRS_URL_TEMPLATE.replace("{time}", trimmed),
             tms_flip_y: false,
@@ -182,9 +235,8 @@ impl LiveBasemapSpec {
         Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
-            label: "EOX Sentinel-2 Cloudless".to_owned(),
             attribution: "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (CC BY 4.0, modified Copernicus Sentinel data)".to_owned(),
-            scheme: TileScheme::WebMercator,
+            scheme: GlobeScheme::WebMercator,
             max_level: EOX_S2_MAX_LEVEL,
             url_template: EOX_S2_URL_TEMPLATE.to_owned(),
             tms_flip_y: false,
@@ -193,8 +245,9 @@ impl LiveBasemapSpec {
     }
 
     /// Build a custom XYZ/TMS live source, validating URL scheme (`http://` or
-    /// `https://`), non-empty host, absence of whitespace/control characters,
-    /// and required coordinate placeholders (`{z}`, `{x}`, `{y}` or `{-y}`).
+    /// `https://`), non-empty host (including bracketed IPv6 literals), absence
+    /// of whitespace/control characters, and required coordinate placeholders
+    /// (`{z}`, `{x}`, `{y}` or `{-y}`).
     pub fn custom(cfg: CustomBasemapConfig<'_>) -> Result<Self, NetError> {
         let template = cfg.url_template.trim();
         if template.is_empty() {
@@ -210,18 +263,20 @@ impl LiveBasemapSpec {
                 "URL template must not contain whitespace or control characters".to_owned(),
             ));
         }
-        let after_scheme = template
-            .strip_prefix("https://")
-            .or_else(|| template.strip_prefix("http://"))
-            .ok_or_else(|| {
-                NetError::InvalidUrlTemplate(
-                    "URL template must start with https:// or http://".to_owned(),
-                )
-            })?;
-        let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-        let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
-        let host = host_port.split(':').next().unwrap_or("");
-        if host.is_empty() || host.contains("{z}") || host.contains("{x}") || host.contains("{y}") {
+        if !template.starts_with("https://") && !template.starts_with("http://") {
+            return Err(NetError::InvalidUrlTemplate(
+                "URL template must start with https:// or http://".to_owned(),
+            ));
+        }
+        let authority = parse_url_authority(template).ok_or_else(|| {
+            NetError::InvalidUrlTemplate("URL template must include a valid hostname".to_owned())
+        })?;
+        let host = authority.host;
+        if host.contains("{z}")
+            || host.contains("{x}")
+            || host.contains("{y}")
+            || host.contains("{-y}")
+        {
             return Err(NetError::InvalidUrlTemplate(
                 "URL template must include a valid hostname".to_owned(),
             ));
@@ -234,20 +289,22 @@ impl LiveBasemapSpec {
                 "URL template must include {z}, {x}, and {y} (or {-y})".to_owned(),
             ));
         }
-        let max_level = cfg.max_level.clamp(1, 20);
+        let max_level = cfg
+            .max_level
+            .clamp(CUSTOM_MAX_LEVEL_MIN, CUSTOM_MAX_LEVEL_MAX);
         // Hash template + tms_flip_y (NEVER the secret API key or max_level)
         // into a safe ASCII disk cache key and SourceId so adjusting max_level
         // does not invalidate cached tiles.
         let identity = format!("custom|{template}|{}", cfg.tms_flip_y);
         let hash = fnv1a_64(identity.as_bytes());
         let cache_key = format!("custom-xyz-{hash:016x}");
-        let label = if cfg.name.trim().is_empty() {
-            "Custom XYZ / TMS".to_owned()
+        let display_name = if cfg.name.trim().is_empty() {
+            "Custom XYZ / TMS"
         } else {
-            cfg.name.trim().to_owned()
+            cfg.name.trim()
         };
         let attribution = if cfg.attribution.trim().is_empty() {
-            format!("Custom tile source: {label}")
+            format!("Custom tile source: {display_name}")
         } else {
             cfg.attribution.trim().to_owned()
         };
@@ -256,9 +313,8 @@ impl LiveBasemapSpec {
         Ok(Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
-            label,
             attribution,
-            scheme: TileScheme::WebMercator,
+            scheme: GlobeScheme::WebMercator,
             max_level,
             url_template: template.to_owned(),
             tms_flip_y: cfg.tms_flip_y,
@@ -274,13 +330,14 @@ impl LiveBasemapSpec {
     /// Validate that `id` is eligible for live fetching (never `PolarCap`,
     /// matches `self.scheme`, `level <= self.max_level`, valid `(x, y)`).
     pub fn validate_tile(&self, id: QuadTileId) -> Result<(u32, u32), NetError> {
-        if matches!(id.scheme, TileScheme::PolarCap { .. }) {
+        if matches!(id.scheme, PlanetaryScheme::PolarCap { .. }) {
             return Err(NetError::PolarCapForbidden);
         }
-        if id.scheme != self.scheme {
+        let expected = self.scheme.into_planetary();
+        if id.scheme != expected {
             return Err(NetError::SchemeMismatch {
                 requested: id.scheme,
-                expected: self.scheme,
+                expected,
             });
         }
         if id.level > self.max_level {
@@ -336,22 +393,21 @@ impl LiveBasemapSpec {
         Ok(url)
     }
 
-    /// Redact any configured API key (raw or percent-encoded) from `text`
-    /// before logging or displaying error messages in the UI.
+    /// Redact any configured API key (raw or percent-encoded) as well as any
+    /// inline URL `user:pass@` authority credentials and `?query` tokens from
+    /// `text` before logging or displaying error messages in the UI.
     pub fn redact_secrets(&self, text: &str) -> String {
-        match self.api_key.as_deref().filter(|k| !k.is_empty()) {
-            Some(secret) => {
-                let mut out = text.replace(secret, "<redacted>");
-                let (enc_upper, enc_lower) = percent_encode_variants(secret);
-                if enc_upper != secret {
-                    out = out.replace(&enc_upper, "<redacted>");
-                }
-                if enc_lower != secret && enc_lower != enc_upper {
-                    out = out.replace(&enc_lower, "<redacted>");
-                }
-                out
+        let mut out = sanitize_urls_in_text(text);
+        if let Some(secret) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
+            out = out.replace(secret, "<redacted>");
+            let (enc_upper, enc_lower) = percent_encode_variants(secret);
+            if enc_upper != secret {
+                out = out.replace(&enc_upper, "<redacted>");
             }
-            None => text.to_owned(),
+            if enc_lower != secret && enc_lower != enc_upper {
+                out = out.replace(&enc_lower, "<redacted>");
+            }
         }
+        out
     }
 }

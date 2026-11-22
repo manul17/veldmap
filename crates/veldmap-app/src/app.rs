@@ -8,8 +8,8 @@ use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor
 use thiserror::Error;
 use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
 use veldmap_core::geo::coords::parse_location;
+use veldmap_core::io::Wakeup;
 use veldmap_core::tile::SourceId;
-use veldmap_storage::BasemapSelection;
 
 use crate::basemap::BasemapManager;
 use crate::basemap_ui::{self, BasemapUiAction, BasemapUiState};
@@ -19,6 +19,7 @@ use crate::gpu_tiles::{
 };
 use crate::hud;
 use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams};
+use crate::settings::BasemapSelection;
 use crate::storage::AppStorage;
 
 /// Logical scroll points mapped to one discrete globe zoom notch.
@@ -211,7 +212,7 @@ impl VeldmapApp {
         let queue = render_state.queue.clone();
 
         let egui_ctx = cc.egui_ctx.clone();
-        let wakeup: veldmap_net::Wakeup = Arc::new(move || {
+        let wakeup: Wakeup = Arc::new(move || {
             egui_ctx.request_repaint();
         });
 
@@ -220,12 +221,8 @@ impl VeldmapApp {
             .sender()
             .ok_or(AppError::UploadChannelClosed)?;
         let storage = AppStorage::open(Arc::clone(&wakeup), None);
-        let basemap = BasemapManager::new(
-            storage.settings(),
-            storage.tile_blob_store(),
-            done_tx,
-            wakeup,
-        );
+        let basemap =
+            BasemapManager::new(storage.settings(), storage.disk_cache(), done_tx, wakeup);
         let basemap_ui = BasemapUiState::new(storage.settings());
 
         Ok(Self {
@@ -265,7 +262,8 @@ impl VeldmapApp {
                     );
                     // Preserve unsaved edits in an open Settings window; only
                     // synchronize the active selection field.
-                    self.basemap_ui.draft.active_basemap = self.storage.settings().active_basemap;
+                    self.basemap_ui
+                        .set_draft_active_basemap(self.storage.settings().active_basemap);
                 }
                 BasemapUiAction::ApplyDraft(draft) => {
                     scene_changed |= self.storage.mutate_settings(|s| draft.apply_into(s));
@@ -387,8 +385,8 @@ impl VeldmapApp {
             textured.then_some(&mut self.gpu_tile_cache),
         ));
 
-        self.basemap.schedule_for_snapshot(
-            &snapshot,
+        self.basemap.schedule_for_tiles(
+            snapshot.visible_tex_ids(),
             &self.gpu_tile_cache,
             &self.pending_uploads,
             1,
@@ -430,7 +428,7 @@ impl eframe::App for VeldmapApp {
             self.scene_generation = self.scene_generation.wrapping_add(1);
         }
         // When `uploaded > 0` on a visible viewport, `snapshot_for_frame` will
-        // rebuild and call `schedule_for_snapshot` -> `reconcile_providers`, so
+        // rebuild and call `schedule_for_tiles` -> `reconcile_providers`, so
         // only reconcile here when no snapshot rebuild will occur.
         let viewport_hidden = self.last_viewport_rect.is_none_or(|r| !r.is_positive());
         if (upload_report.uploaded == 0
@@ -486,10 +484,11 @@ impl eframe::App for VeldmapApp {
                 }
 
                 ui.separator();
+                let basemap_status = self.basemap.status_snapshot();
                 toolbar_actions = basemap_ui::show_toolbar_controls(
                     ui,
                     self.storage.settings(),
-                    &self.basemap,
+                    &basemap_status,
                     &mut self.basemap_ui,
                 );
 
@@ -533,10 +532,8 @@ impl eframe::App for VeldmapApp {
         }
 
         // Event-driven off-UI-thread SQLite stats refresh (zero idle queries).
-        self.storage.maybe_refresh_disk_stats(
-            self.basemap_ui.settings_open,
-            self.basemap.network_status().completed_from_net,
-        );
+        self.storage
+            .maybe_refresh_disk_stats(self.basemap_ui.settings_open());
 
         let disk_ui = self.storage.disk_cache_ui_state();
         let settings_actions = basemap_ui::show_settings_window(
@@ -564,6 +561,8 @@ impl eframe::App for VeldmapApp {
                     .then(|| self.probe_pointer(&ctx, rect, pos))
                     .flatten()
             });
+        } else {
+            self.cursor_geo = None;
         }
 
         let camera_before = self.camera;
@@ -659,9 +658,12 @@ impl eframe::App for VeldmapApp {
                         basemap_ui::paint_attribution_badge(&painter, rect, attr);
                     }
                 } else {
-                    // Release cached snapshot references when collapsed/minimized
-                    // so evicted `Arc<GpuTile>`s are not pinned indefinitely.
+                    // Release cached snapshot references and stale viewport/compass
+                    // rects when collapsed/minimized so evicted `Arc<GpuTile>`s are
+                    // not pinned and `viewport_hidden` reflects the collapsed state.
                     self.cached_snapshot = None;
+                    self.last_viewport_rect = None;
+                    self.last_compass_rect = None;
                 }
             });
 

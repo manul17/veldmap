@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use veldmap_core::tile::{
-    DecodedTile, PixelFormat, QuadTileId, SourceId, TileCache, TileKey, mip_dimensions,
+    DecodedTile, PixelFormat, QuadTileId, SourceId, TileCache, TileKey, mip_chain_byte_size,
 };
 
 /// Default GPU tile VRAM cache cap (`256 MiB`).
@@ -78,16 +78,7 @@ pub fn texture_byte_size(
     format: PixelFormat,
     mip_level_count: u32,
 ) -> usize {
-    if width == 0 || height == 0 {
-        return 0;
-    }
-    let bpp = format.bytes_per_pixel();
-    let mut total = 0usize;
-    for level in 0..mip_level_count.max(1) {
-        let (w, h) = mip_dimensions(width, height, level);
-        total = total.saturating_add((w as usize).saturating_mul(h as usize).saturating_mul(bpp));
-    }
-    total
+    mip_chain_byte_size(width, height, format, mip_level_count.max(1))
 }
 
 /// Outcome of attempting to upload and admit a decoded tile into
@@ -224,41 +215,27 @@ impl GpuTileCache {
     where
         F: Fn(&TileKey) -> bool,
     {
-        if decoded.format != key.format || decoded.gutter != key.gutter {
+        if decoded.format() != key.format || decoded.gutter() != key.gutter {
             tracing::warn!(
                 ?key,
-                decoded_format = ?decoded.format,
-                decoded_gutter = decoded.gutter,
+                decoded_format = ?decoded.format(),
+                decoded_gutter = decoded.gutter(),
                 "Skipping decoded tile whose format or gutter mismatches TileKey"
             );
             return UploadInsertOutcome::Rejected;
         }
         let max_dim = device.limits().max_texture_dimension_2d;
-        if decoded.width == 0
-            || decoded.height == 0
-            || decoded.width > max_dim
-            || decoded.height > max_dim
+        if decoded.width() == 0
+            || decoded.height() == 0
+            || decoded.width() > max_dim
+            || decoded.height() > max_dim
         {
             tracing::warn!(
                 ?key,
-                width = decoded.width,
-                height = decoded.height,
+                width = decoded.width(),
+                height = decoded.height(),
                 max_dim,
                 "Skipping decoded tile with invalid or oversized GPU dimensions"
-            );
-            return UploadInsertOutcome::Rejected;
-        }
-        if !decoded.validate() {
-            tracing::warn!(
-                ?key,
-                width = decoded.width,
-                height = decoded.height,
-                valid_w = decoded.valid_w,
-                valid_h = decoded.valid_h,
-                gutter = decoded.gutter,
-                mip_levels = decoded.mip_level_count(),
-                actual_bytes = decoded.byte_size(),
-                "Skipping decoded tile failing mip/buffer/gutter validation"
             );
             return UploadInsertOutcome::Rejected;
         }
@@ -276,18 +253,18 @@ impl GpuTileCache {
         }
 
         let mip_level_count = decoded.mip_level_count();
-        let bpp = decoded.format.bytes_per_pixel() as u32;
+        let bpp = decoded.format().bytes_per_pixel() as u32;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("veldmap gpu tile"),
             size: wgpu::Extent3d {
-                width: decoded.width,
-                height: decoded.height,
+                width: decoded.width(),
+                height: decoded.height(),
                 depth_or_array_layers: 1,
             },
             mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu_format(decoded.format),
+            format: wgpu_format(decoded.format()),
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -324,12 +301,12 @@ impl GpuTileCache {
         let tile = Arc::new(GpuTile {
             texture,
             view,
-            format: decoded.format,
-            width: decoded.width,
-            height: decoded.height,
-            valid_w: decoded.valid_w,
-            valid_h: decoded.valid_h,
-            gutter: decoded.gutter,
+            format: decoded.format(),
+            width: decoded.width(),
+            height: decoded.height(),
+            valid_w: decoded.valid_w(),
+            valid_h: decoded.valid_h(),
+            gutter: decoded.gutter(),
             byte_size,
             tile_id,
         });
@@ -474,11 +451,6 @@ impl PendingUploads {
     {
         self.drain_channel_into_queue(None, None, &[]);
         self.retain_queued(|k| !predicate(k));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn drain_pending_for_inspection(&mut self) {
-        self.drain_channel_into_queue(None, None, &[]);
     }
 
     fn insert_queued(&mut self, key: TileKey, decoded: DecodedTile) {
@@ -662,121 +634,6 @@ pub const fn bundled_tile_key(id: QuadTileId) -> TileKey {
     TileKey::display_quad(SourceId::BUNDLED_BASEMAP, id)
 }
 
-/// Return whether `key` is a coarsest root tile of `active_source`.
-pub const fn is_active_source_root(key: &TileKey, active_source: SourceId) -> bool {
-    key.is_root_of(active_source)
-}
-
 #[cfg(test)]
-mod tests {
-    use veldmap_core::tile::{BandKey, TileScheme};
-
-    use super::*;
-
-    #[test]
-    fn pending_uploads_clear_source_and_queued_byte_cap_preserve_roots() {
-        let mut pending = PendingUploads::with_max_queued_bytes(10);
-        let tx = pending.sender().expect("sender");
-        let live_a = SourceId::from_stable_key("live-a");
-        let k_live = source_tile_key(
-            live_a,
-            QuadTileId {
-                scheme: TileScheme::WebMercator,
-                level: 1,
-                x: 0,
-                y: 0,
-            },
-        );
-        let k_bundled = bundled_tile_key(QuadTileId {
-            scheme: TileScheme::WebMercator,
-            level: 0,
-            x: 0,
-            y: 0,
-        });
-        let tile_4b = DecodedTile::new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]);
-        tx.send((k_live, tile_4b.clone())).expect("send live");
-        tx.send((k_bundled, tile_4b.clone())).expect("send bundled");
-
-        pending.clear_source(live_a);
-        assert!(!pending.contains(&k_live));
-        assert!(pending.contains(&k_bundled));
-        assert_eq!(pending.count_for_source(live_a), 0);
-        assert_eq!(pending.count_for_source(SourceId::BUNDLED_BASEMAP), 1);
-        assert_eq!(pending.queued_bytes(), 4);
-
-        // Push two finer non-pinned tiles (4 B each -> 12 B > 10 B cap):
-        // enforcing the cap must drop the finest non-pinned tile (z=3) while
-        // keeping the pinned root (z=0) and coarser z=1 tile (8 B <= 10 B).
-        let k_z1 = source_tile_key(
-            live_a,
-            QuadTileId {
-                scheme: TileScheme::WebMercator,
-                level: 1,
-                x: 0,
-                y: 0,
-            },
-        );
-        let k_z3 = source_tile_key(
-            live_a,
-            QuadTileId {
-                scheme: TileScheme::WebMercator,
-                level: 3,
-                x: 0,
-                y: 0,
-            },
-        );
-        pending.insert_queued(k_z1, tile_4b.clone());
-        pending.insert_queued(k_z3, tile_4b);
-        assert_eq!(pending.queued_bytes(), 12);
-
-        pending.enforce_queued_byte_cap(&[SourceId::BUNDLED_BASEMAP]);
-        assert_eq!(pending.queued_bytes(), 8);
-        assert!(pending.contains(&k_bundled));
-        assert!(pending.contains(&k_z1));
-        assert!(!pending.contains(&k_z3));
-    }
-
-    #[test]
-    fn active_source_root_pinning_handles_planetary_and_raster_pyramid() {
-        let live = SourceId::from_stable_key("eox");
-        let wm_root = source_tile_key(
-            live,
-            QuadTileId {
-                scheme: TileScheme::WebMercator,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-        );
-        let wm_child = source_tile_key(
-            live,
-            QuadTileId {
-                scheme: TileScheme::WebMercator,
-                level: 1,
-                x: 0,
-                y: 0,
-            },
-        );
-        assert!(is_active_source_root(&wm_root, live));
-        assert!(!is_active_source_root(&wm_root, SourceId::BUNDLED_BASEMAP));
-        assert!(!is_active_source_root(&wm_child, live));
-
-        let pyr_root = TileKey {
-            source: live,
-            band: BandKey::Display,
-            scheme: TileScheme::RasterPyramid { max_level: 4 },
-            format: PixelFormat::Rgba8UnormSrgb,
-            gutter: 0,
-            decode_rev: 0,
-            level: 4,
-            x: 0,
-            y: 0,
-        };
-        let pyr_finest = TileKey {
-            level: 0,
-            ..pyr_root
-        };
-        assert!(is_active_source_root(&pyr_root, live));
-        assert!(!is_active_source_root(&pyr_finest, live));
-    }
-}
+#[path = "gpu_tiles_tests.rs"]
+mod tests;

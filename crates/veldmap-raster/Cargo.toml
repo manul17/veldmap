@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 image.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 
 [lints]

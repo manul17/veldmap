@@ -12,15 +12,15 @@ VeldMap is built in vertical slices tracked in [plan.md](plan.md):
 
 ## Workspace Layout
 
-- `crates/veldmap-core` — Pure domain logic (`geo`, `tile`, std-only `io::CancelToken`; zero `egui`, `eframe`, `wgpu`, `image`, or network dependencies).
-- `crates/veldmap-raster` — Memory-bounded PNG/JPEG tile decoding, CPU linear-light mipmap generation, and virtual offline equirectangular basemap tiling.
-- `crates/veldmap-storage` — Injectable `StoragePaths`, durable atomic JSON persistence (`write_atomic_durable` / `write_atomic_durable_private`), user settings, and crash-safe vertically partitioned SQLite WAL LRU tile disk cache.
-- `crates/veldmap-net` — Async `tokio` + `reqwest`/`rustls` (`ring`) live HTTP tile streaming, per-host concurrency limiting, bounded CPU decode pool, and NASA GIBS / EOX / Custom XYZ/TMS specs.
-- `crates/veldmap-app` — Native `eframe`/`egui` + `wgpu` desktop application (`[lib]` + `[[bin]]` so rendering and shader tests run headlessly).
+- `crates/veldmap-core` — Pure domain logic (`geo`, `tile`, std-only `io::{CancelToken, Wakeup}`; zero `egui`, `eframe`, `wgpu`, `image`, or network dependencies).
+- `crates/veldmap-raster` — Memory-bounded PNG/JPEG tile decoding, bounded CPU `DecodePool`, CPU linear-light mipmap generation, and virtual offline equirectangular basemap tiling.
+- `crates/veldmap-storage` — Injectable `StoragePaths`, durable atomic JSON persistence (`write_atomic_durable` / `write_atomic_durable_private`), and crash-safe vertically partitioned SQLite WAL LRU tile disk cache.
+- `crates/veldmap-net` — Async `tokio` + `reqwest`/`rustls` (`ring`) live HTTP tile streaming, per-host concurrency limiting, pluggable `TileDecodeExecutor`/`TileBlobStore` seams, and NASA GIBS / EOX / Custom XYZ/TMS specs.
+- `crates/veldmap-app` — Native `eframe`/`egui` + `wgpu` desktop application (`[lib]` + `[[bin]]` so rendering and shader tests run headlessly), including user settings (`settings.rs`) and runtime storage/decode wiring.
 - `assets/` — Public-domain bundled assets and provenance notes ([assets/README.md](assets/README.md)).
 - `docs/` — Build guide, design decisions, glossary, and current limitations ([docs/README.md](docs/README.md)).
 - `plan.md` — Executable vertical-slice roadmap and exit-criteria tracker ([plan.md](plan.md)).
-- `old/` — Temporary legacy migration reference, retired incrementally by slice ([old/README.md](old/README.md)).
+- `old/` — Temporary legacy migration reference, scheduled for full retirement after Slice 3A-1b ([old/README.md](old/README.md)).
 
 ## Quick Start
 

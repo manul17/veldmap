@@ -3377,6 +3377,7 @@ dependencies = [
  "glam",
  "naga",
  "pollster",
+ "serde",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
@@ -3399,14 +3400,12 @@ dependencies = [
 name = "veldmap-net"
 version = "0.1.0"
 dependencies = [
- "image",
  "reqwest",
  "rustls",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "veldmap-core",
- "veldmap-raster",
 ]
 
 [[package]]
@@ -3415,6 +3414,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "thiserror 2.0.21",
+ "tracing",
  "veldmap-core",
 ]
 

@@ -6,13 +6,12 @@
 //! from UI layout code.
 
 use eframe::egui;
-use veldmap_net::{CustomBasemapConfig, LiveBasemapSpec, is_valid_iso_date};
-use veldmap_storage::{
-    AppSettings, BasemapSelection, CustomXyzSettings, MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB,
-};
+use veldmap_net::{CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, is_valid_iso_date};
+use veldmap_storage::{MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB};
 
-use crate::basemap::BasemapManager;
+use crate::basemap::BasemapStatusSnapshot;
 use crate::hud;
+use crate::settings::{AppSettings, BasemapSelection, CustomXyzSettings};
 use crate::storage::DiskCacheUiState;
 
 /// Short human-readable label for toolbar dropdowns and settings UI.
@@ -79,8 +78,8 @@ pub enum BasemapUiAction {
 /// Transient UI editing state for the Basemap & Cache Settings window.
 #[derive(Clone, Debug)]
 pub struct BasemapUiState {
-    pub settings_open: bool,
-    pub draft: BasemapSettingsDraft,
+    settings_open: bool,
+    draft: BasemapSettingsDraft,
     cached_custom_validation: Option<(CustomXyzSettings, Result<(), String>)>,
 }
 
@@ -91,6 +90,17 @@ impl BasemapUiState {
             draft: BasemapSettingsDraft::from_settings(initial),
             cached_custom_validation: None,
         }
+    }
+
+    /// Whether the Basemap & Tile Cache Settings window is currently open.
+    pub const fn settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// Update only the draft's `active_basemap` selection (preserving unsaved
+    /// edits in an open Settings window).
+    pub fn set_draft_active_basemap(&mut self, selection: BasemapSelection) {
+        self.draft.active_basemap = selection;
     }
 
     /// Synchronize the Settings draft from persisted `AppSettings` and clear
@@ -108,7 +118,12 @@ impl BasemapUiState {
             .as_ref()
             .is_none_or(|(prev, _)| prev != &self.draft.custom_xyz);
         if needs_recompute {
-            let res = validate_custom_xyz(&self.draft.custom_xyz);
+            let res = self
+                .draft
+                .custom_xyz
+                .to_live_spec()
+                .map(|_| ())
+                .map_err(|err| err.to_string());
             self.cached_custom_validation = Some((self.draft.custom_xyz.clone(), res));
         }
         match self.cached_custom_validation.as_ref() {
@@ -128,25 +143,12 @@ const ALL_BASEMAPS: [BasemapSelection; 6] = [
     BasemapSelection::EllipsoidOnly,
 ];
 
-fn validate_custom_xyz(custom: &CustomXyzSettings) -> Result<(), String> {
-    LiveBasemapSpec::custom(CustomBasemapConfig {
-        name: &custom.name,
-        url_template: &custom.url_template,
-        api_key: &custom.api_key,
-        tms_flip_y: custom.tms_flip_y,
-        max_level: custom.max_level,
-        attribution: &custom.attribution,
-    })
-    .map(|_| ())
-    .map_err(|err| err.to_string())
-}
-
 /// Render toolbar basemap selector, live streaming / error / offline pill, and
 /// Settings button, returning any user actions to apply in `VeldmapApp`.
 pub fn show_toolbar_controls(
     ui: &mut egui::Ui,
     settings: &AppSettings,
-    manager: &BasemapManager,
+    status: &BasemapStatusSnapshot,
     ui_state: &mut BasemapUiState,
 ) -> Vec<BasemapUiAction> {
     let mut actions = Vec::new();
@@ -192,15 +194,15 @@ pub fn show_toolbar_controls(
 
     // Live streaming / error / offline indicator badge.
     if current.is_live() {
-        let status = manager.network_status();
-        if let Some(init_err) = manager.live_pipeline_error() {
+        let net = &status.network;
+        if let Some(init_err) = status.live_pipeline_error.as_deref() {
             ui.label(
                 egui::RichText::new("Live unavailable")
                     .color(egui::Color32::from_rgb(240, 185, 85))
                     .small(),
             )
             .on_hover_text(init_err);
-        } else if let Some(cfg_err) = manager.config_error() {
+        } else if let Some(cfg_err) = status.config_error.as_deref() {
             let badge = match current {
                 BasemapSelection::NasaGibsViirs => "Invalid date",
                 BasemapSelection::CustomXyz => "Invalid URL",
@@ -212,8 +214,8 @@ pub fn show_toolbar_controls(
                     .small(),
             )
             .on_hover_text(cfg_err);
-        } else if status.offline {
-            let hover = status
+        } else if net.offline {
+            let hover = net
                 .last_error
                 .as_deref()
                 .unwrap_or("Network unreachable; showing offline Blue Marble fallback");
@@ -226,8 +228,8 @@ pub fn show_toolbar_controls(
             if ui.small_button("Retry").clicked() {
                 actions.push(BasemapUiAction::RetryLive);
             }
-        } else if status.failed_count > 0
-            && let Some(err) = status.last_error.as_deref()
+        } else if net.failed_count > 0
+            && let Some(err) = net.last_error.as_deref()
         {
             ui.label(
                 egui::RichText::new("Tile error")
@@ -238,9 +240,9 @@ pub fn show_toolbar_controls(
             if ui.small_button("Retry").clicked() {
                 actions.push(BasemapUiAction::RetryLive);
             }
-        } else if status.in_flight > 0 || status.queued > 0 {
+        } else if net.in_flight > 0 || net.queued > 0 {
             ui.label(
-                egui::RichText::new(format!("Streaming ({})", status.in_flight + status.queued))
+                egui::RichText::new(format!("Streaming ({})", net.in_flight + net.queued))
                     .weak()
                     .small(),
             );
@@ -340,7 +342,7 @@ pub fn show_settings_window(
                     ui.label("Max zoom:");
                     ui.add(egui::Slider::new(
                         &mut ui_state.draft.custom_xyz.max_level,
-                        1..=20,
+                        CUSTOM_MAX_LEVEL_MIN..=CUSTOM_MAX_LEVEL_MAX,
                     ));
                     ui.end_row();
                 });

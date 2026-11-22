@@ -1,6 +1,8 @@
 use super::*;
 use crate::geo::camera::MIN_HEIGHT_M;
 use crate::geo::geodesy::Geodetic;
+use crate::geo::projection::WEB_MERCATOR_LIMIT_DEG;
+use crate::tile::geometry::{POLAR_R_CAP, sample_tile_surface};
 
 #[test]
 fn decoupled_lod_subdivides_past_max_tex_level_with_zero_requests_above_cap() {
@@ -22,7 +24,7 @@ fn decoupled_lod_subdivides_past_max_tex_level_with_zero_requests_above_cap() {
     );
 
     let nadir_ecef = geodesy::world(Geodetic::surface(47.2357, 39.7015));
-    let focal_px = (800.0_f64 * 0.5) / (FOV_Y_DEG * 0.5).to_radians().tan();
+    let focal_px = cam.focal_length_px(800.0);
     let eye = cam.eye_ecef();
     let mut nadir_tile_sag = f64::INFINITY;
     for tile in &tiles {
@@ -65,7 +67,7 @@ fn adaptive_polar_cap_covers_pole_with_sub_cm_sag_at_2m_and_exact_boundary() {
         assert!(!tiles.is_empty());
         assert!(
             tiles.iter().all(
-                |t| matches!(t.id.scheme, TileScheme::PolarCap { north } if north == (pole > 0.0))
+                |t| matches!(t.id.scheme, PlanetaryScheme::PolarCap { north } if north == (pole > 0.0))
             ),
             "at {pole} deg at 2 m, only matching PolarCap tiles should be visible"
         );
@@ -178,7 +180,9 @@ fn web_mercator_never_falsely_culls_across_globe_and_couples_polar_seam() {
                 let cam = Camera::at(lat, lon, height_m);
                 let tiles = traverse(&cam, 1280, 800, &cfg);
                 assert!(
-                    tiles.iter().any(|t| t.id.scheme == TileScheme::WebMercator),
+                    tiles
+                        .iter()
+                        .any(|t| t.id.scheme == PlanetaryScheme::WebMercator),
                     "WebMercator returned 0 tiles at ({lat}, {lon}, {height_m} m)"
                 );
             }
@@ -192,11 +196,11 @@ fn web_mercator_never_falsely_culls_across_globe_and_couples_polar_seam() {
     let tiles = traverse(&cam, 1280, 800, &cfg);
     let merc: Vec<&VisibleTile> = tiles
         .iter()
-        .filter(|t| t.id.scheme == TileScheme::WebMercator)
+        .filter(|t| t.id.scheme == PlanetaryScheme::WebMercator)
         .collect();
     let polar: Vec<&VisibleTile> = tiles
         .iter()
-        .filter(|t| t.id.scheme == TileScheme::PolarCap { north: true })
+        .filter(|t| t.id.scheme == PlanetaryScheme::PolarCap { north: true })
         .collect();
     assert!(!merc.is_empty() && !polar.is_empty());
     for t in &polar {
@@ -215,7 +219,7 @@ fn clamped_geodetic_polar_adjacent_skirts_cover_coarser_neighbor_sag() {
     let cfg = QuadtreeConfig::bundled_geodetic();
     let coarse = describe_tile(
         QuadTileId {
-            scheme: TileScheme::Geodetic,
+            scheme: PlanetaryScheme::Geodetic,
             level: 4,
             x: 0,
             y: 0,
@@ -225,7 +229,7 @@ fn clamped_geodetic_polar_adjacent_skirts_cover_coarser_neighbor_sag() {
     .expect("z=4 row 0");
     let fine = describe_tile(
         QuadTileId {
-            scheme: TileScheme::Geodetic,
+            scheme: PlanetaryScheme::Geodetic,
             level: 5,
             x: 2,
             y: 0,
@@ -250,7 +254,7 @@ fn polar_r_cap_constant_and_bounds_guards_are_exact() {
     assert!(
         sample_tile_surface(
             QuadTileId {
-                scheme: TileScheme::WebMercator,
+                scheme: PlanetaryScheme::WebMercator,
                 level: 1,
                 x: 2,
                 y: 0,
@@ -263,7 +267,7 @@ fn polar_r_cap_constant_and_bounds_guards_are_exact() {
     assert!(
         sample_tile_surface(
             QuadTileId {
-                scheme: TileScheme::PolarCap { north: true },
+                scheme: PlanetaryScheme::PolarCap { north: true },
                 level: 0,
                 x: 1,
                 y: 0,
@@ -275,25 +279,11 @@ fn polar_r_cap_constant_and_bounds_guards_are_exact() {
     );
     // Huge dz in clamp_to_level must not panic.
     let deep = QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 40,
         x: 0,
         y: 0,
     };
     let (clamped, _) = deep.clamp_to_level(0);
     assert_eq!(clamped.level, 0);
-}
-
-#[test]
-fn adaptive_grid_step_divides_ninety_degrees_cleanly() {
-    for m_per_pt in [1e-4, 0.002, 0.5, 10.0, 500.0, 16_000.0, 100_000.0] {
-        let step = adaptive_grid_step_deg(m_per_pt);
-        let ratio = 90.0 / step;
-        assert!(
-            (ratio - ratio.round()).abs() < 1e-6,
-            "step {step} does not cleanly divide 90 deg (ratio={ratio})"
-        );
-    }
-    assert_eq!(adaptive_grid_step_deg(16_320.0), 15.0);
-    assert_eq!(adaptive_grid_step_deg(0.002), 0.000_01);
 }

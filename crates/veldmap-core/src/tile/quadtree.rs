@@ -6,22 +6,20 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 
-use crate::geo::camera::{Camera, FOV_Y_DEG};
+use crate::geo::camera::Camera;
 use crate::geo::cull::{Ball, Frame as CullFrame};
 use crate::geo::geodesy;
-use crate::geo::projection::WEB_MERCATOR_LIMIT_DEG;
 use crate::geo::sag;
 
-pub use super::key::QuadTileId;
-use super::key::TileScheme;
+use super::geometry::{
+    BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, lat_lon_bounds, mercator_lat_deg,
+    polar_cap_point, web_mercator_y_bounds,
+};
+use super::key::{GlobeScheme, PlanetaryScheme, QuadTileId};
 
 /// Default mesh grid cells per quadtree tile side (`16 x 16` quads = 289
 /// surface vertices + 68 skirt vertices).
 pub const DEFAULT_GRID_CELLS: u32 = 16;
-
-/// Stereographic disk radius corresponding to `|lat| = WEB_MERCATOR_LIMIT_DEG`
-/// (`tan((90° - 85.05112878°) / 2)`).
-pub const POLAR_R_CAP: f64 = 0.043_213_918_263_772_28;
 
 /// Maximum WGS84 radius-of-curvature ratio relative to `SEMI_MAJOR_M`
 /// (`a / (1 - f) / a`), used to keep spherical chord-sag bounds strictly
@@ -31,9 +29,9 @@ const POLAR_CURVATURE_SCALE: f64 = 1.0 / (1.0 - geodesy::FLATTENING);
 /// Configuration for planetary quadtree traversal.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QuadtreeConfig {
-    /// Active non-polar planetary scheme (`TileScheme::Geodetic` or
-    /// `TileScheme::WebMercator`).
-    pub scheme: TileScheme,
+    /// Active non-polar planetary scheme (`GlobeScheme::Geodetic` or
+    /// `GlobeScheme::WebMercator`).
+    pub scheme: GlobeScheme,
     /// Maximum texture level offered by the active basemap (`0` requests are
     /// ever emitted above this level; geometry continues subdividing to
     /// `max_geom_level` and samples ancestor sub-rects).
@@ -69,13 +67,13 @@ impl QuadtreeConfig {
     /// basemap with adaptive Polar Stereographic caps (`z = 0`).
     pub const fn bundled_geodetic() -> Self {
         Self {
-            scheme: TileScheme::Geodetic,
-            max_tex_level: 3,
+            scheme: GlobeScheme::Geodetic,
+            max_tex_level: BUNDLED_MAX_LEVEL,
             max_geom_level: 16,
-            polar_max_tex_level: 0,
+            polar_max_tex_level: BUNDLED_POLAR_MAX_LEVEL,
             polar_max_geom_level: 14,
             grid_cells: DEFAULT_GRID_CELLS,
-            tile_px: 256,
+            tile_px: BUNDLED_TILE_PX,
             max_geom_sse_px: 0.5,
             max_tex_sse_px: 1.5,
         }
@@ -84,29 +82,41 @@ impl QuadtreeConfig {
     /// Configuration for a `WebMercator` basemap with given `max_tex_level`.
     pub const fn web_mercator(max_tex_level: u8) -> Self {
         Self {
-            scheme: TileScheme::WebMercator,
+            scheme: GlobeScheme::WebMercator,
             max_tex_level,
             max_geom_level: 17,
-            polar_max_tex_level: 0,
+            polar_max_tex_level: BUNDLED_POLAR_MAX_LEVEL,
             polar_max_geom_level: 14,
             grid_cells: DEFAULT_GRID_CELLS,
-            tile_px: 256,
+            tile_px: BUNDLED_TILE_PX,
             max_geom_sse_px: 0.5,
             max_tex_sse_px: 1.5,
         }
     }
 
-    const fn max_tex_for(&self, scheme: TileScheme) -> u8 {
+    /// Configuration for a main-globe `scheme` (`Geodetic` or `WebMercator`)
+    /// with given `max_tex_level`.
+    pub const fn for_scheme(scheme: GlobeScheme, max_tex_level: u8) -> Self {
         match scheme {
-            TileScheme::PolarCap { .. } => self.polar_max_tex_level,
-            _ => self.max_tex_level,
+            GlobeScheme::WebMercator => Self::web_mercator(max_tex_level),
+            GlobeScheme::Geodetic => Self {
+                max_tex_level,
+                ..Self::bundled_geodetic()
+            },
         }
     }
 
-    const fn max_geom_for(&self, scheme: TileScheme) -> u8 {
+    const fn max_tex_for(&self, scheme: PlanetaryScheme) -> u8 {
         match scheme {
-            TileScheme::PolarCap { .. } => self.polar_max_geom_level,
-            _ => self.max_geom_level,
+            PlanetaryScheme::PolarCap { .. } => self.polar_max_tex_level,
+            PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => self.max_tex_level,
+        }
+    }
+
+    const fn max_geom_for(&self, scheme: PlanetaryScheme) -> u8 {
+        match scheme {
+            PlanetaryScheme::PolarCap { .. } => self.polar_max_geom_level,
+            PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => self.max_geom_level,
         }
     }
 }
@@ -137,169 +147,27 @@ pub struct VisibleTile {
     pub skirt_depth_m: f64,
 }
 
-/// Latitude/longitude bounds and raw texture range for a non-polar tile.
-#[derive(Clone, Copy, Debug)]
-pub struct LatLonTileBounds {
-    pub lon_west_deg: f64,
-    pub lon_east_deg: f64,
-    /// Clamped mesh north latitude (`<= WEB_MERCATOR_LIMIT_DEG`).
-    pub lat_north_deg: f64,
-    /// Clamped mesh south latitude (`>= -WEB_MERCATOR_LIMIT_DEG`).
-    pub lat_south_deg: f64,
-    /// Unclamped tile north latitude (for exact `Geodetic` texture UV mapping).
-    pub raw_lat_north_deg: f64,
-    /// Unclamped tile south latitude (for exact `Geodetic` texture UV mapping).
-    pub raw_lat_south_deg: f64,
-}
-
-fn mercator_lat_deg(merc: f64) -> f64 {
-    merc.sinh().atan().to_degrees()
-}
-
-/// Compute geographic bounds for a `Geodetic` or `WebMercator` tile, returning
-/// `None` if the tile lies entirely inside the `|lat| >= WEB_MERCATOR_LIMIT_DEG`
-/// polar caps (which are owned by `TileScheme::PolarCap`).
-pub fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
-    let (cols, rows) = id.scheme.grid_dims(id.level)?;
-    if id.x >= cols || id.y >= rows {
-        return None;
-    }
-    let cols_f = f64::from(cols);
-    let rows_f = f64::from(rows);
-    let lon_west_deg = -180.0 + 360.0 * f64::from(id.x) / cols_f;
-    let lon_east_deg = -180.0 + 360.0 * f64::from(id.x + 1) / cols_f;
-
-    match id.scheme {
-        TileScheme::Geodetic => {
-            let raw_lat_north_deg = 90.0 - 180.0 * f64::from(id.y) / rows_f;
-            let raw_lat_south_deg = 90.0 - 180.0 * f64::from(id.y + 1) / rows_f;
-            if raw_lat_south_deg >= WEB_MERCATOR_LIMIT_DEG
-                || raw_lat_north_deg <= -WEB_MERCATOR_LIMIT_DEG
-            {
-                return None;
-            }
-            let lat_north_deg = raw_lat_north_deg.min(WEB_MERCATOR_LIMIT_DEG);
-            let lat_south_deg = raw_lat_south_deg.max(-WEB_MERCATOR_LIMIT_DEG);
-            Some(LatLonTileBounds {
-                lon_west_deg,
-                lon_east_deg,
-                lat_north_deg,
-                lat_south_deg,
-                raw_lat_north_deg,
-                raw_lat_south_deg,
-            })
-        }
-        TileScheme::WebMercator => {
-            let merc_n = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y) / rows_f);
-            let merc_s = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y + 1) / rows_f);
-            let lat_north_deg = mercator_lat_deg(merc_n);
-            let lat_south_deg = mercator_lat_deg(merc_s);
-            Some(LatLonTileBounds {
-                lon_west_deg,
-                lon_east_deg,
-                lat_north_deg,
-                lat_south_deg,
-                raw_lat_north_deg: lat_north_deg,
-                raw_lat_south_deg: lat_south_deg,
-            })
-        }
-        TileScheme::PolarCap { .. } | TileScheme::RasterPyramid { .. } => None,
-    }
-}
-
-/// Evaluate a point on the adaptive Polar Stereographic cap at normalized cap
-/// square coordinates `(u, v) in [-1, 1]^2` using the smooth elliptical
-/// square-to-disk diffeomorphism (`dx = u * sqrt(1 - v^2 / 2)`,
-/// `dy = v * sqrt(1 - u^2 / 2)`).
-///
-/// Returns `(lat_deg, lon_deg, dx, dy)` where `dx^2 + dy^2 == 1.0` maps
-/// strictly onto `|lat_deg| == WEB_MERCATOR_LIMIT_DEG`, `(0, 0)` maps to the
-/// exact pole, and standard `(row -> +v, col -> +u)` triangle winding faces
-/// outward on both North and South caps.
-pub fn polar_cap_point(north: bool, u: f64, v: f64) -> (f64, f64, f64, f64) {
-    let dx = u * (1.0 - 0.5 * v * v).max(0.0).sqrt();
-    let dy = v * (1.0 - 0.5 * u * u).max(0.0).sqrt();
-    let rho = dx.hypot(dy).min(1.0);
-    let colat_rad = 2.0 * (rho * POLAR_R_CAP).atan();
-    let colat_deg = colat_rad.to_degrees();
-    let lat_deg = if north {
-        90.0 - colat_deg
-    } else {
-        -90.0 + colat_deg
-    };
-    let lon_deg = if rho == 0.0 {
-        0.0
-    } else if north {
-        (-dy).atan2(dx).to_degrees()
-    } else {
-        dy.atan2(dx).to_degrees()
-    };
-    (lat_deg, lon_deg, dx, dy)
-}
-
-/// Evaluate a surface point `(lat_deg, lon_deg, u_tex, v_tex, dx, dy)` on any
-/// planetary tile (`Geodetic`, `WebMercator`, or `PolarCap`) at mesh-local
-/// fractions `(s, t) in [0, 1]^2` (`s`: west->east / left->right,
-/// `t`: north->south / top->bottom).
-pub fn sample_tile_surface(
-    id: QuadTileId,
-    s: f64,
-    t: f64,
-) -> Option<(f64, f64, f64, f64, f64, f64)> {
-    match id.scheme {
-        TileScheme::Geodetic => {
-            let b = lat_lon_bounds(id)?;
-            let lon = b.lon_west_deg + (b.lon_east_deg - b.lon_west_deg) * s;
-            let lat = b.lat_north_deg + (b.lat_south_deg - b.lat_north_deg) * t;
-            let raw_span = (b.raw_lat_north_deg - b.raw_lat_south_deg).max(1e-12);
-            let v_tex = (b.raw_lat_north_deg - lat) / raw_span;
-            Some((lat, lon, s, v_tex, 0.0, 0.0))
-        }
-        TileScheme::WebMercator => {
-            let (cols, rows) = id.scheme.grid_dims(id.level)?;
-            if id.x >= cols || id.y >= rows {
-                return None;
-            }
-            let cols_f = f64::from(cols);
-            let rows_f = f64::from(rows);
-            let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
-            let merc_n = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y) / rows_f);
-            let merc_s = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y + 1) / rows_f);
-            let merc = merc_n + (merc_s - merc_n) * t;
-            let lat = mercator_lat_deg(merc);
-            Some((lat, lon, s, t, 0.0, 0.0))
-        }
-        TileScheme::PolarCap { north } => {
-            let (n, rows) = id.scheme.grid_dims(id.level)?;
-            if id.x >= n || id.y >= rows {
-                return None;
-            }
-            let n_f = f64::from(n);
-            let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
-            let v = -1.0 + 2.0 * (f64::from(id.y) + t) / n_f;
-            let (lat, lon, dx, dy) = polar_cap_point(north, u, v);
-            Some((lat, lon, s, t, dx, dy))
-        }
-        TileScheme::RasterPyramid { .. } => None,
-    }
-}
-
-/// Tile-local `f64` graticule anchor `(anchor_a, anchor_b)`:
-/// - For `Geodetic` / `WebMercator`: `(lon_center_deg, lat_center_deg)`
-/// - For `PolarCap`: `(dx_center, dy_center)` in unit-disk coordinates
-pub fn tile_grid_anchor(id: QuadTileId) -> Option<(f64, f64)> {
-    let (lat, lon, _, _, dx, dy) = sample_tile_surface(id, 0.5, 0.5)?;
-    match id.scheme {
-        TileScheme::PolarCap { .. } => Some((dx, dy)),
-        _ => Some((lon, lat)),
-    }
-}
-
 /// Compute tile metadata (`origin_ecef_m`, conservative `Ball`, cell-diagonal
 /// chord sagitta, and skirt depth) for `id`, returning `None` if `id` is out of
 /// domain (e.g. a `Geodetic` tile fully inside a polar cap).
 pub fn describe_tile(id: QuadTileId, config: &QuadtreeConfig) -> Option<VisibleTile> {
     describe_tile_with_samples(id, config).map(|(tile, _, _, _)| tile)
+}
+
+#[inline]
+fn surface_unit_and_ecef(lat_deg: f64, lon_deg: f64, e2: f64, one_minus_e2: f64) -> (DVec3, DVec3) {
+    let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
+    let (sin_lon, cos_lon) = lon_deg.to_radians().sin_cos();
+    let curvature = geodesy::SEMI_MAJOR_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+    let eq = curvature * cos_lat;
+    (
+        DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat),
+        DVec3::new(
+            eq * cos_lon,
+            eq * sin_lon,
+            curvature * one_minus_e2 * sin_lat,
+        ),
+    )
 }
 
 fn describe_tile_with_samples(
@@ -339,7 +207,7 @@ fn describe_tile_with_samples(
     let mut merc_equatorial_cell_diag_deg = 0.0_f64;
 
     match id.scheme {
-        TileScheme::Geodetic => {
+        PlanetaryScheme::Geodetic => {
             let b = lat_lon_bounds(id)?;
             let lats = [0u32, 1, 2, 3, 4].map(|row| {
                 b.lat_north_deg + (b.lat_south_deg - b.lat_north_deg) * (f64::from(row) * 0.25)
@@ -360,15 +228,13 @@ fn describe_tile_with_samples(
                 unclamped_cell_diag_deg = raw_cell_lat.hypot(cell_lon);
             }
         }
-        TileScheme::WebMercator => {
+        PlanetaryScheme::WebMercator => {
             let (cols, rows) = id.scheme.grid_dims(id.level)?;
             if id.x >= cols || id.y >= rows {
                 return None;
             }
             let cols_f = f64::from(cols);
-            let rows_f = f64::from(rows);
-            let merc_n = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y) / rows_f);
-            let merc_s = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y + 1) / rows_f);
+            let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
             let lats = [0u32, 1, 2, 3, 4]
                 .map(|row| mercator_lat_deg(merc_n + (merc_s - merc_n) * (f64::from(row) * 0.25)));
             let lons = [0u32, 1, 2, 3, 4]
@@ -391,7 +257,7 @@ fn describe_tile_with_samples(
                 (360.0 / (cols_f * grid_cells)) * mercator_lat_deg(merc_eq).to_radians().cos();
             merc_equatorial_cell_diag_deg = cell_dlat.hypot(cell_dlon);
         }
-        TileScheme::PolarCap { north } => {
+        PlanetaryScheme::PolarCap { north } => {
             let (n, rows) = id.scheme.grid_dims(id.level)?;
             if id.x >= n || id.y >= rows {
                 return None;
@@ -405,20 +271,13 @@ fn describe_tile_with_samples(
                     let s = f64::from(col) * 0.25;
                     let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
                     let (lat, lon, _, _) = polar_cap_point(north, u, v);
-                    let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
-                    let (sin_lon, cos_lon) = lon.to_radians().sin_cos();
-                    let curvature = geodesy::SEMI_MAJOR_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-                    sample_units[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
-                    samples[idx] = DVec3::new(
-                        curvature * cos_lat * cos_lon,
-                        curvature * cos_lat * sin_lon,
-                        curvature * one_minus_e2 * sin_lat,
-                    );
+                    let (unit, ecef) = surface_unit_and_ecef(lat, lon, e2, one_minus_e2);
+                    sample_units[idx] = unit;
+                    samples[idx] = ecef;
                     idx += 1;
                 }
             }
         }
-        TileScheme::RasterPyramid { .. } => return None,
     }
 
     // Center point `(s=0.5, t=0.5)` is index 12 (row 2, col 2).
@@ -505,7 +364,7 @@ fn approx_tile_width_m(tile: &VisibleTile) -> f64 {
         && let Some((cols, _)) = tile.id.scheme.grid_dims(tile.id.level)
         && matches!(
             tile.id.scheme,
-            TileScheme::Geodetic | TileScheme::WebMercator
+            PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator
         )
     {
         return (2.0 * std::f64::consts::PI * geodesy::SEMI_MAJOR_M) / f64::from(cols);
@@ -515,7 +374,7 @@ fn approx_tile_width_m(tile: &VisibleTile) -> f64 {
 }
 
 fn is_polar_perimeter(id: QuadTileId) -> bool {
-    if !matches!(id.scheme, TileScheme::PolarCap { .. }) {
+    if !matches!(id.scheme, PlanetaryScheme::PolarCap { .. }) {
         return false;
     }
     let Some((n, _)) = id.scheme.grid_dims(id.level) else {
@@ -554,8 +413,8 @@ fn should_subdivide(
     let mut tex_subdiv_cap = config.max_tex_for(tile.id.scheme);
     if is_polar_perimeter(tile.id) {
         let level_shift = match config.scheme {
-            TileScheme::Geodetic => 1,
-            _ => 2,
+            GlobeScheme::Geodetic => 1,
+            GlobeScheme::WebMercator => 2,
         };
         tex_subdiv_cap = tex_subdiv_cap.max(config.max_tex_level.saturating_sub(level_shift));
     }
@@ -595,22 +454,19 @@ pub fn traverse(
     let frustum = camera.frustum(aspect);
     let eye = camera.eye_ecef();
     let height_m = camera.height_m();
-    let focal_px = (height_f * 0.5) / (FOV_Y_DEG * 0.5).to_radians().tan();
+    let focal_px = camera.focal_length_px(height_f);
 
     let mut leaves: HashMap<QuadTileId, VisibleTile> = HashMap::new();
 
     // Seed roots: main planetary scheme (`Geodetic` or `WebMercator`) + North &
     // South Polar Stereographic caps.
     let mut stack: Vec<QuadTileId> = Vec::with_capacity(64);
-    if matches!(
-        config.scheme,
-        TileScheme::Geodetic | TileScheme::WebMercator
-    ) && let Some((cols, rows)) = config.scheme.grid_dims(0)
-    {
+    let main_scheme = config.scheme.into_planetary();
+    if let Some((cols, rows)) = main_scheme.grid_dims(0) {
         for y in 0..rows {
             for x in 0..cols {
                 stack.push(QuadTileId {
-                    scheme: config.scheme,
+                    scheme: main_scheme,
                     level: 0,
                     x,
                     y,
@@ -620,7 +476,7 @@ pub fn traverse(
     }
     for north in [true, false] {
         stack.push(QuadTileId {
-            scheme: TileScheme::PolarCap { north },
+            scheme: PlanetaryScheme::PolarCap { north },
             level: 0,
             x: 0,
             y: 0,
@@ -662,17 +518,16 @@ fn neighbor_id(id: QuadTileId, dx: i32, dy: i32) -> Option<QuadTileId> {
         return None;
     }
     let nx = match id.scheme {
-        TileScheme::Geodetic | TileScheme::WebMercator => {
+        PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => {
             (i64::from(id.x) + i64::from(dx)).rem_euclid(i64::from(cols))
         }
-        TileScheme::PolarCap { .. } => {
+        PlanetaryScheme::PolarCap { .. } => {
             let v = i64::from(id.x) + i64::from(dx);
             if v < 0 || v >= i64::from(cols) {
                 return None;
             }
             v
         }
-        TileScheme::RasterPyramid { .. } => return None,
     };
     Some(QuadTileId {
         scheme: id.scheme,
@@ -730,25 +585,6 @@ fn balance_2_to_1(
             }
         }
     }
-}
-
-/// Adaptive graticule spacing in degrees (every candidate evenly divides `90°`
-/// and `180°`), keeping lines spaced cleanly at ~85–425 logical points from
-/// orbital zoom (`15°`) down to `2 m` close-ups (`0.00001° ~ 1.1 m`).
-pub fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
-    const STEPS_DEG: [f64; 13] = [
-        0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0,
-    ];
-    if !metres_per_pt.is_finite() || metres_per_pt <= 0.0 {
-        return 15.0;
-    }
-    let target_deg = (metres_per_pt * 85.0) / 111_320.0;
-    for &step in &STEPS_DEG {
-        if step >= target_deg {
-            return step;
-        }
-    }
-    15.0
 }
 
 #[cfg(test)]

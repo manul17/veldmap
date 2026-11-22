@@ -20,8 +20,8 @@ impl StoragePaths {
     /// Resolve standard OS-native paths (`XDG` on Linux, `AppData` on Windows,
     /// `Library/Application Support` + `Library/Caches` on macOS).
     pub fn system_default() -> Result<Self, StorageError> {
-        let dirs =
-            ProjectDirs::from("io", "veldmap", "VeldMap").ok_or(StorageError::NoPlatformDirs)?;
+        let dirs = ProjectDirs::from("io", "veldmap", veldmap_core::APP_NAME)
+            .ok_or(StorageError::NoPlatformDirs)?;
         Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             cache_dir: dirs.cache_dir().to_path_buf(),

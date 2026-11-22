@@ -14,14 +14,57 @@ use std::sync::{Arc, Weak};
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{
-    DEFAULT_GRID_CELLS, POLAR_R_CAP, QuadTileId, QuadtreeConfig, SourceId, TileCache, TileKey,
-    TileScheme, VisibleTile, adaptive_grid_step_deg, compose_uv_rect, sample_tile_surface,
-    tile_grid_anchor, traverse,
+    DEFAULT_GRID_CELLS, POLAR_R_CAP, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig,
+    SourceId, TileCache, TileKey, VisibleTile, compose_uv_rect, sample_tile_surface, traverse,
 };
 use wgpu::util::DeviceExt;
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache, bundled_tile_key, source_tile_key};
-use crate::mesh::{SharedTileIndices, TileVertex, build_tile_vertices};
+use crate::mesh::{SharedTileIndices, TileVertex, build_tile_vertices, tile_grid_anchor};
+
+/// Native desktop primary `wgpu` backends (Vulkan, DX12, Metal), explicitly
+/// excluding OpenGL/GLES and WebGPU.
+pub const NATIVE_PRIMARY_BACKENDS: wgpu::Backends =
+    wgpu::Backends::PRIMARY.difference(wgpu::Backends::BROWSER_WEBGPU);
+
+/// Restrict environment-resolved `wgpu` backends to [`NATIVE_PRIMARY_BACKENDS`],
+/// warning when unsupported entries are ignored or when falling back.
+pub fn clamp_to_primary_backends(backends: wgpu::Backends) -> wgpu::Backends {
+    let unsupported = backends - NATIVE_PRIMARY_BACKENDS;
+    if !unsupported.is_empty() {
+        tracing::warn!(
+            ?unsupported,
+            "Ignoring unsupported WGPU_BACKEND entries (only Vulkan, DX12, and Metal are supported)"
+        );
+    }
+    let primary = backends & NATIVE_PRIMARY_BACKENDS;
+    if primary.is_empty() {
+        tracing::warn!(
+            "WGPU_BACKEND selected no supported backends; falling back to native primary backends"
+        );
+        NATIVE_PRIMARY_BACKENDS
+    } else {
+        primary
+    }
+}
+
+/// Choose a clean graticule step in degrees (dividing `90°` evenly) such that
+/// lines stay roughly `~85 pt` apart on screen across orbital-to-2 m zoom.
+pub fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
+    const STEPS_DEG: [f64; 13] = [
+        0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0,
+    ];
+    if !metres_per_pt.is_finite() || metres_per_pt <= 0.0 {
+        return 15.0;
+    }
+    let target_deg = (metres_per_pt * 85.0) / 111_320.0;
+    for &step in &STEPS_DEG {
+        if step >= target_deg {
+            return step;
+        }
+    }
+    15.0
+}
 
 /// Embedded WGSL source for the quadtree globe body and procedural graticule.
 pub const GLOBE_WGSL: &str = include_str!("shaders/globe.wgsl");
@@ -104,6 +147,11 @@ pub struct DrawSnapshot {
 }
 
 impl DrawSnapshot {
+    /// Iterator over the texture tile IDs needed by this snapshot.
+    pub fn visible_tex_ids(&self) -> impl Iterator<Item = QuadTileId> + '_ {
+        self.tiles.iter().map(|t| t.visible.tex_id)
+    }
+
     /// Build a draw snapshot from a camera pose, viewport dimensions, active
     /// basemap [`SourceId`], and optional [`GpuTileCache`] (passing
     /// `textured = false` renders untextured WGS84 ellipsoid shading through
@@ -141,7 +189,8 @@ impl DrawSnapshot {
         match (textured, cache) {
             (true, Some(gpu_cache)) => {
                 for vis in visible {
-                    let resolved = if matches!(vis.tex_id.scheme, TileScheme::PolarCap { .. }) {
+                    let resolved = if matches!(vis.tex_id.scheme, PlanetaryScheme::PolarCap { .. })
+                    {
                         let key = bundled_tile_key(vis.tex_id);
                         gpu_cache
                             .carrier(&key)
@@ -237,11 +286,10 @@ impl RenderKey {
         mix(&mut h, snap.tiles.len() as u64);
         for t in &snap.tiles {
             let scheme_tag: u64 = match t.visible.id.scheme {
-                TileScheme::Geodetic => 1,
-                TileScheme::WebMercator => 2,
-                TileScheme::PolarCap { north: true } => 3,
-                TileScheme::PolarCap { north: false } => 4,
-                TileScheme::RasterPyramid { max_level } => 100 + u64::from(max_level),
+                PlanetaryScheme::Geodetic => 1,
+                PlanetaryScheme::WebMercator => 2,
+                PlanetaryScheme::PolarCap { north: true } => 3,
+                PlanetaryScheme::PolarCap { north: false } => 4,
             };
             mix(&mut h, scheme_tag);
             mix(&mut h, u64::from(t.visible.id.level));
@@ -912,6 +960,14 @@ impl GlobeRenderer {
             }
 
             if let Some(gpu_tile) = &draw.texture {
+                if gpu_tile.format != PixelFormat::Rgba8UnormSrgb {
+                    tracing::warn!(
+                        tile_id = gpu_tile.tile_id,
+                        format = ?gpu_tile.format,
+                        "Skipping non-sRGB tile texture in filterable basemap pipeline"
+                    );
+                    continue;
+                }
                 self.tile_bind_groups
                     .entry(gpu_tile.tile_id)
                     .or_insert_with(|| {
@@ -983,7 +1039,7 @@ impl GlobeRenderer {
         for (i, draw) in snapshot.tiles.iter().enumerate() {
             let offset_eye = (draw.visible.origin_ecef_m - eye).as_vec3().to_array();
             let (tile_kind, grid_anchor) = match draw.visible.id.scheme {
-                TileScheme::PolarCap { north } => {
+                PlanetaryScheme::PolarCap { north } => {
                     let (lat0, lon0, dx0, dy0) = sample_tile_surface(draw.visible.id, 0.5, 0.5)
                         .map(|(lat, lon, _, _, dx, dy)| (lat, lon, dx, dy))
                         .unwrap_or((if north { 90.0 } else { -90.0 }, 0.0, 0.0, 0.0));
@@ -1004,7 +1060,7 @@ impl GlobeRenderer {
                         [dx0 as f32, dy0 as f32, colat_phase as f32, lon_phase as f32],
                     )
                 }
-                _ => {
+                PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => {
                     let (anchor_a, anchor_b) =
                         tile_grid_anchor(draw.visible.id).unwrap_or((0.0, 0.0));
                     // Wrap tile anchor phase modulo `grid_step_deg` in f64 on
@@ -1112,5 +1168,44 @@ impl GlobeRenderer {
                 pass.draw_indexed(self.surface_indices.clone(), 0, 0..1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NATIVE_PRIMARY_BACKENDS, adaptive_grid_step_deg, clamp_to_primary_backends};
+
+    #[test]
+    fn clamps_backends_to_primary_and_falls_back_when_empty() {
+        assert_eq!(
+            clamp_to_primary_backends(wgpu::Backends::VULKAN),
+            wgpu::Backends::VULKAN
+        );
+        assert_eq!(
+            clamp_to_primary_backends(wgpu::Backends::VULKAN | wgpu::Backends::GL),
+            wgpu::Backends::VULKAN
+        );
+        assert_eq!(
+            clamp_to_primary_backends(wgpu::Backends::GL | wgpu::Backends::BROWSER_WEBGPU),
+            NATIVE_PRIMARY_BACKENDS
+        );
+        assert_eq!(
+            clamp_to_primary_backends(wgpu::Backends::empty()),
+            NATIVE_PRIMARY_BACKENDS
+        );
+    }
+
+    #[test]
+    fn adaptive_grid_step_divides_ninety_degrees_cleanly() {
+        for m_per_pt in [1e-4, 0.002, 0.5, 10.0, 500.0, 16_000.0, 100_000.0] {
+            let step = adaptive_grid_step_deg(m_per_pt);
+            let ratio = 90.0 / step;
+            assert!(
+                (ratio - ratio.round()).abs() < 1e-6,
+                "step {step} does not cleanly divide 90 deg (ratio={ratio})"
+            );
+        }
+        assert_eq!(adaptive_grid_step_deg(16_320.0), 15.0);
+        assert_eq!(adaptive_grid_step_deg(0.002), 0.000_01);
     }
 }

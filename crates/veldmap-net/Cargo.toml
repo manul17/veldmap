@@ -12,10 +12,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
-veldmap-raster = { path = "../veldmap-raster" }
 
 [dev-dependencies]
-image.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 
 [lints]

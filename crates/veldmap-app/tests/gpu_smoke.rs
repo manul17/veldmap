@@ -25,16 +25,16 @@ use std::collections::HashSet;
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
-use veldmap_app::bundled_basemap::BUNDLED_BASEMAP_JPEG;
+use veldmap_app::BUNDLED_BASEMAP_JPEG;
 use veldmap_app::gpu_tiles::{
     GpuTileCache, PendingUploads, UploadPassParams, bundled_tile_key, source_tile_key,
     texture_byte_size,
 };
-use veldmap_app::render::{DrawSnapshot, GlobeRenderer, RenderParams};
+use veldmap_app::render::{DrawSnapshot, GlobeRenderer, RenderParams, clamp_to_primary_backends};
 use veldmap_core::geo::camera::{Camera, MIN_HEIGHT_M};
 use veldmap_core::geo::projection::WEB_MERCATOR_LIMIT_DEG;
 use veldmap_core::tile::{
-    DecodedTile, PixelFormat, QuadTileId, QuadtreeConfig, SourceId, TileScheme,
+    DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId,
 };
 use veldmap_raster::{BundledBasemap, generate_linear_mipmaps};
 
@@ -51,15 +51,9 @@ fn shared_bundled_basemap() -> &'static BundledBasemap {
     })
 }
 
-const NATIVE_PRIMARY_BACKENDS: wgpu::Backends =
-    wgpu::Backends::PRIMARY.difference(wgpu::Backends::BROWSER_WEBGPU);
-
 fn request_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-    desc.backends &= NATIVE_PRIMARY_BACKENDS;
-    if desc.backends.is_empty() {
-        desc.backends = NATIVE_PRIMARY_BACKENDS;
-    }
+    desc.backends = clamp_to_primary_backends(desc.backends);
     let instance = wgpu::Instance::new(desc);
 
     let adapter = pollster::block_on(async {
@@ -560,25 +554,25 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
     let tx = pending.sender().expect("pending sender");
 
     let fine_id = QuadTileId {
-        scheme: TileScheme::Geodetic,
+        scheme: PlanetaryScheme::Geodetic,
         level: 2,
         x: 4,
         y: 1,
     };
     let root_west_id = QuadTileId {
-        scheme: TileScheme::Geodetic,
+        scheme: PlanetaryScheme::Geodetic,
         level: 0,
         x: 0,
         y: 0,
     };
     let root_east_id = QuadTileId {
-        scheme: TileScheme::Geodetic,
+        scheme: PlanetaryScheme::Geodetic,
         level: 0,
         x: 1,
         y: 0,
     };
     let south_cap_id = QuadTileId {
-        scheme: TileScheme::PolarCap { north: false },
+        scheme: PlanetaryScheme::PolarCap { north: false },
         level: 0,
         x: 0,
         y: 0,
@@ -704,25 +698,25 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
 
     for id in [
         QuadTileId {
-            scheme: TileScheme::Geodetic,
+            scheme: PlanetaryScheme::Geodetic,
             level: 0,
             x: 0,
             y: 0,
         },
         QuadTileId {
-            scheme: TileScheme::Geodetic,
+            scheme: PlanetaryScheme::Geodetic,
             level: 0,
             x: 1,
             y: 0,
         },
         QuadTileId {
-            scheme: TileScheme::PolarCap { north: true },
+            scheme: PlanetaryScheme::PolarCap { north: true },
             level: 0,
             x: 0,
             y: 0,
         },
         QuadTileId {
-            scheme: TileScheme::PolarCap { north: false },
+            scheme: PlanetaryScheme::PolarCap { north: false },
             level: 0,
             x: 0,
             y: 0,
@@ -905,10 +899,11 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
             quad_data[off..off + 4].copy_from_slice(&color);
         }
     }
-    let synthetic_east = DecodedTile::new(64, 64, PixelFormat::Rgba8UnormSrgb, quad_data);
+    let synthetic_east = DecodedTile::try_new(64, 64, PixelFormat::Rgba8UnormSrgb, quad_data)
+        .expect("valid synthetic east tile");
     let mut overzoom_cache = GpuTileCache::new(1024 * 1024);
     let east_root = bundled_tile_key(QuadTileId {
-        scheme: TileScheme::Geodetic,
+        scheme: PlanetaryScheme::Geodetic,
         level: 0,
         x: 1,
         y: 0,
@@ -1116,44 +1111,47 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
 
     // 1. CPU linear-light mipmaps upload into GpuTileCache with exact mip byte accounting.
-    let mut bundled_wm = DecodedTile::new(
+    let mut bundled_wm = DecodedTile::try_new(
         64,
         64,
         PixelFormat::Rgba8UnormSrgb,
         [40, 80, 210, 255].repeat(64 * 64),
-    );
+    )
+    .expect("valid bundled wm tile");
     generate_linear_mipmaps(&mut bundled_wm);
     assert_eq!(bundled_wm.mip_level_count(), 7);
     let expected_bytes = texture_byte_size(64, 64, PixelFormat::Rgba8UnormSrgb, 7);
     assert_eq!(bundled_wm.byte_size(), expected_bytes);
 
-    let mut bundled_polar = DecodedTile::new(
+    let mut bundled_polar = DecodedTile::try_new(
         64,
         64,
         PixelFormat::Rgba8UnormSrgb,
         [235, 235, 235, 255].repeat(64 * 64),
-    );
+    )
+    .expect("valid bundled polar tile");
     generate_linear_mipmaps(&mut bundled_polar);
 
-    let mut live_tile = DecodedTile::new(
+    let mut live_tile = DecodedTile::try_new(
         64,
         64,
         PixelFormat::Rgba8UnormSrgb,
         [40, 200, 70, 255].repeat(64 * 64),
-    );
+    )
+    .expect("valid live tile");
     generate_linear_mipmaps(&mut live_tile);
 
     // Budget holds exactly 2 mipmapped 64x64 tiles so Step 4 genuinely
     // exercises active-frame eviction protection and refusal deferral.
     let mut cache = GpuTileCache::new(expected_bytes * 2);
     let wm_bundled_root = bundled_tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 0,
         x: 0,
         y: 0,
     });
     let south_polar_root = bundled_tile_key(QuadTileId {
-        scheme: TileScheme::PolarCap { north: false },
+        scheme: PlanetaryScheme::PolarCap { north: false },
         level: 0,
         x: 0,
         y: 0,
@@ -1227,7 +1225,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     let live_root = source_tile_key(
         live_source,
         QuadTileId {
-            scheme: TileScheme::WebMercator,
+            scheme: PlanetaryScheme::WebMercator,
             level: 0,
             x: 0,
             y: 0,

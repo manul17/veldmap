@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
+use super::evict::EVICT_BATCH_ROWS;
+use super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE};
 use super::*;
 use crate::TestTempDir;
 
@@ -9,10 +12,8 @@ fn key(source: &str, level: u8, x: u32, y: u32) -> DiskTileKey {
 }
 
 fn count_rows(cache: &TileDiskCache, table: &str) -> i64 {
-    let inner = lock_unpoisoned(&cache.inner);
-    inner
-        .conn
-        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+    let conn = lock_unpoisoned(&cache.writer);
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
         .expect("count rows")
 }
 
@@ -39,6 +40,7 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
     cache.put(&k_c, &[3u8; 40]).expect("put c");
     assert_eq!(cache.stats().expect("stats").payload_bytes, 100);
     assert_eq!(cache.stats().expect("stats").tile_count, 3);
+    assert_eq!(cache.write_generation(), 3);
 
     // Touch `k_a` (debounced in memory) -> must flush before eviction so `k_b`
     // is evicted first, NOT `k_a`.
@@ -67,26 +69,26 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
 #[test]
 fn pragmas_schema_version_and_covering_lru_index_are_configured() {
     let cache = TileDiskCache::open_in_memory(4096).expect("open mem");
-    let inner = lock_unpoisoned(&cache.inner);
+    let conn = lock_unpoisoned(&cache.writer);
 
-    let page_size: i64 = inner
-        .conn
+    let page_size: i64 = conn
         .query_row("PRAGMA page_size;", [], |r| r.get(0))
         .expect("page_size");
-    let foreign_keys: i64 = inner
-        .conn
+    let foreign_keys: i64 = conn
         .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
         .expect("foreign_keys");
-    let user_version: i64 = inner
-        .conn
+    let user_version: i64 = conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))
         .expect("user_version");
+    let busy_timeout: i64 = conn
+        .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
+        .expect("busy_timeout");
     assert_eq!(page_size, SQLITE_PAGE_SIZE);
     assert_eq!(foreign_keys, 1);
     assert_eq!(user_version, SCHEMA_VERSION);
+    assert_eq!(busy_timeout, SQLITE_BUSY_TIMEOUT_MS);
 
-    let mut stmt = inner
-        .conn
+    let mut stmt = conn
         .prepare(
             "EXPLAIN QUERY PLAN
              SELECT tile_id, byte_size FROM tile_meta
@@ -134,13 +136,11 @@ fn recovers_from_corrupt_or_legacy_v1_sqlite_file_and_persists_across_reopen() {
     {
         let upgraded = TileDiskCache::open(&db_path, 4096).expect("upgrade legacy db");
         assert_eq!(upgraded.stats().expect("stats").tile_count, 0);
-        let inner = lock_unpoisoned(&upgraded.inner);
-        let page_size: i64 = inner
-            .conn
+        let conn = lock_unpoisoned(&upgraded.writer);
+        let page_size: i64 = conn
             .query_row("PRAGMA page_size;", [], |r| r.get(0))
             .expect("upgraded page_size");
-        let user_version: i64 = inner
-            .conn
+        let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .expect("upgraded user_version");
         assert_eq!(page_size, SQLITE_PAGE_SIZE);
@@ -155,13 +155,13 @@ fn recovers_from_corrupt_or_legacy_v1_sqlite_file_and_persists_across_reopen() {
 
     let k1 = key("gibs", 3, 2, 1);
     cache.put(&k1, b"png-bytes").expect("put k1");
-    let ts_before = lock_unpoisoned(&cache.inner).last_ts_ms;
+    let ts_before = cache.last_ts_ms.load(Ordering::Acquire);
     drop(cache);
 
     // 3. Reopen and verify persistence + monotonic timestamp seed + shrinking + clear.
     let reopened = TileDiskCache::open(&db_path, 4096).expect("reopen");
     assert!(
-        lock_unpoisoned(&reopened.inner).last_ts_ms >= ts_before,
+        reopened.last_ts_ms.load(Ordering::Acquire) >= ts_before,
         "reopen must seed last_ts_ms from MAX(last_used_ms)"
     );
     assert_eq!(
@@ -193,6 +193,55 @@ fn recovers_from_corrupt_or_legacy_v1_sqlite_file_and_persists_across_reopen() {
         "clear() should reclaim space (before={before_clear}, after={})",
         after_clear.file_bytes
     );
+}
+
+#[test]
+fn file_backed_open_waits_for_brief_external_lock_and_serves_concurrent_wal_readers() {
+    let dir = TestTempDir::new("sqlite-wal-busy");
+    let db_path = dir.path().join("tiles.sqlite3");
+
+    let initial = TileDiskCache::open(&db_path, 1024 * 1024).expect("initial open");
+    let k0 = key("eox", 2, 1, 1);
+    initial.put(&k0, b"cached-payload").expect("seed tile");
+    drop(initial);
+
+    // Hold an exclusive transaction briefly on a separate connection; opening
+    // `TileDiskCache` must wait via `busy_timeout` instead of failing immediately
+    // with `SQLITE_BUSY` on `PRAGMA page_count`/`user_version`.
+    let lock_path = db_path.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let locker = thread::spawn(move || {
+        let mut conn = Connection::open(&lock_path).expect("open locker");
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Exclusive)
+            .expect("exclusive tx");
+        let _ = ready_tx.send(());
+        thread::sleep(Duration::from_millis(80));
+        tx.commit().expect("commit locker");
+    });
+    ready_rx.recv().expect("locker acquired");
+
+    let cache =
+        Arc::new(TileDiskCache::open(&db_path, 1024 * 1024).expect("open under brief lock"));
+    locker.join().expect("join locker");
+
+    // Verify file-backed reads work concurrently even while the writer lock is held.
+    let writer_guard = lock_unpoisoned(&cache.writer);
+    let reader_cache = Arc::clone(&cache);
+    let reader = thread::spawn(move || {
+        assert_eq!(
+            reader_cache.get(&k0).expect("concurrent wal read"),
+            Some(b"cached-payload".to_vec())
+        );
+        assert_eq!(
+            reader_cache.stats().expect("concurrent stats").tile_count,
+            1
+        );
+    });
+    reader
+        .join()
+        .expect("reader completed without blocking on writer");
+    drop(writer_guard);
 }
 
 #[test]

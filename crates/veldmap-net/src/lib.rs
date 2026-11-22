@@ -1,31 +1,25 @@
 //! Asynchronous HTTP tile streaming, live basemap specifications, per-host
-//! concurrency limiting, immediate `CancelToken` abort, and bounded CPU decode
-//! pool for VeldMap.
+//! concurrency limiting, and immediate `CancelToken` abort for VeldMap.
 //!
 //! Uses `reqwest` + `rustls` with the explicit `ring` cryptography provider
 //! (zero OpenSSL or `aws-lc-sys` CMake/NASM build requirements), stays
-//! decoupled from `veldmap-storage` via [`TileBlobStore`], and emits decoded
-//! `Rgba8UnormSrgb` tiles with CPU linear-light mipmaps to a caller-supplied
-//! completion channel.
+//! decoupled from `veldmap-storage` via [`TileBlobStore`], and stays decoupled
+//! from `veldmap-raster` codecs via [`TileDecodeExecutor`].
 
 use thiserror::Error;
-use veldmap_core::tile::{QuadTileId, TileScheme};
+use veldmap_core::io::CancelToken;
+use veldmap_core::tile::{PlanetaryScheme, QuadTileId, TileKey};
 
-pub mod basemap;
-pub mod decode_pool;
-pub mod fetcher;
-pub mod http;
+mod basemap;
+mod fetcher;
+mod http;
 
 pub use basemap::{
-    CustomBasemapConfig, EOX_S2_MAX_LEVEL, EOX_S2_URL_TEMPLATE, GIBS_BLUE_MARBLE_MAX_LEVEL,
-    GIBS_BLUE_MARBLE_URL_TEMPLATE, GIBS_VIIRS_MAX_LEVEL, GIBS_VIIRS_URL_TEMPLATE, LiveBasemapSpec,
+    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, LiveBasemapSpec,
     is_valid_iso_date,
 };
-pub use decode_pool::{DecodeCompletion, DecodeJob, DecodePool, DecodePoolHandle, Wakeup};
 pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
-pub use http::{
-    DEFAULT_MAX_CONCURRENT_PER_HOST, DEFAULT_MAX_TILE_RESPONSE_BYTES, default_user_agent,
-};
+pub use http::sanitize_url_for_display;
 
 /// Minimal encoded-tile persistence boundary injected into
 /// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from SQLite and
@@ -41,6 +35,29 @@ pub trait TileBlobStore: Send + Sync + 'static {
     fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String>;
 }
 
+/// Completion callback executed by a [`TileDecodeExecutor`] after decode
+/// finishes (`Ok(raw_bytes)` after forwarding the decoded tile, or `Err(msg)`
+/// if decode failed or panicked).
+pub type DecodeCompletion = Box<dyn FnOnce(Result<Vec<u8>, String>) + Send + 'static>;
+
+/// Single encoded-tile decode request submitted from [`LiveTilePipeline`] to
+/// an injected [`TileDecodeExecutor`].
+pub struct DecodeRequest {
+    pub key: TileKey,
+    pub bytes: Vec<u8>,
+    pub cancel: CancelToken,
+    pub on_decoded: DecodeCompletion,
+}
+
+/// Narrow CPU decode submission boundary injected into [`LiveTilePipeline`],
+/// keeping `veldmap-net` permanently free of `veldmap-raster` and image codecs.
+pub trait TileDecodeExecutor: Send + Sync + 'static {
+    /// Enqueue `request` for asynchronous CPU decoding. Returns `false` if the
+    /// request was rejected (e.g. queue closed, cancelled, or full under
+    /// backpressure); rejected requests are dropped by the executor.
+    fn submit(&self, request: DecodeRequest) -> bool;
+}
+
 /// Errors produced by live basemap URL resolution and HTTP streaming setup.
 #[derive(Debug, Error)]
 pub enum NetError {
@@ -50,14 +67,14 @@ pub enum NetError {
     PolarCapForbidden,
     #[error("tile scheme mismatch: requested {requested:?}, expected {expected:?}")]
     SchemeMismatch {
-        requested: TileScheme,
-        expected: TileScheme,
+        requested: PlanetaryScheme,
+        expected: PlanetaryScheme,
     },
     #[error("tile level {level} exceeds source max_level {max_level}")]
     LevelAboveMax { level: u8, max_level: u8 },
     #[error("tile coordinates ({x}, {y}) out of range for {scheme:?} z={level}")]
     TileOutOfRange {
-        scheme: TileScheme,
+        scheme: PlanetaryScheme,
         level: u8,
         x: u32,
         y: u32,

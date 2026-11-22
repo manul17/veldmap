@@ -1,48 +1,24 @@
 //! Application-wide storage ownership (`AppStorage`): platform storage paths,
-//! persisted `AppSettings`, shared SQLite WAL `TileDiskCache`, and the
+//! persisted [`AppSettings`], shared SQLite WAL [`TileDiskCache`], and the
 //! serialized off-UI-thread `DiskCacheWorker`.
 //!
-//! Lifted out of `BasemapManager` so future subsystems (local QOI/LZ4 raster
-//! tile caching, session persistence, local library catalog, and credentials)
-//! share one durable storage owner without coupling through basemap code.
+//! Stays completely decoupled from `veldmap-net` (using `veldmap_core::io::Wakeup`
+//! and `TileDiskCache::write_generation()`) so local/offline storage never
+//! depends on HTTP streaming.
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use veldmap_core::io::lock_unpoisoned;
-use veldmap_core::tile::QuadTileId;
-use veldmap_net::{TileBlobStore, Wakeup};
-use veldmap_storage::{AppSettings, DiskCacheStats, DiskTileKey, StoragePaths, TileDiskCache};
+use veldmap_core::io::{Wakeup, lock_unpoisoned};
+use veldmap_storage::{DiskCacheStats, StoragePaths, TileDiskCache};
+
+use crate::settings::AppSettings;
 
 /// Minimum interval between event-driven disk-cache stats refreshes while the
-/// Settings window is open and new tiles are streaming in.
+/// Settings window is open and new tiles are being written.
 const DISK_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Adapter bridging `veldmap-storage`'s [`TileDiskCache`] into `veldmap-net`'s
-/// storage-agnostic [`TileBlobStore`] trait.
-struct SqliteBlobStore(Arc<TileDiskCache>);
-
-impl TileBlobStore for SqliteBlobStore {
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String> {
-        let key = DiskTileKey::new(source_key, id.scheme, id.level, id.x, id.y);
-        self.0.get(&key).map_err(|e| e.to_string())
-    }
-
-    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), String> {
-        let key = DiskTileKey::new(source_key, id.scheme, id.level, id.x, id.y);
-        self.0
-            .put(&key, payload)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String> {
-        let key = DiskTileKey::new(source_key, id.scheme, id.level, id.x, id.y);
-        self.0.delete(&key).map(|_| ()).map_err(|e| e.to_string())
-    }
-}
 
 /// UI-readable snapshot of asynchronous disk cache stats and maintenance state.
 #[derive(Clone, Debug, Default)]
@@ -70,7 +46,7 @@ struct DiskCacheWorker {
 }
 
 impl DiskCacheWorker {
-    fn spawn(cache: Arc<TileDiskCache>, wakeup: Wakeup) -> Self {
+    fn spawn(cache: Arc<TileDiskCache>, wakeup: Wakeup) -> Option<Self> {
         let (tx, rx) = mpsc::channel::<DiskCacheCmd>();
         let state = Arc::new(Mutex::new(DiskCacheUiState {
             available: true,
@@ -127,18 +103,18 @@ impl DiskCacheWorker {
                     }
                 }
             }) {
-            Ok(h) => Some(h),
+            Ok(h) => h,
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to spawn disk cache maintenance worker");
-                None
+                return None;
             }
         };
 
-        Self {
+        Some(Self {
             tx: Some(tx),
             state,
-            handle,
-        }
+            handle: Some(handle),
+        })
     }
 
     fn snapshot(&self) -> DiskCacheUiState {
@@ -162,6 +138,12 @@ impl DiskCacheWorker {
     }
 
     fn request_clear(&self) {
+        let Some(tx) = &self.tx else {
+            let mut st = lock_unpoisoned(&self.state);
+            st.busy = false;
+            st.notice = Some("Disk cache worker unavailable.".to_owned());
+            return;
+        };
         {
             let mut st = lock_unpoisoned(&self.state);
             if st.busy {
@@ -170,8 +152,10 @@ impl DiskCacheWorker {
             st.busy = true;
             st.notice = None;
         }
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(DiskCacheCmd::Clear);
+        if tx.send(DiskCacheCmd::Clear).is_err() {
+            let mut st = lock_unpoisoned(&self.state);
+            st.busy = false;
+            st.notice = Some("Clear failed: maintenance worker disconnected.".to_owned());
         }
     }
 
@@ -201,7 +185,7 @@ pub struct AppStorage {
     disk_cache: Option<Arc<TileDiskCache>>,
     disk_worker: Option<DiskCacheWorker>,
     last_settings_open: bool,
-    last_stats_completed_net: u64,
+    last_stats_write_gen: u64,
     last_stats_refresh: Option<Instant>,
     last_handled_clear_gen: u64,
 }
@@ -241,7 +225,7 @@ impl AppStorage {
 
         let disk_worker = disk_cache
             .as_ref()
-            .map(|cache| DiskCacheWorker::spawn(Arc::clone(cache), wakeup));
+            .and_then(|cache| DiskCacheWorker::spawn(Arc::clone(cache), wakeup));
 
         Self {
             paths: resolved_paths,
@@ -249,14 +233,10 @@ impl AppStorage {
             disk_cache,
             disk_worker,
             last_settings_open: false,
-            last_stats_completed_net: 0,
+            last_stats_write_gen: 0,
             last_stats_refresh: None,
             last_handled_clear_gen: 0,
         }
-    }
-
-    pub fn paths(&self) -> Option<&StoragePaths> {
-        self.paths.as_ref()
     }
 
     pub fn settings(&self) -> &AppSettings {
@@ -267,21 +247,16 @@ impl AppStorage {
         self.disk_cache.as_ref().map(Arc::clone)
     }
 
-    /// Build a [`TileBlobStore`] adapter backed by the shared SQLite cache for
-    /// `veldmap-net` tile streaming.
-    pub fn tile_blob_store(&self) -> Option<Arc<dyn TileBlobStore>> {
-        self.disk_cache
-            .as_ref()
-            .map(|cache| Arc::new(SqliteBlobStore(Arc::clone(cache))) as Arc<dyn TileBlobStore>)
-    }
-
-    /// Update and durably persist [`AppSettings`], forwarding any disk-cache
-    /// cap change to the off-UI-thread maintenance worker. Returns `true` if
-    /// settings changed.
+    /// Update and durably persist [`AppSettings`] when changed, forwarding any
+    /// disk-cache cap change to the off-UI-thread maintenance worker. Returns
+    /// `true` if settings changed.
     pub fn update_settings(&mut self, mut next: AppSettings) -> bool {
         next.normalize();
         let prev_cache_bytes = self.settings.disk_cache_max_bytes();
         let changed = next != self.settings;
+        if !changed {
+            return false;
+        }
         self.settings = next;
         self.save_settings();
 
@@ -291,10 +266,10 @@ impl AppStorage {
         {
             worker.request_set_max_bytes(next_cache_bytes);
         }
-        changed
+        true
     }
 
-    /// Mutate `AppSettings` in place, normalize, and persist durably.
+    /// Mutate `AppSettings` in place, normalize, and persist durably if changed.
     pub fn mutate_settings(&mut self, edit: impl FnOnce(&mut AppSettings)) -> bool {
         let mut next = self.settings.clone();
         edit(&mut next);
@@ -302,7 +277,7 @@ impl AppStorage {
     }
 
     /// Persist the current [`AppSettings`] durably via
-    /// `write_atomic_durable_private()`.
+    /// `write_json_durable_private()`.
     pub fn save_settings(&self) {
         if let Some(paths) = &self.paths
             && let Err(err) = self.settings.save(paths)
@@ -336,24 +311,25 @@ impl AppStorage {
     }
 
     /// Event-driven disk-cache stats refresh: triggers an async stats query
-    /// only when Settings opens or when new live tiles have landed and at least
-    /// `DISK_STATS_REFRESH_INTERVAL` has elapsed (zero idle queries/repaints).
-    pub fn maybe_refresh_disk_stats(&mut self, settings_open: bool, completed_from_net: u64) {
+    /// only when Settings opens or when `TileDiskCache::write_generation()`
+    /// advances and at least `DISK_STATS_REFRESH_INTERVAL` has elapsed (zero
+    /// idle queries/repaints).
+    pub fn maybe_refresh_disk_stats(&mut self, settings_open: bool) {
         let just_opened = settings_open && !self.last_settings_open;
         self.last_settings_open = settings_open;
         if !settings_open {
             return;
         }
-        let Some(worker) = &self.disk_worker else {
+        let (Some(worker), Some(cache)) = (&self.disk_worker, &self.disk_cache) else {
             return;
         };
+        let write_gen = cache.write_generation();
         let now = Instant::now();
         let interval_elapsed = self
             .last_stats_refresh
             .is_none_or(|t| now.duration_since(t) >= DISK_STATS_REFRESH_INTERVAL);
-        if just_opened || (completed_from_net != self.last_stats_completed_net && interval_elapsed)
-        {
-            self.last_stats_completed_net = completed_from_net;
+        if just_opened || (write_gen != self.last_stats_write_gen && interval_elapsed) {
+            self.last_stats_write_gen = write_gen;
             self.last_stats_refresh = Some(now);
             worker.request_refresh();
         }
@@ -389,3 +365,42 @@ impl AppStorage {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub(crate) struct TempTestRoot(PathBuf);
+
+    impl TempTestRoot {
+        pub(crate) fn new(label: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "veldmap-app-test-{label}-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp test dir");
+            Self(dir)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "storage_tests.rs"]
+mod tests;

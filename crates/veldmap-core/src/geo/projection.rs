@@ -6,8 +6,7 @@
 
 use glam::DVec3;
 
-pub use super::geodesy::{Ellipsoid, WGS84};
-use super::geodesy::{Geodetic, SEMI_MAJOR_M, unwind};
+use super::geodesy::{Ellipsoid, Geodetic, SEMI_MAJOR_M, WGS84, unwind};
 
 /// Krasovsky 1940 ellipsoid (SK-42, Gauss-Kruger zones, MSK local systems).
 pub const KRASOVSKY: Ellipsoid = Ellipsoid {

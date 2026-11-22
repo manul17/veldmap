@@ -1,19 +1,20 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use image::{ImageBuffer, ImageFormat, Rgba};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use veldmap_core::io::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{QuadTileId, TileKey, TileScheme};
+use veldmap_core::io::{CancelToken, Wakeup, lock_unpoisoned};
+use veldmap_core::tile::{DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, TileKey};
 use veldmap_net::{
-    CustomBasemapConfig, FetcherConfig, LiveBasemapSpec, LiveTilePipeline, TileBlobStore, Wakeup,
+    CustomBasemapConfig, DecodeRequest, FetcherConfig, LiveBasemapSpec, LiveTilePipeline,
+    TileBlobStore, TileDecodeExecutor,
 };
 
-type BlobMapKey = (String, TileScheme, u8, u32, u32);
+type BlobMapKey = (String, PlanetaryScheme, u8, u32, u32);
+
+const TEST_TILE_MAGIC: &[u8] = b"VELDMAP_TEST_TILE_8X8";
 
 #[derive(Default)]
 struct MemBlobStore {
@@ -44,11 +45,45 @@ impl TileBlobStore for MemBlobStore {
     }
 }
 
-fn make_png_bytes(color: [u8; 4]) -> Vec<u8> {
-    let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_pixel(8, 8, Rgba(color));
-    let mut out = Vec::new();
-    img.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
-        .expect("encode png");
+/// Lightweight test [`TileDecodeExecutor`] keeping `veldmap-net` integration
+/// tests completely independent of `veldmap-raster` and `image`.
+struct TestDecodeExecutor {
+    done_tx: mpsc::Sender<(TileKey, DecodedTile)>,
+    wakeup: Wakeup,
+}
+
+impl TileDecodeExecutor for TestDecodeExecutor {
+    fn submit(&self, req: DecodeRequest) -> bool {
+        if req.cancel.is_cancelled() {
+            return false;
+        }
+        if req.bytes.starts_with(TEST_TILE_MAGIC) {
+            let tile = DecodedTile::try_with_mips(
+                8,
+                8,
+                PixelFormat::Rgba8UnormSrgb,
+                vec![128u8; 8 * 8 * 4],
+                vec![
+                    vec![128u8; 4 * 4 * 4],
+                    vec![128u8; 2 * 2 * 4],
+                    vec![128u8; 4],
+                ],
+            )
+            .expect("synthetic tile");
+            if self.done_tx.send((req.key, tile)).is_ok() {
+                (req.on_decoded)(Ok(req.bytes));
+                (self.wakeup)();
+            }
+        } else {
+            (req.on_decoded)(Err("corrupt test tile payload".to_owned()));
+        }
+        true
+    }
+}
+
+fn make_valid_tile_bytes(tag: u8) -> Vec<u8> {
+    let mut out = TEST_TILE_MAGIC.to_vec();
+    out.push(tag);
     out
 }
 
@@ -69,7 +104,7 @@ struct MockResponse {
 }
 
 impl MockResponse {
-    fn ok_png(body: Vec<u8>, delay: Duration) -> Self {
+    fn ok_tile(body: Vec<u8>, delay: Duration) -> Self {
         Self {
             status: 200,
             headers: "Content-Type: image/png\r\n".to_owned(),
@@ -204,10 +239,10 @@ fn custom_spec(addr: std::net::SocketAddr, max_level: u8) -> LiveBasemapSpec {
 
 #[test]
 fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() {
-    let png = make_png_bytes([30, 180, 90, 255]);
-    let png_c = png.clone();
+    let payload = make_valid_tile_bytes(1);
+    let payload_c = payload.clone();
     let server = spawn_mock_server(move |_, _| {
-        MockResponse::ok_png(png_c.clone(), Duration::from_millis(25))
+        MockResponse::ok_tile(payload_c.clone(), Duration::from_millis(25))
     });
 
     let disk_cache: Arc<dyn TileBlobStore> = Arc::new(MemBlobStore::default());
@@ -217,13 +252,16 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
     let wakeup: Wakeup = Arc::new(move || {
         wakes_c.fetch_add(1, Ordering::AcqRel);
     });
+    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(TestDecodeExecutor {
+        done_tx,
+        wakeup: Arc::clone(&wakeup),
+    });
 
     let cfg = FetcherConfig {
         max_concurrent_per_host: 2,
-        decode_threads: 2,
         ..FetcherConfig::default()
     };
-    let pipeline = LiveTilePipeline::spawn(cfg, Some(Arc::clone(&disk_cache)), done_tx, wakeup)
+    let pipeline = LiveTilePipeline::spawn(cfg, Some(Arc::clone(&disk_cache)), decoder, wakeup)
         .expect("spawn pipeline");
 
     let spec = custom_spec(server.addr, 2);
@@ -232,7 +270,7 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
     let valid_keys: Vec<TileKey> = (0..4u32)
         .map(|x| {
             spec.tile_key(QuadTileId {
-                scheme: TileScheme::WebMercator,
+                scheme: PlanetaryScheme::WebMercator,
                 level: 2,
                 x,
                 y: 0,
@@ -240,13 +278,13 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
         })
         .collect();
     let forbidden_polar = spec.tile_key(QuadTileId {
-        scheme: TileScheme::PolarCap { north: true },
+        scheme: PlanetaryScheme::PolarCap { north: true },
         level: 0,
         x: 0,
         y: 0,
     });
     let forbidden_above_max = spec.tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 3,
         x: 0,
         y: 0,
@@ -269,7 +307,6 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
     assert!(!received.contains_key(&forbidden_above_max));
 
     for tile in received.values() {
-        assert!(tile.validate());
         assert_eq!(tile.mip_level_count(), 4);
     }
     assert_eq!(server.hits.load(Ordering::Acquire), 4);
@@ -282,7 +319,7 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
     while Instant::now() < settle_deadline {
         let all_cached = valid_keys.iter().all(|k| {
             disk_cache
-                .get(&spec.cache_key, k.quad_id())
+                .get(spec.cache_key(), k.quad_id().expect("quad"))
                 .ok()
                 .flatten()
                 .is_some()
@@ -319,13 +356,13 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
 
 #[test]
 fn corrupt_disk_blob_self_heals_from_http_and_cached_tiles_do_not_starve_behind_slow_http() {
-    let png = make_png_bytes([20, 120, 240, 255]);
-    let png_c = png.clone();
+    let payload = make_valid_tile_bytes(2);
+    let payload_c = payload.clone();
     let server = spawn_mock_server(move |path, _| {
         if path.contains("/2/1/0") {
-            MockResponse::ok_png(png_c.clone(), Duration::from_secs(5))
+            MockResponse::ok_tile(payload_c.clone(), Duration::from_secs(5))
         } else {
-            MockResponse::ok_png(png_c.clone(), Duration::ZERO)
+            MockResponse::ok_tile(payload_c.clone(), Duration::ZERO)
         }
     });
 
@@ -333,42 +370,54 @@ fn corrupt_disk_blob_self_heals_from_http_and_cached_tiles_do_not_starve_behind_
     let spec = custom_spec(server.addr, 2);
 
     let k_corrupt = spec.tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 2,
         x: 0,
         y: 0,
     });
     let k_slow = spec.tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 2,
         x: 1,
         y: 0,
     });
     let k_cached = spec.tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 2,
         x: 2,
         y: 0,
     });
 
     store
-        .put(&spec.cache_key, k_corrupt.quad_id(), b"not-a-valid-png")
+        .put(
+            spec.cache_key(),
+            k_corrupt.quad_id().expect("quad"),
+            b"not-a-valid-tile",
+        )
         .expect("seed corrupt");
     store
-        .put(&spec.cache_key, k_cached.quad_id(), &png)
+        .put(
+            spec.cache_key(),
+            k_cached.quad_id().expect("quad"),
+            &payload,
+        )
         .expect("seed valid");
 
     let (done_tx, done_rx) = mpsc::channel();
+    let wakeup: Wakeup = Arc::new(|| {});
+    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(TestDecodeExecutor {
+        done_tx,
+        wakeup: Arc::clone(&wakeup),
+    });
     let cfg = FetcherConfig {
         max_concurrent_per_host: 1,
-        decode_threads: 2,
         ..FetcherConfig::default()
     };
     let pipeline = LiveTilePipeline::spawn(
         cfg,
         Some(Arc::clone(&store) as Arc<dyn TileBlobStore>),
-        done_tx,
-        Arc::new(|| {}),
+        decoder,
+        wakeup,
     )
     .expect("spawn pipeline");
     pipeline.set_active_spec(Some(spec));
@@ -399,8 +448,8 @@ fn corrupt_disk_blob_self_heals_from_http_and_cached_tiles_do_not_starve_behind_
 
 #[test]
 fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
-    let png = make_png_bytes([90, 210, 40, 255]);
-    let png_c = png.clone();
+    let payload = make_valid_tile_bytes(3);
+    let payload_c = payload.clone();
     let flaky_hits = Arc::new(AtomicUsize::new(0));
     let flaky_c = Arc::clone(&flaky_hits);
     let server = spawn_mock_server(move |path, _| {
@@ -412,7 +461,7 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
                 delay: Duration::ZERO,
             }
         } else if path.contains("/1/1/0") {
-            MockResponse::ok_png(b"<html>captive portal</html>".to_vec(), Duration::ZERO)
+            MockResponse::ok_tile(b"<html>captive portal</html>".to_vec(), Duration::ZERO)
         } else if path.contains("/1/0/1") {
             let n = flaky_c.fetch_add(1, Ordering::AcqRel);
             if n == 0 {
@@ -423,7 +472,7 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
                     delay: Duration::ZERO,
                 }
             } else {
-                MockResponse::ok_png(png_c.clone(), Duration::ZERO)
+                MockResponse::ok_tile(payload_c.clone(), Duration::ZERO)
             }
         } else {
             MockResponse {
@@ -437,36 +486,40 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
 
     let store = Arc::new(MemBlobStore::default());
     let (done_tx, done_rx) = mpsc::channel();
+    let wakeup: Wakeup = Arc::new(|| {});
+    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(TestDecodeExecutor {
+        done_tx,
+        wakeup: Arc::clone(&wakeup),
+    });
     let cfg = FetcherConfig {
         max_concurrent_per_host: 4,
-        decode_threads: 2,
         transient_retry_backoff: Duration::from_millis(80),
         ..FetcherConfig::default()
     };
     let pipeline = LiveTilePipeline::spawn(
         cfg,
         Some(Arc::clone(&store) as Arc<dyn TileBlobStore>),
-        done_tx,
-        Arc::new(|| {}),
+        decoder,
+        wakeup,
     )
     .expect("spawn pipeline");
     let spec = custom_spec(server.addr, 2);
     pipeline.set_active_spec(Some(spec.clone()));
 
     let k_204 = spec.tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 1,
         x: 0,
         y: 0,
     });
     let k_corrupt = spec.tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 1,
         x: 1,
         y: 0,
     });
     let k_flaky = spec.tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 1,
         x: 0,
         y: 1,
@@ -474,9 +527,11 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
 
     pipeline.reconcile_wanted(&HashSet::from([k_204]), |_| false);
     let d1 = Instant::now() + Duration::from_secs(2);
-    while (pipeline.active_work_count() > 0 || server.hits.load(Ordering::Acquire) < 1)
-        && Instant::now() < d1
-    {
+    while {
+        let st = pipeline.status();
+        (st.in_flight + st.queued > 0 || server.hits.load(Ordering::Acquire) < 1)
+            && Instant::now() < d1
+    } {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(pipeline.status().failed_count, 0);
@@ -494,7 +549,7 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
     assert_eq!(pipeline.status().failed_count, 1);
     assert!(
         store
-            .get(&spec.cache_key, k_corrupt.quad_id())
+            .get(spec.cache_key(), k_corrupt.quad_id().expect("quad"))
             .expect("get")
             .is_none()
     );
@@ -516,19 +571,24 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
 
 #[test]
 fn cancel_token_aborts_slow_inflight_request_promptly_on_shutdown() {
-    let png = make_png_bytes([10, 20, 30, 255]);
-    let server =
-        spawn_mock_server(move |_, _| MockResponse::ok_png(png.clone(), Duration::from_secs(10)));
+    let payload = make_valid_tile_bytes(4);
+    let server = spawn_mock_server(move |_, _| {
+        MockResponse::ok_tile(payload.clone(), Duration::from_secs(10))
+    });
 
     let (done_tx, _done_rx) = mpsc::channel();
-    let pipeline =
-        LiveTilePipeline::spawn(FetcherConfig::default(), None, done_tx, Arc::new(|| {}))
-            .expect("spawn pipeline");
+    let wakeup: Wakeup = Arc::new(|| {});
+    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(TestDecodeExecutor {
+        done_tx,
+        wakeup: Arc::clone(&wakeup),
+    });
+    let pipeline = LiveTilePipeline::spawn(FetcherConfig::default(), None, decoder, wakeup)
+        .expect("spawn pipeline");
     let spec = custom_spec(server.addr, 1);
     pipeline.set_active_spec(Some(spec.clone()));
 
     let k0 = spec.tile_key(QuadTileId {
-        scheme: TileScheme::WebMercator,
+        scheme: PlanetaryScheme::WebMercator,
         level: 0,
         x: 0,
         y: 0,

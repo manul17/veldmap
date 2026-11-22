@@ -1,19 +1,24 @@
-//! Unified tile addressing (`TileKey`, `TileScheme`, `BandKey`, `PixelFormat`),
-//! pure O(1) LRU `TileCache<K, V>`, and scheme-matched WGS84 planetary quadtree
-//! with adaptive Polar Stereographic caps.
+//! Unified tile addressing (`TileKey`, `TileScheme`, `PlanetaryScheme`,
+//! `GlobeScheme`, `BandKey`, `PixelFormat`), pure O(1) LRU `TileCache<K, V>`,
+//! planetary tile projection/sampling, and scheme-matched WGS84 planetary
+//! quadtree with adaptive Polar Stereographic caps.
 
 pub mod cache;
 pub mod decoded;
+pub mod geometry;
 pub mod key;
 pub mod quadtree;
 
 pub use cache::TileCache;
-pub use decoded::{DecodedTile, max_mip_levels, mip_dimensions};
+pub use decoded::{
+    DecodedTile, DecodedTileError, max_mip_levels, mip_chain_byte_size, mip_dimensions,
+};
+pub use geometry::{
+    BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, LatLonTileBounds, POLAR_R_CAP,
+    lat_lon_bounds, mercator_lat_deg, polar_cap_point, sample_tile_surface, web_mercator_y_bounds,
+};
 pub use key::{
-    BandKey, PixelFormat, QuadTileId, SourceId, TileKey, TileScheme, compose_uv_rect, fnv1a_64,
+    BandKey, GlobeScheme, PixelFormat, PlanetaryScheme, QuadTileId, SourceId, TileKey, TileScheme,
+    compose_uv_rect, fnv1a_64,
 };
-pub use quadtree::{
-    DEFAULT_GRID_CELLS, LatLonTileBounds, POLAR_R_CAP, QuadtreeConfig, VisibleTile,
-    adaptive_grid_step_deg, describe_tile, lat_lon_bounds, polar_cap_point, sample_tile_surface,
-    tile_grid_anchor, traverse,
-};
+pub use quadtree::{DEFAULT_GRID_CELLS, QuadtreeConfig, VisibleTile, describe_tile, traverse};

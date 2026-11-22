@@ -109,6 +109,12 @@ impl Camera {
         self.height_m
     }
 
+    /// Vertical focal length in pixels for a viewport of `height_px` physical
+    /// pixels, derived from the camera's active vertical field of view.
+    pub fn focal_length_px(&self, height_px: f64) -> f64 {
+        (height_px * 0.5) / (FOV_Y_DEG * 0.5).to_radians().tan()
+    }
+
     /// Clockwise heading of the top of the viewport from geographic North in
     /// degrees (`[-180, 180]`, `0` = North up). Returns `0.0` at the poles.
     pub fn heading_deg(&self) -> f64 {

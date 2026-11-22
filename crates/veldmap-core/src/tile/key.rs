@@ -82,6 +82,116 @@ impl PixelFormat {
     }
 }
 
+/// Main-globe (non-polar) coarsest-zero planetary tiling scheme for quadtree
+/// traversal (`Geodetic` or `WebMercator`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GlobeScheme {
+    /// Web Mercator XYZ (`1 x 1` root at `z = 0` coarsest, `2^z x 2^z` tiles,
+    /// `|lat| <= 85.05112878 deg`).
+    WebMercator,
+    /// Equirectangular / EPSG:4326 (`2 x 1` root at `z = 0` coarsest,
+    /// `(2 * 2^z) x 2^z` tiles).
+    Geodetic,
+}
+
+impl GlobeScheme {
+    /// Convert to [`PlanetaryScheme`].
+    pub const fn into_planetary(self) -> PlanetaryScheme {
+        match self {
+            Self::WebMercator => PlanetaryScheme::WebMercator,
+            Self::Geodetic => PlanetaryScheme::Geodetic,
+        }
+    }
+
+    /// Convert to [`TileScheme`].
+    pub const fn into_tile_scheme(self) -> TileScheme {
+        self.into_planetary().into_tile_scheme()
+    }
+
+    /// Return the grid dimensions `(cols, rows)` at `level`, or `None` for
+    /// out-of-range shift levels.
+    pub const fn grid_dims(self, level: u8) -> Option<(u32, u32)> {
+        self.into_planetary().grid_dims(level)
+    }
+}
+
+impl From<GlobeScheme> for PlanetaryScheme {
+    fn from(scheme: GlobeScheme) -> Self {
+        scheme.into_planetary()
+    }
+}
+
+impl From<GlobeScheme> for TileScheme {
+    fn from(scheme: GlobeScheme) -> Self {
+        scheme.into_tile_scheme()
+    }
+}
+
+/// Coarsest-zero planetary tiling scheme (excludes `TileScheme::RasterPyramid`
+/// so planetary quadtree arithmetic can never invert finest-zero raster levels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PlanetaryScheme {
+    /// Web Mercator XYZ (`1 x 1` root at `z = 0` coarsest, `2^z x 2^z` tiles,
+    /// `|lat| <= 85.05112878 deg`).
+    WebMercator,
+    /// Equirectangular / EPSG:4326 (`2 x 1` root at `z = 0` coarsest,
+    /// `(2 * 2^z) x 2^z` tiles).
+    Geodetic,
+    /// Adaptive Polar Stereographic square cap (`1 x 1` root at `z = 0`
+    /// coarsest, `2^z x 2^z` tiles covering `|lat| >= 85.05112878 deg`).
+    PolarCap { north: bool },
+}
+
+impl PlanetaryScheme {
+    /// Convert to [`TileScheme`].
+    pub const fn into_tile_scheme(self) -> TileScheme {
+        match self {
+            Self::WebMercator => TileScheme::WebMercator,
+            Self::Geodetic => TileScheme::Geodetic,
+            Self::PolarCap { north } => TileScheme::PolarCap { north },
+        }
+    }
+
+    /// Return the grid dimensions `(cols, rows)` at `level`, or `None` for
+    /// out-of-range shift levels.
+    pub const fn grid_dims(self, level: u8) -> Option<(u32, u32)> {
+        match self {
+            Self::WebMercator | Self::PolarCap { .. } => {
+                if level <= 30 {
+                    let n = 1u32 << level;
+                    Some((n, n))
+                } else {
+                    None
+                }
+            }
+            Self::Geodetic => {
+                if level <= 29 {
+                    let rows = 1u32 << level;
+                    Some((rows << 1, rows))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Return the coarser parent `(level - 1, x >> 1, y >> 1)`, or `None` at
+    /// `level == 0`.
+    pub const fn parent(self, level: u8, x: u32, y: u32) -> Option<(u8, u32, u32)> {
+        if level == 0 {
+            None
+        } else {
+            Some((level - 1, x >> 1, y >> 1))
+        }
+    }
+}
+
+impl From<PlanetaryScheme> for TileScheme {
+    fn from(scheme: PlanetaryScheme) -> Self {
+        scheme.into_tile_scheme()
+    }
+}
+
 /// Hierarchical tiling scheme governing level direction and parent traversal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TileScheme {
@@ -106,33 +216,39 @@ impl TileScheme {
         !matches!(self, Self::RasterPyramid { .. })
     }
 
-    /// Return the grid dimensions `(cols, rows)` at `level` for planetary
-    /// schemes, or `None` for raster pyramids (whose dimensions depend on the
-    /// underlying raster) or out-of-range shift levels.
-    pub const fn grid_dims(self, level: u8) -> Option<(u32, u32)> {
+    /// Narrow to [`PlanetaryScheme`], returning `None` for `RasterPyramid`.
+    pub const fn as_planetary(self) -> Option<PlanetaryScheme> {
         match self {
-            Self::WebMercator | Self::PolarCap { .. } => {
-                if level <= 30 {
-                    let n = 1u32 << level;
-                    Some((n, n))
-                } else {
-                    None
-                }
-            }
-            Self::Geodetic => {
-                if level <= 29 {
-                    let rows = 1u32 << level;
-                    Some((rows << 1, rows))
-                } else {
-                    None
-                }
-            }
+            Self::WebMercator => Some(PlanetaryScheme::WebMercator),
+            Self::Geodetic => Some(PlanetaryScheme::Geodetic),
+            Self::PolarCap { north } => Some(PlanetaryScheme::PolarCap { north }),
             Self::RasterPyramid { .. } => None,
         }
     }
 
+    /// Narrow to main-globe [`GlobeScheme`], returning `None` for `PolarCap` or
+    /// `RasterPyramid`.
+    pub const fn as_globe(self) -> Option<GlobeScheme> {
+        match self {
+            Self::WebMercator => Some(GlobeScheme::WebMercator),
+            Self::Geodetic => Some(GlobeScheme::Geodetic),
+            Self::PolarCap { .. } | Self::RasterPyramid { .. } => None,
+        }
+    }
+
+    /// Return the grid dimensions `(cols, rows)` at `level` for planetary
+    /// schemes, or `None` for raster pyramids (whose dimensions depend on the
+    /// underlying raster) or out-of-range shift levels.
+    pub const fn grid_dims(self, level: u8) -> Option<(u32, u32)> {
+        match self.as_planetary() {
+            Some(p) => p.grid_dims(level),
+            None => None,
+        }
+    }
+
     /// Return the coarser parent tile `(parent_level, parent_x, parent_y)`, or
-    /// `None` if `(level, x, y)` is already at the coarsest root of the scheme.
+    /// `None` if `(level, x, y)` is already at the coarsest root of the scheme
+    /// (or above `max_level` for `RasterPyramid`).
     ///
     /// Crucially, `WebMercator`/`Geodetic`/`PolarCap` walk `level -> level - 1`
     /// toward `z = 0`, whereas `RasterPyramid { max_level }` walks
@@ -185,10 +301,12 @@ impl TileScheme {
     }
 }
 
-/// Geometry identifier for a single planetary quadtree or polar cap tile.
+/// Geometry identifier for a single planetary quadtree or polar cap tile
+/// (strictly coarsest-zero [`PlanetaryScheme`], statically excluding
+/// finest-zero `TileScheme::RasterPyramid`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct QuadTileId {
-    pub scheme: TileScheme,
+    pub scheme: PlanetaryScheme,
     pub level: u8,
     pub x: u32,
     pub y: u32,
@@ -231,7 +349,8 @@ impl QuadTileId {
 
     /// Return the 4 child tiles of this planetary node.
     pub fn children(self) -> [Self; 4] {
-        let next = self.level + 1;
+        debug_assert!(self.level < u8::MAX, "QuadTileId level overflow");
+        let next = self.level.saturating_add(1);
         let cx = self.x << 1;
         let cy = self.y << 1;
         [
@@ -262,12 +381,8 @@ impl QuadTileId {
         ]
     }
 
-    /// Return the coarser parent node, or `None` at `level == 0` (or for
-    /// non-planetary schemes).
+    /// Return the coarser parent node, or `None` at `level == 0`.
     pub const fn parent(self) -> Option<Self> {
-        if !self.scheme.is_coarsest_zero() {
-            return None;
-        }
         let Some((level, x, y)) = self.scheme.parent(self.level, self.x, self.y) else {
             return None;
         };
@@ -304,7 +419,7 @@ impl TileKey {
         Self {
             source,
             band: BandKey::Display,
-            scheme: id.scheme,
+            scheme: id.scheme.into_tile_scheme(),
             format: PixelFormat::Rgba8UnormSrgb,
             gutter: 0,
             decode_rev: 0,
@@ -314,20 +429,33 @@ impl TileKey {
         }
     }
 
-    /// Extract the geometric `(scheme, level, x, y)` identifier.
-    pub const fn quad_id(&self) -> QuadTileId {
-        QuadTileId {
-            scheme: self.scheme,
+    /// Extract the planetary geometric `(scheme, level, x, y)` identifier,
+    /// returning `None` for non-planetary `TileScheme::RasterPyramid` keys.
+    pub const fn quad_id(&self) -> Option<QuadTileId> {
+        let Some(scheme) = self.scheme.as_planetary() else {
+            return None;
+        };
+        Some(QuadTileId {
+            scheme,
             level: self.level,
             x: self.x,
             y: self.y,
-        }
+        })
     }
 
-    /// Return whether `self` is a coarsest root tile of `source` (works for
-    /// both planetary `z = 0` and `RasterPyramid` `level == max_level`).
+    /// Return whether `self` is a valid coarsest root tile of `source`
+    /// (`level == 0` for planetary schemes, or `level == max_level` for
+    /// `RasterPyramid`; out-of-range `level > max_level` returns `false`).
     pub const fn is_root_of(&self, source: SourceId) -> bool {
-        self.source.0 == source.0 && self.parent().is_none()
+        if self.source.0 != source.0 {
+            return false;
+        }
+        match self.scheme {
+            TileScheme::WebMercator | TileScheme::Geodetic | TileScheme::PolarCap { .. } => {
+                self.level == 0
+            }
+            TileScheme::RasterPyramid { max_level } => self.level == max_level,
+        }
     }
 
     /// Deterministic coarsest-first ordering key for upload and request queues.

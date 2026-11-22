@@ -188,6 +188,37 @@ pub fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Resul
     }
 }
 
+/// Read JSON from `path`, falling back to `T::default()` when missing or
+/// unreadable. On JSON parse failure, preserves the corrupt file as
+/// `<path>.corrupt` via atomic rename so a subsequent save never silently
+/// destroys a hand-edited configuration file.
+pub fn read_json_or_default_with_backup<T: DeserializeOwned + Default>(path: &Path) -> T {
+    match read_json_or_default::<T>(path) {
+        Ok(value) => value,
+        Err(StorageError::Json(err)) => {
+            let mut backup_os = path.as_os_str().to_os_string();
+            backup_os.push(".corrupt");
+            let backup = PathBuf::from(backup_os);
+            let _ = fs::rename(path, &backup);
+            tracing::warn!(
+                path = %path.display(),
+                backup = %backup.display(),
+                error = %err,
+                "Failed to parse persisted JSON; backed up corrupt file and using defaults"
+            );
+            T::default()
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "Failed to read persisted JSON; using defaults"
+            );
+            T::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +304,15 @@ mod tests {
         write_json_durable(&path, &Sample { count: 42 }).expect("write json");
         let loaded: Sample = read_json_or_default(&path).expect("read json");
         assert_eq!(loaded, Sample { count: 42 });
+
+        // Corrupt JSON is backed up to `<path>.corrupt` and falls back to Default.
+        fs::write(&path, b"{not valid json").expect("write corrupt");
+        let fallback: Sample = read_json_or_default_with_backup(&path);
+        assert_eq!(fallback, Sample { count: 0 });
+        let backup = path.with_extension("json.corrupt");
+        assert_eq!(
+            fs::read(&backup).expect("backup preserved"),
+            b"{not valid json"
+        );
     }
 }

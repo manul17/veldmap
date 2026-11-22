@@ -7,12 +7,11 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-use veldmap_core::io::lock_unpoisoned;
-use veldmap_core::tile::{DecodedTile, QuadTileId, SourceId, TileKey, TileScheme};
-use veldmap_net::Wakeup;
+use veldmap_core::io::{Wakeup, lock_unpoisoned};
+use veldmap_core::tile::{
+    DecodedTile, GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey,
+};
 use veldmap_raster::BundledBasemap;
-
-use crate::gpu_tiles::{GpuTileCache, PendingUploads, bundled_tile_key};
 
 /// Embedded public-domain NASA Blue Marble Next Generation equirectangular
 /// global basemap (`3600 x 1800` JPEG, see `assets/README.md`).
@@ -81,7 +80,12 @@ impl BundledBasemapProvider {
                         }
                     };
 
-                    match basemap.render_tile_with_mipmaps(key.quad_id()) {
+                    let Some(quad_id) = key.quad_id() else {
+                        let (lock, _) = &*worker_shared;
+                        lock_unpoisoned(lock).failed.insert(key);
+                        continue;
+                    };
+                    match basemap.render_tile_with_mipmaps(quad_id) {
                         Ok(tile) => {
                             if done_tx.send((key, tile)).is_err() {
                                 break;
@@ -136,14 +140,12 @@ impl BundledBasemapProvider {
     }
 
     /// Clear in-flight markers and cancel unstarted queued requests for tiles
-    /// that have already landed in `cache` or `pending_uploads`, failed
-    /// terminally, or are no longer requested.
-    pub fn reconcile(
-        &mut self,
-        cache: &GpuTileCache,
-        pending_uploads: &PendingUploads,
-        wanted: &HashSet<TileKey>,
-    ) {
+    /// that are already satisfied (`is_satisfied`), failed terminally, or are
+    /// no longer requested.
+    pub fn reconcile<F>(&mut self, wanted: &HashSet<TileKey>, is_satisfied: F)
+    where
+        F: Fn(&TileKey) -> bool,
+    {
         let (lock, _) = &*self.shared;
         let mut state = lock_unpoisoned(lock);
         let WorkerQueue {
@@ -157,8 +159,7 @@ impl BundledBasemapProvider {
             return;
         }
         let keep = |k: &TileKey| {
-            !cache.contains(k)
-                && !pending_uploads.contains(k)
+            !is_satisfied(k)
                 && !failed.contains(k)
                 && (wanted.contains(k) || k.is_root_of(SourceId::BUNDLED_BASEMAP))
         };
@@ -169,26 +170,33 @@ impl BundledBasemapProvider {
     /// Pre-seed the coarsest root tiles (`scheme z = 0` + North/South
     /// `PolarCap z = 0`) so the entire planet renders immediately on startup
     /// and offline fallback stays warm.
-    pub fn seed_roots(&mut self, scheme: TileScheme) {
-        if let Some((cols, rows)) = scheme.grid_dims(0) {
+    pub fn seed_roots(&mut self, scheme: GlobeScheme) {
+        let planetary = scheme.into_planetary();
+        if let Some((cols, rows)) = planetary.grid_dims(0) {
             for y in 0..rows {
                 for x in 0..cols {
-                    self.request(bundled_tile_key(QuadTileId {
-                        scheme,
-                        level: 0,
-                        x,
-                        y,
-                    }));
+                    self.request(TileKey::display_quad(
+                        SourceId::BUNDLED_BASEMAP,
+                        QuadTileId {
+                            scheme: planetary,
+                            level: 0,
+                            x,
+                            y,
+                        },
+                    ));
                 }
             }
         }
         for north in [true, false] {
-            self.request(bundled_tile_key(QuadTileId {
-                scheme: TileScheme::PolarCap { north },
-                level: 0,
-                x: 0,
-                y: 0,
-            }));
+            self.request(TileKey::display_quad(
+                SourceId::BUNDLED_BASEMAP,
+                QuadTileId {
+                    scheme: PlanetaryScheme::PolarCap { north },
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                },
+            ));
         }
     }
 
@@ -218,60 +226,54 @@ impl Drop for BundledBasemapProvider {
 
 #[cfg(test)]
 mod tests {
-    use veldmap_core::tile::PixelFormat;
-
     use super::*;
 
     #[test]
-    fn reconcile_clears_queued_uploads_and_terminal_failures_from_in_flight() {
-        let mut pending = PendingUploads::new();
-        let tx = pending.sender().expect("sender");
-        let cache = GpuTileCache::new(1024 * 1024);
-
-        let k_queued = bundled_tile_key(QuadTileId {
-            scheme: TileScheme::Geodetic,
-            level: 1,
-            x: 0,
-            y: 0,
-        });
-        let k_failed = bundled_tile_key(QuadTileId {
-            scheme: TileScheme::Geodetic,
-            level: 9,
-            x: 0,
-            y: 0,
-        });
-        let k_active = bundled_tile_key(QuadTileId {
-            scheme: TileScheme::Geodetic,
-            level: 1,
-            x: 1,
-            y: 0,
-        });
-
-        tx.send((
-            k_queued,
-            DecodedTile::new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![0, 0, 0, 255]),
-        ))
-        .expect("send queued tile");
-        pending.drain_pending_for_inspection();
-        assert!(pending.contains(&k_queued));
-        assert_eq!(pending.count_for_source(SourceId::BUNDLED_BASEMAP), 1);
+    fn reconcile_clears_satisfied_and_terminal_failures_from_in_flight() {
+        let k_satisfied = TileKey::display_quad(
+            SourceId::BUNDLED_BASEMAP,
+            QuadTileId {
+                scheme: PlanetaryScheme::Geodetic,
+                level: 1,
+                x: 0,
+                y: 0,
+            },
+        );
+        let k_failed = TileKey::display_quad(
+            SourceId::BUNDLED_BASEMAP,
+            QuadTileId {
+                scheme: PlanetaryScheme::Geodetic,
+                level: 9,
+                x: 0,
+                y: 0,
+            },
+        );
+        let k_active = TileKey::display_quad(
+            SourceId::BUNDLED_BASEMAP,
+            QuadTileId {
+                scheme: PlanetaryScheme::Geodetic,
+                level: 1,
+                x: 1,
+                y: 0,
+            },
+        );
 
         let shared = Arc::new((Mutex::new(WorkerQueue::default()), Condvar::new()));
         {
             let mut st = lock_unpoisoned(&shared.0);
-            st.pending.extend([k_queued, k_failed, k_active]);
+            st.pending.extend([k_satisfied, k_failed, k_active]);
             st.failed.insert(k_failed);
         }
         let mut provider = BundledBasemapProvider {
             shared,
-            in_flight: HashSet::from([k_queued, k_failed, k_active]),
+            in_flight: HashSet::from([k_satisfied, k_failed, k_active]),
             worker: None,
         };
 
-        let wanted = HashSet::from([k_queued, k_failed, k_active]);
-        provider.reconcile(&cache, &pending, &wanted);
+        let wanted = HashSet::from([k_satisfied, k_failed, k_active]);
+        provider.reconcile(&wanted, |k| *k == k_satisfied);
 
-        assert!(!provider.is_in_flight(&k_queued));
+        assert!(!provider.is_in_flight(&k_satisfied));
         assert!(!provider.is_in_flight(&k_failed));
         assert!(provider.is_in_flight(&k_active));
         assert_eq!(provider.in_flight_count(), 1);
