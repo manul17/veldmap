@@ -7,13 +7,14 @@ Fast, purely native Rust desktop **Analytical Earth-Observation & Precision-Imag
 VeldMap is built in vertical slices tracked in [plan.md](plan.md):
 
 - **Implemented (Slice 1):** Pure-Rust WGS84 geodesy, map projections, MGRS/DD/DMS coordinate navigation, `f64` infinite Reverse-Z nadir camera & oblate horizon culling, decoupled offscreen `wgpu` WGS84 globe renderer with exact linear-to-sRGB compositing, and baseline GIS HUD (cursor/center readout, altitude, GSD, dynamic scale bar, North compass, Go-To bar).
-- **Planned (Slices 2–6):** Global WGS84 tile quadtree with bundled and live satellite basemaps, local GeoTIFF/BigTIFF/COG/PNG/JPEG and Sentinel-2 JP2 streaming, `R32Float` scientific band math (NDVI/NDWI/false-color + cloud masking), analytical DEM relief, multi-temporal timeline diffing, and NetCDF-4 (v1.1).
+- **Planned (v0.2–v1.0):** Global WGS84 tile quadtree with bundled and live satellite basemaps, local GeoTIFF/BigTIFF/COG/PNG/JPEG overlays & CRS/geodesic tools, zero-auth STAC/COG HTTP Range streaming, `R32Float`/`R8Uint` scientific & categorical band math (NDVI/NDWI/false-color + `SCL` cloud masking), analytical DEM relief, and multi-temporal timeline diffing & time-series export.
+- **Planned (v1.1):** Sentinel-2 JPEG 2000, authenticated CDSE S3 streaming & resumable downloads, and Sentinel-3/5P NetCDF-4/HDF5.
 
 ## Workspace Layout
 
-- `crates/veldmap-core` — Pure domain logic (zero `egui`, `eframe`, or `wgpu` dependencies). Currently provides `geo`; `tile`, `io`/`mem`, and feature-gated `fs`/`codecs`/`net` modules land in upcoming slices ([ADR 0001](docs/decisions/0001-native-workspace-and-threading.md)).
+- `crates/veldmap-core` — Pure domain logic (zero `egui`, `eframe`, or `wgpu` dependencies). Currently provides `geo`; additional domain modules or workspace crates land in upcoming slices ([Design Decisions](docs/decisions.md)).
 - `crates/veldmap-app` — Native `eframe`/`egui` + `wgpu` desktop application (`[lib]` + `[[bin]]` so rendering and shader tests run headlessly).
-- `docs/` — Architecture notes, build guide, glossary, limitations, and Architectural Decision Records ([docs/README.md](docs/README.md)).
+- `docs/` — Build guide, design decisions, glossary, and current limitations ([docs/README.md](docs/README.md)).
 - `plan.md` — Executable vertical-slice roadmap and exit-criteria tracker ([plan.md](plan.md)).
 - `old/` — Temporary legacy migration reference, retired incrementally by slice ([old/README.md](old/README.md)).
 

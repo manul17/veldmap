@@ -1,17 +1,16 @@
 # VeldMap Documentation
 
-Authoritative architecture notes, build instructions, glossary, current limitations, and Architectural Decision Records (ADRs).
+Build instructions, design decisions, domain glossary, and current limitations. Module-level implementation details live in Rust `//!` docstrings (`cargo doc`).
 
 ## Index
 
 - [Building & Running](building.md) — Rust toolchain, platform dependencies, runtime environment variables, and verification commands.
-- [3D WGS84 Globe Architecture](architecture/globe.md) — Coordinates, projections, MGRS, nadir camera, double-single RTE Reverse-Z rendering, and GIS HUD.
-- [Architectural Decision Records](decisions/README.md) — Focused ADRs recording design contracts alongside each vertical slice.
+- [Design Decisions](decisions.md) — Implemented architectural tradeoffs ("why not X") and cross-slice accuracy/safety invariants.
 - [Glossary](glossary.md) — Canonical English domain vocabulary shared across code, UI, and documentation.
-- [Known Limitations](limitations.md) — Explicit scope boundaries and current implementation limits.
+- [Known Limitations](limitations.md) — Explicit v1 scope boundaries and current implementation limits.
 
 ## Document Lifecycle
 
-- [plan.md](../plan.md) tracks the executable vertical-slice roadmap and exit criteria.
-- Once a slice lands and its ADR is accepted under `docs/decisions/`, that ADR is authoritative for the contracts it defines.
+- [plan.md](../plan.md) tracks the vertical-slice roadmap and working hypotheses for upcoming slices.
+- [decisions.md](decisions.md) records decisions only after they are proven in code (or for hard cross-slice invariants).
 - Documentation under `docs/` never links into the temporary `old/` reference directory.

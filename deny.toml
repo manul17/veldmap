@@ -33,19 +33,14 @@ multiple-versions = "allow"
 wildcards = "deny"
 highlight = "all"
 deny = [
-    # Explicitly excluded by architectural guardrails (ADR 0001).
+    # Safety, TLS packaging, and anti-legacy-regression bans (see docs/decisions.md).
     # Wayland windowing (`smithay-client-toolkit` / `winit`) uses memmap2 for SHM buffers;
     # direct or core usage remains banned.
     { crate = "memmap2", wrappers = ["smithay-client-toolkit", "winit"], reason = "Use safe positioned I/O instead of memory-mapped files" },
     { crate = "openssl", reason = "Use pure-Rust rustls instead of OpenSSL C dependencies" },
     { crate = "openssl-sys", reason = "Use pure-Rust rustls instead of OpenSSL C dependencies" },
     { crate = "wasmtime", reason = "VeldMap is purely native Rust; no WASI/Wasmtime host" },
-    { crate = "gdal", reason = "No GDAL C dependencies in VeldMap" },
-    { crate = "gdal-sys", reason = "No GDAL C dependencies in VeldMap" },
-    { crate = "proj", reason = "No PROJ C dependencies in VeldMap" },
-    { crate = "proj-sys", reason = "No PROJ C dependencies in VeldMap" },
-    { crate = "rusqlite", reason = "No SQLite/ORM in VeldMap" },
-    { crate = "sqlx", reason = "No SQLite/ORM in VeldMap" },
+    { crate = "sqlx", reason = "Avoid heavy async SQL ORM dependencies" },
     { crate = "prost", reason = "No protobuf/ConnectRPC in VeldMap" },
     { crate = "tonic", reason = "No gRPC/ConnectRPC in VeldMap" },
 ]

@@ -9,7 +9,7 @@ If you discover a security vulnerability in VeldMap—including credential leaka
 
 ## Active Protections (Enforced Today)
 
-- **Native Memory & Dependency Hygiene:** `unsafe_op_in_unsafe_fn` is denied workspace-wide, and `undocumented_unsafe_blocks`, `unwrap_used`, and `expect_used` are enforced via Clippy `-D warnings` in CI. `memmap2` (outside Wayland SHM wrappers) and C codec/TLS libraries (`openssl`, `gdal`, `proj`) are banned in [deny.toml](deny.toml).
+- **Native Memory & Dependency Hygiene:** `unsafe_op_in_unsafe_fn` is denied workspace-wide, and `undocumented_unsafe_blocks`, `unwrap_used`, and `expect_used` are enforced via Clippy `-D warnings` in CI. `memmap2` (outside Wayland SHM wrappers) and `openssl`/`openssl-sys` are banned in [deny.toml](deny.toml).
 - **Secret Exclusion:** `.env*` files (except `.env.example`) are excluded by `.gitignore` so credentials are never accidentally committed.
 
 ## Planned Security Controls (Upcoming Slices)

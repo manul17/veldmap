@@ -24,11 +24,14 @@ fn shared_headless_device() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
     DEVICE.get_or_init(request_headless_device).as_ref()
 }
 
+const NATIVE_PRIMARY_BACKENDS: wgpu::Backends =
+    wgpu::Backends::PRIMARY.difference(wgpu::Backends::BROWSER_WEBGPU);
+
 fn request_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-    desc.backends &= wgpu::Backends::PRIMARY;
+    desc.backends &= NATIVE_PRIMARY_BACKENDS;
     if desc.backends.is_empty() {
-        desc.backends = wgpu::Backends::PRIMARY;
+        desc.backends = NATIVE_PRIMARY_BACKENDS;
     }
     let instance = wgpu::Instance::new(desc);
 

@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - **Rust toolchain:** Rust `1.95` or newer (Rust 2024 edition). The repository pins the exact toolchain and components (`rustfmt`, `clippy`) in [rust-toolchain.toml](../rust-toolchain.toml).
-- **Graphics driver:** A Vulkan, DirectX 12, or Metal driver (`wgpu::Backends::PRIMARY`). OpenGL/GLES and WebGPU are intentionally unsupported.
+- **Graphics driver:** A Vulkan, DirectX 12, or Metal driver (`wgpu::Backends::PRIMARY` minus `BROWSER_WEBGPU`). OpenGL/GLES and WebGPU are intentionally unsupported.
 - **Linux system libraries:** X11/Wayland development headers are needed to compile `eframe`/`winit`:
 
 ```bash
