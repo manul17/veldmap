@@ -19,7 +19,7 @@ VeldMap serves both planetary Earth observation (Sentinel-2, Landsat, global mos
 
 - VeldMap v1 renders a smooth WGS84 ellipsoid directly at `height = 0.0` with a strictly nadir camera (zero pitch/tilt).
 - Terrain relief is delivered as quantitative GPU layers (hillshade, slope, aspect over DEM COGs in Slice 5B-1) rather than 3D mesh displacement.
-- `Geodetic.height_m`, `DMat4` infinite Reverse-Z, and tile LOD remain intact so any future v2 3D terrain mode can layer cleanly on top.
+- `Geodetic.height_m` and `DMat4` infinite Reverse-Z are retained, while v1 `Camera` (4-DOF nadir state, `near = height_m * 0.5`), `cull::Frame` (`h = 0` ellipsoidal tangent horizon plane), `geodesy::surface_at`, and depth-less draped `outlines` intentionally optimize for `height_m = 0.0`. Any future v2 3D terrain or oblique-camera mode will extend or replace those components rather than layering on without changes.
 
 ### 2. Camera Floor Lowered to `MIN_HEIGHT_M = 2.0` m with `f64` Infinite Reverse-Z
 

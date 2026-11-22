@@ -10,8 +10,6 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use eframe::egui;
-use eframe::egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor};
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::geo::geodesy;
 use wgpu::util::DeviceExt;
@@ -40,6 +38,13 @@ struct CameraUniform {
     neg_eye_lo: [f32; 3],
     _pad1: f32,
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<CameraUniform>() == 96);
+    assert!(std::mem::offset_of!(CameraUniform, view_proj) == 0);
+    assert!(std::mem::offset_of!(CameraUniform, neg_eye_hi) == 64);
+    assert!(std::mem::offset_of!(CameraUniform, neg_eye_lo) == 80);
+};
 
 /// Parameters for a single offscreen globe frame.
 #[derive(Clone, Copy, Debug)]
@@ -517,62 +522,6 @@ impl GlobeRenderer {
         if show_graticule {
             pass.set_pipeline(&self.grid_pipeline);
             pass.draw_indexed(self.graticule_indices.clone(), 0, 0..1);
-        }
-    }
-}
-
-/// `egui_wgpu` paint callback bridging the offscreen [`GlobeRenderer`] into the
-/// viewport panel.
-pub struct GlobePaintCallback {
-    pub rect: egui::Rect,
-    pub camera: Camera,
-    pub show_graticule: bool,
-    pub generation: u64,
-}
-
-impl CallbackTrait for GlobePaintCallback {
-    fn prepare(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        screen_descriptor: &ScreenDescriptor,
-        egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let vp = egui::epaint::ViewportInPixels::from_points(
-            &self.rect,
-            screen_descriptor.pixels_per_point,
-            screen_descriptor.size_in_pixels,
-        );
-        if vp.width_px <= 0 || vp.height_px <= 0 {
-            return Vec::new();
-        }
-
-        if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
-            renderer.render_if_dirty(
-                device,
-                queue,
-                egui_encoder,
-                RenderParams {
-                    width: vp.width_px as u32,
-                    height: vp.height_px as u32,
-                    camera: &self.camera,
-                    show_graticule: self.show_graticule,
-                    generation: self.generation,
-                },
-            );
-        }
-        Vec::new()
-    }
-
-    fn paint(
-        &self,
-        _info: egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        callback_resources: &CallbackResources,
-    ) {
-        if let Some(renderer) = callback_resources.get::<GlobeRenderer>() {
-            renderer.composite_into(render_pass);
         }
     }
 }

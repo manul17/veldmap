@@ -17,7 +17,7 @@ The repository contains two workspace crates:
 - `crates/veldmap-core`: Pure domain logic with zero `egui`, `eframe`, or `wgpu` dependencies.
 - `crates/veldmap-app`: Native desktop application built on `eframe`/`egui` and `wgpu`, structured with both `[lib]` (`veldmap_app`) and `[[bin]]` (`veldmap`) targets so offscreen rendering, HUD, and `naga` shader codegen tests execute headlessly without opening a window.
 
-Re-evaluate extracting `veldmap-raster` into a third workspace crate at Slice 3C-1 if pure-Rust codec compile times degrade inner-loop iteration speed.
+Re-evaluate splitting `veldmap-core` into 3–4 coarse workspace crates along the internal DAG below (`veldmap-core` leaf, `veldmap-raster`, and optionally `veldmap-net`/`veldmap-storage`) at Slice 3A-1 / 4A once `tokio`/`reqwest` and raster codecs land, so Cargo enforces module boundaries directly and compiles crates in parallel.
 
 ### 2. Strict Acyclic Module DAG in `veldmap-core` (Target Layout — Feature Matrix Enforced Starting Slice 2A)
 
@@ -41,7 +41,7 @@ Intra-feature boundaries enforced by CI include `cache ↛ library` and `net ↛
 
 The following technologies are explicitly excluded:
 
-- **Banned workspace-wide in [deny.toml](../../deny.toml):** Wasmtime (`wasmtime`), protobuf/gRPC (`prost`, `tonic`), SQLite/ORMs (`rusqlite`, `sqlx`), memory-mapped file I/O (`memmap2`, permitted only via Wayland SHM wrappers `smithay-client-toolkit` and `winit`; safe positioned I/O is used instead), and C geospatial/TLS bindings (`gdal`/`gdal-sys`, `proj`/`proj-sys`, `openssl`/`openssl-sys`; pure-Rust codecs and `rustls` are used instead).
+- **Banned workspace-wide in [deny.toml](../../deny.toml):** Wasmtime (`wasmtime`), protobuf/gRPC (`prost`, `tonic`), SQLite/ORMs (`rusqlite`, `sqlx`; pure-Rust embedded KV stores such as `redb` remain permitted if tile-cache or catalog small-file indexing needs one), memory-mapped file I/O (`memmap2`, permitted only via Wayland SHM wrappers `smithay-client-toolkit` and `winit`; safe positioned I/O is used instead), and C geospatial/TLS bindings (`gdal`/`gdal-sys`, `proj`/`proj-sys`, `openssl`/`openssl-sys`; pure-Rust codecs and `rustls` are used instead).
 - **Excluded from `veldmap-core` via manifest & isolated CI builds:** UI/GPU crates (`egui`, `eframe`, `wgpu`) and browser/WASM targets (native desktop only).
 
 ### 4. Frame-Driven Streaming Engine & Shutdown Order (Committed Contract — Slices 2–3A)

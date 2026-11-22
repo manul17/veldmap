@@ -2,16 +2,86 @@
 
 use std::sync::Arc;
 
-use eframe::{egui, egui_wgpu};
+use eframe::egui;
+use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use thiserror::Error;
 use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
 use veldmap_core::geo::coords::parse_location;
 
 use crate::hud;
-use crate::render::{GlobePaintCallback, GlobeRenderer};
+use crate::render::{GlobeRenderer, RenderParams};
 
 /// Logical scroll points mapped to one discrete globe zoom notch.
 const SCROLL_PT_PER_STEP: f64 = 48.0;
+
+/// Compute discrete zoom notches from `egui` scroll and pinch/`Ctrl+scroll`
+/// deltas. When an active pinch/zoom gesture is present, it takes precedence
+/// over decaying `smooth_scroll_delta` momentum so the two do not double-count.
+fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
+    if zoom_delta.is_finite() && zoom_delta > 0.0 && (zoom_delta - 1.0).abs() > 1e-6 {
+        f64::from(zoom_delta).ln() / ZOOM_PER_CLICK.ln()
+    } else if scroll_y.is_finite() {
+        f64::from(scroll_y) / SCROLL_PT_PER_STEP
+    } else {
+        0.0
+    }
+}
+
+/// `egui_wgpu` paint callback bridging the offscreen [`GlobeRenderer`] into the
+/// viewport panel.
+struct GlobePaintCallback {
+    rect: egui::Rect,
+    camera: Camera,
+    show_graticule: bool,
+    generation: u64,
+}
+
+impl CallbackTrait for GlobePaintCallback {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen_descriptor: &ScreenDescriptor,
+        egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let vp = egui::epaint::ViewportInPixels::from_points(
+            &self.rect,
+            screen_descriptor.pixels_per_point,
+            screen_descriptor.size_in_pixels,
+        );
+        if vp.width_px <= 0 || vp.height_px <= 0 {
+            return Vec::new();
+        }
+
+        if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
+            renderer.render_if_dirty(
+                device,
+                queue,
+                egui_encoder,
+                RenderParams {
+                    width: vp.width_px as u32,
+                    height: vp.height_px as u32,
+                    camera: &self.camera,
+                    show_graticule: self.show_graticule,
+                    generation: self.generation,
+                },
+            );
+        }
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &CallbackResources,
+    ) {
+        if let Some(renderer) = callback_resources.get::<GlobeRenderer>() {
+            renderer.composite_into(render_pass);
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -161,7 +231,12 @@ impl eframe::App for VeldmapApp {
                 if ui.button("Fly").clicked() || enter_pressed {
                     self.trigger_goto();
                 }
+
+                ui.separator();
+                ui.checkbox(&mut self.show_graticule, "Graticule");
+
                 if let Some(err) = &self.goto_error {
+                    ui.separator();
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(err)
@@ -172,9 +247,6 @@ impl eframe::App for VeldmapApp {
                     )
                     .on_hover_text(err);
                 }
-
-                ui.separator();
-                ui.checkbox(&mut self.show_graticule, "Graticule");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add(
@@ -261,10 +333,7 @@ impl eframe::App for VeldmapApp {
                     if response.hovered() {
                         let (scroll_y, zoom_delta) =
                             ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-                        let mut steps = f64::from(scroll_y) / SCROLL_PT_PER_STEP;
-                        if zoom_delta > 0.0 && (zoom_delta - 1.0).abs() > 1e-6 {
-                            steps += f64::from(zoom_delta).ln() / ZOOM_PER_CLICK.ln();
-                        }
+                        let steps = zoom_steps_from_input(scroll_y, zoom_delta);
                         if steps.abs() > 0.0 {
                             let (hold_x, hold_y) = match response.hover_pos() {
                                 Some(pos) => (
@@ -312,5 +381,22 @@ impl eframe::App for VeldmapApp {
         {
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_steps_prefers_active_pinch_over_residual_scroll() {
+        assert!((zoom_steps_from_input(48.0, 1.0) - 1.0).abs() < 1e-12);
+        assert!((zoom_steps_from_input(-24.0, 1.0) + 0.5).abs() < 1e-12);
+        // Active pinch (zoom_delta = ZOOM_PER_CLICK) yields 1 step without adding scroll_y.
+        let pinch = zoom_steps_from_input(96.0, ZOOM_PER_CLICK as f32);
+        assert!((pinch - 1.0).abs() < 1e-6, "pinch={pinch}");
+        // Non-finite inputs never produce NaN steps.
+        assert_eq!(zoom_steps_from_input(f32::NAN, 1.0), 0.0);
+        assert_eq!(zoom_steps_from_input(0.0, f32::NAN), 0.0);
     }
 }
