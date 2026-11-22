@@ -18,7 +18,6 @@ use veldmap_core::tile::{
     TileScheme, VisibleTile, adaptive_grid_step_deg, compose_uv_rect, sample_tile_surface,
     tile_grid_anchor, traverse,
 };
-use veldmap_raster::{BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL};
 use wgpu::util::DeviceExt;
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache, bundled_tile_key, source_tile_key};
@@ -143,24 +142,20 @@ impl DrawSnapshot {
             (true, Some(gpu_cache)) => {
                 for vis in visible {
                     let resolved = if matches!(vis.tex_id.scheme, TileScheme::PolarCap { .. }) {
-                        let (polar_id, polar_uv) =
-                            vis.tex_id.clamp_to_level(BUNDLED_POLAR_MAX_LEVEL);
-                        let key = bundled_tile_key(polar_id);
-                        gpu_cache.carrier(&key).map(|(ck, c_uv, tile)| {
-                            let uv = compose_uv_rect(c_uv, compose_uv_rect(polar_uv, vis.uv_rect));
-                            (ck, uv, tile)
-                        })
+                        let key = bundled_tile_key(vis.tex_id);
+                        gpu_cache
+                            .carrier(&key)
+                            .map(|(ck, c_uv, tile)| (ck, compose_uv_rect(c_uv, vis.uv_rect), tile))
                     } else {
                         let primary_key = source_tile_key(active_source, vis.tex_id);
                         if let Some((ck, c_uv, tile)) = gpu_cache.carrier(&primary_key) {
                             Some((ck, compose_uv_rect(c_uv, vis.uv_rect), tile))
                         } else if active_source != SourceId::BUNDLED_BASEMAP {
-                            // Offline / Frame-1 fallback to bundled basemap in matching scheme.
-                            let (fb_id, fb_uv) = vis.tex_id.clamp_to_level(BUNDLED_MAX_LEVEL);
-                            let fb_key = bundled_tile_key(fb_id);
+                            // Offline / Frame-1 fallback to bundled basemap in matching scheme:
+                            // `GpuTileCache::carrier` walks up to the finest cached ancestor directly.
+                            let fb_key = bundled_tile_key(vis.tex_id);
                             gpu_cache.carrier(&fb_key).map(|(ck, c_uv, tile)| {
-                                let uv = compose_uv_rect(c_uv, compose_uv_rect(fb_uv, vis.uv_rect));
-                                (ck, uv, tile)
+                                (ck, compose_uv_rect(c_uv, vis.uv_rect), tile)
                             })
                         } else {
                             None
@@ -817,7 +812,9 @@ impl GlobeRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
         });
 

@@ -1,11 +1,14 @@
 //! Crash-safe, multi-process-safe SQLite WAL tile disk cache with O(log N)
-//! per-tile LRU eviction, debounced LRU touch flushing, and
-//! `incremental_vacuum`.
+//! per-tile LRU eviction, vertically partitioned `tile_meta`/`tile_blobs`
+//! tables, debounced LRU touch flushing, and `incremental_vacuum`.
 //!
 //! Storing tiles in a single WAL-mode SQLite database avoids both whole-source
 //! eviction thrashing and loose-file `relatime`/Windows Defender storms.
-//! Because tile caches are ephemeral, corrupted cache files (`DatabaseCorrupt` /
-//! `NotADatabase`) are deleted and recreated cleanly on startup.
+//! Separating `tile_meta` (`last_used_ms`, dimensions/keys) from `tile_blobs`
+//! (`payload BLOB`) ensures batched `get()` LRU touch updates never trigger
+//! SQLite `OP_MakeRecord` overflow-page rewrites of 256 KiB–1 MiB scientific
+//! tile blobs. Because tile caches are ephemeral, corrupted or older-schema
+//! cache files are recreated cleanly on startup.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use veldmap_core::io::lock_unpoisoned;
-use veldmap_core::tile::TileScheme;
+use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme};
 
 use crate::StorageError;
 use crate::settings::DEFAULT_DISK_CACHE_MAX_MB;
@@ -24,6 +27,17 @@ pub const DEFAULT_DISK_CACHE_BYTES: u64 = DEFAULT_DISK_CACHE_MAX_MB * 1024 * 102
 
 /// Maximum encoded payload size admitted for a single cached tile (`16 MiB`).
 pub const MAX_CACHED_TILE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Current SQLite schema version (`PRAGMA user_version`).
+///
+/// Version 2 vertically partitions `tile_meta` and `tile_blobs`, sets
+/// `page_size = 16384`, adds `(band, format, gutter, decode_rev, encoding)`
+/// columns, and tracks O(1) `tile_count` in `cache_meta`.
+const SCHEMA_VERSION: i64 = 2;
+
+/// SQLite page size (`16 KiB`) reducing overflow-chain fragmentation for
+/// 256 KiB–1 MiB tile payloads.
+const SQLITE_PAGE_SIZE: i64 = 16_384;
 
 /// Eviction headroom divisor (`10` => evict down to `90%` of budget so
 /// subsequent inserts do not trigger eviction on every single tile).
@@ -51,6 +65,30 @@ pub fn valid_source_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
+/// Wire/disk payload encoding tag stored alongside each cached tile blob.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TileBlobEncoding {
+    /// Raw upstream encoded image bytes (PNG/JPEG/WebP from live tile servers).
+    #[default]
+    EncodedImage = 0,
+    /// Lossless QOI-encoded 8-bit display RGBA tiles (Slice 3A-1b).
+    Qoi = 1,
+    /// Byte-shuffled LZ4 scientific/categorical tile payloads (Slice 3B).
+    Lz4Raw = 2,
+}
+
+impl TileBlobEncoding {
+    fn from_i64(raw: i64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::EncodedImage),
+            1 => Some(Self::Qoi),
+            2 => Some(Self::Lz4Raw),
+            _ => None,
+        }
+    }
+}
+
 fn encode_scheme(scheme: TileScheme) -> i64 {
     match scheme {
         TileScheme::WebMercator => 1,
@@ -61,17 +99,40 @@ fn encode_scheme(scheme: TileScheme) -> i64 {
     }
 }
 
+fn encode_band(band: BandKey) -> (i64, i64) {
+    match band {
+        BandKey::Display => (0, 0),
+        BandKey::Index(idx) => (1, i64::from(idx)),
+        BandKey::NamedHash(hash) => (2, hash as i64),
+    }
+}
+
+fn encode_format(format: PixelFormat) -> i64 {
+    match format {
+        PixelFormat::Rgba8UnormSrgb => 0,
+        PixelFormat::R32Float => 1,
+        PixelFormat::R8Uint => 2,
+        PixelFormat::R16Uint => 3,
+    }
+}
+
 /// Composite lookup key for one encoded tile stored in [`TileDiskCache`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DiskTileKey {
     pub source_key: String,
+    pub band: BandKey,
     pub scheme: TileScheme,
+    pub format: PixelFormat,
+    pub gutter: u8,
+    pub decode_rev: u32,
     pub level: u8,
     pub x: u32,
     pub y: u32,
 }
 
 impl DiskTileKey {
+    /// Construct a display-track (`BandKey::Display`, `Rgba8UnormSrgb`,
+    /// `gutter = 0`, `decode_rev = 0`) disk cache key.
     pub fn new(
         source_key: impl Into<String>,
         scheme: TileScheme,
@@ -81,10 +142,30 @@ impl DiskTileKey {
     ) -> Self {
         Self {
             source_key: source_key.into(),
+            band: BandKey::Display,
             scheme,
+            format: PixelFormat::Rgba8UnormSrgb,
+            gutter: 0,
+            decode_rev: 0,
             level,
             x,
             y,
+        }
+    }
+
+    /// Construct a full multi-band / multi-format disk cache key from a
+    /// [`TileKey`] and its stable ASCII `source_key` / fingerprint string.
+    pub fn from_tile_key(source_key: impl Into<String>, key: &TileKey) -> Self {
+        Self {
+            source_key: source_key.into(),
+            band: key.band,
+            scheme: key.scheme,
+            format: key.format,
+            gutter: key.gutter,
+            decode_rev: key.decode_rev,
+            level: key.level,
+            x: key.x,
+            y: key.y,
         }
     }
 }
@@ -155,12 +236,14 @@ fn flush_touches_in_tx(
     if touches.is_empty() {
         return Ok(());
     }
-    // Guard with `last_used_ms < ?1` so a buffered touch can never roll back a
-    // newer timestamp written to a replaced/reused rowid.
-    let mut stmt =
-        tx.prepare("UPDATE tiles SET last_used_ms = ?1 WHERE rowid = ?2 AND last_used_ms < ?1")?;
-    for (&rowid, &ts) in touches {
-        stmt.execute(params![ts, rowid])?;
+    // Updates `tile_meta` only (never `tile_blobs`), so read-hit LRU touches
+    // never rewrite BLOB overflow pages. Guarded with `last_used_ms < ?1` so a
+    // buffered touch can never roll back a newer timestamp on a reused tile_id.
+    let mut stmt = tx.prepare(
+        "UPDATE tile_meta SET last_used_ms = ?1 WHERE tile_id = ?2 AND last_used_ms < ?1",
+    )?;
+    for (&tile_id, &ts) in touches {
+        stmt.execute(params![ts, tile_id])?;
     }
     Ok(())
 }
@@ -182,32 +265,75 @@ fn remove_sqlite_files(path: &Path) {
     let _ = std::fs::remove_file(PathBuf::from(shm));
 }
 
+fn query_page_count_and_version(conn: &Connection) -> Result<(i64, i64), rusqlite::Error> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count;", [], |r| r.get(0))?;
+    let user_version: i64 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+    Ok((page_count, user_version))
+}
+
+fn reset_in_place_for_upgrade(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tile_blobs;
+         DROP TABLE IF EXISTS tile_meta;
+         DROP TABLE IF EXISTS tiles;
+         DROP TABLE IF EXISTS cache_meta;
+         PRAGMA journal_mode = DELETE;",
+    )?;
+    conn.pragma_update(None, "page_size", SQLITE_PAGE_SIZE)?;
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    conn.execute_batch("VACUUM;")?;
+    Ok(())
+}
+
 fn init_connection(conn: &Connection, is_file_backed: bool) -> Result<i64, rusqlite::Error> {
     conn.pragma_update(None, "busy_timeout", 5000i64)?;
-    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+
+    let (page_count, user_version) = query_page_count_and_version(conn)?;
+    if page_count == 0 {
+        // `page_size` and `auto_vacuum` must be configured before entering WAL
+        // mode or creating any tables on a brand-new database.
+        conn.pragma_update(None, "page_size", SQLITE_PAGE_SIZE)?;
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    } else if user_version != SCHEMA_VERSION {
+        reset_in_place_for_upgrade(conn)?;
+    }
+
     if is_file_backed {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
     }
+
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS tiles (
+        "CREATE TABLE IF NOT EXISTS tile_meta (
+            tile_id      INTEGER PRIMARY KEY,
             source_key   TEXT    NOT NULL,
+            band_kind    INTEGER NOT NULL,
+            band_id      INTEGER NOT NULL,
             scheme       INTEGER NOT NULL,
+            format       INTEGER NOT NULL,
+            gutter       INTEGER NOT NULL,
+            decode_rev   INTEGER NOT NULL,
             level        INTEGER NOT NULL,
             x            INTEGER NOT NULL,
             y            INTEGER NOT NULL,
-            payload      BLOB    NOT NULL,
+            encoding     INTEGER NOT NULL,
             byte_size    INTEGER NOT NULL,
             last_used_ms INTEGER NOT NULL,
-            PRIMARY KEY (source_key, scheme, level, x, y)
+            UNIQUE (source_key, band_kind, band_id, scheme, format, gutter, decode_rev, level, x, y)
         );
-        DROP INDEX IF EXISTS idx_tiles_lru;
-        CREATE INDEX IF NOT EXISTS idx_tiles_lru_v2 ON tiles (last_used_ms ASC, byte_size);
+        CREATE TABLE IF NOT EXISTS tile_blobs (
+            tile_id INTEGER PRIMARY KEY REFERENCES tile_meta(tile_id) ON DELETE CASCADE,
+            payload BLOB    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tile_meta_lru ON tile_meta (last_used_ms ASC, byte_size);
         CREATE TABLE IF NOT EXISTS cache_meta (
             id          INTEGER PRIMARY KEY CHECK (id = 1),
-            total_bytes INTEGER NOT NULL
+            total_bytes INTEGER NOT NULL,
+            tile_count  INTEGER NOT NULL
         );",
     )?;
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
     // Only reconcile `cache_meta` when missing so warm startups stay O(1)
     // instead of scanning multi-GB tile tables.
@@ -216,20 +342,44 @@ fn init_connection(conn: &Connection, is_file_backed: bool) -> Result<i64, rusql
         .optional()?;
     if has_meta.is_none() {
         conn.execute(
-            "INSERT OR IGNORE INTO cache_meta (id, total_bytes)
-             VALUES (1, (SELECT COALESCE(SUM(byte_size), 0) FROM tiles))",
+            "INSERT OR IGNORE INTO cache_meta (id, total_bytes, tile_count)
+             VALUES (
+                 1,
+                 (SELECT COALESCE(SUM(byte_size), 0) FROM tile_meta),
+                 (SELECT COUNT(*) FROM tile_meta)
+             )",
             [],
         )?;
     }
 
-    // Seed monotonic timestamp from the rightmost leaf of `idx_tiles_lru_v2`
+    // Seed monotonic timestamp from the rightmost leaf of `idx_tile_meta_lru`
     // (O(log N)) so backward system-clock jumps never invert LRU order.
     let max_ts: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(last_used_ms), 0) FROM tiles",
+        "SELECT COALESCE(MAX(last_used_ms), 0) FROM tile_meta",
         [],
         |r| r.get(0),
     )?;
     Ok(max_ts.max(0))
+}
+
+fn open_and_init_file_db(path: &Path) -> Result<(Connection, i64), rusqlite::Error> {
+    let conn = Connection::open(path)?;
+    let (page_count, user_version) = query_page_count_and_version(&conn)?;
+    if page_count > 0 && user_version != SCHEMA_VERSION {
+        tracing::info!(
+            path = %path.display(),
+            old_version = user_version,
+            new_version = SCHEMA_VERSION,
+            "Upgrading ephemeral SQLite tile cache schema; recreating clean cache"
+        );
+        drop(conn);
+        remove_sqlite_files(path);
+        let fresh = Connection::open(path)?;
+        let max_ts = init_connection(&fresh, true)?;
+        return Ok((fresh, max_ts));
+    }
+    let max_ts = init_connection(&conn, true)?;
+    Ok((conn, max_ts))
 }
 
 fn current_total_bytes(conn: &Connection) -> Result<u64, rusqlite::Error> {
@@ -265,17 +415,14 @@ impl std::fmt::Debug for TileDiskCache {
 impl TileDiskCache {
     /// Open or create a file-backed SQLite WAL tile cache at `path` bounded to
     /// `max_bytes` payload bytes. Automatically deletes and recreates a
-    /// corrupted ephemeral cache database (`DatabaseCorrupt` / `NotADatabase`).
+    /// corrupted or older-schema ephemeral cache database.
     pub fn open(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
 
-        let (conn, max_ts) = match Connection::open(&path).and_then(|c| {
-            let max_ts = init_connection(&c, true)?;
-            Ok((c, max_ts))
-        }) {
+        let (conn, max_ts) = match open_and_init_file_db(&path) {
             Ok(pair) => pair,
             Err(err) if is_corrupt_sqlite_error(&err) => {
                 tracing::warn!(
@@ -320,53 +467,94 @@ impl TileDiskCache {
     }
 
     /// Look up cached encoded tile bytes for `key`, recording a debounced LRU
-    /// touch on hit (flushed in batches, before eviction, and on drop).
+    /// touch on hit (flushed in batches to `tile_meta` only, before eviction,
+    /// and on drop).
     pub fn get(&self, key: &DiskTileKey) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.get_encoded(key)?.map(|(_, payload)| payload))
+    }
+
+    /// Look up cached tile bytes and their [`TileBlobEncoding`] tag for `key`.
+    pub fn get_encoded(
+        &self,
+        key: &DiskTileKey,
+    ) -> Result<Option<(TileBlobEncoding, Vec<u8>)>, StorageError> {
         if !valid_source_key(&key.source_key) {
             return Err(StorageError::InvalidSourceKey(key.source_key.clone()));
         }
         let mut inner = lock_unpoisoned(&self.inner);
+        let (band_kind, band_id) = encode_band(key.band);
         let scheme = encode_scheme(key.scheme);
-        let row: Option<(i64, Vec<u8>)> = inner
+        let format = encode_format(key.format);
+        let row: Option<(i64, i64, Vec<u8>)> = inner
             .conn
             .query_row(
-                "SELECT rowid, payload FROM tiles
-                 WHERE source_key = ?1 AND scheme = ?2 AND level = ?3 AND x = ?4 AND y = ?5",
+                "SELECT m.tile_id, m.encoding, b.payload
+                 FROM tile_meta m
+                 JOIN tile_blobs b ON b.tile_id = m.tile_id
+                 WHERE m.source_key = ?1
+                   AND m.band_kind = ?2
+                   AND m.band_id = ?3
+                   AND m.scheme = ?4
+                   AND m.format = ?5
+                   AND m.gutter = ?6
+                   AND m.decode_rev = ?7
+                   AND m.level = ?8
+                   AND m.x = ?9
+                   AND m.y = ?10",
                 params![
                     &key.source_key,
+                    band_kind,
+                    band_id,
                     scheme,
+                    format,
+                    i64::from(key.gutter),
+                    i64::from(key.decode_rev),
                     i64::from(key.level),
                     i64::from(key.x),
                     i64::from(key.y)
                 ],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
 
-        if let Some((rowid, payload)) = row {
+        if let Some((tile_id, encoding_raw, payload)) = row {
+            let Some(encoding) = TileBlobEncoding::from_i64(encoding_raw) else {
+                return Ok(None);
+            };
             let ts = inner.next_monotonic_ts();
-            inner.pending_touches.insert(rowid, ts);
+            inner.pending_touches.insert(tile_id, ts);
             if inner.pending_touches.len() >= TOUCH_FLUSH_THRESHOLD {
                 inner.flush_pending_touches_best_effort();
             }
-            Ok(Some(payload))
+            Ok(Some((encoding, payload)))
         } else {
             Ok(None)
         }
     }
 
-    /// Insert or replace encoded tile bytes for `key`, enforcing
-    /// `payload_bytes <= max_bytes` via O(log N) per-tile LRU eviction and
-    /// `PRAGMA incremental_vacuum`.
+    /// Insert or replace encoded image tile bytes (`TileBlobEncoding::EncodedImage`)
+    /// for `key`, enforcing `payload_bytes <= max_bytes` via O(log N) per-tile
+    /// LRU eviction and `PRAGMA incremental_vacuum`.
     pub fn put(&self, key: &DiskTileKey, payload: &[u8]) -> Result<EvictionReport, StorageError> {
+        self.put_encoded(key, TileBlobEncoding::EncodedImage, payload)
+    }
+
+    /// Insert or replace tile bytes with an explicit [`TileBlobEncoding`] tag.
+    pub fn put_encoded(
+        &self,
+        key: &DiskTileKey,
+        encoding: TileBlobEncoding,
+        payload: &[u8],
+    ) -> Result<EvictionReport, StorageError> {
         let mut inner = lock_unpoisoned(&self.inner);
         let ts = inner.next_monotonic_ts();
-        Self::put_locked(&mut inner, key, payload, ts)
+        Self::put_locked(&mut inner, key, encoding, payload, ts)
     }
 
     fn put_locked(
         inner: &mut CacheInner,
         key: &DiskTileKey,
+        encoding: TileBlobEncoding,
         payload: &[u8],
         ts_ms: i64,
     ) -> Result<EvictionReport, StorageError> {
@@ -386,7 +574,9 @@ impl TileDiskCache {
             });
         }
 
+        let (band_kind, band_id) = encode_band(key.band);
         let scheme = encode_scheme(key.scheme);
+        let format = encode_format(key.format);
         let max_bytes = inner.max_bytes;
         let touches = std::mem::take(&mut inner.pending_touches);
         let report = {
@@ -397,11 +587,25 @@ impl TileDiskCache {
 
             let prev_bytes: Option<i64> = tx
                 .query_row(
-                    "SELECT byte_size FROM tiles
-                     WHERE source_key = ?1 AND scheme = ?2 AND level = ?3 AND x = ?4 AND y = ?5",
+                    "SELECT byte_size FROM tile_meta
+                     WHERE source_key = ?1
+                       AND band_kind = ?2
+                       AND band_id = ?3
+                       AND scheme = ?4
+                       AND format = ?5
+                       AND gutter = ?6
+                       AND decode_rev = ?7
+                       AND level = ?8
+                       AND x = ?9
+                       AND y = ?10",
                     params![
                         &key.source_key,
+                        band_kind,
+                        band_id,
                         scheme,
+                        format,
+                        i64::from(key.gutter),
+                        i64::from(key.decode_rev),
                         i64::from(key.level),
                         i64::from(key.x),
                         i64::from(key.y)
@@ -410,41 +614,68 @@ impl TileDiskCache {
                 )
                 .optional()?;
 
-            let inserted_rowid: i64 = tx.query_row(
-                "INSERT INTO tiles (source_key, scheme, level, x, y, payload, byte_size, last_used_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(source_key, scheme, level, x, y) DO UPDATE SET
-                   payload = excluded.payload,
+            let inserted_id: i64 = tx.query_row(
+                "INSERT INTO tile_meta (
+                     source_key, band_kind, band_id, scheme, format, gutter,
+                     decode_rev, level, x, y, encoding, byte_size, last_used_ms
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(
+                     source_key, band_kind, band_id, scheme, format, gutter,
+                     decode_rev, level, x, y
+                 ) DO UPDATE SET
+                   encoding = excluded.encoding,
                    byte_size = excluded.byte_size,
                    last_used_ms = excluded.last_used_ms
-                 RETURNING rowid",
+                 RETURNING tile_id",
                 params![
                     &key.source_key,
+                    band_kind,
+                    band_id,
                     scheme,
+                    format,
+                    i64::from(key.gutter),
+                    i64::from(key.decode_rev),
                     i64::from(key.level),
                     i64::from(key.x),
                     i64::from(key.y),
-                    payload,
+                    i64::from(encoding as u8),
                     new_bytes as i64,
                     ts_ms,
                 ],
                 |r| r.get(0),
             )?;
 
+            tx.execute(
+                "INSERT INTO tile_blobs (tile_id, payload)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(tile_id) DO UPDATE SET payload = excluded.payload",
+                params![inserted_id, payload],
+            )?;
+
             let old = prev_bytes.unwrap_or(0).max(0) as u64;
-            let current_total: i64 =
-                tx.query_row("SELECT total_bytes FROM cache_meta WHERE id = 1", [], |r| {
-                    r.get(0)
-                })?;
+            let count_delta: i64 = if prev_bytes.is_none() { 1 } else { 0 };
+            let (current_total, current_count): (i64, i64) = tx.query_row(
+                "SELECT total_bytes, tile_count FROM cache_meta WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
             let updated_total = (current_total.max(0) as u64)
                 .saturating_sub(old)
                 .saturating_add(new_bytes);
+            let updated_count = current_count.max(0).saturating_add(count_delta);
             tx.execute(
-                "UPDATE cache_meta SET total_bytes = ?1 WHERE id = 1",
-                params![updated_total as i64],
+                "UPDATE cache_meta SET total_bytes = ?1, tile_count = ?2 WHERE id = 1",
+                params![updated_total as i64, updated_count],
             )?;
 
-            let rep = evict_in_tx(&tx, updated_total, max_bytes, Some(inserted_rowid))?;
+            let rep = evict_in_tx(
+                &tx,
+                updated_total,
+                updated_count as u64,
+                max_bytes,
+                Some(inserted_id),
+            )?;
             tx.commit()?;
             rep
         };
@@ -463,17 +694,33 @@ impl TileDiskCache {
             return Err(StorageError::InvalidSourceKey(key.source_key.clone()));
         }
         let mut inner = lock_unpoisoned(&self.inner);
+        let (band_kind, band_id) = encode_band(key.band);
         let scheme = encode_scheme(key.scheme);
+        let format = encode_format(key.format);
         let tx = inner
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let prev: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT rowid, byte_size FROM tiles
-                 WHERE source_key = ?1 AND scheme = ?2 AND level = ?3 AND x = ?4 AND y = ?5",
+                "SELECT tile_id, byte_size FROM tile_meta
+                 WHERE source_key = ?1
+                   AND band_kind = ?2
+                   AND band_id = ?3
+                   AND scheme = ?4
+                   AND format = ?5
+                   AND gutter = ?6
+                   AND decode_rev = ?7
+                   AND level = ?8
+                   AND x = ?9
+                   AND y = ?10",
                 params![
                     &key.source_key,
+                    band_kind,
+                    band_id,
                     scheme,
+                    format,
+                    i64::from(key.gutter),
+                    i64::from(key.decode_rev),
                     i64::from(key.level),
                     i64::from(key.x),
                     i64::from(key.y)
@@ -481,16 +728,19 @@ impl TileDiskCache {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some((rowid, sz)) = prev else {
+        let Some((tile_id, sz)) = prev else {
             return Ok(false);
         };
-        tx.execute("DELETE FROM tiles WHERE rowid = ?1", params![rowid])?;
+        tx.execute("DELETE FROM tile_meta WHERE tile_id = ?1", params![tile_id])?;
         tx.execute(
-            "UPDATE cache_meta SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
+            "UPDATE cache_meta
+             SET total_bytes = MAX(0, total_bytes - ?1),
+                 tile_count  = MAX(0, tile_count - 1)
+             WHERE id = 1",
             params![sz],
         )?;
         tx.commit()?;
-        inner.pending_touches.remove(&rowid);
+        inner.pending_touches.remove(&tile_id);
         Ok(true)
     }
 
@@ -520,11 +770,18 @@ impl TileDiskCache {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             flush_touches_in_tx(&tx, &touches)?;
-            let current: i64 =
-                tx.query_row("SELECT total_bytes FROM cache_meta WHERE id = 1", [], |r| {
-                    r.get(0)
-                })?;
-            let rep = evict_in_tx(&tx, current.max(0) as u64, max_bytes, None)?;
+            let (current_bytes, current_count): (i64, i64) = tx.query_row(
+                "SELECT total_bytes, tile_count FROM cache_meta WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let rep = evict_in_tx(
+                &tx,
+                current_bytes.max(0) as u64,
+                current_count.max(0) as u64,
+                max_bytes,
+                None,
+            )?;
             tx.commit()?;
             rep
         };
@@ -550,22 +807,27 @@ impl TileDiskCache {
             return Err(StorageError::InvalidSourceKey(source_key.to_owned()));
         }
         let mut inner = lock_unpoisoned(&self.inner);
+        let touches = std::mem::take(&mut inner.pending_touches);
         let deleted = {
             let tx = inner
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            flush_touches_in_tx(&tx, &touches)?;
             let removed_bytes: i64 = tx.query_row(
-                "SELECT COALESCE(SUM(byte_size), 0) FROM tiles WHERE source_key = ?1",
+                "SELECT COALESCE(SUM(byte_size), 0) FROM tile_meta WHERE source_key = ?1",
                 params![source_key],
                 |r| r.get(0),
             )?;
             let deleted = tx.execute(
-                "DELETE FROM tiles WHERE source_key = ?1",
+                "DELETE FROM tile_meta WHERE source_key = ?1",
                 params![source_key],
             )?;
             tx.execute(
-                "UPDATE cache_meta SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
-                params![removed_bytes],
+                "UPDATE cache_meta
+                 SET total_bytes = MAX(0, total_bytes - ?1),
+                     tile_count  = MAX(0, tile_count - ?2)
+                 WHERE id = 1",
+                params![removed_bytes, deleted as i64],
             )?;
             tx.commit()?;
             deleted
@@ -587,8 +849,14 @@ impl TileDiskCache {
             let tx = inner
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute("DELETE FROM tiles", [])?;
-            tx.execute("UPDATE cache_meta SET total_bytes = 0 WHERE id = 1", [])?;
+            // Delete blobs first to avoid per-row cascade work and allow SQLite's
+            // table-truncate optimization.
+            tx.execute("DELETE FROM tile_blobs", [])?;
+            tx.execute("DELETE FROM tile_meta", [])?;
+            tx.execute(
+                "UPDATE cache_meta SET total_bytes = 0, tile_count = 0 WHERE id = 1",
+                [],
+            )?;
             tx.commit()?;
         }
         let _ = inner.conn.execute_batch("PRAGMA incremental_vacuum;");
@@ -598,21 +866,15 @@ impl TileDiskCache {
         Ok(())
     }
 
-    /// Return current tile count, payload byte total, file size (including
-    /// `-wal` sidecar), and cap inside a consistent read snapshot.
+    /// Return current tile count, payload byte total (both O(1) from
+    /// `cache_meta`), file size (including `-wal` sidecar), and cap.
     pub fn stats(&self) -> Result<DiskCacheStats, StorageError> {
-        let mut inner = lock_unpoisoned(&self.inner);
-        let (tile_count, payload_bytes): (i64, i64) = {
-            let tx = inner
-                .conn
-                .transaction_with_behavior(TransactionBehavior::Deferred)?;
-            let count: i64 = tx.query_row("SELECT COUNT(*) FROM tiles", [], |r| r.get(0))?;
-            let bytes: i64 =
-                tx.query_row("SELECT total_bytes FROM cache_meta WHERE id = 1", [], |r| {
-                    r.get(0)
-                })?;
-            (count, bytes)
-        };
+        let inner = lock_unpoisoned(&self.inner);
+        let (tile_count, payload_bytes): (i64, i64) = inner.conn.query_row(
+            "SELECT tile_count, total_bytes FROM cache_meta WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let file_bytes = inner.db_path.as_ref().map_or(0, |p| {
             let main = std::fs::metadata(p).map_or(0, |m| m.len());
             let mut wal_os = p.as_os_str().to_os_string();
@@ -632,8 +894,9 @@ impl TileDiskCache {
 fn evict_in_tx(
     tx: &rusqlite::Transaction<'_>,
     mut total_bytes: u64,
+    mut tile_count: u64,
     max_bytes: u64,
-    protect_rowid: Option<i64>,
+    protect_id: Option<i64>,
 ) -> Result<EvictionReport, rusqlite::Error> {
     if total_bytes <= max_bytes {
         return Ok(EvictionReport {
@@ -647,35 +910,35 @@ fn evict_in_tx(
     let mut evicted_tiles = 0usize;
     let mut evicted_bytes = 0u64;
 
-    // `ORDER BY last_used_ms ASC` (without `, rowid ASC`) lets SQLite satisfy
-    // the query directly from covering index `idx_tiles_lru_v2 (last_used_ms,
+    // `ORDER BY last_used_ms ASC` (without `, tile_id ASC`) lets SQLite satisfy
+    // the query directly from covering index `idx_tile_meta_lru (last_used_ms,
     // byte_size)` with zero temp B-tree sorting and zero table lookups.
-    let mut select_stmt = match protect_rowid {
+    let mut select_stmt = match protect_id {
         Some(_) => tx.prepare(
-            "SELECT rowid, byte_size FROM tiles
-             WHERE rowid != ?2
+            "SELECT tile_id, byte_size FROM tile_meta
+             WHERE tile_id != ?2
              ORDER BY last_used_ms ASC
              LIMIT ?1",
         )?,
         None => tx.prepare(
-            "SELECT rowid, byte_size FROM tiles
+            "SELECT tile_id, byte_size FROM tile_meta
              ORDER BY last_used_ms ASC
              LIMIT ?1",
         )?,
     };
-    let mut delete_stmt = tx.prepare("DELETE FROM tiles WHERE rowid = ?1")?;
+    let mut delete_stmt = tx.prepare("DELETE FROM tile_meta WHERE tile_id = ?1")?;
 
     loop {
         if total_bytes <= target {
             break;
         }
         let mut batch = Vec::with_capacity(EVICT_BATCH_ROWS as usize);
-        match protect_rowid {
+        match protect_id {
             Some(protected) => {
                 let rows = select_stmt.query_map(params![EVICT_BATCH_ROWS, protected], |r| {
-                    let rowid: i64 = r.get(0)?;
+                    let tile_id: i64 = r.get(0)?;
                     let sz: i64 = r.get(1)?;
-                    Ok((rowid, sz.max(0) as u64))
+                    Ok((tile_id, sz.max(0) as u64))
                 })?;
                 for row in rows {
                     batch.push(row?);
@@ -683,9 +946,9 @@ fn evict_in_tx(
             }
             None => {
                 let rows = select_stmt.query_map(params![EVICT_BATCH_ROWS], |r| {
-                    let rowid: i64 = r.get(0)?;
+                    let tile_id: i64 = r.get(0)?;
                     let sz: i64 = r.get(1)?;
-                    Ok((rowid, sz.max(0) as u64))
+                    Ok((tile_id, sz.max(0) as u64))
                 })?;
                 for row in rows {
                     batch.push(row?);
@@ -697,20 +960,21 @@ fn evict_in_tx(
             break;
         }
 
-        for (rowid, sz) in batch {
+        for (tile_id, sz) in batch {
             if total_bytes <= target {
                 break;
             }
-            delete_stmt.execute(params![rowid])?;
+            delete_stmt.execute(params![tile_id])?;
             total_bytes = total_bytes.saturating_sub(sz);
+            tile_count = tile_count.saturating_sub(1);
             evicted_bytes = evicted_bytes.saturating_add(sz);
             evicted_tiles += 1;
         }
     }
 
     tx.execute(
-        "UPDATE cache_meta SET total_bytes = ?1 WHERE id = 1",
-        params![total_bytes as i64],
+        "UPDATE cache_meta SET total_bytes = ?1, tile_count = ?2 WHERE id = 1",
+        params![total_bytes as i64, tile_count as i64],
     )?;
 
     Ok(EvictionReport {
@@ -721,232 +985,5 @@ fn evict_in_tx(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::thread;
-
-    use super::*;
-    use crate::TestTempDir;
-
-    fn key(source: &str, level: u8, x: u32, y: u32) -> DiskTileKey {
-        DiskTileKey::new(source, TileScheme::WebMercator, level, x, y)
-    }
-
-    #[test]
-    fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
-        assert!(valid_source_key("nasa-gibs_blue_marble.v1"));
-        assert!(valid_source_key(&"a".repeat(128)));
-        assert!(!valid_source_key(&"a".repeat(129)));
-        assert!(!valid_source_key(""));
-        assert!(!valid_source_key("."));
-        assert!(!valid_source_key(".."));
-        assert!(!valid_source_key("../escape"));
-        assert!(!valid_source_key("a/b"));
-
-        // Budget = 100 B, 10% headroom target = 90 B.
-        let cache = TileDiskCache::open_in_memory(100).expect("open mem cache");
-        let k_a = key("eox", 12, 0, 0);
-        let k_b = key("eox", 12, 1, 0);
-        let k_c = key("eox", 12, 2, 0);
-        let k_d = key("eox", 12, 3, 0);
-
-        cache.put(&k_a, &[1u8; 40]).expect("put a");
-        cache.put(&k_b, &[2u8; 20]).expect("put b");
-        cache.put(&k_c, &[3u8; 40]).expect("put c");
-        assert_eq!(cache.stats().expect("stats").payload_bytes, 100);
-
-        // Touch `k_a` (debounced in memory) -> must flush before eviction so `k_b`
-        // is evicted first, NOT `k_a`.
-        assert_eq!(cache.get(&k_a).expect("get a"), Some(vec![1u8; 40]));
-
-        // Insert `k_d` (30 B): total becomes 130 > 100, target = 90.
-        // Evicting `k_b` (20) -> 110 > 90; evicting `k_c` (40) -> 70 <= 90.
-        let report = cache.put(&k_d, &[4u8; 30]).expect("put d");
-        assert_eq!(report.evicted_tiles, 2);
-        assert_eq!(report.evicted_bytes, 60);
-        assert_eq!(report.total_bytes_after, 70);
-        assert!(report.total_bytes_after <= 100);
-
-        assert!(cache.get(&k_a).expect("get a").is_some());
-        assert!(cache.get(&k_b).expect("get b").is_none());
-        assert!(cache.get(&k_c).expect("get c").is_none());
-        assert!(cache.get(&k_d).expect("get d").is_some());
-
-        let stats = cache.stats().expect("stats");
-        assert_eq!(stats.tile_count, 2);
-        assert_eq!(stats.payload_bytes, 70);
-    }
-
-    #[test]
-    fn eviction_query_uses_covering_lru_index_without_temp_btree() {
-        let cache = TileDiskCache::open_in_memory(4096).expect("open mem");
-        let inner = lock_unpoisoned(&cache.inner);
-        let mut stmt = inner
-            .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT rowid, byte_size FROM tiles
-                 WHERE rowid != ?2
-                 ORDER BY last_used_ms ASC
-                 LIMIT ?1",
-            )
-            .expect("explain");
-        let details: Vec<String> = stmt
-            .query_map(params![EVICT_BATCH_ROWS, 1i64], |r| r.get::<_, String>(3))
-            .expect("query plan")
-            .map(|r| r.expect("plan row"))
-            .collect();
-        let joined = details.join(" | ");
-        assert!(
-            joined.contains("idx_tiles_lru_v2") && joined.contains("COVERING"),
-            "expected covering idx_tiles_lru_v2 scan, got: {joined}"
-        );
-        assert!(
-            !joined.contains("TEMP B-TREE"),
-            "unexpected temp B-tree sort in eviction plan: {joined}"
-        );
-    }
-
-    #[test]
-    fn recovers_cleanly_from_corrupt_sqlite_file_and_persists_across_reopen() {
-        let dir = TestTempDir::new("sqlite-recovery");
-        let db_path = dir.path().join("tiles.sqlite3");
-
-        // Write garbage bytes simulating a corrupted cache file.
-        std::fs::write(&db_path, b"not a valid sqlite database file!").expect("write corrupt");
-
-        let cache = TileDiskCache::open(&db_path, 4096).expect("recover corrupt db");
-        assert_eq!(cache.stats().expect("stats").tile_count, 0);
-
-        let k1 = key("gibs", 3, 2, 1);
-        cache.put(&k1, b"png-bytes").expect("put k1");
-        let ts_before = lock_unpoisoned(&cache.inner).last_ts_ms;
-        drop(cache);
-
-        // Reopen and verify persistence + monotonic timestamp seed + shrinking + clear.
-        let reopened = TileDiskCache::open(&db_path, 4096).expect("reopen");
-        assert!(
-            lock_unpoisoned(&reopened.inner).last_ts_ms >= ts_before,
-            "reopen must seed last_ts_ms from MAX(last_used_ms)"
-        );
-        assert_eq!(
-            reopened.get(&k1).expect("get k1"),
-            Some(b"png-bytes".to_vec())
-        );
-
-        let ev = reopened.set_max_bytes(4).expect("shrink cap");
-        assert_eq!(ev.evicted_tiles, 1);
-        assert_eq!(reopened.stats().expect("stats").payload_bytes, 0);
-
-        // Put a sizeable blob, then clear() and confirm WAL/file bytes shrink.
-        reopened.set_max_bytes(256 * 1024).expect("grow cap");
-        for i in 0..8u32 {
-            reopened
-                .put(&key("gibs", 4, i, 0), &vec![0xAB; 16 * 1024])
-                .expect("put chunk");
-        }
-        let before_clear = reopened.stats().expect("stats before clear").file_bytes;
-        reopened.clear().expect("clear");
-        let after_clear = reopened.stats().expect("stats after clear");
-        assert_eq!(after_clear.tile_count, 0);
-        assert_eq!(after_clear.payload_bytes, 0);
-        assert!(
-            after_clear.file_bytes < before_clear,
-            "clear() should reclaim space (before={before_clear}, after={})",
-            after_clear.file_bytes
-        );
-    }
-
-    #[test]
-    fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
-        let cache = TileDiskCache::open_in_memory(10_000).expect("open mem");
-        let k = key("eox", 5, 1, 1);
-
-        // Overwrite with larger then smaller payloads; byte accounting stays exact.
-        cache.put(&k, &[1u8; 100]).expect("put 100");
-        assert_eq!(cache.stats().expect("s1").payload_bytes, 100);
-        cache.put(&k, &[2u8; 350]).expect("put 350");
-        assert_eq!(cache.stats().expect("s2").payload_bytes, 350);
-        cache.put(&k, &[3u8; 50]).expect("put 50");
-        assert_eq!(cache.stats().expect("s3").payload_bytes, 50);
-
-        // Skipped puts (empty or > max_bytes) return honest current total_bytes_after.
-        let empty_rep = cache.put(&k, &[]).expect("skip empty");
-        assert_eq!(empty_rep.total_bytes_after, 50);
-        let big_rep = cache.put(&k, &vec![0u8; 20_000]).expect("skip oversized");
-        assert_eq!(big_rep.total_bytes_after, 50);
-
-        // Insert 200 tiles (crossing EVICT_BATCH_ROWS = 128), then shrink cap to trigger
-        // multi-batch eviction.
-        cache.clear().expect("clear");
-        for i in 0..200u32 {
-            cache
-                .put(&key("eox", 8, i, 0), &[i as u8; 40])
-                .expect("put batch tile");
-        }
-        assert_eq!(cache.stats().expect("pre-evict").tile_count, 200);
-        let ev = cache.set_max_bytes(1000).expect("multi-batch evict");
-        assert!(ev.evicted_tiles > EVICT_BATCH_ROWS as usize);
-        assert!(ev.total_bytes_after <= 900);
-        assert_eq!(
-            cache.stats().expect("post-evict").payload_bytes,
-            ev.total_bytes_after
-        );
-    }
-
-    #[test]
-    fn clear_source_removes_only_matching_source() {
-        let cache = TileDiskCache::open_in_memory(4096).expect("open mem");
-        let k1 = key("gibs", 1, 0, 0);
-        let k2 = key("eox", 1, 0, 0);
-        cache.put(&k1, &[1u8; 100]).expect("put k1");
-        cache.put(&k2, &[2u8; 200]).expect("put k2");
-
-        let removed = cache.clear_source("gibs").expect("clear gibs");
-        assert_eq!(removed, 1);
-        assert!(cache.get(&k1).expect("get k1").is_none());
-        assert!(cache.get(&k2).expect("get k2").is_some());
-        assert_eq!(cache.stats().expect("stats").payload_bytes, 200);
-    }
-
-    #[test]
-    fn large_tile_near_budget_never_self_evicts_and_delete_updates_total() {
-        let cache = TileDiskCache::open_in_memory(100).expect("open mem");
-        let old = key("eox", 1, 0, 0);
-        let big = key("eox", 1, 1, 0);
-
-        cache.put(&old, &[1u8; 20]).expect("put old");
-        // 95 B exceeds the 90 B headroom target, yet fits within 100 B cap.
-        // Eviction must drop `old` and MUST NOT self-evict `big`.
-        let rep = cache.put(&big, &[2u8; 95]).expect("put big");
-        assert_eq!(rep.evicted_tiles, 1);
-        assert_eq!(rep.total_bytes_after, 95);
-        assert!(cache.get(&old).expect("get old").is_none());
-        assert_eq!(cache.get(&big).expect("get big"), Some(vec![2u8; 95]));
-
-        assert!(cache.delete(&big).expect("delete big"));
-        assert_eq!(cache.stats().expect("stats").payload_bytes, 0);
-    }
-
-    #[test]
-    fn concurrent_reads_and_writes_keep_budget_and_accounting_consistent() {
-        let cache = Arc::new(TileDiskCache::open_in_memory(4096).expect("open mem"));
-        let mut threads = Vec::new();
-        for tid in 0..4u32 {
-            let c = Arc::clone(&cache);
-            threads.push(thread::spawn(move || {
-                for i in 0..40u32 {
-                    let k = key("eox", 10, tid, i);
-                    c.put(&k, &[tid as u8; 128]).expect("concurrent put");
-                    let _ = c.get(&k).expect("concurrent get");
-                }
-            }));
-        }
-        for h in threads {
-            h.join().expect("join worker");
-        }
-        let stats = cache.stats().expect("stats");
-        assert!(stats.payload_bytes <= 4096);
-        assert_eq!(stats.payload_bytes, stats.tile_count * 128);
-    }
-}
+#[path = "tile_cache_tests.rs"]
+mod tests;

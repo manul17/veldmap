@@ -84,6 +84,21 @@ pub fn compute_scale_bar(m_per_pt: f64, max_width_pt: f32) -> (String, f32) {
     (label, width_pt)
 }
 
+const SCALE_BAR_MARGIN_PT: f32 = 16.0;
+const SCALE_BAR_PAD_X_PT: f32 = 10.0;
+const SCALE_BAR_GAP_PT: f32 = 16.0;
+const SCALE_BAR_MIN_WIDTH_PT: f32 = 48.0;
+const SCALE_BAR_MAX_WIDTH_PT: f32 = 160.0;
+
+/// Horizontal screen width in logical points reserved on the bottom-left for
+/// the metric scale bar plus spacing, so right-aligned viewport overlays (e.g.
+/// the basemap attribution pill) never collide with it.
+pub fn scale_bar_reserved_width(viewport_width_pt: f32) -> f32 {
+    let max_bar_w =
+        (viewport_width_pt * 0.35).clamp(SCALE_BAR_MIN_WIDTH_PT, SCALE_BAR_MAX_WIDTH_PT);
+    SCALE_BAR_MARGIN_PT + max_bar_w + SCALE_BAR_PAD_X_PT * 2.0 + SCALE_BAR_GAP_PT
+}
+
 /// Paint a crisp floating dynamic metric scale bar in the bottom-left corner
 /// of `viewport_rect`.
 pub fn paint_scale_bar(painter: &egui::Painter, viewport_rect: egui::Rect, m_per_pt: f64) {
@@ -94,15 +109,16 @@ pub fn paint_scale_bar(painter: &egui::Painter, viewport_rect: egui::Rect, m_per
     {
         return;
     }
-    let max_width_pt = (viewport_rect.width() * 0.35).clamp(48.0, 160.0);
+    let max_width_pt =
+        (viewport_rect.width() * 0.35).clamp(SCALE_BAR_MIN_WIDTH_PT, SCALE_BAR_MAX_WIDTH_PT);
     // Hide the tangent-plane scale bar at extreme orbital zoom where the bar
     // would exceed 10,000 km and no longer reflects curved planetary scale.
     if m_per_pt * f64::from(max_width_pt) > 10_000_000.0 {
         return;
     }
     let (label, bar_w) = compute_scale_bar(m_per_pt, max_width_pt);
-    let margin = 16.0;
-    let pad_x = 10.0;
+    let margin = SCALE_BAR_MARGIN_PT;
+    let pad_x = SCALE_BAR_PAD_X_PT;
     let pad_y = 6.0;
     let box_w = bar_w + pad_x * 2.0;
     let box_h = 34.0;

@@ -1,8 +1,6 @@
-//! Unified `Copy` tile addressing (`TileKey`, `TileScheme`, `BandKey`,
-//! `PixelFormat`, `SourceId`) shared by planetary basemaps, polar caps, and
-//! local/cloud raster pyramids.
-
-use super::quadtree::QuadTileId;
+//! Unified `Copy` tile addressing (`TileKey`, `QuadTileId`, `TileScheme`,
+//! `BandKey`, `PixelFormat`, `SourceId`) shared by planetary basemaps, polar
+//! caps, and local/cloud raster pyramids.
 
 /// Deterministic 64-bit FNV-1a hash used for stable `Copy` source/band keys.
 pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -42,7 +40,7 @@ impl SourceId {
 }
 
 /// Deterministic, `Copy` band selector avoiding heap allocations in `TileKey`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BandKey {
     /// Display-ready color composite (e.g. sRGB basemap or RGB orthophoto).
     Display,
@@ -61,7 +59,7 @@ impl BandKey {
 }
 
 /// Pixel storage format for GPU and CPU tile caches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PixelFormat {
     /// 8-bit sRGB RGBA display imagery (4 bytes/pixel).
     Rgba8UnormSrgb,
@@ -187,6 +185,101 @@ impl TileScheme {
     }
 }
 
+/// Geometry identifier for a single planetary quadtree or polar cap tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct QuadTileId {
+    pub scheme: TileScheme,
+    pub level: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+impl QuadTileId {
+    /// Return this tile's parent clamped to at most `max_level`, together with
+    /// the exact UV sub-rectangle `[u_off, v_off, u_scale, v_scale]` mapping
+    /// this tile into the clamped ancestor.
+    pub fn clamp_to_level(self, max_level: u8) -> (Self, [f32; 4]) {
+        if self.level <= max_level {
+            return (self, [0.0, 0.0, 1.0, 1.0]);
+        }
+        let dz = self.level - max_level;
+        if dz >= 31 {
+            return (
+                Self {
+                    scheme: self.scheme,
+                    level: max_level,
+                    x: 0,
+                    y: 0,
+                },
+                [0.0, 0.0, 0.0, 0.0],
+            );
+        }
+        let mask = (1u32 << dz) - 1;
+        let scale = 1.0_f64 / f64::from(1u32 << dz);
+        let u0 = f64::from(self.x & mask) * scale;
+        let v0 = f64::from(self.y & mask) * scale;
+        (
+            Self {
+                scheme: self.scheme,
+                level: max_level,
+                x: self.x >> dz,
+                y: self.y >> dz,
+            },
+            [u0 as f32, v0 as f32, scale as f32, scale as f32],
+        )
+    }
+
+    /// Return the 4 child tiles of this planetary node.
+    pub fn children(self) -> [Self; 4] {
+        let next = self.level + 1;
+        let cx = self.x << 1;
+        let cy = self.y << 1;
+        [
+            Self {
+                scheme: self.scheme,
+                level: next,
+                x: cx,
+                y: cy,
+            },
+            Self {
+                scheme: self.scheme,
+                level: next,
+                x: cx + 1,
+                y: cy,
+            },
+            Self {
+                scheme: self.scheme,
+                level: next,
+                x: cx,
+                y: cy + 1,
+            },
+            Self {
+                scheme: self.scheme,
+                level: next,
+                x: cx + 1,
+                y: cy + 1,
+            },
+        ]
+    }
+
+    /// Return the coarser parent node, or `None` at `level == 0` (or for
+    /// non-planetary schemes).
+    pub const fn parent(self) -> Option<Self> {
+        if !self.scheme.is_coarsest_zero() {
+            return None;
+        }
+        let Some((level, x, y)) = self.scheme.parent(self.level, self.x, self.y) else {
+            return None;
+        };
+        Some(Self {
+            scheme: self.scheme,
+            level,
+            x,
+            y,
+        })
+    }
+}
+
 /// Complete, `Copy + Eq + Hash` cache key for any GPU or CPU tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileKey {
@@ -238,12 +331,33 @@ impl TileKey {
     }
 
     /// Deterministic coarsest-first ordering key for upload and request queues.
-    pub const fn coarsest_first_key(&self) -> (u8, TileScheme, u32, u32) {
+    ///
+    /// Orders by `(coarseness_rank, scheme, y, x)` first so multi-band tiles
+    /// (`B04`, `B08`, `SCL`) interleave at each spatial cell, then breaks ties
+    /// deterministically by `(source, band, format, gutter, decode_rev)`.
+    pub const fn coarsest_first_key(
+        &self,
+    ) -> (
+        u8,
+        TileScheme,
+        u32,
+        u32,
+        SourceId,
+        BandKey,
+        PixelFormat,
+        u8,
+        u32,
+    ) {
         (
             self.scheme.coarseness_rank(self.level),
             self.scheme,
             self.y,
             self.x,
+            self.source,
+            self.band,
+            self.format,
+            self.gutter,
+            self.decode_rev,
         )
     }
 
@@ -308,190 +422,4 @@ pub fn compose_uv_rect(outer: [f32; 4], inner: [f32; 4]) -> [f32; 4] {
         outer[2] * inner[2],
         outer[3] * inner[3],
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tile_scheme_parent_respects_level_direction_without_inverting() {
-        // Planetary XYZ / Geodetic / PolarCap: z = 0 is coarsest.
-        for scheme in [
-            TileScheme::WebMercator,
-            TileScheme::Geodetic,
-            TileScheme::PolarCap { north: true },
-            TileScheme::PolarCap { north: false },
-        ] {
-            assert!(scheme.is_coarsest_zero());
-            assert_eq!(scheme.parent(0, 0, 0), None);
-            assert_eq!(scheme.parent(0, 1, 0), None);
-            assert_eq!(scheme.parent(3, 5, 7), Some((2, 2, 3)));
-            assert_eq!(scheme.parent(1, 3, 1), Some((0, 1, 0)));
-            assert!(scheme.coarseness_rank(0) < scheme.coarseness_rank(3));
-        }
-
-        // RasterPyramid: level = 0 is finest, level = max_level is coarsest.
-        let pyr = TileScheme::RasterPyramid { max_level: 5 };
-        assert!(!pyr.is_coarsest_zero());
-        assert_eq!(pyr.parent(5, 0, 0), None);
-        assert_eq!(pyr.parent(6, 0, 0), None);
-        assert_eq!(pyr.parent(0, 5, 7), Some((1, 2, 3)));
-        assert_eq!(pyr.parent(4, 1, 1), Some((5, 0, 0)));
-        assert!(pyr.coarseness_rank(5) < pyr.coarseness_rank(0));
-    }
-
-    #[test]
-    fn sub_rect_in_ancestor_maps_both_planetary_and_raster_pyramid_tiles() {
-        let ancestor = TileKey {
-            source: SourceId::BUNDLED_BASEMAP,
-            band: BandKey::Display,
-            scheme: TileScheme::Geodetic,
-            format: PixelFormat::Rgba8UnormSrgb,
-            gutter: 0,
-            decode_rev: 0,
-            level: 2,
-            x: 3,
-            y: 1,
-        };
-        let child = TileKey {
-            level: 4,
-            x: (3 << 2) + 2,
-            y: (1 << 2) + 3,
-            ..ancestor
-        };
-        assert_eq!(
-            child.sub_rect_in_ancestor(&ancestor),
-            Some([0.5, 0.75, 0.25, 0.25])
-        );
-        assert_eq!(
-            ancestor.sub_rect_in_ancestor(&ancestor),
-            Some([0.0, 0.0, 1.0, 1.0])
-        );
-        // Reversed direction must return None.
-        assert_eq!(ancestor.sub_rect_in_ancestor(&child), None);
-
-        // RasterPyramid ancestor has LARGER level index.
-        let pyr_coarse = TileKey {
-            scheme: TileScheme::RasterPyramid { max_level: 4 },
-            level: 3,
-            x: 1,
-            y: 2,
-            ..ancestor
-        };
-        let pyr_fine = TileKey {
-            level: 1,
-            x: (1 << 2) + 1,
-            y: (2 << 2) + 3,
-            ..pyr_coarse
-        };
-        assert_eq!(
-            pyr_fine.sub_rect_in_ancestor(&pyr_coarse),
-            Some([0.25, 0.75, 0.25, 0.25])
-        );
-        assert_eq!(pyr_coarse.sub_rect_in_ancestor(&pyr_fine), None);
-    }
-
-    #[test]
-    fn band_key_from_name_is_deterministic() {
-        assert_eq!(BandKey::from_name("B08"), BandKey::from_name("B08"));
-        assert_ne!(BandKey::from_name("B08"), BandKey::from_name("B04"));
-        assert_ne!(BandKey::from_name("SCL"), BandKey::Display);
-
-        let s1 = SourceId::from_stable_key("eox-s2cloudless-2023-3857");
-        let s2 = SourceId::from_stable_key("nasa-gibs-bluemarble-l8");
-        assert_eq!(s1, SourceId::from_stable_key("eox-s2cloudless-2023-3857"));
-        assert_ne!(s1, s2);
-        assert_ne!(s1, SourceId::BUNDLED_BASEMAP);
-        assert_ne!(s1.0 & (1u64 << 63), 0, "derived SourceId sets high bit");
-    }
-
-    #[test]
-    fn grid_dims_and_sub_rect_edge_cases_are_guarded() {
-        assert_eq!(
-            TileScheme::WebMercator.grid_dims(30),
-            Some((1 << 30, 1 << 30))
-        );
-        assert_eq!(TileScheme::WebMercator.grid_dims(31), None);
-        assert_eq!(TileScheme::Geodetic.grid_dims(29), Some((1 << 30, 1 << 29)));
-        assert_eq!(TileScheme::Geodetic.grid_dims(30), None);
-        assert_eq!(
-            TileScheme::RasterPyramid { max_level: 4 }.grid_dims(0),
-            None
-        );
-
-        assert_eq!(PixelFormat::Rgba8UnormSrgb.bytes_per_pixel(), 4);
-        assert_eq!(PixelFormat::R32Float.bytes_per_pixel(), 4);
-        assert_eq!(PixelFormat::R8Uint.bytes_per_pixel(), 1);
-        assert_eq!(PixelFormat::R16Uint.bytes_per_pixel(), 2);
-
-        let base = TileKey {
-            source: SourceId::BUNDLED_BASEMAP,
-            band: BandKey::Display,
-            scheme: TileScheme::WebMercator,
-            format: PixelFormat::Rgba8UnormSrgb,
-            gutter: 0,
-            decode_rev: 0,
-            level: 0,
-            x: 0,
-            y: 0,
-        };
-        let other_source = TileKey {
-            source: SourceId::new(2),
-            ..base
-        };
-        assert_eq!(base.sub_rect_in_ancestor(&other_source), None);
-
-        let guttered = TileKey { gutter: 1, ..base };
-        assert_eq!(guttered.sub_rect_in_ancestor(&base), None);
-        assert_eq!(guttered.sub_rect_in_ancestor(&guttered), None);
-
-        let too_deep = TileKey { level: 31, ..base };
-        assert_eq!(too_deep.sub_rect_in_ancestor(&base), None);
-
-        let wrong_branch = TileKey {
-            level: 2,
-            x: 2,
-            y: 0,
-            ..base
-        };
-        let other_parent = TileKey {
-            level: 1,
-            x: 0,
-            y: 0,
-            ..base
-        };
-        assert_eq!(wrong_branch.sub_rect_in_ancestor(&other_parent), None);
-
-        // RasterPyramid rejects levels strictly above max_level in both level_delta and sub_rect.
-        let pyr = TileScheme::RasterPyramid { max_level: 3 };
-        assert_eq!(pyr.level_delta(1, 4), None);
-        assert_eq!(pyr.level_delta(4, 3), None);
-        let pyr_invalid = TileKey {
-            scheme: pyr,
-            level: 4,
-            x: 0,
-            y: 0,
-            ..base
-        };
-        let pyr_fine = TileKey {
-            level: 1,
-            ..pyr_invalid
-        };
-        assert_eq!(pyr_fine.sub_rect_in_ancestor(&pyr_invalid), None);
-
-        // Coarsest-first key orders z=0 before z=2 for planetary, and max_level before 0 for RasterPyramid.
-        assert!(base.coarsest_first_key() < wrong_branch.coarsest_first_key());
-        let pyr_root = TileKey {
-            scheme: pyr,
-            level: 3,
-            ..base
-        };
-        assert!(pyr_root.coarsest_first_key() < pyr_fine.coarsest_first_key());
-
-        assert_eq!(
-            compose_uv_rect([0.5, 0.25, 0.5, 0.5], [0.5, 0.5, 0.5, 0.25]),
-            [0.75, 0.5, 0.25, 0.125]
-        );
-    }
 }

@@ -4,12 +4,20 @@ Canonical English domain terms implemented across VeldMap's code, UI, and docume
 
 | Term | Meaning |
 |---|---|
+| **Carrier / Overzoom** | Finest cached ancestor tile used to texture a subdivided geometry tile via a sub-rectangle UV mapping when finer imagery is unavailable or exceeds `max_level`. |
 | **ECEF** | Earth-Centered, Earth-Fixed Cartesian coordinate system on the WGS84 ellipsoid. |
 | **Footprint** | Geographic boundary polygon of a satellite scene or local raster product. |
-| **Graticule** | Latitude/longitude reference grid draped over the WGS84 ellipsoid. |
-| **GSD** | Ground Sample Distance—surface metres per pixel at viewport center. |
+| **Graticule** | Procedural latitude/longitude reference grid draped post-overlay over the WGS84 ellipsoid. |
+| **GSD** | Ground Sample Distance—surface metres per pixel at viewport center (distinct from a dataset's native source pixel size). |
+| **Gutter** | Extra border ring of texels (e.g. `gutter = 1` on `514x514` DEM tiles) providing neighbor samples for crease-free finite-difference derivatives across tile edges. |
+| **Linear-light mipmap** | CPU-downsampled `Rgba8UnormSrgb` mip chain averaged in linear light (with alpha weighting) so grazing limb angles stay anti-aliased without gamma darkening. |
 | **MGRS** | Military Grid Reference System (e.g., `37UDQ`), widely used for Sentinel-2 tile indexing and coordinate jumps. |
 | **Nadir globe** | VeldMap v1's smooth `height = 0.0` WGS84 ellipsoid camera model with zero camera pitch/tilt, avoiding renderer-induced relief parallax and keeping uniform center GSD. |
+| **Polar Cap** | Adaptive elliptical square-to-disk Polar Stereographic quadtree cap covering `|lat| >= 85.05112878°` with zero live HTTP requests and no polar triangle slivers. |
 | **Precision RTC** | Relative-to-Center rendering (per-tile `f64` origin subtraction on CPU before casting to `f32`) so GPU vertex precision scales with tile size and distance to the camera rather than Earth's radius. |
+| **Quadtree** | Scheme-matched hierarchical WGS84 surface mesh with decoupled geometry (`z_geom <= 16–17`) vs. texture LOD, 2:1 neighbor balancing, and sag-scaled skirts. |
 | **Reverse-Z** | Depth-buffer convention mapping the near plane to `1.0` and infinity to `0.0` in `Depth32Float`, providing uniform precision from orbit down to metre-scale altitude. |
 | **Sag / Sagitta** | Maximum distance a flat chord or triangle dips below the curved ellipsoid surface between vertices. |
+| **TileKey / TileScheme** | Unified `Copy` cache key (`source`, `band`, `scheme`, `format`, `gutter`, `decode_rev`, `level`, `x`, `y`) serving both planetary basemaps (`z = 0` coarsest) and `RasterPyramid` overlays (`level = 0` finest). |
+| **WAL / LRU** | SQLite Write-Ahead Logging combined with Least-Recently-Used per-tile eviction across vertically partitioned `tile_meta` and `tile_blobs` tables. |
+| **WMTS / XYZ / TMS** | Web tiled basemap addressing conventions (`WebMercator` slippy-map `{z}/{x}/{y}`, NASA GIBS `GoogleMapsCompatible` WMTS matrices, and south-up `{-y}` TMS flips). |

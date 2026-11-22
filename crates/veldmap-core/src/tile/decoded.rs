@@ -38,11 +38,21 @@ pub const fn mip_dimensions(width: u32, height: u32, mip_level: u32) -> (u32, u3
 }
 
 /// CPU-decoded tile pixels ready for GPU texture upload, with optional
-/// CPU-generated mipmap levels (`1..N`).
+/// CPU-generated mipmap levels (`1..N`) and explicit valid interior / gutter
+/// dimensions for clipped edge tiles and `gutter = 1` DEM tiles.
 #[derive(Clone)]
 pub struct DecodedTile {
     pub width: u32,
     pub height: u32,
+    /// Valid interior pixel width excluding border gutters
+    /// (`valid_w + 2 * gutter <= width`).
+    pub valid_w: u32,
+    /// Valid interior pixel height excluding border gutters
+    /// (`valid_h + 2 * gutter <= height`).
+    pub valid_h: u32,
+    /// Border gutter width in texels (`0` for standard tiles, `1` for DEM
+    /// derivative tiles).
+    pub gutter: u8,
     pub format: PixelFormat,
     /// Tightly packed mip level 0 pixels (`width * height * bytes_per_pixel`).
     pub data: Vec<u8>,
@@ -56,6 +66,9 @@ impl fmt::Debug for DecodedTile {
         f.debug_struct("DecodedTile")
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("valid_w", &self.valid_w)
+            .field("valid_h", &self.valid_h)
+            .field("gutter", &self.gutter)
             .field("format", &self.format)
             .field("mip_levels", &self.mip_level_count())
             .field("byte_size", &self.byte_size())
@@ -64,18 +77,47 @@ impl fmt::Debug for DecodedTile {
 }
 
 impl DecodedTile {
-    /// Create a single-level (`mip_level_count == 1`) decoded tile.
+    /// Create a single-level (`mip_level_count == 1`, `gutter = 0`, full valid
+    /// interior) decoded tile.
     pub fn new(width: u32, height: u32, format: PixelFormat, data: Vec<u8>) -> Self {
         Self {
             width,
             height,
+            valid_w: width,
+            valid_h: height,
+            gutter: 0,
             format,
             data,
             mips: Vec::new(),
         }
     }
 
-    /// Create a decoded tile carrying precomputed mip levels `1..N`.
+    /// Create a single-level decoded tile with explicit valid interior
+    /// dimensions `(valid_w, valid_h)` and border `gutter` (e.g. clipped
+    /// `RasterPyramid` edge tiles or `514x514` `gutter = 1` DEM tiles).
+    pub fn with_valid_region(
+        width: u32,
+        height: u32,
+        valid_w: u32,
+        valid_h: u32,
+        gutter: u8,
+        format: PixelFormat,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            valid_w,
+            valid_h,
+            gutter,
+            format,
+            data,
+            mips: Vec::new(),
+        }
+    }
+
+    /// Create a decoded tile carrying precomputed mip levels `1..N` (`gutter = 0`,
+    /// full valid interior).
     pub fn with_mips(
         width: u32,
         height: u32,
@@ -86,6 +128,9 @@ impl DecodedTile {
         Self {
             width,
             height,
+            valid_w: width,
+            valid_h: height,
+            gutter: 0,
             format,
             data,
             mips,
@@ -121,11 +166,30 @@ impl DecodedTile {
             .fold(self.data.len(), |acc, mip| acc.saturating_add(mip.len()))
     }
 
-    /// Validate that dimensions are non-zero, mip count does not exceed
+    /// Validate that dimensions and valid interior are non-zero, gutters fit
+    /// cleanly (`valid_w + 2*gutter <= width`, `valid_h + 2*gutter <= height`),
+    /// guttered/padded tiles carry no mip chain, mip count does not exceed
     /// [`max_mip_levels`], and every mip buffer has the exact expected byte
     /// length for its `(w, h, format)`.
     pub fn validate(&self) -> bool {
-        if self.width == 0 || self.height == 0 {
+        if self.width == 0 || self.height == 0 || self.valid_w == 0 || self.valid_h == 0 {
+            return false;
+        }
+        let two_gutter = u32::from(self.gutter) * 2;
+        if self
+            .valid_w
+            .checked_add(two_gutter)
+            .is_none_or(|w| w > self.width)
+            || self
+                .valid_h
+                .checked_add(two_gutter)
+                .is_none_or(|h| h > self.height)
+        {
+            return false;
+        }
+        if (self.gutter != 0 || self.valid_w != self.width || self.valid_h != self.height)
+            && !self.mips.is_empty()
+        {
             return false;
         }
         let max_mips = max_mip_levels(self.width, self.height);
@@ -203,5 +267,34 @@ mod tests {
         let mut bad_mip = valid;
         bad_mip.mips[0].pop();
         assert!(!bad_mip.validate());
+
+        // Guttered DEM tile (6x6 storing 4x4 interior with gutter = 1) validates cleanly.
+        let dem = DecodedTile::with_valid_region(
+            6,
+            6,
+            4,
+            4,
+            1,
+            PixelFormat::R32Float,
+            vec![0u8; 6 * 6 * 4],
+        );
+        assert!(dem.validate());
+
+        // Guttered tile with extra mip levels is rejected.
+        let mut dem_with_mip = dem.clone();
+        dem_with_mip.mips.push(vec![0u8; 3 * 3 * 4]);
+        assert!(!dem_with_mip.validate());
+
+        // Overflowing valid_w + 2*gutter > width is rejected.
+        let bad_gutter = DecodedTile::with_valid_region(
+            6,
+            6,
+            5,
+            4,
+            1,
+            PixelFormat::R32Float,
+            vec![0u8; 6 * 6 * 4],
+        );
+        assert!(!bad_gutter.validate());
     }
 }

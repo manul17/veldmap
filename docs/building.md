@@ -3,12 +3,13 @@
 ## Prerequisites
 
 - **Rust toolchain:** Rust `1.95` or newer (Rust 2024 edition). The repository pins the exact toolchain and components (`rustfmt`, `clippy`) in [rust-toolchain.toml](../rust-toolchain.toml).
+- **C compiler (`cc`):** Required by self-contained bundled native crates (`libsqlite3-sys` for the SQLite tile cache and `ring` for TLS—no external C system libraries or CMake required): `build-essential` on Debian/Ubuntu, Xcode Command Line Tools on macOS, or MSVC Build Tools on Windows.
 - **Graphics driver:** A Vulkan, DirectX 12, or Metal driver (`wgpu::Backends::PRIMARY` minus `BROWSER_WEBGPU`). OpenGL/GLES and WebGPU are intentionally unsupported.
 - **Linux system libraries:** X11/Wayland development headers are needed to compile `eframe`/`winit`:
 
 ```bash
 sudo apt-get install -y \
-  libxkbcommon-dev libwayland-dev libx11-dev \
+  build-essential libxkbcommon-dev libwayland-dev libx11-dev \
   libxcursor-dev libxi-dev libxrandr-dev pkg-config
 ```
 
@@ -20,13 +21,21 @@ For headless GPU tests on Linux CI or machines without a hardware GPU, install `
 # Run the desktop application
 cargo run -p veldmap-app
 
-# Run formatting, lints, and tests
+# Run formatting, lints, rustdoc, and full test suite (matching CI)
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
 
-# Check pure leaf domain build
-cargo check -p veldmap-core --no-default-features
+# Verify headless non-UI crates in isolation
+cargo test --locked -p veldmap-core --no-default-features
+cargo test --locked -p veldmap-raster
+cargo test --locked -p veldmap-storage
+cargo test --locked -p veldmap-net
+
+# Optional local hygiene checks (if installed)
+cargo deny check
+lychee --offline --no-progress docs/ assets/README.md README.md plan.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md
 ```
 
 ## Runtime Environment Variables

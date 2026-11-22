@@ -19,7 +19,7 @@ pub use settings::{
 };
 pub use tile_cache::{
     DEFAULT_DISK_CACHE_BYTES, DiskCacheStats, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES,
-    TileDiskCache, valid_source_key,
+    TileBlobEncoding, TileDiskCache, valid_source_key,
 };
 
 #[cfg(test)]

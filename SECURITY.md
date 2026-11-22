@@ -10,7 +10,8 @@ If you discover a security vulnerability in VeldMap—including credential leaka
 ## Active Protections (Enforced Today)
 
 - **Native Memory & Dependency Hygiene:** `unsafe_op_in_unsafe_fn` is denied workspace-wide, and `undocumented_unsafe_blocks`, `unwrap_used`, and `expect_used` are enforced via Clippy `-D warnings` in CI. `memmap2` (outside Wayland SHM wrappers) and `openssl`/`openssl-sys` are banned in [deny.toml](deny.toml).
-- **Secret Exclusion:** `.env*` files (except `.env.example`) are excluded by `.gitignore` so credentials are never accidentally committed.
+- **TLS, Network Caps & Input Allowlists:** Live HTTP tile requests use `rustls` with the `ring` crypto provider, cap response bodies at `16 MiB` (and initial `Content-Length` pre-allocation at `256 KiB`), validate `DiskTileKey` `source_key` values against a strict ASCII allowlist (`<= 128` bytes, no path separators), and reject out-of-range / `PolarCap` live URLs.
+- **Private Settings & Secret Redaction:** User settings (`settings.json`, which may contain Custom XYZ/TMS `api_key` values) are written atomically with owner-only `0600` permissions on Unix via `write_atomic_durable_private()`; `api_key` values and URL query strings are redacted in `Debug` output and error messages, and `.env*` files (except `.env.example`) are excluded by `.gitignore`.
 
 ## Planned Security Controls (Upcoming Slices)
 

@@ -1,16 +1,19 @@
 //! Basemap selector toolbar controls, Basemap & Cache Settings window, and
 //! viewport attribution badge extracted out of `app.rs`.
 //!
-//! Emits [`BasemapUiAction`] values back to `VeldmapApp` instead of mutating
-//! GPU caches or upload channels directly from UI layout code.
+//! Strictly action-only: emits [`BasemapUiAction`] values back to `VeldmapApp`
+//! without mutating managers, storage, GPU caches, or upload channels directly
+//! from UI layout code.
 
 use eframe::egui;
 use veldmap_net::{CustomBasemapConfig, LiveBasemapSpec, is_valid_iso_date};
 use veldmap_storage::{
-    AppSettings, BasemapSelection, MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB,
+    AppSettings, BasemapSelection, CustomXyzSettings, MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB,
 };
 
 use crate::basemap::BasemapManager;
+use crate::hud;
+use crate::storage::DiskCacheUiState;
 
 /// Short human-readable label for toolbar dropdowns and settings UI.
 pub const fn basemap_label(selection: BasemapSelection) -> &'static str {
@@ -24,6 +27,38 @@ pub const fn basemap_label(selection: BasemapSelection) -> &'static str {
     }
 }
 
+/// Scoped editable slice of [`AppSettings`] owned by the Basemap & Tile Cache
+/// Settings window.
+///
+/// Keeping this slice separate from unrelated `AppSettings` fields (such as
+/// `show_graticule` or future workspace preferences) guarantees saving basemap
+/// settings can never silently clobber other user settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BasemapSettingsDraft {
+    pub active_basemap: BasemapSelection,
+    pub gibs_date: String,
+    pub custom_xyz: CustomXyzSettings,
+    pub disk_cache_max_mb: u64,
+}
+
+impl BasemapSettingsDraft {
+    pub fn from_settings(settings: &AppSettings) -> Self {
+        Self {
+            active_basemap: settings.active_basemap,
+            gibs_date: settings.gibs_date.clone(),
+            custom_xyz: settings.custom_xyz.clone(),
+            disk_cache_max_mb: settings.disk_cache_max_mb,
+        }
+    }
+
+    pub fn apply_into(&self, target: &mut AppSettings) {
+        target.active_basemap = self.active_basemap;
+        target.gibs_date = self.gibs_date.clone();
+        target.custom_xyz = self.custom_xyz.clone();
+        target.disk_cache_max_mb = self.disk_cache_max_mb;
+    }
+}
+
 /// User intent emitted by basemap toolbar / settings widgets and applied by
 /// `VeldmapApp`.
 #[derive(Clone, Debug)]
@@ -31,10 +66,12 @@ pub enum BasemapUiAction {
     /// Switch the active basemap from the toolbar without clobbering unsaved
     /// draft edits in an open Settings window.
     SelectBasemap(BasemapSelection),
-    /// Commit edited settings from the Basemap & Cache Settings window.
-    ApplySettings(AppSettings),
+    /// Commit edited basemap/cache settings from the Settings window.
+    ApplyDraft(BasemapSettingsDraft),
     /// Request an asynchronous SQLite disk cache clear off the UI thread.
     ClearDiskCache,
+    /// Dismiss any transient disk-cache status notice when opening Settings.
+    ClearDiskCacheNotice,
     /// Clear transient failure / offline state and retry visible live tiles.
     RetryLive,
 }
@@ -43,14 +80,41 @@ pub enum BasemapUiAction {
 #[derive(Clone, Debug)]
 pub struct BasemapUiState {
     pub settings_open: bool,
-    pub draft: AppSettings,
+    pub draft: BasemapSettingsDraft,
+    cached_custom_validation: Option<(CustomXyzSettings, Result<(), String>)>,
 }
 
 impl BasemapUiState {
     pub fn new(initial: &AppSettings) -> Self {
         Self {
             settings_open: false,
-            draft: initial.clone(),
+            draft: BasemapSettingsDraft::from_settings(initial),
+            cached_custom_validation: None,
+        }
+    }
+
+    /// Synchronize the Settings draft from persisted `AppSettings` and clear
+    /// cached validation.
+    pub fn sync_from_settings(&mut self, settings: &AppSettings) {
+        self.draft = BasemapSettingsDraft::from_settings(settings);
+        self.cached_custom_validation = None;
+    }
+
+    /// Return cached validation result for `draft.custom_xyz`, recomputing
+    /// only when any field of `custom_xyz` changes.
+    fn custom_validation(&mut self) -> Result<(), &str> {
+        let needs_recompute = self
+            .cached_custom_validation
+            .as_ref()
+            .is_none_or(|(prev, _)| prev != &self.draft.custom_xyz);
+        if needs_recompute {
+            let res = validate_custom_xyz(&self.draft.custom_xyz);
+            self.cached_custom_validation = Some((self.draft.custom_xyz.clone(), res));
+        }
+        match self.cached_custom_validation.as_ref() {
+            Some((_, Ok(()))) => Ok(()),
+            Some((_, Err(err))) => Err(err.as_str()),
+            None => Ok(()),
         }
     }
 }
@@ -64,14 +128,14 @@ const ALL_BASEMAPS: [BasemapSelection; 6] = [
     BasemapSelection::EllipsoidOnly,
 ];
 
-fn validate_custom_draft(draft: &AppSettings) -> Result<(), String> {
+fn validate_custom_xyz(custom: &CustomXyzSettings) -> Result<(), String> {
     LiveBasemapSpec::custom(CustomBasemapConfig {
-        name: &draft.custom_xyz.name,
-        url_template: &draft.custom_xyz.url_template,
-        api_key: &draft.custom_xyz.api_key,
-        tms_flip_y: draft.custom_xyz.tms_flip_y,
-        max_level: draft.custom_xyz.max_level,
-        attribution: &draft.custom_xyz.attribution,
+        name: &custom.name,
+        url_template: &custom.url_template,
+        api_key: &custom.api_key,
+        tms_flip_y: custom.tms_flip_y,
+        max_level: custom.max_level,
+        attribution: &custom.attribution,
     })
     .map(|_| ())
     .map_err(|err| err.to_string())
@@ -81,11 +145,12 @@ fn validate_custom_draft(draft: &AppSettings) -> Result<(), String> {
 /// Settings button, returning any user actions to apply in `VeldmapApp`.
 pub fn show_toolbar_controls(
     ui: &mut egui::Ui,
+    settings: &AppSettings,
     manager: &BasemapManager,
     ui_state: &mut BasemapUiState,
 ) -> Vec<BasemapUiAction> {
     let mut actions = Vec::new();
-    let current = manager.settings().active_basemap;
+    let current = settings.active_basemap;
 
     egui::ComboBox::from_id_salt("basemap_selector")
         .selected_text(basemap_label(current))
@@ -98,16 +163,14 @@ pub fn show_toolbar_controls(
                     && option != current
                 {
                     if option == BasemapSelection::CustomXyz
-                        && manager.settings().custom_xyz.url_template.trim().is_empty()
+                        && settings.custom_xyz.url_template.trim().is_empty()
                     {
-                        // Open Settings to configure URL before activating
-                        // CustomXyz (avoiding an immediate red "Invalid URL").
                         if !ui_state.settings_open {
-                            ui_state.draft = manager.settings().clone();
+                            ui_state.sync_from_settings(settings);
                         }
                         ui_state.draft.active_basemap = BasemapSelection::CustomXyz;
                         ui_state.settings_open = true;
-                        manager.clear_disk_cache_notice();
+                        actions.push(BasemapUiAction::ClearDiskCacheNotice);
                     } else {
                         actions.push(BasemapUiAction::SelectBasemap(option));
                     }
@@ -122,8 +185,8 @@ pub fn show_toolbar_controls(
     {
         ui_state.settings_open = !ui_state.settings_open;
         if ui_state.settings_open {
-            ui_state.draft = manager.settings().clone();
-            manager.clear_disk_cache_notice();
+            ui_state.sync_from_settings(settings);
+            actions.push(BasemapUiAction::ClearDiskCacheNotice);
         }
     }
 
@@ -191,7 +254,8 @@ pub fn show_toolbar_controls(
 /// returning any user actions to apply in `VeldmapApp`.
 pub fn show_settings_window(
     ctx: &egui::Context,
-    manager: &BasemapManager,
+    settings: &AppSettings,
+    disk_ui: &DiskCacheUiState,
     ui_state: &mut BasemapUiState,
 ) -> Vec<BasemapUiAction> {
     if !ui_state.settings_open {
@@ -200,7 +264,6 @@ pub fn show_settings_window(
 
     let mut actions = Vec::new();
     let mut open = ui_state.settings_open;
-    let disk_ui = manager.disk_cache_ui_state();
 
     egui::Window::new("Basemap & Tile Cache Settings")
         .open(&mut open)
@@ -228,7 +291,7 @@ pub fn show_settings_window(
             ui.separator();
             ui.heading("Custom XYZ / TMS Tile Source");
             if ui_state.draft.active_basemap == BasemapSelection::CustomXyz
-                && manager.settings().active_basemap != BasemapSelection::CustomXyz
+                && settings.active_basemap != BasemapSelection::CustomXyz
             {
                 ui.label(
                     egui::RichText::new(
@@ -287,8 +350,9 @@ pub fn show_settings_window(
                 "TMS Y-axis flip (invert {y} from south-up)",
             );
 
-            let custom_validation = validate_custom_draft(&ui_state.draft);
-            if let Err(err) = &custom_validation
+            let custom_err = ui_state.custom_validation().err().map(str::to_owned);
+            let custom_valid = custom_err.is_none();
+            if let Some(err) = &custom_err
                 && (ui_state.draft.active_basemap == BasemapSelection::CustomXyz
                     || !ui_state.draft.custom_xyz.url_template.trim().is_empty())
             {
@@ -334,7 +398,10 @@ pub fn show_settings_window(
                     "Clear Disk Cache"
                 };
                 if ui
-                    .add_enabled(disk_ui.available && !disk_ui.busy, egui::Button::new(clear_label))
+                    .add_enabled(
+                        disk_ui.available && !disk_ui.busy,
+                        egui::Button::new(clear_label),
+                    )
                     .clicked()
                 {
                     actions.push(BasemapUiAction::ClearDiskCache);
@@ -345,7 +412,6 @@ pub fn show_settings_window(
             });
 
             ui.separator();
-            let custom_valid = custom_validation.is_ok();
             let can_apply = date_valid
                 && (ui_state.draft.active_basemap != BasemapSelection::CustomXyz || custom_valid);
             ui.horizontal(|ui| {
@@ -353,7 +419,7 @@ pub fn show_settings_window(
                     .add_enabled(can_apply, egui::Button::new("Apply & Save"))
                     .clicked()
                 {
-                    actions.push(BasemapUiAction::ApplySettings(ui_state.draft.clone()));
+                    actions.push(BasemapUiAction::ApplyDraft(ui_state.draft.clone()));
                 }
                 if ui
                     .add_enabled(
@@ -364,7 +430,7 @@ pub fn show_settings_window(
                 {
                     let mut next = ui_state.draft.clone();
                     next.active_basemap = BasemapSelection::CustomXyz;
-                    actions.push(BasemapUiAction::ApplySettings(next));
+                    actions.push(BasemapUiAction::ApplyDraft(next));
                 }
             });
         });
@@ -381,9 +447,7 @@ pub fn paint_attribution_badge(painter: &egui::Painter, rect: egui::Rect, attrib
         return;
     }
 
-    // Reserve exact width of the bottom-left scale bar (`hud::paint_scale_bar`:
-    // 16 margin + clamped bar width + 20 inner padding) plus a 16 pt gap.
-    let scale_bar_reserve = (rect.width() * 0.35).clamp(48.0, 160.0) + 52.0;
+    let scale_bar_reserve = hud::scale_bar_reserved_width(rect.width());
     let avail = rect.width() - scale_bar_reserve - 26.0; // 16 pad_x*2 + 10 right margin
     if avail < 100.0 {
         return;
@@ -420,4 +484,35 @@ pub fn paint_attribution_badge(painter: &egui::Painter, rect: egui::Rect, attrib
         galley,
         egui::Color32::WHITE,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basemap_draft_preserves_unrelated_app_settings_and_caches_validation() {
+        let mut settings = AppSettings {
+            show_graticule: false,
+            ..AppSettings::default()
+        };
+        let mut ui_state = BasemapUiState::new(&settings);
+        ui_state.draft.active_basemap = BasemapSelection::EoxSentinel2Cloudless;
+        ui_state.draft.disk_cache_max_mb = 1024;
+
+        // Applying basemap draft must leave unrelated `show_graticule` intact.
+        ui_state.draft.apply_into(&mut settings);
+        assert!(!settings.show_graticule);
+        assert_eq!(
+            settings.active_basemap,
+            BasemapSelection::EoxSentinel2Cloudless
+        );
+        assert_eq!(settings.disk_cache_max_mb, 1024);
+
+        // Cached custom validation fails on empty URL, then updates when edited.
+        assert!(ui_state.custom_validation().is_err());
+        ui_state.draft.custom_xyz.url_template =
+            "https://tiles.example.org/{z}/{x}/{y}.png".to_owned();
+        assert!(ui_state.custom_validation().is_ok());
+    }
 }

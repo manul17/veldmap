@@ -25,8 +25,9 @@ use std::collections::HashSet;
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
+use veldmap_app::bundled_basemap::BUNDLED_BASEMAP_JPEG;
 use veldmap_app::gpu_tiles::{
-    BUNDLED_BASEMAP_JPEG, GpuTileCache, PendingUploads, bundled_tile_key, source_tile_key,
+    GpuTileCache, PendingUploads, UploadPassParams, bundled_tile_key, source_tile_key,
     texture_byte_size,
 };
 use veldmap_app::render::{DrawSnapshot, GlobeRenderer, RenderParams};
@@ -602,11 +603,14 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         device,
         queue,
         &mut cache,
-        SourceId::BUNDLED_BASEMAP,
-        None,
-        None,
-        1,
-        Duration::from_millis(0),
+        UploadPassParams {
+            pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
+            observed_source: Some(SourceId::BUNDLED_BASEMAP),
+            wanted: None,
+            protected: None,
+            byte_budget: 1,
+            time_budget: Duration::from_millis(0),
+        },
     );
     assert_eq!(r1.uploaded, 1);
     assert_eq!(r1.remaining, 3);
@@ -638,11 +642,14 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         device,
         queue,
         &mut cache,
-        SourceId::BUNDLED_BASEMAP,
-        None,
-        None,
-        1024 * 1024,
-        Duration::from_secs(1),
+        UploadPassParams {
+            pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
+            observed_source: Some(SourceId::BUNDLED_BASEMAP),
+            wanted: None,
+            protected: None,
+            byte_budget: 1024 * 1024,
+            time_budget: Duration::from_secs(1),
+        },
     );
     assert_eq!(r2.uploaded, 3);
     assert_eq!(r2.remaining, 0);
@@ -664,11 +671,14 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         device,
         queue,
         &mut cache,
-        SourceId::BUNDLED_BASEMAP,
-        None,
-        None,
-        1024 * 1024,
-        Duration::from_secs(1),
+        UploadPassParams {
+            pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
+            observed_source: Some(SourceId::BUNDLED_BASEMAP),
+            wanted: None,
+            protected: None,
+            byte_budget: 1024 * 1024,
+            time_budget: Duration::from_secs(1),
+        },
     );
     assert_eq!(r_dup.uploaded, 0);
 
@@ -1226,15 +1236,19 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
     tx.send((live_root, live_tile.clone())).expect("send live");
+    let pinned_live = [live_source, SourceId::BUNDLED_BASEMAP];
     let rep = pending.drain_and_upload(
         device,
         queue,
         &mut cache,
-        live_source,
-        Some(&HashSet::from([live_root])),
-        Some(&fallback_snap.carrier_keys),
-        1024 * 1024,
-        Duration::from_secs(1),
+        UploadPassParams {
+            pinned_root_sources: &pinned_live,
+            observed_source: Some(live_source),
+            wanted: Some(&HashSet::from([live_root])),
+            protected: Some(&fallback_snap.carrier_keys),
+            byte_budget: 1024 * 1024,
+            time_budget: Duration::from_secs(1),
+        },
     );
     assert_eq!(rep.uploaded, 1);
     assert_eq!(rep.evicted, 1);
@@ -1258,11 +1272,14 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         device,
         queue,
         &mut cache,
-        live_source,
-        Some(&HashSet::from([south_polar_root])),
-        Some(&all_protected),
-        1024 * 1024,
-        Duration::from_secs(1),
+        UploadPassParams {
+            pinned_root_sources: &pinned_live,
+            observed_source: Some(live_source),
+            wanted: Some(&HashSet::from([south_polar_root])),
+            protected: Some(&all_protected),
+            byte_budget: 1024 * 1024,
+            time_budget: Duration::from_secs(1),
+        },
     );
     assert_eq!(deferred_rep.uploaded, 0);
     assert_eq!(deferred_rep.remaining_ready, 0);
@@ -1301,11 +1318,14 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         device,
         queue,
         &mut cache,
-        live_source,
-        Some(&HashSet::from([south_polar_root])),
-        Some(&live_snap.carrier_keys),
-        1024 * 1024,
-        Duration::from_secs(1),
+        UploadPassParams {
+            pinned_root_sources: &pinned_live,
+            observed_source: Some(live_source),
+            wanted: Some(&HashSet::from([south_polar_root])),
+            protected: Some(&live_snap.carrier_keys),
+            byte_budget: 1024 * 1024,
+            time_budget: Duration::from_secs(1),
+        },
     );
     assert_eq!(resumed_rep.uploaded, 1);
     assert_eq!(resumed_rep.evicted, 1);

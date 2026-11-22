@@ -117,15 +117,22 @@ fn downsample_rgba8_srgb_2x(
 }
 
 /// Populate the complete CPU linear-light mipmap chain on `tile` when
-/// `tile.format == PixelFormat::Rgba8UnormSrgb` and `tile.data` matches
-/// `width x height x 4`.
+/// `tile.format == PixelFormat::Rgba8UnormSrgb`, `tile.gutter == 0`, the valid
+/// interior covers the full texture (`valid_w == width && valid_h == height`),
+/// and `tile.data` matches `width x height x 4`.
 ///
-/// Non-display formats (`R32Float`, `R8Uint`, `R16Uint`) are left untouched
-/// with `mips` cleared because scientific/categorical tracks do not use sRGB
-/// hardware mip chains.
+/// Non-display formats (`R32Float`, `R8Uint`, `R16Uint`), guttered tiles, and
+/// padded partial-edge tiles are left untouched with `mips` cleared so 2x box
+/// filtering never shifts gutters or bleeds padding into valid pixels.
 pub fn generate_linear_mipmaps(tile: &mut DecodedTile) {
     tile.mips.clear();
-    if tile.format != PixelFormat::Rgba8UnormSrgb || tile.width == 0 || tile.height == 0 {
+    if tile.format != PixelFormat::Rgba8UnormSrgb
+        || tile.width == 0
+        || tile.height == 0
+        || tile.gutter != 0
+        || tile.valid_w != tile.width
+        || tile.valid_h != tile.height
+    {
         return;
     }
     let expected_base = (tile.width as usize)
@@ -223,5 +230,32 @@ mod tests {
         let mut sci = DecodedTile::new(4, 4, PixelFormat::R32Float, vec![0u8; 4 * 4 * 4]);
         generate_linear_mipmaps(&mut sci);
         assert_eq!(sci.mip_level_count(), 1);
+
+        // Padded partial-edge and guttered sRGB tiles skip mip generation.
+        let mut padded = DecodedTile::with_valid_region(
+            4,
+            4,
+            3,
+            4,
+            0,
+            PixelFormat::Rgba8UnormSrgb,
+            vec![255u8; 4 * 4 * 4],
+        );
+        generate_linear_mipmaps(&mut padded);
+        assert_eq!(padded.mip_level_count(), 1);
+        assert!(padded.validate());
+
+        let mut guttered = DecodedTile::with_valid_region(
+            6,
+            6,
+            4,
+            4,
+            1,
+            PixelFormat::Rgba8UnormSrgb,
+            vec![255u8; 6 * 6 * 4],
+        );
+        generate_linear_mipmaps(&mut guttered);
+        assert_eq!(guttered.mip_level_count(), 1);
+        assert!(guttered.validate());
     }
 }

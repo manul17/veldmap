@@ -1,6 +1,6 @@
 # Legacy Reference (`old/`)
 
-Curated migration input preserved from the legacy VeldMap repository at annotated tag `legacy-reference-snapshot`. This directory is **reference-only** (marked `linguist-vendored` in `.gitattributes`), is never linked from `docs/`, and is deleted incrementally slice-by-slice until complete removal in Slice 6.
+Curated migration input preserved from the legacy VeldMap repository at annotated tag `legacy-reference-snapshot`. This directory is **reference-only** (marked `linguist-vendored` in `.gitattributes`), is never linked from `docs/`, and is scheduled for complete working-tree retirement right after **Slice 3A-1b** (migrating the remaining v1.1 porting hazard checklists into `plan.md` first; later slices consult `git show legacy-reference-snapshot:old/...` on demand).
 
 - **Original reference snapshot (`legacy-reference-snapshot`):** 79 reference files.
 - **Retired in Slice 1:** 20 files (`code/geo/*` except `overlay.rs`, `code/provider/mgrs.rs`, `tests/geo/*`, `tests/provider/mgrs_tests.rs`, `docs/globe.md`, `docs/decisions/0006-terrain-on-the-globe.md`).

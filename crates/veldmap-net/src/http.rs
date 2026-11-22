@@ -9,7 +9,15 @@ use tokio::sync::Semaphore;
 use veldmap_core::io::lock_unpoisoned;
 
 use crate::NetError;
-use crate::fetcher::FetcherConfig;
+
+/// Parameters for constructing a `rustls` + `ring` HTTP tile client without
+/// coupling `http` back to [`crate::fetcher::FetcherConfig`].
+pub(crate) struct HttpClientConfig<'a> {
+    pub user_agent: &'a str,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_concurrent_per_host: usize,
+}
 
 /// Default maximum concurrent HTTP requests per remote host.
 pub const DEFAULT_MAX_CONCURRENT_PER_HOST: usize = 6;
@@ -43,10 +51,10 @@ fn ensure_rustls_ring_provider() {
     });
 }
 
-pub(crate) fn build_http_client(cfg: &FetcherConfig) -> Result<reqwest::Client, NetError> {
+pub(crate) fn build_http_client(cfg: &HttpClientConfig<'_>) -> Result<reqwest::Client, NetError> {
     ensure_rustls_ring_provider();
     reqwest::Client::builder()
-        .user_agent(&cfg.user_agent)
+        .user_agent(cfg.user_agent)
         .connect_timeout(cfg.connect_timeout)
         .timeout(cfg.request_timeout)
         .pool_max_idle_per_host(cfg.max_concurrent_per_host.max(1))

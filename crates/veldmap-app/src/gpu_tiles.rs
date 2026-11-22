@@ -1,29 +1,20 @@
-//! GPU tile ownership (`GpuTile`), VRAM-budgeted `GpuTileCache`, multi-producer
-//! coarsest-first `PendingUploads`, and the virtual offline bundled basemap
-//! worker (`BundledBasemapProvider`).
+//! GPU tile ownership (`GpuTile`), VRAM-budgeted `GpuTileCache`, and
+//! multi-producer coarsest-first `PendingUploads`.
 //!
 //! `GpuTile` owns strictly its `Texture`, `TextureView`, `PixelFormat`,
-//! dimensions, exact byte size (including CPU-generated mip levels), and
-//! monotonic `tile_id: u64` — never pipeline-specific `BindGroup`s or
-//! `view_formats`.
+//! dimensions (`width`, `height`, `valid_w`, `valid_h`, `gutter`), exact byte
+//! size (including CPU-generated mip levels), and monotonic `tile_id: u64` —
+//! never pipeline-specific `BindGroup`s or `view_formats`.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use veldmap_core::io::lock_unpoisoned;
 use veldmap_core::tile::{
-    DecodedTile, PixelFormat, QuadTileId, SourceId, TileCache, TileKey, TileScheme, mip_dimensions,
+    DecodedTile, PixelFormat, QuadTileId, SourceId, TileCache, TileKey, mip_dimensions,
 };
-pub use veldmap_net::Wakeup;
-use veldmap_raster::BundledBasemap;
-
-/// Embedded public-domain NASA Blue Marble Next Generation equirectangular
-/// global basemap (`3600 x 1800` JPEG, see `assets/README.md`).
-pub const BUNDLED_BASEMAP_JPEG: &[u8] =
-    include_bytes!("../../../assets/basemap/blue_marble_ng.jpg");
 
 /// Default GPU tile VRAM cache cap (`256 MiB`).
 pub const DEFAULT_GPU_TILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
@@ -34,6 +25,10 @@ pub const DEFAULT_UPLOAD_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 /// Default per-frame upload wall-clock budget (`2 ms`).
 pub const DEFAULT_UPLOAD_TIME_BUDGET: Duration = Duration::from_millis(2);
 
+/// Default CPU byte cap on decoded tiles buffered in [`PendingUploads`]
+/// awaiting GPU upload (`64 MiB`).
+pub const DEFAULT_MAX_QUEUED_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+
 /// Immutable GPU-resident tile resource.
 pub struct GpuTile {
     pub texture: wgpu::Texture,
@@ -41,6 +36,12 @@ pub struct GpuTile {
     pub format: PixelFormat,
     pub width: u32,
     pub height: u32,
+    /// Valid interior pixel width excluding gutters (`valid_w + 2*gutter <= width`).
+    pub valid_w: u32,
+    /// Valid interior pixel height excluding gutters (`valid_h + 2*gutter <= height`).
+    pub valid_h: u32,
+    /// Border gutter width in texels (`0` for standard tiles, `1` for DEM tiles).
+    pub gutter: u8,
     pub byte_size: usize,
     pub tile_id: u64,
 }
@@ -52,6 +53,9 @@ impl std::fmt::Debug for GpuTile {
             .field("format", &self.format)
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("valid_w", &self.valid_w)
+            .field("valid_h", &self.valid_h)
+            .field("gutter", &self.gutter)
             .field("byte_size", &self.byte_size)
             .finish()
     }
@@ -95,8 +99,8 @@ pub enum UploadInsertOutcome {
     /// Tile is valid and fits the cache ceiling, but all evictable entries are
     /// currently protected by the active frame (caller should keep it deferred).
     RefusedByProtection,
-    /// Tile failed dimension/buffer validation or exceeds `cache.max_bytes()`
-    /// (caller should discard it).
+    /// Tile failed dimension/format/gutter/buffer validation or exceeds
+    /// `cache.max_bytes()` (caller should discard it).
     Rejected,
 }
 
@@ -147,10 +151,26 @@ impl GpuTileCache {
         self.cache.remove_where(|k| k.source == source).len()
     }
 
+    /// Remove every cached GPU tile matching `predicate`, returning how many
+    /// tiles were removed (useful for multi-geocell DEM mosaics or timelines).
+    pub fn remove_where<F>(&mut self, predicate: F) -> usize
+    where
+        F: FnMut(&TileKey) -> bool,
+    {
+        self.cache.remove_where(predicate).len()
+    }
+
     /// Maximum byte appetite allowed for one active pyramid (`< 50%` of VRAM
     /// budget divided across `active_pyramids`).
     pub fn pyramid_byte_cap(&self, active_pyramids: usize) -> usize {
         self.cache.pyramid_byte_cap(active_pyramids)
+    }
+
+    /// Proportional byte appetite cap for one weighted pyramid (`< 50%`
+    /// combined ceiling across heterogeneous multi-band stacks).
+    pub fn proportional_pyramid_byte_cap(&self, pyramid_weight: u64, total_weight: u64) -> usize {
+        self.cache
+            .proportional_pyramid_byte_cap(pyramid_weight, total_weight)
     }
 
     /// Appetite cap in tiles for one active pyramid (`< 50%` of VRAM budget).
@@ -159,8 +179,17 @@ impl GpuTileCache {
             .max_tiles_for_pyramid(active_pyramids, tile_bytes)
     }
 
+    /// Resolve the finest cached carrier tile covering `key` without assuming
+    /// power-of-two unguttered UVs (required for clipped `RasterPyramid` edge
+    /// tiles and `gutter = 1` DEM tiles).
+    pub fn find_carrier(&mut self, key: &TileKey) -> Option<(TileKey, Arc<GpuTile>)> {
+        let (carrier_key, tile) = self.cache.find_carrier(key)?;
+        Some((carrier_key, Arc::clone(tile)))
+    }
+
     /// Resolve the finest cached tile covering `key` (exact or nearest coarser
-    /// ancestor), touching the carrier and all cached ancestors up to the root.
+    /// ancestor) together with its unguttered power-of-two UV sub-rectangle,
+    /// touching the carrier and all cached ancestors up to the root.
     pub fn carrier(&mut self, key: &TileKey) -> Option<(TileKey, [f32; 4], Arc<GpuTile>)> {
         let (carrier_key, uv, tile) = self.cache.carrier(key)?;
         Some((carrier_key, uv, Arc::clone(tile)))
@@ -195,6 +224,15 @@ impl GpuTileCache {
     where
         F: Fn(&TileKey) -> bool,
     {
+        if decoded.format != key.format || decoded.gutter != key.gutter {
+            tracing::warn!(
+                ?key,
+                decoded_format = ?decoded.format,
+                decoded_gutter = decoded.gutter,
+                "Skipping decoded tile whose format or gutter mismatches TileKey"
+            );
+            return UploadInsertOutcome::Rejected;
+        }
         let max_dim = device.limits().max_texture_dimension_2d;
         if decoded.width == 0
             || decoded.height == 0
@@ -215,22 +253,21 @@ impl GpuTileCache {
                 ?key,
                 width = decoded.width,
                 height = decoded.height,
+                valid_w = decoded.valid_w,
+                valid_h = decoded.valid_h,
+                gutter = decoded.gutter,
                 mip_levels = decoded.mip_level_count(),
                 actual_bytes = decoded.byte_size(),
-                "Skipping decoded tile failing mip/buffer validation"
+                "Skipping decoded tile failing mip/buffer/gutter validation"
             );
             return UploadInsertOutcome::Rejected;
         }
 
-        // `decoded.validate()` guarantees `decoded.byte_size()` is the exact
-        // total byte size across base level 0 and all present mip levels.
         let byte_size = decoded.byte_size();
         if self.cache.max_bytes() == 0 || byte_size > self.cache.max_bytes() {
             return UploadInsertOutcome::Rejected;
         }
 
-        // Pre-check cache admission before allocating GPU textures so
-        // saturated active frames never waste texture allocations.
         if !self
             .cache
             .can_admit_protecting(&key, byte_size, &is_protected)
@@ -290,6 +327,9 @@ impl GpuTileCache {
             format: decoded.format,
             width: decoded.width,
             height: decoded.height,
+            valid_w: decoded.valid_w,
+            valid_h: decoded.valid_h,
+            gutter: decoded.gutter,
             byte_size,
             tile_id,
         });
@@ -307,6 +347,25 @@ impl GpuTileCache {
     }
 }
 
+/// Parameters governing one frame's [`PendingUploads::drain_and_upload`] pass.
+#[derive(Clone, Copy, Debug)]
+pub struct UploadPassParams<'a> {
+    /// Sources whose coarsest root tiles (`key.is_root_of(src)`) are pinned
+    /// against `wanted` pruning and queue-cap eviction.
+    pub pinned_root_sources: &'a [SourceId],
+    /// Optional source whose largest uploaded tile byte size is reported in
+    /// [`UploadBatchReport::max_active_tile_bytes`] (used for live basemap
+    /// `@2x`/512 px appetite sizing).
+    pub observed_source: Option<SourceId>,
+    /// Currently desired tile keys across all active layers (`None` skips
+    /// `wanted` pruning).
+    pub wanted: Option<&'a HashSet<TileKey>>,
+    /// Active-frame carrier keys protected from LRU eviction during upload.
+    pub protected: Option<&'a HashSet<TileKey>>,
+    pub byte_budget: usize,
+    pub time_budget: Duration,
+}
+
 /// Summary of one frame's [`PendingUploads::drain_and_upload`] pass.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UploadBatchReport {
@@ -320,16 +379,23 @@ pub struct UploadBatchReport {
     /// Tiles kept queued because active-frame protection blocked eviction (must
     /// NOT trigger an infinite idle repaint loop on its own).
     pub deferred_protected: usize,
-    /// Largest single tile byte size uploaded for `active_source` in this pass.
+    /// Largest single tile byte size uploaded for `observed_source` in this
+    /// pass.
     pub max_active_tile_bytes: usize,
 }
 
-/// Multi-producer completion-channel owner and coarsest-first budgeted GPU tile
-/// upload queue owned on `VeldmapApp`.
+fn is_pinned_root(key: &TileKey, pinned_root_sources: &[SourceId]) -> bool {
+    pinned_root_sources.iter().any(|&src| key.is_root_of(src))
+}
+
+/// Multi-producer completion-channel owner and byte-capped, coarsest-first
+/// budgeted GPU tile upload queue owned on `VeldmapApp`.
 pub struct PendingUploads {
     tx: Option<Sender<(TileKey, DecodedTile)>>,
     rx: Option<Receiver<(TileKey, DecodedTile)>>,
     queued: HashMap<TileKey, DecodedTile>,
+    queued_bytes: usize,
+    max_queued_bytes: usize,
 }
 
 impl Default for PendingUploads {
@@ -339,13 +405,21 @@ impl Default for PendingUploads {
 }
 
 impl PendingUploads {
-    /// Create a new upload queue owning its multi-producer channel.
+    /// Create a new upload queue owning its multi-producer channel bounded by
+    /// [`DEFAULT_MAX_QUEUED_UPLOAD_BYTES`].
     pub fn new() -> Self {
+        Self::with_max_queued_bytes(DEFAULT_MAX_QUEUED_UPLOAD_BYTES)
+    }
+
+    /// Create a new upload queue with an explicit CPU queued byte ceiling.
+    pub fn with_max_queued_bytes(max_queued_bytes: usize) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             tx: Some(tx),
             rx: Some(rx),
             queued: HashMap::new(),
+            queued_bytes: 0,
+            max_queued_bytes,
         }
     }
 
@@ -360,6 +434,7 @@ impl PendingUploads {
         self.tx = None;
         self.rx = None;
         self.queued.clear();
+        self.queued_bytes = 0;
     }
 
     /// Number of decoded tiles currently waiting to upload.
@@ -369,6 +444,11 @@ impl PendingUploads {
 
     pub fn is_empty(&self) -> bool {
         self.queued.is_empty()
+    }
+
+    /// Total CPU bytes currently buffered across queued decoded tiles.
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes
     }
 
     /// Return whether `key` is currently decoded and waiting for GPU upload.
@@ -383,64 +463,135 @@ impl PendingUploads {
 
     /// Discard any queued decoded tiles belonging to `source`.
     pub fn clear_source(&mut self, source: SourceId) {
-        self.drain_channel_into_queue();
-        self.queued.retain(|k, _| k.source != source);
+        self.drain_channel_into_queue(None, None, &[]);
+        self.retain_queued(|k| k.source != source);
     }
 
-    fn drain_channel_into_queue(&mut self) {
-        if let Some(rx) = &self.rx {
-            while let Ok((key, decoded)) = rx.try_recv() {
-                self.queued.insert(key, decoded);
+    /// Discard any queued decoded tiles matching `predicate`.
+    pub fn clear_where<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&TileKey) -> bool,
+    {
+        self.drain_channel_into_queue(None, None, &[]);
+        self.retain_queued(|k| !predicate(k));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_pending_for_inspection(&mut self) {
+        self.drain_channel_into_queue(None, None, &[]);
+    }
+
+    fn insert_queued(&mut self, key: TileKey, decoded: DecodedTile) {
+        let added = decoded.byte_size();
+        if let Some(prev) = self.queued.insert(key, decoded) {
+            self.queued_bytes = self.queued_bytes.saturating_sub(prev.byte_size());
+        }
+        self.queued_bytes = self.queued_bytes.saturating_add(added);
+    }
+
+    fn remove_queued(&mut self, key: &TileKey) -> Option<DecodedTile> {
+        let removed = self.queued.remove(key)?;
+        self.queued_bytes = self.queued_bytes.saturating_sub(removed.byte_size());
+        Some(removed)
+    }
+
+    fn retain_queued(&mut self, mut keep: impl FnMut(&TileKey) -> bool) {
+        let mut bytes = 0usize;
+        self.queued.retain(|key, tile| {
+            let ok = keep(key);
+            if ok {
+                bytes = bytes.saturating_add(tile.byte_size());
             }
+            ok
+        });
+        self.queued_bytes = bytes;
+    }
+
+    fn drain_channel_into_queue(
+        &mut self,
+        cache: Option<&GpuTileCache>,
+        wanted: Option<&HashSet<TileKey>>,
+        pinned_root_sources: &[SourceId],
+    ) {
+        let Some(rx) = &self.rx else {
+            return;
+        };
+        let mut incoming = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            incoming.push(item);
+        }
+        for (key, decoded) in incoming {
+            if cache.is_some_and(|c| c.contains(&key)) {
+                continue;
+            }
+            if let Some(wanted_set) = wanted
+                && !wanted_set.contains(&key)
+                && !is_pinned_root(&key, pinned_root_sources)
+            {
+                continue;
+            }
+            self.insert_queued(key, decoded);
         }
     }
 
-    /// Drain the entire completion channel, prune stale tiles not in `wanted`
-    /// (retaining active-source roots and bundled offline/polar fallback roots
-    /// via `TileKey::is_root_of`), and upload coarsest-first within
-    /// `(byte_budget, time_budget)` while protecting active-frame carriers and
-    /// guaranteeing `>= 1` tile per frame whenever an admissible tile is queued.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "upload pass takes explicit GPU handles, active source, wanted/protected sets, and budgets"
-    )]
+    fn enforce_queued_byte_cap(&mut self, pinned_root_sources: &[SourceId]) {
+        if self.queued_bytes <= self.max_queued_bytes {
+            return;
+        }
+        // Drop finest non-pinned tiles first so coarsest carriers and pinned
+        // roots always survive bursts from fast SSD/COG decode workers.
+        let mut candidates: Vec<TileKey> = self
+            .queued
+            .keys()
+            .copied()
+            .filter(|k| !is_pinned_root(k, pinned_root_sources))
+            .collect();
+        candidates.sort_by_key(|k| Reverse(k.coarsest_first_key()));
+        for key in candidates {
+            if self.queued_bytes <= self.max_queued_bytes {
+                break;
+            }
+            let _ = self.remove_queued(&key);
+        }
+    }
+
+    /// Drain the completion channel, prune cached/unwanted tiles (retaining
+    /// roots of `params.pinned_root_sources`), enforce `max_queued_bytes`, and
+    /// upload coarsest-first within `(byte_budget, time_budget)` while
+    /// protecting active-frame carriers and guaranteeing `>= 1` tile per frame
+    /// whenever an admissible tile is queued.
     pub fn drain_and_upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         cache: &mut GpuTileCache,
-        active_source: SourceId,
-        wanted: Option<&HashSet<TileKey>>,
-        protected: Option<&HashSet<TileKey>>,
-        byte_budget: usize,
-        time_budget: Duration,
+        params: UploadPassParams<'_>,
     ) -> UploadBatchReport {
-        // 1. Drain the entire completion channel every frame so background
-        //    producers never back up behind stale tiles.
-        self.drain_channel_into_queue();
+        // 1. Drain the completion channel, immediately dropping cached or
+        //    unwanted non-pinned tiles so stale bursts never spike RAM.
+        self.drain_channel_into_queue(Some(cache), params.wanted, params.pinned_root_sources);
 
-        // 2. Prune tiles already cached or no longer wanted (retaining
-        //    active-source roots and bundled offline/polar fallback roots so
-        //    Frame-1 pre-seeded roots never drop).
-        self.queued.retain(|key, _| {
+        // 2. Prune already-queued tiles that became cached or unwanted.
+        self.retain_queued(|key| {
             if cache.contains(key) {
                 return false;
             }
-            match wanted {
+            match params.wanted {
                 Some(wanted_set) => {
-                    wanted_set.contains(key)
-                        || key.is_root_of(active_source)
-                        || key.is_root_of(SourceId::BUNDLED_BASEMAP)
+                    wanted_set.contains(key) || is_pinned_root(key, params.pinned_root_sources)
                 }
                 None => true,
             }
         });
 
+        // 3. Bound total queued CPU bytes, dropping finest non-pinned tiles first.
+        self.enforce_queued_byte_cap(params.pinned_root_sources);
+
         if self.queued.is_empty() {
             return UploadBatchReport::default();
         }
 
-        // 3. Order remaining tiles deterministically coarsest-first.
+        // 4. Order remaining tiles deterministically coarsest-first.
         let mut order: Vec<TileKey> = self.queued.keys().copied().collect();
         order.sort_by_key(TileKey::coarsest_first_key);
 
@@ -453,17 +604,19 @@ impl PendingUploads {
 
         for key in order {
             // Anti-starvation: always upload at least 1 admissible tile per frame.
-            if uploaded >= 1 && (bytes_uploaded >= byte_budget || start.elapsed() >= time_budget) {
+            if uploaded >= 1
+                && (bytes_uploaded >= params.byte_budget || start.elapsed() >= params.time_budget)
+            {
                 break;
             }
             if cache.contains(&key) {
-                self.queued.remove(&key);
+                let _ = self.remove_queued(&key);
                 continue;
             }
             let Some(decoded) = self.queued.get(&key) else {
                 continue;
             };
-            let is_protected = |k: &TileKey| protected.is_some_and(|set| set.contains(k));
+            let is_protected = |k: &TileKey| params.protected.is_some_and(|set| set.contains(k));
             match cache.upload_and_insert_protecting(device, queue, key, decoded, is_protected) {
                 UploadInsertOutcome::Inserted {
                     tile,
@@ -472,17 +625,16 @@ impl PendingUploads {
                     bytes_uploaded = bytes_uploaded.saturating_add(tile.byte_size);
                     evicted = evicted.saturating_add(ev_count);
                     uploaded += 1;
-                    if key.source == active_source {
+                    if params.observed_source == Some(key.source) {
                         max_active_tile_bytes = max_active_tile_bytes.max(tile.byte_size);
                     }
-                    self.queued.remove(&key);
+                    let _ = self.remove_queued(&key);
                 }
                 UploadInsertOutcome::RefusedByProtection => {
-                    // Keep deferred in `self.queued` until active-frame carriers change.
                     deferred_protected += 1;
                 }
                 UploadInsertOutcome::Rejected => {
-                    self.queued.remove(&key);
+                    let _ = self.remove_queued(&key);
                 }
             }
         }
@@ -515,267 +667,15 @@ pub const fn is_active_source_root(key: &TileKey, active_source: SourceId) -> bo
     key.is_root_of(active_source)
 }
 
-#[derive(Default)]
-struct WorkerQueue {
-    pending: Vec<TileKey>,
-    failed: HashSet<TileKey>,
-    shutdown: bool,
-}
-
-/// Virtual offline `z = 0..3` Geodetic/WebMercator + `z = 0` PolarCap basemap
-/// tile provider backed by a dedicated background worker thread, coarsest-first
-/// cancellable queue, and injected [`Wakeup`].
-pub struct BundledBasemapProvider {
-    shared: Arc<(Mutex<WorkerQueue>, Condvar)>,
-    in_flight: HashSet<TileKey>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl BundledBasemapProvider {
-    /// Spawn the bundled offline basemap provider pushing mipmapped decoded
-    /// tiles into `done_tx` and invoking `wakeup` on each arrival.
-    pub fn spawn(done_tx: Sender<(TileKey, DecodedTile)>, wakeup: Wakeup) -> Self {
-        let shared = Arc::new((Mutex::new(WorkerQueue::default()), Condvar::new()));
-        let worker_shared = Arc::clone(&shared);
-
-        let worker = match thread::Builder::new()
-            .name("veldmap-bundled-basemap".to_owned())
-            .spawn(move || {
-                let basemap = match BundledBasemap::from_encoded_bytes(BUNDLED_BASEMAP_JPEG) {
-                    Ok(b) => b,
-                    Err(err) => {
-                        tracing::error!(error = %err, "Failed to decode bundled offline basemap");
-                        let (lock, _) = &*worker_shared;
-                        let mut state = lock_unpoisoned(lock);
-                        state.shutdown = true;
-                        state.pending.clear();
-                        return;
-                    }
-                };
-                loop {
-                    let key = {
-                        let (lock, cvar) = &*worker_shared;
-                        let mut state = lock_unpoisoned(lock);
-                        while state.pending.is_empty() && !state.shutdown {
-                            state = match cvar.wait(state) {
-                                Ok(guard) => guard,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                        }
-                        if state.shutdown {
-                            break;
-                        }
-                        // Pop the coarsest pending tile first.
-                        let best_idx = state
-                            .pending
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|(_, k)| k.coarsest_first_key())
-                            .map(|(i, _)| i);
-                        match best_idx {
-                            Some(i) => state.pending.swap_remove(i),
-                            None => continue,
-                        }
-                    };
-
-                    match basemap.render_tile_with_mipmaps(key.quad_id()) {
-                        Ok(tile) => {
-                            if done_tx.send((key, tile)).is_err() {
-                                break;
-                            }
-                            (wakeup)();
-                        }
-                        Err(err) => {
-                            tracing::debug!(?key, error = %err, "Skipping out-of-range bundled tile");
-                            let (lock, _) = &*worker_shared;
-                            lock_unpoisoned(lock).failed.insert(key);
-                        }
-                    }
-                }
-            }) {
-            Ok(handle) => Some(handle),
-            Err(err) => {
-                tracing::error!(error = %err, "Failed to spawn bundled basemap worker thread");
-                None
-            }
-        };
-
-        Self {
-            shared,
-            in_flight: HashSet::new(),
-            worker,
-        }
-    }
-
-    pub fn in_flight_count(&self) -> usize {
-        self.in_flight.len()
-    }
-
-    pub fn is_in_flight(&self, key: &TileKey) -> bool {
-        self.in_flight.contains(key)
-    }
-
-    /// Enqueue `key` for background tile rendering if not already in flight or
-    /// terminally failed. Returns `true` if a new request was submitted.
-    pub fn request(&mut self, key: TileKey) -> bool {
-        if self.worker.is_none() || self.in_flight.contains(&key) {
-            return false;
-        }
-        let (lock, cvar) = &*self.shared;
-        let mut state = lock_unpoisoned(lock);
-        if state.shutdown || state.failed.contains(&key) {
-            return false;
-        }
-        self.in_flight.insert(key);
-        state.pending.push(key);
-        cvar.notify_one();
-        true
-    }
-
-    /// Clear in-flight markers and cancel unstarted queued requests for tiles
-    /// that have already landed in `cache` or `pending_uploads`, failed
-    /// terminally, or are no longer requested.
-    pub fn reconcile(
-        &mut self,
-        cache: &GpuTileCache,
-        pending_uploads: &PendingUploads,
-        wanted: &HashSet<TileKey>,
-    ) {
-        let (lock, _) = &*self.shared;
-        let mut state = lock_unpoisoned(lock);
-        let WorkerQueue {
-            pending,
-            failed,
-            shutdown,
-        } = &mut *state;
-        if *shutdown {
-            self.in_flight.clear();
-            pending.clear();
-            return;
-        }
-        let keep = |k: &TileKey| {
-            !cache.contains(k)
-                && !pending_uploads.contains(k)
-                && !failed.contains(k)
-                && (wanted.contains(k) || k.is_root_of(SourceId::BUNDLED_BASEMAP))
-        };
-        self.in_flight.retain(keep);
-        pending.retain(keep);
-    }
-
-    /// Pre-seed the coarsest root tiles (`scheme z = 0` + North/South
-    /// `PolarCap z = 0`) so the entire planet renders immediately on startup
-    /// and offline fallback stays warm.
-    pub fn seed_roots(&mut self, scheme: TileScheme) {
-        if let Some((cols, rows)) = scheme.grid_dims(0) {
-            for y in 0..rows {
-                for x in 0..cols {
-                    self.request(bundled_tile_key(QuadTileId {
-                        scheme,
-                        level: 0,
-                        x,
-                        y,
-                    }));
-                }
-            }
-        }
-        for north in [true, false] {
-            self.request(bundled_tile_key(QuadTileId {
-                scheme: TileScheme::PolarCap { north },
-                level: 0,
-                x: 0,
-                y: 0,
-            }));
-        }
-    }
-
-    /// Signal shutdown without joining yet (paired with [`Self::join`]).
-    pub fn signal_shutdown(&mut self) {
-        let (lock, cvar) = &*self.shared;
-        let mut state = lock_unpoisoned(lock);
-        state.shutdown = true;
-        state.pending.clear();
-        cvar.notify_all();
-    }
-
-    /// Join the worker thread deterministically.
-    pub fn join(&mut self) {
-        self.signal_shutdown();
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for BundledBasemapProvider {
-    fn drop(&mut self) {
-        self.join();
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use veldmap_core::tile::{BandKey, TileScheme};
+
     use super::*;
-    use veldmap_core::tile::BandKey;
 
     #[test]
-    fn reconcile_clears_queued_uploads_and_terminal_failures_from_in_flight() {
-        let mut pending = PendingUploads::new();
-        let tx = pending.sender().expect("sender");
-        let cache = GpuTileCache::new(1024 * 1024);
-
-        let k_queued = bundled_tile_key(QuadTileId {
-            scheme: TileScheme::Geodetic,
-            level: 1,
-            x: 0,
-            y: 0,
-        });
-        let k_failed = bundled_tile_key(QuadTileId {
-            scheme: TileScheme::Geodetic,
-            level: 9, // above BUNDLED_MAX_LEVEL
-            x: 0,
-            y: 0,
-        });
-        let k_active = bundled_tile_key(QuadTileId {
-            scheme: TileScheme::Geodetic,
-            level: 1,
-            x: 1,
-            y: 0,
-        });
-
-        tx.send((
-            k_queued,
-            DecodedTile::new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![0, 0, 0, 255]),
-        ))
-        .expect("send queued tile");
-        pending.drain_channel_into_queue();
-        assert!(pending.contains(&k_queued));
-        assert_eq!(pending.count_for_source(SourceId::BUNDLED_BASEMAP), 1);
-
-        let shared = Arc::new((Mutex::new(WorkerQueue::default()), Condvar::new()));
-        {
-            let mut st = lock_unpoisoned(&shared.0);
-            st.pending.extend([k_queued, k_failed, k_active]);
-            st.failed.insert(k_failed);
-        }
-        let mut provider = BundledBasemapProvider {
-            shared,
-            in_flight: HashSet::from([k_queued, k_failed, k_active]),
-            worker: None,
-        };
-
-        let wanted = HashSet::from([k_queued, k_failed, k_active]);
-        provider.reconcile(&cache, &pending, &wanted);
-
-        assert!(!provider.is_in_flight(&k_queued));
-        assert!(!provider.is_in_flight(&k_failed));
-        assert!(provider.is_in_flight(&k_active));
-        assert_eq!(provider.in_flight_count(), 1);
-    }
-
-    #[test]
-    fn pending_uploads_clear_source_and_count_for_source_isolate_sources() {
-        let mut pending = PendingUploads::new();
+    fn pending_uploads_clear_source_and_queued_byte_cap_preserve_roots() {
+        let mut pending = PendingUploads::with_max_queued_bytes(10);
         let tx = pending.sender().expect("sender");
         let live_a = SourceId::from_stable_key("live-a");
         let k_live = source_tile_key(
@@ -793,15 +693,47 @@ mod tests {
             x: 0,
             y: 0,
         });
-        let tile = DecodedTile::new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]);
-        tx.send((k_live, tile.clone())).expect("send live");
-        tx.send((k_bundled, tile)).expect("send bundled");
+        let tile_4b = DecodedTile::new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]);
+        tx.send((k_live, tile_4b.clone())).expect("send live");
+        tx.send((k_bundled, tile_4b.clone())).expect("send bundled");
 
         pending.clear_source(live_a);
         assert!(!pending.contains(&k_live));
         assert!(pending.contains(&k_bundled));
         assert_eq!(pending.count_for_source(live_a), 0);
         assert_eq!(pending.count_for_source(SourceId::BUNDLED_BASEMAP), 1);
+        assert_eq!(pending.queued_bytes(), 4);
+
+        // Push two finer non-pinned tiles (4 B each -> 12 B > 10 B cap):
+        // enforcing the cap must drop the finest non-pinned tile (z=3) while
+        // keeping the pinned root (z=0) and coarser z=1 tile (8 B <= 10 B).
+        let k_z1 = source_tile_key(
+            live_a,
+            QuadTileId {
+                scheme: TileScheme::WebMercator,
+                level: 1,
+                x: 0,
+                y: 0,
+            },
+        );
+        let k_z3 = source_tile_key(
+            live_a,
+            QuadTileId {
+                scheme: TileScheme::WebMercator,
+                level: 3,
+                x: 0,
+                y: 0,
+            },
+        );
+        pending.insert_queued(k_z1, tile_4b.clone());
+        pending.insert_queued(k_z3, tile_4b);
+        assert_eq!(pending.queued_bytes(), 12);
+
+        pending.enforce_queued_byte_cap(&[SourceId::BUNDLED_BASEMAP]);
+        assert_eq!(pending.queued_bytes(), 8);
+        assert!(pending.contains(&k_bundled));
+        assert!(pending.contains(&k_z1));
+        assert!(!pending.contains(&k_z3));
     }
 
     #[test]

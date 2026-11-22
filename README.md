@@ -14,7 +14,7 @@ VeldMap is built in vertical slices tracked in [plan.md](plan.md):
 
 - `crates/veldmap-core` — Pure domain logic (`geo`, `tile`, std-only `io::CancelToken`; zero `egui`, `eframe`, `wgpu`, `image`, or network dependencies).
 - `crates/veldmap-raster` — Memory-bounded PNG/JPEG tile decoding, CPU linear-light mipmap generation, and virtual offline equirectangular basemap tiling.
-- `crates/veldmap-storage` — Injectable `StoragePaths`, durable atomic JSON persistence (`write_atomic_durable`), user basemap settings, and crash-safe SQLite WAL LRU tile disk cache.
+- `crates/veldmap-storage` — Injectable `StoragePaths`, durable atomic JSON persistence (`write_atomic_durable` / `write_atomic_durable_private`), user settings, and crash-safe vertically partitioned SQLite WAL LRU tile disk cache.
 - `crates/veldmap-net` — Async `tokio` + `reqwest`/`rustls` (`ring`) live HTTP tile streaming, per-host concurrency limiting, bounded CPU decode pool, and NASA GIBS / EOX / Custom XYZ/TMS specs.
 - `crates/veldmap-app` — Native `eframe`/`egui` + `wgpu` desktop application (`[lib]` + `[[bin]]` so rendering and shader tests run headlessly).
 - `assets/` — Public-domain bundled assets and provenance notes ([assets/README.md](assets/README.md)).
