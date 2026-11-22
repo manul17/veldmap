@@ -70,7 +70,7 @@ impl PixelFormat {
 }
 
 /// Hierarchical tiling scheme governing level direction and parent traversal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TileScheme {
     /// Web Mercator XYZ (`1 x 1` root at `z = 0` coarsest, `2^z x 2^z` tiles,
     /// `|lat| <= 85.05112878 deg`).
@@ -205,6 +205,11 @@ impl TileKey {
         {
             return None;
         }
+        if let TileScheme::RasterPyramid { max_level } = self.scheme
+            && (self.level > max_level || ancestor.level > max_level)
+        {
+            return None;
+        }
         let dz = self.scheme.level_delta(self.level, ancestor.level)?;
         if dz == 0 {
             return (self.x == ancestor.x && self.y == ancestor.y).then_some([0.0, 0.0, 1.0, 1.0]);
@@ -320,5 +325,77 @@ mod tests {
         assert_eq!(BandKey::from_name("B08"), BandKey::from_name("B08"));
         assert_ne!(BandKey::from_name("B08"), BandKey::from_name("B04"));
         assert_ne!(BandKey::from_name("SCL"), BandKey::Display);
+    }
+
+    #[test]
+    fn grid_dims_and_sub_rect_edge_cases_are_guarded() {
+        assert_eq!(
+            TileScheme::WebMercator.grid_dims(30),
+            Some((1 << 30, 1 << 30))
+        );
+        assert_eq!(TileScheme::WebMercator.grid_dims(31), None);
+        assert_eq!(TileScheme::Geodetic.grid_dims(29), Some((1 << 30, 1 << 29)));
+        assert_eq!(TileScheme::Geodetic.grid_dims(30), None);
+        assert_eq!(
+            TileScheme::RasterPyramid { max_level: 4 }.grid_dims(0),
+            None
+        );
+
+        assert_eq!(PixelFormat::Rgba8UnormSrgb.bytes_per_pixel(), 4);
+        assert_eq!(PixelFormat::R32Float.bytes_per_pixel(), 4);
+        assert_eq!(PixelFormat::R8Uint.bytes_per_pixel(), 1);
+        assert_eq!(PixelFormat::R16Uint.bytes_per_pixel(), 2);
+
+        let base = TileKey {
+            source: SourceId::BUNDLED_BASEMAP,
+            band: BandKey::Display,
+            scheme: TileScheme::WebMercator,
+            format: PixelFormat::Rgba8UnormSrgb,
+            decode_rev: 0,
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        let other_source = TileKey {
+            source: SourceId::new(2),
+            ..base
+        };
+        assert_eq!(base.sub_rect_in_ancestor(&other_source), None);
+
+        let too_deep = TileKey { level: 31, ..base };
+        assert_eq!(too_deep.sub_rect_in_ancestor(&base), None);
+
+        let wrong_branch = TileKey {
+            level: 2,
+            x: 2,
+            y: 0,
+            ..base
+        };
+        let other_parent = TileKey {
+            level: 1,
+            x: 0,
+            y: 0,
+            ..base
+        };
+        assert_eq!(wrong_branch.sub_rect_in_ancestor(&other_parent), None);
+
+        // RasterPyramid rejects levels strictly above max_level.
+        let pyr_invalid = TileKey {
+            scheme: TileScheme::RasterPyramid { max_level: 3 },
+            level: 4,
+            x: 0,
+            y: 0,
+            ..base
+        };
+        let pyr_fine = TileKey {
+            level: 1,
+            ..pyr_invalid
+        };
+        assert_eq!(pyr_fine.sub_rect_in_ancestor(&pyr_invalid), None);
+
+        assert_eq!(
+            compose_uv_rect([0.5, 0.25, 0.5, 0.5], [0.5, 0.5, 0.5, 0.25]),
+            [0.75, 0.5, 0.25, 0.125]
+        );
     }
 }

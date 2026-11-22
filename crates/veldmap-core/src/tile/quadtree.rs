@@ -8,7 +8,7 @@ use glam::DVec3;
 
 use crate::geo::camera::{Camera, FOV_Y_DEG};
 use crate::geo::cull::{Ball, Frame as CullFrame};
-use crate::geo::geodesy::{self, Geodetic};
+use crate::geo::geodesy;
 use crate::geo::projection::WEB_MERCATOR_LIMIT_DEG;
 use crate::geo::sag;
 
@@ -20,12 +20,20 @@ pub const DEFAULT_GRID_CELLS: u32 = 16;
 
 /// Stereographic disk radius corresponding to `|lat| = WEB_MERCATOR_LIMIT_DEG`
 /// (`tan((90° - 85.05112878°) / 2)`).
-pub fn polar_r_cap() -> f64 {
-    ((90.0 - WEB_MERCATOR_LIMIT_DEG) * 0.5).to_radians().tan()
+pub const POLAR_R_CAP: f64 = 0.043_213_918_263_772_28;
+
+/// Maximum WGS84 radius-of-curvature ratio relative to `SEMI_MAJOR_M`
+/// (`a / (1 - f) / a`), used to keep spherical chord-sag bounds strictly
+/// conservative at polar latitudes.
+const POLAR_CURVATURE_SCALE: f64 = 1.0 / (1.0 - geodesy::FLATTENING);
+
+/// Return [`POLAR_R_CAP`] without runtime trigonometry.
+pub const fn polar_r_cap() -> f64 {
+    POLAR_R_CAP
 }
 
 /// Geometry identifier for a single planetary quadtree or polar cap tile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct QuadTileId {
     pub scheme: TileScheme,
     pub level: u8,
@@ -42,6 +50,17 @@ impl QuadTileId {
             return (self, [0.0, 0.0, 1.0, 1.0]);
         }
         let dz = self.level - max_level;
+        if dz >= 31 {
+            return (
+                Self {
+                    scheme: self.scheme,
+                    level: max_level,
+                    x: 0,
+                    y: 0,
+                },
+                [0.0, 0.0, 0.0, 0.0],
+            );
+        }
         let mask = (1u32 << dz) - 1;
         let scale = 1.0_f64 / f64::from(1u32 << dz);
         let u0 = f64::from(self.x & mask) * scale;
@@ -142,13 +161,13 @@ impl Default for QuadtreeConfig {
 
 impl QuadtreeConfig {
     /// Default configuration for the bundled offline `Geodetic` (`z = 0..3`)
-    /// basemap with adaptive Polar Stereographic caps (`z = 0..1`).
+    /// basemap with adaptive Polar Stereographic caps (`z = 0`).
     pub const fn bundled_geodetic() -> Self {
         Self {
             scheme: TileScheme::Geodetic,
             max_tex_level: 3,
             max_geom_level: 16,
-            polar_max_tex_level: 1,
+            polar_max_tex_level: 0,
             polar_max_geom_level: 14,
             grid_cells: DEFAULT_GRID_CELLS,
             tile_px: 256,
@@ -163,7 +182,7 @@ impl QuadtreeConfig {
             scheme: TileScheme::WebMercator,
             max_tex_level,
             max_geom_level: 17,
-            polar_max_tex_level: 1,
+            polar_max_tex_level: 0,
             polar_max_geom_level: 14,
             grid_cells: DEFAULT_GRID_CELLS,
             tile_px: 256,
@@ -226,6 +245,10 @@ pub struct LatLonTileBounds {
     pub raw_lat_south_deg: f64,
 }
 
+fn mercator_lat_deg(merc: f64) -> f64 {
+    merc.sinh().atan().to_degrees()
+}
+
 /// Compute geographic bounds for a `Geodetic` or `WebMercator` tile, returning
 /// `None` if the tile lies entirely inside the `|lat| >= WEB_MERCATOR_LIMIT_DEG`
 /// polar caps (which are owned by `TileScheme::PolarCap`).
@@ -262,8 +285,8 @@ pub fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
         TileScheme::WebMercator => {
             let merc_n = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y) / rows_f);
             let merc_s = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y + 1) / rows_f);
-            let lat_north_deg = merc_n.sinh().atan().to_degrees();
-            let lat_south_deg = merc_s.sinh().atan().to_degrees();
+            let lat_north_deg = mercator_lat_deg(merc_n);
+            let lat_south_deg = mercator_lat_deg(merc_s);
             Some(LatLonTileBounds {
                 lon_west_deg,
                 lon_east_deg,
@@ -290,7 +313,7 @@ pub fn polar_cap_point(north: bool, u: f64, v: f64) -> (f64, f64, f64, f64) {
     let dx = u * (1.0 - 0.5 * v * v).max(0.0).sqrt();
     let dy = v * (1.0 - 0.5 * u * u).max(0.0).sqrt();
     let rho = dx.hypot(dy).min(1.0);
-    let colat_rad = 2.0 * (rho * polar_r_cap()).atan();
+    let colat_rad = 2.0 * (rho * POLAR_R_CAP).atan();
     let colat_deg = colat_rad.to_degrees();
     let lat_deg = if north {
         90.0 - colat_deg
@@ -327,17 +350,23 @@ pub fn sample_tile_surface(
         }
         TileScheme::WebMercator => {
             let (cols, rows) = id.scheme.grid_dims(id.level)?;
+            if id.x >= cols || id.y >= rows {
+                return None;
+            }
             let cols_f = f64::from(cols);
             let rows_f = f64::from(rows);
             let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
             let merc_n = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y) / rows_f);
             let merc_s = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y + 1) / rows_f);
             let merc = merc_n + (merc_s - merc_n) * t;
-            let lat = merc.sinh().atan().to_degrees();
+            let lat = mercator_lat_deg(merc);
             Some((lat, lon, s, t, 0.0, 0.0))
         }
         TileScheme::PolarCap { north } => {
-            let (n, _) = id.scheme.grid_dims(id.level)?;
+            let (n, rows) = id.scheme.grid_dims(id.level)?;
+            if id.x >= n || id.y >= rows {
+                return None;
+            }
             let n_f = f64::from(n);
             let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
             let v = -1.0 + 2.0 * (f64::from(id.y) + t) / n_f;
@@ -363,52 +392,145 @@ pub fn tile_grid_anchor(id: QuadTileId) -> Option<(f64, f64)> {
 /// chord sagitta, and skirt depth) for `id`, returning `None` if `id` is out of
 /// domain (e.g. a `Geodetic` tile fully inside a polar cap).
 pub fn describe_tile(id: QuadTileId, config: &QuadtreeConfig) -> Option<VisibleTile> {
-    describe_tile_with_samples(id, config).map(|(tile, _, _)| tile)
+    describe_tile_with_samples(id, config).map(|(tile, _, _, _)| tile)
 }
 
 fn describe_tile_with_samples(
     id: QuadTileId,
     config: &QuadtreeConfig,
-) -> Option<(VisibleTile, [DVec3; 25], f64)> {
+) -> Option<(VisibleTile, [DVec3; 25], f64, f64)> {
+    let grid_cells = f64::from(config.grid_cells.max(1));
     let mut samples = [DVec3::ZERO; 25];
-    let mut sample_geos = [(0.0_f64, 0.0_f64); 25];
-    let mut idx = 0usize;
-    for row in 0..5u32 {
-        let t = f64::from(row) * 0.25;
-        for col in 0..5u32 {
-            let s = f64::from(col) * 0.25;
-            let (lat, lon, _, _, _, _) = sample_tile_surface(id, s, t)?;
-            sample_geos[idx] = (lat, lon);
-            samples[idx] = geodesy::world(Geodetic::surface(lat, lon));
-            idx += 1;
+    let mut sample_units = [DVec3::ZERO; 25];
+    let e2 = geodesy::WGS84.eccentricity_sq();
+    let one_minus_e2 = 1.0 - e2;
+
+    let mut push_sample = |idx: usize, lat_deg: f64, lon_deg: f64| {
+        let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
+        let (sin_lon, cos_lon) = lon_deg.to_radians().sin_cos();
+        let curvature = geodesy::SEMI_MAJOR_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+        sample_units[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+        samples[idx] = DVec3::new(
+            curvature * cos_lat * cos_lon,
+            curvature * cos_lat * sin_lon,
+            curvature * one_minus_e2 * sin_lat,
+        );
+    };
+
+    let mut unclamped_cell_diag_deg = 0.0_f64;
+    let mut merc_equatorial_cell_diag_deg = 0.0_f64;
+
+    match id.scheme {
+        TileScheme::Geodetic => {
+            let b = lat_lon_bounds(id)?;
+            let mut idx = 0usize;
+            for row in 0..5u32 {
+                let t = f64::from(row) * 0.25;
+                let lat = b.lat_north_deg + (b.lat_south_deg - b.lat_north_deg) * t;
+                for col in 0..5u32 {
+                    let s = f64::from(col) * 0.25;
+                    let lon = b.lon_west_deg + (b.lon_east_deg - b.lon_west_deg) * s;
+                    push_sample(idx, lat, lon);
+                    idx += 1;
+                }
+            }
+            if b.lat_north_deg < b.raw_lat_north_deg || b.lat_south_deg > b.raw_lat_south_deg {
+                let raw_cell_lat = (b.raw_lat_north_deg - b.raw_lat_south_deg) / grid_cells;
+                let min_abs_lat = b.lat_north_deg.abs().min(b.lat_south_deg.abs());
+                let cell_lon = ((b.lon_east_deg - b.lon_west_deg) / grid_cells)
+                    * min_abs_lat.to_radians().cos();
+                unclamped_cell_diag_deg = raw_cell_lat.hypot(cell_lon);
+            }
         }
+        TileScheme::WebMercator => {
+            let (cols, rows) = id.scheme.grid_dims(id.level)?;
+            if id.x >= cols || id.y >= rows {
+                return None;
+            }
+            let cols_f = f64::from(cols);
+            let rows_f = f64::from(rows);
+            let merc_n = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y) / rows_f);
+            let merc_s = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y + 1) / rows_f);
+            let mut idx = 0usize;
+            for row in 0..5u32 {
+                let t = f64::from(row) * 0.25;
+                let lat = mercator_lat_deg(merc_n + (merc_s - merc_n) * t);
+                for col in 0..5u32 {
+                    let s = f64::from(col) * 0.25;
+                    let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
+                    push_sample(idx, lat, lon);
+                    idx += 1;
+                }
+            }
+            // Evaluate the most equatorial mesh cell directly so non-linear
+            // Mercator stretching at coarse z=0..1 does not underestimate sag.
+            let d_merc = (merc_n - merc_s) / grid_cells;
+            let merc_eq = if merc_s <= 0.0 && merc_n >= 0.0 {
+                0.0
+            } else if merc_n.abs() < merc_s.abs() {
+                merc_n - 0.5 * d_merc
+            } else {
+                merc_s + 0.5 * d_merc
+            };
+            let cell_dlat = (mercator_lat_deg((merc_eq + 0.5 * d_merc).min(merc_n))
+                - mercator_lat_deg((merc_eq - 0.5 * d_merc).max(merc_s)))
+            .abs();
+            let cell_dlon =
+                (360.0 / (cols_f * grid_cells)) * mercator_lat_deg(merc_eq).to_radians().cos();
+            merc_equatorial_cell_diag_deg = cell_dlat.hypot(cell_dlon);
+        }
+        TileScheme::PolarCap { north } => {
+            let (n, rows) = id.scheme.grid_dims(id.level)?;
+            if id.x >= n || id.y >= rows {
+                return None;
+            }
+            let n_f = f64::from(n);
+            let mut idx = 0usize;
+            for row in 0..5u32 {
+                let t = f64::from(row) * 0.25;
+                let v = -1.0 + 2.0 * (f64::from(id.y) + t) / n_f;
+                for col in 0..5u32 {
+                    let s = f64::from(col) * 0.25;
+                    let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
+                    let (lat, lon, _, _) = polar_cap_point(north, u, v);
+                    push_sample(idx, lat, lon);
+                    idx += 1;
+                }
+            }
+        }
+        TileScheme::RasterPyramid { .. } => return None,
     }
 
     // Center point `(s=0.5, t=0.5)` is index 12 (row 2, col 2).
     let origin_ecef_m = samples[12];
 
-    // Estimate maximum tile diagonal arc and per-cell diagonal sagitta.
-    let grid_cells = f64::from(config.grid_cells.max(1));
+    // Estimate maximum 5x5 subcell diagonal arc from cached unit normals.
     let mut max_subcell_arc_deg = 0.0_f64;
     for row in 0..4usize {
         for col in 0..4usize {
-            let a = sample_geos[row * 5 + col];
-            let b = sample_geos[(row + 1) * 5 + (col + 1)];
-            let c = sample_geos[row * 5 + (col + 1)];
-            let d = sample_geos[(row + 1) * 5 + col];
-            max_subcell_arc_deg = max_subcell_arc_deg
-                .max(geodesy::separation(a, b))
-                .max(geodesy::separation(c, d));
+            let a = sample_units[row * 5 + col];
+            let b = sample_units[(row + 1) * 5 + (col + 1)];
+            let c = sample_units[row * 5 + (col + 1)];
+            let d = sample_units[(row + 1) * 5 + col];
+            let arc_ab = a.cross(b).length().atan2(a.dot(b)).to_degrees();
+            let arc_cd = c.cross(d).length().atan2(c.dot(d)).to_degrees();
+            max_subcell_arc_deg = max_subcell_arc_deg.max(arc_ab).max(arc_cd);
         }
     }
-    // Each 5x5 subcell spans `1/4` of the tile; scale to `1/grid_cells`.
-    let cell_diag_deg = max_subcell_arc_deg * (4.0 / grid_cells);
-    let sag_cell_diag_m = sag::sag_m(cell_diag_deg);
-    let skirt_depth_m = (4.0 * sag_cell_diag_m).max(0.001);
+    // Scale 5x5 subcell (`1/4` of tile) to `1/grid_cells`, taking the exact
+    // equatorial WebMercator cell when larger.
+    let cell_diag_deg =
+        (max_subcell_arc_deg * (4.0 / grid_cells)).max(merc_equatorial_cell_diag_deg);
+    let sag_cell_diag_m = sag::sag_m(cell_diag_deg) * POLAR_CURVATURE_SCALE;
+    // For clamped Geodetic polar-adjacent tiles, derive skirt depth from the
+    // unclamped latitude span so 2:1 coarser neighbors never out-sag a thin sliver.
+    let skirt_sag_m =
+        sag_cell_diag_m.max(sag::sag_m(unclamped_cell_diag_deg) * POLAR_CURVATURE_SCALE);
+    let skirt_depth_m = (4.0 * skirt_sag_m).max(0.001);
 
-    // Widen bounding ball by coarse-sample chord sag so the sphere strictly
-    // encloses the curved ellipsoid surface even at z = 0.
-    let sample_sag_m = sag::sag_m(max_subcell_arc_deg);
+    // Conservative subcell bulge margin (polar curvature + 15% trapezoid slack)
+    // so the bounding sphere strictly encloses the curved ellipsoid surface.
+    let sample_sag_m = sag::sag_m((max_subcell_arc_deg * 1.15).min(180.0)) * POLAR_CURVATURE_SCALE;
     let ball = Ball::over(&samples).widened(sample_sag_m + skirt_depth_m);
 
     let max_tex = config.max_tex_for(id.scheme);
@@ -423,7 +545,7 @@ fn describe_tile_with_samples(
         sag_cell_diag_m,
         skirt_depth_m,
     };
-    Some((tile, samples, sample_sag_m))
+    Some((tile, samples, sample_sag_m, max_subcell_arc_deg))
 }
 
 fn tile_visible(
@@ -431,15 +553,19 @@ fn tile_visible(
     tile: &VisibleTile,
     samples: &[DVec3; 25],
     sample_sag_m: f64,
+    max_subcell_arc_deg: f64,
 ) -> bool {
-    // Tight convex-surface horizon rejection: no point on the WGS84 surface
-    // inside any 5x5 subcell can exceed `max(sample_i · towards) + sample_sag_m`.
-    let max_horizon = samples
-        .iter()
-        .map(|&p| frustum.horizon_margin(p))
-        .fold(f64::NEG_INFINITY, f64::max);
-    if max_horizon + sample_sag_m < 0.0 {
-        return false;
+    // Only apply the 5x5 sample horizon shortcut once subcells are small enough
+    // that spherical-trapezoid circumradius stays within `1.15 * half_diag`;
+    // coarse planetary roots (z = 0..1) rely solely on their enclosing `Ball`.
+    if max_subcell_arc_deg <= 30.0 {
+        let max_horizon = samples
+            .iter()
+            .map(|&p| frustum.horizon_margin(p))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if max_horizon + sample_sag_m < 0.0 {
+            return false;
+        }
     }
     frustum.admits(&tile.ball)
 }
@@ -447,8 +573,27 @@ fn tile_visible(
 /// Approximate ground width of one tile in metres (used for texture SSE while
 /// `level < max_tex_level`).
 fn approx_tile_width_m(tile: &VisibleTile) -> f64 {
+    if tile.id.level <= 1
+        && let Some((cols, _)) = tile.id.scheme.grid_dims(tile.id.level)
+        && matches!(
+            tile.id.scheme,
+            TileScheme::Geodetic | TileScheme::WebMercator
+        )
+    {
+        return (2.0 * std::f64::consts::PI * geodesy::SEMI_MAJOR_M) / f64::from(cols);
+    }
     // Bounding-sphere radius is ~half the tile diagonal (`sqrt(2)/2 * width`).
     (tile.ball.radius * std::f64::consts::SQRT_2).max(1.0)
+}
+
+fn is_polar_perimeter(id: QuadTileId) -> bool {
+    if !matches!(id.scheme, TileScheme::PolarCap { .. }) {
+        return false;
+    }
+    let Some((n, _)) = id.scheme.grid_dims(id.level) else {
+        return false;
+    };
+    id.x == 0 || id.y == 0 || id.x + 1 >= n || id.y + 1 >= n
 }
 
 fn should_subdivide(
@@ -467,19 +612,26 @@ fn should_subdivide(
         .max(camera_height_m)
         .max(1.0);
 
-    // 1. Geometric chord-sag criterion (HiDPI-aware SSE + direct ground sag
-    //    bound `dist_m * 0.0005` so even tiny smoke-test viewports achieve
-    //    sub-millimetre chord sag at 2 m altitude).
+    // 1. Geometric chord-sag criterion (HiDPI-aware SSE).
     let sse_geom_px = (tile.sag_cell_diag_m * focal_px) / dist_m;
-    let direct_sag_limit_m = dist_m * 0.0005;
-    if sse_geom_px > config.max_geom_sse_px || tile.sag_cell_diag_m > direct_sag_limit_m {
+    if sse_geom_px > config.max_geom_sse_px {
         return true;
     }
 
-    // 2. Texture resolution criterion (strictly disabled once `level >= max_tex_level`
-    //    so decoupled geometry LOD never emits requests above `max_tex_level`).
-    let max_tex = config.max_tex_for(tile.id.scheme);
-    if tile.id.level < max_tex {
+    // 2. Texture resolution criterion (clamped to `max_tex_level` so decoupled
+    //    geometry LOD never emits texture requests above `max_tex_level`).
+    //    For PolarCap perimeter tiles touching `±85.0511°`, couple geometry
+    //    refinement to the adjacent main-scheme texture level (still clamping
+    //    `tex_id` to `polar_max_tex_level`) so cross-scheme skirts stay matched.
+    let mut tex_subdiv_cap = config.max_tex_for(tile.id.scheme);
+    if is_polar_perimeter(tile.id) {
+        let level_shift = match config.scheme {
+            TileScheme::Geodetic => 1,
+            _ => 2,
+        };
+        tex_subdiv_cap = tex_subdiv_cap.max(config.max_tex_level.saturating_sub(level_shift));
+    }
+    if tile.id.level < tex_subdiv_cap {
         let texel_m = approx_tile_width_m(tile) / f64::from(config.tile_px.max(1));
         let sse_tex_px = (texel_m * focal_px) / dist_m;
         if sse_tex_px > config.max_tex_sse_px {
@@ -543,10 +695,12 @@ pub fn traverse(
     }
 
     while let Some(id) = stack.pop() {
-        let Some((tile, samples, sample_sag_m)) = describe_tile_with_samples(id, config) else {
+        let Some((tile, samples, sample_sag_m, max_subcell_arc_deg)) =
+            describe_tile_with_samples(id, config)
+        else {
             continue;
         };
-        if !tile_visible(&frustum, &tile, &samples, sample_sag_m) {
+        if !tile_visible(&frustum, &tile, &samples, sample_sag_m, max_subcell_arc_deg) {
             continue;
         }
         if should_subdivide(&tile, eye, height_m, focal_px, config) {
@@ -563,18 +717,8 @@ pub fn traverse(
     balance_2_to_1(&mut leaves, &frustum, config);
 
     let mut out: Vec<VisibleTile> = leaves.into_values().collect();
-    // Deterministic ordering (scheme, level, y, x) for reproducible draws and
-    // stable snapshot equality.
-    out.sort_by_key(|t| {
-        let scheme_ord: u8 = match t.id.scheme {
-            TileScheme::Geodetic => 0,
-            TileScheme::WebMercator => 1,
-            TileScheme::PolarCap { north: true } => 2,
-            TileScheme::PolarCap { north: false } => 3,
-            TileScheme::RasterPyramid { .. } => 4,
-        };
-        (scheme_ord, t.id.level, t.id.y, t.id.x)
-    });
+    // Deterministic ordering for reproducible draws and stable snapshot equality.
+    out.sort_by_key(|t| (t.id.scheme, t.id.level, t.id.y, t.id.x));
     out
 }
 
@@ -637,25 +781,16 @@ fn balance_2_to_1(
         if to_split.is_empty() {
             break;
         }
-        to_split.sort_by_key(|id| {
-            let scheme_ord: u8 = match id.scheme {
-                TileScheme::Geodetic => 0,
-                TileScheme::WebMercator => 1,
-                TileScheme::PolarCap { north: true } => 2,
-                TileScheme::PolarCap { north: false } => 3,
-                TileScheme::RasterPyramid { .. } => 4,
-            };
-            (scheme_ord, id.level, id.y, id.x)
-        });
+        to_split.sort_unstable();
         to_split.dedup();
         for split_id in to_split {
             if leaves.remove(&split_id).is_none() {
                 continue;
             }
             for child in split_id.children() {
-                if let Some((tile, samples, sample_sag_m)) =
+                if let Some((tile, samples, sample_sag_m, max_subcell_arc_deg)) =
                     describe_tile_with_samples(child, config)
-                    && tile_visible(frustum, &tile, &samples, sample_sag_m)
+                    && tile_visible(frustum, &tile, &samples, sample_sag_m, max_subcell_arc_deg)
                 {
                     leaves.insert(child, tile);
                 }
@@ -665,7 +800,7 @@ fn balance_2_to_1(
 }
 
 /// Adaptive graticule spacing in degrees (every candidate evenly divides `90°`
-/// and `180°`), keeping lines spaced cleanly at ~80–250 logical points from
+/// and `180°`), keeping lines spaced cleanly at ~85–425 logical points from
 /// orbital zoom (`15°`) down to `2 m` close-ups (`0.00001° ~ 1.1 m`).
 pub fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
     const STEPS_DEG: [f64; 13] = [
@@ -687,6 +822,7 @@ pub fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::geo::camera::MIN_HEIGHT_M;
+    use crate::geo::geodesy::Geodetic;
 
     #[test]
     fn decoupled_lod_subdivides_past_max_tex_level_with_zero_requests_above_cap() {
@@ -788,70 +924,186 @@ mod tests {
     }
 
     #[test]
-    fn quadtree_is_2_to_1_balanced_across_visible_neighbors() {
+    fn quadtree_is_2_to_1_balanced_across_visible_neighbors_and_antimeridian() {
         let cfg = QuadtreeConfig::bundled_geodetic();
-        // Mid-altitude oblique horizon view exercises multi-LOD transitions.
-        let cam = Camera::at(45.0, 39.0, 500_000.0);
-        let tiles = traverse(&cam, 1280, 800, &cfg);
-        let map: HashMap<QuadTileId, VisibleTile> = tiles.iter().map(|&t| (t.id, t)).collect();
+        for cam in [
+            Camera::at(45.0, 39.0, 500_000.0),
+            Camera::at(35.0, 180.0, 2_000_000.0),
+        ] {
+            let tiles = traverse(&cam, 1280, 800, &cfg);
+            assert!(!tiles.is_empty());
+            let map: HashMap<QuadTileId, VisibleTile> = tiles.iter().map(|&t| (t.id, t)).collect();
 
-        for &id in map.keys() {
-            if id.level < 2 {
-                continue;
-            }
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let Some(nb) = neighbor_id(id, dx, dy) else {
+            for &id in map.keys() {
+                if id.level < 2 {
                     continue;
-                };
-                let mut anc = nb.parent().and_then(QuadTileId::parent);
-                while let Some(a) = anc {
-                    assert!(
-                        !map.contains_key(&a),
-                        "2:1 LOD violation: {:?} is adjacent to coarse leaf {:?}",
-                        id,
-                        a
-                    );
-                    anc = a.parent();
+                }
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let Some(nb) = neighbor_id(id, dx, dy) else {
+                        continue;
+                    };
+                    let mut anc = nb.parent().and_then(QuadTileId::parent);
+                    while let Some(a) = anc {
+                        assert!(
+                            !map.contains_key(&a),
+                            "2:1 LOD violation: {:?} is adjacent to coarse leaf {:?}",
+                            id,
+                            a
+                        );
+                        anc = a.parent();
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn hidpi_viewport_subdivides_at_least_as_finely_as_1x() {
-        let cfg = QuadtreeConfig::bundled_geodetic();
-        let cam = Camera::at(35.0, 20.0, 200_000.0);
-        let lod_1x = traverse(&cam, 800, 600, &cfg);
-        let lod_2x = traverse(&cam, 1600, 1200, &cfg);
+    fn hidpi_viewport_and_sse_config_control_subdivision_strictly() {
+        // Use a high-altitude view where geometry SSE (not max_tex_level) governs refinement.
+        let mut cfg = QuadtreeConfig::bundled_geodetic();
+        cfg.max_tex_level = 0;
+        let cam = Camera::at(35.0, 20.0, 1_500_000.0);
+        let lod_1x = traverse(&cam, 600, 400, &cfg);
+        let lod_2x = traverse(&cam, 2400, 1600, &cfg);
         let max_1x = lod_1x.iter().map(|t| t.id.level).max().unwrap_or(0);
         let max_2x = lod_2x.iter().map(|t| t.id.level).max().unwrap_or(0);
-        let min_sag_1x = lod_1x
-            .iter()
-            .map(|t| t.sag_cell_diag_m)
-            .fold(f64::INFINITY, f64::min);
-        let min_sag_2x = lod_2x
-            .iter()
-            .map(|t| t.sag_cell_diag_m)
-            .fold(f64::INFINITY, f64::min);
         assert!(
-            max_2x >= max_1x && min_sag_2x <= min_sag_1x,
-            "HiDPI 2x should refine at least as finely as 1x: 1x=(lvl {max_1x}, sag {min_sag_1x}), 2x=(lvl {max_2x}, sag {min_sag_2x})"
+            max_2x > max_1x,
+            "HiDPI 4x viewport must subdivide strictly finer than 1x: 1x={max_1x}, 4x={max_2x}"
+        );
+
+        // Relaxing max_geom_sse_px on a standard 800 px viewport must reduce subdivision.
+        let mut loose = cfg;
+        loose.max_geom_sse_px = 8.0;
+        let tight_tiles = traverse(&cam, 1280, 800, &cfg);
+        let loose_tiles = traverse(&cam, 1280, 800, &loose);
+        let tight_max = tight_tiles.iter().map(|t| t.id.level).max().unwrap_or(0);
+        let loose_max = loose_tiles.iter().map(|t| t.id.level).max().unwrap_or(0);
+        assert!(
+            loose_max < tight_max,
+            "relaxing max_geom_sse_px must reduce LOD on 800 px viewport: tight={tight_max}, loose={loose_max}"
+        );
+
+        // Degenerate zero-area viewports return empty cleanly.
+        assert!(traverse(&cam, 0, 800, &cfg).is_empty());
+        assert!(traverse(&cam, 800, 0, &cfg).is_empty());
+    }
+
+    #[test]
+    fn web_mercator_never_falsely_culls_across_globe_and_couples_polar_seam() {
+        let cfg = QuadtreeConfig::web_mercator(12);
+        // Sweep across mid-latitude quadrants including (25 N, -135 W) where
+        // naive z=0 subcell horizon tests falsely cull the root tile.
+        for lat in [-60.0, -25.0, 0.0, 25.0, 60.0] {
+            for lon in [-135.0, -45.0, 0.0, 45.0, 135.0] {
+                for height_m in [MIN_HEIGHT_M, 10_000.0, 400_000.0] {
+                    let cam = Camera::at(lat, lon, height_m);
+                    let tiles = traverse(&cam, 1280, 800, &cfg);
+                    assert!(
+                        tiles.iter().any(|t| t.id.scheme == TileScheme::WebMercator),
+                        "WebMercator returned 0 tiles at ({lat}, {lon}, {height_m} m)"
+                    );
+                }
+            }
+        }
+
+        // At 5 km over the 85.0511 deg polar seam with WebMercator(12), both
+        // WebMercator and PolarCap must appear, PolarCap textures stay <= cap,
+        // and PolarCap perimeter sag stays bounded against WebMercator skirts.
+        let cam = Camera::at(WEB_MERCATOR_LIMIT_DEG, 15.0, 5_000.0);
+        let tiles = traverse(&cam, 1280, 800, &cfg);
+        let merc: Vec<&VisibleTile> = tiles
+            .iter()
+            .filter(|t| t.id.scheme == TileScheme::WebMercator)
+            .collect();
+        let polar: Vec<&VisibleTile> = tiles
+            .iter()
+            .filter(|t| t.id.scheme == TileScheme::PolarCap { north: true })
+            .collect();
+        assert!(!merc.is_empty() && !polar.is_empty());
+        for t in &polar {
+            assert!(t.tex_id.level <= cfg.polar_max_tex_level);
+        }
+        let max_merc_level = merc.iter().map(|t| t.id.level).max().unwrap_or(0);
+        let max_polar_level = polar.iter().map(|t| t.id.level).max().unwrap_or(0);
+        assert!(
+            max_polar_level + 3 >= max_merc_level,
+            "PolarCap perimeter lagged WebMercator at seam: merc={max_merc_level}, polar={max_polar_level}"
         );
     }
 
     #[test]
-    fn web_mercator_quadtree_and_polar_seam_stitch_cleanly() {
-        let cfg = QuadtreeConfig::web_mercator(4);
-        let cam = Camera::at(WEB_MERCATOR_LIMIT_DEG, 0.0, 10_000.0);
-        let tiles = traverse(&cam, 1024, 768, &cfg);
-        let has_merc = tiles.iter().any(|t| t.id.scheme == TileScheme::WebMercator);
-        let has_polar = tiles
-            .iter()
-            .any(|t| t.id.scheme == TileScheme::PolarCap { north: true });
+    fn clamped_geodetic_polar_adjacent_skirts_cover_coarser_neighbor_sag() {
+        let cfg = QuadtreeConfig::bundled_geodetic();
+        let coarse = describe_tile(
+            QuadTileId {
+                scheme: TileScheme::Geodetic,
+                level: 4,
+                x: 0,
+                y: 0,
+            },
+            &cfg,
+        )
+        .expect("z=4 row 0");
+        let fine = describe_tile(
+            QuadTileId {
+                scheme: TileScheme::Geodetic,
+                level: 5,
+                x: 2,
+                y: 0,
+            },
+            &cfg,
+        )
+        .expect("z=5 row 0");
         assert!(
-            has_merc && has_polar,
-            "seam view must contain both WebMercator and North PolarCap"
+            fine.skirt_depth_m >= coarse.sag_cell_diag_m,
+            "clamped Geodetic z=5 skirt ({} m) shallower than adjacent z=4 sag ({} m)",
+            fine.skirt_depth_m,
+            coarse.sag_cell_diag_m
         );
+    }
+
+    #[test]
+    fn polar_r_cap_constant_and_bounds_guards_are_exact() {
+        let expected = ((90.0 - WEB_MERCATOR_LIMIT_DEG) * 0.5).to_radians().tan();
+        assert!((POLAR_R_CAP - expected).abs() < 1e-16);
+
+        // Out-of-bounds WebMercator and PolarCap tile coordinates return None.
+        assert!(
+            sample_tile_surface(
+                QuadTileId {
+                    scheme: TileScheme::WebMercator,
+                    level: 1,
+                    x: 2,
+                    y: 0,
+                },
+                0.5,
+                0.5,
+            )
+            .is_none()
+        );
+        assert!(
+            sample_tile_surface(
+                QuadTileId {
+                    scheme: TileScheme::PolarCap { north: true },
+                    level: 0,
+                    x: 1,
+                    y: 0,
+                },
+                0.5,
+                0.5,
+            )
+            .is_none()
+        );
+        // Huge dz in clamp_to_level must not panic.
+        let deep = QuadTileId {
+            scheme: TileScheme::WebMercator,
+            level: 40,
+            x: 0,
+            y: 0,
+        };
+        let (clamped, _) = deep.clamp_to_level(0);
+        assert_eq!(clamped.level, 0);
     }
 
     #[test]

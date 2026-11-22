@@ -1,11 +1,10 @@
 //! Per-tile CPU `f64` RTC WGS84 quadtree geometry with per-cell sag-scaled
 //! skirts and a single shared static index buffer.
 //!
-//! Replaces Slice 1's coarse static `96 x 192` ellipsoid mesh and static
-//! 672-segment `LineList` graticule. Both the globe surface (`body_*_pipeline`)
-//! and the post-overlay procedural `fwidth()` graticule (`grid_pipeline`)
-//! consume the exact same per-tile vertex buffer and shared static index
-//! buffer (`full` range for body + skirts, `surface` range for graticule).
+//! Both the globe surface (`body_*_pipeline`) and the post-overlay procedural
+//! `fwidth()` graticule (`grid_pipeline`) consume the exact same per-tile
+//! vertex buffer and shared static index buffer (`full` range for body +
+//! skirts, `surface` range for graticule).
 
 use std::ops::Range;
 
@@ -186,15 +185,33 @@ pub fn build_tile_vertices(tile: &VisibleTile, grid_cells: u32) -> Vec<TileVerte
     }
 
     // Helper: push a skirt vertex displaced inward along `-normal` by
-    // `tile.skirt_depth_m` metres.
+    // `tile.skirt_depth_m` metres plus a tiny outward tangential flare so
+    // sub-millimetre f32 RTC edge rounding gaps never leak directly beneath a
+    // nadir camera (while staying strictly below adjacent surfaces in depth).
     let drop_m = tile.skirt_depth_m as f32;
-    let push_skirt = |out: &mut Vec<TileVertex>, src_idx: usize| {
+    let flare_m = (0.05 * drop_m).max(0.002);
+    let push_skirt = |out: &mut Vec<TileVertex>, src_idx: usize, inner_idx: usize| {
         let v = out[src_idx];
+        let inner = out[inner_idx];
+        let raw_x = v.rel_pos[0] - inner.rel_pos[0];
+        let raw_y = v.rel_pos[1] - inner.rel_pos[1];
+        let raw_z = v.rel_pos[2] - inner.rel_pos[2];
+        let dot_n = raw_x * v.normal[0] + raw_y * v.normal[1] + raw_z * v.normal[2];
+        let tx = raw_x - v.normal[0] * dot_n;
+        let ty = raw_y - v.normal[1] * dot_n;
+        let tz = raw_z - v.normal[2] * dot_n;
+        let t_len = (tx * tx + ty * ty + tz * tz).sqrt();
+        let (fx, fy, fz) = if t_len > 1e-9 {
+            let s = flare_m / t_len;
+            (tx * s, ty * s, tz * s)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
         out.push(TileVertex {
             rel_pos: [
-                v.rel_pos[0] - v.normal[0] * drop_m,
-                v.rel_pos[1] - v.normal[1] * drop_m,
-                v.rel_pos[2] - v.normal[2] * drop_m,
+                v.rel_pos[0] - v.normal[0] * drop_m + fx,
+                v.rel_pos[1] - v.normal[1] * drop_m + fy,
+                v.rel_pos[2] - v.normal[2] * drop_m + fz,
             ],
             ..v
         });
@@ -202,20 +219,25 @@ pub fn build_tile_vertices(tile: &VisibleTile, grid_cells: u32) -> Vec<TileVerte
 
     // 2. North skirt (row = 0, col = 0..=n).
     for col in 0..stride {
-        push_skirt(&mut vertices, col);
+        push_skirt(&mut vertices, col, stride + col);
     }
     // 3. South skirt (row = n, col = 0..=n).
     let south_row = (n as usize) * stride;
+    let south_inner = ((n - 1) as usize) * stride;
     for col in 0..stride {
-        push_skirt(&mut vertices, south_row + col);
+        push_skirt(&mut vertices, south_row + col, south_inner + col);
     }
     // 4. West skirt (col = 0, row = 0..=n).
     for row in 0..stride {
-        push_skirt(&mut vertices, row * stride);
+        push_skirt(&mut vertices, row * stride, row * stride + 1);
     }
     // 5. East skirt (col = n, row = 0..=n).
     for row in 0..stride {
-        push_skirt(&mut vertices, row * stride + (n as usize));
+        push_skirt(
+            &mut vertices,
+            row * stride + (n as usize),
+            row * stride + ((n - 1) as usize),
+        );
     }
 
     vertices
@@ -298,6 +320,24 @@ mod tests {
                     "inverted surface triangle on {:?}: dot={}",
                     id,
                     face.dot(normal)
+                );
+            }
+
+            // Every skirt triangle must face laterally outward away from the
+            // tile's local RTC origin (dot with tangential edge offset > 0).
+            for tri in shared.indices[shared.surface.end as usize..shared.full.end as usize]
+                .chunks_exact(3)
+            {
+                let p0 = Vec3::from(verts[tri[0] as usize].rel_pos);
+                let p1 = Vec3::from(verts[tri[1] as usize].rel_pos);
+                let p2 = Vec3::from(verts[tri[2] as usize].rel_pos);
+                let face = (p1 - p0).cross(p2 - p0);
+                let centroid = (p0 + p1 + p2) / 3.0;
+                assert!(
+                    face.dot(centroid) > 0.0,
+                    "inverted skirt triangle on {:?}: dot={}",
+                    id,
+                    face.dot(centroid)
                 );
             }
         }

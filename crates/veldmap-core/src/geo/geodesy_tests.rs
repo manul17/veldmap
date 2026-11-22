@@ -108,28 +108,6 @@ fn fukushima_3d_roundtrip_across_altitudes_and_poles() {
 }
 
 #[test]
-fn parallel_matches_world_in_metres() {
-    for lat in [-85.0, 0.0, 47.2357, 89.5] {
-        for height_m in [0.0, 2.0, 500_000.0] {
-            let p = parallel(lat, height_m);
-            for lon in [-180.0_f64, -42.5, 0.0, 39.7, 179.0] {
-                let (sin_lon, cos_lon) = lon.to_radians().sin_cos();
-                let a = p.at(sin_lon, cos_lon);
-                let b = world(Geodetic {
-                    lat_deg: lat,
-                    lon_deg: lon,
-                    height_m,
-                });
-                assert!(
-                    a.distance(b) < 1e-9,
-                    "mismatch at ({lat}, {lon}, {height_m})"
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn flattening_is_real_in_metres() {
     let point = world(Geodetic::surface(45.0, 0.0));
     assert!(

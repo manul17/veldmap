@@ -14,6 +14,6 @@ pub use camera::Camera;
 pub use coords::{LocationKind, ParseLocationError, ParsedLocation, parse_location};
 pub use cull::{Ball, Frame as CullFrame};
 pub use footprint::{Frame as FootprintFrame, GeoPoint, Ring};
-pub use geodesy::{Ellipsoid, Geodetic, Parallel, WGS84};
+pub use geodesy::{Ellipsoid, Geodetic, WGS84};
 pub use mgrs::{Frame as MgrsFrame, MgrsError};
 pub use projection::{Datum, Projection, System};

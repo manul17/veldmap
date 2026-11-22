@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::camera::Camera;
@@ -93,6 +93,7 @@ pub struct DrawTile {
 pub struct DrawSnapshot {
     pub camera: Camera,
     pub tiles: Vec<DrawTile>,
+    pub grid_cells: u32,
     pub show_graticule: bool,
     pub grid_step_deg: f64,
     pub grid_width_px: f32,
@@ -162,6 +163,7 @@ impl DrawSnapshot {
         Self {
             camera,
             tiles,
+            grid_cells: config.grid_cells.max(1),
             show_graticule,
             grid_step_deg,
             grid_width_px,
@@ -182,6 +184,7 @@ pub struct RenderParams<'a> {
 struct RenderKey {
     width: u32,
     height: u32,
+    grid_cells: u32,
     eye_bits: [u64; 3],
     up_bits: [u64; 3],
     show_graticule: bool,
@@ -222,6 +225,7 @@ impl RenderKey {
         Self {
             width,
             height,
+            grid_cells: snap.grid_cells,
             eye_bits: eye.to_array().map(f64::to_bits),
             up_bits: up.to_array().map(f64::to_bits),
             show_graticule: snap.show_graticule,
@@ -363,9 +367,10 @@ pub struct GlobeRenderer {
     composite_pipeline: wgpu::RenderPipeline,
     /// Bounded O(1) LRU cache of per-tile CPU `f64` RTC vertex buffers.
     tile_meshes: TileCache<QuadTileId, wgpu::Buffer>,
-    /// Lightweight `BindGroup` cache keyed by `GpuTile::tile_id`, pruned
-    /// whenever tiles are evicted from `VeldmapApp`'s `GpuTileCache`.
-    tile_bind_groups: HashMap<u64, wgpu::BindGroup>,
+    /// Lightweight `BindGroup` cache keyed by `GpuTile::tile_id` and guarded
+    /// by `Weak<GpuTile>`, so evicted tiles are swept automatically without
+    /// losing eviction events across discarded `egui` passes.
+    tile_bind_groups: HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)>,
     /// Reusable staging scratch buffer for dynamic per-tile uniforms.
     uniform_staging: Vec<u8>,
     viewport: ViewportState,
@@ -689,12 +694,11 @@ impl GlobeRenderer {
         }
     }
 
-    /// Prune cached `BindGroup` entries for `GpuTile`s evicted from
-    /// `VeldmapApp`'s `GpuTileCache`.
-    pub fn prune_evicted_tiles(&mut self, evicted_tile_ids: &[u64]) {
-        for tile_id in evicted_tile_ids {
-            self.tile_bind_groups.remove(tile_id);
-        }
+    /// Drop cached `BindGroup` entries whose backing `GpuTile` has been
+    /// evicted from `GpuTileCache` and released by all active snapshots.
+    pub fn sweep_stale_bind_groups(&mut self) {
+        self.tile_bind_groups
+            .retain(|_, (weak, _)| weak.strong_count() > 0);
     }
 
     /// Number of currently cached tile texture bind groups.
@@ -712,6 +716,7 @@ impl GlobeRenderer {
         encoder: &mut wgpu::CommandEncoder,
         params: RenderParams<'_>,
     ) -> bool {
+        self.sweep_stale_bind_groups();
         if params.width == 0 || params.height == 0 {
             return false;
         }
@@ -838,7 +843,30 @@ impl GlobeRenderer {
         });
     }
 
+    fn ensure_grid_cells(&mut self, device: &wgpu::Device, grid_cells: u32) {
+        let cells = grid_cells.max(1);
+        if cells == self.grid_cells {
+            return;
+        }
+        let shared = SharedTileIndices::build(cells);
+        self.grid_cells = cells;
+        self.surface_indices = shared.surface;
+        self.full_indices = shared.full;
+        self.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quadtree shared index buffer"),
+            contents: bytemuck::cast_slice(&shared.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let _ = self.tile_meshes.clear();
+    }
+
     fn prepare_tile_resources(&mut self, device: &wgpu::Device, snapshot: &DrawSnapshot) {
+        self.ensure_grid_cells(device, snapshot.grid_cells);
+        let stride = (self.grid_cells + 1) as usize;
+        let single_tile_bytes = (stride * stride + 4 * stride) * std::mem::size_of::<TileVertex>();
+        self.tile_meshes
+            .ensure_max_bytes(snapshot.tiles.len().saturating_mul(single_tile_bytes));
+
         for draw in &snapshot.tiles {
             let id = draw.visible.id;
             if !self.tile_meshes.touch(&id) {
@@ -856,7 +884,7 @@ impl GlobeRenderer {
                 self.tile_bind_groups
                     .entry(gpu_tile.tile_id)
                     .or_insert_with(|| {
-                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("globe tile texture bind group"),
                             layout: &self.tile_texture_layout,
                             entries: &[
@@ -869,7 +897,8 @@ impl GlobeRenderer {
                                     resource: wgpu::BindingResource::Sampler(&self.tile_sampler),
                                 },
                             ],
-                        })
+                        });
+                        (Arc::downgrade(gpu_tile), bg)
                     });
             }
         }
@@ -1011,6 +1040,8 @@ impl GlobeRenderer {
         pass.set_bind_group(0, &self.viewport.camera_bind_group, &[]);
 
         // Pass 1: Opaque WGS84 quadtree surface + downward skirts (Reverse-Z).
+        let mut last_textured: Option<bool> = None;
+        let mut last_tex_id: Option<u64> = None;
         for (i, draw) in snapshot.tiles.iter().enumerate() {
             let Some(vbuf) = self.tile_meshes.peek(&draw.visible.id) else {
                 continue;
@@ -1020,12 +1051,20 @@ impl GlobeRenderer {
             pass.set_bind_group(1, &self.viewport.tile_uniform_bind_group, &[dyn_offset]);
 
             if let Some(gpu_tile) = &draw.texture
-                && let Some(tex_bg) = self.tile_bind_groups.get(&gpu_tile.tile_id)
+                && let Some((_, tex_bg)) = self.tile_bind_groups.get(&gpu_tile.tile_id)
             {
-                pass.set_pipeline(&self.body_textured_pipeline);
-                pass.set_bind_group(2, tex_bg, &[]);
-            } else {
+                if last_textured != Some(true) {
+                    pass.set_pipeline(&self.body_textured_pipeline);
+                    last_textured = Some(true);
+                }
+                if last_tex_id != Some(gpu_tile.tile_id) {
+                    pass.set_bind_group(2, tex_bg, &[]);
+                    last_tex_id = Some(gpu_tile.tile_id);
+                }
+            } else if last_textured != Some(false) {
                 pass.set_pipeline(&self.body_ellipsoid_pipeline);
+                last_textured = Some(false);
+                last_tex_id = None;
             }
             pass.draw_indexed(self.full_indices.clone(), 0, 0..1);
         }

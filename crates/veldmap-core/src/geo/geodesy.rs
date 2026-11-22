@@ -18,9 +18,6 @@ pub const SEMI_MAJOR_M: f64 = 6_378_137.0;
 /// WGS84 flattening (`1 / 298.257223563`).
 pub const FLATTENING: f64 = 1.0 / 298.257_223_563;
 
-/// Square of the WGS84 first eccentricity, `e^2 = 2f - f^2`.
-const ECCENTRICITY_SQ: f64 = FLATTENING * (2.0 - FLATTENING);
-
 /// Reference ellipsoid of revolution.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Ellipsoid {
@@ -98,11 +95,18 @@ impl Ellipsoid {
         let mut s = z_abs / a;
         let mut c = ec * p_norm;
         let norm0 = s.hypot(c);
+        if norm0 <= 0.0 || !norm0.is_finite() {
+            return Geodetic {
+                lat_deg: 0.0,
+                lon_deg,
+                height_m: p - a,
+            };
+        }
         s /= norm0;
         c /= norm0;
 
-        // Two Halley iterations reach full f64 machine precision from deep
-        // underground up through 80,000 km orbital altitudes.
+        // Two Halley iterations reach full f64 machine precision from shallow
+        // underground (-500 km) through 80,000 km orbital altitudes.
         for _ in 0..2 {
             let f_num = (p_norm * s - z_norm * c) - e2 * s * c;
             let d = z_norm + e2 * s * s * s;
@@ -158,40 +162,6 @@ pub fn world(point: Geodetic) -> DVec3 {
     WGS84.to_ecef(point)
 }
 
-/// Precomputed latitude-and-height terms for evaluating multiple points along
-/// the same WGS84 parallel in ECEF metres without repeating trigonometry or
-/// square roots.
-#[derive(Clone, Copy, Debug)]
-pub struct Parallel {
-    sin_lat: f64,
-    cos_lat: f64,
-    equatorial: f64,
-    polar: f64,
-}
-
-/// Precompute ECEF conversion factors (in metres) for a single WGS84 latitude
-/// and ellipsoidal height.
-pub fn parallel(lat_deg: f64, height_m: f64) -> Parallel {
-    let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
-    let curvature = SEMI_MAJOR_M / (1.0 - ECCENTRICITY_SQ * sin_lat * sin_lat).sqrt();
-
-    Parallel {
-        sin_lat,
-        cos_lat,
-        equatorial: curvature + height_m,
-        polar: curvature * (1.0 - ECCENTRICITY_SQ) + height_m,
-    }
-}
-
-impl Parallel {
-    /// Evaluate a point on this parallel in ECEF metres given
-    /// `(sin(lon), cos(lon))`.
-    pub fn at(&self, sin_lon: f64, cos_lon: f64) -> DVec3 {
-        DVec3::new(self.cos_lat * cos_lon, self.cos_lat * sin_lon, self.sin_lat)
-            * DVec3::new(self.equatorial, self.equatorial, self.polar)
-    }
-}
-
 /// Intersect a ray `(origin, direction)` (with `origin` in ECEF metres) with
 /// the WGS84 ellipsoid raised by `height_m` metres. Exact on the WGS84
 /// ellipsoid (`height_m == 0.0`); for non-zero heights uses a proportionally
@@ -217,12 +187,6 @@ pub fn intersect_at(origin: DVec3, direction: DVec3, height_m: f64) -> Option<DV
 
     let t = (-b - discriminant.sqrt()) / (2.0 * a);
     (t > 0.0).then(|| origin + direction * t)
-}
-
-/// Convert a WGS84 ECEF point in **metres** back to 3D [`Geodetic`]
-/// `(lat_deg, lon_deg, height_m)` using Fukushima (2006).
-pub fn geodetic_at(point: DVec3) -> Geodetic {
-    WGS84.from_ecef(point)
 }
 
 /// Convert a WGS84 ECEF point in **metres** back to geodetic

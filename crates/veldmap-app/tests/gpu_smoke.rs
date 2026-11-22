@@ -1,16 +1,17 @@
 //! Headless offscreen `wgpu` smoke and accuracy tests verifying:
 //! 1. Exact 1:1 sRGB/UNORM compositing parity via `view_formats` and `0` idle
 //!    re-renders when camera/snapshot are unchanged.
-//! 2. Post-overlay procedural `fwidth()` graticule toggle and back-hemisphere
-//!    horizon discard.
+//! 2. Post-overlay procedural `fwidth()` graticule toggle, back-hemisphere
+//!    horizon discard, and zoomed-in polar meridian sharpness (`89.96° N`).
 //! 3. Dropped-encoder recovery and `0x0` viewport safety.
-//! 4. `PendingUploads` coarsest-first budgeted uploads (`>= 1` anti-starvation),
-//!    `GpuTileCache` VRAM byte-cap eviction + `GlobeRenderer` bind-group
-//!    pruning, and real NASA Blue Marble bundled basemap rendering.
+//! 4. `PendingUploads` coarsest-first budgeted uploads (`>= 1` anti-starvation,
+//!    duplicate-upload skipping), `GpuTileCache` VRAM byte-cap eviction +
+//!    automatic `Weak<GpuTile>` bind-group sweeping, and real NASA Blue Marble
+//!    bundled basemap rendering.
 //! 5. Close-up (`2 m`) between-vertices accuracy: cell-midpoint sag, sub-metre
 //!    per-tile RTC shift, coarse parent texture overzoom (`z_geom >> max_tex`),
-//!    LOD / polar-boundary seam continuity (zero cracks), and adaptive Polar
-//!    Stereographic cap rendering at `±90°`.
+//!    genuine multi-LOD seam continuity (`max_l > min_l`), `WebMercator`
+//!    `(25° N, -135° W)` rendering, and adaptive Polar Stereographic caps.
 //!
 //! Set `VELDMAP_REQUIRE_GPU_TEST=1` (enabled on Linux Lavapipe and Windows WARP
 //! CI) to fail loudly if no `Backends::PRIMARY` adapter is available.
@@ -223,6 +224,28 @@ fn render_with(
     readback_rgba8(device, queue, &composite_tex, params.width, params.height)
 }
 
+fn render_srgb(
+    renderer: &mut GlobeRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    snapshot: &DrawSnapshot,
+) -> Vec<u8> {
+    render_with(
+        renderer,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width,
+            height,
+            snapshot,
+        },
+        true,
+    )
+}
+
 fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     let idx = ((y * width + x) * 4) as usize;
     [
@@ -285,10 +308,12 @@ fn srgb_and_unorm_compositing_parity_and_zero_idle_rerender() {
     );
 
     assert_eq!(srgb_pixels.len(), unorm_pixels.len());
-    let mut max_diff = 0u8;
-    for (&a, &b) in srgb_pixels.iter().zip(unorm_pixels.iter()) {
-        max_diff = max_diff.max(a.abs_diff(b));
-    }
+    let max_diff = srgb_pixels
+        .iter()
+        .zip(unorm_pixels.iter())
+        .map(|(&a, &b)| a.abs_diff(b))
+        .max()
+        .unwrap_or(0);
     assert!(
         max_diff <= 1,
         "sRGB and UNORM composite outputs diverged by {max_diff} LSB"
@@ -297,10 +322,9 @@ fn srgb_and_unorm_compositing_parity_and_zero_idle_rerender() {
     // Corner at orbital zoom must be the exact sRGB-encoded deep-space background (#0B1320).
     let corner = pixel_at(&srgb_pixels, w, 2, 2);
     assert!(
-        is_clear_background(corner),
+        is_clear_background(corner) && corner[3] == 255,
         "unexpected orbital background corner pixel: {corner:?}"
     );
-    assert_eq!(corner[3], 255);
 
     // Center at Camera::default() (45 deg N, 60 deg E) sits on an exact 15-degree
     // procedural graticule intersection -> #A8B99B (168, 185, 155, 255).
@@ -314,7 +338,7 @@ fn srgb_and_unorm_compositing_parity_and_zero_idle_rerender() {
 }
 
 #[test]
-fn graticule_toggle_and_back_hemisphere_horizon_discard() {
+fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
     let Some((device, queue)) = shared_headless_device() else {
         return;
     };
@@ -326,31 +350,8 @@ fn graticule_toggle_and_back_hemisphere_horizon_discard() {
     let orbital_cam = Camera::default();
     let with_grid_snap = DrawSnapshot::build(orbital_cam, w, h, 1.0, true, false, 1, &cfg, None);
     let no_grid_snap = DrawSnapshot::build(orbital_cam, w, h, 1.0, false, false, 1, &cfg, None);
-
-    let _ = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &with_grid_snap,
-        },
-        true,
-    );
-    let no_grid_pixels = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &no_grid_snap,
-        },
-        true,
-    );
+    let _ = render_srgb(&mut renderer, device, queue, w, h, &with_grid_snap);
+    let no_grid_pixels = render_srgb(&mut renderer, device, queue, w, h, &no_grid_snap);
     let body_center = pixel_at(&no_grid_pixels, w, w / 2, h / 2);
     assert!(
         body_center[0] > 180 && body_center[1] > 170 && body_center[2] > 150,
@@ -358,34 +359,12 @@ fn graticule_toggle_and_back_hemisphere_horizon_discard() {
     );
 
     // At (37.5 N, 52.5 E, 14,000 km), front 15-degree graticule lines lie far
-    // from viewport center; central 11x11 patch must stay free of back-side bleed.
+    // from viewport center; central 9x9 patch must stay free of back-side bleed.
     let cam = Camera::at(37.5, 52.5, 14_000_000.0);
     let s_on = DrawSnapshot::build(cam, w, h, 1.0, true, false, 2, &cfg, None);
     let s_off = DrawSnapshot::build(cam, w, h, 1.0, false, false, 2, &cfg, None);
-    let with_grid = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &s_on,
-        },
-        true,
-    );
-    let without_grid = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &s_off,
-        },
-        true,
-    );
+    let with_grid = render_srgb(&mut renderer, device, queue, w, h, &s_on);
+    let without_grid = render_srgb(&mut renderer, device, queue, w, h, &s_off);
     let mid = w / 2;
     for y in (mid - 4)..=(mid + 4) {
         for x in (mid - 4)..=(mid + 4) {
@@ -397,6 +376,22 @@ fn graticule_toggle_and_back_hemisphere_horizon_discard() {
         }
     }
     assert_ne!(with_grid, without_grid);
+
+    // At 2 m zoom near 89.0 deg N on meridian 0.00005 deg E (an exact step
+    // multiple strictly inside a PolarCap tile), meridians are well separated
+    // on screen (`dw_lon ~ 0.15`) and must remain visibly drawn (not suppressed
+    // by a fixed-latitude polar fade).
+    let polar_cam = Camera::at(89.000_025, 0.000_05, MIN_HEIGHT_M);
+    let polar_on = DrawSnapshot::build(polar_cam, 129, 129, 1.0, true, false, 3, &cfg, None);
+    let polar_off = DrawSnapshot::build(polar_cam, 129, 129, 1.0, false, false, 3, &cfg, None);
+    let p_on = render_srgb(&mut renderer, device, queue, 129, 129, &polar_on);
+    let p_off = render_srgb(&mut renderer, device, queue, 129, 129, &polar_off);
+    let on_px = pixel_at(&p_on, 129, 64, 64);
+    let off_px = pixel_at(&p_off, 129, 64, 64);
+    assert!(
+        on_px[0].abs_diff(off_px[0]) >= 30,
+        "zoomed-in polar meridian at 89.0 N was too faint or faded: on={on_px:?}, off={off_px:?}"
+    );
 }
 
 #[test]
@@ -432,14 +427,7 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
     assert!(renderer.render_if_dirty(device, queue, &mut dropped_enc, params));
     drop(dropped_enc);
 
-    let recovered = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        params,
-        true,
-    );
+    let recovered = render_srgb(&mut renderer, device, queue, 65, 65, &snap);
     let center = pixel_at(&recovered, 65, 32, 32);
     assert!(
         center[0] > 180 && center[1] > 170 && center[2] > 150,
@@ -448,7 +436,7 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
 }
 
 #[test]
-fn gpu_tile_upload_eviction_pruning_and_bundled_basemap_rendering() {
+fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
     let Some((device, queue)) = shared_headless_device() else {
         return;
     };
@@ -457,88 +445,46 @@ fn gpu_tile_upload_eviction_pruning_and_bundled_basemap_rendering() {
         .expect("decode bundled NASA Blue Marble");
     let cfg = QuadtreeConfig::bundled_geodetic();
 
-    // Exercise PendingUploads coarsest-first ordering & >= 1 tile/frame anti-starvation
-    // alongside GpuTileCache byte-cap eviction + GlobeRenderer bind-group pruning.
     let (tx, rx) = mpsc::channel();
     let mut pending = PendingUploads::new(rx);
 
-    let root_west = bundled_tile_key(QuadTileId {
-        scheme: TileScheme::Geodetic,
-        level: 0,
-        x: 0,
-        y: 0,
-    });
-    let root_east = bundled_tile_key(QuadTileId {
-        scheme: TileScheme::Geodetic,
-        level: 0,
-        x: 1,
-        y: 0,
-    });
-    let fine_east = bundled_tile_key(QuadTileId {
+    let fine_id = QuadTileId {
         scheme: TileScheme::Geodetic,
         level: 2,
         x: 4,
         y: 1,
-    });
-    let south_cap = bundled_tile_key(QuadTileId {
+    };
+    let root_west_id = QuadTileId {
+        scheme: TileScheme::Geodetic,
+        level: 0,
+        x: 0,
+        y: 0,
+    };
+    let root_east_id = QuadTileId {
+        scheme: TileScheme::Geodetic,
+        level: 0,
+        x: 1,
+        y: 0,
+    };
+    let south_cap_id = QuadTileId {
         scheme: TileScheme::PolarCap { north: false },
         level: 0,
         x: 0,
         y: 0,
-    });
+    };
 
-    // Send finer tile BEFORE coarser root to verify coarsest-first priority.
-    tx.send((
-        fine_east,
-        basemap
-            .render_tile_sized(
-                QuadTileId {
-                    scheme: TileScheme::Geodetic,
-                    level: 2,
-                    x: 4,
-                    y: 1,
-                },
-                64,
-            )
-            .expect("render fine"),
-    ))
-    .expect("send fine");
-    for (key, id) in [
-        (
-            root_west,
-            QuadTileId {
-                scheme: TileScheme::Geodetic,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-        ),
-        (
-            root_east,
-            QuadTileId {
-                scheme: TileScheme::Geodetic,
-                level: 0,
-                x: 1,
-                y: 0,
-            },
-        ),
-        (
-            south_cap,
-            QuadTileId {
-                scheme: TileScheme::PolarCap { north: false },
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-        ),
-    ] {
-        tx.send((key, basemap.render_tile_sized(id, 64).expect("render root")))
-            .expect("send root");
+    // Send finer tile BEFORE coarser roots to verify coarsest-first priority.
+    for id in [fine_id, root_west_id, root_east_id, south_cap_id] {
+        tx.send((
+            bundled_tile_key(id),
+            basemap.render_tile_sized(id, 64).expect("render tile"),
+        ))
+        .expect("send tile");
     }
 
-    // Cap cache to exactly 3 x (64*64*4 = 16 KiB) = 48 KiB so the 4th upload triggers eviction.
+    // Cap cache to exactly 2 tiles (32 KiB) so uploading 4 tiles triggers real LRU eviction.
     let tile_bytes = 64 * 64 * 4;
-    let mut cache = GpuTileCache::new(tile_bytes * 3);
+    let mut cache = GpuTileCache::new(tile_bytes * 2);
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
 
     // Budget of 1 byte must STILL upload 1 coarsest tile (anti-starvation).
@@ -546,11 +492,28 @@ fn gpu_tile_upload_eviction_pruning_and_bundled_basemap_rendering() {
     assert_eq!(r1.uploaded, 1);
     assert_eq!(r1.remaining, 3);
     assert!(
-        !cache.contains(&fine_east),
+        !cache.contains(&bundled_tile_key(fine_id)),
         "coarsest z=0 must upload before z=2"
     );
 
-    // Upload remaining 3 tiles with ample budget -> 1 tile must be evicted so total_bytes <= cap.
+    // Render using the first uploaded tile so GlobeRenderer caches its BindGroup.
+    {
+        let snap1 = DrawSnapshot::build(
+            Camera::at(0.0, -90.0, 4_000_000.0),
+            65,
+            65,
+            1.0,
+            false,
+            true,
+            1,
+            &cfg,
+            Some(&mut cache),
+        );
+        let _ = render_srgb(&mut renderer, device, queue, 65, 65, &snap1);
+        assert_eq!(renderer.cached_tile_bind_group_count(), 1);
+    }
+
+    // Upload the remaining 3 tiles -> evicts earlier tiles from GpuTileCache.
     let r2 = pending.drain_and_upload(
         device,
         queue,
@@ -561,11 +524,51 @@ fn gpu_tile_upload_eviction_pruning_and_bundled_basemap_rendering() {
     );
     assert_eq!(r2.uploaded, 3);
     assert_eq!(r2.remaining, 0);
-    assert_eq!(r2.evicted_tile_ids.len(), 1);
+    assert!(r2.evicted >= 2);
     assert!(cache.total_bytes() <= cache.max_bytes());
 
-    // Now test full bundled NASA Blue Marble rendering across Sahara, Pacific, and Antarctica.
-    let mut full_cache = GpuTileCache::new(32 * 1024 * 1024);
+    // Re-sending an already-cached key must be skipped (0 duplicate GPU uploads).
+    let cached_id = if cache.contains(&bundled_tile_key(fine_id)) {
+        fine_id
+    } else {
+        south_cap_id
+    };
+    tx.send((
+        bundled_tile_key(cached_id),
+        basemap.render_tile_sized(cached_id, 64).expect("dup tile"),
+    ))
+    .expect("send dup");
+    let r_dup = pending.drain_and_upload(
+        device,
+        queue,
+        &mut cache,
+        None,
+        1024 * 1024,
+        Duration::from_secs(1),
+    );
+    assert_eq!(r_dup.uploaded, 0);
+
+    // Sweeping stale Weak<GpuTile> entries drops the evicted tile's BindGroup automatically.
+    renderer.sweep_stale_bind_groups();
+    assert_eq!(
+        renderer.cached_tile_bind_group_count(),
+        0,
+        "evicted tile BindGroup was not swept via Weak<GpuTile>"
+    );
+}
+
+#[test]
+fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let basemap = BundledBasemap::from_encoded_bytes(BUNDLED_BASEMAP_JPEG)
+        .expect("decode bundled NASA Blue Marble");
+    let cfg = QuadtreeConfig::bundled_geodetic();
+    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut cache = GpuTileCache::new(32 * 1024 * 1024);
+
     for id in [
         QuadTileId {
             scheme: TileScheme::Geodetic,
@@ -592,8 +595,10 @@ fn gpu_tile_upload_eviction_pruning_and_bundled_basemap_rendering() {
             y: 0,
         },
     ] {
-        let decoded = basemap.render_tile(id).expect("render bundled tile");
-        let _ = full_cache.upload_and_insert(device, queue, bundled_tile_key(id), &decoded);
+        let decoded = basemap.render_tile(id).expect("render bundled root");
+        cache
+            .upload_and_insert(device, queue, bundled_tile_key(id), &decoded)
+            .expect("upload root");
     }
 
     let (w, h) = (65, 65);
@@ -608,26 +613,18 @@ fn gpu_tile_upload_eviction_pruning_and_bundled_basemap_rendering() {
         true,
         10,
         &cfg,
-        Some(&mut full_cache),
+        Some(&mut cache),
     );
-    let sahara_px = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &sahara_snap,
-        },
-        true,
+    let s_mid = pixel_at(
+        &render_srgb(&mut renderer, device, queue, w, h, &sahara_snap),
+        w,
+        w / 2,
+        h / 2,
     );
-    let s_mid = pixel_at(&sahara_px, w, w / 2, h / 2);
     assert!(
         s_mid[0] > 140 && s_mid[0] > s_mid[2] + 35,
         "Sahara textured center did not look tan: {s_mid:?}"
     );
-    assert!(renderer.cached_tile_bind_group_count() >= 1);
 
     // 2. Central Pacific (0 N, -150 E) -> deep ocean blue (B > R + 15, R < 50).
     let pacific_snap = DrawSnapshot::build(
@@ -639,21 +636,14 @@ fn gpu_tile_upload_eviction_pruning_and_bundled_basemap_rendering() {
         true,
         11,
         &cfg,
-        Some(&mut full_cache),
+        Some(&mut cache),
     );
-    let pacific_px = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &pacific_snap,
-        },
-        true,
+    let p_mid = pixel_at(
+        &render_srgb(&mut renderer, device, queue, w, h, &pacific_snap),
+        w,
+        w / 2,
+        h / 2,
     );
-    let p_mid = pixel_at(&pacific_px, w, w / 2, h / 2);
     assert!(
         p_mid[2] > p_mid[0] + 15 && p_mid[0] < 50,
         "Pacific textured center did not look ocean blue: {p_mid:?}"
@@ -669,39 +659,22 @@ fn gpu_tile_upload_eviction_pruning_and_bundled_basemap_rendering() {
         true,
         12,
         &cfg,
-        Some(&mut full_cache),
+        Some(&mut cache),
     );
-    let south_px = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &south_snap,
-        },
-        true,
+    let sp_mid = pixel_at(
+        &render_srgb(&mut renderer, device, queue, w, h, &south_snap),
+        w,
+        w / 2,
+        h / 2,
     );
-    let sp_mid = pixel_at(&south_px, w, w / 2, h / 2);
     assert!(
         sp_mid[0] > 180 && sp_mid[1] > 180 && sp_mid[2] > 180,
         "Antarctica PolarCap center did not render bright white: {sp_mid:?}"
     );
-
-    // Verify eviction bind-group pruning removes evicted tile IDs cleanly.
-    let before_bg = renderer.cached_tile_bind_group_count();
-    let evicted_ids: Vec<u64> = south_snap
-        .tiles
-        .iter()
-        .filter_map(|t| t.texture.as_ref().map(|g| g.tile_id))
-        .collect();
-    renderer.prune_evicted_tiles(&evicted_ids);
-    assert!(renderer.cached_tile_bind_group_count() < before_bg);
 }
 
 #[test]
-fn close_up_2m_between_vertices_sag_lod_seam_overzoom_and_polar_cap() {
+fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
     let Some((device, queue)) = shared_headless_device() else {
         return;
     };
@@ -710,9 +683,7 @@ fn close_up_2m_between_vertices_sag_lod_seam_overzoom_and_polar_cap() {
     let cfg = QuadtreeConfig::bundled_geodetic();
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
 
-    // 1. Midpoint between-vertices sag & sub-metre per-tile RTC shift at 2 m.
-    //    `(45.00073 N, 45.00073 E)` sits strictly between tile mesh vertices;
-    //    no pixel may clip against near = 1 m or show deep-space background.
+    // 1. Midpoint between-vertices sag clearance at 2 m altitude.
     let between_cam = Camera::at(45.000_73, 45.000_73, MIN_HEIGHT_M);
     let between_snap = DrawSnapshot::build(between_cam, w, h, 1.0, false, false, 1, &cfg, None);
     let max_level = between_snap
@@ -727,18 +698,7 @@ fn close_up_2m_between_vertices_sag_lod_seam_overzoom_and_polar_cap() {
         cfg.max_tex_level
     );
 
-    let between_px = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &between_snap,
-        },
-        true,
-    );
+    let between_px = render_srgb(&mut renderer, device, queue, w, h, &between_snap);
     for y in 0..h {
         for x in 0..w {
             let px = pixel_at(&between_px, w, x, y);
@@ -749,54 +709,47 @@ fn close_up_2m_between_vertices_sag_lod_seam_overzoom_and_polar_cap() {
         }
     }
 
-    // Sub-metre RTC shift at 2 m altitude: 0.25 m east of (45 N, 45 E) (< 1 ULP
-    // of global f32 ECEF) must shift the procedural `fwidth()` graticule off center.
-    let on_grid_cam = Camera::at(45.0, 45.0, MIN_HEIGHT_M);
+    // 2. Sub-metre RTC + graticule phase shift at 2 m (0.25 m < 1 ULP of global f32 ECEF).
     let dlon_25cm = 0.25 / (111_320.0 * 45.0_f64.to_radians().cos());
-    let shifted_cam = Camera::at(45.0, 45.0 + dlon_25cm, MIN_HEIGHT_M);
-    let s0 = DrawSnapshot::build(on_grid_cam, w, h, 1.0, true, false, 2, &cfg, None);
-    let s1 = DrawSnapshot::build(shifted_cam, w, h, 1.0, true, false, 3, &cfg, None);
-    let p0 = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &s0,
-        },
+    let s0 = DrawSnapshot::build(
+        Camera::at(45.0, 45.0, MIN_HEIGHT_M),
+        w,
+        h,
+        1.0,
         true,
+        false,
+        2,
+        &cfg,
+        None,
     );
-    let p1 = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &s1,
-        },
+    let s1 = DrawSnapshot::build(
+        Camera::at(45.0, 45.0 + dlon_25cm, MIN_HEIGHT_M),
+        w,
+        h,
+        1.0,
         true,
+        false,
+        3,
+        &cfg,
+        None,
     );
     assert_ne!(
-        p0, p1,
-        "0.25 m shift at 2 m altitude collapsed (per-tile RTC / graticule phase lost precision)"
+        render_srgb(&mut renderer, device, queue, w, h, &s0),
+        render_srgb(&mut renderer, device, queue, w, h, &s1),
+        "0.25 m shift at 2 m altitude collapsed"
     );
 
-    // 2. Coarse parent texture overzoom at 2 m altitude:
-    //    Upload ONLY coarse z = 0 Geodetic root tiles painted in distinct
-    //    quadrants (NE = bright red, SE = bright green, NW = bright blue, SW = yellow)
-    //    so overzooming z_geom >= 13 at (45 N, 45 E) samples strictly the NE quadrant (red)
-    //    via sub-rect UVs with ZERO requests above max_tex_level.
+    // 3. Coarse parent texture overzoom at 2 m altitude:
+    //    East root (x=1, y=0) painted in distinct quadrants:
+    //    NW (0..90 E, 0..90 N) = red, NE (90..180 E, 0..90 N) = green,
+    //    SW (0..90 E, -90..0 S) = blue, SE (90..180 E, -90..0 S) = yellow.
     let mut quad_data = vec![0u8; 64 * 64 * 4];
     for py in 0..64u32 {
         for px in 0..64u32 {
             let color = match (px < 32, py < 32) {
-                (true, true) => [220, 40, 40, 255], // Top-left (0..90 E, 0..90 N) -> RED
-                (false, true) => [40, 210, 40, 255], // Top-right (90..180 E, 0..90 N) -> GREEN
-                (true, false) => [40, 80, 220, 255], // Bottom-left (0..90 E, -90..0 S) -> BLUE
+                (true, true) => [220, 40, 40, 255],
+                (false, true) => [40, 210, 40, 255],
+                (true, false) => [40, 80, 220, 255],
                 (false, false) => [220, 200, 40, 255],
             };
             let off = ((py * 64 + px) * 4) as usize;
@@ -816,9 +769,11 @@ fn close_up_2m_between_vertices_sag_lod_seam_overzoom_and_polar_cap() {
         x: 1,
         y: 0,
     });
-    let _ = overzoom_cache.upload_and_insert(device, queue, east_root, &synthetic_east);
+    overzoom_cache
+        .upload_and_insert(device, queue, east_root, &synthetic_east)
+        .expect("upload synthetic root");
 
-    // (45 N, 45 E) lies at the exact center of the top-left quadrant (RED) of east root (x=1, y=0).
+    // (45 N, 45 E) sits at the center of the NW quadrant (RED) of east root (x=1, y=0).
     let overzoom_snap = DrawSnapshot::build(
         Camera::at(45.0, 45.0, MIN_HEIGHT_M),
         w,
@@ -830,33 +785,62 @@ fn close_up_2m_between_vertices_sag_lod_seam_overzoom_and_polar_cap() {
         &cfg,
         Some(&mut overzoom_cache),
     );
-    let overzoom_px = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &overzoom_snap,
-        },
-        true,
-    );
+    let overzoom_px = render_srgb(&mut renderer, device, queue, w, h, &overzoom_snap);
     for y in 0..h {
         for x in 0..w {
             let px = pixel_at(&overzoom_px, w, x, y);
             assert!(
                 px[0] > 200 && px[1] < 60 && px[2] < 60,
-                "coarse parent overzoom pixel ({x},{y}) did not sample expected red sub-rect: {px:?}"
+                "coarse parent overzoom pixel ({x},{y}) did not sample red sub-rect: {px:?}"
             );
         }
     }
 
-    // 3. Multi-LOD seam continuity (mid-altitude multi-level transition, polar
-    //    boundary seam at +85.05112878 deg, and adaptive Polar Cap at ±90 deg):
-    //    ZERO background pixels may leak through any LOD seam or pole sliver!
-    let multi_lod_cam = Camera::at(45.0, 39.0, 250_000.0);
-    let multi_lod_snap = DrawSnapshot::build(multi_lod_cam, w, h, 1.0, true, false, 5, &cfg, None);
+    // 4. PolarCap close-up (2 m) procedural graticule precision at (86 N, 0 E).
+    let dlat_25cm = 0.25 / 111_320.0;
+    let pc_on = DrawSnapshot::build(
+        Camera::at(86.0, 0.0, MIN_HEIGHT_M),
+        w,
+        h,
+        1.0,
+        true,
+        false,
+        6,
+        &cfg,
+        None,
+    );
+    let pc_shifted = DrawSnapshot::build(
+        Camera::at(86.0 + dlat_25cm, 0.0, MIN_HEIGHT_M),
+        w,
+        h,
+        1.0,
+        true,
+        false,
+        7,
+        &cfg,
+        None,
+    );
+    assert_ne!(
+        render_srgb(&mut renderer, device, queue, w, h, &pc_on),
+        render_srgb(&mut renderer, device, queue, w, h, &pc_shifted),
+        "0.25 m shift on PolarCap at (86 N, 2 m) collapsed"
+    );
+}
+
+#[test]
+fn multi_lod_polar_seam_and_web_mercator_continuity() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let cfg = QuadtreeConfig::bundled_geodetic();
+    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+    // 1. Genuine multi-LOD transition: assert `max_l > min_l` strictly and zero cracks.
+    let (mw, mh) = (193, 193);
+    let multi_lod_cam = Camera::at(45.0, 39.0, 3_500_000.0);
+    let multi_lod_snap =
+        DrawSnapshot::build(multi_lod_cam, mw, mh, 1.0, true, false, 1, &cfg, None);
     let min_l = multi_lod_snap
         .tiles
         .iter()
@@ -870,58 +854,56 @@ fn close_up_2m_between_vertices_sag_lod_seam_overzoom_and_polar_cap() {
         .max()
         .unwrap_or(0);
     assert!(
-        max_l >= min_l,
-        "expected valid LOD range in mid-altitude view"
+        max_l > min_l,
+        "expected a genuine multi-LOD transition, got min_l={min_l}, max_l={max_l}"
     );
-    let multi_lod_px = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &multi_lod_snap,
-        },
-        true,
-    );
-    for y in 0..h {
-        for x in 0..w {
-            let px = pixel_at(&multi_lod_px, w, x, y);
+    let multi_lod_px = render_srgb(&mut renderer, device, queue, mw, mh, &multi_lod_snap);
+    for y in 0..mh {
+        for x in 0..mw {
+            let px = pixel_at(&multi_lod_px, mw, x, y);
             assert!(
                 !is_clear_background(px),
-                "mid-altitude multi-LOD seam leaked background at ({x},{y}): {px:?}"
+                "multi-LOD seam leaked background at ({x},{y}): {px:?}"
             );
         }
     }
 
-    for (label, cam) in [
+    // 2. Polar boundary seam, exact North Pole, near South Pole, and WebMercator (25 N, -135 W).
+    let (w, h) = (65, 65);
+    let merc_cfg = QuadtreeConfig::web_mercator(10);
+    for (label, cam, active_cfg) in [
         (
-            "polar boundary seam at 50 m",
+            "Geodetic polar boundary seam at 50 m",
             Camera::at(WEB_MERCATOR_LIMIT_DEG, 15.0, 50.0),
+            &cfg,
+        ),
+        (
+            "WebMercator(10) polar seam at 5 km",
+            Camera::at(WEB_MERCATOR_LIMIT_DEG, 15.0, 5_000.0),
+            &merc_cfg,
+        ),
+        (
+            "WebMercator(10) mid-latitude (25 N, -135 W) at 2 m",
+            Camera::at(25.0, -135.0, MIN_HEIGHT_M),
+            &merc_cfg,
         ),
         (
             "exact North Pole at 2 m",
             Camera::at(90.0, 0.0, MIN_HEIGHT_M),
+            &cfg,
         ),
         (
             "near South Pole at 2 m",
             Camera::at(-89.995, 135.0, MIN_HEIGHT_M),
+            &cfg,
         ),
     ] {
-        let seam_snap = DrawSnapshot::build(cam, w, h, 1.0, true, false, 5, &cfg, None);
-        let seam_px = render_with(
-            &mut renderer,
-            device,
-            queue,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            RenderParams {
-                width: w,
-                height: h,
-                snapshot: &seam_snap,
-            },
-            true,
+        let seam_snap = DrawSnapshot::build(cam, w, h, 1.0, true, false, 5, active_cfg, None);
+        assert!(
+            !seam_snap.tiles.is_empty(),
+            "{label}: quadtree produced 0 tiles"
         );
+        let seam_px = render_srgb(&mut renderer, device, queue, w, h, &seam_snap);
         for y in 0..h {
             for x in 0..w {
                 let px = pixel_at(&seam_px, w, x, y);
@@ -932,59 +914,4 @@ fn close_up_2m_between_vertices_sag_lod_seam_overzoom_and_polar_cap() {
             }
         }
     }
-
-    // 4. PolarCap close-up (2 m) procedural graticule precision: shifting 0.25 m
-    //    north of (86.0 N, 0.0 E) on a fine PolarCap tile must visibly shift the
-    //    86.0 N parallel line (no f32 colat/lon cancellation collapse).
-    let pc_on = DrawSnapshot::build(
-        Camera::at(86.0, 0.0, MIN_HEIGHT_M),
-        w,
-        h,
-        1.0,
-        true,
-        false,
-        6,
-        &cfg,
-        None,
-    );
-    let dlat_25cm = 0.25 / 111_320.0;
-    let pc_shifted = DrawSnapshot::build(
-        Camera::at(86.0 + dlat_25cm, 0.0, MIN_HEIGHT_M),
-        w,
-        h,
-        1.0,
-        true,
-        false,
-        7,
-        &cfg,
-        None,
-    );
-    let pc_px0 = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &pc_on,
-        },
-        true,
-    );
-    let pc_px1 = render_with(
-        &mut renderer,
-        device,
-        queue,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        RenderParams {
-            width: w,
-            height: h,
-            snapshot: &pc_shifted,
-        },
-        true,
-    );
-    assert_ne!(
-        pc_px0, pc_px1,
-        "0.25 m shift on PolarCap at (86 N, 2 m) collapsed (PolarCap graticule lost precision)"
-    );
 }

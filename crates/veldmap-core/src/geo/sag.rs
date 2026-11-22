@@ -24,12 +24,6 @@ pub fn max_chord_deg(tolerance_m: f64) -> f64 {
     4.0 * half_sag.sqrt().asin().to_degrees()
 }
 
-/// Maximum quad side in degrees whose triangle diagonal stays within
-/// `tolerance_m` metres of sagitta (`max_chord_deg / sqrt(2)`).
-pub fn max_quad_side_deg(tolerance_m: f64) -> f64 {
-    max_chord_deg(tolerance_m) / std::f64::consts::SQRT_2
-}
-
 /// Shared maximum angular step along densified outline and footprint edges
 /// (half the sagitta limit chord so radial fill diagonals stay tight to the
 /// ellipsoid and footprint hit-testing matches drawn outlines).

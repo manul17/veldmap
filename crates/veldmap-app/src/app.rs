@@ -38,7 +38,7 @@ fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
 /// Active planetary basemap display mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BasemapMode {
-    /// Bundled offline satellite basemap (`z = 0..3` Geodetic + `z = 0..1` PolarCap).
+    /// Bundled offline satellite basemap (`z = 0..3` Geodetic + `z = 0` PolarCap).
     Satellite,
     /// Untextured WGS84 ellipsoid rendered through the exact same quadtree.
     EllipsoidOnly,
@@ -81,13 +81,11 @@ impl SnapshotKey {
     }
 }
 
-/// `egui_wgpu` paint callback bridging an immutable `Arc<DrawSnapshot>` and
-/// any pending `GpuTile` bind-group evictions into the offscreen
-/// [`GlobeRenderer`].
+/// `egui_wgpu` paint callback bridging an immutable `Arc<DrawSnapshot>` into
+/// the offscreen [`GlobeRenderer`].
 struct GlobePaintCallback {
     rect: egui::Rect,
     snapshot: Arc<DrawSnapshot>,
-    evicted_tile_ids: Vec<u64>,
 }
 
 impl CallbackTrait for GlobePaintCallback {
@@ -102,11 +100,9 @@ impl CallbackTrait for GlobePaintCallback {
         let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() else {
             return Vec::new();
         };
-        // Always prune evicted tile bind groups even if the viewport is
-        // minimized (`0x0`), so GPU textures never leak across minimized frames.
-        if !self.evicted_tile_ids.is_empty() {
-            renderer.prune_evicted_tiles(&self.evicted_tile_ids);
-        }
+        // Sweep any cached BindGroups whose `Weak<GpuTile>` dropped to 0 even
+        // when the viewport is minimized (`0x0`).
+        renderer.sweep_stale_bind_groups();
 
         let vp = egui::epaint::ViewportInPixels::from_points(
             &self.rect,
@@ -160,7 +156,6 @@ pub struct VeldmapApp {
     pending_uploads: PendingUploads,
     basemap_provider: BundledBasemapProvider,
     wanted_tiles: HashSet<TileKey>,
-    pending_evictions: Vec<u64>,
     cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
     scene_generation: u64,
     cursor_geo: Option<(f64, f64)>,
@@ -223,7 +218,6 @@ impl VeldmapApp {
             pending_uploads,
             basemap_provider,
             wanted_tiles: HashSet::new(),
-            pending_evictions: Vec::new(),
             cached_snapshot: None,
             scene_generation: 1,
             cursor_geo: None,
@@ -334,18 +328,25 @@ impl VeldmapApp {
                 if self.wanted_tiles.insert(tex_key) {
                     if self.gpu_tile_cache.contains(&tex_key) {
                         already_cached_wanted += 1;
-                    } else {
+                    } else if !self.basemap_provider.is_in_flight(&tex_key) {
                         missing.push(tex_key);
                     }
                 }
             }
-            // Request coarsest tiles first while keeping visible + in-flight
-            // strictly within the <50% VRAM appetite cap.
-            let remaining_budget = appetite_cap.saturating_sub(already_cached_wanted);
-            missing.sort_by_key(|k| (k.scheme.coarseness_rank(k.level), k.y, k.x));
+            // Cancel stale queued requests first, then request coarsest missing
+            // tiles while keeping visible + in-flight + queued strictly within
+            // the < 50% VRAM appetite cap.
+            self.basemap_provider
+                .reconcile(&self.gpu_tile_cache, &self.wanted_tiles);
+            let committed = already_cached_wanted
+                .saturating_add(self.basemap_provider.in_flight_count())
+                .saturating_add(self.pending_uploads.len());
+            let remaining_budget = appetite_cap.saturating_sub(committed);
+            missing.sort_by_key(|k| (k.scheme.coarseness_rank(k.level), k.scheme, k.y, k.x));
             for tex_key in missing.into_iter().take(remaining_budget) {
                 self.basemap_provider.request(tex_key);
             }
+        } else {
             self.basemap_provider
                 .reconcile(&self.gpu_tile_cache, &self.wanted_tiles);
         }
@@ -361,19 +362,19 @@ impl eframe::App for VeldmapApp {
 
         // Drain background tile completions and upload coarsest-first within
         // the per-frame VRAM/time budget before building this frame's snapshot.
-        let wanted_filter = (!self.wanted_tiles.is_empty()).then_some(&self.wanted_tiles);
+        // Passing `Some(&self.wanted_tiles)` keeps `level == 0` planetary roots
+        // warm on startup while pruning stale non-root tiles (including in
+        // `EllipsoidOnly` mode).
         let upload_report = self.pending_uploads.drain_and_upload(
             &self.device,
             &self.queue,
             &mut self.gpu_tile_cache,
-            wanted_filter,
+            Some(&self.wanted_tiles),
             DEFAULT_UPLOAD_BYTE_BUDGET,
             DEFAULT_UPLOAD_TIME_BUDGET,
         );
         if upload_report.uploaded > 0 {
             self.scene_generation = self.scene_generation.wrapping_add(1);
-            self.pending_evictions
-                .extend(upload_report.evicted_tile_ids);
             self.basemap_provider
                 .reconcile(&self.gpu_tile_cache, &self.wanted_tiles);
         }
@@ -390,9 +391,6 @@ impl eframe::App for VeldmapApp {
         if reset_north_key {
             self.camera.reset_north();
         }
-
-        let mode_before = self.basemap_mode;
-        let graticule_before = self.show_graticule;
 
         // Top toolbar: title, Go-To DD/DMS/MGRS input, Satellite/Ellipsoid
         // switcher, graticule toggle, and GPU badge.
@@ -448,10 +446,6 @@ impl eframe::App for VeldmapApp {
                 });
             });
         });
-
-        if self.basemap_mode != mode_before {
-            self.scene_generation = self.scene_generation.wrapping_add(1);
-        }
 
         // Probe the current pointer against the previous frame's viewport rect
         // before laying out the bottom status bar so hover readouts stay in
@@ -543,16 +537,11 @@ impl eframe::App for VeldmapApp {
 
                     let snapshot =
                         self.snapshot_for_frame(width_px, height_px, ctx.pixels_per_point());
-                    let evicted_tile_ids = std::mem::take(&mut self.pending_evictions);
 
                     // Register offscreen globe + 1:1 nearest composite paint callback.
                     painter.add(egui_wgpu::Callback::new_paint_callback(
                         rect,
-                        GlobePaintCallback {
-                            rect,
-                            snapshot,
-                            evicted_tile_ids,
-                        },
+                        GlobePaintCallback { rect, snapshot },
                     ));
 
                     // Floating dynamic metric scale bar.
@@ -571,15 +560,12 @@ impl eframe::App for VeldmapApp {
             }
         }
 
-        // Request a follow-up repaint only for active flights, camera/mode/UI
-        // changes, viewport resizes, or non-empty upload backlog (never idle).
+        // Request a follow-up repaint only for active flights, camera changes,
+        // viewport resizes, or non-empty upload backlog (never idle).
         if self.camera.is_flying()
             || self.camera != camera_before
             || self.last_viewport_rect != rect_before
-            || self.basemap_mode != mode_before
-            || self.show_graticule != graticule_before
             || upload_report.remaining > 0
-            || !self.pending_uploads.is_empty()
         {
             ctx.request_repaint();
         }

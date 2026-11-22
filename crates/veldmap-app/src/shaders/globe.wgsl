@@ -112,52 +112,66 @@ fn draped_line_alpha(facing: f32) -> f32 {
 fn fs_grid(in: VsOut) -> @location(0) vec4<f32> {
     let step = max(camera.grid_step_deg, 1e-6);
 
-    // 1. LatLon tile coordinates: CPU f64-wrapped phase + f32 tile-relative delta.
-    let ll_lon = (tile.grid_anchor.x + in.grid_rel.x) / step;
-    let ll_lat = (tile.grid_anchor.y + in.grid_rel.y) / step;
+    var lat_cycles: f32;
+    var lon_a: f32;
+    var dw_lat: f32;
+    var dw_lon: f32;
+    var pole_guard: f32 = 1.0;
 
-    // 2. PolarCap tile coordinates: cancellation-free deltas relative to tile
-    //    center `a = tile.grid_anchor.xy` + CPU f64-wrapped phase in `zw`.
-    let a = tile.grid_anchor.xy;
-    let d = in.grid_rel.xy;
-    let ps = a + d;
-    let rho = length(ps);
-    let rho0 = length(a);
-    let r_cap = camera.polar_r_cap;
-    let drho = (2.0 * dot(a, d) + dot(d, d)) / max(rho + rho0, 1e-12);
-    let d_colat_deg = degrees(2.0 * atan((drho * r_cap) / (1.0 + rho * rho0 * r_cap * r_cap)));
-    let pc_lat = (tile.grid_anchor.z + d_colat_deg) / step;
+    // `tile.tile_kind` is a uniform, so branching on `!= 0.0` is dynamically
+    // uniform in WGSL / `naga`: non-polar tiles skip all PolarCap trig while
+    // every `fwidth()` still executes strictly before any horizon `discard`.
+    if tile.tile_kind != 0.0 {
+        let a = tile.grid_anchor.xy;
+        let d = in.grid_rel.xy;
+        let ps = a + d;
+        let rho = length(ps);
+        let rho0 = length(a);
+        let r_cap = camera.polar_r_cap;
+        let drho = (2.0 * dot(a, d) + dot(d, d)) / max(rho + rho0, 1e-12);
+        let d_colat_deg = degrees(2.0 * atan((drho * r_cap) / (1.0 + rho * rho0 * r_cap * r_cap)));
+        lat_cycles = (tile.grid_anchor.z + d_colat_deg) / step;
 
-    // Guard `atan2(0, 0)` at exact poles to prevent NaN propagation on DX12/HLSL.
-    let is_north_cap = tile.tile_kind > 0.0;
-    let sy = select(ps.y, -ps.y, is_north_cap);
-    let safe_x = select(ps.x, 1.0, rho < 1e-12);
-    let safe_sy = select(sy, 0.0, rho < 1e-12);
-    let pc_abs_lon_a = degrees(atan2(safe_sy, safe_x)) / step;
-    let pc_abs_lon_b = degrees(atan2(-safe_sy, -safe_x)) / step;
-
-    // Signed longitude delta from `a` to `a + d` for PolarCap tiles strictly
-    // clear of the pole (`abs(tile_kind) > 1.5`), avoiding f32 ULP collapse at 2 m.
-    let a_sy = select(a.y, -a.y, is_north_cap);
-    let d_sy = select(d.y, -d.y, is_north_cap);
-    let rel_num = a.x * d_sy - a_sy * d.x;
-    let rel_den = max(dot(a, a) + dot(a, d), 1e-12);
-    let d_lon_deg = degrees(atan2(rel_num, rel_den));
-    let pc_rel_lon = (tile.grid_anchor.w + d_lon_deg) / step;
-
-    let use_pc_rel_lon = abs(tile.tile_kind) > 1.5;
-    let pc_lon_a = select(pc_abs_lon_a, pc_rel_lon, use_pc_rel_lon);
-    let pc_lon_b = select(pc_abs_lon_b, pc_rel_lon, use_pc_rel_lon);
-
-    let is_polar = tile.tile_kind != 0.0;
-    let lat_cycles = select(ll_lat, pc_lat, is_polar);
-    let lon_a = select(ll_lon, pc_lon_a, is_polar);
-    let lon_b = select(ll_lon, pc_lon_b, is_polar);
-
-    // Compute ALL derivatives unconditionally in uniform control flow BEFORE
-    // any horizon discard so `naga` validation succeeds across SPV/HLSL/MSL.
-    let dw_lat = fwidth(lat_cycles);
-    let dw_lon = min(fwidth(lon_a), fwidth(lon_b));
+        let is_north_cap = tile.tile_kind > 0.0;
+        if abs(tile.tile_kind) > 1.5 {
+            // Cancellation-free relative longitude delta for PolarCap tiles
+            // strictly clear of the pole (preserves sub-metre precision at 2 m).
+            let a_sy = select(a.y, -a.y, is_north_cap);
+            let d_sy = select(d.y, -d.y, is_north_cap);
+            let rel_num = a.x * d_sy - a_sy * d.x;
+            let rel_den = max(dot(a, a) + dot(a, d), 1e-12);
+            // Small-angle Taylor series avoids driver-dependent `atan2`
+            // polynomial error (~5e-7 rad) shifting fine 2 m polar meridians.
+            let t = rel_num / rel_den;
+            let t2 = t * t;
+            let d_lon_rad = select(
+                atan2(rel_num, rel_den),
+                t * (1.0 - t2 * (0.33333334 - t2 * (0.2 - t2 * 0.14285715))),
+                abs(t) <= 0.15,
+            );
+            let d_lon_deg = degrees(d_lon_rad);
+            lon_a = (tile.grid_anchor.w + d_lon_deg) / step;
+            dw_lon = fwidth(lon_a);
+        } else {
+            // Guard `atan2(0, 0)` at exact poles to prevent NaN propagation on DX12/HLSL.
+            let sy = select(ps.y, -ps.y, is_north_cap);
+            let safe_x = select(ps.x, 1.0, rho < 1e-12);
+            let safe_sy = select(sy, 0.0, rho < 1e-12);
+            lon_a = degrees(atan2(safe_sy, safe_x)) / step;
+            let lon_b = degrees(atan2(-safe_sy, -safe_x)) / step;
+            dw_lon = min(fwidth(lon_a), fwidth(lon_b));
+        }
+        dw_lat = fwidth(lat_cycles);
+        // Suppress only the millimetre-scale singularity at the exact pole (`rho ~ 0`),
+        // letting `density_fade` control meridian crowding dynamically at every zoom.
+        pole_guard = smoothstep(1e-8, 5e-8, rho);
+    } else {
+        // LatLon tile coordinates: CPU f64-wrapped phase + f32 tile-relative delta.
+        lon_a = (tile.grid_anchor.x + in.grid_rel.x) / step;
+        lat_cycles = (tile.grid_anchor.y + in.grid_rel.y) / step;
+        dw_lat = fwidth(lat_cycles);
+        dw_lon = fwidth(lon_a);
+    }
 
     let facing = horizon_facing(in);
     if facing <= 0.0 {
@@ -171,18 +185,11 @@ fn fs_grid(in: VsOut) -> @location(0) vec4<f32> {
     let line_lat = 1.0 - smoothstep(half_w - 0.5, half_w + 0.5, dist_lat);
     let line_lon_raw = 1.0 - smoothstep(half_w - 0.5, half_w + 0.5, dist_lon);
 
-    // Smooth polar meridian fade (`edge0 < edge1` strictly per WGSL/Metal/HLSL spec):
-    // cleanly suppresses meridian convergence and moire near ±90 deg while
-    // keeping fine zoomed-in meridians sharp.
-    let colat_deg = degrees(2.0 * atan(rho * r_cap));
-    let abs_lat = select(
-        abs(tile.grid_anchor.z + in.grid_rel.y),
-        90.0 - colat_deg,
-        is_polar,
-    );
-    let pole_fade = 1.0 - smoothstep(86.0, 89.95, abs_lat);
+    // Smooth screen-space meridian density fade (`edge0 < edge1` strictly per
+    // WGSL/Metal/HLSL spec): suppresses convergence moire near ±90 deg while
+    // keeping fine zoomed-in polar meridians sharp down to 2 m altitude.
     let density_fade = 1.0 - smoothstep(0.12, 0.45, dw_lon);
-    let line_lon = line_lon_raw * pole_fade * density_fade;
+    let line_lon = line_lon_raw * pole_guard * density_fade;
 
     let line = max(line_lat, line_lon);
     let alpha = line * draped_line_alpha(facing);

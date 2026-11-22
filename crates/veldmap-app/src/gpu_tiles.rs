@@ -7,9 +7,8 @@
 //! `tile_id: u64` — never pipeline-specific `BindGroup`s or `view_formats`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -94,7 +93,7 @@ pub fn texture_byte_size(
 /// `VeldmapApp`.
 pub struct GpuTileCache {
     cache: TileCache<TileKey, Arc<GpuTile>>,
-    next_tile_id: AtomicU64,
+    next_tile_id: u64,
 }
 
 impl GpuTileCache {
@@ -102,7 +101,7 @@ impl GpuTileCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             cache: TileCache::new(max_bytes),
-            next_tile_id: AtomicU64::new(1),
+            next_tile_id: 1,
         }
     }
 
@@ -139,17 +138,56 @@ impl GpuTileCache {
         Some((carrier_key, uv, Arc::clone(tile)))
     }
 
-    /// Upload a CPU-decoded tile into GPU memory, insert it into the LRU cache,
-    /// and return `(tile, evicted_tile_ids)` so the renderer can prune stale
-    /// `BindGroup` entries for evicted tiles.
+    /// Validate and upload a CPU-decoded tile into GPU memory and insert it
+    /// into the LRU cache. Returns `Some((tile, evicted_count))` on success,
+    /// or `None` if dimensions, buffer size, or cache budget cannot admit it.
     pub fn upload_and_insert(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: TileKey,
         decoded: &DecodedTile,
-    ) -> (Arc<GpuTile>, Vec<u64>) {
+    ) -> Option<(Arc<GpuTile>, usize)> {
+        let max_dim = device.limits().max_texture_dimension_2d;
+        if decoded.width == 0
+            || decoded.height == 0
+            || decoded.width > max_dim
+            || decoded.height > max_dim
+        {
+            tracing::warn!(
+                ?key,
+                width = decoded.width,
+                height = decoded.height,
+                max_dim,
+                "Skipping decoded tile with invalid or oversized GPU dimensions"
+            );
+            return None;
+        }
+        let bpp = decoded.format.bytes_per_pixel();
+        let expected_len = (decoded.width as usize)
+            .checked_mul(decoded.height as usize)
+            .and_then(|px| px.checked_mul(bpp))?;
+        if decoded.data.len() != expected_len {
+            tracing::warn!(
+                ?key,
+                actual = decoded.data.len(),
+                expected = expected_len,
+                "Skipping decoded tile with mismatched pixel buffer length"
+            );
+            return None;
+        }
+
         let mip_level_count = 1u32;
+        let byte_size = texture_byte_size(
+            decoded.width,
+            decoded.height,
+            decoded.format,
+            mip_level_count,
+        );
+        if self.cache.max_bytes() == 0 || byte_size > self.cache.max_bytes() {
+            return None;
+        }
+
         let size = wgpu::Extent3d {
             width: decoded.width,
             height: decoded.height,
@@ -166,7 +204,6 @@ impl GpuTileCache {
             view_formats: &[],
         });
 
-        let bpp = decoded.format.bytes_per_pixel() as u32;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -177,20 +214,15 @@ impl GpuTileCache {
             &decoded.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(decoded.width * bpp),
+                bytes_per_row: Some(decoded.width * (bpp as u32)),
                 rows_per_image: Some(decoded.height),
             },
             size,
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let byte_size = texture_byte_size(
-            decoded.width,
-            decoded.height,
-            decoded.format,
-            mip_level_count,
-        );
-        let tile_id = self.next_tile_id.fetch_add(1, Ordering::Relaxed);
+        let tile_id = self.next_tile_id;
+        self.next_tile_id = self.next_tile_id.wrapping_add(1);
         let tile = Arc::new(GpuTile {
             texture,
             view,
@@ -201,21 +233,18 @@ impl GpuTileCache {
             tile_id,
         });
 
-        let evicted_ids = self
-            .cache
-            .insert(key, Arc::clone(&tile), byte_size)
-            .into_iter()
-            .map(|(_, evicted)| evicted.tile_id)
-            .collect();
-        (tile, evicted_ids)
+        match self.cache.insert(key, Arc::clone(&tile), byte_size) {
+            Ok(evicted) => Some((tile, evicted.len())),
+            Err(_) => None,
+        }
     }
 }
 
 /// Summary of one frame's [`PendingUploads::drain_and_upload`] pass.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct UploadBatchReport {
     pub uploaded: usize,
-    pub evicted_tile_ids: Vec<u64>,
+    pub evicted: usize,
     pub remaining: usize,
 }
 
@@ -262,26 +291,32 @@ impl PendingUploads {
             self.queued.insert(key, decoded);
         }
 
-        // 2. Prune tiles no longer wanted (retaining `level == 0` roots for
-        //    planetary schemes so coarse fallback imagery stays warm).
-        if let Some(wanted_set) = wanted {
-            self.queued.retain(|key, _| {
-                wanted_set.contains(key) || (key.scheme.is_coarsest_zero() && key.level == 0)
-            });
-        }
+        // 2. Prune tiles already cached or no longer wanted (retaining
+        //    `level == 0` planetary roots so coarse fallback imagery stays warm).
+        self.queued.retain(|key, _| {
+            if cache.contains(key) {
+                return false;
+            }
+            match wanted {
+                Some(wanted_set) => {
+                    wanted_set.contains(key) || (key.scheme.is_coarsest_zero() && key.level == 0)
+                }
+                None => true,
+            }
+        });
 
         if self.queued.is_empty() {
             return UploadBatchReport::default();
         }
 
-        // 3. Order remaining tiles coarsest-first (`coarseness_rank` ascending).
+        // 3. Order remaining tiles deterministically coarsest-first.
         let mut order: Vec<TileKey> = self.queued.keys().copied().collect();
-        order.sort_by_key(|k| (k.scheme.coarseness_rank(k.level), k.y, k.x));
+        order.sort_by_key(|k| (k.scheme.coarseness_rank(k.level), k.scheme, k.y, k.x));
 
         let start = Instant::now();
         let mut uploaded = 0usize;
+        let mut evicted = 0usize;
         let mut bytes_uploaded = 0usize;
-        let mut evicted_tile_ids = Vec::new();
 
         for key in order {
             // Anti-starvation: always upload at least 1 tile per frame.
@@ -291,15 +326,19 @@ impl PendingUploads {
             let Some(decoded) = self.queued.remove(&key) else {
                 continue;
             };
+            if cache.contains(&key) {
+                continue;
+            }
             bytes_uploaded = bytes_uploaded.saturating_add(decoded.byte_size());
-            let (_, evicted) = cache.upload_and_insert(device, queue, key, &decoded);
-            evicted_tile_ids.extend(evicted);
-            uploaded += 1;
+            if let Some((_, ev_count)) = cache.upload_and_insert(device, queue, key, &decoded) {
+                evicted = evicted.saturating_add(ev_count);
+                uploaded += 1;
+            }
         }
 
         UploadBatchReport {
             uploaded,
-            evicted_tile_ids,
+            evicted,
             remaining: self.queued.len(),
         }
     }
@@ -319,11 +358,28 @@ pub const fn bundled_tile_key(id: QuadTileId) -> TileKey {
     }
 }
 
-/// Virtual offline `z = 0..3` Geodetic + `z = 0..1` PolarCap basemap tile
-/// provider backed by a dedicated background worker thread and injected
-/// [`Wakeup`].
+#[derive(Default)]
+struct WorkerQueue {
+    pending: Vec<TileKey>,
+    shutdown: bool,
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn is_planetary_root(key: &TileKey) -> bool {
+    key.scheme.is_coarsest_zero() && key.level == 0
+}
+
+/// Virtual offline `z = 0..3` Geodetic + `z = 0` PolarCap basemap tile
+/// provider backed by a dedicated background worker thread, coarsest-first
+/// cancellable queue, and injected [`Wakeup`].
 pub struct BundledBasemapProvider {
-    req_tx: Option<Sender<TileKey>>,
+    shared: Arc<(Mutex<WorkerQueue>, Condvar)>,
     in_flight: HashSet<TileKey>,
     worker: Option<JoinHandle<()>>,
 }
@@ -332,10 +388,11 @@ impl BundledBasemapProvider {
     /// Spawn the bundled offline basemap provider delivering decoded tiles to
     /// the returned [`PendingUploads`] and invoking `wakeup` on each arrival.
     pub fn spawn(wakeup: Wakeup) -> (Self, PendingUploads) {
-        let (req_tx, req_rx) = mpsc::channel::<TileKey>();
+        let shared = Arc::new((Mutex::new(WorkerQueue::default()), Condvar::new()));
+        let worker_shared = Arc::clone(&shared);
         let (done_tx, done_rx) = mpsc::channel::<(TileKey, DecodedTile)>();
 
-        let worker = thread::Builder::new()
+        let worker = match thread::Builder::new()
             .name("veldmap-bundled-basemap".to_owned())
             .spawn(move || {
                 let basemap = match BundledBasemap::from_encoded_bytes(BUNDLED_BASEMAP_JPEG) {
@@ -345,7 +402,34 @@ impl BundledBasemapProvider {
                         return;
                     }
                 };
-                while let Ok(key) = req_rx.recv() {
+                loop {
+                    let key = {
+                        let (lock, cvar) = &*worker_shared;
+                        let mut state = lock_unpoisoned(lock);
+                        while state.pending.is_empty() && !state.shutdown {
+                            state = match cvar.wait(state) {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                        }
+                        if state.shutdown {
+                            break;
+                        }
+                        // Pop the coarsest pending tile first.
+                        let best_idx = state
+                            .pending
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, k)| {
+                                (k.scheme.coarseness_rank(k.level), k.scheme, k.y, k.x)
+                            })
+                            .map(|(i, _)| i);
+                        match best_idx {
+                            Some(i) => state.pending.swap_remove(i),
+                            None => continue,
+                        }
+                    };
+
                     let id = QuadTileId {
                         scheme: key.scheme,
                         level: key.level,
@@ -364,12 +448,17 @@ impl BundledBasemapProvider {
                         }
                     }
                 }
-            })
-            .ok();
+            }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to spawn bundled basemap worker thread");
+                None
+            }
+        };
 
         (
             Self {
-                req_tx: Some(req_tx),
+                shared,
                 in_flight: HashSet::new(),
                 worker,
             },
@@ -377,28 +466,41 @@ impl BundledBasemapProvider {
         )
     }
 
+    /// Number of tiles currently tracked as in flight.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Whether `key` is already tracked as in flight.
+    pub fn is_in_flight(&self, key: &TileKey) -> bool {
+        self.in_flight.contains(key)
+    }
+
     /// Enqueue `key` for background tile rendering if not already in flight.
     /// Returns `true` if a new request was submitted.
     pub fn request(&mut self, key: TileKey) -> bool {
-        if !self.in_flight.insert(key) {
+        if self.worker.is_none() || !self.in_flight.insert(key) {
             return false;
         }
-        if let Some(tx) = &self.req_tx
-            && tx.send(key).is_ok()
-        {
-            true
-        } else {
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock_unpoisoned(lock);
+        if state.shutdown {
             self.in_flight.remove(&key);
-            false
+            return false;
         }
+        state.pending.push(key);
+        cvar.notify_one();
+        true
     }
 
-    /// Clear in-flight markers for tiles that have already landed in `cache`
-    /// or are no longer requested (e.g. if evicted later so they can be
-    /// re-requested cleanly).
+    /// Clear in-flight markers and cancel unstarted queued requests for tiles
+    /// that have already landed in `cache` or are no longer requested.
     pub fn reconcile(&mut self, cache: &GpuTileCache, wanted: &HashSet<TileKey>) {
-        self.in_flight
-            .retain(|k| !cache.contains(k) && (wanted.contains(k) || k.level == 0));
+        let keep = |k: &TileKey| !cache.contains(k) && (wanted.contains(k) || is_planetary_root(k));
+        self.in_flight.retain(keep);
+        let (lock, _) = &*self.shared;
+        let mut state = lock_unpoisoned(lock);
+        state.pending.retain(keep);
     }
 
     /// Pre-seed the coarsest root tiles (`Geodetic z = 0` + North/South
@@ -429,8 +531,13 @@ impl BundledBasemapProvider {
 
 impl Drop for BundledBasemapProvider {
     fn drop(&mut self) {
-        // Close request channel first so the worker exits its recv loop promptly.
-        self.req_tx.take();
+        {
+            let (lock, cvar) = &*self.shared;
+            let mut state = lock_unpoisoned(lock);
+            state.shutdown = true;
+            state.pending.clear();
+            cvar.notify_all();
+        }
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }

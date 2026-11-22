@@ -62,6 +62,13 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.max_bytes
     }
 
+    /// Raise the configured maximum byte budget to at least `min_bytes`.
+    pub fn ensure_max_bytes(&mut self, min_bytes: usize) {
+        if min_bytes > self.max_bytes {
+            self.max_bytes = min_bytes;
+        }
+    }
+
     /// Return whether `key` is currently cached (without updating recency).
     pub fn contains(&self, key: &K) -> bool {
         self.index.contains_key(key)
@@ -92,12 +99,13 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     /// Insert or replace `key` with `value` occupying `byte_size` bytes,
     /// evicting least-recently-used entries until `total_bytes() <= max_bytes()`.
     ///
-    /// Returns all evicted `(K, V)` pairs (including any replaced previous
-    /// value for `key`). If `byte_size > max_bytes`, the entry cannot fit and
-    /// is returned directly without modifying existing cache contents.
-    pub fn insert(&mut self, key: K, value: V, byte_size: usize) -> Vec<(K, V)> {
-        if byte_size > self.max_bytes {
-            return vec![(key, value)];
+    /// Returns `Ok(evicted)` containing all evicted `(K, V)` pairs (including
+    /// any replaced previous value for `key`), or `Err((key, value))` without
+    /// modifying existing cache contents if `max_bytes == 0` or
+    /// `byte_size > max_bytes`.
+    pub fn insert(&mut self, key: K, value: V, byte_size: usize) -> Result<Vec<(K, V)>, (K, V)> {
+        if self.max_bytes == 0 || byte_size > self.max_bytes {
+            return Err((key, value));
         }
 
         let mut evicted = Vec::new();
@@ -122,7 +130,7 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.attach_front(slot);
         self.index.insert(key, slot);
         self.total_bytes += byte_size;
-        evicted
+        Ok(evicted)
     }
 
     /// Remove `key` from the cache in O(1), returning `(value, byte_size)`.
@@ -162,12 +170,13 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     }
 
     /// Maximum tile count allowed for one active pyramid given `tile_bytes`,
-    /// clamped to at least 1 when `tile_bytes <= max_bytes`.
+    /// strictly honoring the `< 50%` byte appetite cap (returns `0` if even one
+    /// tile would exceed the per-pyramid cap).
     pub fn max_tiles_for_pyramid(&self, active_pyramids: usize, tile_bytes: usize) -> usize {
         if tile_bytes == 0 || tile_bytes > self.max_bytes {
             return 0;
         }
-        (self.pyramid_byte_cap(active_pyramids) / tile_bytes).max(1)
+        self.pyramid_byte_cap(active_pyramids) / tile_bytes
     }
 
     fn alloc_slot(&mut self, node: Node<K, V>) -> usize {
@@ -301,9 +310,9 @@ mod tests {
         let k3 = make_key(TileScheme::Geodetic, 1, 2, 0);
         let k4 = make_key(TileScheme::Geodetic, 1, 3, 0);
 
-        assert!(cache.insert(k1, 1u32, 100).is_empty());
-        assert!(cache.insert(k2, 2u32, 100).is_empty());
-        assert!(cache.insert(k3, 3u32, 100).is_empty());
+        assert!(cache.insert(k1, 1u32, 100).expect("insert k1").is_empty());
+        assert!(cache.insert(k2, 2u32, 100).expect("insert k2").is_empty());
+        assert!(cache.insert(k3, 3u32, 100).expect("insert k3").is_empty());
         assert_eq!(cache.total_bytes(), 300);
         assert_eq!(cache.len(), 3);
 
@@ -311,7 +320,7 @@ mod tests {
         assert_eq!(cache.get(&k1), Some(&1));
 
         // Inserting k4 (100 B) must evict k2.
-        let evicted = cache.insert(k4, 4u32, 100);
+        let evicted = cache.insert(k4, 4u32, 100).expect("insert k4");
         assert_eq!(evicted, vec![(k2, 2)]);
         assert_eq!(cache.total_bytes(), 300);
         assert!(!cache.contains(&k2));
@@ -319,12 +328,51 @@ mod tests {
         assert!(cache.contains(&k3));
         assert!(cache.contains(&k4));
 
-        // Oversized single entry (> max_bytes) is rejected without corrupting cache.
+        // Replacing an existing key returns its previous value and updates byte count.
+        let replaced = cache.insert(k3, 30u32, 150).expect("replace k3");
+        assert_eq!(replaced, vec![(k3, 3), (k1, 1)]);
+        assert_eq!(cache.total_bytes(), 250);
+        assert_eq!(cache.peek(&k3), Some(&30));
+
+        // Oversized single entry (> max_bytes) returns Err without corrupting cache.
         let k_big = make_key(TileScheme::Geodetic, 2, 0, 0);
         let rejected = cache.insert(k_big, 99, 500);
-        assert_eq!(rejected, vec![(k_big, 99)]);
-        assert_eq!(cache.total_bytes(), 300);
-        assert_eq!(cache.len(), 3);
+        assert_eq!(rejected, Err((k_big, 99)));
+        assert_eq!(cache.total_bytes(), 250);
+        assert_eq!(cache.len(), 2);
+
+        // Zero-budget cache rejects even 0-byte inserts cleanly.
+        let mut zero_cache: TileCache<TileKey, u32> = TileCache::new(0);
+        assert_eq!(zero_cache.insert(k1, 1, 0), Err((k1, 1)));
+    }
+
+    #[test]
+    fn remove_and_clear_maintain_intrusive_links_and_carrier_misses() {
+        let mut cache = TileCache::new(400);
+        let k1 = make_key(TileScheme::Geodetic, 1, 0, 0);
+        let k2 = make_key(TileScheme::Geodetic, 1, 1, 0);
+        let k3 = make_key(TileScheme::Geodetic, 1, 2, 0);
+        assert!(cache.carrier(&k1).is_none());
+
+        cache.insert(k1, "a", 100).expect("k1");
+        cache.insert(k2, "b", 100).expect("k2");
+        cache.insert(k3, "c", 100).expect("k3");
+
+        // Remove middle, head, then singleton tail.
+        assert_eq!(cache.remove(&k2), Some(("b", 100)));
+        assert_eq!(cache.remove(&k3), Some(("c", 100)));
+        assert_eq!(cache.remove(&k1), Some(("a", 100)));
+        assert!(cache.is_empty());
+        assert_eq!(cache.total_bytes(), 0);
+        assert_eq!(cache.remove(&k1), None);
+
+        // Re-insert into recycled slab slots and clear.
+        cache.insert(k1, "x", 50).expect("re-insert k1");
+        cache.insert(k2, "y", 50).expect("re-insert k2");
+        let cleared = cache.clear();
+        assert_eq!(cleared.len(), 2);
+        assert!(cache.is_empty());
+        assert_eq!(cache.total_bytes(), 0);
     }
 
     #[test]
@@ -334,9 +382,9 @@ mod tests {
         let root = make_key(TileScheme::WebMercator, 0, 0, 0);
         let mid = make_key(TileScheme::WebMercator, 1, 1, 0);
         let decoy = make_key(TileScheme::WebMercator, 2, 0, 0);
-        geo_cache.insert(root, "root", 100);
-        geo_cache.insert(mid, "mid", 100);
-        geo_cache.insert(decoy, "decoy", 100);
+        geo_cache.insert(root, "root", 100).expect("root");
+        geo_cache.insert(mid, "mid", 100).expect("mid");
+        geo_cache.insert(decoy, "decoy", 100).expect("decoy");
 
         // Query a leaf under `mid`: carrier resolves to `mid` AND touches `root`!
         let leaf = make_key(TileScheme::WebMercator, 3, 4, 0);
@@ -347,7 +395,7 @@ mod tests {
 
         // Inserting a new tile must evict `decoy`, NOT `root`.
         let newcomer = make_key(TileScheme::WebMercator, 2, 3, 3);
-        let evicted = geo_cache.insert(newcomer, "new", 100);
+        let evicted = geo_cache.insert(newcomer, "new", 100).expect("newcomer");
         assert_eq!(evicted, vec![(decoy, "decoy")]);
         assert!(geo_cache.contains(&root));
         assert!(geo_cache.contains(&mid));
@@ -358,9 +406,9 @@ mod tests {
         let p_root = make_key(pyr, 3, 0, 0);
         let p_mid = make_key(pyr, 2, 1, 1);
         let p_decoy = make_key(pyr, 1, 0, 0);
-        pyr_cache.insert(p_root, "p_root", 100);
-        pyr_cache.insert(p_mid, "p_mid", 100);
-        pyr_cache.insert(p_decoy, "p_decoy", 100);
+        pyr_cache.insert(p_root, "p_root", 100).expect("p_root");
+        pyr_cache.insert(p_mid, "p_mid", 100).expect("p_mid");
+        pyr_cache.insert(p_decoy, "p_decoy", 100).expect("p_decoy");
 
         let p_leaf = make_key(pyr, 0, 5, 6); // (5>>2=1, 6>>2=1) -> p_mid!
         let (p_carrier, p_uv, p_val) = pyr_cache.carrier(&p_leaf).expect("pyramid carrier");
@@ -369,7 +417,7 @@ mod tests {
         assert_eq!(p_uv, [0.25, 0.5, 0.25, 0.25]);
 
         let p_new = make_key(pyr, 1, 3, 3);
-        let p_evicted = pyr_cache.insert(p_new, "p_new", 100);
+        let p_evicted = pyr_cache.insert(p_new, "p_new", 100).expect("p_new");
         assert_eq!(p_evicted, vec![(p_decoy, "p_decoy")]);
         assert!(pyr_cache.contains(&p_root));
         assert!(pyr_cache.contains(&p_mid));
@@ -386,5 +434,11 @@ mod tests {
         assert!(cap2 * 4 < cache.max_bytes());
         assert!(cap4 * 8 < cache.max_bytes());
         assert!(cache.max_tiles_for_pyramid(1, 256 * 256 * 4) < 512);
+
+        // Small budget with multiple pyramids must never exceed < 50% total appetite.
+        let small: TileCache<TileKey, u8> = TileCache::new(1000);
+        let per_pyr = small.max_tiles_for_pyramid(4, 200);
+        assert_eq!(per_pyr, 0);
+        assert!(per_pyr * 4 * 200 * 2 < small.max_bytes());
     }
 }
