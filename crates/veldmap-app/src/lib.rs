@@ -1,6 +1,7 @@
 //! Library surface of `veldmap-app` exposing the decoupled offscreen
 //! `GlobeRenderer`, per-tile RTC quadtree mesh generator, `GpuTileCache`,
-//! `PendingUploads`, and HUD formatting utilities for headless GPU smoke tests
+//! `PendingUploads`, live/offline basemap orchestration (`basemap`,
+//! `basemap_ui`), and HUD formatting utilities for headless GPU smoke tests
 //! and `naga` shader validation.
 
 pub mod app;

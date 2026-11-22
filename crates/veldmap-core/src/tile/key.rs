@@ -2,6 +2,22 @@
 //! `PixelFormat`, `SourceId`) shared by planetary basemaps, polar caps, and
 //! local/cloud raster pyramids.
 
+use super::quadtree::QuadTileId;
+
+/// Deterministic 64-bit FNV-1a hash used for stable `Copy` source/band keys.
+pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    hash
+}
+
 /// Compact identifier for a tile data source (bundled basemap, live XYZ/TMS
 /// layer, local GeoTIFF, or cloud COG).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -21,17 +37,7 @@ impl SourceId {
     /// Sets the high bit so derived IDs never collide with small reserved
     /// constants such as [`Self::BUNDLED_BASEMAP`].
     pub const fn from_stable_key(key: &str) -> Self {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let bytes = key.as_bytes();
-        let mut hash = FNV_OFFSET;
-        let mut i = 0;
-        while i < bytes.len() {
-            hash ^= bytes[i] as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-            i += 1;
-        }
-        Self(hash | (1u64 << 63))
+        Self(fnv1a_64(key.as_bytes()) | (1u64 << 63))
     }
 }
 
@@ -50,17 +56,7 @@ pub enum BandKey {
 impl BandKey {
     /// Compute a deterministic 64-bit FNV-1a hash for a band or variable name.
     pub const fn from_name(name: &str) -> Self {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let bytes = name.as_bytes();
-        let mut hash = FNV_OFFSET;
-        let mut i = 0;
-        while i < bytes.len() {
-            hash ^= bytes[i] as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-            i += 1;
-        }
-        Self::NamedHash(hash)
+        Self::NamedHash(fnv1a_64(name.as_bytes()))
     }
 }
 
@@ -208,6 +204,39 @@ pub struct TileKey {
 }
 
 impl TileKey {
+    /// Build the canonical display `TileKey` (`BandKey::Display`,
+    /// `PixelFormat::Rgba8UnormSrgb`, `gutter = 0`, `decode_rev = 0`) for
+    /// `(source, id)`.
+    pub const fn display_quad(source: SourceId, id: QuadTileId) -> Self {
+        Self {
+            source,
+            band: BandKey::Display,
+            scheme: id.scheme,
+            format: PixelFormat::Rgba8UnormSrgb,
+            gutter: 0,
+            decode_rev: 0,
+            level: id.level,
+            x: id.x,
+            y: id.y,
+        }
+    }
+
+    /// Extract the geometric `(scheme, level, x, y)` identifier.
+    pub const fn quad_id(&self) -> QuadTileId {
+        QuadTileId {
+            scheme: self.scheme,
+            level: self.level,
+            x: self.x,
+            y: self.y,
+        }
+    }
+
+    /// Return whether `self` is a coarsest root tile of `source` (works for
+    /// both planetary `z = 0` and `RasterPyramid` `level == max_level`).
+    pub const fn is_root_of(&self, source: SourceId) -> bool {
+        self.source.0 == source.0 && self.parent().is_none()
+    }
+
     /// Deterministic coarsest-first ordering key for upload and request queues.
     pub const fn coarsest_first_key(&self) -> (u8, TileScheme, u32, u32) {
         (
@@ -368,6 +397,13 @@ mod tests {
         assert_eq!(BandKey::from_name("B08"), BandKey::from_name("B08"));
         assert_ne!(BandKey::from_name("B08"), BandKey::from_name("B04"));
         assert_ne!(BandKey::from_name("SCL"), BandKey::Display);
+
+        let s1 = SourceId::from_stable_key("eox-s2cloudless-2023-3857");
+        let s2 = SourceId::from_stable_key("nasa-gibs-bluemarble-l8");
+        assert_eq!(s1, SourceId::from_stable_key("eox-s2cloudless-2023-3857"));
+        assert_ne!(s1, s2);
+        assert_ne!(s1, SourceId::BUNDLED_BASEMAP);
+        assert_ne!(s1.0 & (1u64 << 63), 0, "derived SourceId sets high bit");
     }
 
     #[test]

@@ -9,16 +9,19 @@ use super::key::PixelFormat;
 /// Maximum number of mip levels (including base level 0) for a 2D texture of
 /// dimensions `(width, height)`.
 pub const fn max_mip_levels(width: u32, height: u32) -> u32 {
-    let max_dim = if width > height { width } else { height };
-    if max_dim == 0 {
-        0
-    } else {
-        32 - max_dim.leading_zeros()
+    if width == 0 || height == 0 {
+        return 0;
     }
+    let max_dim = if width > height { width } else { height };
+    32 - max_dim.leading_zeros()
 }
 
 /// Dimensions `(mip_width, mip_height)` at `mip_level` (`0` = base image).
+/// Returns `(0, 0)` when either base dimension is zero.
 pub const fn mip_dimensions(width: u32, height: u32, mip_level: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (0, 0);
+    }
     let mw = if mip_level >= 32 {
         1
     } else {
@@ -92,7 +95,8 @@ impl DecodedTile {
     /// Total number of mip levels present (`1` for base only, up to
     /// [`max_mip_levels`]).
     pub fn mip_level_count(&self) -> u32 {
-        1u32.saturating_add(self.mips.len() as u32)
+        let extra = u32::try_from(self.mips.len()).unwrap_or(u32::MAX);
+        1u32.saturating_add(extra)
     }
 
     /// Dimensions `(w, h)` of mip level `level` (`0` = base).
@@ -126,7 +130,7 @@ impl DecodedTile {
         }
         let max_mips = max_mip_levels(self.width, self.height);
         let count = self.mip_level_count();
-        if count == 0 || count > max_mips {
+        if count > max_mips {
             return false;
         }
         let bpp = self.format.bytes_per_pixel();
@@ -156,9 +160,23 @@ mod tests {
     #[test]
     fn mip_dimensions_and_validation_handle_pow2_and_non_pow2() {
         assert_eq!(max_mip_levels(0, 0), 0);
+        assert_eq!(max_mip_levels(0, 10), 0);
+        assert_eq!(max_mip_levels(10, 0), 0);
+        assert_eq!(mip_dimensions(0, 0, 0), (0, 0));
+        assert_eq!(mip_dimensions(0, 10, 0), (0, 0));
+        assert_eq!(mip_dimensions(10, 0, 2), (0, 0));
         assert_eq!(max_mip_levels(1, 1), 1);
         assert_eq!(max_mip_levels(256, 256), 9);
         assert_eq!(max_mip_levels(5, 3), 3);
+
+        assert!(
+            !DecodedTile::new(0, 4, PixelFormat::Rgba8UnormSrgb, Vec::new()).validate(),
+            "0xN tile must fail validation"
+        );
+        assert!(
+            !DecodedTile::new(4, 0, PixelFormat::Rgba8UnormSrgb, Vec::new()).validate(),
+            "Nx0 tile must fail validation"
+        );
 
         assert_eq!(mip_dimensions(5, 3, 0), (5, 3));
         assert_eq!(mip_dimensions(5, 3, 1), (2, 1));

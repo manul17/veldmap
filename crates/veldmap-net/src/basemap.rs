@@ -5,10 +5,7 @@
 
 use std::fmt;
 
-use veldmap_core::tile::{BandKey, PixelFormat, QuadTileId, SourceId, TileKey, TileScheme};
-use veldmap_storage::{
-    AppSettings, BasemapSelection, CustomXyzSettings, DEFAULT_GIBS_DATE, DiskTileKey,
-};
+use veldmap_core::tile::{QuadTileId, SourceId, TileKey, TileScheme, fnv1a_64};
 
 use crate::NetError;
 
@@ -26,6 +23,9 @@ pub const GIBS_VIIRS_MAX_LEVEL: u8 = 9;
 pub const EOX_S2_URL_TEMPLATE: &str =
     "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/g/{z}/{y}/{x}.jpg";
 pub const EOX_S2_MAX_LEVEL: u8 = 14;
+
+/// Standard `{s}` subdomain pool for custom XYZ/TMS templates.
+const SUBDOMAINS: [&str; 3] = ["a", "b", "c"];
 
 /// Validate an explicit calendar-valid `YYYY-MM-DD` UTC date string for dated
 /// GIBS layers (enforcing exact month lengths and leap-year February).
@@ -81,28 +81,35 @@ fn percent_encode_variants(secret: &str) -> (String, String) {
     (upper, lower)
 }
 
-fn fnv1a_hex(input: &str) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for &b in input.as_bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(FNV_PRIME);
+fn redact_url_query(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => url.to_owned(),
     }
-    format!("{hash:016x}")
+}
+
+/// Pure networking configuration for constructing a Custom XYZ / TMS
+/// [`LiveBasemapSpec`] without coupling `veldmap-net` to `veldmap-storage`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomBasemapConfig<'a> {
+    pub name: &'a str,
+    pub url_template: &'a str,
+    pub api_key: &'a str,
+    pub tms_flip_y: bool,
+    pub max_level: u8,
+    pub attribution: &'a str,
 }
 
 /// Complete specification of an HTTP(S) live tile basemap source.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LiveBasemapSpec {
     pub source_id: SourceId,
-    /// Safe ASCII key used inside `TileDiskCache` (never contains `api_key`).
+    /// Safe ASCII key used inside [`crate::TileBlobStore`] (never contains `api_key`).
     pub cache_key: String,
     pub label: String,
     pub attribution: String,
     pub scheme: TileScheme,
     pub max_level: u8,
-    pub tile_px: u32,
     pub url_template: String,
     pub tms_flip_y: bool,
     pub api_key: Option<String>,
@@ -116,8 +123,7 @@ impl fmt::Debug for LiveBasemapSpec {
             .field("label", &self.label)
             .field("scheme", &self.scheme)
             .field("max_level", &self.max_level)
-            .field("tile_px", &self.tile_px)
-            .field("url_template", &self.url_template)
+            .field("url_template", &redact_url_query(&self.url_template))
             .field("tms_flip_y", &self.tms_flip_y)
             .field(
                 "api_key",
@@ -143,7 +149,6 @@ impl LiveBasemapSpec {
             attribution: "Imagery: NASA GIBS / Blue Marble (Public Domain)".to_owned(),
             scheme: TileScheme::WebMercator,
             max_level: GIBS_BLUE_MARBLE_MAX_LEVEL,
-            tile_px: 256,
             url_template: GIBS_BLUE_MARBLE_URL_TEMPLATE.to_owned(),
             tms_flip_y: false,
             api_key: None,
@@ -151,27 +156,24 @@ impl LiveBasemapSpec {
     }
 
     /// NASA GIBS VIIRS SNPP Corrected Reflectance True Color
-    /// (`GoogleMapsCompatible_Level9`, explicit `YYYY-MM-DD` date, Public Domain).
-    pub fn nasa_gibs_viirs(date: &str) -> Self {
+    /// (`GoogleMapsCompatible_Level9`, explicit `YYYY-MM-DD` UTC date, Public Domain).
+    pub fn nasa_gibs_viirs(date: &str) -> Result<Self, NetError> {
         let trimmed = date.trim();
-        let valid_date = if is_valid_iso_date(trimmed) {
-            trimmed
-        } else {
-            DEFAULT_GIBS_DATE
-        };
-        let cache_key = format!("nasa-gibs-viirs-l9-{valid_date}");
-        Self {
+        if !is_valid_iso_date(trimmed) {
+            return Err(NetError::InvalidDate(trimmed.to_owned()));
+        }
+        let cache_key = format!("nasa-gibs-viirs-l9-{trimmed}");
+        Ok(Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
-            label: format!("NASA GIBS VIIRS ({valid_date})"),
-            attribution: format!("Imagery: NASA GIBS / VIIRS SNPP {valid_date} (Public Domain)"),
+            label: format!("NASA GIBS VIIRS ({trimmed})"),
+            attribution: format!("Imagery: NASA GIBS / VIIRS SNPP {trimmed} (Public Domain)"),
             scheme: TileScheme::WebMercator,
             max_level: GIBS_VIIRS_MAX_LEVEL,
-            tile_px: 256,
-            url_template: GIBS_VIIRS_URL_TEMPLATE.replace("{time}", valid_date),
+            url_template: GIBS_VIIRS_URL_TEMPLATE.replace("{time}", trimmed),
             tms_flip_y: false,
             api_key: None,
-        }
+        })
     }
 
     /// EOX Sentinel-2 Cloudless 2023 (`WebMercator`, CC BY 4.0, `max_level = 14`).
@@ -184,25 +186,44 @@ impl LiveBasemapSpec {
             attribution: "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (CC BY 4.0, modified Copernicus Sentinel data)".to_owned(),
             scheme: TileScheme::WebMercator,
             max_level: EOX_S2_MAX_LEVEL,
-            tile_px: 256,
             url_template: EOX_S2_URL_TEMPLATE.to_owned(),
             tms_flip_y: false,
             api_key: None,
         }
     }
 
-    /// Build a custom XYZ/TMS live source from user settings, validating the
-    /// URL scheme (`http://` or `https://`) and required coordinate tokens.
-    pub fn from_custom(cfg: &CustomXyzSettings) -> Result<Self, NetError> {
+    /// Build a custom XYZ/TMS live source, validating URL scheme (`http://` or
+    /// `https://`), non-empty host, absence of whitespace/control characters,
+    /// and required coordinate placeholders (`{z}`, `{x}`, `{y}` or `{-y}`).
+    pub fn custom(cfg: CustomBasemapConfig<'_>) -> Result<Self, NetError> {
         let template = cfg.url_template.trim();
         if template.is_empty() {
             return Err(NetError::InvalidUrlTemplate(
                 "URL template must not be empty".to_owned(),
             ));
         }
-        if !template.starts_with("https://") && !template.starts_with("http://") {
+        if template
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
             return Err(NetError::InvalidUrlTemplate(
-                "URL template must start with https:// or http://".to_owned(),
+                "URL template must not contain whitespace or control characters".to_owned(),
+            ));
+        }
+        let after_scheme = template
+            .strip_prefix("https://")
+            .or_else(|| template.strip_prefix("http://"))
+            .ok_or_else(|| {
+                NetError::InvalidUrlTemplate(
+                    "URL template must start with https:// or http://".to_owned(),
+                )
+            })?;
+        let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+        let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+        let host = host_port.split(':').next().unwrap_or("");
+        if host.is_empty() || host.contains("{z}") || host.contains("{x}") || host.contains("{y}") {
+            return Err(NetError::InvalidUrlTemplate(
+                "URL template must include a valid hostname".to_owned(),
             ));
         }
         let has_z = template.contains("{z}");
@@ -214,10 +235,12 @@ impl LiveBasemapSpec {
             ));
         }
         let max_level = cfg.max_level.clamp(1, 20);
-        // Hash template + tms_flip_y (NEVER the secret API key) into a safe
-        // ASCII disk cache key and SourceId.
-        let identity = format!("custom|{}|{}|{}", template, cfg.tms_flip_y, max_level);
-        let cache_key = format!("custom-xyz-{}", fnv1a_hex(&identity));
+        // Hash template + tms_flip_y (NEVER the secret API key or max_level)
+        // into a safe ASCII disk cache key and SourceId so adjusting max_level
+        // does not invalidate cached tiles.
+        let identity = format!("custom|{template}|{}", cfg.tms_flip_y);
+        let hash = fnv1a_64(identity.as_bytes());
+        let cache_key = format!("custom-xyz-{hash:016x}");
         let label = if cfg.name.trim().is_empty() {
             "Custom XYZ / TMS".to_owned()
         } else {
@@ -237,38 +260,15 @@ impl LiveBasemapSpec {
             attribution,
             scheme: TileScheme::WebMercator,
             max_level,
-            tile_px: 256,
             url_template: template.to_owned(),
             tms_flip_y: cfg.tms_flip_y,
             api_key,
         })
     }
 
-    /// Resolve the active [`LiveBasemapSpec`] from [`AppSettings`], returning
-    /// `Ok(None)` for offline (`BundledBlueMarble`) or `EllipsoidOnly` modes.
-    pub fn from_settings(settings: &AppSettings) -> Result<Option<Self>, NetError> {
-        match settings.active_basemap {
-            BasemapSelection::BundledBlueMarble | BasemapSelection::EllipsoidOnly => Ok(None),
-            BasemapSelection::NasaGibsBlueMarble => Ok(Some(Self::nasa_gibs_blue_marble())),
-            BasemapSelection::NasaGibsViirs => Ok(Some(Self::nasa_gibs_viirs(&settings.gibs_date))),
-            BasemapSelection::EoxSentinel2Cloudless => Ok(Some(Self::eox_sentinel2_cloudless())),
-            BasemapSelection::CustomXyz => Self::from_custom(&settings.custom_xyz).map(Some),
-        }
-    }
-
-    /// Build the canonical `TileKey` for `id` under this live source.
+    /// Build the canonical display `TileKey` for `id` under this live source.
     pub const fn tile_key(&self, id: QuadTileId) -> TileKey {
-        TileKey {
-            source: self.source_id,
-            band: BandKey::Display,
-            scheme: id.scheme,
-            format: PixelFormat::Rgba8UnormSrgb,
-            gutter: 0,
-            decode_rev: 0,
-            level: id.level,
-            x: id.x,
-            y: id.y,
-        }
+        TileKey::display_quad(self.source_id, id)
     }
 
     /// Validate that `id` is eligible for live fetching (never `PolarCap`,
@@ -309,35 +309,27 @@ impl LiveBasemapSpec {
         Ok((cols, rows))
     }
 
-    /// Build the disk cache key for `id` after verifying the live-basemap
-    /// contract.
-    pub fn disk_key(&self, id: QuadTileId) -> Result<DiskTileKey, NetError> {
-        self.validate_tile(id)?;
-        Ok(DiskTileKey::new(
-            self.cache_key.clone(),
-            id.scheme,
-            id.level,
-            id.x,
-            id.y,
-        ))
-    }
-
     /// Resolve the concrete HTTP(S) tile URL for `id`, rejecting `PolarCap`
     /// keys and any `level > self.max_level`.
     pub fn resolve_url(&self, id: QuadTileId) -> Result<String, NetError> {
         let (_cols, rows) = self.validate_tile(id)?;
         let tms_y = rows - 1 - id.y;
         let effective_y = if self.tms_flip_y { tms_y } else { id.y };
+        let sub_idx = ((u64::from(id.x) + u64::from(id.y)) % (SUBDOMAINS.len() as u64)) as usize;
 
         let mut url = self
             .url_template
+            .replace("{s}", SUBDOMAINS[sub_idx])
             .replace("{z}", &id.level.to_string())
             .replace("{x}", &id.x.to_string())
             .replace("{-y}", &tms_y.to_string())
             .replace("{y}", &effective_y.to_string());
 
         if let Some(key) = self.api_key.as_deref() {
-            url = url.replace("{api_key}", key).replace("{key}", key);
+            let (encoded_key, _) = percent_encode_variants(key);
+            url = url
+                .replace("{api_key}", &encoded_key)
+                .replace("{key}", &encoded_key);
         } else {
             url = url.replace("{api_key}", "").replace("{key}", "");
         }
@@ -370,7 +362,7 @@ mod tests {
 
     #[test]
     fn gibs_and_eox_specs_enforce_polar_cap_and_max_level_contracts() {
-        let gibs = LiveBasemapSpec::nasa_gibs_viirs("2024-07-01");
+        let gibs = LiveBasemapSpec::nasa_gibs_viirs("2024-07-01").expect("valid date");
         assert_eq!(gibs.scheme, TileScheme::WebMercator);
         assert_eq!(gibs.max_level, 9);
         let url = gibs
@@ -392,6 +384,26 @@ mod tests {
                 y: 0,
             }),
             Err(NetError::PolarCapForbidden)
+        ));
+
+        // Scheme mismatch & OOB coordinates fail cleanly.
+        assert!(matches!(
+            gibs.resolve_url(QuadTileId {
+                scheme: TileScheme::Geodetic,
+                level: 0,
+                x: 0,
+                y: 0,
+            }),
+            Err(NetError::SchemeMismatch { .. })
+        ));
+        assert!(matches!(
+            gibs.resolve_url(QuadTileId {
+                scheme: TileScheme::WebMercator,
+                level: 1,
+                x: 2,
+                y: 0,
+            }),
+            Err(NetError::TileOutOfRange { .. })
         ));
 
         // Levels above max_level are strictly forbidden (0 requests above max_level).
@@ -432,16 +444,16 @@ mod tests {
     }
 
     #[test]
-    fn custom_xyz_tms_handles_flip_y_and_redacts_api_key() {
-        let cfg = CustomXyzSettings {
-            name: "Custom".to_owned(),
-            url_template: "https://tiles.example.org/{z}/{x}/{y}.png?token={key}".to_owned(),
-            api_key: "secret-abc-999".to_owned(),
+    fn custom_xyz_tms_handles_subdomains_flip_y_encoding_and_redaction() {
+        let base_cfg = CustomBasemapConfig {
+            name: "Custom",
+            url_template: "https://{s}.tiles.example.org/{z}/{x}/{y}.png?token={key}&extra=1",
+            api_key: "sec+ret/key 99",
             tms_flip_y: true,
             max_level: 6,
-            attribution: "Example".to_owned(),
+            attribution: "Example",
         };
-        let spec = LiveBasemapSpec::from_custom(&cfg).expect("build custom");
+        let spec = LiveBasemapSpec::custom(base_cfg.clone()).expect("build custom");
         let url = spec
             .resolve_url(QuadTileId {
                 scheme: TileScheme::WebMercator,
@@ -450,26 +462,70 @@ mod tests {
                 y: 0,
             })
             .expect("resolve custom url");
-        // At z=2, rows=4, flipped y for y=0 is 3.
+        // (x + y) % 3 = 1 -> "b"; at z=2, rows=4, flipped y for y=0 is 3; API key percent-encoded.
         assert_eq!(
             url,
-            "https://tiles.example.org/2/1/3.png?token=secret-abc-999"
+            "https://b.tiles.example.org/2/1/3.png?token=sec%2Bret%2Fkey%2099&extra=1"
         );
-        assert!(!format!("{spec:?}").contains("secret-abc-999"));
-        assert!(!spec.cache_key.contains("secret-abc-999"));
+        let dbg = format!("{spec:?}");
+        assert!(!dbg.contains("sec+ret"));
+        assert!(!dbg.contains("extra=1"), "query string must be redacted");
+        assert!(!spec.cache_key.contains("sec"));
         assert_eq!(
             spec.redact_secrets(&url),
-            "https://tiles.example.org/2/1/3.png?token=<redacted>"
+            "https://b.tiles.example.org/2/1/3.png?token=<redacted>&extra=1"
+        );
+        assert_eq!(
+            spec.redact_secrets("err: sec%2bret%2fkey%2099"),
+            "err: <redacted>"
         );
 
-        // Invalid templates are rejected.
-        assert!(matches!(
-            LiveBasemapSpec::from_custom(&CustomXyzSettings {
-                url_template: "ftp://example.com/{z}/{x}/{y}.png".to_owned(),
-                ..cfg
-            }),
-            Err(NetError::InvalidUrlTemplate(_))
-        ));
+        // Adjusting max_level must preserve cache_key and source_id.
+        let higher_max = LiveBasemapSpec::custom(CustomBasemapConfig {
+            max_level: 14,
+            ..base_cfg.clone()
+        })
+        .expect("build higher max");
+        assert_eq!(spec.cache_key, higher_max.cache_key);
+        assert_eq!(spec.source_id, higher_max.source_id);
+
+        // Explicit `{-y}` works even when `tms_flip_y == false`.
+        let neg_y = LiveBasemapSpec::custom(CustomBasemapConfig {
+            url_template: "https://tiles.example.org/{z}/{x}/{-y}.png",
+            tms_flip_y: false,
+            api_key: "",
+            ..base_cfg.clone()
+        })
+        .expect("neg y");
+        assert_eq!(
+            neg_y
+                .resolve_url(QuadTileId {
+                    scheme: TileScheme::WebMercator,
+                    level: 2,
+                    x: 1,
+                    y: 0,
+                })
+                .expect("neg y url"),
+            "https://tiles.example.org/2/1/3.png"
+        );
+
+        // Invalid templates (bad scheme, missing host, whitespace) are rejected.
+        for bad in [
+            "ftp://example.com/{z}/{x}/{y}.png",
+            "https://{z}/{x}/{y}.png",
+            "https://example.com/{z}/{x}/{y}.png bad",
+        ] {
+            assert!(
+                matches!(
+                    LiveBasemapSpec::custom(CustomBasemapConfig {
+                        url_template: bad,
+                        ..base_cfg.clone()
+                    }),
+                    Err(NetError::InvalidUrlTemplate(_))
+                ),
+                "expected InvalidUrlTemplate for {bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -480,8 +536,9 @@ mod tests {
         assert!(!is_valid_iso_date("2024-02-31")); // impossible calendar date
         assert!(!is_valid_iso_date("2024-13-01"));
         assert!(!is_valid_iso_date("not-a-date"));
-        // Invalid date falls back cleanly to DEFAULT_GIBS_DATE.
-        let gibs = LiveBasemapSpec::nasa_gibs_viirs("bad-date");
-        assert!(gibs.url_template.contains(DEFAULT_GIBS_DATE));
+        assert!(matches!(
+            LiveBasemapSpec::nasa_gibs_viirs("bad-date"),
+            Err(NetError::InvalidDate(_))
+        ));
     }
 }

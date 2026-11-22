@@ -1,6 +1,6 @@
 //! Injectable application storage paths (`config_dir`, `cache_dir`, `data_dir`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use directories::ProjectDirs;
 
@@ -47,19 +47,6 @@ impl StoragePaths {
     /// Path to the single-file SQLite WAL tile cache (`cache_dir/tiles.sqlite3`).
     pub fn tile_cache_db_path(&self) -> PathBuf {
         self.cache_dir.join("tiles.sqlite3")
-    }
-
-    /// Ensure `config_dir`, `cache_dir`, and `data_dir` exist on disk.
-    pub fn ensure_dirs(&self) -> Result<(), StorageError> {
-        for dir in [&self.config_dir, &self.cache_dir, &self.data_dir] {
-            std::fs::create_dir_all(dir)?;
-        }
-        Ok(())
-    }
-
-    /// Return the configured cache directory.
-    pub fn cache_dir(&self) -> &Path {
-        &self.cache_dir
     }
 }
 

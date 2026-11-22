@@ -1133,8 +1133,9 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     );
     generate_linear_mipmaps(&mut live_tile);
 
-    // Budget holds 3 mipmapped 64x64 tiles comfortably.
-    let mut cache = GpuTileCache::new(expected_bytes * 3);
+    // Budget holds exactly 2 mipmapped 64x64 tiles so Step 4 genuinely
+    // exercises active-frame eviction protection and refusal deferral.
+    let mut cache = GpuTileCache::new(expected_bytes * 2);
     let wm_bundled_root = bundled_tile_key(QuadTileId {
         scheme: TileScheme::WebMercator,
         level: 0,
@@ -1183,7 +1184,8 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     );
 
     // 3. PolarCap under active `live_source` ALWAYS resolves to bundled polar
-    //    white (never live_source).
+    //    white (never live_source). This touches `south_polar_root`, making
+    //    `wm_bundled_root` the LRU tail.
     let polar_snap = DrawSnapshot::build(
         Camera::at(-89.5, 0.0, 400_000.0),
         w,
@@ -1208,8 +1210,10 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         "expected bundled polar white under live source, got {polar_px:?}"
     );
 
-    // 4. Upload live WebMercator root via PendingUploads with active-frame
-    //    protection -> live green overrides bundled fallback immediately.
+    // 4. Upload live WebMercator root into the FULL 2-tile cache while
+    //    `wm_bundled_root` (currently LRU tail!) is protected by `fallback_snap`.
+    //    Active-frame protection MUST skip `wm_bundled_root` and evict
+    //    `south_polar_root` instead.
     let live_root = source_tile_key(
         live_source,
         QuadTileId {
@@ -1233,8 +1237,40 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         Duration::from_secs(1),
     );
     assert_eq!(rep.uploaded, 1);
-    assert!(cache.contains(&wm_bundled_root));
+    assert_eq!(rep.evicted, 1);
+    assert!(
+        cache.contains(&wm_bundled_root),
+        "protected LRU tail must survive"
+    );
+    assert!(
+        !cache.contains(&south_polar_root),
+        "unprotected tile must be evicted"
+    );
     assert!(cache.contains(&live_root));
+
+    // 4b. When ALL cached tiles are protected, an incoming tile is deferred
+    //     (NOT silently discarded) with `remaining_ready == 0, deferred_protected == 1`,
+    //     and uploads cleanly once protection lifts without re-sending.
+    let all_protected = HashSet::from([wm_bundled_root, live_root]);
+    tx.send((south_polar_root, bundled_polar))
+        .expect("re-send polar cap");
+    let deferred_rep = pending.drain_and_upload(
+        device,
+        queue,
+        &mut cache,
+        live_source,
+        Some(&HashSet::from([south_polar_root])),
+        Some(&all_protected),
+        1024 * 1024,
+        Duration::from_secs(1),
+    );
+    assert_eq!(deferred_rep.uploaded, 0);
+    assert_eq!(deferred_rep.remaining_ready, 0);
+    assert_eq!(deferred_rep.deferred_protected, 1);
+    assert!(
+        pending.contains(&south_polar_root),
+        "protected-refused tile must stay deferred in queue"
+    );
 
     let live_snap = DrawSnapshot::build(
         Camera::at(0.0, 0.0, 2_000_000.0),
@@ -1259,9 +1295,25 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         "expected green live tile override, got {live_px:?}"
     );
 
+    // Now `live_snap` protects only `live_root` (unprotecting `wm_bundled_root`),
+    // so the deferred `south_polar_root` uploads immediately without re-sending.
+    let resumed_rep = pending.drain_and_upload(
+        device,
+        queue,
+        &mut cache,
+        live_source,
+        Some(&HashSet::from([south_polar_root])),
+        Some(&live_snap.carrier_keys),
+        1024 * 1024,
+        Duration::from_secs(1),
+    );
+    assert_eq!(resumed_rep.uploaded, 1);
+    assert_eq!(resumed_rep.evicted, 1);
+    assert!(cache.contains(&south_polar_root));
+    assert!(cache.contains(&live_root));
+
     // 5. Removing `live_source` clears only live tiles and preserves bundled fallback.
     assert_eq!(cache.remove_source(live_source), 1);
     assert!(!cache.contains(&live_root));
-    assert!(cache.contains(&wm_bundled_root));
     assert!(cache.contains(&south_polar_root));
 }

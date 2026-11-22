@@ -13,7 +13,6 @@ tokio.workspace = true
 tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 veldmap-raster = { path = "../veldmap-raster" }
-veldmap-storage = { path = "../veldmap-storage" }
 
 [dev-dependencies]
 image.workspace = true

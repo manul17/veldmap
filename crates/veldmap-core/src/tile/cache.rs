@@ -1,5 +1,6 @@
-//! Pure O(1) byte-budgeted LRU tile cache with scheme-aware ancestor touching
-//! and `< 50%` per-pyramid appetite capping.
+//! Byte-budgeted intrusive LRU tile cache with O(1) lookups/unprotected
+//! inserts, optional active-frame-protected admission, scheme-aware ancestor
+//! touching, and `< 50%` per-pyramid appetite capping.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -97,14 +98,42 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     }
 
     /// Insert or replace `key` with `value` occupying `byte_size` bytes,
-    /// evicting least-recently-used entries until `total_bytes() <= max_bytes()`.
+    /// evicting least-recently-used entries in O(1) per eviction until
+    /// `total_bytes() <= max_bytes()`.
     ///
     /// Returns `Ok(evicted)` containing all evicted `(K, V)` pairs (including
     /// any replaced previous value for `key`), or `Err((key, value))` without
     /// modifying existing cache contents if `max_bytes == 0` or
     /// `byte_size > max_bytes`.
     pub fn insert(&mut self, key: K, value: V, byte_size: usize) -> Result<Vec<(K, V)>, (K, V)> {
-        self.insert_protecting(key, value, byte_size, |_| false)
+        if self.max_bytes == 0 || byte_size > self.max_bytes {
+            return Err((key, value));
+        }
+
+        let target_before_insert = self.max_bytes - byte_size;
+        let mut evicted = Vec::new();
+        if let Some((old_val, _)) = self.remove(&key) {
+            evicted.push((key, old_val));
+        }
+
+        while self.total_bytes > target_before_insert {
+            let Some(victim) = self.pop_lru() else {
+                break;
+            };
+            evicted.push(victim);
+        }
+
+        let slot = self.alloc_slot(Node {
+            key,
+            value,
+            byte_size,
+            prev: None,
+            next: None,
+        });
+        self.attach_front(slot);
+        self.index.insert(key, slot);
+        self.total_bytes += byte_size;
+        Ok(evicted)
     }
 
     /// Return whether inserting or replacing `key` of `byte_size` can succeed
@@ -150,9 +179,10 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     /// refusing to evict any cached entry for which `is_protected(&k)` returns
     /// `true` (e.g. tiles currently displayed in the active frame).
     ///
-    /// Preserves `total_bytes() <= max_bytes()` strictly. If freeing space
-    /// would require evicting a protected entry, returns `Err((key, value))`
-    /// without modifying existing cache contents.
+    /// Preserves `total_bytes() <= max_bytes()` strictly in a single O(P + E)
+    /// tail-to-head scan. If freeing space would require evicting a protected
+    /// entry, returns `Err((key, value))` without modifying existing cache
+    /// contents.
     pub fn insert_protecting<F>(
         &mut self,
         key: K,
@@ -163,21 +193,51 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     where
         F: Fn(&K) -> bool,
     {
-        if !self.can_admit_protecting(&key, byte_size, &is_protected) {
+        if self.max_bytes == 0 || byte_size > self.max_bytes {
             return Err((key, value));
         }
 
+        let existing_bytes = self
+            .index
+            .get(&key)
+            .and_then(|&slot| self.nodes[slot].as_ref())
+            .map_or(0, |n| n.byte_size);
+        let bytes_without_key = self.total_bytes.saturating_sub(existing_bytes);
         let target_before_insert = self.max_bytes - byte_size;
-        let mut evicted = Vec::new();
+
+        // Collect victim slots in one O(P + E) tail-to-head walk before
+        // mutating the cache so refusal remains atomic.
+        let mut victim_slots = Vec::new();
+        if bytes_without_key > target_before_insert {
+            let need_to_free = bytes_without_key - target_before_insert;
+            let mut reclaimable = 0usize;
+            let mut cursor = self.tail;
+            while let Some(slot) = cursor {
+                let Some(node) = self.nodes[slot].as_ref() else {
+                    break;
+                };
+                if node.key != key && !is_protected(&node.key) {
+                    victim_slots.push(slot);
+                    reclaimable = reclaimable.saturating_add(node.byte_size);
+                    if reclaimable >= need_to_free {
+                        break;
+                    }
+                }
+                cursor = node.prev;
+            }
+            if reclaimable < need_to_free {
+                return Err((key, value));
+            }
+        }
+
+        let mut evicted = Vec::with_capacity(victim_slots.len() + 1);
         if let Some((old_val, _)) = self.remove(&key) {
             evicted.push((key, old_val));
         }
-
-        while self.total_bytes > target_before_insert {
-            let Some(victim) = self.pop_lru_skipping(&is_protected) else {
-                break;
-            };
-            evicted.push(victim);
+        for slot in victim_slots {
+            if let Some(victim) = self.remove_slot(slot) {
+                evicted.push(victim);
+            }
         }
 
         let slot = self.alloc_slot(Node {
@@ -325,24 +385,6 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.remove_slot(slot)
     }
 
-    fn pop_lru_skipping<F>(&mut self, is_protected: &F) -> Option<(K, V)>
-    where
-        F: Fn(&K) -> bool,
-    {
-        let mut cursor = self.tail;
-        while let Some(slot) = cursor {
-            let (key, prev) = match self.nodes[slot].as_ref() {
-                Some(node) => (node.key, node.prev),
-                None => return None,
-            };
-            if !is_protected(&key) {
-                return self.remove_slot(slot);
-            }
-            cursor = prev;
-        }
-        None
-    }
-
     fn remove_slot(&mut self, slot: usize) -> Option<(K, V)> {
         self.detach(slot);
         let node = self.nodes[slot].take()?;
@@ -383,6 +425,12 @@ impl<V> TileCache<TileKey, V> {
             self.touch(&cur);
             anc = cur.parent();
         }
+    }
+
+    /// Read-only check whether `key` or any of its coarser ancestors along
+    /// [`TileKey::parent`] is currently cached (without mutating LRU order).
+    pub fn has_carrier(&self, key: &TileKey) -> bool {
+        self.find_carrier_slot(key).is_some()
     }
 
     /// Find the finest cached tile covering `key` (either `key` itself or its

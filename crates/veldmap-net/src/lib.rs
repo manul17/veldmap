@@ -3,27 +3,43 @@
 //! pool for VeldMap.
 //!
 //! Uses `reqwest` + `rustls` with the explicit `ring` cryptography provider
-//! (zero OpenSSL or `aws-lc-sys` CMake/NASM build requirements) and routes
-//! decoded `Rgba8UnormSrgb` tiles with CPU linear-light mipmaps into
-//! `PendingUploads`'s completion channel.
+//! (zero OpenSSL or `aws-lc-sys` CMake/NASM build requirements), stays
+//! decoupled from `veldmap-storage` via [`TileBlobStore`], and emits decoded
+//! `Rgba8UnormSrgb` tiles with CPU linear-light mipmaps to a caller-supplied
+//! completion channel.
 
 use thiserror::Error;
-use veldmap_core::tile::TileScheme;
+use veldmap_core::tile::{QuadTileId, TileScheme};
 
 pub mod basemap;
 pub mod decode_pool;
 pub mod fetcher;
+pub mod http;
 
 pub use basemap::{
-    EOX_S2_MAX_LEVEL, EOX_S2_URL_TEMPLATE, GIBS_BLUE_MARBLE_MAX_LEVEL,
+    CustomBasemapConfig, EOX_S2_MAX_LEVEL, EOX_S2_URL_TEMPLATE, GIBS_BLUE_MARBLE_MAX_LEVEL,
     GIBS_BLUE_MARBLE_URL_TEMPLATE, GIBS_VIIRS_MAX_LEVEL, GIBS_VIIRS_URL_TEMPLATE, LiveBasemapSpec,
     is_valid_iso_date,
 };
 pub use decode_pool::{DecodeCompletion, DecodeJob, DecodePool, DecodePoolHandle, Wakeup};
-pub use fetcher::{
-    DEFAULT_MAX_CONCURRENT_PER_HOST, FetcherConfig, LiveTilePipeline, NetworkStatus,
-    default_user_agent,
+pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
+pub use http::{
+    DEFAULT_MAX_CONCURRENT_PER_HOST, DEFAULT_MAX_TILE_RESPONSE_BYTES, default_user_agent,
 };
+
+/// Minimal encoded-tile persistence boundary injected into
+/// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from SQLite and
+/// application settings types in `veldmap-storage`.
+pub trait TileBlobStore: Send + Sync + 'static {
+    /// Fetch cached encoded tile bytes for `(source_key, id)`, if present.
+    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String>;
+
+    /// Persist decode-validated encoded tile bytes for `(source_key, id)`.
+    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), String>;
+
+    /// Delete one cached tile entry (e.g. if a cached payload fails decode).
+    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String>;
+}
 
 /// Errors produced by live basemap URL resolution and HTTP streaming setup.
 #[derive(Debug, Error)]
@@ -48,6 +64,8 @@ pub enum NetError {
     },
     #[error("invalid custom tile URL template: {0}")]
     InvalidUrlTemplate(String),
+    #[error("invalid UTC date '{0}' (expected YYYY-MM-DD)")]
+    InvalidDate(String),
     #[error("failed to initialize HTTP client: {0}")]
     HttpClient(String),
     #[error("failed to initialize tokio runtime: {0}")]
