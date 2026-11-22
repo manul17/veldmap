@@ -40,19 +40,19 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 
 ### Milestone v0.2 — Planetary Basemaps & Local Precision Workstation
 
-#### Slice 2B — Async Tile Streaming, Disk Cache & Live Satellite Basemaps `[ ]`
-- [ ] **Workspace crates (`veldmap-net`, `veldmap-storage`), `CancelToken` & multi-producer decode pipeline:**
+#### Slice 2B — Async Tile Streaming, Disk Cache & Live Satellite Basemaps `[x]`
+- [x] **Workspace crates (`veldmap-net`, `veldmap-storage`), `CancelToken` & multi-producer decode pipeline:**
   - Move shared `DecodedTile` (with optional mip chain) and zero-dep async-waking `CancelToken` (`AtomicBool` + `Waker` / listener hook for immediate `tokio::select!` abort on pan/shutdown) into `veldmap-core`.
   - Introduce `veldmap-net` (`tokio` + `reqwest` over `rustls` — explicitly select `ring` vs. `aws-lc-rs` upfront and verify `deny.toml` license compliance + 3-OS builds): HTTP tile fetcher with per-host concurrency limits, compliant `User-Agent`, replaceable visible-first queue, and immediate cancellation.
   - Introduce the bounded `std::thread` CPU decode pool (generating **CPU linear-light mipmaps** on decoded `Rgba8UnormSrgb` tiles reusing `veldmap-raster`'s LUT math so `GpuTile` stays `TEXTURE_BINDING | COPY_DST`, paired with `MipmapFilterMode::Linear` on the tile sampler) and deterministic shutdown join order (`CancelToken` → drop completion rx / join decode pool → drop `tokio::Runtime`).
   - Refactor `PendingUploads` to own its channel and expose cloneable senders, parameterize `DrawSnapshot` by active `SourceId`, replace `is_coarsest_zero() && level == 0` root pinning with active-source `key.parent().is_none()`, add active-frame `TileCache` protection + `remove_where(source)`, and extract live basemap orchestration & settings UI out of `app.rs`.
-- [ ] **Disk cache & durable storage (`veldmap-storage`):**
+- [x] **Disk cache & durable storage (`veldmap-storage`):**
   - Implement durable atomic writes (`write_atomic_durable()` with `sync_all()` + synchronous handle drop before rename on Windows) for user settings/catalog state, plus crash-safe bounded tile disk caching (referencing `old/code/cache/` & `evict_tests.rs`).
   - Avoid whole-source or coarse `(source, z)` bucket eviction (which thrashes single-source live basemaps at `z = 12..14`) and avoid loose-file `relatime`/Windows NTFS-Defender storms: prefer **SQLite WAL (`rusqlite` bundled)** for single-file multi-process-safe O(log N) LRU + `incremental_vacuum`, or **spatial macro-buckets** `(source, z, x >> 4, y >> 4)` if keeping 2B strictly pure-Rust.
-- [ ] **Legally clean live basemaps & `PolarCap` contract:**
+- [x] **Legally clean live basemaps & `PolarCap` contract:**
   - Wire NASA GIBS via **`GoogleMapsCompatible_Level9` (`WebMercator`)** (avoiding GIBS's non-standard `288°/tile` `EPSG4326` matrix; static layer or explicit `{Time}`) + EOX Sentinel-2 Cloudless (`WebMercator`, CC BY 4.0, `max_level` ~13–14) with visible attribution, per-source `max_level` clamping + ancestor overzooming (`0` requests above `max_level`), and Custom XYZ/TMS URL & API-key settings.
   - Define the `PolarCap` + live-basemap contract explicitly: guarantee **`0` live HTTP requests for `PolarCap` keys**, and route `PolarCap` textures either to a tiny pre-baked polar asset or to lazy-loaded `SourceId::BUNDLED_BASEMAP` offline fallback (keeping Frame-1 orbital views consistent).
-- [ ] **3-OS Clippy, docs & `old/` cleanup:** Expand `cargo clippy --locked --workspace --all-targets -- -D warnings` to Windows/macOS in CI now that platform `#[cfg]` code lands; update `docs/decisions.md` and `docs/limitations.md`; delete `old/code/cache/` and `old/tests/cache/evict_tests.rs`.
+- [x] **3-OS Clippy, docs & `old/` cleanup:** Expand `cargo clippy --locked --workspace --all-targets -- -D warnings` to Windows/macOS in CI now that platform `#[cfg]` code lands; update `docs/decisions.md` and `docs/limitations.md`; delete `old/code/cache/` and `old/tests/cache/evict_tests.rs`.
 - **Exit criteria:**
   - *Automated CI:* Eviction (`disk_bytes <= cap`), durable atomic-write/crash-recovery, `CancelToken`, `0` requests above `max_level`, `0` HTTP requests for `PolarCap`, and 3-OS Clippy pass.
   - *Manual QA:* Live NASA GIBS / EOX tiles stream with mipmapped limb smoothness, visible attribution, bounded disk cache, and clean offline fallback.
@@ -181,5 +181,5 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 
 ## Next Step
 
-- **Current state:** Phases 0–0.5, Slice 1, and Slice 2A are complete on `main` (see [Design Decisions](docs/decisions.md)).
-- **Immediate task:** Start **Slice 2B — Async Tile Streaming, Disk Cache & Live Satellite Basemaps**: move shared `DecodedTile` + zero-dep async-waking `CancelToken` into `veldmap-core`, introduce `veldmap-net` (`tokio` + `reqwest`/`rustls`, verifying `ring` vs. `aws-lc-rs` against `deny.toml` and 3-OS builds), bounded CPU decode pool with linear-light mipmap generation, `veldmap-storage` durable atomic writes + SQLite WAL (or spatial macro-bucket) LRU disk cache, multi-producer `PendingUploads` + active-source `DrawSnapshot` + basemap UI extraction from `app.rs`, live NASA GIBS (`GoogleMapsCompatible_Level9`) + EOX Sentinel-2 Cloudless with explicit `PolarCap` contract & offline fallback, 3-OS Clippy, and `old/code/cache/` retirement.
+- **Current state:** Phases 0–0.5, Slice 1, Slice 2A, and Slice 2B are complete on `main` (see [Design Decisions](docs/decisions.md)).
+- **Immediate task:** Start **Slice 3A-1a — Core Local GeoTIFF/COG Engine & `ByteSource`**: implement sync caller-buffered `ByteSource` + `SourceFingerprint` (`veldmap-core` / `veldmap-storage`), unified `BandInfo` + pyramid/resampling/radiometry/grid/cascade + core GeoTIFF/BigTIFF/COG decoder (`veldmap-raster`), bounded local decode memory budget, panic/cancel-safe singleflight decoded-chunk cache, native `TileScheduler`, and `CountingByteSource` read-amplification + concurrency/memory-bound stress tests.

@@ -104,17 +104,77 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     /// modifying existing cache contents if `max_bytes == 0` or
     /// `byte_size > max_bytes`.
     pub fn insert(&mut self, key: K, value: V, byte_size: usize) -> Result<Vec<(K, V)>, (K, V)> {
+        self.insert_protecting(key, value, byte_size, |_| false)
+    }
+
+    /// Return whether inserting or replacing `key` of `byte_size` can succeed
+    /// within `max_bytes` without evicting any entry where `is_protected(&k)`
+    /// returns `true`.
+    pub fn can_admit_protecting<F>(&self, key: &K, byte_size: usize, is_protected: F) -> bool
+    where
+        F: Fn(&K) -> bool,
+    {
         if self.max_bytes == 0 || byte_size > self.max_bytes {
+            return false;
+        }
+        let existing_bytes = self
+            .index
+            .get(key)
+            .and_then(|&slot| self.nodes[slot].as_ref())
+            .map_or(0, |n| n.byte_size);
+        let bytes_without_key = self.total_bytes.saturating_sub(existing_bytes);
+        let target_before_insert = self.max_bytes - byte_size;
+        if bytes_without_key <= target_before_insert {
+            return true;
+        }
+        let need_to_free = bytes_without_key - target_before_insert;
+        let mut reclaimable = 0usize;
+        let mut cursor = self.tail;
+        while let Some(slot) = cursor {
+            if let Some(node) = self.nodes[slot].as_ref() {
+                if node.key != *key && !is_protected(&node.key) {
+                    reclaimable = reclaimable.saturating_add(node.byte_size);
+                    if reclaimable >= need_to_free {
+                        return true;
+                    }
+                }
+                cursor = node.prev;
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Insert or replace `key` with `value` occupying `byte_size` bytes while
+    /// refusing to evict any cached entry for which `is_protected(&k)` returns
+    /// `true` (e.g. tiles currently displayed in the active frame).
+    ///
+    /// Preserves `total_bytes() <= max_bytes()` strictly. If freeing space
+    /// would require evicting a protected entry, returns `Err((key, value))`
+    /// without modifying existing cache contents.
+    pub fn insert_protecting<F>(
+        &mut self,
+        key: K,
+        value: V,
+        byte_size: usize,
+        is_protected: F,
+    ) -> Result<Vec<(K, V)>, (K, V)>
+    where
+        F: Fn(&K) -> bool,
+    {
+        if !self.can_admit_protecting(&key, byte_size, &is_protected) {
             return Err((key, value));
         }
 
+        let target_before_insert = self.max_bytes - byte_size;
         let mut evicted = Vec::new();
         if let Some((old_val, _)) = self.remove(&key) {
             evicted.push((key, old_val));
         }
 
-        while self.total_bytes > self.max_bytes - byte_size {
-            let Some(victim) = self.pop_lru() else {
+        while self.total_bytes > target_before_insert {
+            let Some(victim) = self.pop_lru_skipping(&is_protected) else {
                 break;
             };
             evicted.push(victim);
@@ -131,6 +191,27 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.index.insert(key, slot);
         self.total_bytes += byte_size;
         Ok(evicted)
+    }
+
+    /// Remove every entry matching `predicate` and return the removed `(K, V)`
+    /// pairs while keeping intrusive LRU links and `total_bytes` consistent.
+    pub fn remove_where<F>(&mut self, mut predicate: F) -> Vec<(K, V)>
+    where
+        F: FnMut(&K) -> bool,
+    {
+        let matching: Vec<K> = self
+            .index
+            .keys()
+            .copied()
+            .filter(|k| predicate(k))
+            .collect();
+        let mut removed = Vec::with_capacity(matching.len());
+        for key in matching {
+            if let Some((val, _)) = self.remove(&key) {
+                removed.push((key, val));
+            }
+        }
+        removed
     }
 
     /// Remove `key` from the cache in O(1), returning `(value, byte_size)`.
@@ -241,6 +322,28 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
 
     fn pop_lru(&mut self) -> Option<(K, V)> {
         let slot = self.tail?;
+        self.remove_slot(slot)
+    }
+
+    fn pop_lru_skipping<F>(&mut self, is_protected: &F) -> Option<(K, V)>
+    where
+        F: Fn(&K) -> bool,
+    {
+        let mut cursor = self.tail;
+        while let Some(slot) = cursor {
+            let (key, prev) = match self.nodes[slot].as_ref() {
+                Some(node) => (node.key, node.prev),
+                None => return None,
+            };
+            if !is_protected(&key) {
+                return self.remove_slot(slot);
+            }
+            cursor = prev;
+        }
+        None
+    }
+
+    fn remove_slot(&mut self, slot: usize) -> Option<(K, V)> {
         self.detach(slot);
         let node = self.nodes[slot].take()?;
         self.index.remove(&node.key);
@@ -491,5 +594,59 @@ mod tests {
         let per_pyr = small.max_tiles_for_pyramid(4, 200);
         assert_eq!(per_pyr, 0);
         assert!(per_pyr * 4 * 200 * 2 < small.max_bytes());
+    }
+
+    #[test]
+    fn active_frame_protection_and_remove_where_preserve_invariants() {
+        let mut cache = TileCache::new(300);
+        let k1 = make_key(TileScheme::WebMercator, 1, 0, 0);
+        let k2 = make_key(TileScheme::WebMercator, 1, 1, 0);
+        let k3 = make_key(TileScheme::WebMercator, 1, 0, 1);
+        let k4 = make_key(TileScheme::WebMercator, 1, 1, 1);
+        let other = TileKey {
+            source: SourceId::from_stable_key("other-source"),
+            ..k1
+        };
+
+        cache.insert(k1, "k1", 100).expect("k1");
+        cache.insert(k2, "k2", 100).expect("k2");
+        cache.insert(k3, "k3", 100).expect("k3");
+
+        // k1 is the LRU tail, but protected (currently displayed in active frame).
+        // Inserting k4 must skip k1 and evict k2 instead.
+        let ev = cache
+            .insert_protecting(k4, "k4", 100, |k| *k == k1)
+            .expect("insert skipping protected");
+        assert_eq!(ev, vec![(k2, "k2")]);
+        assert!(cache.contains(&k1));
+        assert!(!cache.contains(&k2));
+        assert!(cache.contains(&k3));
+        assert!(cache.contains(&k4));
+        assert_eq!(cache.total_bytes(), 300);
+
+        // If every cached tile is protected, admission is rejected atomically
+        // without evicting protected tiles or corrupting existing entries.
+        let rejected = cache.insert_protecting(other, "other", 100, |_| true);
+        assert_eq!(rejected, Err((other, "other")));
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.total_bytes(), 300);
+        assert!(cache.contains(&k1));
+
+        // Replacing an existing entry with a larger payload that cannot fit
+        // without evicting protected tiles also fails atomically without removing `k3`.
+        let rejected_replace = cache.insert_protecting(k3, "k3_big", 200, |k| *k != k3);
+        assert_eq!(rejected_replace, Err((k3, "k3_big")));
+        assert_eq!(cache.peek(&k3), Some(&"k3"));
+        assert_eq!(cache.total_bytes(), 300);
+
+        // Insert a tile from another source, then remove_where clears only the bundled source.
+        cache
+            .insert_protecting(other, "other", 100, |k| *k == k1)
+            .expect("insert other");
+        let removed = cache.remove_where(|k| k.source == SourceId::BUNDLED_BASEMAP);
+        assert_eq!(removed.len(), 2);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains(&other));
+        assert_eq!(cache.total_bytes(), 100);
     }
 }

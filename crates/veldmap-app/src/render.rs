@@ -6,7 +6,7 @@
 //! Reverse-Z target, then composites 1:1 with `FilterMode::Nearest` onto
 //! `egui_wgpu`'s target format via `view_formats`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -14,13 +14,14 @@ use std::sync::{Arc, Weak};
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{
-    DEFAULT_GRID_CELLS, POLAR_R_CAP, QuadTileId, QuadtreeConfig, TileCache, TileScheme,
-    VisibleTile, adaptive_grid_step_deg, compose_uv_rect, sample_tile_surface, tile_grid_anchor,
-    traverse,
+    DEFAULT_GRID_CELLS, POLAR_R_CAP, QuadTileId, QuadtreeConfig, SourceId, TileCache, TileKey,
+    TileScheme, VisibleTile, adaptive_grid_step_deg, compose_uv_rect, sample_tile_surface,
+    tile_grid_anchor, traverse,
 };
+use veldmap_raster::{BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL};
 use wgpu::util::DeviceExt;
 
-use crate::gpu_tiles::{GpuTile, GpuTileCache, bundled_tile_key};
+use crate::gpu_tiles::{GpuTile, GpuTileCache, bundled_tile_key, source_tile_key};
 use crate::mesh::{SharedTileIndices, TileVertex, build_tile_vertices};
 
 /// Embedded WGSL source for the quadtree globe body and procedural graticule.
@@ -93,6 +94,9 @@ pub struct DrawTile {
 pub struct DrawSnapshot {
     pub camera: Camera,
     pub tiles: Vec<DrawTile>,
+    /// Exact GPU carrier tile keys referenced by `tiles`, used for active-frame
+    /// `TileCache` protection so uploads never evict currently visible tiles.
+    pub carrier_keys: HashSet<TileKey>,
     pub grid_cells: u32,
     pub show_graticule: bool,
     pub grid_step_deg: f64,
@@ -101,12 +105,18 @@ pub struct DrawSnapshot {
 }
 
 impl DrawSnapshot {
-    /// Build a draw snapshot from a camera pose, viewport dimensions, and
-    /// optional [`GpuTileCache`] (passing `textured = false` renders untextured
-    /// WGS84 ellipsoid shading through the exact same quadtree).
+    /// Build a draw snapshot from a camera pose, viewport dimensions, active
+    /// basemap [`SourceId`], and optional [`GpuTileCache`] (passing
+    /// `textured = false` renders untextured WGS84 ellipsoid shading through
+    /// the exact same quadtree).
+    ///
+    /// Enforces the explicit `PolarCap` + live-basemap contract: `PolarCap`
+    /// tiles always resolve against `SourceId::BUNDLED_BASEMAP` (never a live
+    /// HTTP source), and non-polar live tiles seamlessly fall back to cached
+    /// `SourceId::BUNDLED_BASEMAP` tiles while streaming or offline.
     #[expect(
         clippy::too_many_arguments,
-        reason = "snapshot builder groups explicit viewport, graticule, and cache inputs"
+        reason = "snapshot builder groups explicit viewport, source, graticule, and cache inputs"
     )]
     pub fn build(
         camera: Camera,
@@ -115,6 +125,7 @@ impl DrawSnapshot {
         pixels_per_point: f32,
         show_graticule: bool,
         textured: bool,
+        active_source: SourceId,
         generation: u64,
         config: &QuadtreeConfig,
         cache: Option<&mut GpuTileCache>,
@@ -127,14 +138,37 @@ impl DrawSnapshot {
         let grid_width_px = (0.75 * pixels_per_point.max(1.0)).clamp(0.65, 3.0);
 
         let mut tiles = Vec::with_capacity(visible.len());
+        let mut carrier_keys = HashSet::new();
         match (textured, cache) {
             (true, Some(gpu_cache)) => {
                 for vis in visible {
-                    let wanted_key = bundled_tile_key(vis.tex_id);
-                    if let Some((_carrier_key, carrier_uv, gpu_tile)) =
-                        gpu_cache.carrier(&wanted_key)
-                    {
-                        let uv_rect = compose_uv_rect(carrier_uv, vis.uv_rect);
+                    let resolved = if matches!(vis.tex_id.scheme, TileScheme::PolarCap { .. }) {
+                        let (polar_id, polar_uv) =
+                            vis.tex_id.clamp_to_level(BUNDLED_POLAR_MAX_LEVEL);
+                        let key = bundled_tile_key(polar_id);
+                        gpu_cache.carrier(&key).map(|(ck, c_uv, tile)| {
+                            let uv = compose_uv_rect(c_uv, compose_uv_rect(polar_uv, vis.uv_rect));
+                            (ck, uv, tile)
+                        })
+                    } else {
+                        let primary_key = source_tile_key(active_source, vis.tex_id);
+                        if let Some((ck, c_uv, tile)) = gpu_cache.carrier(&primary_key) {
+                            Some((ck, compose_uv_rect(c_uv, vis.uv_rect), tile))
+                        } else if active_source != SourceId::BUNDLED_BASEMAP {
+                            // Offline / Frame-1 fallback to bundled basemap in matching scheme.
+                            let (fb_id, fb_uv) = vis.tex_id.clamp_to_level(BUNDLED_MAX_LEVEL);
+                            let fb_key = bundled_tile_key(fb_id);
+                            gpu_cache.carrier(&fb_key).map(|(ck, c_uv, tile)| {
+                                let uv = compose_uv_rect(c_uv, compose_uv_rect(fb_uv, vis.uv_rect));
+                                (ck, uv, tile)
+                            })
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some((carrier_key, uv_rect, gpu_tile)) = resolved {
+                        carrier_keys.insert(carrier_key);
                         tiles.push(DrawTile {
                             visible: vis,
                             texture: Some(gpu_tile),
@@ -163,6 +197,7 @@ impl DrawSnapshot {
         Self {
             camera,
             tiles,
+            carrier_keys,
             grid_cells: config.grid_cells.max(1),
             show_graticule,
             grid_step_deg,
@@ -449,13 +484,13 @@ impl GlobeRenderer {
             });
 
         let tile_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("globe tile linear clamp sampler"),
+            label: Some("globe tile trilinear clamp sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 

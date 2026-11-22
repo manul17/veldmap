@@ -4,18 +4,15 @@ Curated migration input preserved from the legacy VeldMap repository at annotate
 
 - **Original reference snapshot (`legacy-reference-snapshot`):** 79 reference files.
 - **Retired in Slice 1:** 20 files (`code/geo/*` except `overlay.rs`, `code/provider/mgrs.rs`, `tests/geo/*`, `tests/provider/mgrs_tests.rs`, `docs/globe.md`, `docs/decisions/0006-terrain-on-the-globe.md`).
-- **Remaining reference files:** 59 files (20 of which still contain legacy Cyrillic comments, test strings, or glossary entries; everything ported into `crates/` and `docs/` is strictly English, and the `old/` CI exclusion is removed in Slice 6).
+- **Retired in Slice 2B:** 5 files (`code/cache/{evict,layout,store,tile}.rs`, `tests/cache/evict_tests.rs`).
+- **Remaining reference files:** 54 files (everything ported into `crates/` and `docs/` is strictly English, and the `old/` CI exclusion is removed in Slice 6).
 
-## Remaining Retirement Manifest (59 Reference Files)
+## Remaining Retirement Manifest (54 Reference Files)
 
 Each reference file is deleted only after its **last** consumer slice closes and its tests/ADRs land.
 
 | File | Consumer Slices | Delete After Slice |
 |---|---|---|
-| `code/cache/evict.rs` | Slice 2B | Slice 2B |
-| `code/cache/layout.rs` | Slice 2B | Slice 2B |
-| `code/cache/store.rs` | Slice 2B | Slice 2B |
-| `code/cache/tile.rs` | Slice 2B | Slice 2B |
 | `code/geo/overlay.rs` | Slice 3A-1 | Slice 3A-1 |
 | `code/library/catalog.rs` | Slice 4B | Slice 4B |
 | `code/library/download.rs` | Slice 4B | Slice 4B |
@@ -58,7 +55,6 @@ Each reference file is deleted only after its **last** consumer slice closes and
 | `docs/imagery.md` | Slice 3C-1, Slice 4B, Slice 6 | Slice 6 |
 | `docs/limitations.md` | Phase 0.5, Slice 1–6 | Slice 6 |
 | `docs/viewing-pipeline.md` | Slice 2A, Slice 3A-1 | Slice 3A-1 |
-| `tests/cache/evict_tests.rs` | Slice 2B | Slice 2B |
 | `tests/provider/imagery_tests.rs` | Slice 4B | Slice 4B |
 | `tests/provider/manifest_tests.rs` | Slice 4B | Slice 4B |
 | `tests/provider/s3_tests.rs` | Slice 4B | Slice 4B |

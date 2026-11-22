@@ -6,14 +6,16 @@ Fast, purely native Rust desktop **Analytical Earth-Observation & Precision-Imag
 
 VeldMap is built in vertical slices tracked in [plan.md](plan.md):
 
-- **Implemented (Slices 1–2A):** Interactive 3D WGS84 globe (`2 m` altitude floor, geodetic-nadir camera, MGRS/DD/DMS Go-To navigation, baseline GIS HUD) backed by pure-Rust `f64` geodesy/projections, an adaptive planetary quadtree with Polar Stereographic caps, a post-overlay procedural graticule, and a bundled offline NASA Blue Marble basemap (`veldmap-raster`).
-- **Planned (v0.2–v1.0):** Async live satellite basemaps (NASA GIBS / EOX Sentinel-2 Cloudless) & disk cache, local GeoTIFF/BigTIFF/COG/PNG/JPEG overlays & CRS/geodesic tools, zero-auth STAC/COG HTTP Range streaming, `R32Float`/`R8Uint`/`R16Uint` scientific & categorical band math (NDVI/NDWI/false-color + `SCL` cloud masking), analytical DEM relief, and multi-temporal timeline diffing & time-series export.
+- **Implemented (Slices 1–2B):** Interactive 3D WGS84 globe (`2 m` altitude floor, geodetic-nadir camera, MGRS/DD/DMS Go-To navigation, baseline GIS HUD) backed by pure-Rust `f64` geodesy/projections, an adaptive planetary quadtree with Polar Stereographic caps, a post-overlay procedural graticule, bundled offline NASA Blue Marble (`veldmap-raster`), durable settings + SQLite WAL LRU disk caching (`veldmap-storage`), and async live HTTP basemaps (NASA GIBS, EOX Sentinel-2 Cloudless, Custom XYZ/TMS) with CPU linear-light mipmaps and offline/polar fallback (`veldmap-net`).
+- **Planned (v0.2–v1.0):** Local GeoTIFF/BigTIFF/COG/PNG/JPEG overlays & CRS/geodesic tools, zero-auth STAC/COG HTTP Range streaming, `R32Float`/`R8Uint`/`R16Uint` scientific & categorical band math (NDVI/NDWI/false-color + `SCL` cloud masking), analytical DEM relief, and multi-temporal timeline diffing & time-series export.
 - **Planned (v1.1):** Sentinel-2 JPEG 2000, authenticated CDSE S3 streaming & resumable downloads, and Sentinel-3/5P NetCDF-4/HDF5.
 
 ## Workspace Layout
 
-- `crates/veldmap-core` — Pure domain logic (`geo`, `tile`; zero `egui`, `eframe`, `wgpu`, `image`, or network dependencies).
-- `crates/veldmap-raster` — Memory-bounded PNG/JPEG tile decoding and virtual offline equirectangular basemap tiling.
+- `crates/veldmap-core` — Pure domain logic (`geo`, `tile`, std-only `io::CancelToken`; zero `egui`, `eframe`, `wgpu`, `image`, or network dependencies).
+- `crates/veldmap-raster` — Memory-bounded PNG/JPEG tile decoding, CPU linear-light mipmap generation, and virtual offline equirectangular basemap tiling.
+- `crates/veldmap-storage` — Injectable `StoragePaths`, durable atomic JSON persistence (`write_atomic_durable`), user basemap settings, and crash-safe SQLite WAL LRU tile disk cache.
+- `crates/veldmap-net` — Async `tokio` + `reqwest`/`rustls` (`ring`) live HTTP tile streaming, per-host concurrency limiting, bounded CPU decode pool, and NASA GIBS / EOX / Custom XYZ/TMS specs.
 - `crates/veldmap-app` — Native `eframe`/`egui` + `wgpu` desktop application (`[lib]` + `[[bin]]` so rendering and shader tests run headlessly).
 - `assets/` — Public-domain bundled assets and provenance notes ([assets/README.md](assets/README.md)).
 - `docs/` — Build guide, design decisions, glossary, and current limitations ([docs/README.md](docs/README.md)).

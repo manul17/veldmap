@@ -1,7 +1,6 @@
 //! Main `eframe::App` state, GPU tile cache / upload scheduling, cached
 //! quadtree draw snapshots, globe input handling, and GIS HUD layout.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use eframe::egui;
@@ -9,12 +8,14 @@ use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor
 use thiserror::Error;
 use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
 use veldmap_core::geo::coords::parse_location;
-use veldmap_core::tile::{QuadtreeConfig, TileKey};
-use veldmap_raster::BUNDLED_TILE_PX;
+use veldmap_core::tile::SourceId;
+use veldmap_storage::BasemapSelection;
 
+use crate::basemap::BasemapManager;
+use crate::basemap_ui::{self, BasemapUiState};
 use crate::gpu_tiles::{
-    BundledBasemapProvider, DEFAULT_GPU_TILE_CACHE_BYTES, DEFAULT_UPLOAD_BYTE_BUDGET,
-    DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads, bundled_tile_key,
+    DEFAULT_GPU_TILE_CACHE_BYTES, DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET,
+    GpuTileCache, PendingUploads,
 };
 use crate::hud;
 use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams};
@@ -35,15 +36,6 @@ fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
     }
 }
 
-/// Active planetary basemap display mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BasemapMode {
-    /// Bundled offline satellite basemap (`z = 0..3` Geodetic + `z = 0` PolarCap).
-    Satellite,
-    /// Untextured WGS84 ellipsoid rendered through the exact same quadtree.
-    EllipsoidOnly,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SnapshotKey {
     eye_bits: [u64; 3],
@@ -51,18 +43,24 @@ struct SnapshotKey {
     width_px: u32,
     height_px: u32,
     ppp_bits: u32,
-    basemap_mode: BasemapMode,
+    basemap: BasemapSelection,
+    active_source: SourceId,
     show_graticule: bool,
     scene_generation: u64,
 }
 
 impl SnapshotKey {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "snapshot cache key hashes explicit camera, viewport, basemap, and generation fields"
+    )]
     fn new(
         camera: &Camera,
         width_px: u32,
         height_px: u32,
         pixels_per_point: f32,
-        basemap_mode: BasemapMode,
+        basemap: BasemapSelection,
+        active_source: SourceId,
         show_graticule: bool,
         scene_generation: u64,
     ) -> Self {
@@ -74,7 +72,8 @@ impl SnapshotKey {
             width_px,
             height_px,
             ppp_bits: pixels_per_point.to_bits(),
-            basemap_mode,
+            basemap,
+            active_source,
             show_graticule,
             scene_generation,
         }
@@ -147,13 +146,11 @@ pub struct VeldmapApp {
     device: wgpu::Device,
     queue: wgpu::Queue,
     camera: Camera,
-    basemap_mode: BasemapMode,
     show_graticule: bool,
-    quadtree_config: QuadtreeConfig,
     gpu_tile_cache: GpuTileCache,
     pending_uploads: PendingUploads,
-    basemap_provider: BundledBasemapProvider,
-    wanted_tiles: HashSet<TileKey>,
+    basemap: BasemapManager,
+    basemap_ui: BasemapUiState,
     cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
     scene_generation: u64,
     cursor_geo: Option<(f64, f64)>,
@@ -162,6 +159,18 @@ pub struct VeldmapApp {
     last_viewport_height_px: f64,
     goto_input: String,
     goto_error: Option<String>,
+}
+
+impl Drop for VeldmapApp {
+    fn drop(&mut self) {
+        // Deterministic shutdown order:
+        // 1. Cancel tokens / signal background workers
+        // 2. Drop completion channel receiver (`PendingUploads::close`)
+        // 3. Join CPU decode & bundled threads -> shut down `tokio::Runtime`
+        self.basemap.begin_shutdown();
+        self.pending_uploads.close();
+        self.basemap.finish_shutdown();
+    }
 }
 
 impl VeldmapApp {
@@ -200,22 +209,23 @@ impl VeldmapApp {
         let wakeup = Arc::new(move || {
             egui_ctx.request_repaint();
         });
-        let quadtree_config = QuadtreeConfig::bundled_geodetic();
-        let (mut basemap_provider, pending_uploads) = BundledBasemapProvider::spawn(wakeup);
-        basemap_provider.seed_roots(quadtree_config.scheme);
+
+        let pending_uploads = PendingUploads::new();
+        let done_tx = pending_uploads.sender().ok_or(AppError::MissingWgpu)?;
+        let basemap = BasemapManager::new(done_tx, wakeup, None);
+        let show_graticule = basemap.settings().show_graticule;
+        let basemap_ui = BasemapUiState::new(basemap.settings());
 
         Ok(Self {
             adapter_label,
             device,
             queue,
             camera: Camera::default(),
-            basemap_mode: BasemapMode::Satellite,
-            show_graticule: true,
-            quadtree_config,
+            show_graticule,
             gpu_tile_cache: GpuTileCache::new(DEFAULT_GPU_TILE_CACHE_BYTES),
             pending_uploads,
-            basemap_provider,
-            wanted_tiles: HashSet::new(),
+            basemap,
+            basemap_ui,
             cached_snapshot: None,
             scene_generation: 1,
             cursor_geo: None,
@@ -278,7 +288,7 @@ impl VeldmapApp {
     }
 
     /// Return the cached immutable `Arc<DrawSnapshot>` when `(camera, viewport,
-    /// mode, graticule, scene_generation)` is unchanged (avoiding quadtree
+    /// basemap, graticule, scene_generation)` is unchanged (avoiding quadtree
     /// traversal on 120 Hz mouse hover), or rebuild and schedule missing tiles.
     fn snapshot_for_frame(
         &mut self,
@@ -286,12 +296,15 @@ impl VeldmapApp {
         height_px: u32,
         pixels_per_point: f32,
     ) -> Arc<DrawSnapshot> {
+        let active_source = self.basemap.active_source();
+        let selection = self.basemap.settings().active_basemap;
         let key = SnapshotKey::new(
             &self.camera,
             width_px,
             height_px,
             pixels_per_point,
-            self.basemap_mode,
+            selection,
+            active_source,
             self.show_graticule,
             self.scene_generation,
         );
@@ -301,7 +314,8 @@ impl VeldmapApp {
             return Arc::clone(snapshot);
         }
 
-        let textured = self.basemap_mode == BasemapMode::Satellite;
+        let textured = self.basemap.is_textured();
+        let quadtree_config = self.basemap.quadtree_config();
         let snapshot = Arc::new(DrawSnapshot::build(
             self.camera,
             width_px,
@@ -309,53 +323,14 @@ impl VeldmapApp {
             pixels_per_point,
             self.show_graticule,
             textured,
+            active_source,
             self.scene_generation,
-            &self.quadtree_config,
+            &quadtree_config,
             textured.then_some(&mut self.gpu_tile_cache),
         ));
 
-        self.wanted_tiles.clear();
-        if textured {
-            let tile_bytes = (BUNDLED_TILE_PX as usize) * (BUNDLED_TILE_PX as usize) * 4;
-            let appetite_cap = self.gpu_tile_cache.max_tiles_for_pyramid(1, tile_bytes);
-
-            let mut missing: Vec<TileKey> = Vec::new();
-            let mut already_cached_wanted = 0usize;
-            for draw in &snapshot.tiles {
-                let tex_key = bundled_tile_key(draw.visible.tex_id);
-                if self.wanted_tiles.insert(tex_key) {
-                    if self.gpu_tile_cache.contains(&tex_key) {
-                        already_cached_wanted += 1;
-                    } else if !self.pending_uploads.contains(&tex_key)
-                        && !self.basemap_provider.is_in_flight(&tex_key)
-                    {
-                        missing.push(tex_key);
-                    }
-                }
-            }
-            // Cancel stale queued requests and release tiles already waiting in
-            // `pending_uploads` from `in_flight` first so visible + in-flight +
-            // queued are counted once against the < 50% VRAM appetite cap.
-            self.basemap_provider.reconcile(
-                &self.gpu_tile_cache,
-                &self.pending_uploads,
-                &self.wanted_tiles,
-            );
-            let committed = already_cached_wanted
-                .saturating_add(self.basemap_provider.in_flight_count())
-                .saturating_add(self.pending_uploads.len());
-            let remaining_budget = appetite_cap.saturating_sub(committed);
-            missing.sort_by_key(TileKey::coarsest_first_key);
-            for tex_key in missing.into_iter().take(remaining_budget) {
-                self.basemap_provider.request(tex_key);
-            }
-        } else {
-            self.basemap_provider.reconcile(
-                &self.gpu_tile_cache,
-                &self.pending_uploads,
-                &self.wanted_tiles,
-            );
-        }
+        self.basemap
+            .schedule_for_snapshot(&snapshot, &self.gpu_tile_cache, &self.pending_uploads);
 
         self.cached_snapshot = Some((key, Arc::clone(&snapshot)));
         snapshot
@@ -367,15 +342,20 @@ impl eframe::App for VeldmapApp {
         let ctx = ui.ctx().clone();
 
         // Drain background tile completions and upload coarsest-first within
-        // the per-frame VRAM/time budget before building this frame's snapshot.
-        // Passing `Some(&self.wanted_tiles)` keeps `level == 0` planetary roots
-        // warm on startup while pruning stale non-root tiles (including in
-        // `EllipsoidOnly` mode).
+        // the per-frame VRAM/time budget while protecting active-frame
+        // carriers from eviction.
+        let active_source = self.basemap.active_source();
+        let protected = self
+            .cached_snapshot
+            .as_ref()
+            .map(|(_, snap)| &snap.carrier_keys);
         let upload_report = self.pending_uploads.drain_and_upload(
             &self.device,
             &self.queue,
             &mut self.gpu_tile_cache,
-            Some(&self.wanted_tiles),
+            active_source,
+            Some(self.basemap.wanted_tiles()),
+            protected,
             DEFAULT_UPLOAD_BYTE_BUDGET,
             DEFAULT_UPLOAD_TIME_BUDGET,
         );
@@ -383,11 +363,8 @@ impl eframe::App for VeldmapApp {
             self.scene_generation = self.scene_generation.wrapping_add(1);
         }
         if upload_report.uploaded > 0 || upload_report.remaining > 0 {
-            self.basemap_provider.reconcile(
-                &self.gpu_tile_cache,
-                &self.pending_uploads,
-                &self.wanted_tiles,
-            );
+            self.basemap
+                .reconcile_providers(&self.gpu_tile_cache, &self.pending_uploads);
         }
 
         // Advance active quaternion camera flights (cap dt to 50 ms so a
@@ -403,8 +380,9 @@ impl eframe::App for VeldmapApp {
             self.camera.reset_north();
         }
 
-        // Top toolbar: title, Go-To DD/DMS/MGRS input, Satellite/Ellipsoid
-        // switcher, graticule toggle, and GPU badge.
+        // Top toolbar: title, Go-To DD/DMS/MGRS input, live/offline basemap
+        // selector + settings, graticule toggle, and GPU badge.
+        let mut basemap_changed = false;
         egui::Panel::top("top_toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong(veldmap_core::APP_NAME);
@@ -412,7 +390,7 @@ impl eframe::App for VeldmapApp {
 
                 ui.label("Go to:");
                 let text_edit = egui::TextEdit::singleline(&mut self.goto_input)
-                    .desired_width(180.0)
+                    .desired_width(170.0)
                     .hint_text("DD, DMS, or MGRS (e.g. 47.23, 39.70 / 37UDQ)");
                 let edit_resp = ui.add(text_edit);
                 if edit_resp.changed() {
@@ -425,15 +403,24 @@ impl eframe::App for VeldmapApp {
                 }
 
                 ui.separator();
-                ui.selectable_value(&mut self.basemap_mode, BasemapMode::Satellite, "Satellite");
-                ui.selectable_value(
-                    &mut self.basemap_mode,
-                    BasemapMode::EllipsoidOnly,
-                    "Ellipsoid-only",
+                basemap_changed |= basemap_ui::show_toolbar_controls(
+                    ui,
+                    &mut self.basemap,
+                    &mut self.basemap_ui,
+                    &mut self.gpu_tile_cache,
+                    &mut self.pending_uploads,
                 );
 
                 ui.separator();
-                ui.checkbox(&mut self.show_graticule, "Graticule");
+                if ui.checkbox(&mut self.show_graticule, "Graticule").changed() {
+                    let mut next = self.basemap.settings().clone();
+                    next.show_graticule = self.show_graticule;
+                    self.basemap.apply_settings(
+                        next,
+                        &mut self.gpu_tile_cache,
+                        &mut self.pending_uploads,
+                    );
+                }
 
                 if let Some(err) = &self.goto_error {
                     ui.separator();
@@ -457,6 +444,17 @@ impl eframe::App for VeldmapApp {
                 });
             });
         });
+
+        basemap_changed |= basemap_ui::show_settings_window(
+            &ctx,
+            &mut self.basemap,
+            &mut self.basemap_ui,
+            &mut self.gpu_tile_cache,
+            &mut self.pending_uploads,
+        );
+        if basemap_changed {
+            self.scene_generation = self.scene_generation.wrapping_add(1);
+        }
 
         // Probe the current pointer against the previous frame's viewport rect
         // before laying out the bottom status bar so hover readouts stay in
@@ -558,6 +556,11 @@ impl eframe::App for VeldmapApp {
                     // Floating dynamic metric scale bar.
                     let m_per_pt = self.camera.metres_per_pixel(height_pt);
                     hud::paint_scale_bar(&painter, rect, m_per_pt);
+
+                    // Visible basemap attribution pill (NASA GIBS / EOX CC BY 4.0 / Custom).
+                    if let Some(attr) = self.basemap.attribution() {
+                        basemap_ui::paint_attribution_badge(&painter, rect, attr);
+                    }
                 } else {
                     // Release cached snapshot references when collapsed/minimized
                     // so evicted `Arc<GpuTile>`s are not pinned indefinitely.
@@ -576,10 +579,11 @@ impl eframe::App for VeldmapApp {
         }
 
         // Request a follow-up repaint only for active flights, camera changes,
-        // viewport resizes, or non-empty upload backlog (never idle).
+        // viewport resizes, basemap switches, or non-empty upload backlog (never idle).
         if self.camera.is_flying()
             || self.camera != camera_before
             || self.last_viewport_rect != rect_before
+            || basemap_changed
             || upload_report.remaining > 0
         {
             ctx.request_repaint();

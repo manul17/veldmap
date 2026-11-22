@@ -21,17 +21,21 @@
     reason = "INVARIANT: integration test helpers panic on headless GPU harness failure"
 )]
 
+use std::collections::HashSet;
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
 use veldmap_app::gpu_tiles::{
-    BUNDLED_BASEMAP_JPEG, GpuTileCache, PendingUploads, bundled_tile_key,
+    BUNDLED_BASEMAP_JPEG, GpuTileCache, PendingUploads, bundled_tile_key, source_tile_key,
+    texture_byte_size,
 };
 use veldmap_app::render::{DrawSnapshot, GlobeRenderer, RenderParams};
 use veldmap_core::geo::camera::{Camera, MIN_HEIGHT_M};
 use veldmap_core::geo::projection::WEB_MERCATOR_LIMIT_DEG;
-use veldmap_core::tile::{PixelFormat, QuadTileId, QuadtreeConfig, TileScheme};
-use veldmap_raster::{BundledBasemap, DecodedTile};
+use veldmap_core::tile::{
+    DecodedTile, PixelFormat, QuadTileId, QuadtreeConfig, SourceId, TileScheme,
+};
+use veldmap_raster::{BundledBasemap, generate_linear_mipmaps};
 
 fn shared_headless_device() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
     static DEVICE: OnceLock<Option<(wgpu::Device, wgpu::Queue)>> = OnceLock::new();
@@ -277,7 +281,18 @@ fn srgb_and_unorm_compositing_parity_and_zero_idle_rerender() {
     let (w, h) = (129, 129);
     let cfg = QuadtreeConfig::bundled_geodetic();
     let orbital_cam = Camera::default();
-    let snap = DrawSnapshot::build(orbital_cam, w, h, 1.0, true, false, 1, &cfg, None);
+    let snap = DrawSnapshot::build(
+        orbital_cam,
+        w,
+        h,
+        1.0,
+        true,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        1,
+        &cfg,
+        None,
+    );
     let orbital_params = RenderParams {
         width: w,
         height: h,
@@ -356,8 +371,30 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
 
     let orbital_cam = Camera::default();
-    let with_grid_snap = DrawSnapshot::build(orbital_cam, w, h, 1.0, true, false, 1, &cfg, None);
-    let no_grid_snap = DrawSnapshot::build(orbital_cam, w, h, 1.0, false, false, 1, &cfg, None);
+    let with_grid_snap = DrawSnapshot::build(
+        orbital_cam,
+        w,
+        h,
+        1.0,
+        true,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        1,
+        &cfg,
+        None,
+    );
+    let no_grid_snap = DrawSnapshot::build(
+        orbital_cam,
+        w,
+        h,
+        1.0,
+        false,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        1,
+        &cfg,
+        None,
+    );
     let _ = render_srgb(&mut renderer, device, queue, w, h, &with_grid_snap);
     let no_grid_pixels = render_srgb(&mut renderer, device, queue, w, h, &no_grid_snap);
     let body_center = pixel_at(&no_grid_pixels, w, w / 2, h / 2);
@@ -369,8 +406,30 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
     // At (37.5 N, 52.5 E, 14,000 km), front 15-degree graticule lines lie far
     // from viewport center; central 9x9 patch must stay free of back-side bleed.
     let cam = Camera::at(37.5, 52.5, 14_000_000.0);
-    let s_on = DrawSnapshot::build(cam, w, h, 1.0, true, false, 2, &cfg, None);
-    let s_off = DrawSnapshot::build(cam, w, h, 1.0, false, false, 2, &cfg, None);
+    let s_on = DrawSnapshot::build(
+        cam,
+        w,
+        h,
+        1.0,
+        true,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        2,
+        &cfg,
+        None,
+    );
+    let s_off = DrawSnapshot::build(
+        cam,
+        w,
+        h,
+        1.0,
+        false,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        2,
+        &cfg,
+        None,
+    );
     let with_grid = render_srgb(&mut renderer, device, queue, w, h, &s_on);
     let without_grid = render_srgb(&mut renderer, device, queue, w, h, &s_off);
     let mid = w / 2;
@@ -390,8 +449,30 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
     // on screen (`dw_lon ~ 0.15`) and must remain visibly drawn (not suppressed
     // by a fixed-latitude polar fade).
     let polar_cam = Camera::at(89.000_025, 0.000_05, MIN_HEIGHT_M);
-    let polar_on = DrawSnapshot::build(polar_cam, 129, 129, 1.0, true, false, 3, &cfg, None);
-    let polar_off = DrawSnapshot::build(polar_cam, 129, 129, 1.0, false, false, 3, &cfg, None);
+    let polar_on = DrawSnapshot::build(
+        polar_cam,
+        129,
+        129,
+        1.0,
+        true,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        3,
+        &cfg,
+        None,
+    );
+    let polar_off = DrawSnapshot::build(
+        polar_cam,
+        129,
+        129,
+        1.0,
+        false,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        3,
+        &cfg,
+        None,
+    );
     let p_on = render_srgb(&mut renderer, device, queue, 129, 129, &polar_on);
     let p_off = render_srgb(&mut renderer, device, queue, 129, 129, &polar_off);
     let on_px = pixel_at(&p_on, 129, 64, 64);
@@ -411,7 +492,18 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
     let cfg = QuadtreeConfig::bundled_geodetic();
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
     let cam = Camera::at(37.5, 52.5, 14_000_000.0);
-    let empty_snap = DrawSnapshot::build(cam, 0, 0, 1.0, true, false, 1, &cfg, None);
+    let empty_snap = DrawSnapshot::build(
+        cam,
+        0,
+        0,
+        1.0,
+        true,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        1,
+        &cfg,
+        None,
+    );
 
     let mut zero_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     assert!(!renderer.render_if_dirty(
@@ -425,7 +517,18 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
         },
     ));
 
-    let snap = DrawSnapshot::build(cam, 65, 65, 1.0, true, false, 1, &cfg, None);
+    let snap = DrawSnapshot::build(
+        cam,
+        65,
+        65,
+        1.0,
+        true,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        1,
+        &cfg,
+        None,
+    );
     let params = RenderParams {
         width: 65,
         height: 65,
@@ -452,8 +555,8 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
     let basemap = shared_bundled_basemap();
     let cfg = QuadtreeConfig::bundled_geodetic();
 
-    let (tx, rx) = mpsc::channel();
-    let mut pending = PendingUploads::new(rx);
+    let mut pending = PendingUploads::new();
+    let tx = pending.sender().expect("pending sender");
 
     let fine_id = QuadTileId {
         scheme: TileScheme::Geodetic,
@@ -495,7 +598,16 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
 
     // Budget of 1 byte must STILL upload 1 coarsest tile (anti-starvation).
-    let r1 = pending.drain_and_upload(device, queue, &mut cache, None, 1, Duration::from_millis(0));
+    let r1 = pending.drain_and_upload(
+        device,
+        queue,
+        &mut cache,
+        SourceId::BUNDLED_BASEMAP,
+        None,
+        None,
+        1,
+        Duration::from_millis(0),
+    );
     assert_eq!(r1.uploaded, 1);
     assert_eq!(r1.remaining, 3);
     assert!(
@@ -512,6 +624,7 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
             1.0,
             false,
             true,
+            SourceId::BUNDLED_BASEMAP,
             1,
             &cfg,
             Some(&mut cache),
@@ -525,6 +638,8 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         device,
         queue,
         &mut cache,
+        SourceId::BUNDLED_BASEMAP,
+        None,
         None,
         1024 * 1024,
         Duration::from_secs(1),
@@ -549,6 +664,8 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         device,
         queue,
         &mut cache,
+        SourceId::BUNDLED_BASEMAP,
+        None,
         None,
         1024 * 1024,
         Duration::from_secs(1),
@@ -617,6 +734,7 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
         1.0,
         false,
         true,
+        SourceId::BUNDLED_BASEMAP,
         10,
         &cfg,
         Some(&mut cache),
@@ -640,6 +758,7 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
         1.0,
         false,
         true,
+        SourceId::BUNDLED_BASEMAP,
         11,
         &cfg,
         Some(&mut cache),
@@ -663,6 +782,7 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
         1.0,
         false,
         true,
+        SourceId::BUNDLED_BASEMAP,
         12,
         &cfg,
         Some(&mut cache),
@@ -691,7 +811,18 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
 
     // 1. Midpoint between-vertices sag clearance at 2 m altitude.
     let between_cam = Camera::at(45.000_73, 45.000_73, MIN_HEIGHT_M);
-    let between_snap = DrawSnapshot::build(between_cam, w, h, 1.0, false, false, 1, &cfg, None);
+    let between_snap = DrawSnapshot::build(
+        between_cam,
+        w,
+        h,
+        1.0,
+        false,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        1,
+        &cfg,
+        None,
+    );
     let max_level = between_snap
         .tiles
         .iter()
@@ -724,6 +855,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         1.0,
         true,
         false,
+        SourceId::BUNDLED_BASEMAP,
         2,
         &cfg,
         None,
@@ -735,6 +867,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         1.0,
         true,
         false,
+        SourceId::BUNDLED_BASEMAP,
         3,
         &cfg,
         None,
@@ -762,12 +895,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
             quad_data[off..off + 4].copy_from_slice(&color);
         }
     }
-    let synthetic_east = DecodedTile {
-        width: 64,
-        height: 64,
-        format: PixelFormat::Rgba8UnormSrgb,
-        data: quad_data,
-    };
+    let synthetic_east = DecodedTile::new(64, 64, PixelFormat::Rgba8UnormSrgb, quad_data);
     let mut overzoom_cache = GpuTileCache::new(1024 * 1024);
     let east_root = bundled_tile_key(QuadTileId {
         scheme: TileScheme::Geodetic,
@@ -787,6 +915,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         1.0,
         false,
         true,
+        SourceId::BUNDLED_BASEMAP,
         4,
         &cfg,
         Some(&mut overzoom_cache),
@@ -814,6 +943,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         1.0,
         true,
         false,
+        SourceId::BUNDLED_BASEMAP,
         6,
         &cfg,
         None,
@@ -825,6 +955,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         1.0,
         true,
         false,
+        SourceId::BUNDLED_BASEMAP,
         7,
         &cfg,
         None,
@@ -836,6 +967,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         1.0,
         true,
         false,
+        SourceId::BUNDLED_BASEMAP,
         8,
         &cfg,
         None,
@@ -865,8 +997,18 @@ fn multi_lod_polar_seam_and_web_mercator_continuity() {
     // 1. Genuine multi-LOD transition: assert `max_l > min_l` strictly and zero cracks.
     let (mw, mh) = (193, 193);
     let multi_lod_cam = Camera::at(45.0, 39.0, 3_500_000.0);
-    let multi_lod_snap =
-        DrawSnapshot::build(multi_lod_cam, mw, mh, 1.0, true, false, 1, &cfg, None);
+    let multi_lod_snap = DrawSnapshot::build(
+        multi_lod_cam,
+        mw,
+        mh,
+        1.0,
+        true,
+        false,
+        SourceId::BUNDLED_BASEMAP,
+        1,
+        &cfg,
+        None,
+    );
     let min_l = multi_lod_snap
         .tiles
         .iter()
@@ -924,7 +1066,18 @@ fn multi_lod_polar_seam_and_web_mercator_continuity() {
             &cfg,
         ),
     ] {
-        let seam_snap = DrawSnapshot::build(cam, w, h, 1.0, true, false, 5, active_cfg, None);
+        let seam_snap = DrawSnapshot::build(
+            cam,
+            w,
+            h,
+            1.0,
+            true,
+            false,
+            SourceId::BUNDLED_BASEMAP,
+            5,
+            active_cfg,
+            None,
+        );
         assert!(
             !seam_snap.tiles.is_empty(),
             "{label}: quadtree produced 0 tiles"
@@ -940,4 +1093,175 @@ fn multi_lod_polar_seam_and_web_mercator_continuity() {
             }
         }
     }
+}
+
+#[test]
+fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let live_source = SourceId::from_stable_key("eox-s2cloudless-test");
+    let merc_cfg = QuadtreeConfig::web_mercator(14);
+    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+    // 1. CPU linear-light mipmaps upload into GpuTileCache with exact mip byte accounting.
+    let mut bundled_wm = DecodedTile::new(
+        64,
+        64,
+        PixelFormat::Rgba8UnormSrgb,
+        [40, 80, 210, 255].repeat(64 * 64),
+    );
+    generate_linear_mipmaps(&mut bundled_wm);
+    assert_eq!(bundled_wm.mip_level_count(), 7);
+    let expected_bytes = texture_byte_size(64, 64, PixelFormat::Rgba8UnormSrgb, 7);
+    assert_eq!(bundled_wm.byte_size(), expected_bytes);
+
+    let mut bundled_polar = DecodedTile::new(
+        64,
+        64,
+        PixelFormat::Rgba8UnormSrgb,
+        [235, 235, 235, 255].repeat(64 * 64),
+    );
+    generate_linear_mipmaps(&mut bundled_polar);
+
+    let mut live_tile = DecodedTile::new(
+        64,
+        64,
+        PixelFormat::Rgba8UnormSrgb,
+        [40, 200, 70, 255].repeat(64 * 64),
+    );
+    generate_linear_mipmaps(&mut live_tile);
+
+    // Budget holds 3 mipmapped 64x64 tiles comfortably.
+    let mut cache = GpuTileCache::new(expected_bytes * 3);
+    let wm_bundled_root = bundled_tile_key(QuadTileId {
+        scheme: TileScheme::WebMercator,
+        level: 0,
+        x: 0,
+        y: 0,
+    });
+    let south_polar_root = bundled_tile_key(QuadTileId {
+        scheme: TileScheme::PolarCap { north: false },
+        level: 0,
+        x: 0,
+        y: 0,
+    });
+    cache
+        .upload_and_insert(device, queue, wm_bundled_root, &bundled_wm)
+        .expect("upload bundled wm fallback");
+    cache
+        .upload_and_insert(device, queue, south_polar_root, &bundled_polar)
+        .expect("upload bundled polar cap");
+    assert_eq!(cache.total_bytes(), expected_bytes * 2);
+
+    // 2. While live tiles have not arrived yet, DrawSnapshot parameterized by
+    //    `live_source` falls back cleanly to bundled WebMercator blue.
+    let (w, h) = (65, 65);
+    let fallback_snap = DrawSnapshot::build(
+        Camera::at(0.0, 0.0, 2_000_000.0),
+        w,
+        h,
+        1.0,
+        false,
+        true,
+        live_source,
+        1,
+        &merc_cfg,
+        Some(&mut cache),
+    );
+    assert!(fallback_snap.carrier_keys.contains(&wm_bundled_root));
+    let fb_px = pixel_at(
+        &render_srgb(&mut renderer, device, queue, w, h, &fallback_snap),
+        w,
+        w / 2,
+        h / 2,
+    );
+    assert!(
+        fb_px[2] > fb_px[1] + 50,
+        "expected blue bundled offline fallback, got {fb_px:?}"
+    );
+
+    // 3. PolarCap under active `live_source` ALWAYS resolves to bundled polar
+    //    white (never live_source).
+    let polar_snap = DrawSnapshot::build(
+        Camera::at(-89.5, 0.0, 400_000.0),
+        w,
+        h,
+        1.0,
+        false,
+        true,
+        live_source,
+        2,
+        &merc_cfg,
+        Some(&mut cache),
+    );
+    assert!(polar_snap.carrier_keys.contains(&south_polar_root));
+    let polar_px = pixel_at(
+        &render_srgb(&mut renderer, device, queue, w, h, &polar_snap),
+        w,
+        w / 2,
+        h / 2,
+    );
+    assert!(
+        polar_px[0] > 180 && polar_px[1] > 180 && polar_px[2] > 180,
+        "expected bundled polar white under live source, got {polar_px:?}"
+    );
+
+    // 4. Upload live WebMercator root via PendingUploads with active-frame
+    //    protection -> live green overrides bundled fallback immediately.
+    let live_root = source_tile_key(
+        live_source,
+        QuadTileId {
+            scheme: TileScheme::WebMercator,
+            level: 0,
+            x: 0,
+            y: 0,
+        },
+    );
+    let mut pending = PendingUploads::new();
+    let tx = pending.sender().expect("sender");
+    tx.send((live_root, live_tile.clone())).expect("send live");
+    let rep = pending.drain_and_upload(
+        device,
+        queue,
+        &mut cache,
+        live_source,
+        Some(&HashSet::from([live_root])),
+        Some(&fallback_snap.carrier_keys),
+        1024 * 1024,
+        Duration::from_secs(1),
+    );
+    assert_eq!(rep.uploaded, 1);
+    assert!(cache.contains(&wm_bundled_root));
+    assert!(cache.contains(&live_root));
+
+    let live_snap = DrawSnapshot::build(
+        Camera::at(0.0, 0.0, 2_000_000.0),
+        w,
+        h,
+        1.0,
+        false,
+        true,
+        live_source,
+        3,
+        &merc_cfg,
+        Some(&mut cache),
+    );
+    let live_px = pixel_at(
+        &render_srgb(&mut renderer, device, queue, w, h, &live_snap),
+        w,
+        w / 2,
+        h / 2,
+    );
+    assert!(
+        live_px[1] > live_px[2] + 50,
+        "expected green live tile override, got {live_px:?}"
+    );
+
+    // 5. Removing `live_source` clears only live tiles and preserves bundled fallback.
+    assert_eq!(cache.remove_source(live_source), 1);
+    assert!(!cache.contains(&live_root));
+    assert!(cache.contains(&wm_bundled_root));
+    assert!(cache.contains(&south_polar_root));
 }

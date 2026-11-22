@@ -47,10 +47,12 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      - name: Check veldmap-core and veldmap-raster isolated headless builds
+      - name: Check headless non-UI crates in isolation
         run: |
           cargo test --locked -p veldmap-core --no-default-features
           cargo test --locked -p veldmap-raster
+          cargo test --locked -p veldmap-storage
+          cargo test --locked -p veldmap-net
 
       - name: Check rustdoc builds cleanly
         env:
@@ -152,6 +154,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "test"
+
+      - name: Run 3-OS Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run workspace unit, shader codegen, and headless GPU smoke tests
         env:

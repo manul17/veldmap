@@ -6,7 +6,7 @@ use veldmap_app::app::VeldmapApp;
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
-            "info,veldmap=debug,veldmap_app=debug,veldmap_core=debug,veldmap_raster=debug,wgpu_core=warn,wgpu_hal=warn",
+            "info,veldmap=debug,veldmap_app=debug,veldmap_core=debug,veldmap_raster=debug,veldmap_net=debug,veldmap_storage=debug,wgpu_core=warn,wgpu_hal=warn",
         )
     });
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();

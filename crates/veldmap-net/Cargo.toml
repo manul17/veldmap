@@ -1,0 +1,23 @@
+[package]
+name = "veldmap-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+veldmap-core = { path = "../veldmap-core" }
+veldmap-raster = { path = "../veldmap-raster" }
+veldmap-storage = { path = "../veldmap-storage" }
+
+[dev-dependencies]
+image.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
+
+[lints]
+workspace = true

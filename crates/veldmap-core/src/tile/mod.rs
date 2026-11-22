@@ -3,10 +3,12 @@
 //! with adaptive Polar Stereographic caps.
 
 pub mod cache;
+pub mod decoded;
 pub mod key;
 pub mod quadtree;
 
 pub use cache::TileCache;
+pub use decoded::{DecodedTile, max_mip_levels, mip_dimensions};
 pub use key::{BandKey, PixelFormat, SourceId, TileKey, TileScheme, compose_uv_rect};
 pub use quadtree::{
     DEFAULT_GRID_CELLS, LatLonTileBounds, POLAR_R_CAP, QuadTileId, QuadtreeConfig, VisibleTile,

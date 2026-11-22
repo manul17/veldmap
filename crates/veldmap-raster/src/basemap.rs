@@ -11,13 +11,15 @@
 //!   coarse-level aliasing)
 
 use std::fmt;
-use std::sync::OnceLock;
 
-use veldmap_core::tile::{PixelFormat, QuadTileId, TileScheme, polar_cap_point};
+use veldmap_core::tile::{DecodedTile, PixelFormat, QuadTileId, TileScheme, polar_cap_point};
 
+use crate::mipmap::{
+    LINEAR_TO_SRGB_LUT_LEN, generate_linear_mipmaps, linear_to_srgb_lut, linear_to_srgb_u8,
+    srgb_to_linear_lut,
+};
 use crate::{
-    DecodedTile, MAX_EQUIR_ALLOC_BYTES, MAX_EQUIR_DIM, MAX_MAP_TILE_DIM, RasterError,
-    decode_rgb8_limited,
+    MAX_EQUIR_ALLOC_BYTES, MAX_EQUIR_DIM, MAX_MAP_TILE_DIM, RasterError, decode_rgb8_limited,
 };
 
 /// Default tile size produced by [`BundledBasemap`].
@@ -35,55 +37,6 @@ pub const BUNDLED_POLAR_MAX_LEVEL: u8 = 0;
 
 /// Maximum number of prefiltered half-resolution mip levels built above base.
 const MAX_MIP_STEPS: usize = 3;
-
-fn srgb_to_linear_lut() -> &'static [f32; 256] {
-    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut table = [0.0_f32; 256];
-        for (i, slot) in table.iter_mut().enumerate() {
-            let s = (i as f32) / 255.0;
-            *slot = if s <= 0.04045 {
-                s / 12.92
-            } else {
-                ((s + 0.055) / 1.055).powf(2.4)
-            };
-        }
-        table
-    })
-}
-
-/// Size of the linear-to-sRGB lookup table (`8 KiB`, fits in L1 cache and
-/// round-trips all 256 sRGB code values without `powf` in inner pixel loops).
-const LINEAR_TO_SRGB_LUT_LEN: usize = 8192;
-
-fn linear_to_srgb_lut() -> &'static [u8; LINEAR_TO_SRGB_LUT_LEN] {
-    static LUT: OnceLock<[u8; LINEAR_TO_SRGB_LUT_LEN]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut table = [0u8; LINEAR_TO_SRGB_LUT_LEN];
-        let denom = (LINEAR_TO_SRGB_LUT_LEN - 1) as f32;
-        for (i, slot) in table.iter_mut().enumerate() {
-            let x = (i as f32) / denom;
-            let s = if x <= 0.003_130_8 {
-                x * 12.92
-            } else {
-                1.055 * x.powf(1.0 / 2.4) - 0.055
-            };
-            *slot = (s * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        table
-    })
-}
-
-#[inline]
-fn linear_to_srgb_u8(linear: f32, lut: &[u8; LINEAR_TO_SRGB_LUT_LEN]) -> u8 {
-    let x = linear.clamp(0.0, 1.0);
-    if x <= 0.003_130_8 {
-        (x * (12.92 * 255.0)).round() as u8
-    } else {
-        let idx = ((x * ((LINEAR_TO_SRGB_LUT_LEN - 1) as f32)) + 0.5) as usize;
-        lut[idx.min(LINEAR_TO_SRGB_LUT_LEN - 1)]
-    }
-}
 
 struct RgbLevel {
     width: u32,
@@ -277,6 +230,14 @@ impl BundledBasemap {
         self.render_tile_sized(id, BUNDLED_TILE_PX)
     }
 
+    /// Render one `BUNDLED_TILE_PX x BUNDLED_TILE_PX` virtual tile for `id`
+    /// and populate its CPU linear-light mipmap chain.
+    pub fn render_tile_with_mipmaps(&self, id: QuadTileId) -> Result<DecodedTile, RasterError> {
+        let mut tile = self.render_tile(id)?;
+        generate_linear_mipmaps(&mut tile);
+        Ok(tile)
+    }
+
     /// Render one `tile_px x tile_px` virtual tile for `id`.
     pub fn render_tile_sized(
         &self,
@@ -397,12 +358,12 @@ impl BundledBasemap {
             TileScheme::RasterPyramid { .. } => return Err(out_of_range()),
         }
 
-        Ok(DecodedTile {
-            width: tile_px,
-            height: tile_px,
-            format: PixelFormat::Rgba8UnormSrgb,
+        Ok(DecodedTile::new(
+            tile_px,
+            tile_px,
+            PixelFormat::Rgba8UnormSrgb,
             data,
-        })
+        ))
     }
 }
 

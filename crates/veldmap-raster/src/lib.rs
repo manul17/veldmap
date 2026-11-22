@@ -5,7 +5,6 @@
 //! bundled equirectangular basemap provider (`z = 0..3` Geodetic + `z = 0`
 //! Polar Stereographic caps).
 
-use std::fmt;
 use std::io::Cursor;
 
 use image::{ColorType, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
@@ -13,8 +12,11 @@ use thiserror::Error;
 use veldmap_core::tile::{PixelFormat, TileScheme};
 
 pub mod basemap;
+pub mod mipmap;
 
 pub use basemap::{BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, BundledBasemap};
+pub use mipmap::generate_linear_mipmaps;
+pub use veldmap_core::tile::DecodedTile;
 
 /// Maximum single map-tile dimension accepted by [`decode_map_tile`] and
 /// [`BundledBasemap::render_tile_sized`].
@@ -56,37 +58,18 @@ pub enum RasterError {
     },
 }
 
-/// CPU-decoded tile pixels ready for GPU texture upload.
-#[derive(Clone)]
-pub struct DecodedTile {
-    pub width: u32,
-    pub height: u32,
-    pub format: PixelFormat,
-    pub data: Vec<u8>,
-}
-
-impl fmt::Debug for DecodedTile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DecodedTile")
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("format", &self.format)
-            .field("byte_size", &self.data.len())
-            .finish()
-    }
-}
-
-impl DecodedTile {
-    /// Exact unpacked byte size of `data`.
-    pub fn byte_size(&self) -> usize {
-        self.data.len()
-    }
-}
-
 /// Decode raw PNG or JPEG map-tile bytes into tightly packed `Rgba8UnormSrgb`
 /// pixels under explicit dimension and peak-allocation limits.
 pub fn decode_map_tile(bytes: &[u8]) -> Result<DecodedTile, RasterError> {
     decode_rgba8_limited(bytes, MAX_MAP_TILE_DIM, MAX_MAP_TILE_ALLOC_BYTES)
+}
+
+/// Decode raw PNG or JPEG map-tile bytes into tightly packed `Rgba8UnormSrgb`
+/// pixels and populate a complete CPU linear-light mipmap chain.
+pub fn decode_map_tile_with_mipmaps(bytes: &[u8]) -> Result<DecodedTile, RasterError> {
+    let mut tile = decode_map_tile(bytes)?;
+    generate_linear_mipmaps(&mut tile);
+    Ok(tile)
 }
 
 fn make_limits(max_dim: u32, max_alloc_bytes: u64) -> Limits {
@@ -212,12 +195,12 @@ pub(crate) fn decode_rgba8_limited(
             height: h,
         });
     }
-    Ok(DecodedTile {
-        width: w,
-        height: h,
-        format: PixelFormat::Rgba8UnormSrgb,
-        data: img.into_raw(),
-    })
+    Ok(DecodedTile::new(
+        w,
+        h,
+        PixelFormat::Rgba8UnormSrgb,
+        img.into_raw(),
+    ))
 }
 
 /// Decode an opaque PNG or JPEG image directly into tightly packed `Rgb8`

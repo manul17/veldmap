@@ -14,6 +14,25 @@ impl SourceId {
     pub const fn new(id: u64) -> Self {
         Self(id)
     }
+
+    /// Derive a deterministic `SourceId` from a stable ASCII/UTF-8 source key
+    /// (e.g. a live basemap layer ID or normalized URL template).
+    ///
+    /// Sets the high bit so derived IDs never collide with small reserved
+    /// constants such as [`Self::BUNDLED_BASEMAP`].
+    pub const fn from_stable_key(key: &str) -> Self {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let bytes = key.as_bytes();
+        let mut hash = FNV_OFFSET;
+        let mut i = 0;
+        while i < bytes.len() {
+            hash ^= bytes[i] as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+            i += 1;
+        }
+        Self(hash | (1u64 << 63))
+    }
 }
 
 /// Deterministic, `Copy` band selector avoiding heap allocations in `TileKey`.
