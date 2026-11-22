@@ -169,13 +169,16 @@ impl Outlines {
 
         let base = self.hatch.len() as u32;
         self.hatch.push(surface_dir(centre));
-        for step in 1..=steps {
+        for step in 1..steps {
             let part = f64::from(step) / f64::from(steps);
             for point in ring.iter().map(direction) {
                 self.hatch
                     .push(surface_dir(centre.lerp(point, part).normalize()));
             }
         }
+        // Reuse exact f64-split outer ring vertices directly so the hatch
+        // boundary aligns cleanly with the outline stroke (no f32 normal drift).
+        self.hatch.extend_from_slice(ring);
 
         let count = ring.len() as u32;
         let ring_at = |level: u32| base + 1 + level * count;
@@ -206,37 +209,28 @@ fn surface_dir(direction: DVec3) -> OutlineVertex {
 }
 
 fn ring(outline: &Outline) -> Vec<Vec<OutlineVertex>> {
-    let points = match outline.points.as_slice() {
-        [first, .., last] if first.lat == last.lat && first.lon == last.lon => {
-            &outline.points[..outline.points.len() - 1]
-        }
-        all => all,
-    };
-    if points.len() < 3 {
+    let raw: Vec<(f64, f64)> = outline.points.iter().map(|p| (p.lat, p.lon)).collect();
+    let places = geodesy::dedup_ring(&raw);
+    if places.len() < 3 {
         return Vec::new();
     }
 
-    let at = |index: usize| {
-        let point = &points[index % points.len()];
-        (point.lat, point.lon)
-    };
-    let places: Vec<(f64, f64)> = (0..points.len()).map(at).collect();
-    let sweeps: Vec<f64> = (0..points.len())
-        .map(|index| geodesy::sweep(at(index), at(index + 1)))
-        .collect();
-    let cuts = seam_cuts(&places, &sweeps);
-
+    let cuts = geodesy::band_seam_cuts(&places);
     let start = cuts.first().map_or(0, |cut| cut + 1);
     let (mut loops, mut current) = (Vec::new(), Vec::new());
-    for step in 0..points.len() {
-        let index = (start + step) % points.len();
+    for step in 0..places.len() {
+        let index = (start + step) % places.len();
         if cuts.contains(&index) {
             if !current.is_empty() {
                 loops.push(std::mem::take(&mut current));
             }
             continue;
         }
-        edge(&mut current, at(index), at(index + 1));
+        edge(
+            &mut current,
+            places[index],
+            places[(index + 1) % places.len()],
+        );
     }
     if !current.is_empty() {
         loops.push(current);
@@ -244,57 +238,13 @@ fn ring(outline: &Outline) -> Vec<Vec<OutlineVertex>> {
     loops
 }
 
-fn seam_cuts(places: &[(f64, f64)], sweeps: &[f64]) -> Vec<usize> {
-    let cuts: Vec<usize> = (0..sweeps.len())
-        .filter(|index| sweeps[*index] == 0.0)
-        .collect();
-    if cuts.is_empty() {
-        return Vec::new();
-    }
-
-    let mut carried = false;
-    for pair in 0..cuts.len() {
-        let (from, to) = (cuts[pair], cuts[(pair + 1) % cuts.len()]);
-        let run: Vec<usize> = (1..sweeps.len())
-            .map(|step| (from + step) % sweeps.len())
-            .take_while(|index| *index != to)
-            .collect();
-        let Some((&first, &last)) = run.first().zip(run.last()) else {
-            continue;
-        };
-        let (opens, closes) = (places[first], places[(last + 1) % places.len()]);
-        let lon_gap = geodesy::unwind(opens.1, closes.1) - opens.1;
-        if opens.0 != closes.0 || lon_gap.abs() > (geodesy::TURN_DEG - geodesy::FULL_CIRCLE_DEG) {
-            return Vec::new();
-        }
-        let span: f64 = run.iter().map(|index| sweeps[*index]).sum();
-        if span.abs() >= geodesy::FULL_CIRCLE_DEG {
-            carried = true;
-        } else if span == 0.0 {
-            continue;
-        } else {
-            return Vec::new();
-        }
-    }
-    if carried { cuts } else { Vec::new() }
-}
-
 fn edge(ring: &mut Vec<OutlineVertex>, from: (f64, f64), to: (f64, f64)) {
     if from == to {
         return;
     }
-    let edge_deg = max_edge_deg();
-    let most = (geodesy::TURN_DEG / edge_deg).ceil();
-    let raw = (geodesy::edge_span(from, to) / edge_deg).ceil();
-    let steps = if raw.is_finite() {
-        raw.clamp(1.0, most) as u32
-    } else {
-        1
-    };
-    for step in 0..steps {
-        let (lat_deg, lon_deg) = geodesy::edge_point(from, to, f64::from(step) / f64::from(steps));
+    geodesy::trace_edge(from, to, max_edge_deg(), |(lat_deg, lon_deg)| {
         ring.push(surface_vertex(lat_deg, lon_deg));
-    }
+    });
 }
 
 #[cfg(test)]
@@ -413,18 +363,21 @@ mod tests {
     #[test]
     fn outlines_sit_directly_on_the_wgs84_ellipsoid() {
         let square = [(45.0, 39.0), (45.0, 40.0), (46.0, 40.0), (46.0, 39.0)];
-        let built = Outlines::build(&[outline(&square)]);
+        let built = Outlines::build(&[styled(&square, OutlineStyle::Pending)]);
         for v in &built.vertices {
-            let (lat, lon) = angles_of(v);
-            let expected = geodesy::world(Geodetic::surface(lat, lon));
             let actual = glam::Vec3::from(v.position).as_dvec3()
                 + glam::Vec3::from(v.position_low).as_dvec3();
+            let (lat, lon) = geodesy::surface_at(actual);
+            let expected = geodesy::world(Geodetic::surface(lat, lon));
             let err_m = (actual - expected).length() * geodesy::SEMI_MAJOR_M;
             assert!(
-                err_m < 1.0,
+                err_m < 1e-3,
                 "outline vertex drifted {err_m} m from ellipsoid"
             );
         }
+        // Outermost hatch ring must match the outline vertices bit-for-bit.
+        let n = built.vertices.len();
+        assert_eq!(&built.hatch[built.hatch.len() - n..], &built.vertices[..]);
     }
 
     #[test]
@@ -520,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn a_band_with_a_gap_keeps_its_edges() {
+    fn a_gapped_band_keeps_its_edges_and_gets_no_fill() {
         let mut points = vec![(-70.0, 10.0), (70.0, 10.0)];
         for lon in [90.0, 170.0, -110.0, -30.0, 0.0] {
             points.push((70.0, lon));
@@ -529,12 +482,16 @@ mod tests {
         for lon in [-30.0, -110.0, 170.0, 90.0] {
             points.push((-70.0, lon));
         }
-        let gapped = outline(&points);
+        let gapped = styled(&points, OutlineStyle::Pending);
 
         let loops = ring(&gapped);
         assert_eq!(loops.len(), 1);
         let angles: Vec<(f64, f64)> = loops.concat().iter().map(angles_of).collect();
         assert!(geodesy::encircles(&angles));
+
+        let built = Outlines::build(&[gapped]);
+        assert!(!built.indices.is_empty());
+        assert!(built.hatch_indices.is_empty());
     }
 
     #[test]
@@ -580,6 +537,8 @@ mod tests {
             (-70.0125, -180.0125),
             (70.0125, -180.0125),
             (70.0125, -180.0125),
+            (70.0125, 0.0),
+            (70.0125, 0.0),
             (70.0125, 179.9875),
             (-70.0125, 179.9875),
         ]);
@@ -592,24 +551,6 @@ mod tests {
             .filter(|lat| (-69.0..=69.0).contains(lat))
             .count();
         assert_eq!(stray, 0);
-    }
-
-    #[test]
-    fn a_gapped_band_is_whole_and_still_gets_no_fill() {
-        let mut points = vec![(-70.0, 10.0), (70.0, 10.0)];
-        for lon in [90.0, 170.0, -110.0, -30.0, 0.0] {
-            points.push((70.0, lon));
-        }
-        points.push((-70.0, 0.0));
-        for lon in [-30.0, -110.0, 170.0, 90.0] {
-            points.push((-70.0, lon));
-        }
-        let gapped = styled(&points, OutlineStyle::Pending);
-        assert_eq!(ring(&gapped).len(), 1);
-
-        let built = Outlines::build(&[gapped]);
-        assert!(!built.indices.is_empty());
-        assert!(built.hatch_indices.is_empty());
     }
 
     #[test]

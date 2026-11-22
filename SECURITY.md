@@ -4,7 +4,7 @@
 
 If you discover a security vulnerability in VeldMap—including credential leakage, codec memory-safety/DoS bugs (malformed GeoTIFF/JPEG 2000/NetCDF files), path traversal in downloads/caches, or TLS/signing issues—please report it responsibly rather than opening a public issue.
 
-- Use GitHub Security Advisories ("Report a vulnerability") on the repository, or contact the maintainer directly.
+- Use GitHub Security Advisories ("Report a vulnerability") on the repository.
 - Include reproduction steps, affected commit/version, and any crafted test input needed to verify the fix.
 
 ## Active Protections (Enforced Today)

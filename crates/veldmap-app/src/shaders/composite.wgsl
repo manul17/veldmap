@@ -2,8 +2,8 @@
 // globe target into egui's render pass.
 //
 // The bound texture view matches the swapchain color space via `view_formats`:
-//   - `Rgba8UnormSrgb` view when `target_format.is_srgb()` is true
-//   - `Rgba8Unorm` view when `target_format.is_srgb()` is false
+//   - `Rgba8UnormSrgb` view when the target expects linear output (sRGB or float targets)
+//   - `Rgba8Unorm` view for non-sRGB 8-bit targets
 // This preserves exact sRGB pixel values with zero manual gamma encoding.
 
 struct VsOut {

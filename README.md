@@ -19,18 +19,12 @@ VeldMap is built in vertical slices tracked in [plan.md](plan.md):
 
 ## Quick Start
 
-Requires Rust `1.95` or newer (pinned via `rust-toolchain.toml`) and a Vulkan, DX12, or Metal GPU driver. See [docs/building.md](docs/building.md) for platform prerequisites and environment overrides (`WGPU_BACKEND`, `WGPU_POWER_PREF`, `RUST_LOG`).
+Requires Rust `1.95` or newer (pinned via `rust-toolchain.toml`) and a Vulkan, DX12, or Metal GPU driver. See [docs/building.md](docs/building.md) for platform prerequisites, verification commands, and environment overrides (`WGPU_BACKEND`, `WGPU_POWER_PREF`, `RUST_LOG`).
 
 ```bash
 cargo run -p veldmap-app
 cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
 ```
-
-## Credentials (Planned — Slice 4B)
-
-Local files and zero-auth STAC/COG catalogs require no credentials. Authenticated Copernicus Data Space Ecosystem (CDSE) S3 access will read `COPERNICUS_ACCESS_KEY` and `COPERNICUS_ACCESS_SECRET` from a git-ignored `.env` file (template in [.env.example](.env.example)) once CDSE support lands in Slice 4B.
 
 ## Contributing & Security
 

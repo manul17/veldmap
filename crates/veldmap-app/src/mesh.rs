@@ -1,23 +1,23 @@
-//! Precision-safe untextured WGS84 ellipsoid mesh and depth-less draped
-//! 15-degree graticule at `height_m = 0.0`.
+//! Untextured WGS84 ellipsoid fallback mesh and depth-less draped 15-degree
+//! graticule at `height_m = 0.0`.
 //!
-//! Uses a single watertight WGS84 grid with `(pos_hi, pos_lo)` double-single
-//! ECEF vertex splitting (sub-millimetre precision relative to the eye down to
-//! 2 m altitude via Sterbenz's lemma, with zero inter-octant seams).
+//! Uses a single watertight `96 x 192` WGS84 grid with `(pos_hi, pos_lo)`
+//! double-single ECEF vertex splitting. Note that double-single RTE assumes
+//! non-reassociating IEEE-754 float arithmetic and this coarse static mesh is
+//! retired in Slice 2A in favor of per-tile RTC quadtree geometry.
 
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
-use glam::DVec3;
 use veldmap_core::geo::geodesy::{self, Geodetic, World};
 
 /// Vertex layout shared by the WGS84 ellipsoid body and draped graticule.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GlobeVertex {
-    /// High half of `(vertex_ecef - origin_ecef)`.
+    /// High half of the ECEF vertex position.
     pub pos_hi: World,
-    /// Low half of `(vertex_ecef - origin_ecef)`.
+    /// Low half of the ECEF vertex position.
     pub pos_lo: World,
     /// Outward unit WGS84 ellipsoidal normal.
     pub normal: World,
@@ -34,15 +34,14 @@ impl GlobeVertex {
         ],
     };
 
-    /// Construct a vertex positioned relative to `origin_ecef` in `f64` and
-    /// split into `(high, low)` `f32` halves.
-    pub fn relative_to(point: Geodetic, origin_ecef: DVec3) -> Self {
-        let rel = geodesy::world(point) - origin_ecef;
-        let (pos_hi, pos_lo) = geodesy::parts(rel);
+    /// Construct a surface vertex at `(lat_deg, lon_deg)` on `height_m = 0.0`
+    /// with ECEF coordinates split into `(high, low)` `f32` halves.
+    pub fn on_surface(lat_deg: f64, lon_deg: f64) -> Self {
+        let (pos_hi, pos_lo) = geodesy::parts(geodesy::world(Geodetic::surface(lat_deg, lon_deg)));
         Self {
             pos_hi,
             pos_lo,
-            normal: geodesy::normal(point.lat_deg, point.lon_deg),
+            normal: geodesy::normal(lat_deg, lon_deg),
         }
     }
 }
@@ -101,10 +100,7 @@ fn build_ellipsoid(vertices: &mut Vec<GlobeVertex>, indices: &mut Vec<u32>) -> R
         for col in 0..=LON_CELLS {
             let t_lon = f64::from(col) / f64::from(LON_CELLS);
             let lon = -180.0 + 360.0 * t_lon;
-            vertices.push(GlobeVertex::relative_to(
-                Geodetic::surface(lat, lon),
-                DVec3::ZERO,
-            ));
+            vertices.push(GlobeVertex::on_surface(lat, lon));
         }
     }
 
@@ -130,8 +126,7 @@ fn build_graticule(vertices: &mut Vec<GlobeVertex>, indices: &mut Vec<u32>) {
         }
     };
 
-    let at =
-        |lat: f64, lon: f64| GlobeVertex::relative_to(Geodetic::surface(lat, lon), DVec3::ZERO);
+    let at = GlobeVertex::on_surface;
 
     for step in 0..(360 / GRID_STEP_DEG) {
         let lon = -180.0 + f64::from(step * GRID_STEP_DEG);
@@ -170,14 +165,14 @@ mod tests {
             lon_deg: 39.7015,
             height_m: 2.0,
         });
-        let (neg_eye_hi, neg_eye_lo) = geodesy::parts(DVec3::ZERO - eye);
+        let (neg_eye_hi, neg_eye_lo) = geodesy::parts(-eye);
 
         let p0 = Geodetic::surface(47.2357, 39.7015);
         let step_m = 0.01;
         let p1 = Geodetic::surface(47.2357 + step_m / 111_320.0, 39.7015);
 
-        let v0 = GlobeVertex::relative_to(p0, DVec3::ZERO);
-        let v1 = GlobeVertex::relative_to(p1, DVec3::ZERO);
+        let v0 = GlobeVertex::on_surface(p0.lat_deg, p0.lon_deg);
+        let v1 = GlobeVertex::on_surface(p1.lat_deg, p1.lon_deg);
 
         let rel = |v: GlobeVertex| {
             (Vec3::from(v.pos_hi) + Vec3::from(neg_eye_hi))
@@ -199,8 +194,28 @@ mod tests {
         assert!(!mesh.graticule.is_empty());
         assert_eq!((mesh.graticule.end - mesh.graticule.start) % 2, 0);
 
-        // Graticule vertices sit directly on height_m = 0.0 (zero lift).
-        for step in [0usize, 13, 128, 512] {
+        // Every index must point to a valid vertex.
+        let vcount = mesh.vertices.len() as u32;
+        assert!(mesh.indices.iter().all(|&i| i < vcount));
+
+        // Antimeridian seam columns (-180 deg and +180 deg) must coincide on every row.
+        let stride = (LON_CELLS + 1) as usize;
+        for row in 0..=LAT_CELLS as usize {
+            let west = mesh.vertices[row * stride];
+            let east = mesh.vertices[row * stride + LON_CELLS as usize];
+            let pw = Vec3::from(west.pos_hi).as_dvec3() + Vec3::from(west.pos_lo).as_dvec3();
+            let pe = Vec3::from(east.pos_hi).as_dvec3() + Vec3::from(east.pos_lo).as_dvec3();
+            let gap_m = (pw - pe).length() * geodesy::SEMI_MAJOR_M;
+            assert!(
+                gap_m < 1e-6,
+                "antimeridian seam gap on row {row}: {gap_m} m"
+            );
+        }
+
+        // Sample both meridian and parallel graticule vertices and verify zero surface lift.
+        let grid_len = (mesh.graticule.end - mesh.graticule.start) as usize;
+        for frac in [0, 1, 7, 15, 23, 30, 34] {
+            let step = (grid_len * frac) / 35;
             let idx = mesh.indices[mesh.graticule.start as usize + step] as usize;
             let v = mesh.vertices[idx];
             let actual = Vec3::from(v.pos_hi).as_dvec3() + Vec3::from(v.pos_lo).as_dvec3();

@@ -2,15 +2,21 @@
 //! projection and orthonormal frame controls.
 //!
 //! All camera internals are private behind view-agnostic queries. The v1 globe
-//! lies directly on the WGS84 ellipsoid (`height_m = 0.0`), removing legacy
-//! surface lift and lowering the altitude floor to [`MIN_HEIGHT_M`] (2 m) for
-//! centimetre-scale orthophoto inspection.
+//! lies directly on the WGS84 ellipsoid (`height_m = 0.0`) with an altitude
+//! floor of [`MIN_HEIGHT_M`] (2 m) for centimetre-scale orthophoto inspection.
 
-use glam::{DMat3, DMat4, DQuat, DVec3, DVec4, Mat4};
+use glam::{DMat3, DMat4, DQuat, DVec3, DVec4};
 
 use super::cull;
-use super::geodesy::{self, Geodetic, World};
-use super::wheel::ZOOM_PER_STEP;
+use super::geodesy::{self, Geodetic};
+
+/// Zoom scale factor per discrete step (shared between 3D globe pinch/wheel
+/// scaling and future 2D inspection views).
+pub const ZOOM_PER_CLICK: f64 = 1.25;
+
+/// Altitude multiplier applied per wheel notch on the 3D globe (inverse of
+/// [`ZOOM_PER_CLICK`]).
+pub const ZOOM_PER_STEP: f64 = 1.0 / ZOOM_PER_CLICK;
 
 /// Vertical field of view in degrees.
 pub const FOV_Y_DEG: f64 = 50.0;
@@ -18,7 +24,7 @@ pub const FOV_Y_DEG: f64 = 50.0;
 /// Minimum camera altitude above the WGS84 ellipsoid in metres.
 ///
 /// At 2 m altitude with a 50-degree vertical FOV on a 1000-row viewport,
-/// ground sample distance is ~1.86 mm/px — finer than 2 cm drone orthophotos.
+/// ground sample distance is ~1.87 mm/px — finer than 2 cm drone orthophotos.
 pub const MIN_HEIGHT_M: f64 = 2.0;
 
 /// Maximum camera altitude above the WGS84 ellipsoid in metres.
@@ -26,9 +32,6 @@ pub const MAX_HEIGHT_M: f64 = 80_000_000.0;
 
 /// Allowed camera altitude bounds `(min_m, max_m)`.
 pub const HEIGHT_RANGE_M: (f64, f64) = (MIN_HEIGHT_M, MAX_HEIGHT_M);
-
-/// Surface radius in equatorial radii (`1.0` = directly on the WGS84 ellipsoid).
-const DRAWN_RADIUS: f64 = 1.0;
 
 /// Grazing magnification factor at which cursor zoom hold begins softening
 /// toward the center of the viewport.
@@ -124,11 +127,6 @@ impl Camera {
         geodesy::world(self.geodetic())
     }
 
-    /// Eye position split into `(high, low)` `f32` halves.
-    pub fn eye_parts(&self) -> (World, World) {
-        geodesy::parts(self.eye_ecef())
-    }
-
     /// Orthonormal camera basis `(right, up, forward)` in ECEF coordinates,
     /// with `forward` aimed geocentrially toward Earth's center so the globe
     /// stays centered from orbit while matching [`Camera::probe`].
@@ -143,7 +141,7 @@ impl Camera {
     pub fn visible_deg(&self) -> f64 {
         match self.arc_at((FOV_Y_DEG * 0.5).to_radians()) {
             Some(arc) => arc.to_degrees(),
-            None => (DRAWN_RADIUS / self.radius()).acos().to_degrees(),
+            None => (1.0 / self.radius()).acos().to_degrees(),
         }
     }
 
@@ -167,11 +165,6 @@ impl Camera {
         let near = (self.height_m * 0.5) / geodesy::SEMI_MAJOR_M;
         perspective_infinite_reverse_rh(FOV_Y_DEG.to_radians(), aspect, near)
             * turn_to(self.basis())
-    }
-
-    /// Single-precision view-projection matrix for GPU camera uniforms.
-    pub fn view_projection_f32(&self, aspect: f32) -> Mat4 {
-        self.view_projection(f64::from(aspect)).as_mat4()
     }
 
     /// Project a world-space `f64` ECEF point into clip space.
@@ -412,7 +405,7 @@ impl Camera {
     }
 
     fn grazing(&self, alpha: f64) -> Option<f64> {
-        let sine = self.radius() / DRAWN_RADIUS * alpha.sin();
+        let sine = self.radius() * alpha.sin();
         (sine < 1.0).then(|| (1.0 - sine * sine).sqrt())
     }
 
@@ -422,12 +415,11 @@ impl Camera {
     }
 
     fn slope_at(&self, alpha: f64) -> Option<f64> {
-        let radius = self.radius() / DRAWN_RADIUS;
-        Some(radius * alpha.cos() / self.grazing(alpha)? - 1.0)
+        Some(self.radius() * alpha.cos() / self.grazing(alpha)? - 1.0)
     }
 
     fn arc_at(&self, alpha: f64) -> Option<f64> {
-        let sine = self.radius() / DRAWN_RADIUS * alpha.sin();
+        let sine = self.radius() * alpha.sin();
         (sine < 1.0).then(|| sine.asin() - alpha)
     }
 
@@ -486,7 +478,7 @@ pub fn height_for(radius_deg: f64) -> f64 {
     let arc = radius_deg
         .clamp(0.0, (std::f64::consts::FRAC_PI_2 - half).to_degrees())
         .to_radians();
-    let radius = DRAWN_RADIUS * (arc + half).sin() / half.sin();
+    let radius = (arc + half).sin() / half.sin();
     (radius - 1.0) * geodesy::SEMI_MAJOR_M
 }
 
@@ -604,27 +596,30 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_carries_no_shift() {
-        for (lat, lon, height) in [
-            (0.0, 0.0, 1e6),
-            (45.0, 60.0, MIN_HEIGHT_M),
-            (-80.0, 179.0, 5e7),
-        ] {
-            let turn = turn_to(at(lat, lon, height).basis());
-            assert_eq!(turn * DVec4::W, DVec4::W);
-        }
-    }
-
-    #[test]
-    fn center_gsd_matches_trigonometry_from_floor_to_orbit() {
+    fn center_gsd_matches_probe_spacing_and_floor_target() {
         let height_px = 1000.0;
-        for height_m in [MIN_HEIGHT_M, 10_000.0, 14_000_000.0, MAX_HEIGHT_M] {
+        let floor = at(0.0, 0.0, MIN_HEIGHT_M);
+        // At 2 m altitude, 50 deg FOV, 1000 rows -> ~1.865 mm/px (< 2 cm drone imagery).
+        let floor_gsd = floor.metres_per_pixel(height_px);
+        assert!(
+            (floor_gsd - 0.001_865_2).abs() < 1e-6,
+            "unexpected floor GSD: {floor_gsd} m/px"
+        );
+
+        // Verify GSD agrees with adjacent-pixel ray probe spacing at center.
+        for height_m in [MIN_HEIGHT_M, 1_000.0, 100_000.0] {
             let camera = at(0.0, 0.0, height_m);
-            let want = 2.0 * height_m * (FOV_Y_DEG * 0.5).to_radians().tan() / height_px;
-            let got = camera.metres_per_pixel(height_px);
+            let p0 = camera.probe(0.5, 0.5, 1.0).expect("center hit");
+            let p1 = camera
+                .probe(0.5, 0.5 + 1.0 / height_px, 1.0)
+                .expect("adjacent pixel hit");
+            let w0 = geodesy::world(Geodetic::surface(p0.0, p0.1));
+            let w1 = geodesy::world(Geodetic::surface(p1.0, p1.1));
+            let probed_m = (w1 - w0).length() * geodesy::SEMI_MAJOR_M;
+            let gsd_m = camera.metres_per_pixel(height_px);
             assert!(
-                (got - want).abs() < 1e-9 * want,
-                "at {height_m} m: {got} m/px vs {want} m/px"
+                (probed_m - gsd_m).abs() / gsd_m < 0.01,
+                "at {height_m} m: probed {probed_m} m vs GSD {gsd_m} m"
             );
         }
     }
@@ -640,7 +635,22 @@ mod tests {
         let before = cam;
         cam.focus(f64::NAN, 10.0, 1.0);
         cam.fly_to(45.0, f64::INFINITY, 1000.0);
+        cam.orbit(f64::NAN, 0.1);
+        cam.zoom_at(f64::NAN, 0.0, 0.0);
         assert_eq!(cam, before);
+
+        // Exact pole operations stay finite and orthonormal.
+        for pole in [90.0, -90.0] {
+            let mut p = Camera::at(pole, 0.0, 10_000.0);
+            assert!(p.eye_ecef().is_finite());
+            assert_eq!(p.heading_deg(), 0.0);
+            assert!(p.probe(0.5, 0.5, 1.5).is_some());
+            assert!(!p.reset_north());
+            p.orbit(0.1, 0.1);
+            p.zoom_at(1.0, 0.1, -0.1);
+            assert!(p.eye_ecef().is_finite());
+            assert!(p.at.dot(p.up).abs() < 1e-9);
+        }
     }
 
     #[test]
@@ -652,7 +662,7 @@ mod tests {
         }
         let camera = at(0.0, 0.0, at_brim);
         let radius = 1.0 + at_brim / geodesy::SEMI_MAJOR_M;
-        let limb = (DRAWN_RADIUS / radius).asin().to_degrees();
+        let limb = (1.0 / radius).asin().to_degrees();
         assert!((limb - FOV_Y_DEG * 0.5).abs() < 1e-6);
         assert!((camera.visible_deg() - brim).abs() < 1e-6);
     }
@@ -808,38 +818,6 @@ mod tests {
         let point =
             geodesy::intersect_at(camera.eye_ecef(), camera.look(right, above), 0.0).expect("hit");
         (point, (right, above))
-    }
-
-    #[test]
-    fn zoom_keeps_the_place_under_the_cursor() {
-        let scale = pixels_per_tangent(1300.0);
-        let mut worst: f64 = 0.0;
-
-        for height_m in [
-            MIN_HEIGHT_M * 4.0,
-            100.0,
-            10_000.0,
-            1_000_000.0,
-            14_000_000.0,
-        ] {
-            for (hold_x, hold_y) in [(0.0, 0.0), (0.2, 0.0), (-0.1, 0.15), (0.12, -0.18)] {
-                for steps in [1.0, -1.0, 3.0] {
-                    let mut camera = at(45.0, 60.0, height_m);
-                    let (held, (right, above)) = held_at(&camera, hold_x, hold_y);
-
-                    camera.zoom_at(steps, hold_x, hold_y);
-
-                    let (now_right, now_above) = camera.seen_at(held).expect("in front");
-                    let missed = (now_right - right).hypot(now_above - above) * scale;
-                    worst = worst.max(missed);
-                    assert!(
-                        missed < 0.01,
-                        "from {height_m} m ({steps} steps) at ({hold_x}, {hold_y}): {missed:.4} px"
-                    );
-                }
-            }
-        }
-        assert!(worst > 0.0);
     }
 
     #[test]

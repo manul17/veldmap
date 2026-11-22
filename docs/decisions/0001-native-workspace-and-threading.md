@@ -29,7 +29,7 @@ Re-evaluate extracting `veldmap-raster` into a third workspace crate at Slice 3C
    - `io` / `mem` *(Slices 2B, 3A-1)*: strictly synchronous caller-buffered `ByteSource` trait, `Signer` trait, zero-dependency async-waking `CancelToken`, lock-free `MemoryBudget` + `Shrinkable`, pure `StoragePaths`.
 2. **Orthogonal Mid-Layer (each depends only on the leaf layer):**
    - `cache` (`fs` feature, *Slice 2B*): raw-byte tile disk store, two-tier atomic writes, incremental LRU eviction.
-   - `raster` (`codecs` feature, *Slice 3A-1*): pure-Rust decoders, level tables, grid/cascade/resampling, radiometry, pure synchronous range-planners.
+   - `raster` (`codecs` feature, *Slice 2A lightweight PNG/JPEG; Slice 3A-1a full raster engine*): pure-Rust decoders, level tables, grid/cascade/resampling, radiometry, pure synchronous range-planners.
    - `net` (`net` feature, *Slices 2B, 4A*; `tokio` + `reqwest` over `rustls`): tile fetcher, `HttpRange` (`ByteSource` + pinned prefetch + `Shrinkable` 64 KiB block pool), retry/ETag/range helpers.
    - `provider` (`net` feature, *Slices 4A, 4B*): STAC/COG discovery, CDSE OData/S3/SigV4 (`Signer`), manifests.
 3. **Upper Layer (`fs`, optional `net`):**
@@ -39,13 +39,10 @@ Intra-feature boundaries enforced by CI include `cache ↛ library` and `net ↛
 
 ### 3. Explicit Dependency Exclusions (Active)
 
-The following technologies are explicitly excluded from `veldmap-core` and banned in [deny.toml](../../deny.toml):
+The following technologies are explicitly excluded:
 
-- WASI, Wasmtime, ConnectRPC, protobuf/gRPC, browser WASM shims, and Emscripten.
-- SQLite and ORMs (`rusqlite`, `sqlx`).
-- Memory-mapped file I/O (`memmap2`, permitted only via Wayland SHM wrappers in `winit`/`smithay-client-toolkit`); safe positioned I/O is used instead.
-- C geospatial and TLS bindings (`gdal`, `proj`, `openssl`/`openssl-sys`); pure-Rust codecs and `rustls` are used instead.
-- UI/GPU crates (`egui`, `eframe`, `wgpu`) inside `veldmap-core`.
+- **Banned workspace-wide in [deny.toml](../../deny.toml):** Wasmtime (`wasmtime`), protobuf/gRPC (`prost`, `tonic`), SQLite/ORMs (`rusqlite`, `sqlx`), memory-mapped file I/O (`memmap2`, permitted only via Wayland SHM wrappers `smithay-client-toolkit` and `winit`; safe positioned I/O is used instead), and C geospatial/TLS bindings (`gdal`/`gdal-sys`, `proj`/`proj-sys`, `openssl`/`openssl-sys`; pure-Rust codecs and `rustls` are used instead).
+- **Excluded from `veldmap-core` via manifest & isolated CI builds:** UI/GPU crates (`egui`, `eframe`, `wgpu`) and browser/WASM targets (native desktop only).
 
 ### 4. Frame-Driven Streaming Engine & Shutdown Order (Committed Contract — Slices 2–3A)
 

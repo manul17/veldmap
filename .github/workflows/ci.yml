@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -31,6 +38,8 @@ jobs:
         uses: dtolnay/rust-toolchain@master
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "hygiene"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -39,12 +48,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Check veldmap-core isolated leaf build
-        run: |
-          cargo check -p veldmap-core --no-default-features
-          cargo test -p veldmap-core --no-default-features
-
-      - name: Run naga WGSL SPV/HLSL/MSL shader codegen test
-        run: cargo test -p veldmap-app --test shader_codegen
+        run: cargo test -p veldmap-core --no-default-features
 
       - name: Install and run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -52,25 +56,23 @@ jobs:
       - name: Check English-only hygiene (no Cyrillic outside old/)
         run: |
           python3 - <<'EOF'
-          import pathlib, re, sys
+          import os, pathlib, re, sys
 
-          root = pathlib.Path(".")
           pattern = re.compile(r"[\u0400-\u04FF]")
           skip_dirs = {".git", "target", "old"}
           offenders = []
 
-          for path in sorted(root.rglob("*")):
-              if not path.is_file():
-                  continue
-              if any(part in skip_dirs for part in path.parts):
-                  continue
-              try:
-                  text = path.read_text(encoding="utf-8")
-              except UnicodeDecodeError:
-                  continue
-              for lineno, line in enumerate(text.splitlines(), 1):
-                  if pattern.search(line):
-                      offenders.append(f"{path}:{lineno}: {line.strip()}")
+          for dirpath, dirnames, filenames in os.walk("."):
+              dirnames[:] = sorted(d for d in dirnames if d not in skip_dirs)
+              for filename in sorted(filenames):
+                  path = pathlib.Path(dirpath, filename)
+                  try:
+                      text = path.read_text(encoding="utf-8")
+                  except UnicodeDecodeError:
+                      continue
+                  for lineno, line in enumerate(text.splitlines(), 1):
+                      if pattern.search(line):
+                          offenders.append(f"{path}:{lineno}: {line.strip()}")
 
           if offenders:
               print("Cyrillic characters found outside old/:", file=sys.stderr)
@@ -85,11 +87,12 @@ jobs:
           python3 - <<'EOF'
           import pathlib, re, sys
 
-          pattern = re.compile(r"\]\([^)]*(?:^|/)old(?:/|\))")
+          inline_pattern = re.compile(r"\]\((?:[^)]*/)?old(?:/|\))")
+          ref_pattern = re.compile(r"^\s*\[[^\]]+\]:\s*(?:\S*/)?old(?:/|$)")
           offenders = []
           for path in sorted(pathlib.Path("docs").rglob("*.md")):
               for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                  if pattern.search(line):
+                  if inline_pattern.search(line) or ref_pattern.search(line):
                       offenders.append(f"{path}:{lineno}: {line.strip()}")
 
           if offenders:
@@ -140,8 +143,10 @@ jobs:
         uses: dtolnay/rust-toolchain@master
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "test"
 
       - name: Run workspace unit, shader codegen, and headless GPU smoke tests
         env:
           VELDMAP_REQUIRE_GPU_TEST: ${{ matrix.require_gpu }}
-        run: cargo test --workspace -- --nocapture
+        run: cargo test --workspace

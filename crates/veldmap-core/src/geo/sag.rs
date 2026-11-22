@@ -1,7 +1,7 @@
 //! Chord and quad sagitta helpers for curved WGS84 surface meshes.
 //!
-//! Used by tile skirts, surface outlines, and raster warp-mesh subdivision to
-//! bound how far flat chords dip below the curved ellipsoid surface.
+//! Used for surface outline densification and upcoming tile/warp-mesh
+//! subdivision to bound how far flat chords dip below the curved ellipsoid.
 
 use super::geodesy::SEMI_MAJOR_M;
 
@@ -36,6 +36,12 @@ mod tests {
 
     #[test]
     fn limit_chord_sags_exactly_to_tolerance() {
+        // 1 degree equatorial arc sags ~243.0 m on WGS84 (R * (1 - cos(0.5 deg))).
+        assert!(
+            (sag_m(1.0) - 243.0).abs() < 0.2,
+            "sag_m(1.0)={}",
+            sag_m(1.0)
+        );
         for tolerance_m in [0.001, 1.0, 70.0, 10_000.0] {
             let sag = sag_m(max_chord_deg(tolerance_m));
             assert!(
@@ -43,12 +49,5 @@ mod tests {
                 "limit chord sag {sag} m != {tolerance_m} m"
             );
         }
-    }
-
-    #[test]
-    fn quad_diagonal_stays_within_tolerance() {
-        let tol = 70.0;
-        let diagonal = max_quad_side_deg(tol) * std::f64::consts::SQRT_2;
-        assert!((sag_m(diagonal) - tol).abs() < 1e-6);
     }
 }

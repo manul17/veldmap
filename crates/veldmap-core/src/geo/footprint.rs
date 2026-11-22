@@ -69,33 +69,21 @@ fn angles(ring: &Ring) -> Vec<(f64, f64)> {
 
 fn traced(ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
     const MAX_EDGE_DEG: f64 = 0.25;
-    const MOST: f64 = geodesy::TURN_DEG / MAX_EDGE_DEG;
 
     let mut out = Vec::with_capacity(ring.len());
     for (at, &from) in ring.iter().enumerate() {
         let to = ring[(at + 1) % ring.len()];
-        let raw = (geodesy::edge_span(from, to) / MAX_EDGE_DEG).ceil();
-        let steps = if raw.is_finite() {
-            raw.clamp(1.0, MOST) as u32
-        } else {
-            1
-        };
-        for step in 0..steps {
-            out.push(geodesy::edge_point(
-                from,
-                to,
-                f64::from(step) / f64::from(steps),
-            ));
-        }
+        geodesy::trace_edge(from, to, MAX_EDGE_DEG, |p| out.push(p));
     }
     out
 }
 
 fn inside(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
+    let ring = geodesy::dedup_ring(ring);
     if ring.len() < 3 {
         return false;
     }
-    let traced = traced(ring);
+    let traced = traced(&ring);
     let turned = turn(&traced, lat, lon);
     if turned.abs() > 180.0 {
         let Some((centre_lat, centre_lon)) = middle(ring.iter().copied()) else {
@@ -110,7 +98,9 @@ fn inside(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
         return geodesy::unit(lat, lon).dot(geodesy::unit(centre_lat, centre_lon)) > 0.0;
     }
 
-    geodesy::encircles(&traced) && {
+    // Whole-Earth parallel bands cancel winding to ~0 between their parallels;
+    // require genuine closed-band seam cuts so tilted polar rings never match.
+    !geodesy::band_seam_cuts(&ring).is_empty() && {
         let (low, high) = ring.iter().fold((f64::MAX, f64::MIN), |(low, high), p| {
             (low.min(p.0), high.max(p.0))
         });
@@ -306,5 +296,23 @@ mod tests {
         assert!(covers(&c_shape, 18.0, 15.0));
         assert!(!covers(&c_shape, 10.0, 12.0)); // inside notch
         assert!(!covers(&c_shape, -10.0, -178.0)); // antipode
+    }
+
+    #[test]
+    fn tilted_polar_ring_rejects_exterior_points_within_its_latitude_span() {
+        let tilted = [ring(&[(80.0, 0.0), (80.0, 120.0), (88.0, -120.0)])];
+        assert!(covers(&tilted, 89.0, 0.0));
+        assert!(!covers(&tilted, 82.0, -120.0));
+        assert!(!covers(&tilted, -85.0, 0.0));
+
+        // GeoJSON-style closed ring (first == last) must behave identically.
+        let closed = [ring(&[
+            (80.0, 0.0),
+            (80.0, 120.0),
+            (88.0, -120.0),
+            (80.0, 0.0),
+        ])];
+        assert!(covers(&closed, 89.0, 0.0));
+        assert!(!covers(&closed, 82.0, -120.0));
     }
 }

@@ -47,10 +47,16 @@ pub fn format_resolution(m_per_px: f64) -> String {
 
 /// Choose a clean `1–2–5` metric scale-bar distance and its exact screen width
 /// in logical points for `m_per_pt` ground metres per logical point.
+///
+/// The returned width always equals `bar_m / m_per_pt` (falling in
+/// `[0.4 * max_width_pt, max_width_pt]`), so the visual bar never distorts
+/// metric scale.
 pub fn compute_scale_bar(m_per_pt: f64, max_width_pt: f32) -> (String, f32) {
     let max_w = f64::from(max_width_pt).max(1.0);
-    let min_w = 24.0_f64.min(max_w);
-    let target_m = (m_per_pt * max_w).max(0.01);
+    if !m_per_pt.is_finite() || m_per_pt <= 0.0 {
+        return ("0 m".to_owned(), 0.0);
+    }
+    let target_m = m_per_pt * max_w;
     let exponent = target_m.log10().floor();
     let decade = 10_f64.powf(exponent);
     let mantissa = target_m / decade;
@@ -62,14 +68,18 @@ pub fn compute_scale_bar(m_per_pt: f64, max_width_pt: f32) -> (String, f32) {
         1.0
     };
     let bar_m = nice * decade;
-    let width_pt = (bar_m / m_per_pt).clamp(min_w, max_w) as f32;
+    let width_pt = (bar_m / m_per_pt) as f32;
 
     let label = if bar_m >= 1_000.0 {
         format!("{} km", (bar_m / 1_000.0).round() as u64)
     } else if bar_m >= 1.0 {
         format!("{} m", bar_m.round() as u64)
-    } else {
+    } else if bar_m >= 0.01 {
         format!("{} cm", (bar_m * 100.0).round() as u64)
+    } else if bar_m >= 0.001 {
+        format!("{} mm", (bar_m * 1_000.0).round() as u64)
+    } else {
+        format!("{:.2} mm", bar_m * 1_000.0)
     };
     (label, width_pt)
 }
@@ -77,10 +87,20 @@ pub fn compute_scale_bar(m_per_pt: f64, max_width_pt: f32) -> (String, f32) {
 /// Paint a crisp floating dynamic metric scale bar in the bottom-left corner
 /// of `viewport_rect`.
 pub fn paint_scale_bar(painter: &egui::Painter, viewport_rect: egui::Rect, m_per_pt: f64) {
-    if !m_per_pt.is_finite() || m_per_pt <= 0.0 {
+    if !m_per_pt.is_finite()
+        || m_per_pt <= 0.0
+        || viewport_rect.width() < 120.0
+        || viewport_rect.height() < 80.0
+    {
         return;
     }
-    let (label, bar_w) = compute_scale_bar(m_per_pt, 160.0);
+    let max_width_pt = (viewport_rect.width() * 0.35).clamp(48.0, 160.0);
+    // Hide the tangent-plane scale bar at extreme orbital zoom where the bar
+    // would exceed 10,000 km and no longer reflects curved planetary scale.
+    if m_per_pt * f64::from(max_width_pt) > 10_000_000.0 {
+        return;
+    }
+    let (label, bar_w) = compute_scale_bar(m_per_pt, max_width_pt);
     let margin = 16.0;
     let pad_x = 10.0;
     let pad_y = 6.0;
@@ -136,14 +156,13 @@ pub fn paint_scale_bar(painter: &egui::Painter, viewport_rect: egui::Rect, m_per
 
 /// Interactive floating North compass dial in the top-right corner of
 /// `viewport_rect`. Hosted in a foreground `egui::Area` so clicks and hovers
-/// never bleed into the globe viewport underneath. Returns `true` when clicked
-/// to reset North.
+/// never bleed into the globe viewport underneath. Returns `(clicked, rect)`.
 pub fn show_north_compass(
     ctx: &egui::Context,
     viewport_rect: egui::Rect,
     heading_deg: f64,
-) -> bool {
-    let size = 46.0;
+) -> (bool, egui::Rect) {
+    let size = 48.0;
     let margin = 16.0;
     let pos = egui::pos2(
         viewport_rect.right() - margin - size,
@@ -157,6 +176,7 @@ pub fn show_north_compass(
         .show(ctx, |ui| {
             let (compass_rect, response) =
                 ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             let painter = ui.painter();
             let center = compass_rect.center();
             let radius = size * 0.5;
@@ -185,8 +205,8 @@ pub fn show_north_compass(
                 )
             };
 
-            let tip_n = rot(0.0, -radius * 0.58);
-            let tip_s = rot(0.0, radius * 0.58);
+            let tip_n = rot(0.0, -radius * 0.48);
+            let tip_s = rot(0.0, radius * 0.52);
             let left = rot(-4.0, 0.0);
             let right = rot(4.0, 0.0);
 
@@ -201,7 +221,7 @@ pub fn show_north_compass(
                 egui::Stroke::NONE,
             ));
             painter.text(
-                rot(0.0, -radius * 0.78),
+                rot(0.0, -radius * 0.72),
                 egui::Align2::CENTER_CENTER,
                 "N",
                 egui::FontId::proportional(9.5),
@@ -212,7 +232,7 @@ pub fn show_north_compass(
             response.on_hover_text(format!(
                 "Heading: {heading_deg:.1}°\nClick or press N to reset North"
             ));
-            clicked
+            (clicked, compass_rect)
         });
 
     area_resp.inner
@@ -223,18 +243,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scale_bar_selects_nice_1_2_5_increments_and_handles_narrow_bounds() {
+    fn scale_bar_selects_nice_1_2_5_increments_and_stays_metrically_accurate() {
         let (label, w) = compute_scale_bar(10.0, 150.0);
         assert_eq!(label, "1 km");
         assert!((w - 100.0).abs() < 1e-3);
 
-        let (label_close, w_close) = compute_scale_bar(0.02, 150.0);
-        assert_eq!(label_close, "2 m");
-        assert!((w_close - 100.0).abs() < 1e-3);
+        let (label_m, w_m) = compute_scale_bar(0.02, 150.0);
+        assert_eq!(label_m, "2 m");
+        assert!((w_m - 100.0).abs() < 1e-3);
 
-        // Must never panic even when max_width_pt < 24.0.
-        let (_, narrow_w) = compute_scale_bar(10.0, 12.0);
-        assert!((narrow_w - 12.0).abs() < 1e-3);
+        let (label_cm, w_cm) = compute_scale_bar(0.001_5, 160.0);
+        assert_eq!(label_cm, "20 cm");
+        assert!((w_cm - (0.20 / 0.001_5) as f32).abs() < 1e-3);
+
+        // Extreme close-up in a narrow pane must use mm rather than distorting width.
+        let (label_mm, w_mm) = compute_scale_bar(0.000_5, 12.0);
+        assert_eq!(label_mm, "5 mm");
+        assert!((w_mm - 10.0).abs() < 1e-3);
+
+        // Non-finite or non-positive resolutions degrade gracefully.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(compute_scale_bar(bad, 160.0), ("0 m".to_owned(), 0.0));
+        }
     }
 
     #[test]

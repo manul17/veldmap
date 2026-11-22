@@ -48,7 +48,8 @@ impl Ball {
     }
 }
 
-/// Conservative frustum + polar-horizon culling frame in `f64`.
+/// Conservative frustum + ellipsoidal-horizon culling frame in `f64`
+/// (exact for surface geometry at `height_m <= 0`).
 #[derive(Clone, Copy, Debug)]
 pub struct Frame {
     inward: [DVec3; 4],
@@ -254,5 +255,24 @@ mod tests {
                 assert!(ball.centre.distance(point) <= ball.radius + 1e-12);
             }
         }
+        let empty = Ball::over(&[]);
+        assert_eq!(empty.centre, DVec3::ZERO);
+        assert_eq!(empty.radius, 0.0);
+    }
+
+    #[test]
+    fn culling_is_accurate_at_2m_altitude() {
+        let cam = Camera::at(45.0, 39.0, camera::MIN_HEIGHT_M);
+        let frame = cam.frustum(1.5);
+        let directly_below = Ball {
+            centre: at(45.0, 39.0, 0.0),
+            radius: 1e-7,
+        };
+        let far_away = Ball {
+            centre: at(45.01, 39.0, 0.0),
+            radius: 1e-7,
+        };
+        assert!(frame.admits(&directly_below));
+        assert!(!frame.admits(&far_away));
     }
 }

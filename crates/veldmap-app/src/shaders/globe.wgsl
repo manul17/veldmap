@@ -7,25 +7,23 @@
 struct CameraUniform {
     /// Rotation-only Reverse-Z infinite perspective view-projection matrix.
     view_proj: mat4x4<f32>,
-};
-
-struct ChunkUniform {
-    /// High half of `(chunk_origin_ecef - camera_eye_ecef)` computed in f64 on CPU.
-    origin_minus_eye_hi: vec3<f32>,
+    /// High half of `-camera_eye_ecef` computed in f64 on CPU.
+    neg_eye_hi: vec3<f32>,
     _pad0: f32,
-    /// Low half of `(chunk_origin_ecef - camera_eye_ecef)` computed in f64 on CPU.
-    origin_minus_eye_lo: vec3<f32>,
+    /// Low half of `-camera_eye_ecef` computed in f64 on CPU.
+    neg_eye_lo: vec3<f32>,
     _pad1: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
-@group(1) @binding(0) var<uniform> chunk: ChunkUniform;
 
 /// Compute vertex position relative to camera eye with high-half cancellation
-/// (Sterbenz's lemma) plus low-half sub-millimetre remainder.
-/// Parentheses are load-bearing: never add high + low before combining pairs.
+/// (Sterbenz's lemma) plus low-half remainder.
+/// Parentheses are load-bearing under IEEE-754 non-reassociation; Slice 2A
+/// transitions tiled globe geometry to CPU `f64` per-tile RTC to avoid any
+/// GPU fast-math reassociation hazard across backends.
 fn relative_to_eye(pos_hi: vec3<f32>, pos_lo: vec3<f32>) -> vec3<f32> {
-    return (pos_hi + chunk.origin_minus_eye_hi) + (pos_lo + chunk.origin_minus_eye_lo);
+    return (pos_hi + camera.neg_eye_hi) + (pos_lo + camera.neg_eye_lo);
 }
 
 struct VsOut {
@@ -74,7 +72,8 @@ fn fs_body(in: VsOut) -> @location(0) vec4<f32> {
     let body = mix(SHADE_LINEAR, LIT_LINEAR, 0.45 + 0.55 * lambert);
 
     let facing = clamp(horizon_facing(in), 0.0, 1.0);
-    let rim = pow(1.0 - facing, 3.0);
+    let inv_facing = 1.0 - facing;
+    let rim = inv_facing * inv_facing * inv_facing;
     return vec4<f32>(mix(body, ACCENT_LINEAR, rim * 0.85), 1.0);
 }
 

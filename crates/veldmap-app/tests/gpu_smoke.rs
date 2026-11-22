@@ -14,8 +14,15 @@
     reason = "INVARIANT: integration test helpers panic on headless GPU harness failure"
 )]
 
+use std::sync::OnceLock;
+
 use veldmap_app::render::{GlobeRenderer, RenderParams};
 use veldmap_core::geo::camera::{Camera, MIN_HEIGHT_M};
+
+fn shared_headless_device() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
+    static DEVICE: OnceLock<Option<(wgpu::Device, wgpu::Queue)>> = OnceLock::new();
+    DEVICE.get_or_init(request_headless_device).as_ref()
+}
 
 fn request_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
@@ -211,8 +218,8 @@ fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
 }
 
 #[test]
-fn headless_reverse_z_and_exact_srgb_compositing() {
-    let Some((device, queue)) = request_headless_device() else {
+fn srgb_and_unorm_compositing_parity_and_dirty_cache() {
+    let Some((device, queue)) = shared_headless_device() else {
         return;
     };
 
@@ -220,25 +227,6 @@ fn headless_reverse_z_and_exact_srgb_compositing() {
     // avoiding cross-driver line tie-break ambiguity on even boundaries.
     let (w, h) = (129, 129);
     let orbital_cam = Camera::default();
-
-    let mut srgb_renderer = GlobeRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-    let mut unorm_renderer = GlobeRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
-
-    // 0x0 viewport must skip cleanly without panicking.
-    let mut zero_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    assert!(!srgb_renderer.render_if_dirty(
-        &device,
-        &queue,
-        &mut zero_enc,
-        RenderParams {
-            width: 0,
-            height: 0,
-            camera: &orbital_cam,
-            show_graticule: true,
-            generation: 1,
-        },
-    ));
-
     let orbital_params = RenderParams {
         width: w,
         height: h,
@@ -247,28 +235,33 @@ fn headless_reverse_z_and_exact_srgb_compositing() {
         generation: 1,
     };
 
-    // 1. Composite onto BOTH sRGB and UNORM targets and verify exact 1:1 parity.
+    let mut srgb_renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut unorm_renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8Unorm);
+
+    // Composite onto BOTH sRGB and UNORM targets and verify exact 1:1 parity.
     let srgb_pixels = render_with(
         &mut srgb_renderer,
-        &device,
-        &queue,
+        device,
+        queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
         orbital_params,
         true,
     );
-    // Identical key must skip offscreen redraw via dirty-key cache.
-    let _ = render_with(
+    // Identical key must skip offscreen redraw via dirty-key cache and produce identical output.
+    let cached_pixels = render_with(
         &mut srgb_renderer,
-        &device,
-        &queue,
+        device,
+        queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
         orbital_params,
         false,
     );
+    assert_eq!(cached_pixels, srgb_pixels);
+
     let unorm_pixels = render_with(
         &mut unorm_renderer,
-        &device,
-        &queue,
+        device,
+        queue,
         wgpu::TextureFormat::Rgba8Unorm,
         orbital_params,
         true,
@@ -301,17 +294,43 @@ fn headless_reverse_z_and_exact_srgb_compositing() {
             && center[2].abs_diff(155) <= 2,
         "orbital center pixel did not match exact draped graticule sRGB #A8B99B: {center:?}"
     );
+}
 
-    // 2. Toggling show_graticule MUST re-render even with unchanged generation,
+#[test]
+fn graticule_toggle_and_back_hemisphere_horizon_discard() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let (w, h) = (129, 129);
+    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+    // Toggling show_graticule MUST re-render even with unchanged generation,
     // replacing the center graticule intersection with the lit ellipsoid body.
+    let orbital_cam = Camera::default();
+    let base = RenderParams {
+        width: w,
+        height: h,
+        camera: &orbital_cam,
+        show_graticule: true,
+        generation: 1,
+    };
+    let _ = render_with(
+        &mut renderer,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        base,
+        true,
+    );
     let no_grid_pixels = render_with(
-        &mut srgb_renderer,
-        &device,
-        &queue,
+        &mut renderer,
+        device,
+        queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
         RenderParams {
             show_graticule: false,
-            ..orbital_params
+            ..base
         },
         true,
     );
@@ -321,22 +340,143 @@ fn headless_reverse_z_and_exact_srgb_compositing() {
         "center pixel without graticule did not render lit ellipsoid in sRGB: {body_center:?}"
     );
 
-    // 3. Resize existing renderer and verify Reverse-Z close-up at 2 m altitude
-    // directly over an exact ellipsoid mesh vertex (45 N, 45 E -> 2.0 m from eye,
-    // 1.0 m past the near plane) fills the viewport with zero near-plane clipping.
-    let close_cam = Camera::at(45.0, 45.0, MIN_HEIGHT_M);
+    // Verify `fs_grid` back-hemisphere horizon discard: at (37.5 N, 52.5 E,
+    // 14,000 km), front 15-degree graticule lines lie >8 px from center, while
+    // back-hemisphere graticule lines project ~4–5 px from center. Every pixel
+    // in the central 11x11 patch (59..=69) must match the grid-off render.
+    let cam = Camera::at(37.5, 52.5, 14_000_000.0);
+    let params = RenderParams {
+        width: w,
+        height: h,
+        camera: &cam,
+        show_graticule: true,
+        generation: 1,
+    };
+    let with_grid = render_with(
+        &mut renderer,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        params,
+        true,
+    );
+    let without_grid = render_with(
+        &mut renderer,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            show_graticule: false,
+            ..params
+        },
+        true,
+    );
+    let mid = w / 2;
+    for y in (mid - 5)..=(mid + 5) {
+        for x in (mid - 5)..=(mid + 5) {
+            assert_eq!(
+                pixel_at(&with_grid, w, x, y),
+                pixel_at(&without_grid, w, x, y),
+                "back-hemisphere graticule bled into front pixel ({x}, {y})"
+            );
+        }
+    }
+    // Outside the center gap, front-hemisphere graticule lines must still draw.
+    assert_ne!(with_grid, without_grid);
+}
+
+#[test]
+fn dropped_encoder_recovery_and_zero_viewport_safety() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let cam = Camera::at(37.5, 52.5, 14_000_000.0);
+
+    // 0x0 viewport must skip cleanly without panicking.
+    let mut zero_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    assert!(!renderer.render_if_dirty(
+        device,
+        queue,
+        &mut zero_enc,
+        RenderParams {
+            width: 0,
+            height: 0,
+            camera: &cam,
+            show_graticule: true,
+            generation: 1,
+        },
+    ));
+
+    // If `render_if_dirty` runs into an encoder discarded before `composite_into`
+    // (as happens on swapchain `Outdated`/`Lost`/`Occluded`), the next frame with
+    // the same key must re-render rather than presenting an unrendered texture.
+    let params = RenderParams {
+        width: 65,
+        height: 65,
+        camera: &cam,
+        show_graticule: true,
+        generation: 1,
+    };
+    let mut dropped_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    assert!(renderer.render_if_dirty(device, queue, &mut dropped_enc, params));
+    drop(dropped_enc);
+
+    let recovered = render_with(
+        &mut renderer,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        params,
+        true,
+    );
+    let center = pixel_at(&recovered, 65, 32, 32);
+    assert!(
+        center[0] > 180 && center[1] > 170 && center[2] > 150,
+        "recovered render did not produce lit globe center: {center:?}"
+    );
+}
+
+#[test]
+fn reverse_z_close_up_at_2m_and_sub_metre_rte_shift() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+    // Start at orbital size, then resize down to verify target recreation and
+    // Reverse-Z close-up at 2 m altitude directly over vertex (45 N, 45 E).
+    let orbital = Camera::default();
+    let _ = render_with(
+        &mut renderer,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width: 129,
+            height: 129,
+            camera: &orbital,
+            show_graticule: false,
+            generation: 1,
+        },
+        true,
+    );
+
     let (rw, rh) = (65, 65);
+    let close_cam = Camera::at(45.0, 45.0, MIN_HEIGHT_M);
     let close_pixels = render_with(
-        &mut srgb_renderer,
-        &device,
-        &queue,
+        &mut renderer,
+        device,
+        queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
         RenderParams {
             width: rw,
             height: rh,
             camera: &close_cam,
             show_graticule: false,
-            generation: 2,
+            generation: 1,
         },
         true,
     );
@@ -347,4 +487,42 @@ fn headless_reverse_z_and_exact_srgb_compositing() {
             "2 m altitude Reverse-Z pixel at ({x},{y}) clipped or missed surface: {px:?}"
         );
     }
+
+    // Verify sub-metre RTE shift on the GPU: shifting the camera 0.25 m east
+    // of (45 N, 45 E) — smaller than 1 ULP of single-precision ECEF (~0.76 m) —
+    // must visibly shift the 45 E meridian line off the center pixel.
+    let on_vertex = render_with(
+        &mut renderer,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width: rw,
+            height: rh,
+            camera: &close_cam,
+            show_graticule: true,
+            generation: 1,
+        },
+        true,
+    );
+    let dlon_25cm = 0.25 / (111_320.0 * 45.0_f64.to_radians().cos());
+    let shifted_cam = Camera::at(45.0, 45.0 + dlon_25cm, MIN_HEIGHT_M);
+    let shifted = render_with(
+        &mut renderer,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width: rw,
+            height: rh,
+            camera: &shifted_cam,
+            show_graticule: true,
+            generation: 1,
+        },
+        true,
+    );
+    assert_ne!(
+        on_vertex, shifted,
+        "0.25 m shift at 2 m altitude collapsed (double-single RTE lost sub-metre precision)"
+    );
 }

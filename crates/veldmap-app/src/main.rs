@@ -12,69 +12,29 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-/// Parse `WGPU_BACKEND` while explicitly excluding OpenGL/GLES/WebGPU so the
-/// application stays on `Backends::PRIMARY` (Vulkan, DX12, Metal).
-fn configured_backends() -> wgpu::Backends {
-    let Ok(raw) = std::env::var("WGPU_BACKEND") else {
-        return wgpu::Backends::PRIMARY;
-    };
-
-    let mut backends = wgpu::Backends::empty();
-    for token in raw.split([',', '|', ' ']).filter(|s| !s.is_empty()) {
-        match token.to_ascii_lowercase().as_str() {
-            "primary" => backends |= wgpu::Backends::PRIMARY,
-            "vulkan" | "vk" => backends |= wgpu::Backends::VULKAN,
-            "dx12" | "d3d12" => backends |= wgpu::Backends::DX12,
-            "metal" | "mtl" => backends |= wgpu::Backends::METAL,
-            "gl" | "opengl" | "gles" | "webgpu" => {
-                tracing::warn!(
-                    backend = token,
-                    "Ignoring unsupported WGPU_BACKEND value (only Vulkan, DX12, and Metal are supported)"
-                );
-            }
-            other => {
-                tracing::warn!(backend = other, "Ignoring unknown WGPU_BACKEND value");
-            }
-        }
-    }
-
-    if backends.is_empty() {
+/// Restrict `egui_wgpu`'s environment-resolved backends to `Backends::PRIMARY`
+/// (Vulkan, DX12, Metal), explicitly excluding OpenGL/GLES/WebGPU.
+fn clamp_to_primary_backends(backends: wgpu::Backends) -> wgpu::Backends {
+    let unsupported = backends - wgpu::Backends::PRIMARY;
+    if !unsupported.is_empty() {
         tracing::warn!(
-            value = raw,
+            ?unsupported,
+            "Ignoring unsupported WGPU_BACKEND entries (only Vulkan, DX12, and Metal are supported)"
+        );
+    }
+    let primary = backends & wgpu::Backends::PRIMARY;
+    if primary.is_empty() {
+        tracing::warn!(
             "WGPU_BACKEND selected no supported backends; falling back to Backends::PRIMARY"
         );
         wgpu::Backends::PRIMARY
     } else {
-        backends
-    }
-}
-
-/// Parse `WGPU_POWER_PREF` (`high`, `low`, `none`).
-fn configured_power_preference() -> wgpu::PowerPreference {
-    let Ok(raw) = std::env::var("WGPU_POWER_PREF") else {
-        return wgpu::PowerPreference::HighPerformance;
-    };
-
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "high" | "high_performance" | "high-performance" => wgpu::PowerPreference::HighPerformance,
-        "low" | "low_power" | "low-power" => wgpu::PowerPreference::LowPower,
-        "none" | "default" => wgpu::PowerPreference::None,
-        other => {
-            tracing::warn!(
-                value = other,
-                "Ignoring unknown WGPU_POWER_PREF value; using HighPerformance"
-            );
-            wgpu::PowerPreference::HighPerformance
-        }
+        primary
     }
 }
 
 fn main() -> eframe::Result<()> {
     init_tracing();
-
-    let backends = configured_backends();
-    let power_preference = configured_power_preference();
-    tracing::info!(?backends, ?power_preference, "Starting VeldMap");
 
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -85,8 +45,13 @@ fn main() -> eframe::Result<()> {
     };
 
     if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
-        setup.instance_descriptor.backends = backends;
-        setup.power_preference = power_preference;
+        setup.instance_descriptor.backends =
+            clamp_to_primary_backends(setup.instance_descriptor.backends);
+        tracing::info!(
+            backends = ?setup.instance_descriptor.backends,
+            power_preference = ?setup.power_preference,
+            "Starting VeldMap"
+        );
     }
 
     eframe::run_native(

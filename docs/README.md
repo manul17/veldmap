@@ -6,7 +6,7 @@ Authoritative architecture notes, build instructions, glossary, current limitati
 
 - [Building & Running](building.md) — Rust toolchain, platform dependencies, runtime environment variables, and verification commands.
 - [3D WGS84 Globe Architecture](architecture/globe.md) — Coordinates, projections, MGRS, nadir camera, double-single RTE Reverse-Z rendering, and GIS HUD.
-- [Architectural Decision Records](decisions/README.md) — Empirical single-decision records proving design contracts alongside each vertical slice.
+- [Architectural Decision Records](decisions/README.md) — Focused ADRs recording design contracts alongside each vertical slice.
 - [Glossary](glossary.md) — Canonical English domain vocabulary shared across code, UI, and documentation.
 - [Known Limitations](limitations.md) — Explicit scope boundaries and current implementation limits.
 

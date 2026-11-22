@@ -28,6 +28,8 @@ pub enum MgrsError {
     ZoneOutOfRange(u32),
     #[error("MGRS latitude band '{0}' is invalid")]
     InvalidBand(char),
+    #[error("MGRS zone {zone}{band} does not exist")]
+    InvalidZoneBand { zone: u32, band: char },
     #[error("MGRS 100 km column '{col}' is invalid in zone {zone}")]
     InvalidColumn { col: char, zone: u32 },
     #[error("MGRS 100 km row '{0}' is invalid")]
@@ -52,14 +54,20 @@ const BANDS: &[u8] = b"CDEFGHJKLMNPQRSTUVWX";
 /// Row letters of 100 km squares (cycle of 20, omitting I and O).
 const ROWS: &[u8] = b"ABCDEFGHJKLMNPQRSTUV";
 
-fn band_middle_deg(band: usize) -> f64 {
+fn band_bounds_deg(band: usize) -> (f64, f64) {
     let south_edge = -80.0 + band as f64 * BAND_DEG;
     let height = if band == BANDS.len() - 1 {
         LAST_BAND_DEG
     } else {
         BAND_DEG
     };
-    south_edge + height * 0.5
+    (south_edge, south_edge + height)
+}
+
+#[cfg(test)]
+fn band_middle_deg(band: usize) -> f64 {
+    let (south_edge, north_edge) = band_bounds_deg(band);
+    (south_edge + north_edge) * 0.5
 }
 
 /// Extract a 5-character MGRS tile code (`_TxxABC_`) from a Sentinel-2 product
@@ -75,15 +83,44 @@ pub fn tile_of(product_name: &str) -> Option<&str> {
     })
 }
 
-/// Resolve the southwest UTM corner `(zone, south, easting_m, northing_m)` of
-/// an MGRS 100 km grid square from a zone (`1..=60`), band letter, column
-/// letter, and row letter.
+struct SquareOrigin {
+    zone: u32,
+    south: bool,
+    easting: f64,
+    northing: f64,
+    south_edge: f64,
+    north_edge: f64,
+    west_lon: f64,
+    east_lon: f64,
+}
+
+/// Longitude bounds `(west_deg, east_deg)` of an MGRS zone-band cell,
+/// accounting for the Norway (`31V`/`32V`) and Svalbard (`31X`/`33X`/`35X`/`37X`)
+/// exceptions.
+fn zone_lon_bounds_deg(zone: u32, band_char: u8) -> (f64, f64) {
+    match (zone, band_char) {
+        (31, b'V') => (0.0, 3.0),
+        (32, b'V') => (3.0, 12.0),
+        (31, b'X') => (0.0, 9.0),
+        (33, b'X') => (9.0, 21.0),
+        (35, b'X') => (21.0, 33.0),
+        (37, b'X') => (33.0, 42.0),
+        _ => {
+            let west = f64::from(zone) * 6.0 - 186.0;
+            (west, west + 6.0)
+        }
+    }
+}
+
+/// Resolve the southwest UTM corner and latitude/longitude bounds of an MGRS
+/// 100 km grid square from a zone (`1..=60`), band letter, column letter, and
+/// row letter.
 fn square_origin(
     zone: u32,
     band_char: u8,
     col_char: u8,
     row_char: u8,
-) -> Result<(u32, bool, f64, f64), MgrsError> {
+) -> Result<SquareOrigin, MgrsError> {
     if !(1..=60).contains(&zone) {
         return Err(MgrsError::ZoneOutOfRange(zone));
     }
@@ -91,6 +128,12 @@ fn square_origin(
         .iter()
         .position(|&b| b == band_char)
         .ok_or(MgrsError::InvalidBand(band_char as char))?;
+    if band_char == b'X' && matches!(zone, 32 | 34 | 36) {
+        return Err(MgrsError::InvalidZoneBand {
+            zone,
+            band: band_char as char,
+        });
+    }
 
     let column_set: &[u8] = match (zone - 1) % 3 {
         0 => b"ABCDEFGH",
@@ -114,7 +157,9 @@ fn square_origin(
     let shift = if zone.is_multiple_of(2) { 5 } else { 0 };
     let base = ((row + ROWS.len() - shift) % ROWS.len()) as f64 * SQUARE_M;
 
-    let band_mid_deg = band_middle_deg(band);
+    let (south_edge, north_edge) = band_bounds_deg(band);
+    let (west_lon, east_lon) = zone_lon_bounds_deg(zone, band_char);
+    let band_mid_deg = (south_edge + north_edge) * 0.5;
     let south = band_mid_deg < 0.0;
     let approx = band_mid_deg.abs() * 110_946.0;
     let target = if south { 10_000_000.0 - approx } else { approx };
@@ -123,7 +168,46 @@ fn square_origin(
         northing += ROW_CYCLE_M;
     }
 
-    Ok((zone, south, easting, northing))
+    // Verify that the 100 km square actually overlaps the stated latitude band
+    // and UTM zone longitude span (rejects out-of-band rows like `37MAA` and
+    // out-of-zone high-latitude columns like `37XAA`).
+    let system = System::utm(zone, south);
+    let mut min_lat = f64::INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    let mut min_lon = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    for (x, y) in [
+        (easting, northing),
+        (easting + SQUARE_M, northing),
+        (easting, northing + SQUARE_M),
+        (easting + SQUARE_M, northing + SQUARE_M),
+    ] {
+        let (lat, lon) = system.to_geodetic(x, y);
+        min_lat = min_lat.min(lat);
+        max_lat = max_lat.max(lat);
+        min_lon = min_lon.min(lon);
+        max_lon = max_lon.max(lon);
+    }
+    if max_lat <= south_edge || min_lat >= north_edge {
+        return Err(MgrsError::InvalidRow(row_char as char));
+    }
+    if max_lon <= west_lon || min_lon >= east_lon {
+        return Err(MgrsError::InvalidColumn {
+            col: col_char as char,
+            zone,
+        });
+    }
+
+    Ok(SquareOrigin {
+        zone,
+        south,
+        easting,
+        northing,
+        south_edge,
+        north_edge,
+        west_lon,
+        east_lon,
+    })
 }
 
 /// Compute the Sentinel-2 109.8 km granule frame in UTM metres for a
@@ -136,15 +220,15 @@ pub fn frame(tile: &str) -> Result<Frame, MgrsError> {
     let zone: u32 = tile[..2]
         .parse()
         .map_err(|_| MgrsError::InvalidZoneNumber(tile.to_owned()))?;
-    let (zone, south, x0, northing) = square_origin(zone, bytes[2], bytes[3], bytes[4])?;
+    let origin = square_origin(zone, bytes[2], bytes[3], bytes[4])?;
 
-    let y1 = northing + SQUARE_M;
+    let y1 = origin.northing + SQUARE_M;
     Ok(Frame {
-        zone,
-        south,
-        x0,
+        zone: origin.zone,
+        south: origin.south,
+        x0: origin.easting,
         y0: y1 - TILE_SIDE_M,
-        x1: x0 + TILE_SIDE_M,
+        x1: origin.easting + TILE_SIDE_M,
         y1,
     })
 }
@@ -153,67 +237,105 @@ pub fn frame(tile: &str) -> Result<Frame, MgrsError> {
 /// `"4Q FJ 12345 67890"`, or `"37UDQ5050"`) into WGS84
 /// `(lat_deg, lon_deg, suggested_radius_deg)` centered on the addressed cell.
 pub fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> {
-    let compact: String = input
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
+    let trimmed = input.trim();
+    if trimmed.is_empty() || !trimmed.is_ascii() {
+        return Err(MgrsError::InvalidFormat(input.to_owned()));
+    }
+
+    // Track non-whitespace byte positions so we can validate whitespace-separated
+    // easting/northing digit halves without silently gluing unequal halves.
+    let mut compact = Vec::with_capacity(trimmed.len());
+    let mut orig_positions = Vec::with_capacity(trimmed.len());
+    for (idx, b) in trimmed.bytes().enumerate() {
+        if !b.is_ascii_whitespace() {
+            compact.push(b.to_ascii_uppercase());
+            orig_positions.push(idx);
+        }
+    }
     if compact.is_empty() {
         return Err(MgrsError::InvalidFormat(input.to_owned()));
     }
 
     // Allow Sentinel-2 tile notation with leading `T` (e.g. `T40WFC`).
-    let stripped = compact
-        .strip_prefix('T')
-        .filter(|rest| rest.bytes().next().is_some_and(|b| b.is_ascii_digit()))
-        .unwrap_or(&compact);
+    let start = usize::from(compact[0] == b'T' && compact.get(1).is_some_and(u8::is_ascii_digit));
+    let bytes = &compact[start..];
 
-    if !stripped.is_ascii() {
-        return Err(MgrsError::InvalidFormat(input.to_owned()));
-    }
-
-    let bytes = stripped.as_bytes();
     let zone_digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
     if !(1..=2).contains(&zone_digits) || bytes.len() < zone_digits + 3 {
         return Err(MgrsError::InvalidFormat(input.to_owned()));
     }
-    let zone: u32 = stripped[..zone_digits]
+    let zone_str = std::str::from_utf8(&bytes[..zone_digits])
+        .map_err(|_| MgrsError::InvalidZoneNumber(input.to_owned()))?;
+    let zone: u32 = zone_str
         .parse()
         .map_err(|_| MgrsError::InvalidZoneNumber(input.to_owned()))?;
 
     let band = bytes[zone_digits];
     let col = bytes[zone_digits + 1];
     let row = bytes[zone_digits + 2];
-    let rest = &stripped[zone_digits + 3..];
+    let digits_start = start + zone_digits + 3;
 
-    let (zone, south, x0, y0) = square_origin(zone, band, col, row)?;
+    let origin = square_origin(zone, band, col, row)?;
 
-    let (easting, northing, cell_side_m) = if rest.is_empty() {
-        (x0 + SQUARE_M * 0.5, y0 + SQUARE_M * 0.5, SQUARE_M)
-    } else {
-        if !rest.bytes().all(|b| b.is_ascii_digit())
-            || !rest.len().is_multiple_of(2)
-            || rest.len() > 10
-        {
-            return Err(MgrsError::InvalidDigits(rest.to_owned()));
-        }
-        let half = rest.len() / 2;
-        let step_m = 10_f64.powi(5 - half as i32);
-        let e_val: f64 = rest[..half]
-            .parse()
-            .map_err(|_| MgrsError::InvalidDigits(rest.to_owned()))?;
-        let n_val: f64 = rest[half..]
-            .parse()
-            .map_err(|_| MgrsError::InvalidDigits(rest.to_owned()))?;
+    let has_digits = digits_start < compact.len();
+    let (easting, northing, cell_side_m) = if !has_digits {
         (
-            x0 + (e_val + 0.5) * step_m,
-            y0 + (n_val + 0.5) * step_m,
+            origin.easting + SQUARE_M * 0.5,
+            origin.northing + SQUARE_M * 0.5,
+            SQUARE_M,
+        )
+    } else {
+        let raw_digits = &trimmed[orig_positions[digits_start]..];
+        let digit_parts: Vec<&str> = raw_digits.split_whitespace().collect();
+        let (e_str, n_str) = match digit_parts.as_slice() {
+            [combined] => {
+                if !combined.bytes().all(|b| b.is_ascii_digit())
+                    || !combined.len().is_multiple_of(2)
+                    || combined.len() > 10
+                {
+                    return Err(MgrsError::InvalidDigits(raw_digits.to_owned()));
+                }
+                combined.split_at(combined.len() / 2)
+            }
+            [e_part, n_part] => {
+                if e_part.len() != n_part.len()
+                    || !(1..=5).contains(&e_part.len())
+                    || !e_part.bytes().all(|b| b.is_ascii_digit())
+                    || !n_part.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(MgrsError::InvalidDigits(raw_digits.to_owned()));
+                }
+                (*e_part, *n_part)
+            }
+            _ => return Err(MgrsError::InvalidDigits(raw_digits.to_owned())),
+        };
+        let step_m = 10_f64.powi(5 - e_str.len() as i32);
+        let e_val: f64 = e_str
+            .parse()
+            .map_err(|_| MgrsError::InvalidDigits(raw_digits.to_owned()))?;
+        let n_val: f64 = n_str
+            .parse()
+            .map_err(|_| MgrsError::InvalidDigits(raw_digits.to_owned()))?;
+        (
+            origin.easting + (e_val + 0.5) * step_m,
+            origin.northing + (n_val + 0.5) * step_m,
             step_m,
         )
     };
 
-    let system = System::utm(zone, south);
+    let system = System::utm(origin.zone, origin.south);
     let (lat_deg, lon_deg) = system.to_geodetic(easting, northing);
+    if has_digits {
+        if !(origin.south_edge - 1e-6..=origin.north_edge + 1e-6).contains(&lat_deg) {
+            return Err(MgrsError::InvalidRow(row as char));
+        }
+        if !(origin.west_lon - 1e-6..=origin.east_lon + 1e-6).contains(&lon_deg) {
+            return Err(MgrsError::InvalidColumn {
+                col: col as char,
+                zone: origin.zone,
+            });
+        }
+    }
     let lon_deg = unwind(0.0, lon_deg);
     let radius_deg = (cell_side_m / 111_320.0).clamp(0.002, 1.0);
     Ok((lat_deg, lon_deg, radius_deg))
@@ -309,24 +431,53 @@ mod tests {
         assert!(frame("a\u{00E9}bc").is_err());
         assert!(parse_to_wgs84("37UD\u{0419}").is_err());
         assert!(parse_to_wgs84("37UD\u{00E9}").is_err());
+        // Out-of-band row letter wrapping into the wrong hemisphere, unequal digit halves,
+        // nonexistent Svalbard zones (32X/34X/36X), and out-of-zone high-latitude columns.
+        assert!(parse_to_wgs84("37MAA").is_err());
+        assert!(parse_to_wgs84("37UDQ 12 3456").is_err());
+        assert!(matches!(
+            parse_to_wgs84("32XAA"),
+            Err(MgrsError::InvalidZoneBand {
+                zone: 32,
+                band: 'X'
+            })
+        ));
+        assert!(parse_to_wgs84("34XAA").is_err());
+        assert!(parse_to_wgs84("36XAA").is_err());
+        assert!(matches!(
+            parse_to_wgs84("37XAA"),
+            Err(MgrsError::InvalidColumn { col: 'A', zone: 37 })
+        ));
     }
 
     #[test]
     fn parse_mgrs_square_and_full_grid_to_wgs84() {
+        // 31N AA 66021 00000 is the exact equator / prime meridian (0 N, 0 E) to ~1 m.
+        let (lat0, lon0, radius0) = parse_to_wgs84("31N AA 66021 00000").unwrap();
+        assert!(lat0.abs() < 1e-4, "lat0={lat0}");
+        assert!(lon0.abs() < 1e-4, "lon0={lon0}");
+        assert!(radius0 <= 0.003);
+
+        // Sentinel-2 reference granule T40WFC center (650 km E, 7750 km N in UTM 40N).
         let (lat, lon, radius) = parse_to_wgs84("T40WFC").unwrap();
-        assert!((69.0..70.5).contains(&lat), "lat={lat}");
-        assert!((59.0..62.0).contains(&lon), "lon={lon}");
+        assert!((lat - 69.8117).abs() < 0.01, "lat={lat}");
+        assert!((lon - 60.9036).abs() < 0.01, "lon={lon}");
         assert!(radius > 0.5);
 
-        // 37UDQ: UTM zone 37N, band U (48..56 N), square DQ (E 400..500 km, N 5400..5500 km)
+        // 37U DQ 50000 50000: UTM 37N E=450,000.5 m, N=5,450,000.5 m.
         let (lat_m, lon_m, radius_m) = parse_to_wgs84("37U DQ 50000 50000").unwrap();
-        assert!((48.5..50.0).contains(&lat_m), "lat={lat_m}");
-        assert!((37.5..39.5).contains(&lon_m), "lon={lon_m}");
-        assert!(radius_m < 0.05);
+        assert!((lat_m - 49.2015).abs() < 0.001, "lat={lat_m}");
+        assert!((lon_m - 38.3132).abs() < 0.001, "lon={lon_m}");
+        assert!(radius_m < 0.01);
 
-        // Single-digit zone (e.g. Hawaii zone 4Q)
+        // Single-digit zone (Hawaii 4Q FJ 1234 5678: UTM 4N E=612,345 m, N=2,356,785 m).
         let (lat_h, lon_h, _) = parse_to_wgs84("4Q FJ 1234 5678").unwrap();
-        assert!((16.0..24.0).contains(&lat_h), "lat={lat_h}");
-        assert!((-162.0..-154.0).contains(&lon_h), "lon={lon_h}");
+        assert!((lat_h - 21.309_478).abs() < 1e-4, "lat={lat_h}");
+        assert!((lon_h + 157.916_819).abs() < 1e-4, "lon={lon_h}");
+
+        // Norway widened 32V (Bergen ~60.391 N, 5.322 E -> 32V KN 973 010).
+        let (lat_no, lon_no, _) = parse_to_wgs84("32V KN 973 010").unwrap();
+        assert!((lat_no - 60.395).abs() < 0.01, "lat_no={lat_no}");
+        assert!((lon_no - 5.322).abs() < 0.01, "lon_no={lon_no}");
     }
 }

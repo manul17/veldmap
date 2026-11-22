@@ -234,6 +234,21 @@ fn split_by_hemisphere(input: &str) -> Option<(&str, &str)> {
     None
 }
 
+fn is_seconds_suffix(last: char, before: &str) -> bool {
+    matches!(last, 's' | 'S')
+        && before.ends_with(|c: char| c.is_ascii_digit())
+        && contains_dms_marker(before)
+        && (last == 's' || before.chars().any(|c| matches!(c, 'd' | 'D' | 'm' | 'M')))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AngleUnit {
+    Deg,
+    Min,
+    Sec,
+    Colon,
+}
+
 fn parse_angle(
     clause: &str,
     original: &str,
@@ -251,69 +266,114 @@ fn parse_angle(
     }
 
     // 2. Optional trailing hemisphere (`33°52'07.7"S`, `33d 52m 7.7s S`, `33.8688S`).
-    if hemisphere.is_none()
-        && let Some(last) = rest.chars().next_back()
+    // Always check even if a prefix hemisphere was found so conflicting forms
+    // like `"N 45S"` are rejected rather than having `S` treated as seconds.
+    if let Some(last) = rest.chars().next_back()
         && let Some(h) = parse_hemisphere_char(last)
     {
         let before = &rest[..rest.len() - last.len_utf8()];
-        let is_seconds_suffix = matches!(last, 's' | 'S')
-            && before.ends_with(|c: char| c.is_ascii_digit())
-            && contains_dms_marker(before)
-            && (last == 's' || before.chars().any(|c| matches!(c, 'd' | 'D' | 'm' | 'M')));
-        if !is_seconds_suffix {
+        if !is_seconds_suffix(last, before) {
+            if hemisphere.is_some() {
+                return Err(ParseLocationError::Unrecognized(original.to_owned()));
+            }
             hemisphere = Some(h);
             rest = before.trim();
         }
     }
 
-    let mut cleaned = String::with_capacity(rest.len());
+    let mut slots: [Option<f64>; 3] = [None; 3];
+    let mut next_slot = 0usize;
     let mut has_dms_markers = false;
-    let mut prev_char: Option<char> = None;
+    let mut count = 0usize;
 
-    for ch in rest.chars() {
-        match ch {
-            '°' | 'º' | 'd' | 'D' | '\'' | '′' | 'm' | 'M' | '"' | '″' | ':' => {
-                has_dms_markers = true;
-                cleaned.push(' ');
-            }
-            's' | 'S' if prev_char.is_some_and(|c| c.is_ascii_digit()) => {
-                has_dms_markers = true;
-                cleaned.push(' ');
-            }
-            _ => cleaned.push(ch),
+    let mut chars = rest.char_indices().peekable();
+    while let Some(&(start, ch)) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
         }
-        prev_char = Some(ch);
+        let mut end = start;
+        while let Some(&(idx, c)) = chars.peek() {
+            if c.is_ascii_digit() || matches!(c, '.' | '+' | '-') {
+                end = idx + c.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if end == start {
+            return Err(ParseLocationError::Unrecognized(original.to_owned()));
+        }
+        let val: f64 = rest[start..end]
+            .parse()
+            .map_err(|_| ParseLocationError::Unrecognized(original.to_owned()))?;
+        if !val.is_finite() {
+            return Err(ParseLocationError::Unrecognized(original.to_owned()));
+        }
+
+        let unit = match chars.peek().map(|&(_, c)| c) {
+            Some('°' | 'º' | 'd' | 'D') => {
+                chars.next();
+                has_dms_markers = true;
+                Some(AngleUnit::Deg)
+            }
+            Some('\'' | '′' | 'm' | 'M') => {
+                chars.next();
+                has_dms_markers = true;
+                Some(AngleUnit::Min)
+            }
+            Some('"' | '″' | 's' | 'S') => {
+                chars.next();
+                has_dms_markers = true;
+                Some(AngleUnit::Sec)
+            }
+            Some(':') => {
+                chars.next();
+                has_dms_markers = true;
+                Some(AngleUnit::Colon)
+            }
+            Some(c) if c.is_whitespace() => None,
+            None => None,
+            Some(_) => return Err(ParseLocationError::Unrecognized(original.to_owned())),
+        };
+
+        let slot = match unit {
+            Some(AngleUnit::Deg) => 0,
+            Some(AngleUnit::Min) => 1,
+            Some(AngleUnit::Sec) => 2,
+            Some(AngleUnit::Colon) | None => next_slot,
+        };
+        if slot < next_slot || slot >= 3 {
+            return Err(ParseLocationError::Unrecognized(original.to_owned()));
+        }
+        slots[slot] = Some(val);
+        next_slot = slot + 1;
+        count += 1;
     }
 
-    let nums: Vec<f64> = cleaned
-        .split_whitespace()
-        .map(str::parse::<f64>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ParseLocationError::Unrecognized(original.to_owned()))?;
+    let Some(deg_raw) = slots[0] else {
+        return Err(ParseLocationError::Unrecognized(original.to_owned()));
+    };
 
-    if nums.is_empty() || nums.len() > 3 {
+    if hemisphere.is_some() && deg_raw.is_sign_negative() {
         return Err(ParseLocationError::Unrecognized(original.to_owned()));
     }
 
-    if hemisphere.is_some() && nums[0].is_sign_negative() {
-        return Err(ParseLocationError::Unrecognized(original.to_owned()));
-    }
-
-    let sign_from_deg = if nums[0].is_sign_negative() {
+    let sign_from_deg = if deg_raw.is_sign_negative() {
         -1.0
     } else {
         1.0
     };
-    let deg = nums[0].abs();
-    let min = nums.get(1).copied().unwrap_or(0.0);
-    let sec = nums.get(2).copied().unwrap_or(0.0);
+    let deg = deg_raw.abs();
+    let min = slots[1].unwrap_or(0.0);
+    let sec = slots[2].unwrap_or(0.0);
     if !(0.0..60.0).contains(&min) || !(0.0..60.0).contains(&sec) {
         return Err(ParseLocationError::Unrecognized(original.to_owned()));
     }
 
     let mag = deg + min / 60.0 + sec / 3600.0;
     let sign = hemisphere.map_or(sign_from_deg, Hemisphere::sign);
-    let is_dms = nums.len() > 1 || has_dms_markers;
+    let is_dms = count > 1 || has_dms_markers;
     Ok((sign * mag, hemisphere, is_dms))
 }
 
@@ -395,6 +455,24 @@ mod tests {
         let dm_south = parse_location("33° 52' S, 151° 12' E").unwrap();
         assert!((dm_south.lat_deg + (33.0 + 52.0 / 60.0)).abs() < 1e-7);
         assert!((dm_south.lon_deg - (151.0 + 12.0 / 60.0)).abs() < 1e-7);
+
+        // Negative zero degrees must preserve negative sign on minutes/seconds.
+        let neg_zero = parse_location("-0° 30' 00\", 10° 00' 00\"").unwrap();
+        assert!((neg_zero.lat_deg + 0.5).abs() < 1e-9);
+        assert!((neg_zero.lon_deg - 10.0).abs() < 1e-9);
+
+        // Degrees + seconds with omitted minutes must treat `10s` as seconds, not minutes.
+        let deg_sec = parse_location("45d 10s, 10 E").unwrap();
+        assert_eq!(deg_sec.kind, LocationKind::DegreesMinutesSeconds);
+        assert!((deg_sec.lat_deg - (45.0 + 10.0 / 3600.0)).abs() < 1e-9);
+        assert!((deg_sec.lon_deg - 10.0).abs() < 1e-9);
+
+        // Colon-separated DMS with semicolon delimiter and exact ±90/±180 boundaries.
+        let colon = parse_location("47:14:08.5N; 39:42:05.4E").unwrap();
+        assert!((colon.lat_deg - loc.lat_deg).abs() < 1e-7);
+        assert!((colon.lon_deg - loc.lon_deg).abs() < 1e-7);
+        let bounds = parse_location("-90.0, 180.0").unwrap();
+        assert_eq!((bounds.lat_deg, bounds.lon_deg), (-90.0, 180.0));
     }
 
     #[test]
@@ -420,6 +498,16 @@ mod tests {
             "not a coordinate",
             "-33.8688S, 151.2093E",
             "N 45 S, 10 E",
+            "N 45S, 10 E",
+            "N 45° 10' 5\" S, 10 E",
+            "47° 60' 0\", 10°",
+            "47° 10' 60\", 10°",
+            "47m 14d, 10 E",
+            "47d 14d, 10 E",
+            "NaN, 10.0",
+            "inf, 10.0",
+            "37MAA",
+            "32XAA",
             "37UD\u{0419}",
             "37UD\u{00E9}",
         ] {

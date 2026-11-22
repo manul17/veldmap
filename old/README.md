@@ -55,7 +55,7 @@ Each reference file is deleted only after its **last** consumer slice closes and
 | `docs/download.md` | Slice 4B | Slice 4B |
 | `docs/georeference.md` | Slice 3A-2, Slice 6 | Slice 6 |
 | `docs/glossary.md` | Phase 0.5, Slice 1–6 | Slice 6 |
-| `docs/imagery.md` | Slice 3C-1, Slice 4B | Slice 4B |
+| `docs/imagery.md` | Slice 3C-1, Slice 4B, Slice 6 | Slice 6 |
 | `docs/limitations.md` | Phase 0.5, Slice 1–6 | Slice 6 |
 | `docs/viewing-pipeline.md` | Slice 2A, Slice 3A-1 | Slice 3A-1 |
 | `tests/cache/evict_tests.rs` | Slice 2B | Slice 2B |

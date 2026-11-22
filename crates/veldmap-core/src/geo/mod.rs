@@ -10,7 +10,6 @@ pub mod mgrs;
 pub mod outlines;
 pub mod projection;
 pub mod sag;
-pub mod wheel;
 
 pub use camera::Camera;
 pub use coords::{LocationKind, ParseLocationError, ParsedLocation, parse_location};

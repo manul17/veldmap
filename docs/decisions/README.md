@@ -1,6 +1,6 @@
 # Architectural Decision Records
 
-Single-decision ADRs documenting VeldMap's authoritative design contracts. Each ADR lands alongside the vertical slice that implements and proves it.
+Focused ADRs documenting VeldMap's authoritative design contracts and cross-slice guardrails. Each ADR lands alongside the vertical slice that introduces or proves it.
 
 | ADR | Title | Status |
 |---|---|---|

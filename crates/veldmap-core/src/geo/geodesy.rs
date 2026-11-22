@@ -2,7 +2,7 @@
 //! coordinates.
 //!
 //! Everything with a place on Earth goes through this module: the globe body,
-//! graticule, camera, outlines, and raster warp meshes.
+//! graticule, camera, outlines, and future tiled overlays.
 //!
 //! ## Axes and Units
 //!
@@ -86,11 +86,6 @@ impl Parallel {
     }
 }
 
-/// Convert geodetic coordinates to single-precision GPU world coordinates.
-pub fn position(point: Geodetic) -> World {
-    world(point).as_vec3().to_array()
-}
-
 /// Split an `f64` world point into `(high, low)` `f32` halves.
 ///
 /// By Sterbenz's lemma, subtracting two nearby `f32` high halves is exact, and
@@ -112,8 +107,9 @@ pub fn offset(head: (World, World), tail: (World, World)) -> World {
 }
 
 /// Intersect a ray `(origin, direction)` with the WGS84 ellipsoid raised by
-/// `height_m` metres. Returns `None` if the ray misses or hits behind the
-/// origin.
+/// `height_m` metres. Exact on the WGS84 ellipsoid (`height_m == 0.0`); for
+/// non-zero heights uses a proportionally scaled ellipsoid (`b * (1 + h / a)`).
+/// Returns `None` if `direction` is zero or the ray misses / hits behind `origin`.
 pub fn intersect_at(origin: DVec3, direction: DVec3, height_m: f64) -> Option<DVec3> {
     let stretch = DVec3::new(1.0, 1.0, 1.0 / (1.0 - FLATTENING));
     let start = origin * stretch;
@@ -121,6 +117,9 @@ pub fn intersect_at(origin: DVec3, direction: DVec3, height_m: f64) -> Option<DV
     let radius = 1.0 + height_m / SEMI_MAJOR_M;
 
     let a = along.dot(along);
+    if !a.is_finite() || a <= 0.0 {
+        return None;
+    }
     let b = 2.0 * start.dot(along);
     let c = start.dot(start) - radius * radius;
     let discriminant = b * b - 4.0 * a * c;
@@ -144,11 +143,8 @@ pub fn surface_at(point: DVec3) -> (f64, f64) {
 /// Angular separation between two `(lat_deg, lon_deg)` points in degrees of
 /// arc (`1 deg ~ 111 km`).
 pub fn separation(from: (f64, f64), to: (f64, f64)) -> f64 {
-    unit(from.0, from.1)
-        .dot(unit(to.0, to.1))
-        .clamp(-1.0, 1.0)
-        .acos()
-        .to_degrees()
+    let (a, b) = (unit(from.0, from.1), unit(to.0, to.1));
+    a.cross(b).length().atan2(a.dot(b)).to_degrees()
 }
 
 /// Interpolate along the great-circle arc between two `(lat_deg, lon_deg)`
@@ -162,14 +158,21 @@ pub fn between(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
     }
 
     let (a, b) = (unit(from.0, from.1), unit(to.0, to.1));
-    let angle = a.dot(b).clamp(-1.0, 1.0).acos();
-    let sin = angle.sin();
-    if sin.abs() < 1e-12 {
-        return from;
-    }
-
-    let (head, tail) = (((1.0 - t) * angle).sin() / sin, (t * angle).sin() / sin);
-    let mid = (a * head + b * tail).normalize();
+    let angle = a.cross(b).length().atan2(a.dot(b));
+    let mid = if angle < 1e-6 {
+        let v = a * (1.0 - t) + b * t;
+        if v.length_squared() <= 0.0 {
+            return from;
+        }
+        v.normalize()
+    } else {
+        let sin = angle.sin();
+        if sin.abs() < 1e-12 {
+            return from;
+        }
+        let (head, tail) = (((1.0 - t) * angle).sin() / sin, (t * angle).sin() / sin);
+        (a * head + b * tail).normalize()
+    };
     (
         mid.z.asin().to_degrees(),
         unwind(from.1, mid.y.atan2(mid.x).to_degrees()),
@@ -229,10 +232,89 @@ pub fn edge_point(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
     }
 }
 
+/// Emit densified `(lat_deg, lon_deg)` points along an edge from `from`
+/// (inclusive) toward `to` (exclusive) so no segment exceeds `max_edge_deg`.
+pub fn trace_edge(
+    from: (f64, f64),
+    to: (f64, f64),
+    max_edge_deg: f64,
+    mut emit: impl FnMut((f64, f64)),
+) {
+    let most = (TURN_DEG / max_edge_deg).ceil();
+    let raw = (edge_span(from, to) / max_edge_deg).ceil();
+    let steps = if raw.is_finite() {
+        raw.clamp(1.0, most) as u32
+    } else {
+        1
+    };
+    for step in 0..steps {
+        emit(edge_point(from, to, f64::from(step) / f64::from(steps)));
+    }
+}
+
+/// Remove consecutive duplicate points (including wrap-around `last == first`)
+/// from a closed `(lat_deg, lon_deg)` ring.
+pub fn dedup_ring(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+    for &p in points {
+        if out.last() != Some(&p) {
+            out.push(p);
+        }
+    }
+    if out.len() > 1 && out.first() == out.last() {
+        out.pop();
+    }
+    out
+}
+
+/// Identify meridian seam cuts of a closed whole-Earth band (constant-latitude
+/// parallels wrapping `>= FULL_CIRCLE_DEG` connected by zero-sweep meridians).
+/// Returns an empty vector if `places` is not a closed whole-Earth band.
+pub fn band_seam_cuts(places: &[(f64, f64)]) -> Vec<usize> {
+    if places.len() < 3 {
+        return Vec::new();
+    }
+    let sweeps: Vec<f64> = (0..places.len())
+        .map(|i| sweep(places[i], places[(i + 1) % places.len()]))
+        .collect();
+    let cuts: Vec<usize> = (0..sweeps.len())
+        .filter(|&index| sweeps[index] == 0.0)
+        .collect();
+    if cuts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut carried = false;
+    for pair in 0..cuts.len() {
+        let (from, to) = (cuts[pair], cuts[(pair + 1) % cuts.len()]);
+        let run: Vec<usize> = (1..sweeps.len())
+            .map(|step| (from + step) % sweeps.len())
+            .take_while(|index| *index != to)
+            .collect();
+        let Some((&first, &last)) = run.first().zip(run.last()) else {
+            continue;
+        };
+        let (opens, closes) = (places[first], places[(last + 1) % places.len()]);
+        let lon_gap = unwind(opens.1, closes.1) - opens.1;
+        if opens.0 != closes.0 || lon_gap.abs() > (TURN_DEG - FULL_CIRCLE_DEG) {
+            return Vec::new();
+        }
+        let span: f64 = run.iter().map(|index| sweeps[*index]).sum();
+        if span.abs() >= FULL_CIRCLE_DEG {
+            carried = true;
+        } else if span == 0.0 {
+            continue;
+        } else {
+            return Vec::new();
+        }
+    }
+    if carried { cuts } else { Vec::new() }
+}
+
 /// Return whether a densified `(lat_deg, lon_deg)` ring wraps completely around
 /// the Earth in longitude (no empty longitude gap >= 180 degrees).
 pub fn encircles(ring: &[(f64, f64)]) -> bool {
-    if ring.len() < 2 {
+    if ring.len() < 2 || ring.iter().any(|point| !point.1.is_finite()) {
         return false;
     }
     let mut lons: Vec<f64> = ring.iter().map(|point| point.1.rem_euclid(360.0)).collect();
@@ -263,11 +345,6 @@ pub fn unwind(base: f64, lon_deg: f64) -> f64 {
 /// Outward unit normal to the WGS84 ellipsoid in `f32` vertex layout.
 pub fn normal(lat_deg: f64, lon_deg: f64) -> World {
     unit(lat_deg, lon_deg).as_vec3().to_array()
-}
-
-/// Convert metres into world units (`value / SEMI_MAJOR_M`) as `f32`.
-pub fn metres(value: f64) -> f32 {
-    (value / SEMI_MAJOR_M) as f32
 }
 
 /// Convert a unit ECEF direction vector back into `(lat_deg, lon_deg)`.
@@ -494,5 +571,36 @@ mod tests {
 
         assert!(intersect_at(eye, DVec3::Y, 0.0).is_none());
         assert!(intersect_at(eye, DVec3::X, 0.0).is_none());
+        assert!(intersect_at(eye, DVec3::ZERO, 0.0).is_none());
+    }
+
+    #[test]
+    fn sub_metre_separation_and_between_preserve_precision() {
+        let p0 = (47.2357, 39.7015);
+        // ~1 cm northward step (~9e-8 deg ~ 1.57e-9 rad, where dot.acos() collapses to 0).
+        let dlat = 0.01 / (SEMI_MAJOR_M * std::f64::consts::PI / 180.0);
+        let p1 = (p0.0 + dlat, p0.1);
+        let sep_m = separation(p0, p1).to_radians() * SEMI_MAJOR_M;
+        assert!((sep_m - 0.01).abs() < 1e-6, "sep_m={sep_m}");
+
+        let mid = between(p0, p1, 0.5);
+        assert!((mid.0 - (p0.0 + 0.5 * dlat)).abs() < 1e-12);
+        assert!((mid.1 - p0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn surface_at_exact_poles_is_finite() {
+        for pole in [90.0, -90.0] {
+            let (lat, lon) = surface_at(world(Geodetic::surface(pole, 0.0)));
+            assert!((lat - pole).abs() < 1e-12);
+            assert!(lon.is_finite());
+        }
+    }
+
+    #[test]
+    fn encircles_detects_full_wrap_and_rejects_gaps_and_nan() {
+        assert!(encircles(&[(0.0, -120.0), (0.0, 0.0), (0.0, 120.0)]));
+        assert!(!encircles(&[(0.0, 0.0), (0.0, 60.0), (0.0, 120.0)]));
+        assert!(!encircles(&[(0.0, 0.0), (0.0, f64::NAN), (0.0, 120.0)]));
     }
 }
