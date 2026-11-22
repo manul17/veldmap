@@ -98,12 +98,8 @@ impl Camera {
     }
 
     /// Geodetic `(lat_deg, lon_deg)` directly under the camera eye along the
-    /// outward WGS84 ellipsoid normal (`at`).
-    ///
-    /// Note that [`Camera::basis`] aims geocentrically toward Earth's center so
-    /// the globe stays centered from orbit; at mid-latitudes (`~45 deg`), this
-    /// differs from the geodetic normal by up to `~0.192 deg` (~3.6 px on a
-    /// 1000-row viewport at low altitude).
+    /// outward WGS84 ellipsoid normal (`at`), matching the center pixel of
+    /// [`Camera::probe`].
     pub fn center(&self) -> (f64, f64) {
         geodesy::angles(self.at)
     }
@@ -128,16 +124,17 @@ impl Camera {
         self.flight.is_some()
     }
 
-    /// Exact `f64` ECEF position of the camera eye in world units.
+    /// Exact `f64` ECEF position of the camera eye in **metres**.
     pub fn eye_ecef(&self) -> DVec3 {
         geodesy::world(self.geodetic())
     }
 
     /// Orthonormal camera basis `(right, up, forward)` in ECEF coordinates,
-    /// with `forward` aimed geocentrially toward Earth's center so the globe
-    /// stays centered from orbit while matching [`Camera::probe`].
+    /// with `forward = -self.at` aimed strictly along the geodetic nadir
+    /// normal so the viewport center ray hits [`Camera::center`] with zero
+    /// mid-latitude parallax or orbit-to-ground zoom drift.
     pub fn basis(&self) -> (DVec3, DVec3, DVec3) {
-        let forward = -self.eye_ecef().normalize();
+        let forward = -self.at;
         let side = forward.cross(self.up).normalize();
         (side, side.cross(forward), forward)
     }
@@ -158,17 +155,18 @@ impl Camera {
         (2.0 * self.height_m * half_tan) / height_px.max(1.0)
     }
 
-    /// Rotation-only infinite Reverse-Z view-projection matrix in `f64`.
+    /// Rotation-only infinite Reverse-Z view-projection matrix in `f64`
+    /// (operating on eye-relative ECEF coordinates in **metres**).
     ///
     /// Translation is intentionally omitted: vertices are shifted relative to
-    /// the eye in `f64` (per-tile RTC or high/low split) before multiplication.
+    /// the eye in `f64` via per-tile RTC offsets before multiplication.
     pub fn view_projection(&self, aspect: f64) -> DMat4 {
         let aspect = if aspect.is_finite() && aspect > 0.0 {
             aspect
         } else {
             1.0
         };
-        let near = (self.height_m * 0.5) / geodesy::SEMI_MAJOR_M;
+        let near = self.height_m * 0.5;
         perspective_infinite_reverse_rh(FOV_Y_DEG.to_radians(), aspect, near)
             * turn_to(self.basis())
     }

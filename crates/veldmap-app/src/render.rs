@@ -1,22 +1,29 @@
-//! Offscreen `wgpu` WGS84 globe renderer decoupled from `egui`.
+//! Offscreen `wgpu` WGS84 quadtree globe renderer decoupled from `egui`.
 //!
-//! Renders the WGS84 ellipsoid and depth-less draped graticule into an
-//! offscreen `Rgba8UnormSrgb` + `Depth32Float` Reverse-Z target, then
-//! composites 1:1 with `FilterMode::Nearest` onto `egui_wgpu`'s target format
-//! via `view_formats` (`Rgba8UnormSrgb` when the target expects linear output,
-//! `Rgba8Unorm` for non-sRGB 8-bit swapchains).
+//! Renders per-tile CPU `f64` RTC quadtree meshes (textured sRGB basemap or
+//! untextured WGS84 ellipsoid shading) and the post-overlay procedural
+//! `fwidth()` graticule into an offscreen `Rgba8UnormSrgb` + `Depth32Float`
+//! Reverse-Z target, then composites 1:1 with `FilterMode::Nearest` onto
+//! `egui_wgpu`'s target format via `view_formats`.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::camera::Camera;
-use veldmap_core::geo::geodesy;
+use veldmap_core::tile::{
+    DEFAULT_GRID_CELLS, QuadTileId, QuadtreeConfig, TileCache, TileScheme, VisibleTile,
+    adaptive_grid_step_deg, compose_uv_rect, polar_r_cap, sample_tile_surface, tile_grid_anchor,
+    traverse,
+};
 use wgpu::util::DeviceExt;
 
-use crate::mesh::{GlobeMesh, GlobeVertex};
+use crate::gpu_tiles::{GpuTile, GpuTileCache, bundled_tile_key};
+use crate::mesh::{SharedTileIndices, TileVertex, build_tile_vertices};
 
-/// Embedded WGSL source for the globe body and draped graticule.
+/// Embedded WGSL source for the quadtree globe body and procedural graticule.
 pub const GLOBE_WGSL: &str = include_str!("shaders/globe.wgsl");
 /// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.
 pub const COMPOSITE_WGSL: &str = include_str!("shaders/composite.wgsl");
@@ -29,31 +36,146 @@ pub const CLEAR_COLOR_LINEAR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+/// Default VRAM budget for cached per-tile geometry vertex buffers (`16 MiB`,
+/// ~1,000 cached `16 x 16` tiles).
+const DEFAULT_MESH_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
-    neg_eye_hi: [f32; 3],
+    grid_step_deg: f32,
+    grid_width_px: f32,
+    polar_r_cap: f32,
     _pad0: f32,
-    neg_eye_lo: [f32; 3],
-    _pad1: f32,
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<CameraUniform>() == 96);
+    assert!(std::mem::size_of::<CameraUniform>() == 80);
     assert!(std::mem::offset_of!(CameraUniform, view_proj) == 0);
-    assert!(std::mem::offset_of!(CameraUniform, neg_eye_hi) == 64);
-    assert!(std::mem::offset_of!(CameraUniform, neg_eye_lo) == 80);
+    assert!(std::mem::offset_of!(CameraUniform, grid_step_deg) == 64);
+    assert!(std::mem::offset_of!(CameraUniform, grid_width_px) == 68);
+    assert!(std::mem::offset_of!(CameraUniform, polar_r_cap) == 72);
 };
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TileUniform {
+    offset_eye: [f32; 3],
+    tile_kind: f32,
+    uv_rect: [f32; 4],
+    grid_anchor: [f32; 4],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<TileUniform>() == 48);
+    assert!(std::mem::offset_of!(TileUniform, offset_eye) == 0);
+    assert!(std::mem::offset_of!(TileUniform, tile_kind) == 12);
+    assert!(std::mem::offset_of!(TileUniform, uv_rect) == 16);
+    assert!(std::mem::offset_of!(TileUniform, grid_anchor) == 32);
+};
+
+/// Single tile draw entry inside an immutable [`DrawSnapshot`].
+#[derive(Clone, Debug)]
+pub struct DrawTile {
+    pub visible: VisibleTile,
+    /// Resolved GPU carrier texture (`None` in Ellipsoid-only mode or before
+    /// any coarse ancestor tile has uploaded).
+    pub texture: Option<Arc<GpuTile>>,
+    /// Final UV sub-rectangle in `texture`'s coordinate space.
+    pub uv_rect: [f32; 4],
+}
+
+/// Immutable per-frame draw snapshot built on `VeldmapApp` (cached by
+/// `(camera_key, scene_generation)` so 120 Hz mouse hover never rebuilds tile
+/// lists) and handed to `GlobePaintCallback`.
+#[derive(Clone, Debug)]
+pub struct DrawSnapshot {
+    pub camera: Camera,
+    pub tiles: Vec<DrawTile>,
+    pub show_graticule: bool,
+    pub grid_step_deg: f64,
+    pub grid_width_px: f32,
+    pub generation: u64,
+}
+
+impl DrawSnapshot {
+    /// Build a draw snapshot from a camera pose, viewport dimensions, and
+    /// optional [`GpuTileCache`] (passing `textured = false` renders untextured
+    /// WGS84 ellipsoid shading through the exact same quadtree).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "snapshot builder groups explicit viewport, graticule, and cache inputs"
+    )]
+    pub fn build(
+        camera: Camera,
+        width_px: u32,
+        height_px: u32,
+        pixels_per_point: f32,
+        show_graticule: bool,
+        textured: bool,
+        generation: u64,
+        config: &QuadtreeConfig,
+        cache: Option<&mut GpuTileCache>,
+    ) -> Self {
+        let visible = traverse(&camera, width_px, height_px, config);
+        let ppp = f64::from(pixels_per_point.max(0.5));
+        let height_pt = (f64::from(height_px.max(1)) / ppp).max(1.0);
+        let m_per_pt = camera.metres_per_pixel(height_pt);
+        let grid_step_deg = adaptive_grid_step_deg(m_per_pt);
+        let grid_width_px = (0.75 * pixels_per_point.max(1.0)).clamp(0.65, 3.0);
+
+        let mut tiles = Vec::with_capacity(visible.len());
+        match (textured, cache) {
+            (true, Some(gpu_cache)) => {
+                for vis in visible {
+                    let wanted_key = bundled_tile_key(vis.tex_id);
+                    if let Some((_carrier_key, carrier_uv, gpu_tile)) =
+                        gpu_cache.carrier(&wanted_key)
+                    {
+                        let uv_rect = compose_uv_rect(carrier_uv, vis.uv_rect);
+                        tiles.push(DrawTile {
+                            visible: vis,
+                            texture: Some(gpu_tile),
+                            uv_rect,
+                        });
+                    } else {
+                        tiles.push(DrawTile {
+                            visible: vis,
+                            texture: None,
+                            uv_rect: vis.uv_rect,
+                        });
+                    }
+                }
+            }
+            _ => {
+                for vis in visible {
+                    tiles.push(DrawTile {
+                        visible: vis,
+                        texture: None,
+                        uv_rect: vis.uv_rect,
+                    });
+                }
+            }
+        }
+
+        Self {
+            camera,
+            tiles,
+            show_graticule,
+            grid_step_deg,
+            grid_width_px,
+            generation,
+        }
+    }
+}
 
 /// Parameters for a single offscreen globe frame.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderParams<'a> {
     pub width: u32,
     pub height: u32,
-    pub camera: &'a Camera,
-    pub show_graticule: bool,
-    pub generation: u64,
+    pub snapshot: &'a DrawSnapshot,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,20 +185,50 @@ struct RenderKey {
     eye_bits: [u64; 3],
     up_bits: [u64; 3],
     show_graticule: bool,
+    grid_step_bits: u64,
+    grid_width_bits: u32,
     generation: u64,
+    tiles_hash: u64,
 }
 
 impl RenderKey {
     fn from_params(width: u32, height: u32, params: &RenderParams<'_>) -> Self {
-        let eye = params.camera.eye_ecef();
-        let (_, up, _) = params.camera.basis();
+        let snap = params.snapshot;
+        let eye = snap.camera.eye_ecef();
+        let (_, up, _) = snap.camera.basis();
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        let mix = |h: &mut u64, v: u64| {
+            *h ^= v;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        mix(&mut h, snap.tiles.len() as u64);
+        for t in &snap.tiles {
+            let scheme_tag: u64 = match t.visible.id.scheme {
+                TileScheme::Geodetic => 1,
+                TileScheme::WebMercator => 2,
+                TileScheme::PolarCap { north: true } => 3,
+                TileScheme::PolarCap { north: false } => 4,
+                TileScheme::RasterPyramid { max_level } => 100 + u64::from(max_level),
+            };
+            mix(&mut h, scheme_tag);
+            mix(&mut h, u64::from(t.visible.id.level));
+            mix(&mut h, u64::from(t.visible.id.x));
+            mix(&mut h, u64::from(t.visible.id.y));
+            mix(&mut h, t.texture.as_ref().map_or(0, |g| g.tile_id));
+            for c in t.uv_rect {
+                mix(&mut h, u64::from(c.to_bits()));
+            }
+        }
         Self {
             width,
             height,
             eye_bits: eye.to_array().map(f64::to_bits),
             up_bits: up.to_array().map(f64::to_bits),
-            show_graticule: params.show_graticule,
-            generation: params.generation,
+            show_graticule: snap.show_graticule,
+            grid_step_bits: snap.grid_step_deg.to_bits(),
+            grid_width_bits: snap.grid_width_px.to_bits(),
+            generation: snap.generation,
+            tiles_hash: h,
         }
     }
 }
@@ -89,60 +241,160 @@ struct OffscreenTarget {
     composite_bind_group: wgpu::BindGroup,
 }
 
-/// Standalone offscreen `wgpu` WGS84 globe renderer.
-pub struct GlobeRenderer {
-    target_format: wgpu::TextureFormat,
-    body_indices: Range<u32>,
-    graticule_indices: Range<u32>,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+/// Per-viewport GPU buffers and offscreen targets grouped cleanly so resizing
+/// never recreates `camera_buffer` and future Slice 3B multi-viewport rendering
+/// can instantiate multiple `ViewportState`s against shared pipelines/caches.
+struct ViewportState {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    body_pipeline: wgpu::RenderPipeline,
-    grid_pipeline: wgpu::RenderPipeline,
-    composite_layout: wgpu::BindGroupLayout,
-    composite_sampler: wgpu::Sampler,
-    composite_pipeline: wgpu::RenderPipeline,
+    tile_uniform_buffer: wgpu::Buffer,
+    tile_uniform_bind_group: wgpu::BindGroup,
+    tile_uniform_capacity: usize,
     offscreen: Option<OffscreenTarget>,
     last_render: Option<RenderKey>,
     /// Tracks whether the most recent offscreen pass reached `composite_into`.
-    /// If `egui_wgpu` drops its `CommandEncoder` (e.g. on swapchain `Outdated`
-    /// or `Lost`), this stays `true` so the next `prepare` re-records the pass
-    /// instead of compositing an unrendered or stale texture.
     pending_present: AtomicBool,
 }
 
-impl GlobeRenderer {
-    /// Create all static GPU buffers and pipelines for the globe and 1:1
-    /// composite pass targeting `target_format`.
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let mesh = GlobeMesh::build();
-        let body_indices = mesh.body;
-        let graticule_indices = mesh.graticule;
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("globe vertex buffer"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("globe index buffer"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
+impl ViewportState {
+    fn new(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        tile_uniform_layout: &wgpu::BindGroupLayout,
+        tile_uniform_stride: u32,
+    ) -> Self {
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globe camera uniform"),
             size: std::mem::size_of::<CameraUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globe camera bind group"),
+            layout: camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        let initial_cap = 128usize;
+        let (tile_uniform_buffer, tile_uniform_bind_group) = Self::alloc_tile_uniforms(
+            device,
+            tile_uniform_layout,
+            tile_uniform_stride,
+            initial_cap,
+        );
+
+        Self {
+            camera_buffer,
+            camera_bind_group,
+            tile_uniform_buffer,
+            tile_uniform_bind_group,
+            tile_uniform_capacity: initial_cap,
+            offscreen: None,
+            last_render: None,
+            pending_present: AtomicBool::new(false),
+        }
+    }
+
+    fn alloc_tile_uniforms(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        stride: u32,
+        capacity: usize,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let size = (capacity.max(1) as u64) * u64::from(stride);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("globe per-tile dynamic uniform"),
+            size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globe per-tile dynamic bind group"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<TileUniform>() as u64),
+                }),
+            }],
+        });
+        (buffer, bind_group)
+    }
+
+    fn ensure_tile_uniform_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        stride: u32,
+        needed: usize,
+    ) {
+        if needed <= self.tile_uniform_capacity {
+            return;
+        }
+        let next_cap = needed.next_power_of_two().max(128);
+        let (buf, bg) = Self::alloc_tile_uniforms(device, layout, stride, next_cap);
+        self.tile_uniform_buffer = buf;
+        self.tile_uniform_bind_group = bg;
+        self.tile_uniform_capacity = next_cap;
+    }
+}
+
+/// Standalone offscreen `wgpu` WGS84 quadtree globe renderer.
+pub struct GlobeRenderer {
+    target_format: wgpu::TextureFormat,
+    grid_cells: u32,
+    surface_indices: Range<u32>,
+    full_indices: Range<u32>,
+    index_buffer: wgpu::Buffer,
+    tile_uniform_layout: wgpu::BindGroupLayout,
+    tile_uniform_stride: u32,
+    tile_texture_layout: wgpu::BindGroupLayout,
+    tile_sampler: wgpu::Sampler,
+    body_ellipsoid_pipeline: wgpu::RenderPipeline,
+    body_textured_pipeline: wgpu::RenderPipeline,
+    grid_pipeline: wgpu::RenderPipeline,
+    composite_layout: wgpu::BindGroupLayout,
+    composite_sampler: wgpu::Sampler,
+    composite_pipeline: wgpu::RenderPipeline,
+    /// Bounded O(1) LRU cache of per-tile CPU `f64` RTC vertex buffers.
+    tile_meshes: TileCache<QuadTileId, wgpu::Buffer>,
+    /// Lightweight `BindGroup` cache keyed by `GpuTile::tile_id`, pruned
+    /// whenever tiles are evicted from `VeldmapApp`'s `GpuTileCache`.
+    tile_bind_groups: HashMap<u64, wgpu::BindGroup>,
+    /// Reusable staging scratch buffer for dynamic per-tile uniforms.
+    uniform_staging: Vec<u8>,
+    viewport: ViewportState,
+}
+
+impl GlobeRenderer {
+    /// Create all shared GPU pipelines, static quadtree index buffer, and
+    /// primary `ViewportState` targeting `target_format`.
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let grid_cells = DEFAULT_GRID_CELLS;
+        let shared = SharedTileIndices::build(grid_cells);
+        let surface_indices = shared.surface;
+        let full_indices = shared.full;
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quadtree shared index buffer"),
+            contents: bytemuck::cast_slice(&shared.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let align = device.limits().min_uniform_buffer_offset_alignment.max(1);
+        let raw_tile_size = std::mem::size_of::<TileUniform>() as u32;
+        let tile_uniform_stride = raw_tile_size.div_ceil(align) * align;
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globe camera bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -154,13 +406,53 @@ impl GlobeRenderer {
             }],
         });
 
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globe camera bind group"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+        let tile_uniform_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("globe per-tile dynamic uniform layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(u64::from(raw_tile_size)),
+                    },
+                    count: None,
+                }],
+            });
+
+        let tile_texture_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("globe tile texture layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let tile_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("globe tile linear clamp sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
         });
 
         let globe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -168,57 +460,107 @@ impl GlobeRenderer {
             source: wgpu::ShaderSource::Wgsl(GLOBE_WGSL.into()),
         });
 
-        let globe_pipeline_layout =
+        let untextured_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("globe pipeline layout"),
-                bind_group_layouts: &[Some(&camera_layout)],
+                label: Some("globe untextured pipeline layout"),
+                bind_group_layouts: &[Some(&camera_layout), Some(&tile_uniform_layout)],
                 immediate_size: 0,
             });
 
-        let body_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("globe body pipeline (Reverse-Z)"),
-            layout: Some(&globe_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &globe_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(GlobeVertex::LAYOUT)],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &globe_shader,
-                entry_point: Some("fs_body"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                front_face: wgpu::FrontFace::Ccw,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let textured_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("globe textured pipeline layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&tile_uniform_layout),
+                    Some(&tile_texture_layout),
+                ],
+                immediate_size: 0,
+            });
+
+        let body_ellipsoid_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("globe body ellipsoid pipeline (Reverse-Z)"),
+                layout: Some(&untextured_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &globe_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Some(TileVertex::LAYOUT)],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &globe_shader,
+                    entry_point: Some("fs_body_ellipsoid"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: Some(wgpu::Face::Back),
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let body_textured_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("globe body textured pipeline (Reverse-Z)"),
+                layout: Some(&textured_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &globe_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Some(TileVertex::LAYOUT)],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &globe_shader,
+                    entry_point: Some("fs_body_textured"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: Some(wgpu::Face::Back),
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
         let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("globe draped graticule pipeline"),
-            layout: Some(&globe_pipeline_layout),
+            label: Some("globe post-overlay procedural graticule pipeline"),
+            layout: Some(&untextured_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &globe_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Some(GlobeVertex::LAYOUT)],
+                buffers: &[Some(TileVertex::LAYOUT)],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -232,7 +574,9 @@ impl GlobeRenderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                front_face: wgpu::FrontFace::Ccw,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -315,29 +659,52 @@ impl GlobeRenderer {
             cache: None,
         });
 
+        let viewport = ViewportState::new(
+            device,
+            &camera_layout,
+            &tile_uniform_layout,
+            tile_uniform_stride,
+        );
+
         Self {
             target_format,
-            body_indices,
-            graticule_indices,
-            vertex_buffer,
+            grid_cells,
+            surface_indices,
+            full_indices,
             index_buffer,
-            camera_buffer,
-            camera_bind_group,
-            body_pipeline,
+            tile_uniform_layout,
+            tile_uniform_stride,
+            tile_texture_layout,
+            tile_sampler,
+            body_ellipsoid_pipeline,
+            body_textured_pipeline,
             grid_pipeline,
             composite_layout,
             composite_sampler,
             composite_pipeline,
-            offscreen: None,
-            last_render: None,
-            pending_present: AtomicBool::new(false),
+            tile_meshes: TileCache::new(DEFAULT_MESH_CACHE_BYTES),
+            tile_bind_groups: HashMap::new(),
+            uniform_staging: Vec::new(),
+            viewport,
         }
     }
 
+    /// Prune cached `BindGroup` entries for `GpuTile`s evicted from
+    /// `VeldmapApp`'s `GpuTileCache`.
+    pub fn prune_evicted_tiles(&mut self, evicted_tile_ids: &[u64]) {
+        for tile_id in evicted_tile_ids {
+            self.tile_bind_groups.remove(tile_id);
+        }
+    }
+
+    /// Number of currently cached tile texture bind groups.
+    pub fn cached_tile_bind_group_count(&self) -> usize {
+        self.tile_bind_groups.len()
+    }
+
     /// Ensure the offscreen target matches `(params.width, params.height)`
-    /// clamped to device limits and re-render the globe if the target or scene
-    /// parameters changed. Returns `true` if a new offscreen frame was
-    /// rendered.
+    /// clamped to device limits and re-render the globe if the target or draw
+    /// snapshot changed. Returns `true` if a new offscreen frame was rendered.
     pub fn render_if_dirty(
         &mut self,
         device: &wgpu::Device,
@@ -353,9 +720,10 @@ impl GlobeRenderer {
         let height = params.height.clamp(1, max_dim);
 
         let key = RenderKey::from_params(width, height, &params);
-        if !self.pending_present.load(Ordering::Relaxed)
-            && self.last_render == Some(key)
+        if !self.viewport.pending_present.load(Ordering::Relaxed)
+            && self.viewport.last_render == Some(key)
             && self
+                .viewport
                 .offscreen
                 .as_ref()
                 .is_some_and(|t| t.width == width && t.height == height)
@@ -364,20 +732,24 @@ impl GlobeRenderer {
         }
 
         self.ensure_offscreen(device, width, height);
-        self.upload_uniforms(queue, width, height, params.camera);
-        self.record_offscreen_pass(encoder, params.show_graticule);
-        self.last_render = Some(key);
-        self.pending_present.store(true, Ordering::Relaxed);
+        self.prepare_tile_resources(device, params.snapshot);
+        self.upload_uniforms(device, queue, width, height, params.snapshot);
+        self.record_offscreen_pass(encoder, params.snapshot);
+
+        self.viewport.last_render = Some(key);
+        self.viewport.pending_present.store(true, Ordering::Relaxed);
         true
     }
 
     /// Record the 1:1 `FilterMode::Nearest` composite draw into an existing
     /// render pass targeting `self.target_format`.
     pub fn composite_into(&self, render_pass: &mut wgpu::RenderPass<'_>) {
-        let Some(target) = &self.offscreen else {
+        let Some(target) = &self.viewport.offscreen else {
             return;
         };
-        self.pending_present.store(false, Ordering::Relaxed);
+        self.viewport
+            .pending_present
+            .store(false, Ordering::Relaxed);
         render_pass.set_pipeline(&self.composite_pipeline);
         render_pass.set_bind_group(0, &target.composite_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
@@ -385,6 +757,7 @@ impl GlobeRenderer {
 
     fn ensure_offscreen(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if self
+            .viewport
             .offscreen
             .as_ref()
             .is_some_and(|t| t.width == width && t.height == height)
@@ -415,10 +788,6 @@ impl GlobeRenderer {
             ..Default::default()
         });
 
-        // Match swapchain color space via view_formats so compositing is exact 1:1:
-        // sRGB and linear float targets expect linear shader output (sample via
-        // `Rgba8UnormSrgb`); non-sRGB 8-bit targets expect raw sRGB-encoded bytes
-        // (sample via `Rgba8Unorm`).
         let target_expects_linear = self.target_format.is_srgb()
             || matches!(
                 self.target_format,
@@ -460,7 +829,7 @@ impl GlobeRenderer {
             ],
         });
 
-        self.offscreen = Some(OffscreenTarget {
+        self.viewport.offscreen = Some(OffscreenTarget {
             width,
             height,
             color_srgb_view,
@@ -469,21 +838,147 @@ impl GlobeRenderer {
         });
     }
 
-    fn upload_uniforms(&self, queue: &wgpu::Queue, width: u32, height: u32, camera: &Camera) {
-        let aspect = f64::from(width) / f64::from(height.max(1));
-        let (neg_eye_hi, neg_eye_lo) = geodesy::parts(-camera.eye_ecef());
-        let cam_uniform = CameraUniform {
-            view_proj: camera.view_projection(aspect).as_mat4().to_cols_array_2d(),
-            neg_eye_hi,
-            _pad0: 0.0,
-            neg_eye_lo,
-            _pad1: 0.0,
-        };
-        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uniform));
+    fn prepare_tile_resources(&mut self, device: &wgpu::Device, snapshot: &DrawSnapshot) {
+        for draw in &snapshot.tiles {
+            let id = draw.visible.id;
+            if !self.tile_meshes.touch(&id) {
+                let verts = build_tile_vertices(&draw.visible, self.grid_cells);
+                let byte_size = std::mem::size_of_val(verts.as_slice());
+                let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("quadtree tile RTC vertex buffer"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let _ = self.tile_meshes.insert(id, vbuf, byte_size);
+            }
+
+            if let Some(gpu_tile) = &draw.texture {
+                self.tile_bind_groups
+                    .entry(gpu_tile.tile_id)
+                    .or_insert_with(|| {
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("globe tile texture bind group"),
+                            layout: &self.tile_texture_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&gpu_tile.view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.tile_sampler),
+                                },
+                            ],
+                        })
+                    });
+            }
+        }
     }
 
-    fn record_offscreen_pass(&self, encoder: &mut wgpu::CommandEncoder, show_graticule: bool) {
-        let Some(target) = &self.offscreen else {
+    fn upload_uniforms(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        snapshot: &DrawSnapshot,
+    ) {
+        let aspect = f64::from(width) / f64::from(height.max(1));
+        let cam_uniform = CameraUniform {
+            view_proj: snapshot
+                .camera
+                .view_projection(aspect)
+                .as_mat4()
+                .to_cols_array_2d(),
+            grid_step_deg: snapshot.grid_step_deg as f32,
+            grid_width_px: snapshot.grid_width_px,
+            polar_r_cap: polar_r_cap() as f32,
+            _pad0: 0.0,
+        };
+        queue.write_buffer(
+            &self.viewport.camera_buffer,
+            0,
+            bytemuck::bytes_of(&cam_uniform),
+        );
+
+        let tile_count = snapshot.tiles.len();
+        if tile_count == 0 {
+            return;
+        }
+        self.viewport.ensure_tile_uniform_capacity(
+            device,
+            &self.tile_uniform_layout,
+            self.tile_uniform_stride,
+            tile_count,
+        );
+
+        let stride = self.tile_uniform_stride as usize;
+        let total_bytes = tile_count * stride;
+        self.uniform_staging.clear();
+        self.uniform_staging.resize(total_bytes, 0);
+
+        let eye = snapshot.camera.eye_ecef();
+        let step_deg = snapshot.grid_step_deg.max(1e-6);
+
+        for (i, draw) in snapshot.tiles.iter().enumerate() {
+            let offset_eye = (draw.visible.origin_ecef_m - eye).as_vec3().to_array();
+            let (tile_kind, grid_anchor) = match draw.visible.id.scheme {
+                TileScheme::PolarCap { north } => {
+                    let (lat0, lon0, dx0, dy0) = sample_tile_surface(draw.visible.id, 0.5, 0.5)
+                        .map(|(lat, lon, _, _, dx, dy)| (lat, lon, dx, dy))
+                        .unwrap_or((if north { 90.0 } else { -90.0 }, 0.0, 0.0, 0.0));
+                    let colat0_deg = 90.0 - lat0.abs();
+                    let colat_phase = colat0_deg.rem_euclid(step_deg);
+                    let lon_phase = lon0.rem_euclid(step_deg);
+
+                    // Use cancellation-free relative longitude deltas when the
+                    // tile's disk center is strictly clear of the pole (`rho0 > 4 * tile_half_diag`).
+                    let rho0 = dx0.hypot(dy0);
+                    let n = f64::from(1u32 << draw.visible.id.level.min(30));
+                    let tile_half_diag = std::f64::consts::SQRT_2 / n;
+                    let clear_of_pole = draw.visible.id.level >= 2 && rho0 > 4.0 * tile_half_diag;
+                    let sign = if north { 1.0_f32 } else { -1.0_f32 };
+                    let kind = if clear_of_pole { sign * 2.0 } else { sign };
+                    (
+                        kind,
+                        [dx0 as f32, dy0 as f32, colat_phase as f32, lon_phase as f32],
+                    )
+                }
+                _ => {
+                    let (anchor_a, anchor_b) =
+                        tile_grid_anchor(draw.visible.id).unwrap_or((0.0, 0.0));
+                    // Wrap tile anchor phase modulo `grid_step_deg` in f64 on
+                    // CPU so `f32` fragment arithmetic preserves sub-millimetre
+                    // accuracy even at `2 m` altitude.
+                    let lon_phase = anchor_a.rem_euclid(step_deg);
+                    let lat_phase = anchor_b.rem_euclid(step_deg);
+                    (
+                        0.0_f32,
+                        [lon_phase as f32, lat_phase as f32, anchor_b as f32, 0.0],
+                    )
+                }
+            };
+
+            let u = TileUniform {
+                offset_eye,
+                tile_kind,
+                uv_rect: draw.uv_rect,
+                grid_anchor,
+            };
+            let bytes = bytemuck::bytes_of(&u);
+            let dst_start = i * stride;
+            self.uniform_staging[dst_start..dst_start + bytes.len()].copy_from_slice(bytes);
+        }
+
+        queue.write_buffer(
+            &self.viewport.tile_uniform_buffer,
+            0,
+            &self.uniform_staging[..total_bytes],
+        );
+    }
+
+    fn record_offscreen_pass(&self, encoder: &mut wgpu::CommandEncoder, snapshot: &DrawSnapshot) {
+        let Some(target) = &self.viewport.offscreen else {
             return;
         };
 
@@ -512,16 +1007,43 @@ impl GlobeRenderer {
             multiview_mask: None,
         });
 
-        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(0, &self.viewport.camera_bind_group, &[]);
 
-        pass.set_pipeline(&self.body_pipeline);
-        pass.draw_indexed(self.body_indices.clone(), 0, 0..1);
+        // Pass 1: Opaque WGS84 quadtree surface + downward skirts (Reverse-Z).
+        for (i, draw) in snapshot.tiles.iter().enumerate() {
+            let Some(vbuf) = self.tile_meshes.peek(&draw.visible.id) else {
+                continue;
+            };
+            let dyn_offset = (i as u32) * self.tile_uniform_stride;
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            pass.set_bind_group(1, &self.viewport.tile_uniform_bind_group, &[dyn_offset]);
 
-        if show_graticule {
+            if let Some(gpu_tile) = &draw.texture
+                && let Some(tex_bg) = self.tile_bind_groups.get(&gpu_tile.tile_id)
+            {
+                pass.set_pipeline(&self.body_textured_pipeline);
+                pass.set_bind_group(2, tex_bg, &[]);
+            } else {
+                pass.set_pipeline(&self.body_ellipsoid_pipeline);
+            }
+            pass.draw_indexed(self.full_indices.clone(), 0, 0..1);
+        }
+
+        // Pass 2: Post-overlay transparent procedural `fwidth()` graticule
+        // reusing the exact same quadtree vertex/index buffers (`surface` only,
+        // skipping skirts) so future Slice 3A-1b overlays never bury it.
+        if snapshot.show_graticule {
             pass.set_pipeline(&self.grid_pipeline);
-            pass.draw_indexed(self.graticule_indices.clone(), 0, 0..1);
+            for (i, draw) in snapshot.tiles.iter().enumerate() {
+                let Some(vbuf) = self.tile_meshes.peek(&draw.visible.id) else {
+                    continue;
+                };
+                let dyn_offset = (i as u32) * self.tile_uniform_stride;
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.set_bind_group(1, &self.viewport.tile_uniform_bind_group, &[dyn_offset]);
+                pass.draw_indexed(self.surface_indices.clone(), 0, 0..1);
+            }
         }
     }
 }

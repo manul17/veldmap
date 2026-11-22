@@ -26,7 +26,7 @@ fn view_proj_from(lat: f64, lon: f64, height_m: f64, aspect: f64) -> (DMat4, DVe
         DVec3::ZERO.extend(1.0),
     );
     let f = 1.0 / (25.0_f64.to_radians()).tan();
-    let near = (height_m * 0.5) / geodesy::SEMI_MAJOR_M;
+    let near = height_m * 0.5;
     let proj = DMat4::from_cols(
         DVec4::new(f / aspect, 0.0, 0.0, 0.0),
         DVec4::new(0.0, f, 0.0, 0.0),
@@ -81,12 +81,12 @@ fn the_horizon_matches_the_oblate_wgs84_ellipsoid_tangent_plane() {
                 let n = geodesy::unit(f64::from(lat), lon);
                 let facing = n.dot(eye - p);
                 let clears_horizon = p.dot(frame.towards) >= frame.horizon;
-                if facing > 1e-9 {
+                if facing > 1e-3 {
                     assert!(
                         clears_horizon,
                         "visible surface point ({lat}, {lon}) at cam ({lat_cam}, {height_m} m) was falsely culled"
                     );
-                } else if facing < -1e-9 {
+                } else if facing < -1e-3 {
                     assert!(
                         !clears_horizon,
                         "back-side surface point ({lat}, {lon}) at cam ({lat_cam}, {height_m} m) was not culled"
@@ -144,4 +144,43 @@ fn a_ball_covers_every_point_it_was_built_on() {
     let empty = Ball::over(&[]);
     assert_eq!(empty.centre, DVec3::ZERO);
     assert_eq!(empty.radius, 0.0);
+}
+
+#[test]
+fn reverse_z_near_plane_culls_balls_behind_near_and_admits_straddling_balls() {
+    let height_m = 100.0;
+    let (view_proj, eye) = view_proj_from(45.0, 20.0, height_m, 1.5);
+    let frame = Frame::new(&view_proj, eye);
+    let forward = -eye.normalize();
+    let near = height_m * 0.5;
+
+    // Ball strictly between eye and near plane (behind near plane).
+    let behind_near = Ball {
+        centre: eye + forward * (near * 0.4),
+        radius: near * 0.2,
+    };
+    assert!(
+        !frame.admits(&behind_near),
+        "ball strictly behind near plane should be culled"
+    );
+
+    // Ball behind the camera eye.
+    let behind_eye = Ball {
+        centre: eye - forward * 50.0,
+        radius: 10.0,
+    };
+    assert!(
+        !frame.admits(&behind_eye),
+        "ball behind camera eye should be culled"
+    );
+
+    // Ball straddling the near plane (extends past near along forward).
+    let straddling = Ball {
+        centre: eye + forward * (near * 0.8),
+        radius: near * 0.3,
+    };
+    assert!(
+        frame.admits(&straddling),
+        "ball straddling near plane must be admitted"
+    );
 }

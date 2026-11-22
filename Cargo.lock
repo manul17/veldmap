@@ -1015,6 +1015,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2599,6 +2601,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "veldmap-core",
+ "veldmap-raster",
  "wgpu",
 ]
 
@@ -2608,6 +2611,15 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "veldmap-raster"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "thiserror 2.0.21",
+ "veldmap-core",
 ]
 
 [[package]]

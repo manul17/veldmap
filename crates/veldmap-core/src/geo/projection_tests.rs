@@ -102,9 +102,9 @@ fn the_datum_shift_is_worth_a_hundred_metres() {
 #[test]
 fn the_helmert_and_its_inverse_are_exact() {
     let points = [
-        [3_000_000.0, 2_000_000.0, 5_200_000.0],
-        [-1_500_000.0, 5_800_000.0, 2_000_000.0],
-        [4_000_000.0, -3_000_000.0, -3_500_000.0],
+        DVec3::new(3_000_000.0, 2_000_000.0, 5_200_000.0),
+        DVec3::new(-1_500_000.0, 5_800_000.0, 2_000_000.0),
+        DVec3::new(4_000_000.0, -3_000_000.0, -3_500_000.0),
     ];
     let turned = Datum {
         rotate_sec: [-1.5, -0.35, -0.79],
@@ -113,10 +113,8 @@ fn the_helmert_and_its_inverse_are_exact() {
     for datum in [PULKOVO_1942, turned] {
         for point in points {
             let back = datum.helmert_back(datum.helmert(point));
-            for axis in 0..3 {
-                let off = (back[axis] - point[axis]).abs();
-                assert!(off < 1e-6, "{:?}, axis {axis}: {off} m", datum.rotate_sec);
-            }
+            let off = back.distance(point);
+            assert!(off < 1e-6, "{:?}: {off} m", datum.rotate_sec);
         }
     }
 }
@@ -250,13 +248,15 @@ fn a_shifted_datum_on_the_same_ellipsoid_still_moves() {
 
 #[test]
 fn the_axis_gives_a_pole_and_not_a_nan() {
-    let polar = KRASOVSKY.semi_major_m * (1.0 - KRASOVSKY.flattening);
-    let (north, lon) = KRASOVSKY.earth_centred_to_geodetic([0.0, 0.0, polar]);
-    assert!((north - 90.0).abs() < 1e-9);
-    assert_eq!(lon, 0.0);
+    let polar = KRASOVSKY.semi_minor_m();
+    let north = KRASOVSKY.from_ecef(DVec3::new(0.0, 0.0, polar));
+    assert!((north.lat_deg - 90.0).abs() < 1e-12);
+    assert_eq!(north.lon_deg, 0.0);
+    assert!(north.height_m.abs() < 1e-9);
 
-    let (south, _) = KRASOVSKY.earth_centred_to_geodetic([0.0, 0.0, -polar]);
-    assert!((south + 90.0).abs() < 1e-9);
+    let south = KRASOVSKY.from_ecef(DVec3::new(0.0, 0.0, -polar));
+    assert!((south.lat_deg + 90.0).abs() < 1e-12);
+    assert!(south.height_m.abs() < 1e-9);
 }
 
 #[test]
@@ -282,11 +282,12 @@ fn hemispheres_mirror() {
 #[test]
 fn near_pole_geodetic_and_datum_roundtrips_avoid_singularity() {
     for lat_deg in [85.0, 89.5, 89.999, -89.999, 90.0, -90.0] {
-        let ecef = WGS84.to_earth_centred(lat_deg, 37.0);
-        let (back_lat, _) = WGS84.earth_centred_to_geodetic(ecef);
+        let ecef = WGS84.to_ecef(Geodetic::surface(lat_deg, 37.0));
+        let back = WGS84.from_ecef(ecef);
         assert!(
-            (back_lat - lat_deg).abs() < 1e-12,
-            "near-pole ECEF roundtrip failed at {lat_deg}: got {back_lat}"
+            (back.lat_deg - lat_deg).abs() < 1e-12,
+            "near-pole ECEF roundtrip failed at {lat_deg}: got {}",
+            back.lat_deg
         );
 
         let shifted = PULKOVO_1942.to_wgs84(lat_deg, 37.0);

@@ -4,20 +4,10 @@
 //!
 //! Only WGS84 geodetic coordinates cross the boundary of this module.
 
-use super::geodesy::{FLATTENING, SEMI_MAJOR_M, unwind};
+use glam::DVec3;
 
-/// Reference ellipsoid of revolution.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Ellipsoid {
-    pub semi_major_m: f64,
-    pub flattening: f64,
-}
-
-/// WGS84 reference ellipsoid.
-pub const WGS84: Ellipsoid = Ellipsoid {
-    semi_major_m: SEMI_MAJOR_M,
-    flattening: FLATTENING,
-};
+pub use super::geodesy::{Ellipsoid, WGS84};
+use super::geodesy::{Geodetic, SEMI_MAJOR_M, unwind};
 
 /// Krasovsky 1940 ellipsoid (SK-42, Gauss-Kruger zones, MSK local systems).
 pub const KRASOVSKY: Ellipsoid = Ellipsoid {
@@ -25,76 +15,32 @@ pub const KRASOVSKY: Ellipsoid = Ellipsoid {
     flattening: 1.0 / 298.3,
 };
 
-impl Ellipsoid {
-    fn third_flattening(&self) -> f64 {
-        self.flattening / (2.0 - self.flattening)
-    }
-
-    fn eccentricity_sq(&self) -> f64 {
-        self.flattening * (2.0 - self.flattening)
-    }
-
-    fn rectifying_radius(&self) -> f64 {
-        let n = self.third_flattening();
-        self.semi_major_m / (1.0 + n) * (1.0 + n * n / 4.0 + n * n * n * n / 64.0)
-    }
-
-    /// Forward Krueger series coefficients up to `n^4`.
-    fn alpha(&self) -> [f64; 4] {
-        let n = self.third_flattening();
-        [
-            n / 2.0 - 2.0 * n * n / 3.0 + 5.0 * n * n * n / 16.0 + 41.0 * n * n * n * n / 180.0,
-            13.0 * n * n / 48.0 - 3.0 * n * n * n / 5.0 + 557.0 * n * n * n * n / 1440.0,
-            61.0 * n * n * n / 240.0 - 103.0 * n * n * n * n / 140.0,
-            49_561.0 * n * n * n * n / 161_280.0,
-        ]
-    }
-
-    /// Inverse Krueger series coefficients up to `n^4`.
-    fn beta(&self) -> [f64; 4] {
-        let n = self.third_flattening();
-        [
-            n / 2.0 - 2.0 * n * n / 3.0 + 37.0 * n * n * n / 96.0 - n * n * n * n / 360.0,
-            n * n / 48.0 + n * n * n / 15.0 - 437.0 * n * n * n * n / 1440.0,
-            17.0 * n * n * n / 480.0 - 37.0 * n * n * n * n / 840.0,
-            4_397.0 * n * n * n * n / 161_280.0,
-        ]
-    }
-
-    fn to_earth_centred(self, lat_deg: f64, lon_deg: f64) -> [f64; 3] {
-        let (lat, lon) = (lat_deg.to_radians(), lon_deg.to_radians());
-        let e2 = self.eccentricity_sq();
-        let curvature = self.semi_major_m / (1.0 - e2 * lat.sin() * lat.sin()).sqrt();
-        [
-            curvature * lat.cos() * lon.cos(),
-            curvature * lat.cos() * lon.sin(),
-            curvature * (1.0 - e2) * lat.sin(),
-        ]
-    }
-
-    fn earth_centred_to_geodetic(self, point: [f64; 3]) -> (f64, f64) {
-        let [x, y, z] = point;
-        let flat = x.hypot(y);
-        if flat == 0.0 {
-            return (90.0_f64.copysign(z), 0.0);
-        }
-        let lat = self.latitude_at(flat, z, CENTRED_ROUNDS);
-        (lat.to_degrees(), y.atan2(x).to_degrees())
-    }
-
-    fn latitude_at(&self, flat: f64, z: f64, rounds: u32) -> f64 {
-        let e2 = self.eccentricity_sq();
-        let mut lat = z.atan2(flat * (1.0 - e2));
-        for _ in 0..rounds {
-            let sin = lat.sin();
-            let curvature = self.semi_major_m / (1.0 - e2 * sin * sin).sqrt();
-            lat = (z + e2 * curvature * sin).atan2(flat);
-        }
-        lat
-    }
+fn rectifying_radius(ellipsoid: Ellipsoid) -> f64 {
+    let n = ellipsoid.third_flattening();
+    ellipsoid.semi_major_m / (1.0 + n) * (1.0 + n * n / 4.0 + n * n * n * n / 64.0)
 }
 
-const CENTRED_ROUNDS: u32 = 6;
+/// Forward Krueger series coefficients up to `n^4`.
+fn krueger_alpha(ellipsoid: Ellipsoid) -> [f64; 4] {
+    let n = ellipsoid.third_flattening();
+    [
+        n / 2.0 - 2.0 * n * n / 3.0 + 5.0 * n * n * n / 16.0 + 41.0 * n * n * n * n / 180.0,
+        13.0 * n * n / 48.0 - 3.0 * n * n * n / 5.0 + 557.0 * n * n * n * n / 1440.0,
+        61.0 * n * n * n / 240.0 - 103.0 * n * n * n * n / 140.0,
+        49_561.0 * n * n * n * n / 161_280.0,
+    ]
+}
+
+/// Inverse Krueger series coefficients up to `n^4`.
+fn krueger_beta(ellipsoid: Ellipsoid) -> [f64; 4] {
+    let n = ellipsoid.third_flattening();
+    [
+        n / 2.0 - 2.0 * n * n / 3.0 + 37.0 * n * n * n / 96.0 - n * n * n * n / 360.0,
+        n * n / 48.0 + n * n * n / 15.0 - 437.0 * n * n * n * n / 1440.0,
+        17.0 * n * n * n / 480.0 - 37.0 * n * n * n * n / 840.0,
+        4_397.0 * n * n * n * n / 161_280.0,
+    ]
+}
 
 fn geodetic_from_conformal(e: f64, tau_c: f64, rounds: u32) -> f64 {
     let psi = tau_c.asinh();
@@ -144,48 +90,52 @@ impl Datum {
         )
     }
 
-    fn helmert(&self, point: [f64; 3]) -> [f64; 3] {
+    fn helmert(&self, point: DVec3) -> DVec3 {
         let ([wx, wy, wz], scale) = self.turn();
-        let [x, y, z] = point;
         let [dx, dy, dz] = self.shift_m;
-        [
-            dx + scale * (x + wz * y - wy * z),
-            dy + scale * (-wz * x + y + wx * z),
-            dz + scale * (wy * x - wx * y + z),
-        ]
+        DVec3::new(
+            dx + scale * (point.x + wz * point.y - wy * point.z),
+            dy + scale * (-wz * point.x + point.y + wx * point.z),
+            dz + scale * (wy * point.x - wx * point.y + point.z),
+        )
     }
 
     /// Exact closed-form inverse of `I + W`: `(I - W + w w^T) / (1 + |w|^2)`.
-    fn helmert_back(&self, point: [f64; 3]) -> [f64; 3] {
+    fn helmert_back(&self, point: DVec3) -> DVec3 {
         let ([wx, wy, wz], scale) = self.turn();
-        let [x, y, z] = [0, 1, 2].map(|axis| (point[axis] - self.shift_m[axis]) / scale);
+        let x = (point.x - self.shift_m[0]) / scale;
+        let y = (point.y - self.shift_m[1]) / scale;
+        let z = (point.z - self.shift_m[2]) / scale;
 
         let square = wx * wx + wy * wy + wz * wz;
         let along = wx * x + wy * y + wz * z;
-        [
+        DVec3::new(
             (x - (wz * y - wy * z) + wx * along) / (1.0 + square),
             (y - (-wz * x + wx * z) + wy * along) / (1.0 + square),
             (z - (wy * x - wx * y) + wz * along) / (1.0 + square),
-        ]
+        )
     }
 
-    /// Convert `(lat_deg, lon_deg)` from this datum into WGS84.
+    /// Convert 2D `(lat_deg, lon_deg)` from this datum into WGS84 (discarding
+    /// the phantom Helmert ellipsoidal height `Delta h` on 2D output).
     pub fn to_wgs84(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         if *self == WGS84_DATUM {
             return (lat_deg, lon_deg);
         }
-        let point = self.ellipsoid.to_earth_centred(lat_deg, lon_deg);
-        WGS84.earth_centred_to_geodetic(self.helmert(point))
+        let point = self.ellipsoid.to_ecef(Geodetic::surface(lat_deg, lon_deg));
+        let shifted = WGS84.from_ecef(self.helmert(point));
+        (shifted.lat_deg, shifted.lon_deg)
     }
 
-    /// Convert WGS84 `(lat_deg, lon_deg)` into this datum.
+    /// Convert 2D WGS84 `(lat_deg, lon_deg)` into this datum (discarding
+    /// phantom Helmert `Delta h` on 2D output).
     pub fn from_wgs84(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         if *self == WGS84_DATUM {
             return (lat_deg, lon_deg);
         }
-        let point = WGS84.to_earth_centred(lat_deg, lon_deg);
-        self.ellipsoid
-            .earth_centred_to_geodetic(self.helmert_back(point))
+        let point = WGS84.to_ecef(Geodetic::surface(lat_deg, lon_deg));
+        let shifted = self.ellipsoid.from_ecef(self.helmert_back(point));
+        (shifted.lat_deg, shifted.lon_deg)
     }
 }
 
@@ -327,13 +277,13 @@ impl System {
         let eta = (lam.sin() / tau_c.hypot(lam.cos())).asinh();
 
         let (mut x, mut y) = (xi, eta);
-        for (j, a) in ellipsoid.alpha().iter().enumerate() {
+        for (j, a) in krueger_alpha(ellipsoid).iter().enumerate() {
             let k = 2.0 * (j as f64 + 1.0);
             x += a * (k * xi).sin() * (k * eta).cosh();
             y += a * (k * xi).cos() * (k * eta).sinh();
         }
 
-        let radius = self.scale * ellipsoid.rectifying_radius();
+        let radius = self.scale * rectifying_radius(ellipsoid);
         (
             self.false_easting_m + radius * y,
             self.false_northing_m + radius * x,
@@ -344,12 +294,12 @@ impl System {
     /// unwound onto the continuous longitude branch around `central_meridian_deg`.
     pub fn to_geodetic(&self, easting: f64, northing: f64) -> (f64, f64) {
         let ellipsoid = self.datum.ellipsoid;
-        let radius = self.scale * ellipsoid.rectifying_radius();
+        let radius = self.scale * rectifying_radius(ellipsoid);
         let xi = (northing - self.false_northing_m) / radius;
         let eta = (easting - self.false_easting_m) / radius;
 
         let (mut x, mut y) = (xi, eta);
-        for (j, b) in ellipsoid.beta().iter().enumerate() {
+        for (j, b) in krueger_beta(ellipsoid).iter().enumerate() {
             let k = 2.0 * (j as f64 + 1.0);
             x -= b * (k * xi).sin() * (k * eta).cosh();
             y -= b * (k * xi).cos() * (k * eta).sinh();

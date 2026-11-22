@@ -16,14 +16,15 @@ path = "src/main.rs"
 [dependencies]
 bytemuck.workspace = true
 eframe.workspace = true
+glam.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 veldmap-core = { path = "../veldmap-core" }
+veldmap-raster = { path = "../veldmap-raster" }
 wgpu.workspace = true
 
 [dev-dependencies]
-glam.workspace = true
 naga.workspace = true
 pollster.workspace = true
 

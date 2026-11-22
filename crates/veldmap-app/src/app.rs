@@ -1,5 +1,7 @@
-//! Main `eframe::App` state, globe input handling, and GIS HUD layout.
+//! Main `eframe::App` state, GPU tile cache / upload scheduling, cached
+//! quadtree draw snapshots, globe input handling, and GIS HUD layout.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use eframe::egui;
@@ -7,9 +9,15 @@ use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor
 use thiserror::Error;
 use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
 use veldmap_core::geo::coords::parse_location;
+use veldmap_core::tile::{QuadtreeConfig, TileKey};
+use veldmap_raster::BUNDLED_TILE_PX;
 
+use crate::gpu_tiles::{
+    BundledBasemapProvider, DEFAULT_GPU_TILE_CACHE_BYTES, DEFAULT_UPLOAD_BYTE_BUDGET,
+    DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads, bundled_tile_key,
+};
 use crate::hud;
-use crate::render::{GlobeRenderer, RenderParams};
+use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams};
 
 /// Logical scroll points mapped to one discrete globe zoom notch.
 const SCROLL_PT_PER_STEP: f64 = 48.0;
@@ -27,13 +35,59 @@ fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
     }
 }
 
-/// `egui_wgpu` paint callback bridging the offscreen [`GlobeRenderer`] into the
-/// viewport panel.
+/// Active planetary basemap display mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BasemapMode {
+    /// Bundled offline satellite basemap (`z = 0..3` Geodetic + `z = 0..1` PolarCap).
+    Satellite,
+    /// Untextured WGS84 ellipsoid rendered through the exact same quadtree.
+    EllipsoidOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotKey {
+    eye_bits: [u64; 3],
+    up_bits: [u64; 3],
+    width_px: u32,
+    height_px: u32,
+    ppp_bits: u32,
+    basemap_mode: BasemapMode,
+    show_graticule: bool,
+    scene_generation: u64,
+}
+
+impl SnapshotKey {
+    fn new(
+        camera: &Camera,
+        width_px: u32,
+        height_px: u32,
+        pixels_per_point: f32,
+        basemap_mode: BasemapMode,
+        show_graticule: bool,
+        scene_generation: u64,
+    ) -> Self {
+        let eye = camera.eye_ecef();
+        let (_, up, _) = camera.basis();
+        Self {
+            eye_bits: eye.to_array().map(f64::to_bits),
+            up_bits: up.to_array().map(f64::to_bits),
+            width_px,
+            height_px,
+            ppp_bits: pixels_per_point.to_bits(),
+            basemap_mode,
+            show_graticule,
+            scene_generation,
+        }
+    }
+}
+
+/// `egui_wgpu` paint callback bridging an immutable `Arc<DrawSnapshot>` and
+/// any pending `GpuTile` bind-group evictions into the offscreen
+/// [`GlobeRenderer`].
 struct GlobePaintCallback {
     rect: egui::Rect,
-    camera: Camera,
-    show_graticule: bool,
-    generation: u64,
+    snapshot: Arc<DrawSnapshot>,
+    evicted_tile_ids: Vec<u64>,
 }
 
 impl CallbackTrait for GlobePaintCallback {
@@ -45,6 +99,15 @@ impl CallbackTrait for GlobePaintCallback {
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() else {
+            return Vec::new();
+        };
+        // Always prune evicted tile bind groups even if the viewport is
+        // minimized (`0x0`), so GPU textures never leak across minimized frames.
+        if !self.evicted_tile_ids.is_empty() {
+            renderer.prune_evicted_tiles(&self.evicted_tile_ids);
+        }
+
         let vp = egui::epaint::ViewportInPixels::from_points(
             &self.rect,
             screen_descriptor.pixels_per_point,
@@ -54,20 +117,16 @@ impl CallbackTrait for GlobePaintCallback {
             return Vec::new();
         }
 
-        if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
-            renderer.render_if_dirty(
-                device,
-                queue,
-                egui_encoder,
-                RenderParams {
-                    width: vp.width_px as u32,
-                    height: vp.height_px as u32,
-                    camera: &self.camera,
-                    show_graticule: self.show_graticule,
-                    generation: self.generation,
-                },
-            );
-        }
+        renderer.render_if_dirty(
+            device,
+            queue,
+            egui_encoder,
+            RenderParams {
+                width: vp.width_px as u32,
+                height: vp.height_px as u32,
+                snapshot: &self.snapshot,
+            },
+        );
         Vec::new()
     }
 
@@ -91,11 +150,18 @@ pub enum AppError {
 
 pub struct VeldmapApp {
     adapter_label: String,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
     camera: Camera,
+    basemap_mode: BasemapMode,
     show_graticule: bool,
-    /// Reserved for non-camera scene mutations (e.g. tile uploads/evictions in
-    /// Slice 2A); camera pose and `show_graticule` are tracked directly in
-    /// `GlobeRenderer`'s `RenderKey`.
+    quadtree_config: QuadtreeConfig,
+    gpu_tile_cache: GpuTileCache,
+    pending_uploads: PendingUploads,
+    basemap_provider: BundledBasemapProvider,
+    wanted_tiles: HashSet<TileKey>,
+    pending_evictions: Vec<u64>,
+    cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
     scene_generation: u64,
     cursor_geo: Option<(f64, f64)>,
     last_viewport_rect: Option<egui::Rect>,
@@ -134,10 +200,31 @@ impl VeldmapApp {
             .callback_resources
             .insert(renderer);
 
+        let device = render_state.device.clone();
+        let queue = render_state.queue.clone();
+
+        let egui_ctx = cc.egui_ctx.clone();
+        let wakeup = Arc::new(move || {
+            egui_ctx.request_repaint();
+        });
+        let quadtree_config = QuadtreeConfig::bundled_geodetic();
+        let (mut basemap_provider, pending_uploads) = BundledBasemapProvider::spawn(wakeup);
+        basemap_provider.seed_roots(quadtree_config.scheme);
+
         Ok(Self {
             adapter_label,
+            device,
+            queue,
             camera: Camera::default(),
+            basemap_mode: BasemapMode::Satellite,
             show_graticule: true,
+            quadtree_config,
+            gpu_tile_cache: GpuTileCache::new(DEFAULT_GPU_TILE_CACHE_BYTES),
+            pending_uploads,
+            basemap_provider,
+            wanted_tiles: HashSet::new(),
+            pending_evictions: Vec::new(),
+            cached_snapshot: None,
             scene_generation: 1,
             cursor_geo: None,
             last_viewport_rect: None,
@@ -167,7 +254,7 @@ impl VeldmapApp {
         }
     }
 
-    fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (f64, f64, f64) {
+    fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (u32, u32, f64) {
         let ppp = ctx.pixels_per_point();
         let screen_rect = ctx.content_rect();
         let screen_px = [
@@ -175,9 +262,13 @@ impl VeldmapApp {
             (screen_rect.height() * ppp).round().max(1.0) as u32,
         ];
         let vp = egui::epaint::ViewportInPixels::from_points(&rect, ppp, screen_px);
-        let width_px = f64::from(vp.width_px.max(1));
-        let height_px = f64::from(vp.height_px.max(1));
-        (width_px, height_px, width_px / height_px)
+        let width_px = vp.width_px.max(1) as u32;
+        let height_px = vp.height_px.max(1) as u32;
+        (
+            width_px,
+            height_px,
+            f64::from(width_px) / f64::from(height_px),
+        )
     }
 
     fn probe_pointer(
@@ -193,11 +284,99 @@ impl VeldmapApp {
         let ny = f64::from(pos.y - rect.top()) / height_pt;
         self.camera.probe(nx, ny, aspect)
     }
+
+    /// Return the cached immutable `Arc<DrawSnapshot>` when `(camera, viewport,
+    /// mode, graticule, scene_generation)` is unchanged (avoiding quadtree
+    /// traversal on 120 Hz mouse hover), or rebuild and schedule missing tiles.
+    fn snapshot_for_frame(
+        &mut self,
+        width_px: u32,
+        height_px: u32,
+        pixels_per_point: f32,
+    ) -> Arc<DrawSnapshot> {
+        let key = SnapshotKey::new(
+            &self.camera,
+            width_px,
+            height_px,
+            pixels_per_point,
+            self.basemap_mode,
+            self.show_graticule,
+            self.scene_generation,
+        );
+        if let Some((cached_key, snapshot)) = &self.cached_snapshot
+            && *cached_key == key
+        {
+            return Arc::clone(snapshot);
+        }
+
+        let textured = self.basemap_mode == BasemapMode::Satellite;
+        let snapshot = Arc::new(DrawSnapshot::build(
+            self.camera,
+            width_px,
+            height_px,
+            pixels_per_point,
+            self.show_graticule,
+            textured,
+            self.scene_generation,
+            &self.quadtree_config,
+            textured.then_some(&mut self.gpu_tile_cache),
+        ));
+
+        self.wanted_tiles.clear();
+        if textured {
+            let tile_bytes = (BUNDLED_TILE_PX as usize) * (BUNDLED_TILE_PX as usize) * 4;
+            let appetite_cap = self.gpu_tile_cache.max_tiles_for_pyramid(1, tile_bytes);
+
+            let mut missing: Vec<TileKey> = Vec::new();
+            let mut already_cached_wanted = 0usize;
+            for draw in &snapshot.tiles {
+                let tex_key = bundled_tile_key(draw.visible.tex_id);
+                if self.wanted_tiles.insert(tex_key) {
+                    if self.gpu_tile_cache.contains(&tex_key) {
+                        already_cached_wanted += 1;
+                    } else {
+                        missing.push(tex_key);
+                    }
+                }
+            }
+            // Request coarsest tiles first while keeping visible + in-flight
+            // strictly within the <50% VRAM appetite cap.
+            let remaining_budget = appetite_cap.saturating_sub(already_cached_wanted);
+            missing.sort_by_key(|k| (k.scheme.coarseness_rank(k.level), k.y, k.x));
+            for tex_key in missing.into_iter().take(remaining_budget) {
+                self.basemap_provider.request(tex_key);
+            }
+            self.basemap_provider
+                .reconcile(&self.gpu_tile_cache, &self.wanted_tiles);
+        }
+
+        self.cached_snapshot = Some((key, Arc::clone(&snapshot)));
+        snapshot
+    }
 }
 
 impl eframe::App for VeldmapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Drain background tile completions and upload coarsest-first within
+        // the per-frame VRAM/time budget before building this frame's snapshot.
+        let wanted_filter = (!self.wanted_tiles.is_empty()).then_some(&self.wanted_tiles);
+        let upload_report = self.pending_uploads.drain_and_upload(
+            &self.device,
+            &self.queue,
+            &mut self.gpu_tile_cache,
+            wanted_filter,
+            DEFAULT_UPLOAD_BYTE_BUDGET,
+            DEFAULT_UPLOAD_TIME_BUDGET,
+        );
+        if upload_report.uploaded > 0 {
+            self.scene_generation = self.scene_generation.wrapping_add(1);
+            self.pending_evictions
+                .extend(upload_report.evicted_tile_ids);
+            self.basemap_provider
+                .reconcile(&self.gpu_tile_cache, &self.wanted_tiles);
+        }
 
         // Advance active quaternion camera flights (cap dt to 50 ms so a
         // frame hitch never jumps abruptly through a 0.6 s flight).
@@ -212,7 +391,11 @@ impl eframe::App for VeldmapApp {
             self.camera.reset_north();
         }
 
-        // Top toolbar: title, Go-To DD/DMS/MGRS input, graticule toggle, GPU badge.
+        let mode_before = self.basemap_mode;
+        let graticule_before = self.show_graticule;
+
+        // Top toolbar: title, Go-To DD/DMS/MGRS input, Satellite/Ellipsoid
+        // switcher, graticule toggle, and GPU badge.
         egui::Panel::top("top_toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong(veldmap_core::APP_NAME);
@@ -231,6 +414,14 @@ impl eframe::App for VeldmapApp {
                 if ui.button("Fly").clicked() || enter_pressed {
                     self.trigger_goto();
                 }
+
+                ui.separator();
+                ui.selectable_value(&mut self.basemap_mode, BasemapMode::Satellite, "Satellite");
+                ui.selectable_value(
+                    &mut self.basemap_mode,
+                    BasemapMode::EllipsoidOnly,
+                    "Ellipsoid-only",
+                );
 
                 ui.separator();
                 ui.checkbox(&mut self.show_graticule, "Graticule");
@@ -257,6 +448,10 @@ impl eframe::App for VeldmapApp {
                 });
             });
         });
+
+        if self.basemap_mode != mode_before {
+            self.scene_generation = self.scene_generation.wrapping_add(1);
+        }
 
         // Probe the current pointer against the previous frame's viewport rect
         // before laying out the bottom status bar so hover readouts stay in
@@ -312,9 +507,9 @@ impl eframe::App for VeldmapApp {
                 if rect.is_positive() {
                     viewport_rect = Some(rect);
                     self.last_viewport_rect = Some(rect);
-                    let (_, height_px, _) = Self::viewport_pixels(&ctx, rect);
+                    let (width_px, height_px, _) = Self::viewport_pixels(&ctx, rect);
                     let height_pt = f64::from(rect.height()).max(1.0);
-                    self.last_viewport_height_px = height_px;
+                    self.last_viewport_height_px = f64::from(height_px);
 
                     if response.dragged_by(egui::PointerButton::Primary) {
                         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -346,14 +541,17 @@ impl eframe::App for VeldmapApp {
                         }
                     }
 
+                    let snapshot =
+                        self.snapshot_for_frame(width_px, height_px, ctx.pixels_per_point());
+                    let evicted_tile_ids = std::mem::take(&mut self.pending_evictions);
+
                     // Register offscreen globe + 1:1 nearest composite paint callback.
                     painter.add(egui_wgpu::Callback::new_paint_callback(
                         rect,
                         GlobePaintCallback {
                             rect,
-                            camera: self.camera,
-                            show_graticule: self.show_graticule,
-                            generation: self.scene_generation,
+                            snapshot,
+                            evicted_tile_ids,
                         },
                     ));
 
@@ -373,11 +571,15 @@ impl eframe::App for VeldmapApp {
             }
         }
 
-        // Request a follow-up repaint only for active flights, camera moves, or
-        // viewport resizes (never on plain mouse hover).
+        // Request a follow-up repaint only for active flights, camera/mode/UI
+        // changes, viewport resizes, or non-empty upload backlog (never idle).
         if self.camera.is_flying()
             || self.camera != camera_before
             || self.last_viewport_rect != rect_before
+            || self.basemap_mode != mode_before
+            || self.show_graticule != graticule_before
+            || upload_report.remaining > 0
+            || !self.pending_uploads.is_empty()
         {
             ctx.request_repaint();
         }
@@ -392,10 +594,8 @@ mod tests {
     fn zoom_steps_prefers_active_pinch_over_residual_scroll() {
         assert!((zoom_steps_from_input(48.0, 1.0) - 1.0).abs() < 1e-12);
         assert!((zoom_steps_from_input(-24.0, 1.0) + 0.5).abs() < 1e-12);
-        // Active pinch (zoom_delta = ZOOM_PER_CLICK) yields 1 step without adding scroll_y.
         let pinch = zoom_steps_from_input(96.0, ZOOM_PER_CLICK as f32);
         assert!((pinch - 1.0).abs() < 1e-6, "pinch={pinch}");
-        // Non-finite inputs never produce NaN steps.
         assert_eq!(zoom_steps_from_input(f32::NAN, 1.0), 0.0);
         assert_eq!(zoom_steps_from_input(0.0, f32::NAN), 0.0);
     }

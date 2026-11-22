@@ -109,7 +109,7 @@ fn center_gsd_matches_probe_spacing_and_floor_target() {
             .expect("adjacent pixel hit");
         let w0 = geodesy::world(Geodetic::surface(p0.0, p0.1));
         let w1 = geodesy::world(Geodetic::surface(p1.0, p1.1));
-        let probed_m = (w1 - w0).length() * geodesy::SEMI_MAJOR_M;
+        let probed_m = (w1 - w0).length();
         let gsd_m = camera.metres_per_pixel(height_px);
         assert!(
             (probed_m - gsd_m).abs() / gsd_m < 0.01,
@@ -562,4 +562,38 @@ fn ray_and_probe_guard_invalid_aspect_ratios() {
         assert_eq!(camera.ray(0.75, 0.25, bad_aspect), expected);
         assert!(camera.probe(0.75, 0.25, bad_aspect).is_some());
     }
+}
+
+#[test]
+fn geodetic_nadir_aim_matches_center_with_zero_mid_latitude_offset() {
+    for lat_deg in [-85.0, -45.0, 0.0, 45.0, 85.0] {
+        for height_m in [MIN_HEIGHT_M, 1_000.0, 100_000.0, 14_000_000.0, MAX_HEIGHT_M] {
+            let cam = at(lat_deg, 39.7015, height_m);
+            let center = cam.center();
+            let probed = cam.probe(0.5, 0.5, 16.0 / 9.0).expect("nadir hits WGS84");
+            assert!(
+                (probed.0 - center.0).abs() < 1e-11,
+                "lat drift at ({lat_deg}, {height_m} m): probed {probed:?} vs center {center:?}"
+            );
+            assert!(
+                (geodesy::unwind(center.1, probed.1) - center.1).abs() < 1e-11,
+                "lon drift at ({lat_deg}, {height_m} m): probed {probed:?} vs center {center:?}"
+            );
+        }
+    }
+
+    // Zooming straight in from orbit to 2 m at viewport center at 45 deg lat
+    // must keep center pinned with zero drift (eliminating the legacy 14.7 km drift).
+    let mut cam = at(45.0, 60.0, 14_000_000.0);
+    let before = cam.center();
+    for _ in 0..80 {
+        cam.zoom_at(1.0, 0.0, 0.0);
+    }
+    assert_eq!(cam.height_m(), MIN_HEIGHT_M);
+    let after = cam.center();
+    let drift_m = geodesy::separation(before, after).to_radians() * geodesy::SEMI_MAJOR_M;
+    assert!(
+        drift_m < 1e-3,
+        "orbit-to-2m center zoom drifted by {drift_m} m"
+    );
 }

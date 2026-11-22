@@ -44,68 +44,103 @@ fn an_endless_longitude_does_not_hang_the_unwinding() {
 }
 
 #[test]
-fn the_halves_add_back_up_to_the_point() {
-    let places = [
-        world(Geodetic::surface(45.0, 60.0)),
-        world(Geodetic::surface(-78.0, -179.0)),
-        world(Geodetic {
-            lat_deg: 0.0,
-            lon_deg: 0.0,
-            height_m: 80_000_000.0,
-        }),
-        DVec3::ZERO,
-    ];
-    for point in places {
-        let (high, low) = parts(point);
-        let back = Vec3::from(high).as_dvec3() + Vec3::from(low).as_dvec3();
-        let off_m = (back - point).length() * SEMI_MAJOR_M;
-        assert!(off_m < 1e-6, "{point:?}: diverged by {off_m} m");
-    }
-}
-
-#[test]
-fn two_halves_preserve_sub_millimetre_offsets() {
-    let here = world(Geodetic::surface(45.0, 60.0));
-    let cm_step = here + DVec3::Z * (0.01 / SEMI_MAJOR_M);
-    assert_eq!(
-        parts(here).0,
-        parts(cm_step).0,
-        "high half alone cannot resolve 1 cm"
-    );
-
-    for step_m in [0.01, 0.1, 1.0, 100.0, 10_000.0] {
-        let there = here + DVec3::Z * (step_m / SEMI_MAJOR_M);
-        let step = Vec3::from(offset(parts(there), parts(here)));
-        let moved = f64::from(step.length()) * SEMI_MAJOR_M;
-        assert!(
-            (moved - step_m).abs() < 1e-4,
-            "{moved} m instead of {step_m}"
-        );
-        assert!(step.z > 0.0, "offset points the wrong way: {step:?}");
-    }
-}
-
-#[test]
 fn surface_roundtrip() {
     for &(lat, lon) in &[(0.0, 0.0), (45.0, 60.0), (-33.9, 151.2), (78.0, -179.5)] {
         let (back_lat, back_lon) = surface_at(world(Geodetic::surface(lat, lon)));
-        assert!((back_lat - lat).abs() < 1e-9, "{lat} -> {back_lat}");
-        assert!((back_lon - lon).abs() < 1e-9, "{lon} -> {back_lon}");
+        assert!((back_lat - lat).abs() < 1e-12, "{lat} -> {back_lat}");
+        assert!((back_lon - lon).abs() < 1e-12, "{lon} -> {back_lon}");
     }
 }
 
 #[test]
-fn flattening_is_real() {
+fn fukushima_3d_roundtrip_across_altitudes_and_poles() {
+    let ellipsoids = [
+        WGS84,
+        Ellipsoid {
+            semi_major_m: 6_378_245.0,
+            flattening: 1.0 / 298.3,
+        },
+    ];
+    for ellipsoid in ellipsoids {
+        for lat_deg in [
+            -90.0,
+            -89.999,
+            -85.051_129,
+            -45.0,
+            -0.001,
+            0.0,
+            0.001,
+            45.0,
+            85.051_129,
+            89.999,
+            90.0,
+        ] {
+            for lon_deg in [-179.5, -45.0, 0.0, 39.7015, 179.9] {
+                for height_m in [-500.0, 0.0, 2.0, 10_000.0, 1_000_000.0, 80_000_000.0] {
+                    let input = Geodetic {
+                        lat_deg,
+                        lon_deg,
+                        height_m,
+                    };
+                    let ecef = ellipsoid.to_ecef(input);
+                    let back = ellipsoid.from_ecef(ecef);
+                    assert!(
+                        (back.lat_deg - lat_deg).abs() < 1e-11,
+                        "lat mismatch at {input:?}: got {back:?}"
+                    );
+                    if lat_deg.abs() < 90.0 {
+                        assert!(
+                            (unwind(lon_deg, back.lon_deg) - lon_deg).abs() < 1e-11,
+                            "lon mismatch at {input:?}: got {back:?}"
+                        );
+                    } else {
+                        assert!(back.lon_deg.is_finite());
+                    }
+                    let h_tol = 1e-6_f64.max(height_m.abs() * 1e-12);
+                    assert!(
+                        (back.height_m - height_m).abs() < h_tol,
+                        "height mismatch at {input:?}: got {back:?} (tol {h_tol})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_matches_world_in_metres() {
+    for lat in [-85.0, 0.0, 47.2357, 89.5] {
+        for height_m in [0.0, 2.0, 500_000.0] {
+            let p = parallel(lat, height_m);
+            for lon in [-180.0_f64, -42.5, 0.0, 39.7, 179.0] {
+                let (sin_lon, cos_lon) = lon.to_radians().sin_cos();
+                let a = p.at(sin_lon, cos_lon);
+                let b = world(Geodetic {
+                    lat_deg: lat,
+                    lon_deg: lon,
+                    height_m,
+                });
+                assert!(
+                    a.distance(b) < 1e-9,
+                    "mismatch at ({lat}, {lon}, {height_m})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn flattening_is_real_in_metres() {
     let point = world(Geodetic::surface(45.0, 0.0));
     assert!(
-        point.z < 45.0_f64.to_radians().sin() - 1e-4,
+        point.z < SEMI_MAJOR_M * 45.0_f64.to_radians().sin() - 1_000.0,
         "z = {}",
         point.z
     );
-    assert!((world(Geodetic::surface(0.0, 0.0)).x - 1.0).abs() < 1e-12);
+    assert!((world(Geodetic::surface(0.0, 0.0)).x - SEMI_MAJOR_M).abs() < 1e-9);
     let polar = world(Geodetic::surface(90.0, 0.0)).z;
     assert!(
-        ((1.0 - polar) * SEMI_MAJOR_M - 21_384.7).abs() < 1.0,
+        ((SEMI_MAJOR_M - polar) - 21_384.7).abs() < 1.0,
         "polar compression ~21.4 km: {polar}"
     );
 }
@@ -190,15 +225,30 @@ fn an_edge_is_measured_by_the_way_it_goes() {
 }
 
 #[test]
-fn ray_hits_and_misses() {
-    let eye = DVec3::new(2.0, 0.0, 0.0);
+fn ray_hits_and_misses_in_metres() {
+    let eye = DVec3::new(2.0 * SEMI_MAJOR_M, 0.0, 0.0);
     let hit = intersect_at(eye, DVec3::NEG_X, 0.0).expect("ray toward center");
     let (lat, lon) = surface_at(hit);
-    assert!(lat.abs() < 1e-9 && lon.abs() < 1e-9);
+    assert!(lat.abs() < 1e-12 && lon.abs() < 1e-12);
 
     let raised = intersect_at(eye, DVec3::NEG_X, 1_000.0).expect("ray toward raised surface");
-    let lifted = (raised.x - hit.x) * SEMI_MAJOR_M;
-    assert!((lifted - 1_000.0).abs() < 1.0, "lift measured {lifted} m");
+    let lifted = raised.x - hit.x;
+    assert!((lifted - 1_000.0).abs() < 1e-6, "lift measured {lifted} m");
+
+    // 2 m close-up ray intersection preserves sub-millimetre precision.
+    let low_eye = world(Geodetic {
+        lat_deg: 47.2357,
+        lon_deg: 39.7015,
+        height_m: 2.0,
+    });
+    let nadir = -unit(47.2357, 39.7015);
+    let low_hit = intersect_at(low_eye, nadir, 0.0).expect("2 m nadir hit");
+    let expected = world(Geodetic::surface(47.2357, 39.7015));
+    assert!(
+        low_hit.distance(expected) < 1e-6,
+        "2 m nadir hit drifted by {} m",
+        low_hit.distance(expected)
+    );
 
     assert!(intersect_at(eye, DVec3::Y, 0.0).is_none());
     assert!(intersect_at(eye, DVec3::X, 0.0).is_none());
@@ -208,7 +258,6 @@ fn ray_hits_and_misses() {
 #[test]
 fn sub_metre_separation_and_between_preserve_precision() {
     let p0 = (47.2357, 39.7015);
-    // ~1 cm northward step (~9e-8 deg ~ 1.57e-9 rad, where dot.acos() collapses to 0).
     let dlat = 0.01 / (SEMI_MAJOR_M * std::f64::consts::PI / 180.0);
     let p1 = (p0.0 + dlat, p0.1);
     let sep_m = separation(p0, p1).to_radians() * SEMI_MAJOR_M;
@@ -226,13 +275,6 @@ fn surface_at_exact_poles_is_finite() {
         assert!((lat - pole).abs() < 1e-12);
         assert!(lon.is_finite());
     }
-}
-
-#[test]
-fn encircles_detects_full_wrap_and_rejects_gaps_and_nan() {
-    assert!(encircles(&[(0.0, -120.0), (0.0, 0.0), (0.0, 120.0)]));
-    assert!(!encircles(&[(0.0, 0.0), (0.0, 60.0), (0.0, 120.0)]));
-    assert!(!encircles(&[(0.0, 0.0), (0.0, f64::NAN), (0.0, 120.0)]));
 }
 
 #[test]

@@ -15,4 +15,4 @@ No standalone font binaries are stored in this repository. The desktop UI curren
 
 ## Bundled Imagery Assets
 
-No imagery datasets are currently bundled in the repository. Public-domain global basemap assets added in Slice 2 will be documented here with full provenance.
+- **`assets/basemap/blue_marble_ng.jpg`** — NASA *Blue Marble Next Generation + Topography + Bathymetry* (`3600 x 1800` global equirectangular composite by Reto Stöckli, NASA Earth Observatory, sourced unmodified from Wikimedia Commons `File:Blue_Marble_Next_Generation_+_topography_+_bathymetry.jpg`, SHA-256 `062582f953750c05c12514b9ff498b8db5b2c68e1e0563b0bea2f3385be9f5db`). **Public Domain** (U.S. Government work / NASA). See [assets/README.md](assets/README.md).
