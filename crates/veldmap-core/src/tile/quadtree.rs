@@ -27,11 +27,6 @@ pub const POLAR_R_CAP: f64 = 0.043_213_918_263_772_28;
 /// conservative at polar latitudes.
 const POLAR_CURVATURE_SCALE: f64 = 1.0 / (1.0 - geodesy::FLATTENING);
 
-/// Return [`POLAR_R_CAP`] without runtime trigonometry.
-pub const fn polar_r_cap() -> f64 {
-    POLAR_R_CAP
-}
-
 /// Geometry identifier for a single planetary quadtree or polar cap tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct QuadTileId {
@@ -109,8 +104,12 @@ impl QuadTileId {
         ]
     }
 
-    /// Return the coarser parent node, or `None` at `level == 0`.
+    /// Return the coarser parent node, or `None` at `level == 0` (or for
+    /// non-planetary schemes).
     pub const fn parent(self) -> Option<Self> {
+        if !self.scheme.is_coarsest_zero() {
+            return None;
+        }
         let Some((level, x, y)) = self.scheme.parent(self.level, self.x, self.y) else {
             return None;
         };
@@ -226,7 +225,9 @@ pub struct VisibleTile {
     /// cell in metres.
     pub sag_cell_diag_m: f64,
     /// Inward skirt depth along `-normal` in metres
-    /// (`max(4.0 * sag_cell_diag_m, 0.001)`).
+    /// (`max(4.0 * sag_cell_diag_m, 0.001)`, raised to the unclamped span sag
+    /// on polar-clamped `Geodetic` tiles so coarser neighbors never out-sag a
+    /// thin sliver).
     pub skirt_depth_m: f64,
 }
 
@@ -405,16 +406,27 @@ fn describe_tile_with_samples(
     let e2 = geodesy::WGS84.eccentricity_sq();
     let one_minus_e2 = 1.0 - e2;
 
-    let mut push_sample = |idx: usize, lat_deg: f64, lon_deg: f64| {
-        let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
-        let (sin_lon, cos_lon) = lon_deg.to_radians().sin_cos();
-        let curvature = geodesy::SEMI_MAJOR_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-        sample_units[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
-        samples[idx] = DVec3::new(
-            curvature * cos_lat * cos_lon,
-            curvature * cos_lat * sin_lon,
-            curvature * one_minus_e2 * sin_lat,
-        );
+    let mut fill_separable_grid = |lats_deg: [f64; 5], lons_deg: [f64; 5]| {
+        let mut lat_cache = [(0.0_f64, 0.0_f64, 0.0_f64); 5];
+        for (slot, lat_deg) in lat_cache.iter_mut().zip(lats_deg) {
+            let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
+            let curvature = geodesy::SEMI_MAJOR_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+            *slot = (sin_lat, cos_lat, curvature);
+        }
+        let mut lon_cache = [(0.0_f64, 0.0_f64); 5];
+        for (slot, lon_deg) in lon_cache.iter_mut().zip(lons_deg) {
+            *slot = lon_deg.to_radians().sin_cos();
+        }
+        let mut idx = 0usize;
+        for &(sin_lat, cos_lat, curvature) in &lat_cache {
+            let eq = curvature * cos_lat;
+            let z = curvature * one_minus_e2 * sin_lat;
+            for &(sin_lon, cos_lon) in &lon_cache {
+                sample_units[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+                samples[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
+                idx += 1;
+            }
+        }
     };
 
     let mut unclamped_cell_diag_deg = 0.0_f64;
@@ -423,20 +435,20 @@ fn describe_tile_with_samples(
     match id.scheme {
         TileScheme::Geodetic => {
             let b = lat_lon_bounds(id)?;
-            let mut idx = 0usize;
-            for row in 0..5u32 {
-                let t = f64::from(row) * 0.25;
-                let lat = b.lat_north_deg + (b.lat_south_deg - b.lat_north_deg) * t;
-                for col in 0..5u32 {
-                    let s = f64::from(col) * 0.25;
-                    let lon = b.lon_west_deg + (b.lon_east_deg - b.lon_west_deg) * s;
-                    push_sample(idx, lat, lon);
-                    idx += 1;
-                }
-            }
+            let lats = [0u32, 1, 2, 3, 4].map(|row| {
+                b.lat_north_deg + (b.lat_south_deg - b.lat_north_deg) * (f64::from(row) * 0.25)
+            });
+            let lons = [0u32, 1, 2, 3, 4].map(|col| {
+                b.lon_west_deg + (b.lon_east_deg - b.lon_west_deg) * (f64::from(col) * 0.25)
+            });
+            fill_separable_grid(lats, lons);
             if b.lat_north_deg < b.raw_lat_north_deg || b.lat_south_deg > b.raw_lat_south_deg {
                 let raw_cell_lat = (b.raw_lat_north_deg - b.raw_lat_south_deg) / grid_cells;
-                let min_abs_lat = b.lat_north_deg.abs().min(b.lat_south_deg.abs());
+                let min_abs_lat = if b.lat_south_deg <= 0.0 && b.lat_north_deg >= 0.0 {
+                    0.0
+                } else {
+                    b.lat_north_deg.abs().min(b.lat_south_deg.abs())
+                };
                 let cell_lon = ((b.lon_east_deg - b.lon_west_deg) / grid_cells)
                     * min_abs_lat.to_radians().cos();
                 unclamped_cell_diag_deg = raw_cell_lat.hypot(cell_lon);
@@ -451,17 +463,11 @@ fn describe_tile_with_samples(
             let rows_f = f64::from(rows);
             let merc_n = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y) / rows_f);
             let merc_s = std::f64::consts::PI * (1.0 - 2.0 * f64::from(id.y + 1) / rows_f);
-            let mut idx = 0usize;
-            for row in 0..5u32 {
-                let t = f64::from(row) * 0.25;
-                let lat = mercator_lat_deg(merc_n + (merc_s - merc_n) * t);
-                for col in 0..5u32 {
-                    let s = f64::from(col) * 0.25;
-                    let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
-                    push_sample(idx, lat, lon);
-                    idx += 1;
-                }
-            }
+            let lats = [0u32, 1, 2, 3, 4]
+                .map(|row| mercator_lat_deg(merc_n + (merc_s - merc_n) * (f64::from(row) * 0.25)));
+            let lons = [0u32, 1, 2, 3, 4]
+                .map(|col| -180.0 + 360.0 * (f64::from(id.x) + f64::from(col) * 0.25) / cols_f);
+            fill_separable_grid(lats, lons);
             // Evaluate the most equatorial mesh cell directly so non-linear
             // Mercator stretching at coarse z=0..1 does not underestimate sag.
             let d_merc = (merc_n - merc_s) / grid_cells;
@@ -493,7 +499,15 @@ fn describe_tile_with_samples(
                     let s = f64::from(col) * 0.25;
                     let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
                     let (lat, lon, _, _) = polar_cap_point(north, u, v);
-                    push_sample(idx, lat, lon);
+                    let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+                    let (sin_lon, cos_lon) = lon.to_radians().sin_cos();
+                    let curvature = geodesy::SEMI_MAJOR_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+                    sample_units[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+                    samples[idx] = DVec3::new(
+                        curvature * cos_lat * cos_lon,
+                        curvature * cos_lat * sin_lon,
+                        curvature * one_minus_e2 * sin_lat,
+                    );
                     idx += 1;
                 }
             }
@@ -504,19 +518,27 @@ fn describe_tile_with_samples(
     // Center point `(s=0.5, t=0.5)` is index 12 (row 2, col 2).
     let origin_ecef_m = samples[12];
 
-    // Estimate maximum 5x5 subcell diagonal arc from cached unit normals.
-    let mut max_subcell_arc_deg = 0.0_f64;
+    // Estimate maximum 5x5 subcell diagonal arc from cached unit normals via
+    // squared chord length (`|a - b|^2 = 4 sin^2(theta / 2)`, strictly
+    // monotonic on `[0, pi]`), needing only one `asin` instead of 32 `atan2`s.
+    let mut max_chord_sq = 0.0_f64;
     for row in 0..4usize {
         for col in 0..4usize {
             let a = sample_units[row * 5 + col];
             let b = sample_units[(row + 1) * 5 + (col + 1)];
             let c = sample_units[row * 5 + (col + 1)];
             let d = sample_units[(row + 1) * 5 + col];
-            let arc_ab = a.cross(b).length().atan2(a.dot(b)).to_degrees();
-            let arc_cd = c.cross(d).length().atan2(c.dot(d)).to_degrees();
-            max_subcell_arc_deg = max_subcell_arc_deg.max(arc_ab).max(arc_cd);
+            max_chord_sq = max_chord_sq
+                .max((a - b).length_squared())
+                .max((c - d).length_squared());
         }
     }
+    let max_subcell_arc_deg = 2.0
+        * (0.25 * max_chord_sq)
+            .clamp(0.0, 1.0)
+            .sqrt()
+            .asin()
+            .to_degrees();
     // Scale 5x5 subcell (`1/4` of tile) to `1/grid_cells`, taking the exact
     // equatorial WebMercator cell when larger.
     let cell_diag_deg =
@@ -671,9 +693,14 @@ pub fn traverse(
 
     let mut leaves: HashMap<QuadTileId, VisibleTile> = HashMap::new();
 
-    // Seed roots: main planetary scheme + North & South Polar Stereographic caps.
+    // Seed roots: main planetary scheme (`Geodetic` or `WebMercator`) + North &
+    // South Polar Stereographic caps.
     let mut stack: Vec<QuadTileId> = Vec::with_capacity(64);
-    if let Some((cols, rows)) = config.scheme.grid_dims(0) {
+    if matches!(
+        config.scheme,
+        TileScheme::Geodetic | TileScheme::WebMercator
+    ) && let Some((cols, rows)) = config.scheme.grid_dims(0)
+    {
         for y in 0..rows {
             for x in 0..cols {
                 stack.push(QuadTileId {

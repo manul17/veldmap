@@ -6,7 +6,7 @@ Fast, purely native Rust desktop **Analytical Earth-Observation & Precision-Imag
 
 VeldMap is built in vertical slices tracked in [plan.md](plan.md):
 
-- **Implemented (Slices 1–2A):** Pure-Rust WGS84 geodesy (`f64` ECEF metres + Fukushima 2006 3D inverse), map projections, MGRS/DD/DMS coordinate navigation, `f64` infinite Reverse-Z geodetic-nadir camera & oblate horizon culling, decoupled offscreen `wgpu` WGS84 planetary quadtree with adaptive Polar Stereographic caps, per-tile CPU `f64` RTC geometry, procedural post-overlay `fwidth()` graticule, `TileKey`/`TileCache`/`GpuTileCache`, bundled offline NASA Blue Marble basemap (`veldmap-raster`), exact linear-to-sRGB compositing, and baseline GIS HUD.
+- **Implemented (Slices 1–2A):** Interactive 3D WGS84 globe (`2 m` altitude floor, geodetic-nadir camera, MGRS/DD/DMS Go-To navigation, baseline GIS HUD) backed by pure-Rust `f64` geodesy/projections, an adaptive planetary quadtree with Polar Stereographic caps, a post-overlay procedural graticule, and a bundled offline NASA Blue Marble basemap (`veldmap-raster`).
 - **Planned (v0.2–v1.0):** Async live satellite basemaps (NASA GIBS / EOX Sentinel-2 Cloudless) & disk cache, local GeoTIFF/BigTIFF/COG/PNG/JPEG overlays & CRS/geodesic tools, zero-auth STAC/COG HTTP Range streaming, `R32Float`/`R8Uint`/`R16Uint` scientific & categorical band math (NDVI/NDWI/false-color + `SCL` cloud masking), analytical DEM relief, and multi-temporal timeline diffing & time-series export.
 - **Planned (v1.1):** Sentinel-2 JPEG 2000, authenticated CDSE S3 streaming & resumable downloads, and Sentinel-3/5P NetCDF-4/HDF5.
 

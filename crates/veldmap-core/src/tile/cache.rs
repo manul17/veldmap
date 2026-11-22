@@ -16,8 +16,8 @@ struct Node<K, V> {
 
 /// Pure O(1) doubly-linked intrusive slab LRU cache bounded by `max_bytes`.
 ///
-/// Evictions return the evicted `(K, V)` entries so callers (such as
-/// `GpuTileCache`) can prune associated GPU bind groups deterministically.
+/// Evictions return the evicted `(K, V)` entries so callers can inspect or
+/// drop released resources deterministically.
 pub struct TileCache<K: Copy + Eq + Hash, V> {
     nodes: Vec<Option<Node<K, V>>>,
     free: Vec<usize>,
@@ -113,7 +113,7 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
             evicted.push((key, old_val));
         }
 
-        while self.total_bytes.saturating_add(byte_size) > self.max_bytes {
+        while self.total_bytes > self.max_bytes - byte_size {
             let Some(victim) = self.pop_lru() else {
                 break;
             };
@@ -262,24 +262,49 @@ impl<V> TileCache<TileKey, V> {
         }
     }
 
-    /// Find the finest cached tile covering `key` (either `key` itself or its
-    /// nearest cached coarser ancestor via [`TileKey::parent`]), touch that
-    /// carrier and all of its cached ancestors up to the root, and return
-    /// `(carrier_key, uv_rect_in_carrier, &value)`.
-    pub fn carrier(&mut self, key: &TileKey) -> Option<(TileKey, [f32; 4], &V)> {
+    fn find_carrier_slot(&self, key: &TileKey) -> Option<(TileKey, usize)> {
         let mut cursor = Some(*key);
-        let mut found = None;
         while let Some(cur) = cursor {
-            if self.contains(&cur) {
-                found = Some(cur);
-                break;
+            if let Some(&slot) = self.index.get(&cur) {
+                return Some((cur, slot));
             }
             cursor = cur.parent();
         }
-        let carrier_key = found?;
+        None
+    }
+
+    fn touch_carrier_and_ancestors(&mut self, carrier_key: TileKey, carrier_slot: usize) {
+        self.move_to_front(carrier_slot);
+        let mut anc = carrier_key.parent();
+        while let Some(cur) = anc {
+            self.touch(&cur);
+            anc = cur.parent();
+        }
+    }
+
+    /// Find the finest cached tile covering `key` (either `key` itself or its
+    /// nearest cached coarser ancestor via [`TileKey::parent`]), touch that
+    /// carrier and all of its cached ancestors up to the root, and return
+    /// `(carrier_key, &value)`.
+    ///
+    /// Decoupled from UV sub-rectangle math so callers serving clipped or
+    /// guttered `RasterPyramid` tiles can compute exact UVs from the carrier's
+    /// pixel dimensions and gutter metadata.
+    pub fn find_carrier(&mut self, key: &TileKey) -> Option<(TileKey, &V)> {
+        let (carrier_key, carrier_slot) = self.find_carrier_slot(key)?;
+        self.touch_carrier_and_ancestors(carrier_key, carrier_slot);
+        let value = self.nodes[carrier_slot].as_ref().map(|n| &n.value)?;
+        Some((carrier_key, value))
+    }
+
+    /// Planetary convenience wrapper around [`Self::find_carrier`] that also
+    /// computes the unguttered power-of-two UV sub-rectangle via
+    /// [`TileKey::sub_rect_in_ancestor`].
+    pub fn carrier(&mut self, key: &TileKey) -> Option<(TileKey, [f32; 4], &V)> {
+        let (carrier_key, carrier_slot) = self.find_carrier_slot(key)?;
         let uv_rect = key.sub_rect_in_ancestor(&carrier_key)?;
-        self.touch_with_ancestors(&carrier_key);
-        let value = self.peek(&carrier_key)?;
+        self.touch_carrier_and_ancestors(carrier_key, carrier_slot);
+        let value = self.nodes[carrier_slot].as_ref().map(|n| &n.value)?;
         Some((carrier_key, uv_rect, value))
     }
 }
@@ -295,6 +320,7 @@ mod tests {
             band: BandKey::Display,
             scheme,
             format: PixelFormat::Rgba8UnormSrgb,
+            gutter: 0,
             decode_rev: 0,
             level,
             x,
@@ -344,6 +370,14 @@ mod tests {
         // Zero-budget cache rejects even 0-byte inserts cleanly.
         let mut zero_cache: TileCache<TileKey, u32> = TileCache::new(0);
         assert_eq!(zero_cache.insert(k1, 1, 0), Err((k1, 1)));
+
+        // usize::MAX budget evicts cleanly without overflowing `total_bytes + byte_size`.
+        let mut max_cache: TileCache<TileKey, u32> = TileCache::new(usize::MAX);
+        let half_plus = (usize::MAX / 2) + 1;
+        assert!(max_cache.insert(k1, 1, half_plus).expect("k1").is_empty());
+        let ev = max_cache.insert(k2, 2, half_plus).expect("k2");
+        assert_eq!(ev, vec![(k1, 1)]);
+        assert_eq!(max_cache.total_bytes(), half_plus);
     }
 
     #[test]
@@ -421,6 +455,23 @@ mod tests {
         assert_eq!(p_evicted, vec![(p_decoy, "p_decoy")]);
         assert!(pyr_cache.contains(&p_root));
         assert!(pyr_cache.contains(&p_mid));
+
+        // Guttered RasterPyramid tiles resolve via `find_carrier`, while
+        // unguttered planetary `carrier()` refuses them.
+        let g_root = TileKey {
+            gutter: 1,
+            ..p_root
+        };
+        let g_leaf = TileKey {
+            gutter: 1,
+            ..p_leaf
+        };
+        let mut g_cache = TileCache::new(200);
+        g_cache.insert(g_root, "g_root", 100).expect("g_root");
+        assert!(g_cache.carrier(&g_leaf).is_none());
+        let (found_key, found_val) = g_cache.find_carrier(&g_leaf).expect("guttered carrier");
+        assert_eq!(found_key, g_root);
+        assert_eq!(*found_val, "g_root");
     }
 
     #[test]

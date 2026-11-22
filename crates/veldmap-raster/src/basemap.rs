@@ -10,6 +10,7 @@
 //! - `TileScheme::WebMercator` (`z = 0..=3`, mip-filtered per row to avoid
 //!   coarse-level aliasing)
 
+use std::fmt;
 use std::sync::OnceLock;
 
 use veldmap_core::tile::{PixelFormat, QuadTileId, TileScheme, polar_cap_point};
@@ -51,27 +52,59 @@ fn srgb_to_linear_lut() -> &'static [f32; 256] {
     })
 }
 
-#[inline]
-fn linear_to_srgb_u8(linear: f32) -> u8 {
-    let x = linear.clamp(0.0, 1.0);
-    let s = if x <= 0.003_130_8 {
-        x * 12.92
-    } else {
-        1.055 * x.powf(1.0 / 2.4) - 0.055
-    };
-    (s * 255.0).round().clamp(0.0, 255.0) as u8
+/// Size of the linear-to-sRGB lookup table (`8 KiB`, fits in L1 cache and
+/// round-trips all 256 sRGB code values without `powf` in inner pixel loops).
+const LINEAR_TO_SRGB_LUT_LEN: usize = 8192;
+
+fn linear_to_srgb_lut() -> &'static [u8; LINEAR_TO_SRGB_LUT_LEN] {
+    static LUT: OnceLock<[u8; LINEAR_TO_SRGB_LUT_LEN]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0u8; LINEAR_TO_SRGB_LUT_LEN];
+        let denom = (LINEAR_TO_SRGB_LUT_LEN - 1) as f32;
+        for (i, slot) in table.iter_mut().enumerate() {
+            let x = (i as f32) / denom;
+            let s = if x <= 0.003_130_8 {
+                x * 12.92
+            } else {
+                1.055 * x.powf(1.0 / 2.4) - 0.055
+            };
+            *slot = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        table
+    })
 }
 
-#[derive(Clone, Debug)]
+#[inline]
+fn linear_to_srgb_u8(linear: f32, lut: &[u8; LINEAR_TO_SRGB_LUT_LEN]) -> u8 {
+    let x = linear.clamp(0.0, 1.0);
+    if x <= 0.003_130_8 {
+        (x * (12.92 * 255.0)).round() as u8
+    } else {
+        let idx = ((x * ((LINEAR_TO_SRGB_LUT_LEN - 1) as f32)) + 0.5) as usize;
+        lut[idx.min(LINEAR_TO_SRGB_LUT_LEN - 1)]
+    }
+}
+
 struct RgbLevel {
     width: u32,
     height: u32,
     rgb: Box<[u8]>,
 }
 
+impl fmt::Debug for RgbLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RgbLevel")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("byte_size", &self.rgb.len())
+            .finish()
+    }
+}
+
 impl RgbLevel {
     fn downsample_2x(&self) -> Self {
-        let lut = srgb_to_linear_lut();
+        let to_lin = srgb_to_linear_lut();
+        let to_srgb = linear_to_srgb_lut();
         let src_w = self.width as usize;
         let src_h = self.height as usize;
         let dst_w = (src_w / 2).max(1);
@@ -91,11 +124,11 @@ impl RgbLevel {
                 let dst = (y * dst_w + x) * 3;
                 for ch in 0..3 {
                     let avg = 0.25
-                        * (lut[usize::from(self.rgb[o00 + ch])]
-                            + lut[usize::from(self.rgb[o10 + ch])]
-                            + lut[usize::from(self.rgb[o01 + ch])]
-                            + lut[usize::from(self.rgb[o11 + ch])]);
-                    out[dst + ch] = linear_to_srgb_u8(avg);
+                        * (to_lin[usize::from(self.rgb[o00 + ch])]
+                            + to_lin[usize::from(self.rgb[o10 + ch])]
+                            + to_lin[usize::from(self.rgb[o01 + ch])]
+                            + to_lin[usize::from(self.rgb[o11 + ch])]);
+                    out[dst + ch] = linear_to_srgb_u8(avg, to_srgb);
                 }
             }
         }
@@ -108,8 +141,13 @@ impl RgbLevel {
     }
 
     #[inline]
-    fn sample_bilinear_srgb(&self, lat_deg: f64, lon_deg: f64) -> [u8; 4] {
-        let lut = srgb_to_linear_lut();
+    fn sample_bilinear_srgb_with_luts(
+        &self,
+        lat_deg: f64,
+        lon_deg: f64,
+        to_lin: &[f32; 256],
+        to_srgb: &[u8; LINEAR_TO_SRGB_LUT_LEN],
+    ) -> [u8; 4] {
         let w = self.width as usize;
         let h = self.height as usize;
 
@@ -141,11 +179,11 @@ impl RgbLevel {
 
         let mut out = [255u8; 4];
         for ch in 0..3 {
-            let lin = lut[usize::from(self.rgb[o00 + ch])] * w00
-                + lut[usize::from(self.rgb[o10 + ch])] * w10
-                + lut[usize::from(self.rgb[o01 + ch])] * w01
-                + lut[usize::from(self.rgb[o11 + ch])] * w11;
-            out[ch] = linear_to_srgb_u8(lin);
+            let lin = to_lin[usize::from(self.rgb[o00 + ch])] * w00
+                + to_lin[usize::from(self.rgb[o10 + ch])] * w10
+                + to_lin[usize::from(self.rgb[o01 + ch])] * w01
+                + to_lin[usize::from(self.rgb[o11 + ch])] * w11;
+            out[ch] = linear_to_srgb_u8(lin, to_srgb);
         }
         out
     }
@@ -153,9 +191,17 @@ impl RgbLevel {
 
 /// Decoded equirectangular source image with a compact `Rgb8` linear-light mip
 /// pyramid backing virtual offline basemap tiles.
-#[derive(Clone, Debug)]
 pub struct BundledBasemap {
     levels: Vec<RgbLevel>,
+}
+
+impl fmt::Debug for BundledBasemap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BundledBasemap")
+            .field("dimensions", &self.dimensions())
+            .field("mip_levels", &self.levels.len())
+            .finish()
+    }
 }
 
 impl BundledBasemap {
@@ -169,8 +215,9 @@ impl BundledBasemap {
     }
 
     /// Construct directly from raw `Rgba8UnormSrgb` pixels (extracting RGB;
-    /// useful in synthetic tests).
-    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self, RasterError> {
+    /// used in synthetic unit tests).
+    #[cfg(test)]
+    fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self, RasterError> {
         let px_count = (width as usize)
             .checked_mul(height as usize)
             .ok_or(RasterError::InvalidDimensions { width, height })?;
@@ -194,7 +241,13 @@ impl BundledBasemap {
             let Some(prev) = levels.last() else {
                 break;
             };
-            if prev.width <= 64 || prev.height <= 32 {
+            // Stop before halving odd dimensions so a mip level never silently
+            // truncates the last column/row and shifts geographic alignment.
+            if prev.width <= 64
+                || prev.height <= 32
+                || !prev.width.is_multiple_of(2)
+                || !prev.height.is_multiple_of(2)
+            {
                 break;
             }
             levels.push(prev.downsample_2x());
@@ -274,6 +327,9 @@ impl BundledBasemap {
         let cols_f = f64::from(cols);
         let rows_f = f64::from(rows);
 
+        let to_lin = srgb_to_linear_lut();
+        let to_srgb = linear_to_srgb_lut();
+
         match id.scheme {
             TileScheme::Geodetic => {
                 let scale_x = base_w_f / (cols_f * tile_f);
@@ -288,7 +344,9 @@ impl BundledBasemap {
                         let s = (px as f64 + 0.5) / tile_f;
                         let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
                         let off = row_off + px * 4;
-                        data[off..off + 4].copy_from_slice(&mip.sample_bilinear_srgb(lat, lon));
+                        data[off..off + 4].copy_from_slice(
+                            &mip.sample_bilinear_srgb_with_luts(lat, lon, to_lin, to_srgb),
+                        );
                     }
                 }
             }
@@ -313,7 +371,9 @@ impl BundledBasemap {
                         let s = (px as f64 + 0.5) / tile_f;
                         let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
                         let off = row_off + px * 4;
-                        data[off..off + 4].copy_from_slice(&mip.sample_bilinear_srgb(lat, lon));
+                        data[off..off + 4].copy_from_slice(
+                            &mip.sample_bilinear_srgb_with_luts(lat, lon, to_lin, to_srgb),
+                        );
                     }
                 }
             }
@@ -328,7 +388,9 @@ impl BundledBasemap {
                         let u = -1.0 + 2.0 * (f64::from(id.x) + s) / cols_f;
                         let (lat, lon, _, _) = polar_cap_point(north, u, v);
                         let off = row_off + px * 4;
-                        data[off..off + 4].copy_from_slice(&mip.sample_bilinear_srgb(lat, lon));
+                        data[off..off + 4].copy_from_slice(
+                            &mip.sample_bilinear_srgb_with_luts(lat, lon, to_lin, to_srgb),
+                        );
                     }
                 }
             }
@@ -553,22 +615,30 @@ mod tests {
         assert_eq!(basemap.dimensions(), (3600, 1800));
         assert!(basemap.levels.len() >= 4, "expected base + 3 mip levels");
 
+        let to_lin = srgb_to_linear_lut();
+        let to_srgb = linear_to_srgb_lut();
+        // Verify exact sRGB -> linear -> sRGB LUT round-trip across all 256 values.
+        for v in 0..=255u8 {
+            assert_eq!(linear_to_srgb_u8(to_lin[usize::from(v)], to_srgb), v);
+        }
+
         // South pole (Antarctica) must be bright white/ice.
-        let sp = basemap.levels[0].sample_bilinear_srgb(-89.0, 0.0);
+        let sp = basemap.levels[0].sample_bilinear_srgb_with_luts(-89.0, 0.0, to_lin, to_srgb);
         assert!(
             sp[0] > 200 && sp[1] > 200 && sp[2] > 200,
             "south pole={sp:?}"
         );
 
         // Sahara desert (23 N, 13 E) must be bright tan (R > G > B).
-        let sahara = basemap.levels[0].sample_bilinear_srgb(23.0, 13.0);
+        let sahara = basemap.levels[0].sample_bilinear_srgb_with_luts(23.0, 13.0, to_lin, to_srgb);
         assert!(
             sahara[0] > 150 && sahara[0] > sahara[2].saturating_add(40),
             "sahara={sahara:?}"
         );
 
         // Central Pacific (0 N, -150 E) must be deep ocean blue (B > R).
-        let pacific = basemap.levels[0].sample_bilinear_srgb(0.0, -150.0);
+        let pacific =
+            basemap.levels[0].sample_bilinear_srgb_with_luts(0.0, -150.0, to_lin, to_srgb);
         assert!(
             pacific[2] > pacific[0].saturating_add(20) && pacific[0] < 40,
             "pacific={pacific:?}"

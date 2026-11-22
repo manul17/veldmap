@@ -5,9 +5,10 @@
 //! bundled equirectangular basemap provider (`z = 0..3` Geodetic + `z = 0`
 //! Polar Stereographic caps).
 
+use std::fmt;
 use std::io::Cursor;
 
-use image::{ImageFormat, ImageReader, Limits};
+use image::{ColorType, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 use thiserror::Error;
 use veldmap_core::tile::{PixelFormat, TileScheme};
 
@@ -56,12 +57,23 @@ pub enum RasterError {
 }
 
 /// CPU-decoded tile pixels ready for GPU texture upload.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DecodedTile {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
     pub data: Vec<u8>,
+}
+
+impl fmt::Debug for DecodedTile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodedTile")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("format", &self.format)
+            .field("byte_size", &self.data.len())
+            .finish()
+    }
 }
 
 impl DecodedTile {
@@ -77,56 +89,110 @@ pub fn decode_map_tile(bytes: &[u8]) -> Result<DecodedTile, RasterError> {
     decode_rgba8_limited(bytes, MAX_MAP_TILE_DIM, MAX_MAP_TILE_ALLOC_BYTES)
 }
 
-fn inspect_and_check_limits(
+fn make_limits(max_dim: u32, max_alloc_bytes: u64) -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(max_dim);
+    limits.max_image_height = Some(max_dim);
+    limits.max_alloc = Some(max_alloc_bytes);
+    limits
+}
+
+fn map_image_err(
+    err: image::ImageError,
+    width: u32,
+    height: u32,
+    estimated_bytes: u64,
+    limit_bytes: u64,
+) -> RasterError {
+    match err {
+        image::ImageError::Limits(_) => RasterError::LimitExceeded {
+            width,
+            height,
+            estimated_bytes,
+            limit_bytes,
+        },
+        other => RasterError::Decode(other),
+    }
+}
+
+fn decode_limited_for_target(
     bytes: &[u8],
     max_dim: u32,
     max_alloc_bytes: u64,
-    output_bpp: u64,
-) -> Result<(u32, u32, u64), RasterError> {
-    let reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|_| RasterError::UnsupportedFormat)?;
-
-    match reader.format() {
-        Some(ImageFormat::Png | ImageFormat::Jpeg) => {}
-        _ => return Err(RasterError::UnsupportedFormat),
-    }
-
-    let (width, height) = reader.into_dimensions()?;
-    if width == 0 || height == 0 {
-        return Err(RasterError::InvalidDimensions { width, height });
-    }
-    let output_bytes = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|px| px.checked_mul(output_bpp))
-        .ok_or(RasterError::InvalidDimensions { width, height })?;
-    if width > max_dim || height > max_dim || output_bytes > max_alloc_bytes {
-        return Err(RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes: output_bytes,
-            limit_bytes: max_alloc_bytes,
-        });
-    }
-    Ok((width, height, output_bytes))
-}
-
-fn decode_image_limited(
-    bytes: &[u8],
-    max_dim: u32,
-    decoder_alloc_limit: u64,
-) -> Result<image::DynamicImage, RasterError> {
+    target: ColorType,
+) -> Result<DynamicImage, RasterError> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| RasterError::UnsupportedFormat)?;
 
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(max_dim);
-    limits.max_image_height = Some(max_dim);
-    limits.max_alloc = Some(decoder_alloc_limit);
-    reader.limits(limits);
+    let format = match reader.format() {
+        Some(f @ (ImageFormat::Png | ImageFormat::Jpeg)) => f,
+        _ => return Err(RasterError::UnsupportedFormat),
+    };
 
-    Ok(reader.decode()?)
+    // Apply dimension and allocation limits BEFORE `into_decoder()` so codecs
+    // (notably `png::Reader`, whose `set_limits` does not lower internal buffer
+    // budgets in `image 0.25`) enforce `max_dim` and `max_alloc_bytes` while
+    // parsing headers and metadata chunks.
+    reader.limits(make_limits(max_dim, max_alloc_bytes));
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|err| map_image_err(err, 0, 0, 0, max_alloc_bytes))?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return Err(RasterError::InvalidDimensions { width, height });
+    }
+
+    let src_color = decoder.color_type();
+    let src_bpp = u64::from(src_color.bytes_per_pixel());
+    let dst_bpp = u64::from(target.bytes_per_pixel());
+    let px_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(RasterError::InvalidDimensions { width, height })?;
+    let src_bytes = px_count
+        .checked_mul(src_bpp)
+        .ok_or(RasterError::InvalidDimensions { width, height })?;
+    let dst_bytes = px_count
+        .checked_mul(dst_bpp)
+        .ok_or(RasterError::InvalidDimensions { width, height })?;
+
+    // When `src_color == target`, `.into_rgba8()` / `.into_rgb8()` moves the
+    // decoded buffer in place; otherwise reserve both buffers simultaneously.
+    let conversion_bytes = if src_color == target { 0 } else { dst_bytes };
+    let estimated_peak = src_bytes.saturating_add(conversion_bytes);
+    if width > max_dim || height > max_dim || estimated_peak > max_alloc_bytes {
+        return Err(RasterError::LimitExceeded {
+            width,
+            height,
+            estimated_bytes: estimated_peak,
+            limit_bytes: max_alloc_bytes,
+        });
+    }
+
+    let final_decoder = if conversion_bytes == 0 {
+        decoder
+    } else {
+        let tight_limits = make_limits(max_dim, max_alloc_bytes - conversion_bytes);
+        if format == ImageFormat::Png {
+            // Drop the first decoder BEFORE creating the tighter one so two
+            // `PngDecoder` instances never overlap in memory, while ensuring
+            // `png::Reader`'s internal budget honors `max_alloc - conversion`.
+            drop(decoder);
+            let mut tight_reader = ImageReader::with_format(Cursor::new(bytes), format);
+            tight_reader.limits(tight_limits);
+            tight_reader
+                .into_decoder()
+                .map_err(|err| map_image_err(err, width, height, estimated_peak, max_alloc_bytes))?
+        } else {
+            decoder.set_limits(tight_limits).map_err(|err| {
+                map_image_err(err, width, height, estimated_peak, max_alloc_bytes)
+            })?;
+            decoder
+        }
+    };
+
+    DynamicImage::from_decoder(final_decoder)
+        .map_err(|err| map_image_err(err, width, height, estimated_peak, max_alloc_bytes))
 }
 
 /// Decode a PNG or JPEG image into tightly packed `Rgba8UnormSrgb` pixels
@@ -137,20 +203,8 @@ pub(crate) fn decode_rgba8_limited(
     max_dim: u32,
     max_alloc_bytes: u64,
 ) -> Result<DecodedTile, RasterError> {
-    let (width, height, rgba_bytes) = inspect_and_check_limits(bytes, max_dim, max_alloc_bytes, 4)?;
-    // Reserve space for `.into_rgba8()` conversion when the source is non-RGBA
-    // (e.g. RGB8 JPEG), while still allowing an in-place RGBA8 PNG decode.
-    let rgb_overhead = (rgba_bytes * 3) / 4;
-    if rgba_bytes.saturating_add(rgb_overhead) > max_alloc_bytes {
-        return Err(RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes: rgba_bytes.saturating_add(rgb_overhead),
-            limit_bytes: max_alloc_bytes,
-        });
-    }
-    let decoder_limit = max_alloc_bytes.saturating_sub(rgba_bytes).max(rgba_bytes);
-    let img = decode_image_limited(bytes, max_dim, decoder_limit)?.into_rgba8();
+    let img =
+        decode_limited_for_target(bytes, max_dim, max_alloc_bytes, ColorType::Rgba8)?.into_rgba8();
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return Err(RasterError::InvalidDimensions {
@@ -167,15 +221,15 @@ pub(crate) fn decode_rgba8_limited(
 }
 
 /// Decode an opaque PNG or JPEG image directly into tightly packed `Rgb8`
-/// bytes without an intermediate RGBA8 expansion.
+/// bytes while bounding peak memory (including any non-RGB8 conversion buffer)
+/// within `max_alloc_bytes`.
 pub(crate) fn decode_rgb8_limited(
     bytes: &[u8],
     max_dim: u32,
     max_alloc_bytes: u64,
 ) -> Result<(u32, u32, Box<[u8]>), RasterError> {
-    let (_width, _height, _rgb_bytes) =
-        inspect_and_check_limits(bytes, max_dim, max_alloc_bytes, 3)?;
-    let img = decode_image_limited(bytes, max_dim, max_alloc_bytes)?.into_rgb8();
+    let img =
+        decode_limited_for_target(bytes, max_dim, max_alloc_bytes, ColorType::Rgb8)?.into_rgb8();
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return Err(RasterError::InvalidDimensions {
@@ -249,9 +303,23 @@ mod tests {
             decode_rgba8_limited(&png_bytes, 2, MAX_MAP_TILE_ALLOC_BYTES),
             Err(RasterError::LimitExceeded { .. })
         ));
+        // 4x4 RGBA8 PNG (64 B) rejected when budget < 64 B.
         assert!(matches!(
-            decode_rgba8_limited(&png_bytes, MAX_MAP_TILE_DIM, 64),
+            decode_rgba8_limited(&png_bytes, MAX_MAP_TILE_DIM, 63),
             Err(RasterError::LimitExceeded { .. })
         ));
+        // 8x8 RGB8 JPEG (192 B src + 256 B dst = 448 B peak) rejected at 400 B.
+        assert!(matches!(
+            decode_rgba8_limited(&jpg_bytes, MAX_MAP_TILE_DIM, 400),
+            Err(RasterError::LimitExceeded { .. })
+        ));
+        // 4x4 RGBA8 PNG converted to RGB8 (64 B src + 48 B dst = 112 B peak) rejected at 100 B.
+        assert!(matches!(
+            decode_rgb8_limited(&png_bytes, MAX_MAP_TILE_DIM, 100),
+            Err(RasterError::LimitExceeded { .. })
+        ));
+        // Concise Debug formatting omits raw pixel dumps.
+        let dbg = format!("{decoded_png:?}");
+        assert!(dbg.contains("byte_size: 64"), "unexpected Debug: {dbg}");
     }
 }

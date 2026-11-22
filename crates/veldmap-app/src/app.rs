@@ -100,9 +100,6 @@ impl CallbackTrait for GlobePaintCallback {
         let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() else {
             return Vec::new();
         };
-        // Sweep any cached BindGroups whose `Weak<GpuTile>` dropped to 0 even
-        // when the viewport is minimized (`0x0`).
-        renderer.sweep_stale_bind_groups();
 
         let vp = egui::epaint::ViewportInPixels::from_points(
             &self.rect,
@@ -110,6 +107,7 @@ impl CallbackTrait for GlobePaintCallback {
             screen_descriptor.size_in_pixels,
         );
         if vp.width_px <= 0 || vp.height_px <= 0 {
+            renderer.sweep_stale_bind_groups();
             return Vec::new();
         }
 
@@ -328,27 +326,35 @@ impl VeldmapApp {
                 if self.wanted_tiles.insert(tex_key) {
                     if self.gpu_tile_cache.contains(&tex_key) {
                         already_cached_wanted += 1;
-                    } else if !self.basemap_provider.is_in_flight(&tex_key) {
+                    } else if !self.pending_uploads.contains(&tex_key)
+                        && !self.basemap_provider.is_in_flight(&tex_key)
+                    {
                         missing.push(tex_key);
                     }
                 }
             }
-            // Cancel stale queued requests first, then request coarsest missing
-            // tiles while keeping visible + in-flight + queued strictly within
-            // the < 50% VRAM appetite cap.
-            self.basemap_provider
-                .reconcile(&self.gpu_tile_cache, &self.wanted_tiles);
+            // Cancel stale queued requests and release tiles already waiting in
+            // `pending_uploads` from `in_flight` first so visible + in-flight +
+            // queued are counted once against the < 50% VRAM appetite cap.
+            self.basemap_provider.reconcile(
+                &self.gpu_tile_cache,
+                &self.pending_uploads,
+                &self.wanted_tiles,
+            );
             let committed = already_cached_wanted
                 .saturating_add(self.basemap_provider.in_flight_count())
                 .saturating_add(self.pending_uploads.len());
             let remaining_budget = appetite_cap.saturating_sub(committed);
-            missing.sort_by_key(|k| (k.scheme.coarseness_rank(k.level), k.scheme, k.y, k.x));
+            missing.sort_by_key(TileKey::coarsest_first_key);
             for tex_key in missing.into_iter().take(remaining_budget) {
                 self.basemap_provider.request(tex_key);
             }
         } else {
-            self.basemap_provider
-                .reconcile(&self.gpu_tile_cache, &self.wanted_tiles);
+            self.basemap_provider.reconcile(
+                &self.gpu_tile_cache,
+                &self.pending_uploads,
+                &self.wanted_tiles,
+            );
         }
 
         self.cached_snapshot = Some((key, Arc::clone(&snapshot)));
@@ -375,8 +381,13 @@ impl eframe::App for VeldmapApp {
         );
         if upload_report.uploaded > 0 {
             self.scene_generation = self.scene_generation.wrapping_add(1);
-            self.basemap_provider
-                .reconcile(&self.gpu_tile_cache, &self.wanted_tiles);
+        }
+        if upload_report.uploaded > 0 || upload_report.remaining > 0 {
+            self.basemap_provider.reconcile(
+                &self.gpu_tile_cache,
+                &self.pending_uploads,
+                &self.wanted_tiles,
+            );
         }
 
         // Advance active quaternion camera flights (cap dt to 50 ms so a
@@ -547,6 +558,10 @@ impl eframe::App for VeldmapApp {
                     // Floating dynamic metric scale bar.
                     let m_per_pt = self.camera.metres_per_pixel(height_pt);
                     hud::paint_scale_bar(&painter, rect, m_per_pt);
+                } else {
+                    // Release cached snapshot references when collapsed/minimized
+                    // so evicted `Arc<GpuTile>`s are not pinned indefinitely.
+                    self.cached_snapshot = None;
                 }
             });
 

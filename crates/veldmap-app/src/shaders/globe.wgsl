@@ -30,7 +30,7 @@ struct TileUniform {
     /// Ancestor UV sub-rect: `(u_offset, v_offset, u_scale, v_scale)`.
     uv_rect: vec4<f32>,
     /// Graticule anchor in `f32`:
-    /// - LatLon: `(lon_phase_deg, lat_phase_deg, anchor_lat_deg, 0.0)` where
+    /// - LatLon: `(lon_phase_deg, lat_phase_deg, 0.0, 0.0)` where
     ///   `*_phase_deg = rem_euclid(anchor_deg, grid_step_deg)` in `f64` on CPU.
     /// - PolarCap: `(anchor_dx, anchor_dy, colat_phase_deg, lon_phase_deg)`.
     grid_anchor: vec4<f32>,
@@ -154,6 +154,10 @@ fn fs_grid(in: VsOut) -> @location(0) vec4<f32> {
             dw_lon = fwidth(lon_a);
         } else {
             // Guard `atan2(0, 0)` at exact poles to prevent NaN propagation on DX12/HLSL.
+            // Coupling invariant: near the pole at fine `step`, `180 / step` can
+            // exceed `f32` fractional precision, so this branch relies on
+            // `density_fade` (`dw_lon >= 0.45`) suppressing crowded pole-adjacent
+            // meridians while `abs(tile_kind) > 1.5` handles clear-of-pole tiles.
             let sy = select(ps.y, -ps.y, is_north_cap);
             let safe_x = select(ps.x, 1.0, rho < 1e-12);
             let safe_sy = select(sy, 0.0, rho < 1e-12);

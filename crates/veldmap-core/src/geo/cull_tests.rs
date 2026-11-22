@@ -184,3 +184,11 @@ fn reverse_z_near_plane_culls_balls_behind_near_and_admits_straddling_balls() {
         "ball straddling near plane must be admitted"
     );
 }
+
+#[test]
+fn degenerate_zero_eye_produces_no_nan_in_horizon_plane() {
+    let (view_proj, _) = view_proj_from(0.0, 0.0, 1000.0, 1.5);
+    let frame = Frame::new(&view_proj, DVec3::ZERO);
+    assert!(frame.towards.is_finite());
+    assert!(!frame.horizon_margin(at(0.0, 0.0, 0.0)).is_nan());
+}

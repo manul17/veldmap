@@ -94,13 +94,18 @@ impl Frame {
         let a_eye = DVec3::new(eye.x, eye.y, eye.z / (polar * polar));
         let len = a_eye.length();
         let a_sq = geodesy::SEMI_MAJOR_M * geodesy::SEMI_MAJOR_M;
+        let (towards, horizon) = if len > 0.0 && len.is_finite() {
+            (a_eye / len, a_sq / len)
+        } else {
+            (DVec3::ZERO, f64::NEG_INFINITY)
+        };
         Self {
             inward,
             eye,
             forward,
             near,
-            towards: a_eye / len,
-            horizon: a_sq / len,
+            towards,
+            horizon,
         }
     }
 

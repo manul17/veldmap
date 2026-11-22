@@ -38,6 +38,14 @@ fn shared_headless_device() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
     DEVICE.get_or_init(request_headless_device).as_ref()
 }
 
+fn shared_bundled_basemap() -> &'static BundledBasemap {
+    static BASEMAP: OnceLock<BundledBasemap> = OnceLock::new();
+    BASEMAP.get_or_init(|| {
+        BundledBasemap::from_encoded_bytes(BUNDLED_BASEMAP_JPEG)
+            .expect("decode bundled NASA Blue Marble")
+    })
+}
+
 const NATIVE_PRIMARY_BACKENDS: wgpu::Backends =
     wgpu::Backends::PRIMARY.difference(wgpu::Backends::BROWSER_WEBGPU);
 
@@ -441,8 +449,7 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         return;
     };
 
-    let basemap = BundledBasemap::from_encoded_bytes(BUNDLED_BASEMAP_JPEG)
-        .expect("decode bundled NASA Blue Marble");
+    let basemap = shared_bundled_basemap();
     let cfg = QuadtreeConfig::bundled_geodetic();
 
     let (tx, rx) = mpsc::channel();
@@ -563,8 +570,7 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
         return;
     };
 
-    let basemap = BundledBasemap::from_encoded_bytes(BUNDLED_BASEMAP_JPEG)
-        .expect("decode bundled NASA Blue Marble");
+    let basemap = shared_bundled_basemap();
     let cfg = QuadtreeConfig::bundled_geodetic();
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
     let mut cache = GpuTileCache::new(32 * 1024 * 1024);
@@ -796,8 +802,11 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         }
     }
 
-    // 4. PolarCap close-up (2 m) procedural graticule precision at (86 N, 0 E).
+    // 4. PolarCap close-up (2 m) procedural graticule precision at (86 N, 0 E):
+    //    test both 0.25 m latitude shift (colatitude delta) and 0.25 m
+    //    longitude shift (cancellation-free Taylor meridian path).
     let dlat_25cm = 0.25 / 111_320.0;
+    let dlon_25cm_86n = 0.25 / (111_320.0 * 86.0_f64.to_radians().cos());
     let pc_on = DrawSnapshot::build(
         Camera::at(86.0, 0.0, MIN_HEIGHT_M),
         w,
@@ -809,7 +818,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         &cfg,
         None,
     );
-    let pc_shifted = DrawSnapshot::build(
+    let pc_lat_shifted = DrawSnapshot::build(
         Camera::at(86.0 + dlat_25cm, 0.0, MIN_HEIGHT_M),
         w,
         h,
@@ -820,10 +829,27 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         &cfg,
         None,
     );
+    let pc_lon_shifted = DrawSnapshot::build(
+        Camera::at(86.0, dlon_25cm_86n, MIN_HEIGHT_M),
+        w,
+        h,
+        1.0,
+        true,
+        false,
+        8,
+        &cfg,
+        None,
+    );
+    let pc_base_px = render_srgb(&mut renderer, device, queue, w, h, &pc_on);
     assert_ne!(
-        render_srgb(&mut renderer, device, queue, w, h, &pc_on),
-        render_srgb(&mut renderer, device, queue, w, h, &pc_shifted),
-        "0.25 m shift on PolarCap at (86 N, 2 m) collapsed"
+        pc_base_px,
+        render_srgb(&mut renderer, device, queue, w, h, &pc_lat_shifted),
+        "0.25 m latitude shift on PolarCap at (86 N, 2 m) collapsed"
+    );
+    assert_ne!(
+        pc_base_px,
+        render_srgb(&mut renderer, device, queue, w, h, &pc_lon_shifted),
+        "0.25 m longitude shift on PolarCap at (86 N, 2 m) collapsed"
     );
 }
 

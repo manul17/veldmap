@@ -14,8 +14,8 @@ use std::sync::{Arc, Weak};
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{
-    DEFAULT_GRID_CELLS, QuadTileId, QuadtreeConfig, TileCache, TileScheme, VisibleTile,
-    adaptive_grid_step_deg, compose_uv_rect, polar_r_cap, sample_tile_surface, tile_grid_anchor,
+    DEFAULT_GRID_CELLS, POLAR_R_CAP, QuadTileId, QuadtreeConfig, TileCache, TileScheme,
+    VisibleTile, adaptive_grid_step_deg, compose_uv_rect, sample_tile_surface, tile_grid_anchor,
     traverse,
 };
 use wgpu::util::DeviceExt;
@@ -246,8 +246,7 @@ struct OffscreenTarget {
 }
 
 /// Per-viewport GPU buffers and offscreen targets grouped cleanly so resizing
-/// never recreates `camera_buffer` and future Slice 3B multi-viewport rendering
-/// can instantiate multiple `ViewportState`s against shared pipelines/caches.
+/// never recreates `camera_buffer` or `tile_uniform_buffer`.
 struct ViewportState {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -921,7 +920,7 @@ impl GlobeRenderer {
                 .to_cols_array_2d(),
             grid_step_deg: snapshot.grid_step_deg as f32,
             grid_width_px: snapshot.grid_width_px,
-            polar_r_cap: polar_r_cap() as f32,
+            polar_r_cap: POLAR_R_CAP as f32,
             _pad0: 0.0,
         };
         queue.write_buffer(
@@ -981,10 +980,7 @@ impl GlobeRenderer {
                     // accuracy even at `2 m` altitude.
                     let lon_phase = anchor_a.rem_euclid(step_deg);
                     let lat_phase = anchor_b.rem_euclid(step_deg);
-                    (
-                        0.0_f32,
-                        [lon_phase as f32, lat_phase as f32, anchor_b as f32, 0.0],
-                    )
+                    (0.0_f32, [lon_phase as f32, lat_phase as f32, 0.0, 0.0])
                 }
             };
 
@@ -1071,7 +1067,7 @@ impl GlobeRenderer {
 
         // Pass 2: Post-overlay transparent procedural `fwidth()` graticule
         // reusing the exact same quadtree vertex/index buffers (`surface` only,
-        // skipping skirts) so future Slice 3A-1b overlays never bury it.
+        // skipping skirts) so draped raster overlays never bury it.
         if snapshot.show_graticule {
             pass.set_pipeline(&self.grid_pipeline);
             for (i, draw) in snapshot.tiles.iter().enumerate() {

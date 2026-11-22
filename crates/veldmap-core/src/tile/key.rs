@@ -154,13 +154,20 @@ impl TileScheme {
     }
 
     /// Return how many pyramid steps `finer_level` is below `coarser_level`,
-    /// or `None` if `coarser_level` is strictly finer than `finer_level`.
+    /// or `None` if `coarser_level` is strictly finer than `finer_level` or
+    /// either level exceeds `RasterPyramid::max_level`.
     pub const fn level_delta(self, finer_level: u8, coarser_level: u8) -> Option<u8> {
         match self {
             Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => {
                 finer_level.checked_sub(coarser_level)
             }
-            Self::RasterPyramid { .. } => coarser_level.checked_sub(finer_level),
+            Self::RasterPyramid { max_level } => {
+                if finer_level > max_level || coarser_level > max_level {
+                    None
+                } else {
+                    coarser_level.checked_sub(finer_level)
+                }
+            }
         }
     }
 }
@@ -172,6 +179,9 @@ pub struct TileKey {
     pub band: BandKey,
     pub scheme: TileScheme,
     pub format: PixelFormat,
+    /// Border gutter width in texels (`0` for standard tiles, `1` for DEM
+    /// relief tiles) so guttered and unguttered tiles never alias in caches.
+    pub gutter: u8,
     pub decode_rev: u32,
     pub level: u8,
     pub x: u32,
@@ -179,6 +189,16 @@ pub struct TileKey {
 }
 
 impl TileKey {
+    /// Deterministic coarsest-first ordering key for upload and request queues.
+    pub const fn coarsest_first_key(&self) -> (u8, TileScheme, u32, u32) {
+        (
+            self.scheme.coarseness_rank(self.level),
+            self.scheme,
+            self.y,
+            self.x,
+        )
+    }
+
     /// Return this tile's immediate coarser parent key, or `None` at the root.
     pub const fn parent(&self) -> Option<Self> {
         let Some((level, x, y)) = self.scheme.parent(self.level, self.x, self.y) else {
@@ -192,21 +212,24 @@ impl TileKey {
         })
     }
 
-    /// Compute the UV sub-rectangle `[u_offset, v_offset, u_scale, v_scale]`
-    /// mapping `self`'s local `[0, 1]^2` UV space into `ancestor`'s texture
-    /// space. Returns `None` if `ancestor` is not a valid ancestor of `self`
-    /// (or differs in source/band/scheme/format/decode_rev).
+    /// Compute the power-of-two UV sub-rectangle
+    /// `[u_offset, v_offset, u_scale, v_scale]` mapping `self`'s local
+    /// `[0, 1]^2` UV space into `ancestor`'s texture space.
+    ///
+    /// Intended for unguttered (`gutter == 0`) power-of-two quadtrees. Returns
+    /// `None` if `ancestor` is not a valid ancestor of `self`, differs in
+    /// source/band/scheme/format/gutter/decode_rev, or if `gutter != 0`
+    /// (guttered tiles and clipped `RasterPyramid` edge tiles should resolve
+    /// carriers via `TileCache::find_carrier` and compute UVs from the
+    /// carrier's `(width, height, valid_w, valid_h, gutter)`).
     pub fn sub_rect_in_ancestor(&self, ancestor: &Self) -> Option<[f32; 4]> {
         if self.source != ancestor.source
             || self.band != ancestor.band
             || self.scheme != ancestor.scheme
             || self.format != ancestor.format
+            || self.gutter != ancestor.gutter
+            || self.gutter != 0
             || self.decode_rev != ancestor.decode_rev
-        {
-            return None;
-        }
-        if let TileScheme::RasterPyramid { max_level } = self.scheme
-            && (self.level > max_level || ancestor.level > max_level)
         {
             return None;
         }
@@ -277,6 +300,7 @@ mod tests {
             band: BandKey::Display,
             scheme: TileScheme::Geodetic,
             format: PixelFormat::Rgba8UnormSrgb,
+            gutter: 0,
             decode_rev: 0,
             level: 2,
             x: 3,
@@ -351,6 +375,7 @@ mod tests {
             band: BandKey::Display,
             scheme: TileScheme::WebMercator,
             format: PixelFormat::Rgba8UnormSrgb,
+            gutter: 0,
             decode_rev: 0,
             level: 0,
             x: 0,
@@ -361,6 +386,10 @@ mod tests {
             ..base
         };
         assert_eq!(base.sub_rect_in_ancestor(&other_source), None);
+
+        let guttered = TileKey { gutter: 1, ..base };
+        assert_eq!(guttered.sub_rect_in_ancestor(&base), None);
+        assert_eq!(guttered.sub_rect_in_ancestor(&guttered), None);
 
         let too_deep = TileKey { level: 31, ..base };
         assert_eq!(too_deep.sub_rect_in_ancestor(&base), None);
@@ -379,9 +408,12 @@ mod tests {
         };
         assert_eq!(wrong_branch.sub_rect_in_ancestor(&other_parent), None);
 
-        // RasterPyramid rejects levels strictly above max_level.
+        // RasterPyramid rejects levels strictly above max_level in both level_delta and sub_rect.
+        let pyr = TileScheme::RasterPyramid { max_level: 3 };
+        assert_eq!(pyr.level_delta(1, 4), None);
+        assert_eq!(pyr.level_delta(4, 3), None);
         let pyr_invalid = TileKey {
-            scheme: TileScheme::RasterPyramid { max_level: 3 },
+            scheme: pyr,
             level: 4,
             x: 0,
             y: 0,
@@ -392,6 +424,15 @@ mod tests {
             ..pyr_invalid
         };
         assert_eq!(pyr_fine.sub_rect_in_ancestor(&pyr_invalid), None);
+
+        // Coarsest-first key orders z=0 before z=2 for planetary, and max_level before 0 for RasterPyramid.
+        assert!(base.coarsest_first_key() < wrong_branch.coarsest_first_key());
+        let pyr_root = TileKey {
+            scheme: pyr,
+            level: 3,
+            ..base
+        };
+        assert!(pyr_root.coarsest_first_key() < pyr_fine.coarsest_first_key());
 
         assert_eq!(
             compose_uv_rect([0.5, 0.25, 0.5, 0.5], [0.5, 0.5, 0.5, 0.25]),

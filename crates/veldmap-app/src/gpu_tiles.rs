@@ -35,9 +35,6 @@ pub const DEFAULT_UPLOAD_TIME_BUDGET: Duration = Duration::from_millis(2);
 pub type Wakeup = Arc<dyn Fn() + Send + Sync>;
 
 /// Immutable GPU-resident tile resource.
-///
-/// Owns only the GPU texture, default view, pixel format, dimensions, true
-/// byte size (including mip chain), and monotonic `tile_id: u64`.
 pub struct GpuTile {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -272,6 +269,11 @@ impl PendingUploads {
         self.queued.is_empty()
     }
 
+    /// Return whether `key` is currently decoded and waiting for GPU upload.
+    pub fn contains(&self, key: &TileKey) -> bool {
+        self.queued.contains_key(key)
+    }
+
     /// Drain the entire completion channel, prune stale tiles not in `wanted`
     /// (unless they are root coarse fallback tiles), and upload coarsest-first
     /// within `(byte_budget, time_budget)` while guaranteeing `>= 1` tile per
@@ -298,9 +300,7 @@ impl PendingUploads {
                 return false;
             }
             match wanted {
-                Some(wanted_set) => {
-                    wanted_set.contains(key) || (key.scheme.is_coarsest_zero() && key.level == 0)
-                }
+                Some(wanted_set) => wanted_set.contains(key) || is_planetary_root(key),
                 None => true,
             }
         });
@@ -311,7 +311,7 @@ impl PendingUploads {
 
         // 3. Order remaining tiles deterministically coarsest-first.
         let mut order: Vec<TileKey> = self.queued.keys().copied().collect();
-        order.sort_by_key(|k| (k.scheme.coarseness_rank(k.level), k.scheme, k.y, k.x));
+        order.sort_by_key(TileKey::coarsest_first_key);
 
         let start = Instant::now();
         let mut uploaded = 0usize;
@@ -329,8 +329,8 @@ impl PendingUploads {
             if cache.contains(&key) {
                 continue;
             }
-            bytes_uploaded = bytes_uploaded.saturating_add(decoded.byte_size());
             if let Some((_, ev_count)) = cache.upload_and_insert(device, queue, key, &decoded) {
+                bytes_uploaded = bytes_uploaded.saturating_add(decoded.byte_size());
                 evicted = evicted.saturating_add(ev_count);
                 uploaded += 1;
             }
@@ -351,6 +351,7 @@ pub const fn bundled_tile_key(id: QuadTileId) -> TileKey {
         band: BandKey::Display,
         scheme: id.scheme,
         format: PixelFormat::Rgba8UnormSrgb,
+        gutter: 0,
         decode_rev: 0,
         level: id.level,
         x: id.x,
@@ -361,6 +362,7 @@ pub const fn bundled_tile_key(id: QuadTileId) -> TileKey {
 #[derive(Default)]
 struct WorkerQueue {
     pending: Vec<TileKey>,
+    failed: HashSet<TileKey>,
     shutdown: bool,
 }
 
@@ -399,6 +401,10 @@ impl BundledBasemapProvider {
                     Ok(b) => b,
                     Err(err) => {
                         tracing::error!(error = %err, "Failed to decode bundled offline basemap");
+                        let (lock, _) = &*worker_shared;
+                        let mut state = lock_unpoisoned(lock);
+                        state.shutdown = true;
+                        state.pending.clear();
                         return;
                     }
                 };
@@ -420,9 +426,7 @@ impl BundledBasemapProvider {
                             .pending
                             .iter()
                             .enumerate()
-                            .min_by_key(|(_, k)| {
-                                (k.scheme.coarseness_rank(k.level), k.scheme, k.y, k.x)
-                            })
+                            .min_by_key(|(_, k)| k.coarsest_first_key())
                             .map(|(i, _)| i);
                         match best_idx {
                             Some(i) => state.pending.swap_remove(i),
@@ -445,6 +449,8 @@ impl BundledBasemapProvider {
                         }
                         Err(err) => {
                             tracing::debug!(?key, error = %err, "Skipping out-of-range bundled tile");
+                            let (lock, _) = &*worker_shared;
+                            lock_unpoisoned(lock).failed.insert(key);
                         }
                     }
                 }
@@ -476,31 +482,52 @@ impl BundledBasemapProvider {
         self.in_flight.contains(key)
     }
 
-    /// Enqueue `key` for background tile rendering if not already in flight.
-    /// Returns `true` if a new request was submitted.
+    /// Enqueue `key` for background tile rendering if not already in flight or
+    /// terminally failed. Returns `true` if a new request was submitted.
     pub fn request(&mut self, key: TileKey) -> bool {
-        if self.worker.is_none() || !self.in_flight.insert(key) {
+        if self.worker.is_none() || self.in_flight.contains(&key) {
             return false;
         }
         let (lock, cvar) = &*self.shared;
         let mut state = lock_unpoisoned(lock);
-        if state.shutdown {
-            self.in_flight.remove(&key);
+        if state.shutdown || state.failed.contains(&key) {
             return false;
         }
+        self.in_flight.insert(key);
         state.pending.push(key);
         cvar.notify_one();
         true
     }
 
     /// Clear in-flight markers and cancel unstarted queued requests for tiles
-    /// that have already landed in `cache` or are no longer requested.
-    pub fn reconcile(&mut self, cache: &GpuTileCache, wanted: &HashSet<TileKey>) {
-        let keep = |k: &TileKey| !cache.contains(k) && (wanted.contains(k) || is_planetary_root(k));
-        self.in_flight.retain(keep);
+    /// that have already landed in `cache` or `pending_uploads`, failed
+    /// terminally, or are no longer requested.
+    pub fn reconcile(
+        &mut self,
+        cache: &GpuTileCache,
+        pending_uploads: &PendingUploads,
+        wanted: &HashSet<TileKey>,
+    ) {
         let (lock, _) = &*self.shared;
         let mut state = lock_unpoisoned(lock);
-        state.pending.retain(keep);
+        let WorkerQueue {
+            pending,
+            failed,
+            shutdown,
+        } = &mut *state;
+        if *shutdown {
+            self.in_flight.clear();
+            pending.clear();
+            return;
+        }
+        let keep = |k: &TileKey| {
+            !cache.contains(k)
+                && !pending_uploads.contains(k)
+                && !failed.contains(k)
+                && (wanted.contains(k) || is_planetary_root(k))
+        };
+        self.in_flight.retain(keep);
+        pending.retain(keep);
     }
 
     /// Pre-seed the coarsest root tiles (`Geodetic z = 0` + North/South
@@ -541,5 +568,78 @@ impl Drop for BundledBasemapProvider {
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_clears_queued_uploads_and_terminal_failures_from_in_flight() {
+        let (tx, rx) = mpsc::channel();
+        let mut pending = PendingUploads::new(rx);
+        let cache = GpuTileCache::new(1024 * 1024);
+
+        let k_queued = bundled_tile_key(QuadTileId {
+            scheme: TileScheme::Geodetic,
+            level: 1,
+            x: 0,
+            y: 0,
+        });
+        let k_failed = bundled_tile_key(QuadTileId {
+            scheme: TileScheme::Geodetic,
+            level: 9, // above BUNDLED_MAX_LEVEL
+            x: 0,
+            y: 0,
+        });
+        let k_active = bundled_tile_key(QuadTileId {
+            scheme: TileScheme::Geodetic,
+            level: 1,
+            x: 1,
+            y: 0,
+        });
+
+        // Simulate `k_queued` sitting in `PendingUploads::queued`.
+        tx.send((
+            k_queued,
+            DecodedTile {
+                width: 1,
+                height: 1,
+                format: PixelFormat::Rgba8UnormSrgb,
+                data: vec![0, 0, 0, 255],
+            },
+        ))
+        .expect("send queued tile");
+        while let Ok((k, t)) = pending.rx.try_recv() {
+            pending.queued.insert(k, t);
+        }
+        assert!(pending.contains(&k_queued));
+
+        let shared = Arc::new((Mutex::new(WorkerQueue::default()), Condvar::new()));
+        {
+            let mut st = lock_unpoisoned(&shared.0);
+            st.pending.extend([k_queued, k_failed, k_active]);
+            st.failed.insert(k_failed);
+        }
+        let mut provider = BundledBasemapProvider {
+            shared,
+            in_flight: HashSet::from([k_queued, k_failed, k_active]),
+            worker: None,
+        };
+
+        let wanted = HashSet::from([k_queued, k_failed, k_active]);
+        provider.reconcile(&cache, &pending, &wanted);
+
+        assert!(
+            !provider.is_in_flight(&k_queued),
+            "queued tile must not stay in_flight (prevents appetite double-count)"
+        );
+        assert!(
+            !provider.is_in_flight(&k_failed),
+            "terminally failed tile must be cleared from in_flight"
+        );
+        assert!(provider.is_in_flight(&k_active));
+        assert_eq!(provider.in_flight_count(), 1);
     }
 }
