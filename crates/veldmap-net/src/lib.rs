@@ -6,6 +6,8 @@
 //! decoupled from `veldmap-storage` via [`TileBlobStore`], and stays decoupled
 //! from `veldmap-raster` codecs via [`TileDecodeExecutor`].
 
+use std::sync::Arc;
+
 use thiserror::Error;
 use veldmap_core::io::CancelToken;
 use veldmap_core::tile::{PlanetaryScheme, QuadTileId, TileKey};
@@ -13,13 +15,14 @@ use veldmap_core::tile::{PlanetaryScheme, QuadTileId, TileKey};
 mod basemap;
 mod fetcher;
 mod http;
+mod redact;
 
 pub use basemap::{
     CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, LiveBasemapSpec,
-    is_valid_iso_date,
+    is_valid_gibs_date,
 };
 pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
-pub use http::sanitize_url_for_display;
+pub use redact::sanitize_url_for_display;
 
 /// Minimal encoded-tile persistence boundary injected into
 /// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from SQLite and
@@ -36,15 +39,15 @@ pub trait TileBlobStore: Send + Sync + 'static {
 }
 
 /// Completion callback executed by a [`TileDecodeExecutor`] after decode
-/// finishes (`Ok(raw_bytes)` after forwarding the decoded tile, or `Err(msg)`
-/// if decode failed or panicked).
-pub type DecodeCompletion = Box<dyn FnOnce(Result<Vec<u8>, String>) + Send + 'static>;
+/// finishes (`Ok(())` after forwarding the decoded tile, or `Err(msg)` if
+/// decode failed or panicked).
+pub type DecodeCompletion = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
 
 /// Single encoded-tile decode request submitted from [`LiveTilePipeline`] to
 /// an injected [`TileDecodeExecutor`].
 pub struct DecodeRequest {
     pub key: TileKey,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
     pub cancel: CancelToken,
     pub on_decoded: DecodeCompletion,
 }

@@ -177,12 +177,6 @@ impl Camera {
             * turn_to(self.basis())
     }
 
-    /// Project a world-space `f64` ECEF point into clip space.
-    pub fn project(&self, aspect: f64, point: DVec3) -> DVec4 {
-        let vp = self.view_projection(aspect);
-        project(&vp, point, self.eye_ecef())
-    }
-
     /// Build a high-precision `f64` frustum + horizon culling frame.
     pub fn frustum(&self, aspect: f64) -> cull::Frame {
         let vp = self.view_projection(aspect);

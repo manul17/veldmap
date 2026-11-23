@@ -7,16 +7,17 @@
 use thiserror::Error;
 use veldmap_core::tile::PlanetaryScheme;
 
-pub mod basemap;
-pub mod decode_pool;
-pub mod map_tile;
-pub mod mipmap;
+mod basemap;
+mod decode_pool;
+mod map_tile;
+mod mipmap;
 
 pub use basemap::{BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, BundledBasemap};
-pub use decode_pool::{DecodeCompletion, DecodeJob, DecodePool, DecodePoolHandle};
-pub use map_tile::{
-    MAX_MAP_TILE_ALLOC_BYTES, MAX_MAP_TILE_DIM, decode_map_tile, decode_map_tile_with_mipmaps,
+pub use decode_pool::{
+    DEFAULT_MAX_PENDING_DECODE_BYTES, DEFAULT_MAX_PENDING_DECODE_JOBS, DecodeJob, DecodePool,
+    DecodePoolConfig, DecodePoolHandle,
 };
+pub use map_tile::{decode_map_tile, decode_map_tile_with_mipmaps};
 pub use mipmap::generate_linear_mipmaps;
 
 /// Errors returned by raster tile decoders and virtual tile providers.

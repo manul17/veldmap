@@ -1,6 +1,6 @@
 use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId};
 use veldmap_net::{
-    CustomBasemapConfig, LiveBasemapSpec, NetError, is_valid_iso_date, sanitize_url_for_display,
+    CustomBasemapConfig, LiveBasemapSpec, NetError, is_valid_gibs_date, sanitize_url_for_display,
 };
 
 #[test]
@@ -194,12 +194,12 @@ fn custom_xyz_tms_handles_subdomains_flip_y_ipv6_encoding_and_redaction() {
 
 #[test]
 fn iso_date_validation_accepts_valid_and_rejects_malformed() {
-    assert!(is_valid_iso_date("2024-07-01"));
-    assert!(is_valid_iso_date("2024-02-29"));
-    assert!(!is_valid_iso_date("2023-02-29"));
-    assert!(!is_valid_iso_date("2024-02-31"));
-    assert!(!is_valid_iso_date("2024-13-01"));
-    assert!(!is_valid_iso_date("not-a-date"));
+    assert!(is_valid_gibs_date("2024-07-01"));
+    assert!(is_valid_gibs_date("2024-02-29"));
+    assert!(!is_valid_gibs_date("2023-02-29"));
+    assert!(!is_valid_gibs_date("2024-02-31"));
+    assert!(!is_valid_gibs_date("2024-13-01"));
+    assert!(!is_valid_gibs_date("not-a-date"));
     assert!(matches!(
         LiveBasemapSpec::nasa_gibs_viirs("bad-date"),
         Err(NetError::InvalidDate(_))

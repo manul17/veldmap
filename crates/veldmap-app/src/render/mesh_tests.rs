@@ -1,4 +1,5 @@
 use glam::Vec3;
+use veldmap_core::geo::geodesy::Geodetic;
 use veldmap_core::tile::{
     DEFAULT_GRID_CELLS, PlanetaryScheme, QuadTileId, QuadtreeConfig, describe_tile,
 };
@@ -7,7 +8,7 @@ use super::*;
 
 #[test]
 fn all_planetary_and_polar_surface_triangles_have_outward_ccw_winding() {
-    let cfg = QuadtreeConfig::bundled_geodetic();
+    let cfg = QuadtreeConfig::geodetic(3);
     let shared = SharedTileIndices::build(DEFAULT_GRID_CELLS);
     let samples = [
         QuadTileId {
@@ -97,7 +98,7 @@ fn all_planetary_and_polar_surface_triangles_have_outward_ccw_winding() {
 
 #[test]
 fn per_tile_rtc_preserves_sub_millimetre_precision_at_2m_zoom() {
-    let cfg = QuadtreeConfig::bundled_geodetic();
+    let cfg = QuadtreeConfig::geodetic(3);
     // z = 16 tile containing (47.2357 N, 39.7015 E).
     let level = 16u8;
     let (cols, rows) = PlanetaryScheme::Geodetic.grid_dims(level).expect("dims");
@@ -132,7 +133,7 @@ fn per_tile_rtc_preserves_sub_millimetre_precision_at_2m_zoom() {
 
 #[test]
 fn skirts_drop_inward_by_at_least_four_times_cell_sag() {
-    let cfg = QuadtreeConfig::bundled_geodetic();
+    let cfg = QuadtreeConfig::geodetic(3);
     let tile = describe_tile(
         QuadTileId {
             scheme: PlanetaryScheme::Geodetic,

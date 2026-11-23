@@ -12,7 +12,6 @@
 
 use std::fmt;
 
-pub use veldmap_core::tile::{BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX};
 use veldmap_core::tile::{
     DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, mercator_lat_deg, polar_cap_point,
     web_mercator_y_bounds,
@@ -24,6 +23,16 @@ use crate::mipmap::{
     LINEAR_TO_SRGB_LUT_LEN, generate_linear_mipmaps, linear_to_srgb_lut, linear_to_srgb_u8,
     srgb_to_linear_lut,
 };
+
+/// Default tile size in pixels for the bundled offline global basemap.
+pub const BUNDLED_TILE_PX: u32 = 256;
+
+/// Maximum `Geodetic` / `WebMercator` zoom level served by the bundled offline
+/// basemap (`3600 x 1800` NASA Blue Marble Next Generation).
+pub const BUNDLED_MAX_LEVEL: u8 = 3;
+
+/// Maximum `PolarCap` zoom level served by the bundled offline basemap.
+pub const BUNDLED_POLAR_MAX_LEVEL: u8 = 0;
 
 /// Maximum dimension accepted for a bundled global equirectangular basemap.
 const MAX_EQUIR_DIM: u32 = 8192;
@@ -262,10 +271,7 @@ impl BundledBasemap {
         if id.level > max_level {
             return Err(out_of_range());
         }
-        let (cols, rows) = id.scheme.grid_dims(id.level).ok_or_else(out_of_range)?;
-        if id.x >= cols || id.y >= rows {
-            return Err(out_of_range());
-        }
+        let (cols, rows) = id.checked_grid_dims().ok_or_else(out_of_range)?;
 
         let tile_usize = tile_px as usize;
         let total_bytes = tile_usize

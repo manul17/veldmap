@@ -11,11 +11,11 @@ use crate::mipmap::generate_linear_mipmaps;
 
 /// Maximum single map-tile dimension accepted by [`decode_map_tile`] and
 /// [`crate::BundledBasemap::render_tile_sized`].
-pub const MAX_MAP_TILE_DIM: u32 = 2048;
+pub(crate) const MAX_MAP_TILE_DIM: u32 = 2048;
 
 /// Maximum peak allocation budget for decoding a single map tile (`36 MiB`,
 /// covering a `2048 x 2048` RGB/PNG decode plus RGBA8 conversion).
-pub const MAX_MAP_TILE_ALLOC_BYTES: u64 = 36 * 1024 * 1024;
+pub(crate) const MAX_MAP_TILE_ALLOC_BYTES: u64 = 36 * 1024 * 1024;
 
 /// Decode raw PNG or JPEG map-tile bytes into tightly packed `Rgba8UnormSrgb`
 /// pixels under explicit dimension and peak-allocation limits.

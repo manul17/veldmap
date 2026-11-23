@@ -6,13 +6,14 @@
 //! from UI layout code.
 
 use eframe::egui;
-use veldmap_net::{CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, is_valid_iso_date};
-use veldmap_storage::{MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB};
 
 use crate::basemap::BasemapStatusSnapshot;
 use crate::hud;
-use crate::settings::{AppSettings, BasemapSelection, CustomXyzSettings};
-use crate::storage::DiskCacheUiState;
+use crate::settings::{
+    AppSettings, BasemapSelection, CUSTOM_MAX_LEVEL_RANGE, CustomXyzSettings,
+    DISK_CACHE_MAX_MB_RANGE, validate_gibs_date,
+};
+use crate::storage::{DiskCacheNotice, DiskCacheStatus};
 
 /// Short human-readable label for toolbar dropdowns and settings UI.
 pub const fn basemap_label(selection: BasemapSelection) -> &'static str {
@@ -23,6 +24,17 @@ pub const fn basemap_label(selection: BasemapSelection) -> &'static str {
         BasemapSelection::EoxSentinel2Cloudless => "EOX Sentinel-2 Cloudless",
         BasemapSelection::CustomXyz => "Custom XYZ / TMS",
         BasemapSelection::EllipsoidOnly => "Ellipsoid-only",
+    }
+}
+
+fn format_disk_cache_notice(notice: &DiskCacheNotice) -> String {
+    match notice {
+        DiskCacheNotice::Cleared => "Disk cache cleared.".to_owned(),
+        DiskCacheNotice::ClearFailed(err) => format!("Clear failed: {err}"),
+        DiskCacheNotice::WorkerUnavailable => "Disk cache worker unavailable.".to_owned(),
+        DiskCacheNotice::WorkerDisconnected => {
+            "Clear failed: maintenance worker disconnected.".to_owned()
+        }
     }
 }
 
@@ -79,6 +91,7 @@ pub enum BasemapUiAction {
 #[derive(Clone, Debug)]
 pub struct BasemapUiState {
     settings_open: bool,
+    was_settings_open: bool,
     draft: BasemapSettingsDraft,
     cached_custom_validation: Option<(CustomXyzSettings, Result<(), String>)>,
 }
@@ -87,14 +100,18 @@ impl BasemapUiState {
     pub fn new(initial: &AppSettings) -> Self {
         Self {
             settings_open: false,
+            was_settings_open: false,
             draft: BasemapSettingsDraft::from_settings(initial),
             cached_custom_validation: None,
         }
     }
 
-    /// Whether the Basemap & Tile Cache Settings window is currently open.
-    pub const fn settings_open(&self) -> bool {
-        self.settings_open
+    /// Return `(is_open, just_opened)` transition state for event-driven stats
+    /// refreshes so `AppStorage` stays decoupled from UI window visibility.
+    pub fn poll_settings_window_state(&mut self) -> (bool, bool) {
+        let just_opened = self.settings_open && !self.was_settings_open;
+        self.was_settings_open = self.settings_open;
+        (self.settings_open, just_opened)
     }
 
     /// Update only the draft's `active_basemap` selection (preserving unsaved
@@ -142,6 +159,70 @@ const ALL_BASEMAPS: [BasemapSelection; 6] = [
     BasemapSelection::CustomXyz,
     BasemapSelection::EllipsoidOnly,
 ];
+
+fn show_live_status_badge(
+    ui: &mut egui::Ui,
+    current: BasemapSelection,
+    status: &BasemapStatusSnapshot,
+    actions: &mut Vec<BasemapUiAction>,
+) {
+    if !current.is_live() {
+        return;
+    }
+    let net = &status.network;
+    if let Some(init_err) = status.live_pipeline_error.as_deref() {
+        ui.label(
+            egui::RichText::new("Live unavailable")
+                .color(egui::Color32::from_rgb(240, 185, 85))
+                .small(),
+        )
+        .on_hover_text(init_err);
+    } else if let Some(cfg_err) = status.config_error.as_deref() {
+        let badge = match current {
+            BasemapSelection::NasaGibsViirs => "Invalid date",
+            BasemapSelection::CustomXyz => "Invalid URL",
+            _ => "Config error",
+        };
+        ui.label(
+            egui::RichText::new(badge)
+                .color(egui::Color32::from_rgb(235, 110, 95))
+                .small(),
+        )
+        .on_hover_text(cfg_err);
+    } else if net.offline {
+        let hover = net
+            .last_error
+            .as_deref()
+            .unwrap_or("Network unreachable; showing offline Blue Marble fallback");
+        ui.label(
+            egui::RichText::new("Offline (fallback)")
+                .color(egui::Color32::from_rgb(240, 185, 85))
+                .small(),
+        )
+        .on_hover_text(hover);
+        if ui.small_button("Retry").clicked() {
+            actions.push(BasemapUiAction::RetryLive);
+        }
+    } else if net.failed_count > 0
+        && let Some(err) = net.last_error.as_deref()
+    {
+        ui.label(
+            egui::RichText::new("Tile error")
+                .color(egui::Color32::from_rgb(235, 145, 95))
+                .small(),
+        )
+        .on_hover_text(err);
+        if ui.small_button("Retry").clicked() {
+            actions.push(BasemapUiAction::RetryLive);
+        }
+    } else if net.in_flight > 0 || net.queued > 0 {
+        ui.label(
+            egui::RichText::new(format!("Streaming ({})", net.in_flight + net.queued))
+                .weak()
+                .small(),
+        );
+    }
+}
 
 /// Render toolbar basemap selector, live streaming / error / offline pill, and
 /// Settings button, returning any user actions to apply in `VeldmapApp`.
@@ -192,64 +273,162 @@ pub fn show_toolbar_controls(
         }
     }
 
-    // Live streaming / error / offline indicator badge.
-    if current.is_live() {
-        let net = &status.network;
-        if let Some(init_err) = status.live_pipeline_error.as_deref() {
-            ui.label(
-                egui::RichText::new("Live unavailable")
-                    .color(egui::Color32::from_rgb(240, 185, 85))
-                    .small(),
+    show_live_status_badge(ui, current, status, &mut actions);
+    actions
+}
+
+fn show_gibs_section(ui: &mut egui::Ui, ui_state: &mut BasemapUiState) -> bool {
+    ui.heading("NASA GIBS Daily Imagery");
+    ui.horizontal(|ui| {
+        ui.label("VIIRS Date (UTC YYYY-MM-DD):");
+        ui.add(
+            egui::TextEdit::singleline(&mut ui_state.draft.gibs_date)
+                .desired_width(110.0)
+                .hint_text("2024-07-01"),
+        );
+    });
+    let date_valid = validate_gibs_date(&ui_state.draft.gibs_date);
+    if !date_valid {
+        ui.label(
+            egui::RichText::new("Enter a valid YYYY-MM-DD date (e.g. 2024-07-01).")
+                .color(egui::Color32::from_rgb(240, 185, 85))
+                .small(),
+        );
+    }
+    date_valid
+}
+
+fn show_custom_xyz_section(
+    ui: &mut egui::Ui,
+    settings: &AppSettings,
+    ui_state: &mut BasemapUiState,
+) -> bool {
+    ui.heading("Custom XYZ / TMS Tile Source");
+    if ui_state.draft.active_basemap == BasemapSelection::CustomXyz
+        && settings.active_basemap != BasemapSelection::CustomXyz
+    {
+        ui.label(
+            egui::RichText::new(
+                "Enter a valid URL template below, then click Apply & Save or Use Custom XYZ.",
             )
-            .on_hover_text(init_err);
-        } else if let Some(cfg_err) = status.config_error.as_deref() {
-            let badge = match current {
-                BasemapSelection::NasaGibsViirs => "Invalid date",
-                BasemapSelection::CustomXyz => "Invalid URL",
-                _ => "Config error",
-            };
-            ui.label(
-                egui::RichText::new(badge)
-                    .color(egui::Color32::from_rgb(235, 110, 95))
-                    .small(),
+            .weak()
+            .small(),
+        );
+    }
+    egui::Grid::new("custom_xyz_grid")
+        .num_columns(2)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Name:");
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.draft.custom_xyz.name)
+                    .desired_width(260.0),
+            );
+            ui.end_row();
+
+            ui.label("URL template:");
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.draft.custom_xyz.url_template)
+                    .desired_width(260.0)
+                    .hint_text("https://{s}.host/{z}/{x}/{y}.png?key={key}"),
+            );
+            ui.end_row();
+
+            ui.label("API key (optional):");
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.draft.custom_xyz.api_key)
+                    .password(true)
+                    .desired_width(260.0)
+                    .hint_text("Substituted for {key} / {api_key}"),
+            );
+            ui.end_row();
+
+            ui.label("Attribution:");
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.draft.custom_xyz.attribution)
+                    .desired_width(260.0)
+                    .hint_text("Data provider credit"),
+            );
+            ui.end_row();
+
+            ui.label("Max zoom:");
+            ui.add(egui::Slider::new(
+                &mut ui_state.draft.custom_xyz.max_level,
+                CUSTOM_MAX_LEVEL_RANGE,
+            ));
+            ui.end_row();
+        });
+
+    ui.checkbox(
+        &mut ui_state.draft.custom_xyz.tms_flip_y,
+        "TMS Y-axis flip (invert {y} from south-up)",
+    );
+
+    let custom_err = ui_state.custom_validation().err().map(str::to_owned);
+    let custom_valid = custom_err.is_none();
+    if let Some(err) = &custom_err
+        && (ui_state.draft.active_basemap == BasemapSelection::CustomXyz
+            || !ui_state.draft.custom_xyz.url_template.trim().is_empty())
+    {
+        ui.label(
+            egui::RichText::new(err)
+                .color(egui::Color32::from_rgb(235, 110, 95))
+                .small(),
+        );
+    }
+    custom_valid
+}
+
+fn show_disk_cache_section(
+    ui: &mut egui::Ui,
+    disk_status: &DiskCacheStatus,
+    disk_cache_max_mb: &mut u64,
+    actions: &mut Vec<BasemapUiAction>,
+) {
+    ui.heading("SQLite WAL Tile Disk Cache");
+    if disk_status.available {
+        if let Some(stats) = disk_status.stats {
+            let used_mb = (stats.payload_bytes as f64) / (1024.0 * 1024.0);
+            let cap_mb = (stats.max_bytes as f64) / (1024.0 * 1024.0);
+            ui.monospace(format!(
+                "Cached: {} tiles · {:.1} MiB / {:.0} MiB",
+                stats.tile_count, used_mb, cap_mb
+            ));
+        } else {
+            ui.label(egui::RichText::new("Loading cache statistics…").weak());
+        }
+    } else {
+        ui.label(egui::RichText::new("Disk cache unavailable in this session.").weak());
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Disk cap (MiB):");
+        ui.add(egui::Slider::new(disk_cache_max_mb, DISK_CACHE_MAX_MB_RANGE).logarithmic(true));
+    });
+
+    ui.horizontal(|ui| {
+        let clear_label = if disk_status.busy {
+            "Clearing…"
+        } else {
+            "Clear Disk Cache"
+        };
+        if ui
+            .add_enabled(
+                disk_status.available && !disk_status.busy,
+                egui::Button::new(clear_label),
             )
-            .on_hover_text(cfg_err);
-        } else if net.offline {
-            let hover = net
-                .last_error
-                .as_deref()
-                .unwrap_or("Network unreachable; showing offline Blue Marble fallback");
-            ui.label(
-                egui::RichText::new("Offline (fallback)")
-                    .color(egui::Color32::from_rgb(240, 185, 85))
-                    .small(),
-            )
-            .on_hover_text(hover);
-            if ui.small_button("Retry").clicked() {
-                actions.push(BasemapUiAction::RetryLive);
-            }
-        } else if net.failed_count > 0
-            && let Some(err) = net.last_error.as_deref()
+            .clicked()
         {
+            actions.push(BasemapUiAction::ClearDiskCache);
+        }
+        if let Some(notice) = &disk_status.notice {
             ui.label(
-                egui::RichText::new("Tile error")
-                    .color(egui::Color32::from_rgb(235, 145, 95))
-                    .small(),
-            )
-            .on_hover_text(err);
-            if ui.small_button("Retry").clicked() {
-                actions.push(BasemapUiAction::RetryLive);
-            }
-        } else if net.in_flight > 0 || net.queued > 0 {
-            ui.label(
-                egui::RichText::new(format!("Streaming ({})", net.in_flight + net.queued))
+                egui::RichText::new(format_disk_cache_notice(notice))
                     .weak()
                     .small(),
             );
         }
-    }
-
-    actions
+    });
 }
 
 /// Render the floating Basemap & Disk Cache Settings window when open,
@@ -257,7 +436,7 @@ pub fn show_toolbar_controls(
 pub fn show_settings_window(
     ctx: &egui::Context,
     settings: &AppSettings,
-    disk_ui: &DiskCacheUiState,
+    disk_status: &DiskCacheStatus,
     ui_state: &mut BasemapUiState,
 ) -> Vec<BasemapUiAction> {
     if !ui_state.settings_open {
@@ -272,146 +451,18 @@ pub fn show_settings_window(
         .resizable(false)
         .default_width(420.0)
         .show(ctx, |ui| {
-            ui.heading("NASA GIBS Daily Imagery");
-            ui.horizontal(|ui| {
-                ui.label("VIIRS Date (UTC YYYY-MM-DD):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut ui_state.draft.gibs_date)
-                        .desired_width(110.0)
-                        .hint_text("2024-07-01"),
-                );
-            });
-            let date_valid = is_valid_iso_date(ui_state.draft.gibs_date.trim());
-            if !date_valid {
-                ui.label(
-                    egui::RichText::new("Enter a valid YYYY-MM-DD date (e.g. 2024-07-01).")
-                        .color(egui::Color32::from_rgb(240, 185, 85))
-                        .small(),
-                );
-            }
+            let date_valid = show_gibs_section(ui, ui_state);
 
             ui.separator();
-            ui.heading("Custom XYZ / TMS Tile Source");
-            if ui_state.draft.active_basemap == BasemapSelection::CustomXyz
-                && settings.active_basemap != BasemapSelection::CustomXyz
-            {
-                ui.label(
-                    egui::RichText::new(
-                        "Enter a valid URL template below, then click Apply & Save or Use Custom XYZ.",
-                    )
-                    .weak()
-                    .small(),
-                );
-            }
-            egui::Grid::new("custom_xyz_grid")
-                .num_columns(2)
-                .spacing([8.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Name:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut ui_state.draft.custom_xyz.name)
-                            .desired_width(260.0),
-                    );
-                    ui.end_row();
+            let custom_valid = show_custom_xyz_section(ui, settings, ui_state);
 
-                    ui.label("URL template:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut ui_state.draft.custom_xyz.url_template)
-                            .desired_width(260.0)
-                            .hint_text("https://{s}.host/{z}/{x}/{y}.png?key={key}"),
-                    );
-                    ui.end_row();
-
-                    ui.label("API key (optional):");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut ui_state.draft.custom_xyz.api_key)
-                            .password(true)
-                            .desired_width(260.0)
-                            .hint_text("Substituted for {key} / {api_key}"),
-                    );
-                    ui.end_row();
-
-                    ui.label("Attribution:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut ui_state.draft.custom_xyz.attribution)
-                            .desired_width(260.0)
-                            .hint_text("Data provider credit"),
-                    );
-                    ui.end_row();
-
-                    ui.label("Max zoom:");
-                    ui.add(egui::Slider::new(
-                        &mut ui_state.draft.custom_xyz.max_level,
-                        CUSTOM_MAX_LEVEL_MIN..=CUSTOM_MAX_LEVEL_MAX,
-                    ));
-                    ui.end_row();
-                });
-
-            ui.checkbox(
-                &mut ui_state.draft.custom_xyz.tms_flip_y,
-                "TMS Y-axis flip (invert {y} from south-up)",
+            ui.separator();
+            show_disk_cache_section(
+                ui,
+                disk_status,
+                &mut ui_state.draft.disk_cache_max_mb,
+                &mut actions,
             );
-
-            let custom_err = ui_state.custom_validation().err().map(str::to_owned);
-            let custom_valid = custom_err.is_none();
-            if let Some(err) = &custom_err
-                && (ui_state.draft.active_basemap == BasemapSelection::CustomXyz
-                    || !ui_state.draft.custom_xyz.url_template.trim().is_empty())
-            {
-                ui.label(
-                    egui::RichText::new(err)
-                        .color(egui::Color32::from_rgb(235, 110, 95))
-                        .small(),
-                );
-            }
-
-            ui.separator();
-            ui.heading("SQLite WAL Tile Disk Cache");
-            if disk_ui.available {
-                if let Some(stats) = disk_ui.stats {
-                    let used_mb = (stats.payload_bytes as f64) / (1024.0 * 1024.0);
-                    let cap_mb = (stats.max_bytes as f64) / (1024.0 * 1024.0);
-                    ui.monospace(format!(
-                        "Cached: {} tiles · {:.1} MiB / {:.0} MiB",
-                        stats.tile_count, used_mb, cap_mb
-                    ));
-                } else {
-                    ui.label(egui::RichText::new("Loading cache statistics…").weak());
-                }
-            } else {
-                ui.label(egui::RichText::new("Disk cache unavailable in this session.").weak());
-            }
-
-            ui.horizontal(|ui| {
-                ui.label("Disk cap (MiB):");
-                ui.add(
-                    egui::Slider::new(
-                        &mut ui_state.draft.disk_cache_max_mb,
-                        MIN_DISK_CACHE_MAX_MB..=MAX_DISK_CACHE_MAX_MB,
-                    )
-                    .logarithmic(true),
-                );
-            });
-
-            ui.horizontal(|ui| {
-                let clear_label = if disk_ui.busy {
-                    "Clearing…"
-                } else {
-                    "Clear Disk Cache"
-                };
-                if ui
-                    .add_enabled(
-                        disk_ui.available && !disk_ui.busy,
-                        egui::Button::new(clear_label),
-                    )
-                    .clicked()
-                {
-                    actions.push(BasemapUiAction::ClearDiskCache);
-                }
-                if let Some(notice) = &disk_ui.notice {
-                    ui.label(egui::RichText::new(notice).weak().small());
-                }
-            });
 
             ui.separator();
             let can_apply = date_valid

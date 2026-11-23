@@ -14,11 +14,14 @@ pub use decoded::{
     DecodedTile, DecodedTileError, max_mip_levels, mip_chain_byte_size, mip_dimensions,
 };
 pub use geometry::{
-    BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, LatLonTileBounds, POLAR_R_CAP,
-    lat_lon_bounds, mercator_lat_deg, polar_cap_point, sample_tile_surface, web_mercator_y_bounds,
+    LatLonTileBounds, POLAR_R_CAP, lat_lon_bounds, mercator_lat_deg, polar_cap_point,
+    sample_tile_surface, web_mercator_y_bounds,
 };
 pub use key::{
     BandKey, GlobeScheme, PixelFormat, PlanetaryScheme, QuadTileId, SourceId, TileKey, TileScheme,
     compose_uv_rect, fnv1a_64,
 };
-pub use quadtree::{DEFAULT_GRID_CELLS, QuadtreeConfig, VisibleTile, describe_tile, traverse};
+pub use quadtree::{
+    DEFAULT_GRID_CELLS, DEFAULT_POLAR_MAX_TEX_LEVEL, DEFAULT_TILE_PX, QuadtreeConfig, VisibleTile,
+    describe_tile, traverse,
+};

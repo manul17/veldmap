@@ -63,6 +63,20 @@ impl Ellipsoid {
         )
     }
 
+    /// Compute both the surface (`height_m = 0.0`) ECEF point in **metres** and
+    /// the outward unit geodetic normal in a single trigonometric evaluation.
+    #[inline]
+    pub fn surface_ecef_and_normal(&self, lat_deg: f64, lon_deg: f64) -> (DVec3, DVec3) {
+        let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
+        let (sin_lon, cos_lon) = lon_deg.to_radians().sin_cos();
+        let e2 = self.eccentricity_sq();
+        let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+        let eq = curvature * cos_lat;
+        let ecef = DVec3::new(eq * cos_lon, eq * sin_lon, curvature * (1.0 - e2) * sin_lat);
+        let normal = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+        (ecef, normal)
+    }
+
     /// Convert `f64` ECEF Cartesian coordinates in **metres** back to 3D
     /// geodetic `(lat_deg, lon_deg, height_m)` using Fukushima's (2006)
     /// Halley-accelerated method.
@@ -162,6 +176,13 @@ pub fn world(point: Geodetic) -> DVec3 {
     WGS84.to_ecef(point)
 }
 
+/// Compute both the WGS84 surface ECEF position in **metres** and outward unit
+/// geodetic normal for `(lat_deg, lon_deg)` in a single `sin_cos` pass.
+#[inline]
+pub fn surface_ecef_and_normal(lat_deg: f64, lon_deg: f64) -> (DVec3, DVec3) {
+    WGS84.surface_ecef_and_normal(lat_deg, lon_deg)
+}
+
 /// Intersect a ray `(origin, direction)` (with `origin` in ECEF metres) with
 /// the WGS84 ellipsoid raised by `height_m` metres. Exact on the WGS84
 /// ellipsoid (`height_m == 0.0`); for non-zero heights uses a proportionally
@@ -235,141 +256,8 @@ pub fn between(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
     )
 }
 
-/// Minimum longitude span treated as a full circle around the globe.
-///
-/// Pixel-centered global grids may fall half a pixel short of 360 degrees
-/// (for example `-179.9875 -> 179.9875`).
-pub(crate) const FULL_CIRCLE_DEG: f64 = 359.0;
-
 /// One full turn of longitude in degrees.
 pub(crate) const TURN_DEG: f64 = 360.0;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Along {
-    Parallel,
-    Meridian,
-    Arc,
-}
-
-fn along(from: (f64, f64), to: (f64, f64)) -> Along {
-    match (from.0 == to.0, from.1 == to.1) {
-        (true, _) => Along::Parallel,
-        (_, true) => Along::Meridian,
-        _ => Along::Arc,
-    }
-}
-
-/// Signed longitude sweep along an edge, preserving full-circle bands while
-/// taking the shorter antimeridian branch for all other edges.
-pub(crate) fn sweep(from: (f64, f64), to: (f64, f64)) -> f64 {
-    if (to.1 - from.1).abs() >= FULL_CIRCLE_DEG {
-        to.1 - from.1
-    } else {
-        unwind(from.1, to.1) - from.1
-    }
-}
-
-/// Edge length in degrees of surface arc, matching how the edge is traced.
-pub(crate) fn edge_span(from: (f64, f64), to: (f64, f64)) -> f64 {
-    match along(from, to) {
-        Along::Parallel => sweep(from, to).abs() * from.0.to_radians().cos(),
-        Along::Meridian => (to.0 - from.0).abs(),
-        Along::Arc => separation(from, to),
-    }
-}
-
-/// Point along an edge at fraction `t`, following a parallel, meridian, or
-/// great-circle arc according to the endpoint geometry.
-pub(crate) fn edge_point(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
-    match along(from, to) {
-        Along::Parallel => (from.0, from.1 + sweep(from, to) * t),
-        Along::Meridian => (from.0 + (to.0 - from.0) * t, from.1),
-        Along::Arc => between(from, to, t),
-    }
-}
-
-/// Emit densified `(lat_deg, lon_deg)` points along an edge from `from`
-/// (inclusive) toward `to` (exclusive) so no segment exceeds `max_edge_deg`.
-pub(crate) fn trace_edge(
-    from: (f64, f64),
-    to: (f64, f64),
-    max_edge_deg: f64,
-    mut emit: impl FnMut((f64, f64)),
-) {
-    let steps = if max_edge_deg.is_finite() && max_edge_deg > 0.0 {
-        let most = (TURN_DEG / max_edge_deg).ceil().max(1.0);
-        let raw = (edge_span(from, to) / max_edge_deg).ceil();
-        if raw.is_finite() {
-            raw.clamp(1.0, most) as u32
-        } else {
-            1
-        }
-    } else {
-        1
-    };
-    for step in 0..steps {
-        emit(edge_point(from, to, f64::from(step) / f64::from(steps)));
-    }
-}
-
-/// Remove consecutive duplicate points (including wrap-around `last == first`)
-/// from a closed `(lat_deg, lon_deg)` ring.
-pub(crate) fn dedup_ring(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let mut out: Vec<(f64, f64)> = Vec::with_capacity(points.len());
-    for &p in points {
-        if out.last() != Some(&p) {
-            out.push(p);
-        }
-    }
-    if out.len() > 1 && out.first() == out.last() {
-        out.pop();
-    }
-    out
-}
-
-/// Identify meridian seam cuts of a closed whole-Earth band (constant-latitude
-/// parallels wrapping `>= FULL_CIRCLE_DEG` connected by zero-sweep meridians).
-/// Returns an empty vector if `places` is not a closed whole-Earth band.
-pub(crate) fn band_seam_cuts(places: &[(f64, f64)]) -> Vec<usize> {
-    if places.len() < 3 {
-        return Vec::new();
-    }
-    let sweeps: Vec<f64> = (0..places.len())
-        .map(|i| sweep(places[i], places[(i + 1) % places.len()]))
-        .collect();
-    let cuts: Vec<usize> = (0..sweeps.len())
-        .filter(|&index| sweeps[index] == 0.0)
-        .collect();
-    if cuts.is_empty() {
-        return Vec::new();
-    }
-
-    let mut carried = false;
-    for pair in 0..cuts.len() {
-        let (from, to) = (cuts[pair], cuts[(pair + 1) % cuts.len()]);
-        let run: Vec<usize> = (1..sweeps.len())
-            .map(|step| (from + step) % sweeps.len())
-            .take_while(|index| *index != to)
-            .collect();
-        let Some((&first, &last)) = run.first().zip(run.last()) else {
-            continue;
-        };
-        let (opens, closes) = (places[first], places[(last + 1) % places.len()]);
-        let lon_gap = unwind(opens.1, closes.1) - opens.1;
-        if opens.0 != closes.0 || lon_gap.abs() > (TURN_DEG - FULL_CIRCLE_DEG) {
-            return Vec::new();
-        }
-        let span: f64 = run.iter().map(|index| sweeps[*index]).sum();
-        if span.abs() >= FULL_CIRCLE_DEG {
-            carried = true;
-        } else if span == 0.0 {
-            continue;
-        } else {
-            return Vec::new();
-        }
-    }
-    if carried { cuts } else { Vec::new() }
-}
 
 /// Shift `lon_deg` by an integer multiple of 360 degrees so it lies within
 /// `[-180, +180]` of `base`.

@@ -71,7 +71,7 @@ impl TileDecodeExecutor for TestDecodeExecutor {
             )
             .expect("synthetic tile");
             if self.done_tx.send((req.key, tile)).is_ok() {
-                (req.on_decoded)(Ok(req.bytes));
+                (req.on_decoded)(Ok(()));
                 (self.wakeup)();
             }
         } else {

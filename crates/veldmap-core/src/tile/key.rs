@@ -210,12 +210,6 @@ pub enum TileScheme {
 }
 
 impl TileScheme {
-    /// Return whether `level = 0` is the coarsest level (`true` for planetary
-    /// XYZ/Geodetic/PolarCap schemes, `false` for `RasterPyramid`).
-    pub const fn is_coarsest_zero(self) -> bool {
-        !matches!(self, Self::RasterPyramid { .. })
-    }
-
     /// Narrow to [`PlanetaryScheme`], returning `None` for `RasterPyramid`.
     pub const fn as_planetary(self) -> Option<PlanetaryScheme> {
         match self {
@@ -255,14 +249,10 @@ impl TileScheme {
     /// `level -> level + 1` toward `max_level`, so ancestor lookups and LRU
     /// ancestor touches never invert.
     pub const fn parent(self, level: u8, x: u32, y: u32) -> Option<(u8, u32, u32)> {
+        if let Some(planetary) = self.as_planetary() {
+            return planetary.parent(level, x, y);
+        }
         match self {
-            Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => {
-                if level == 0 {
-                    None
-                } else {
-                    Some((level - 1, x >> 1, y >> 1))
-                }
-            }
             Self::RasterPyramid { max_level } => {
                 if level >= max_level {
                     None
@@ -270,6 +260,7 @@ impl TileScheme {
                     Some((level + 1, x >> 1, y >> 1))
                 }
             }
+            Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => None,
         }
     }
 
@@ -312,7 +303,32 @@ pub struct QuadTileId {
     pub y: u32,
 }
 
+/// Power-of-two UV sub-rectangle `[u0, v0, scale, scale]` for a tile `(x, y)`
+/// nested `dz` levels (`1 <= dz < 31`) below an ancestor.
+#[inline]
+fn sub_rect_for_shift(x: u32, y: u32, dz: u8) -> [f32; 4] {
+    let mask = (1u32 << dz) - 1;
+    let scale = 1.0_f64 / f64::from(1u32 << dz);
+    let u0 = f64::from(x & mask) * scale;
+    let v0 = f64::from(y & mask) * scale;
+    [u0 as f32, v0 as f32, scale as f32, scale as f32]
+}
+
 impl QuadTileId {
+    /// Validate `self.level`, `self.x`, and `self.y` against the planetary
+    /// grid, returning `Some((cols, rows))` iff the tile lies strictly inside
+    /// the grid bounds at `self.level`.
+    pub const fn checked_grid_dims(self) -> Option<(u32, u32)> {
+        let Some((cols, rows)) = self.scheme.grid_dims(self.level) else {
+            return None;
+        };
+        if self.x < cols && self.y < rows {
+            Some((cols, rows))
+        } else {
+            None
+        }
+    }
+
     /// Return this tile's parent clamped to at most `max_level`, together with
     /// the exact UV sub-rectangle `[u_off, v_off, u_scale, v_scale]` mapping
     /// this tile into the clamped ancestor.
@@ -332,10 +348,6 @@ impl QuadTileId {
                 [0.0, 0.0, 0.0, 0.0],
             );
         }
-        let mask = (1u32 << dz) - 1;
-        let scale = 1.0_f64 / f64::from(1u32 << dz);
-        let u0 = f64::from(self.x & mask) * scale;
-        let v0 = f64::from(self.y & mask) * scale;
         (
             Self {
                 scheme: self.scheme,
@@ -343,7 +355,7 @@ impl QuadTileId {
                 x: self.x >> dz,
                 y: self.y >> dz,
             },
-            [u0 as f32, v0 as f32, scale as f32, scale as f32],
+            sub_rect_for_shift(self.x, self.y, dz),
         )
     }
 
@@ -533,11 +545,7 @@ impl TileKey {
         if (self.x >> dz) != ancestor.x || (self.y >> dz) != ancestor.y {
             return None;
         }
-        let mask = (1u32 << dz) - 1;
-        let scale = 1.0_f64 / f64::from(1u32 << dz);
-        let u0 = f64::from(self.x & mask) * scale;
-        let v0 = f64::from(self.y & mask) * scale;
-        Some([u0 as f32, v0 as f32, scale as f32, scale as f32])
+        Some(sub_rect_for_shift(self.x, self.y, dz))
     }
 }
 

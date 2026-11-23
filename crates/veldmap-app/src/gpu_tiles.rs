@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use veldmap_core::tile::{
-    DecodedTile, PixelFormat, QuadTileId, SourceId, TileCache, TileKey, mip_chain_byte_size,
-};
+use veldmap_core::tile::{DecodedTile, PixelFormat, QuadTileId, SourceId, TileCache, TileKey};
 
 /// Default GPU tile VRAM cache cap (`256 MiB`).
 pub const DEFAULT_GPU_TILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
@@ -27,7 +25,7 @@ pub const DEFAULT_UPLOAD_TIME_BUDGET: Duration = Duration::from_millis(2);
 
 /// Default CPU byte cap on decoded tiles buffered in [`PendingUploads`]
 /// awaiting GPU upload (`64 MiB`).
-pub const DEFAULT_MAX_QUEUED_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_QUEUED_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Immutable GPU-resident tile resource.
 pub struct GpuTile {
@@ -62,23 +60,13 @@ impl std::fmt::Debug for GpuTile {
 }
 
 /// Convert domain [`PixelFormat`] to the corresponding `wgpu::TextureFormat`.
-pub fn wgpu_format(format: PixelFormat) -> wgpu::TextureFormat {
+pub(crate) fn wgpu_format(format: PixelFormat) -> wgpu::TextureFormat {
     match format {
         PixelFormat::Rgba8UnormSrgb => wgpu::TextureFormat::Rgba8UnormSrgb,
         PixelFormat::R32Float => wgpu::TextureFormat::R32Float,
         PixelFormat::R8Uint => wgpu::TextureFormat::R8Uint,
         PixelFormat::R16Uint => wgpu::TextureFormat::R16Uint,
     }
-}
-
-/// Compute true GPU texture byte size across `mip_level_count` mip levels.
-pub fn texture_byte_size(
-    width: u32,
-    height: u32,
-    format: PixelFormat,
-    mip_level_count: u32,
-) -> usize {
-    mip_chain_byte_size(width, height, format, mip_level_count.max(1))
 }
 
 /// Outcome of attempting to upload and admit a decoded tile into
@@ -109,14 +97,6 @@ impl GpuTileCache {
             cache: TileCache::new(max_bytes),
             next_tile_id: 1,
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.cache.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -162,12 +142,6 @@ impl GpuTileCache {
     pub fn proportional_pyramid_byte_cap(&self, pyramid_weight: u64, total_weight: u64) -> usize {
         self.cache
             .proportional_pyramid_byte_cap(pyramid_weight, total_weight)
-    }
-
-    /// Appetite cap in tiles for one active pyramid (`< 50%` of VRAM budget).
-    pub fn max_tiles_for_pyramid(&self, active_pyramids: usize, tile_bytes: usize) -> usize {
-        self.cache
-            .max_tiles_for_pyramid(active_pyramids, tile_bytes)
     }
 
     /// Resolve the finest cached carrier tile covering `key` without assuming
@@ -383,7 +357,7 @@ impl Default for PendingUploads {
 
 impl PendingUploads {
     /// Create a new upload queue owning its multi-producer channel bounded by
-    /// [`DEFAULT_MAX_QUEUED_UPLOAD_BYTES`].
+    /// `DEFAULT_MAX_QUEUED_UPLOAD_BYTES` (64 MiB).
     pub fn new() -> Self {
         Self::with_max_queued_bytes(DEFAULT_MAX_QUEUED_UPLOAD_BYTES)
     }
@@ -412,15 +386,6 @@ impl PendingUploads {
         self.rx = None;
         self.queued.clear();
         self.queued_bytes = 0;
-    }
-
-    /// Number of decoded tiles currently waiting to upload.
-    pub fn len(&self) -> usize {
-        self.queued.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.queued.is_empty()
     }
 
     /// Total CPU bytes currently buffered across queued decoded tiles.

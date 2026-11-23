@@ -3,7 +3,9 @@ use veldmap_core::tile::{TileScheme, traverse};
 use veldmap_storage::StoragePaths;
 
 use super::*;
-use crate::storage::{AppStorage, tests_support::TempTestRoot};
+use crate::gpu_tiles::source_tile_key;
+use crate::storage::AppStorage;
+use crate::test_support::TempTestRoot;
 
 #[test]
 fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {

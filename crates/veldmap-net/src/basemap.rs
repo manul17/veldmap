@@ -8,7 +8,9 @@ use std::fmt;
 use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey, fnv1a_64};
 
 use crate::NetError;
-use crate::http::{parse_url_authority, sanitize_url_for_display, sanitize_urls_in_text};
+use crate::redact::{
+    parse_url_authority, percent_encode_variants, sanitize_url_for_display, sanitize_urls_in_text,
+};
 
 /// Minimum allowed custom XYZ/TMS maximum zoom level.
 pub const CUSTOM_MAX_LEVEL_MIN: u8 = 1;
@@ -34,9 +36,10 @@ const EOX_S2_MAX_LEVEL: u8 = 14;
 /// Standard `{s}` subdomain pool for custom XYZ/TMS templates.
 const SUBDOMAINS: [&str; 3] = ["a", "b", "c"];
 
-/// Validate an explicit calendar-valid `YYYY-MM-DD` UTC date string for dated
-/// GIBS layers (enforcing exact month lengths and leap-year February).
-pub fn is_valid_iso_date(date: &str) -> bool {
+/// Validate an explicit calendar-valid `YYYY-MM-DD` UTC date string within the
+/// NASA GIBS epoch (`2000..=2100`, enforcing exact month lengths and leap-year
+/// February).
+pub fn is_valid_gibs_date(date: &str) -> bool {
     let b = date.as_bytes();
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
         return false;
@@ -71,21 +74,6 @@ pub fn is_valid_iso_date(date: &str) -> bool {
         _ => 0,
     };
     day <= max_day
-}
-
-fn percent_encode_variants(secret: &str) -> (String, String) {
-    let mut upper = String::with_capacity(secret.len());
-    let mut lower = String::with_capacity(secret.len());
-    for &b in secret.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            upper.push(char::from(b));
-            lower.push(char::from(b));
-        } else {
-            upper.push_str(&format!("%{b:02X}"));
-            lower.push_str(&format!("%{b:02x}"));
-        }
-    }
-    (upper, lower)
 }
 
 /// Pure networking configuration for constructing a Custom XYZ / TMS
@@ -213,7 +201,7 @@ impl LiveBasemapSpec {
     /// (`GoogleMapsCompatible_Level9`, explicit `YYYY-MM-DD` UTC date, Public Domain).
     pub fn nasa_gibs_viirs(date: &str) -> Result<Self, NetError> {
         let trimmed = date.trim();
-        if !is_valid_iso_date(trimmed) {
+        if !is_valid_gibs_date(trimmed) {
             return Err(NetError::InvalidDate(trimmed.to_owned()));
         }
         let cache_key = format!("nasa-gibs-viirs-l9-{trimmed}");
@@ -346,23 +334,12 @@ impl LiveBasemapSpec {
                 max_level: self.max_level,
             });
         }
-        let (cols, rows) = id
-            .scheme
-            .grid_dims(id.level)
-            .ok_or(NetError::TileOutOfRange {
-                scheme: id.scheme,
-                level: id.level,
-                x: id.x,
-                y: id.y,
-            })?;
-        if id.x >= cols || id.y >= rows {
-            return Err(NetError::TileOutOfRange {
-                scheme: id.scheme,
-                level: id.level,
-                x: id.x,
-                y: id.y,
-            });
-        }
+        let (cols, rows) = id.checked_grid_dims().ok_or(NetError::TileOutOfRange {
+            scheme: id.scheme,
+            level: id.level,
+            x: id.x,
+            y: id.y,
+        })?;
         Ok((cols, rows))
     }
 

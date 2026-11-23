@@ -20,6 +20,50 @@ pub(super) const SQLITE_PAGE_SIZE: i64 = 16_384;
 /// multi-process WAL startups never fail prematurely with `SQLITE_BUSY`.
 pub(super) const SQLITE_BUSY_TIMEOUT_MS: i64 = 5000;
 
+/// Schema-coupled lookup query joining `tile_meta` and `tile_blobs` on the
+/// 10-column composite tile key.
+pub(super) const SELECT_TILE_BLOB_SQL: &str = "SELECT m.tile_id, m.encoding, b.payload
+     FROM tile_meta m
+     JOIN tile_blobs b ON b.tile_id = m.tile_id
+     WHERE m.source_key = ?1
+       AND m.band_kind = ?2
+       AND m.band_id = ?3
+       AND m.scheme = ?4
+       AND m.format = ?5
+       AND m.gutter = ?6
+       AND m.decode_rev = ?7
+       AND m.level = ?8
+       AND m.x = ?9
+       AND m.y = ?10";
+
+/// Schema-coupled lookup returning `(tile_id, byte_size)` from `tile_meta`.
+pub(super) const SELECT_META_ID_BYTES_SQL: &str = "SELECT tile_id, byte_size FROM tile_meta
+     WHERE source_key = ?1
+       AND band_kind = ?2
+       AND band_id = ?3
+       AND scheme = ?4
+       AND format = ?5
+       AND gutter = ?6
+       AND decode_rev = ?7
+       AND level = ?8
+       AND x = ?9
+       AND y = ?10";
+
+/// Schema-coupled upsert into `tile_meta` matching its 10-column `UNIQUE` key.
+pub(super) const UPSERT_META_SQL: &str = "INSERT INTO tile_meta (
+         source_key, band_kind, band_id, scheme, format, gutter,
+         decode_rev, level, x, y, encoding, byte_size, last_used_ms
+     )
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+     ON CONFLICT(
+         source_key, band_kind, band_id, scheme, format, gutter,
+         decode_rev, level, x, y
+     ) DO UPDATE SET
+       encoding = excluded.encoding,
+       byte_size = excluded.byte_size,
+       last_used_ms = excluded.last_used_ms
+     RETURNING tile_id";
+
 pub(super) fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();
     os.push(suffix);

@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme};
+
 use super::evict::EVICT_BATCH_ROWS;
 use super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE};
 use super::*;
@@ -306,6 +308,10 @@ fn multi_band_format_gutter_and_encoding_never_alias() {
         cache.get_encoded(&k_dem_g1).expect("get dem"),
         Some((TileBlobEncoding::Qoi, b"dem-g1".to_vec()))
     );
+    // `get()` only returns `EncodedImage` entries and must never hand Qoi/Lz4Raw
+    // payloads to a raw-image caller.
+    assert_eq!(cache.get(&k_b04).expect("get b04 raw"), None);
+    assert_eq!(cache.get(&k_dem_g1).expect("get dem raw"), None);
     assert_eq!(cache.stats().expect("stats").tile_count, 4);
     assert_eq!(count_rows(&cache, "tile_blobs"), 4);
 }

@@ -13,26 +13,28 @@
 //!   bundled/decode threads -> shut down `tokio::Runtime`)
 
 use std::collections::HashSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use veldmap_core::io::{CancelToken, Wakeup};
 use veldmap_core::tile::{
-    BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, DecodedTile, PixelFormat,
-    PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey, max_mip_levels,
-    mip_chain_byte_size,
+    DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey,
+    max_mip_levels, mip_chain_byte_size,
 };
 use veldmap_net::{
     DecodeRequest, FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError, NetworkStatus,
     TileBlobStore, TileDecodeExecutor,
 };
-use veldmap_raster::{DecodeJob, DecodePool, DecodePoolHandle};
+use veldmap_raster::{
+    BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, DecodeJob, DecodePool,
+    DecodePoolConfig, DecodePoolHandle, decode_map_tile_with_mipmaps,
+};
 use veldmap_storage::{DiskTileKey, TileDiskCache};
 
 use crate::bundled_basemap::BundledBasemapProvider;
-use crate::gpu_tiles::{
-    GpuTileCache, PendingUploads, UploadBatchReport, bundled_tile_key, source_tile_key,
-};
+use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, bundled_tile_key};
+use crate::render::BasemapCarrierPolicy;
 use crate::settings::{AppSettings, BasemapSelection};
 
 /// Attribution string displayed for the bundled public-domain Blue Marble
@@ -90,17 +92,58 @@ impl TileBlobStore for SqliteBlobStore {
     }
 }
 
-/// Adapter bridging `veldmap-raster`'s [`DecodePoolHandle`] into `veldmap-net`'s
-/// codec-agnostic [`TileDecodeExecutor`] trait.
-struct RasterDecodeExecutor(DecodePoolHandle);
+/// Adapter bridging `veldmap-raster`'s generic [`DecodePoolHandle`] into
+/// `veldmap-net`'s codec-agnostic [`TileDecodeExecutor`] trait.
+struct RasterDecodeExecutor {
+    pool: DecodePoolHandle,
+    done_tx: Sender<(TileKey, DecodedTile)>,
+    wakeup: Wakeup,
+    shutdown: CancelToken,
+}
 
 impl TileDecodeExecutor for RasterDecodeExecutor {
     fn submit(&self, req: DecodeRequest) -> bool {
-        self.0.submit(DecodeJob {
-            key: req.key,
-            bytes: req.bytes,
+        let key = req.key;
+        let queued_bytes = req.bytes.len();
+        let cancel = req.cancel.clone();
+        let done_tx = self.done_tx.clone();
+        let wakeup = Arc::clone(&self.wakeup);
+        let shutdown = self.shutdown.clone();
+        let bytes = req.bytes;
+        let on_decoded = req.on_decoded;
+
+        self.pool.submit(DecodeJob {
+            key,
+            queued_bytes,
             cancel: req.cancel,
-            on_decoded: req.on_decoded,
+            work: Box::new(move || {
+                let decoded =
+                    catch_unwind(AssertUnwindSafe(|| decode_map_tile_with_mipmaps(&bytes)));
+                match decoded {
+                    Ok(Ok(tile)) => {
+                        if cancel.is_cancelled() || shutdown.is_cancelled() {
+                            return;
+                        }
+                        if done_tx.send((key, tile)).is_err() {
+                            return;
+                        }
+                        on_decoded(Ok(()));
+                        (wakeup)();
+                    }
+                    Ok(Err(err)) => {
+                        tracing::debug!(
+                            ?key,
+                            error = %err,
+                            "Failed to decode map tile payload"
+                        );
+                        on_decoded(Err(err.to_string()));
+                    }
+                    Err(_) => {
+                        tracing::error!(?key, "Tile decoder panicked; isolated worker continues");
+                        on_decoded(Err("tile decoder panicked".to_owned()));
+                    }
+                }
+            }),
         })
     }
 }
@@ -139,6 +182,13 @@ pub struct BasemapManager {
     wanted_all: HashSet<TileKey>,
 }
 
+impl Drop for BasemapManager {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+        self.finish_shutdown();
+    }
+}
+
 impl BasemapManager {
     /// Initialize basemap orchestration using initial `settings` and an
     /// optional shared SQLite [`TileDiskCache`] from [`crate::storage::AppStorage`].
@@ -156,13 +206,18 @@ impl BasemapManager {
             .clamp(2, 4);
         let decode_shutdown = CancelToken::new();
         let decode_pool = DecodePool::spawn(
-            decode_threads,
-            done_tx,
-            Arc::clone(&wakeup),
+            DecodePoolConfig {
+                worker_count: decode_threads,
+                ..DecodePoolConfig::default()
+            },
             decode_shutdown.clone(),
         );
-        let decode_executor: Arc<dyn TileDecodeExecutor> =
-            Arc::new(RasterDecodeExecutor(decode_pool.handle()));
+        let decode_executor: Arc<dyn TileDecodeExecutor> = Arc::new(RasterDecodeExecutor {
+            pool: decode_pool.handle(),
+            done_tx,
+            wakeup: Arc::clone(&wakeup),
+            shutdown: decode_shutdown.clone(),
+        });
         let blob_store: Option<Arc<dyn TileBlobStore>> =
             disk_cache.map(|cache| Arc::new(SqliteBlobStore(cache)) as Arc<dyn TileBlobStore>);
 
@@ -217,12 +272,20 @@ impl BasemapManager {
         }
     }
 
+    /// Pure carrier-routing policy matching the active basemap source.
+    pub fn carrier_policy(&self) -> BasemapCarrierPolicy {
+        BasemapCarrierPolicy::new(self.active_source())
+    }
+
     /// Active planetary [`QuadtreeConfig`] matched to the selected basemap.
     pub fn quadtree_config(&self) -> QuadtreeConfig {
-        match &self.active_live_spec {
+        let mut cfg = match &self.active_live_spec {
             Some(spec) => QuadtreeConfig::for_scheme(spec.scheme(), spec.max_level()),
-            None => QuadtreeConfig::bundled_geodetic(),
-        }
+            None => QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL),
+        };
+        cfg.polar_max_tex_level = BUNDLED_POLAR_MAX_LEVEL;
+        cfg.tile_px = BUNDLED_TILE_PX;
+        cfg
     }
 
     /// Visible attribution string for the active basemap (`None` for
@@ -374,25 +437,29 @@ impl BasemapManager {
         let mut cached_live_wanted = 0usize;
         let mut queued_live_wanted = 0usize;
 
+        let policy = self.carrier_policy();
+        let wanted_bundled = &mut self.wanted_bundled;
+        let bundled_provider = &self.bundled_provider;
+        let mut record_bundled_candidate = |key: TileKey| {
+            if wanted_bundled.insert(key) {
+                if gpu_cache.contains(&key) {
+                    cached_bundled_wanted += 1;
+                } else if !pending_uploads.contains(&key) && !bundled_provider.is_in_flight(&key) {
+                    missing_bundled.push(key);
+                }
+            }
+        };
+
         if let Some(spec) = &self.active_live_spec {
             let mut seen_live = HashSet::new();
 
             for tex_id in visible_tex_ids {
                 if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. }) {
                     let (polar_id, _) = tex_id.clamp_to_level(BUNDLED_POLAR_MAX_LEVEL);
-                    let key = bundled_tile_key(polar_id);
-                    if self.wanted_bundled.insert(key) {
-                        if gpu_cache.contains(&key) {
-                            cached_bundled_wanted += 1;
-                        } else if !pending_uploads.contains(&key)
-                            && !self.bundled_provider.is_in_flight(&key)
-                        {
-                            missing_bundled.push(key);
-                        }
-                    }
+                    record_bundled_candidate(policy.primary_key(polar_id));
                 } else {
                     let (clamped_live, _) = tex_id.clamp_to_level(spec.max_level());
-                    let live_key = source_tile_key(spec.source_id(), clamped_live);
+                    let live_key = spec.tile_key(clamped_live);
                     if seen_live.insert(live_key) {
                         if gpu_cache.contains(&live_key) {
                             cached_live_wanted += 1;
@@ -407,31 +474,15 @@ impl BasemapManager {
 
                     if !gpu_cache.has_carrier(&live_key) {
                         let (fb_id, _) = tex_id.clamp_to_level(BUNDLED_MAX_LEVEL.min(1));
-                        let fb_key = bundled_tile_key(fb_id);
-                        if self.wanted_bundled.insert(fb_key) {
-                            if gpu_cache.contains(&fb_key) {
-                                cached_bundled_wanted += 1;
-                            } else if !pending_uploads.contains(&fb_key)
-                                && !self.bundled_provider.is_in_flight(&fb_key)
-                            {
-                                missing_bundled.push(fb_key);
-                            }
+                        if let Some(fb_key) = policy.fallback_key(fb_id) {
+                            record_bundled_candidate(fb_key);
                         }
                     }
                 }
             }
         } else {
             for tex_id in visible_tex_ids {
-                let key = bundled_tile_key(tex_id);
-                if self.wanted_bundled.insert(key) {
-                    if gpu_cache.contains(&key) {
-                        cached_bundled_wanted += 1;
-                    } else if !pending_uploads.contains(&key)
-                        && !self.bundled_provider.is_in_flight(&key)
-                    {
-                        missing_bundled.push(key);
-                    }
-                }
+                record_bundled_candidate(bundled_tile_key(tex_id));
             }
         }
 

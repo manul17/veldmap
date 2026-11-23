@@ -4,9 +4,9 @@ use std::time::Duration;
 use veldmap_core::tile::TileScheme;
 use veldmap_storage::DiskTileKey;
 
-use super::tests_support::TempTestRoot;
 use super::*;
 use crate::settings::BasemapSelection;
+use crate::test_support::TempTestRoot;
 
 #[test]
 fn update_settings_skips_noop_writes_and_persists_changes() {
@@ -54,13 +54,10 @@ fn disk_cache_worker_handles_refresh_cap_clear_and_disconnected_recovery() {
     // Opening Settings triggers an async stats refresh.
     storage.maybe_refresh_disk_stats(true);
     let deadline = Instant::now() + Duration::from_secs(2);
-    while storage.disk_cache_ui_state().stats.is_none() && Instant::now() < deadline {
+    while storage.disk_cache_status().stats.is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
-    let stats = storage
-        .disk_cache_ui_state()
-        .stats
-        .expect("stats refreshed");
+    let stats = storage.disk_cache_status().stats.expect("stats refreshed");
     assert_eq!(stats.tile_count, 1);
     assert_eq!(stats.payload_bytes, 256);
 
@@ -71,25 +68,28 @@ fn disk_cache_worker_handles_refresh_cap_clear_and_disconnected_recovery() {
     while !storage.poll_clear_completed() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
-    let post_clear = storage.disk_cache_ui_state();
+    let post_clear = storage.disk_cache_status();
     assert!(!post_clear.busy);
-    assert_eq!(post_clear.notice.as_deref(), Some("Disk cache cleared."));
+    assert_eq!(post_clear.notice, Some(DiskCacheNotice::Cleared));
     assert_eq!(post_clear.stats.expect("post-clear stats").tile_count, 0);
     assert!(!storage.poll_clear_completed(), "clear_gen consumed once");
 
     storage.clear_disk_cache_notice();
-    assert!(storage.disk_cache_ui_state().notice.is_none());
+    assert!(storage.disk_cache_status().notice.is_none());
 
     // After closing the worker channel, `request_clear_disk_cache()` must NOT
     // permanently wedge `busy = true`.
     storage.begin_shutdown();
     storage.request_clear_disk_cache();
-    let after_closed = storage.disk_cache_ui_state();
+    let after_closed = storage.disk_cache_status();
     assert!(
         !after_closed.busy,
         "request_clear after worker disconnect must never wedge busy=true"
     );
-    assert!(after_closed.notice.is_some());
+    assert_eq!(
+        after_closed.notice,
+        Some(DiskCacheNotice::WorkerUnavailable)
+    );
 
     storage.finish_shutdown();
 }

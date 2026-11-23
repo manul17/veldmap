@@ -10,16 +10,6 @@ use super::key::{PlanetaryScheme, QuadTileId};
 /// (`tan((90° - 85.05112878°) / 2)`).
 pub const POLAR_R_CAP: f64 = 0.043_213_918_263_772_28;
 
-/// Default tile size in pixels for the bundled offline global basemap.
-pub const BUNDLED_TILE_PX: u32 = 256;
-
-/// Maximum `Geodetic` / `WebMercator` zoom level served by the bundled offline
-/// basemap.
-pub const BUNDLED_MAX_LEVEL: u8 = 3;
-
-/// Maximum `PolarCap` zoom level served by the bundled offline basemap.
-pub const BUNDLED_POLAR_MAX_LEVEL: u8 = 0;
-
 /// Latitude/longitude bounds and raw texture range for a non-polar tile.
 #[derive(Clone, Copy, Debug)]
 pub struct LatLonTileBounds {
@@ -55,10 +45,7 @@ pub fn web_mercator_y_bounds(y: u32, rows: u32) -> (f64, f64) {
 /// `None` if the tile is a `PolarCap`, out of bounds, or lies entirely inside
 /// the `|lat| >= WEB_MERCATOR_LIMIT_DEG` polar caps.
 pub fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
-    let (cols, rows) = id.scheme.grid_dims(id.level)?;
-    if id.x >= cols || id.y >= rows {
-        return None;
-    }
+    let (cols, rows) = id.checked_grid_dims()?;
     let cols_f = f64::from(cols);
     let rows_f = f64::from(rows);
     let lon_west_deg = -180.0 + 360.0 * f64::from(id.x) / cols_f;
@@ -150,10 +137,7 @@ pub fn sample_tile_surface(
             Some((lat, lon, s, v_tex, 0.0, 0.0))
         }
         PlanetaryScheme::WebMercator => {
-            let (cols, rows) = id.scheme.grid_dims(id.level)?;
-            if id.x >= cols || id.y >= rows {
-                return None;
-            }
+            let (cols, rows) = id.checked_grid_dims()?;
             let cols_f = f64::from(cols);
             let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
             let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
@@ -162,15 +146,99 @@ pub fn sample_tile_surface(
             Some((lat, lon, s, t, 0.0, 0.0))
         }
         PlanetaryScheme::PolarCap { north } => {
-            let (n, rows) = id.scheme.grid_dims(id.level)?;
-            if id.x >= n || id.y >= rows {
-                return None;
-            }
+            let (n, _) = id.checked_grid_dims()?;
             let n_f = f64::from(n);
             let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
             let v = -1.0 + 2.0 * (f64::from(id.y) + t) / n_f;
             let (lat, lon, dx, dy) = polar_cap_point(north, u, v);
             Some((lat, lon, s, t, dx, dy))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mercator_y_bounds_and_lat_conversion_cover_web_mercator_extent() {
+        let (n0, s0) = web_mercator_y_bounds(0, 1);
+        assert!((n0 - std::f64::consts::PI).abs() < 1e-12);
+        assert!((s0 + std::f64::consts::PI).abs() < 1e-12);
+        assert!((mercator_lat_deg(n0) - WEB_MERCATOR_LIMIT_DEG).abs() < 1e-6);
+        assert!((mercator_lat_deg(s0) + WEB_MERCATOR_LIMIT_DEG).abs() < 1e-6);
+        assert!(mercator_lat_deg(0.0).abs() < 1e-12);
+
+        let (n1, s1) = web_mercator_y_bounds(0, 2);
+        assert!((n1 - std::f64::consts::PI).abs() < 1e-12);
+        assert!(s1.abs() < 1e-12);
+    }
+
+    #[test]
+    fn lat_lon_bounds_handles_polar_clamping_cap_exclusion_and_out_of_range() {
+        // Level-0 Geodetic tiles clamp north/south to +/- WEB_MERCATOR_LIMIT_DEG
+        // while keeping unclamped raw latitudes for texture UV mapping.
+        let geo0 = QuadTileId {
+            scheme: PlanetaryScheme::Geodetic,
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        let b = lat_lon_bounds(geo0).expect("geodetic z=0 valid");
+        assert_eq!(b.lon_west_deg, -180.0);
+        assert_eq!(b.lon_east_deg, 0.0);
+        assert_eq!(b.raw_lat_north_deg, 90.0);
+        assert_eq!(b.raw_lat_south_deg, -90.0);
+        assert!((b.lat_north_deg - WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
+        assert!((b.lat_south_deg + WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
+
+        // At z=6 (rows=64, 2.8125 deg/row), row 0 covers [87.1875, 90] -> fully inside polar cap.
+        let inside_cap = QuadTileId {
+            scheme: PlanetaryScheme::Geodetic,
+            level: 6,
+            x: 0,
+            y: 0,
+        };
+        assert!(lat_lon_bounds(inside_cap).is_none());
+
+        // PolarCap and out-of-range tiles return None.
+        assert!(
+            lat_lon_bounds(QuadTileId {
+                scheme: PlanetaryScheme::PolarCap { north: true },
+                level: 0,
+                x: 0,
+                y: 0,
+            })
+            .is_none()
+        );
+        assert!(
+            lat_lon_bounds(QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 0,
+                x: 1,
+                y: 0,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn sample_tile_surface_clamped_geodetic_v_tex_maps_unclamped_texture_range() {
+        let geo0 = QuadTileId {
+            scheme: PlanetaryScheme::Geodetic,
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        let (lat_n, lon_w, u0, v0, _, _) =
+            sample_tile_surface(geo0, 0.0, 0.0).expect("north-west corner");
+        let (lat_s, lon_e, u1, v1, _, _) =
+            sample_tile_surface(geo0, 1.0, 1.0).expect("south-east corner");
+        assert!((lat_n - WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
+        assert!((lat_s + WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
+        assert_eq!((lon_w, lon_e, u0, u1), (-180.0, 0.0, 0.0, 1.0));
+        let expected_v0 = (90.0 - WEB_MERCATOR_LIMIT_DEG) / 180.0;
+        assert!((v0 - expected_v0).abs() < 1e-12);
+        assert!((v1 - (1.0 - expected_v0)).abs() < 1e-12);
     }
 }

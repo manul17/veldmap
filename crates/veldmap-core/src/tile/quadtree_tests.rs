@@ -6,7 +6,7 @@ use crate::tile::geometry::{POLAR_R_CAP, sample_tile_surface};
 
 #[test]
 fn decoupled_lod_subdivides_past_max_tex_level_with_zero_requests_above_cap() {
-    let cfg = QuadtreeConfig::bundled_geodetic();
+    let cfg = QuadtreeConfig::geodetic(3);
     let cam = Camera::at(47.2357, 39.7015, MIN_HEIGHT_M);
     let tiles = traverse(&cam, 1280, 800, &cfg);
 
@@ -60,7 +60,7 @@ fn decoupled_lod_subdivides_past_max_tex_level_with_zero_requests_above_cap() {
 
 #[test]
 fn adaptive_polar_cap_covers_pole_with_sub_cm_sag_at_2m_and_exact_boundary() {
-    let cfg = QuadtreeConfig::bundled_geodetic();
+    let cfg = QuadtreeConfig::geodetic(3);
     for pole in [90.0, -90.0] {
         let cam = Camera::at(pole, 0.0, MIN_HEIGHT_M);
         let tiles = traverse(&cam, 1024, 768, &cfg);
@@ -105,7 +105,7 @@ fn adaptive_polar_cap_covers_pole_with_sub_cm_sag_at_2m_and_exact_boundary() {
 
 #[test]
 fn quadtree_is_2_to_1_balanced_across_visible_neighbors_and_antimeridian() {
-    let cfg = QuadtreeConfig::bundled_geodetic();
+    let cfg = QuadtreeConfig::geodetic(3);
     for cam in [
         Camera::at(45.0, 39.0, 500_000.0),
         Camera::at(35.0, 180.0, 2_000_000.0),
@@ -140,7 +140,7 @@ fn quadtree_is_2_to_1_balanced_across_visible_neighbors_and_antimeridian() {
 #[test]
 fn hidpi_viewport_and_sse_config_control_subdivision_strictly() {
     // Use a high-altitude view where geometry SSE (not max_tex_level) governs refinement.
-    let mut cfg = QuadtreeConfig::bundled_geodetic();
+    let mut cfg = QuadtreeConfig::geodetic(3);
     cfg.max_tex_level = 0;
     let cam = Camera::at(35.0, 20.0, 1_500_000.0);
     let lod_1x = traverse(&cam, 600, 400, &cfg);
@@ -216,7 +216,7 @@ fn web_mercator_never_falsely_culls_across_globe_and_couples_polar_seam() {
 
 #[test]
 fn clamped_geodetic_polar_adjacent_skirts_cover_coarser_neighbor_sag() {
-    let cfg = QuadtreeConfig::bundled_geodetic();
+    let cfg = QuadtreeConfig::geodetic(3);
     let coarse = describe_tile(
         QuadTileId {
             scheme: PlanetaryScheme::Geodetic,

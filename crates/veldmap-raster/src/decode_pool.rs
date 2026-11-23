@@ -1,55 +1,80 @@
-//! Bounded `std::thread` CPU decode pool generating linear-light mipmaps on
-//! decoded `Rgba8UnormSrgb` tiles with panic isolation, count + byte queue
-//! capping, deduplication by `TileKey`, immediate cancellation checks, and
-//! deterministic shutdown joining.
+//! Generic bounded `std::thread` CPU decode pool with panic isolation,
+//! configurable job-count + byte queue capping, coarsest-first priority
+//! scheduling, deduplication by `TileKey`, immediate cancellation checks,
+//! outside-mutex drop hygiene, and deterministic shutdown joining.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-use veldmap_core::io::{CancelGuard, CancelToken, Wakeup, lock_unpoisoned};
-use veldmap_core::tile::{DecodedTile, TileKey};
+use veldmap_core::io::{CancelGuard, CancelToken, lock_unpoisoned};
+use veldmap_core::tile::TileKey;
 
-use crate::decode_map_tile_with_mipmaps;
+/// Default maximum queued decode jobs awaiting a CPU worker.
+pub const DEFAULT_MAX_PENDING_DECODE_JOBS: usize = 128;
 
-/// Maximum encoded tile payloads queued awaiting a CPU decode worker.
-const MAX_PENDING_DECODE_JOBS: usize = 128;
+/// Default maximum cumulative queued bytes awaiting a CPU worker (`64 MiB`).
+pub const DEFAULT_MAX_PENDING_DECODE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Maximum cumulative encoded bytes queued awaiting a CPU decode worker
-/// (`64 MiB`, matching `PendingUploads`'s decoded byte cap).
-const MAX_PENDING_DECODE_BYTES: usize = 64 * 1024 * 1024;
-
-/// Completion callback executed after decode finishes (`Ok(raw_bytes)` after
-/// the decoded tile is sent to the upload channel, or `Err(reason)` if decode
-/// failed or panicked). Owning the caller's in-flight guard inside this
-/// callback keeps in-flight tracking and cancellation active through decode.
-pub type DecodeCompletion = Box<dyn FnOnce(Result<Vec<u8>, String>) + Send + 'static>;
-
-/// Single encoded tile decode request submitted to [`DecodePoolHandle`].
-pub struct DecodeJob {
-    pub key: TileKey,
-    pub bytes: Vec<u8>,
-    pub cancel: CancelToken,
-    pub on_decoded: DecodeCompletion,
+/// Configuration for [`DecodePool::spawn`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodePoolConfig {
+    /// Number of worker threads (clamped to `1..=8`).
+    pub worker_count: usize,
+    /// Maximum number of queued jobs before finer jobs are evicted or rejected.
+    pub max_pending_jobs: usize,
+    /// Maximum cumulative `queued_bytes` across queued jobs.
+    pub max_pending_bytes: usize,
 }
 
-#[derive(Default)]
+impl Default for DecodePoolConfig {
+    fn default() -> Self {
+        Self {
+            worker_count: 4,
+            max_pending_jobs: DEFAULT_MAX_PENDING_DECODE_JOBS,
+            max_pending_bytes: DEFAULT_MAX_PENDING_DECODE_BYTES,
+        }
+    }
+}
+
+/// Single prioritized, byte-accounted CPU decode job submitted to
+/// [`DecodePoolHandle`].
+pub struct DecodeJob {
+    pub key: TileKey,
+    /// Accounted payload/working bytes charged against `max_pending_bytes`.
+    pub queued_bytes: usize,
+    pub cancel: CancelToken,
+    /// Decode closure executed on a worker thread inside `catch_unwind`.
+    pub work: Box<dyn FnOnce() + Send + 'static>,
+}
+
 struct DecodeQueue {
     jobs: Vec<DecodeJob>,
     queued_bytes: usize,
+    max_pending_jobs: usize,
+    max_pending_bytes: usize,
     closed: bool,
 }
 
 impl DecodeQueue {
+    fn new(max_pending_jobs: usize, max_pending_bytes: usize) -> Self {
+        Self {
+            jobs: Vec::new(),
+            queued_bytes: 0,
+            max_pending_jobs: max_pending_jobs.max(1),
+            max_pending_bytes,
+            closed: false,
+        }
+    }
+
     fn push_job(&mut self, job: DecodeJob) {
-        self.queued_bytes = self.queued_bytes.saturating_add(job.bytes.len());
+        self.queued_bytes = self.queued_bytes.saturating_add(job.queued_bytes);
         self.jobs.push(job);
     }
 
     fn swap_remove_job(&mut self, idx: usize) -> DecodeJob {
         let job = self.jobs.swap_remove(idx);
-        self.queued_bytes = self.queued_bytes.saturating_sub(job.bytes.len());
+        self.queued_bytes = self.queued_bytes.saturating_sub(job.queued_bytes);
         job
     }
 
@@ -71,20 +96,18 @@ impl DecodeQueue {
     }
 }
 
-/// Cloneable producer handle for submitting raw encoded tile bytes to the
-/// bounded CPU decode pool.
+/// Cloneable producer handle for submitting work to a [`DecodePool`].
 #[derive(Clone)]
 pub struct DecodePoolHandle {
     shared: Arc<(Mutex<DecodeQueue>, Condvar)>,
 }
 
 impl DecodePoolHandle {
-    /// Enqueue raw PNG/JPEG bytes for CPU decode + linear-light mipmap
-    /// generation. Prunes cancelled jobs, deduplicates by `TileKey`, and
-    /// enforces both count (`MAX_PENDING_DECODE_JOBS`) and encoded-byte
-    /// (`MAX_PENDING_DECODE_BYTES`) caps while always dropping evicted or
-    /// rejected `DecodeJob`s OUTSIDE `DecodeQueue`'s mutex to avoid lock-order
-    /// deadlocks with caller drop guards.
+    /// Enqueue a CPU decode job. Prunes cancelled jobs, deduplicates by
+    /// `TileKey`, and enforces both `max_pending_jobs` and `max_pending_bytes`
+    /// caps while always dropping evicted or rejected `DecodeJob`s OUTSIDE
+    /// `DecodeQueue`'s mutex to avoid lock-order deadlocks with caller drop
+    /// guards.
     pub fn submit(&self, job: DecodeJob) -> bool {
         if job.cancel.is_cancelled() {
             return false;
@@ -103,17 +126,18 @@ impl DecodePoolHandle {
                     to_drop.push(job);
                     false
                 } else {
-                    let incoming_bytes = job.bytes.len();
+                    let incoming_bytes = job.queued_bytes;
                     let incoming_rank = job.key.coarsest_first_key();
+                    let max_jobs = queue.max_pending_jobs;
+                    let max_bytes = queue.max_pending_bytes;
 
                     // Plan eviction victims transactionally before mutating the
                     // queue so rejecting an incoming job never destroys valid
                     // finer queued jobs (always permitting a single job into an
                     // empty queue).
                     let needs_eviction = !queue.jobs.is_empty()
-                        && (queue.jobs.len() >= MAX_PENDING_DECODE_JOBS
-                            || queue.queued_bytes.saturating_add(incoming_bytes)
-                                > MAX_PENDING_DECODE_BYTES);
+                        && (queue.jobs.len() >= max_jobs
+                            || queue.queued_bytes.saturating_add(incoming_bytes) > max_bytes);
 
                     let planned_victims = if needs_eviction {
                         let mut candidates: Vec<(usize, _, usize)> = queue
@@ -122,7 +146,7 @@ impl DecodePoolHandle {
                             .enumerate()
                             .filter_map(|(idx, j)| {
                                 let rank = j.key.coarsest_first_key();
-                                (incoming_rank < rank).then_some((idx, rank, j.bytes.len()))
+                                (incoming_rank < rank).then_some((idx, rank, j.queued_bytes))
                             })
                             .collect();
                         // Finest-first victim order (highest `coarsest_first_key` first).
@@ -133,9 +157,8 @@ impl DecodePoolHandle {
                         let mut victims = Vec::new();
                         for (idx, _, bytes) in candidates {
                             if remaining_jobs == 0
-                                || (remaining_jobs < MAX_PENDING_DECODE_JOBS
-                                    && remaining_bytes.saturating_add(incoming_bytes)
-                                        <= MAX_PENDING_DECODE_BYTES)
+                                || (remaining_jobs < max_jobs
+                                    && remaining_bytes.saturating_add(incoming_bytes) <= max_bytes)
                             {
                                 break;
                             }
@@ -145,9 +168,8 @@ impl DecodePoolHandle {
                         }
 
                         let fits = remaining_jobs == 0
-                            || (remaining_jobs < MAX_PENDING_DECODE_JOBS
-                                && remaining_bytes.saturating_add(incoming_bytes)
-                                    <= MAX_PENDING_DECODE_BYTES);
+                            || (remaining_jobs < max_jobs
+                                && remaining_bytes.saturating_add(incoming_bytes) <= max_bytes);
                         fits.then_some(victims)
                     } else {
                         Some(Vec::new())
@@ -185,16 +207,16 @@ pub struct DecodePool {
 }
 
 impl DecodePool {
-    /// Spawn `worker_count` (clamped to `1..=8`) CPU decode threads pushing
-    /// mipmapped `DecodedTile`s into `done_tx` and triggering `wakeup`.
-    pub fn spawn(
-        worker_count: usize,
-        done_tx: Sender<(TileKey, DecodedTile)>,
-        wakeup: Wakeup,
-        shutdown: CancelToken,
-    ) -> Self {
-        let count = worker_count.clamp(1, 8);
-        let shared = Arc::new((Mutex::new(DecodeQueue::default()), Condvar::new()));
+    /// Spawn a bounded CPU decode pool configured by `config`.
+    pub fn spawn(config: DecodePoolConfig, shutdown: CancelToken) -> Self {
+        let count = config.worker_count.clamp(1, 8);
+        let shared = Arc::new((
+            Mutex::new(DecodeQueue::new(
+                config.max_pending_jobs,
+                config.max_pending_bytes,
+            )),
+            Condvar::new(),
+        ));
 
         // Wake sleeping decode threads immediately when `shutdown` cancels,
         // dropping cleared jobs strictly outside `DecodeQueue`'s lock.
@@ -214,8 +236,6 @@ impl DecodePool {
         let mut workers = Vec::with_capacity(count);
         for idx in 0..count {
             let worker_shared = Arc::clone(&shared);
-            let tx = done_tx.clone();
-            let wake = Arc::clone(&wakeup);
             let stop = shutdown.clone();
 
             match thread::Builder::new()
@@ -256,37 +276,13 @@ impl DecodePool {
                             continue;
                         }
 
-                        // Panic isolation around image codecs per workspace safety invariants.
-                        let decoded = catch_unwind(AssertUnwindSafe(|| {
-                            decode_map_tile_with_mipmaps(&job.bytes)
-                        }));
-
-                        match decoded {
-                            Ok(Ok(tile)) => {
-                                if job.cancel.is_cancelled() || stop.is_cancelled() {
-                                    continue;
-                                }
-                                if tx.send((job.key, tile)).is_err() {
-                                    break;
-                                }
-                                (job.on_decoded)(Ok(job.bytes));
-                                (wake)();
-                            }
-                            Ok(Err(err)) => {
-                                tracing::debug!(
-                                    key = ?job.key,
-                                    error = %err,
-                                    "Failed to decode map tile payload"
-                                );
-                                (job.on_decoded)(Err(err.to_string()));
-                            }
-                            Err(_) => {
-                                tracing::error!(
-                                    key = ?job.key,
-                                    "Tile decoder panicked; isolated worker continues"
-                                );
-                                (job.on_decoded)(Err("tile decoder panicked".to_owned()));
-                            }
+                        // Panic isolation around decoders per workspace safety invariants.
+                        let key = job.key;
+                        if catch_unwind(AssertUnwindSafe(job.work)).is_err() {
+                            tracing::error!(
+                                ?key,
+                                "Tile decode job panicked; isolated worker continues"
+                            );
                         }
                     }
                 }) {
@@ -309,7 +305,7 @@ impl DecodePool {
         }
     }
 
-    /// Return a cloneable handle for submitting encoded tile jobs.
+    /// Return a cloneable handle for submitting decode jobs.
     pub fn handle(&self) -> DecodePoolHandle {
         DecodePoolHandle {
             shared: Arc::clone(&self.shared),

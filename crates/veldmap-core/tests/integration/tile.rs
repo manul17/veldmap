@@ -28,7 +28,7 @@ fn tile_scheme_parent_respects_level_direction_without_inverting() {
         TileScheme::PolarCap { north: true },
         TileScheme::PolarCap { north: false },
     ] {
-        assert!(scheme.is_coarsest_zero());
+        assert!(scheme.as_planetary().is_some());
         assert_eq!(scheme.parent(0, 0, 0), None);
         assert_eq!(scheme.parent(0, 1, 0), None);
         assert_eq!(scheme.parent(3, 5, 7), Some((2, 2, 3)));
@@ -37,7 +37,6 @@ fn tile_scheme_parent_respects_level_direction_without_inverting() {
     }
 
     let pyr = TileScheme::RasterPyramid { max_level: 5 };
-    assert!(!pyr.is_coarsest_zero());
     assert!(pyr.as_planetary().is_none());
     assert!(pyr.as_globe().is_none());
     assert_eq!(pyr.parent(5, 0, 0), None);

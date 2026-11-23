@@ -114,3 +114,33 @@ fn pinned_root_check_handles_planetary_and_raster_pyramid() {
     assert!(!is_pinned_root(&pyr_finest, &[live]));
     assert!(!is_pinned_root(&pyr_oob, &[live]));
 }
+
+#[test]
+fn clear_where_and_proportional_budget_cover_pre_3a_hooks() {
+    let mut pending = PendingUploads::new();
+    let tx = pending.sender().expect("sender");
+    let tile_4b =
+        DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]).expect("tile");
+    let k0 = bundled_tile_key(QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 0,
+        x: 0,
+        y: 0,
+    });
+    let k2 = bundled_tile_key(QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 2,
+        x: 1,
+        y: 1,
+    });
+    tx.send((k0, tile_4b.clone())).expect("send k0");
+    tx.send((k2, tile_4b)).expect("send k2");
+
+    pending.clear_where(|k| k.level >= 2);
+    assert!(pending.contains(&k0));
+    assert!(!pending.contains(&k2));
+
+    let cache = GpuTileCache::new(100 * 1024 * 1024);
+    let weighted = cache.proportional_pyramid_byte_cap(4, 10);
+    assert!(weighted > 0 && weighted * 2 < cache.max_bytes());
+}

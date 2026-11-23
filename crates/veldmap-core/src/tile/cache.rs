@@ -250,10 +250,7 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     /// Remove `key` from the cache in O(1), returning `(value, byte_size)`.
     pub fn remove(&mut self, key: &K) -> Option<(V, usize)> {
         let slot = self.index.remove(key)?;
-        self.detach(slot);
-        let node = self.nodes[slot].take()?;
-        self.free.push(slot);
-        self.total_bytes = self.total_bytes.saturating_sub(node.byte_size);
+        let node = self.take_slot(slot)?;
         Some((node.value, node.byte_size))
     }
 
@@ -270,58 +267,6 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.tail = None;
         self.total_bytes = 0;
         out
-    }
-
-    /// Maximum byte appetite allowed for one active pyramid (`< 50%` of
-    /// `max_bytes` divided evenly among `active_pyramids`).
-    ///
-    /// Keeping each visible set + in-flight request strictly below half the
-    /// cache budget prevents newly arriving tiles from evicting the currently
-    /// displayed frame before a step finishes.
-    pub fn pyramid_byte_cap(&self, active_pyramids: usize) -> usize {
-        let half_strict = (self.max_bytes / 2).saturating_sub(1);
-        half_strict / active_pyramids.max(1)
-    }
-
-    /// Maximum byte appetite allowed for one active pyramid weighted
-    /// proportionally by its per-tile byte cost (`pyramid_weight / total_weight`)
-    /// within the strict `< 50%` combined appetite ceiling.
-    ///
-    /// Useful for heterogeneous multi-band stacks (e.g. basemap `Rgba8` +
-    /// multiple `R32Float` optical/DEM bands + `R8Uint` `SCL`).
-    pub fn proportional_pyramid_byte_cap(&self, pyramid_weight: u64, total_weight: u64) -> usize {
-        let half_strict = (self.max_bytes / 2).saturating_sub(1);
-        if pyramid_weight == 0 || half_strict == 0 {
-            return 0;
-        }
-        let denom = total_weight.max(pyramid_weight);
-        let scaled =
-            (u128::from(half_strict as u64) * u128::from(pyramid_weight)) / u128::from(denom);
-        usize::try_from(scaled).unwrap_or(half_strict)
-    }
-
-    /// Maximum tile count allowed for one active pyramid given `tile_bytes`,
-    /// strictly honoring the `< 50%` byte appetite cap (returns `0` if even one
-    /// tile would exceed the per-pyramid cap).
-    pub fn max_tiles_for_pyramid(&self, active_pyramids: usize, tile_bytes: usize) -> usize {
-        if tile_bytes == 0 || tile_bytes > self.max_bytes {
-            return 0;
-        }
-        self.pyramid_byte_cap(active_pyramids) / tile_bytes
-    }
-
-    /// Maximum tile count allowed for one weighted pyramid given `tile_bytes`,
-    /// strictly honoring [`Self::proportional_pyramid_byte_cap`].
-    pub fn max_tiles_for_weighted_pyramid(
-        &self,
-        pyramid_weight: u64,
-        total_weight: u64,
-        tile_bytes: usize,
-    ) -> usize {
-        if tile_bytes == 0 || tile_bytes > self.max_bytes {
-            return 0;
-        }
-        self.proportional_pyramid_byte_cap(pyramid_weight, total_weight) / tile_bytes
     }
 
     fn insert_front_node(&mut self, key: K, value: V, byte_size: usize) -> usize {
@@ -401,17 +346,73 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.remove_slot(slot)
     }
 
-    fn remove_slot(&mut self, slot: usize) -> Option<(K, V)> {
+    fn take_slot(&mut self, slot: usize) -> Option<Node<K, V>> {
         self.detach(slot);
         let node = self.nodes[slot].take()?;
-        self.index.remove(&node.key);
         self.free.push(slot);
         self.total_bytes = self.total_bytes.saturating_sub(node.byte_size);
+        Some(node)
+    }
+
+    fn remove_slot(&mut self, slot: usize) -> Option<(K, V)> {
+        let node = self.take_slot(slot)?;
+        self.index.remove(&node.key);
         Some((node.key, node.value))
     }
 }
 
 impl<V> TileCache<TileKey, V> {
+    /// Maximum byte appetite allowed for one active pyramid (`< 50%` of
+    /// `max_bytes` divided evenly among `active_pyramids`).
+    ///
+    /// Keeping each visible set + in-flight request strictly below half the
+    /// cache budget prevents newly arriving tiles from evicting the currently
+    /// displayed frame before a step finishes.
+    pub fn pyramid_byte_cap(&self, active_pyramids: usize) -> usize {
+        let half_strict = (self.max_bytes / 2).saturating_sub(1);
+        half_strict / active_pyramids.max(1)
+    }
+
+    /// Maximum byte appetite allowed for one active pyramid weighted
+    /// proportionally by its per-tile byte cost (`pyramid_weight / total_weight`)
+    /// within the strict `< 50%` combined appetite ceiling.
+    ///
+    /// Useful for heterogeneous multi-band stacks (e.g. basemap `Rgba8` +
+    /// multiple `R32Float` optical/DEM bands + `R8Uint` `SCL`).
+    pub fn proportional_pyramid_byte_cap(&self, pyramid_weight: u64, total_weight: u64) -> usize {
+        let half_strict = (self.max_bytes / 2).saturating_sub(1);
+        if pyramid_weight == 0 || half_strict == 0 {
+            return 0;
+        }
+        let denom = total_weight.max(pyramid_weight);
+        let scaled =
+            (u128::from(half_strict as u64) * u128::from(pyramid_weight)) / u128::from(denom);
+        usize::try_from(scaled).unwrap_or(half_strict)
+    }
+
+    /// Maximum tile count allowed for one active pyramid given `tile_bytes`,
+    /// strictly honoring the `< 50%` byte appetite cap (returns `0` if even one
+    /// tile would exceed the per-pyramid cap).
+    pub fn max_tiles_for_pyramid(&self, active_pyramids: usize, tile_bytes: usize) -> usize {
+        if tile_bytes == 0 || tile_bytes > self.max_bytes {
+            return 0;
+        }
+        self.pyramid_byte_cap(active_pyramids) / tile_bytes
+    }
+
+    /// Maximum tile count allowed for one weighted pyramid given `tile_bytes`,
+    /// strictly honoring [`Self::proportional_pyramid_byte_cap`].
+    pub fn max_tiles_for_weighted_pyramid(
+        &self,
+        pyramid_weight: u64,
+        total_weight: u64,
+        tile_bytes: usize,
+    ) -> usize {
+        if tile_bytes == 0 || tile_bytes > self.max_bytes {
+            return 0;
+        }
+        self.proportional_pyramid_byte_cap(pyramid_weight, total_weight) / tile_bytes
+    }
     fn find_carrier_slot(&self, key: &TileKey) -> Option<(TileKey, usize)> {
         let mut cursor = Some(*key);
         while let Some(cur) = cursor {

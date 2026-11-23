@@ -14,5 +14,8 @@ thiserror.workspace = true
 tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+
 [lints]
 workspace = true

@@ -20,13 +20,23 @@ use crate::settings::AppSettings;
 /// Settings window is open and new tiles are being written.
 const DISK_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// UI-readable snapshot of asynchronous disk cache stats and maintenance state.
+/// Typed asynchronous maintenance outcome reported by [`DiskCacheWorker`]
+/// (formatted into user-facing copy by the UI layer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiskCacheNotice {
+    Cleared,
+    ClearFailed(String),
+    WorkerUnavailable,
+    WorkerDisconnected,
+}
+
+/// Snapshot of asynchronous disk cache stats and maintenance state.
 #[derive(Clone, Debug, Default)]
-pub struct DiskCacheUiState {
+pub struct DiskCacheStatus {
     pub available: bool,
     pub stats: Option<DiskCacheStats>,
     pub busy: bool,
-    pub notice: Option<String>,
+    pub notice: Option<DiskCacheNotice>,
     pub clear_gen: u64,
 }
 
@@ -41,14 +51,14 @@ enum DiskCacheCmd {
 /// deterministically on shutdown).
 struct DiskCacheWorker {
     tx: Option<Sender<DiskCacheCmd>>,
-    state: Arc<Mutex<DiskCacheUiState>>,
+    state: Arc<Mutex<DiskCacheStatus>>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl DiskCacheWorker {
     fn spawn(cache: Arc<TileDiskCache>, wakeup: Wakeup) -> Option<Self> {
         let (tx, rx) = mpsc::channel::<DiskCacheCmd>();
-        let state = Arc::new(Mutex::new(DiskCacheUiState {
+        let state = Arc::new(Mutex::new(DiskCacheStatus {
             available: true,
             stats: None,
             busy: false,
@@ -90,11 +100,12 @@ impl DiskCacheWorker {
                                 }
                                 match res {
                                     Ok(()) => {
-                                        st.notice = Some("Disk cache cleared.".to_owned());
+                                        st.notice = Some(DiskCacheNotice::Cleared);
                                         st.clear_gen = st.clear_gen.wrapping_add(1);
                                     }
                                     Err(err) => {
-                                        st.notice = Some(format!("Clear failed: {err}"));
+                                        st.notice =
+                                            Some(DiskCacheNotice::ClearFailed(err.to_string()));
                                     }
                                 }
                             }
@@ -117,7 +128,7 @@ impl DiskCacheWorker {
         })
     }
 
-    fn snapshot(&self) -> DiskCacheUiState {
+    fn snapshot(&self) -> DiskCacheStatus {
         lock_unpoisoned(&self.state).clone()
     }
 
@@ -141,7 +152,7 @@ impl DiskCacheWorker {
         let Some(tx) = &self.tx else {
             let mut st = lock_unpoisoned(&self.state);
             st.busy = false;
-            st.notice = Some("Disk cache worker unavailable.".to_owned());
+            st.notice = Some(DiskCacheNotice::WorkerUnavailable);
             return;
         };
         {
@@ -155,7 +166,7 @@ impl DiskCacheWorker {
         if tx.send(DiskCacheCmd::Clear).is_err() {
             let mut st = lock_unpoisoned(&self.state);
             st.busy = false;
-            st.notice = Some("Clear failed: maintenance worker disconnected.".to_owned());
+            st.notice = Some(DiskCacheNotice::WorkerDisconnected);
         }
     }
 
@@ -184,7 +195,6 @@ pub struct AppStorage {
     settings: AppSettings,
     disk_cache: Option<Arc<TileDiskCache>>,
     disk_worker: Option<DiskCacheWorker>,
-    last_settings_open: bool,
     last_stats_write_gen: u64,
     last_stats_refresh: Option<Instant>,
     last_handled_clear_gen: u64,
@@ -232,7 +242,6 @@ impl AppStorage {
             settings,
             disk_cache,
             disk_worker,
-            last_settings_open: false,
             last_stats_write_gen: 0,
             last_stats_refresh: None,
             last_handled_clear_gen: 0,
@@ -288,14 +297,14 @@ impl AppStorage {
 
     /// Cached off-UI-thread disk cache status & stats snapshot (zero SQLite
     /// blocking on the UI thread).
-    pub fn disk_cache_ui_state(&self) -> DiskCacheUiState {
+    pub fn disk_cache_status(&self) -> DiskCacheStatus {
         self.disk_worker
             .as_ref()
             .map(DiskCacheWorker::snapshot)
             .unwrap_or_default()
     }
 
-    /// Clear transient disk cache UI notice (e.g. when reopening Settings).
+    /// Clear transient disk cache notice (e.g. when reopening Settings).
     pub fn clear_disk_cache_notice(&self) {
         if let Some(worker) = &self.disk_worker {
             worker.clear_notice();
@@ -311,15 +320,10 @@ impl AppStorage {
     }
 
     /// Event-driven disk-cache stats refresh: triggers an async stats query
-    /// only when Settings opens or when `TileDiskCache::write_generation()`
-    /// advances and at least `DISK_STATS_REFRESH_INTERVAL` has elapsed (zero
-    /// idle queries/repaints).
-    pub fn maybe_refresh_disk_stats(&mut self, settings_open: bool) {
-        let just_opened = settings_open && !self.last_settings_open;
-        self.last_settings_open = settings_open;
-        if !settings_open {
-            return;
-        }
+    /// only when `force_refresh` is `true` (e.g. Settings just opened) or when
+    /// `TileDiskCache::write_generation()` advances and at least
+    /// `DISK_STATS_REFRESH_INTERVAL` has elapsed (zero idle queries/repaints).
+    pub fn maybe_refresh_disk_stats(&mut self, force_refresh: bool) {
         let (Some(worker), Some(cache)) = (&self.disk_worker, &self.disk_cache) else {
             return;
         };
@@ -328,7 +332,7 @@ impl AppStorage {
         let interval_elapsed = self
             .last_stats_refresh
             .is_none_or(|t| now.duration_since(t) >= DISK_STATS_REFRESH_INTERVAL);
-        if just_opened || (write_gen != self.last_stats_write_gen && interval_elapsed) {
+        if force_refresh || (write_gen != self.last_stats_write_gen && interval_elapsed) {
             self.last_stats_write_gen = write_gen;
             self.last_stats_refresh = Some(now);
             worker.request_refresh();
@@ -362,41 +366,6 @@ impl AppStorage {
     pub fn finish_shutdown(&mut self) {
         if let Some(worker) = &mut self.disk_worker {
             worker.join();
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod tests_support {
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    pub(crate) struct TempTestRoot(PathBuf);
-
-    impl TempTestRoot {
-        pub(crate) fn new(label: &str) -> Self {
-            static SEQ: AtomicU64 = AtomicU64::new(0);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "veldmap-app-test-{label}-{}-{nanos}-{seq}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).expect("create temp test dir");
-            Self(dir)
-        }
-
-        pub(crate) fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempTestRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }

@@ -7,9 +7,9 @@
 
 use thiserror::Error;
 
-pub mod atomic;
-pub mod paths;
-pub mod tile_cache;
+mod atomic;
+mod paths;
+mod tile_cache;
 
 pub use atomic::{
     read_json_or_default, read_json_or_default_with_backup, write_atomic_durable,
@@ -17,9 +17,9 @@ pub use atomic::{
 };
 pub use paths::StoragePaths;
 pub use tile_cache::{
-    DEFAULT_DISK_CACHE_BYTES, DEFAULT_DISK_CACHE_MAX_MB, DiskCacheStats, DiskTileKey,
-    EvictionReport, MAX_CACHED_TILE_BYTES, MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB,
-    TileBlobEncoding, TileDiskCache, valid_source_key,
+    DEFAULT_DISK_CACHE_MAX_MB, DiskCacheStats, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES,
+    MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB, TileBlobEncoding, TileDiskCache,
+    valid_source_key,
 };
 
 #[cfg(test)]

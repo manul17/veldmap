@@ -11,15 +11,21 @@ use crate::geo::cull::{Ball, Frame as CullFrame};
 use crate::geo::geodesy;
 use crate::geo::sag;
 
-use super::geometry::{
-    BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, lat_lon_bounds, mercator_lat_deg,
-    polar_cap_point, web_mercator_y_bounds,
-};
+use super::geometry::{lat_lon_bounds, mercator_lat_deg, polar_cap_point, web_mercator_y_bounds};
 use super::key::{GlobeScheme, PlanetaryScheme, QuadTileId};
 
 /// Default mesh grid cells per quadtree tile side (`16 x 16` quads = 289
 /// surface vertices + 68 skirt vertices).
 pub const DEFAULT_GRID_CELLS: u32 = 16;
+
+/// Neutral default planetary tile size in pixels for SSE estimation.
+pub const DEFAULT_TILE_PX: u32 = 256;
+
+/// Neutral default maximum `PolarCap` texture zoom level.
+pub const DEFAULT_POLAR_MAX_TEX_LEVEL: u8 = 0;
+
+/// Default `Geodetic` maximum texture level used by [`QuadtreeConfig::default`].
+const DEFAULT_GEODETIC_MAX_TEX_LEVEL: u8 = 3;
 
 /// Maximum WGS84 radius-of-curvature ratio relative to `SEMI_MAJOR_M`
 /// (`a / (1 - f) / a`), used to keep spherical chord-sag bounds strictly
@@ -58,22 +64,22 @@ pub struct QuadtreeConfig {
 
 impl Default for QuadtreeConfig {
     fn default() -> Self {
-        Self::bundled_geodetic()
+        Self::geodetic(DEFAULT_GEODETIC_MAX_TEX_LEVEL)
     }
 }
 
 impl QuadtreeConfig {
-    /// Default configuration for the bundled offline `Geodetic` (`z = 0..3`)
-    /// basemap with adaptive Polar Stereographic caps (`z = 0`).
-    pub const fn bundled_geodetic() -> Self {
+    /// Configuration for a `Geodetic` basemap with given `max_tex_level` and
+    /// adaptive Polar Stereographic caps (`z = 0` default texture cap).
+    pub const fn geodetic(max_tex_level: u8) -> Self {
         Self {
             scheme: GlobeScheme::Geodetic,
-            max_tex_level: BUNDLED_MAX_LEVEL,
+            max_tex_level,
             max_geom_level: 16,
-            polar_max_tex_level: BUNDLED_POLAR_MAX_LEVEL,
+            polar_max_tex_level: DEFAULT_POLAR_MAX_TEX_LEVEL,
             polar_max_geom_level: 14,
             grid_cells: DEFAULT_GRID_CELLS,
-            tile_px: BUNDLED_TILE_PX,
+            tile_px: DEFAULT_TILE_PX,
             max_geom_sse_px: 0.5,
             max_tex_sse_px: 1.5,
         }
@@ -85,10 +91,10 @@ impl QuadtreeConfig {
             scheme: GlobeScheme::WebMercator,
             max_tex_level,
             max_geom_level: 17,
-            polar_max_tex_level: BUNDLED_POLAR_MAX_LEVEL,
+            polar_max_tex_level: DEFAULT_POLAR_MAX_TEX_LEVEL,
             polar_max_geom_level: 14,
             grid_cells: DEFAULT_GRID_CELLS,
-            tile_px: BUNDLED_TILE_PX,
+            tile_px: DEFAULT_TILE_PX,
             max_geom_sse_px: 0.5,
             max_tex_sse_px: 1.5,
         }
@@ -99,10 +105,7 @@ impl QuadtreeConfig {
     pub const fn for_scheme(scheme: GlobeScheme, max_tex_level: u8) -> Self {
         match scheme {
             GlobeScheme::WebMercator => Self::web_mercator(max_tex_level),
-            GlobeScheme::Geodetic => Self {
-                max_tex_level,
-                ..Self::bundled_geodetic()
-            },
+            GlobeScheme::Geodetic => Self::geodetic(max_tex_level),
         }
     }
 
@@ -147,39 +150,29 @@ pub struct VisibleTile {
     pub skirt_depth_m: f64,
 }
 
+struct DescribedTile {
+    tile: VisibleTile,
+    samples: [DVec3; 25],
+    sample_sag_m: f64,
+    max_subcell_arc_deg: f64,
+}
+
 /// Compute tile metadata (`origin_ecef_m`, conservative `Ball`, cell-diagonal
 /// chord sagitta, and skirt depth) for `id`, returning `None` if `id` is out of
 /// domain (e.g. a `Geodetic` tile fully inside a polar cap).
 pub fn describe_tile(id: QuadTileId, config: &QuadtreeConfig) -> Option<VisibleTile> {
-    describe_tile_with_samples(id, config).map(|(tile, _, _, _)| tile)
+    describe_tile_with_samples(id, config).map(|described| described.tile)
 }
 
-#[inline]
-fn surface_unit_and_ecef(lat_deg: f64, lon_deg: f64, e2: f64, one_minus_e2: f64) -> (DVec3, DVec3) {
-    let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
-    let (sin_lon, cos_lon) = lon_deg.to_radians().sin_cos();
-    let curvature = geodesy::SEMI_MAJOR_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-    let eq = curvature * cos_lat;
-    (
-        DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat),
-        DVec3::new(
-            eq * cos_lon,
-            eq * sin_lon,
-            curvature * one_minus_e2 * sin_lat,
-        ),
-    )
-}
-
-fn describe_tile_with_samples(
-    id: QuadTileId,
-    config: &QuadtreeConfig,
-) -> Option<(VisibleTile, [DVec3; 25], f64, f64)> {
+fn describe_tile_with_samples(id: QuadTileId, config: &QuadtreeConfig) -> Option<DescribedTile> {
     let grid_cells = f64::from(config.grid_cells.max(1));
     let mut samples = [DVec3::ZERO; 25];
     let mut sample_units = [DVec3::ZERO; 25];
     let e2 = geodesy::WGS84.eccentricity_sq();
     let one_minus_e2 = 1.0 - e2;
 
+    // Intentionally factors the 5x5 grid into 5 lat + 5 lon trig evaluations
+    // (10 sin_cos + 5 sqrt instead of 50 sin_cos + 25 sqrt per visited node).
     let mut fill_separable_grid = |lats_deg: [f64; 5], lons_deg: [f64; 5]| {
         let mut lat_cache = [(0.0_f64, 0.0_f64, 0.0_f64); 5];
         for (slot, lat_deg) in lat_cache.iter_mut().zip(lats_deg) {
@@ -229,10 +222,7 @@ fn describe_tile_with_samples(
             }
         }
         PlanetaryScheme::WebMercator => {
-            let (cols, rows) = id.scheme.grid_dims(id.level)?;
-            if id.x >= cols || id.y >= rows {
-                return None;
-            }
+            let (cols, rows) = id.checked_grid_dims()?;
             let cols_f = f64::from(cols);
             let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
             let lats = [0u32, 1, 2, 3, 4]
@@ -258,10 +248,7 @@ fn describe_tile_with_samples(
             merc_equatorial_cell_diag_deg = cell_dlat.hypot(cell_dlon);
         }
         PlanetaryScheme::PolarCap { north } => {
-            let (n, rows) = id.scheme.grid_dims(id.level)?;
-            if id.x >= n || id.y >= rows {
-                return None;
-            }
+            let (n, _) = id.checked_grid_dims()?;
             let n_f = f64::from(n);
             let mut idx = 0usize;
             for row in 0..5u32 {
@@ -271,7 +258,7 @@ fn describe_tile_with_samples(
                     let s = f64::from(col) * 0.25;
                     let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
                     let (lat, lon, _, _) = polar_cap_point(north, u, v);
-                    let (unit, ecef) = surface_unit_and_ecef(lat, lon, e2, one_minus_e2);
+                    let (ecef, unit) = geodesy::surface_ecef_and_normal(lat, lon);
                     sample_units[idx] = unit;
                     samples[idx] = ecef;
                     idx += 1;
@@ -332,29 +319,29 @@ fn describe_tile_with_samples(
         sag_cell_diag_m,
         skirt_depth_m,
     };
-    Some((tile, samples, sample_sag_m, max_subcell_arc_deg))
+    Some(DescribedTile {
+        tile,
+        samples,
+        sample_sag_m,
+        max_subcell_arc_deg,
+    })
 }
 
-fn tile_visible(
-    frustum: &CullFrame,
-    tile: &VisibleTile,
-    samples: &[DVec3; 25],
-    sample_sag_m: f64,
-    max_subcell_arc_deg: f64,
-) -> bool {
+fn tile_visible(frustum: &CullFrame, described: &DescribedTile) -> bool {
     // Only apply the 5x5 sample horizon shortcut once subcells are small enough
     // that spherical-trapezoid circumradius stays within `1.15 * half_diag`;
     // coarse planetary roots (z = 0..1) rely solely on their enclosing `Ball`.
-    if max_subcell_arc_deg <= 30.0 {
-        let max_horizon = samples
+    if described.max_subcell_arc_deg <= 30.0 {
+        let max_horizon = described
+            .samples
             .iter()
             .map(|&p| frustum.horizon_margin(p))
             .fold(f64::NEG_INFINITY, f64::max);
-        if max_horizon + sample_sag_m < 0.0 {
+        if max_horizon + described.sample_sag_m < 0.0 {
             return false;
         }
     }
-    frustum.admits(&tile.ball)
+    frustum.admits(&described.tile.ball)
 }
 
 /// Approximate ground width of one tile in metres (used for texture SSE while
@@ -484,20 +471,18 @@ pub fn traverse(
     }
 
     while let Some(id) = stack.pop() {
-        let Some((tile, samples, sample_sag_m, max_subcell_arc_deg)) =
-            describe_tile_with_samples(id, config)
-        else {
+        let Some(described) = describe_tile_with_samples(id, config) else {
             continue;
         };
-        if !tile_visible(&frustum, &tile, &samples, sample_sag_m, max_subcell_arc_deg) {
+        if !tile_visible(&frustum, &described) {
             continue;
         }
-        if should_subdivide(&tile, eye, height_m, focal_px, config) {
+        if should_subdivide(&described.tile, eye, height_m, focal_px, config) {
             for child in id.children() {
                 stack.push(child);
             }
         } else {
-            leaves.insert(id, tile);
+            leaves.insert(id, described.tile);
         }
     }
 
@@ -576,11 +561,10 @@ fn balance_2_to_1(
                 continue;
             }
             for child in split_id.children() {
-                if let Some((tile, samples, sample_sag_m, max_subcell_arc_deg)) =
-                    describe_tile_with_samples(child, config)
-                    && tile_visible(frustum, &tile, &samples, sample_sag_m, max_subcell_arc_deg)
+                if let Some(described) = describe_tile_with_samples(child, config)
+                    && tile_visible(frustum, &described)
                 {
-                    leaves.insert(child, tile);
+                    leaves.insert(child, described.tile);
                 }
             }
         }

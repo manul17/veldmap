@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 bytemuck.workspace = true
 eframe.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

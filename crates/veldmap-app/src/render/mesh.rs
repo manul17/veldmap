@@ -9,13 +9,13 @@
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
-use veldmap_core::geo::geodesy::{self, Geodetic};
+use veldmap_core::geo::geodesy;
 use veldmap_core::tile::{PlanetaryScheme, QuadTileId, VisibleTile, sample_tile_surface};
 
 /// Tile-local `f64` graticule anchor `(anchor_a, anchor_b)`:
 /// - For `Geodetic` / `WebMercator`: `(lon_center_deg, lat_center_deg)`
 /// - For `PolarCap`: `(dx_center, dy_center)` in unit-disk coordinates
-pub(crate) fn tile_grid_anchor(id: QuadTileId) -> Option<(f64, f64)> {
+pub(super) fn tile_grid_anchor(id: QuadTileId) -> Option<(f64, f64)> {
     let (lat, lon, _, _, dx, dy) = sample_tile_surface(id, 0.5, 0.5)?;
     match id.scheme {
         PlanetaryScheme::PolarCap { .. } => Some((dx, dy)),
@@ -178,9 +178,9 @@ pub fn build_tile_vertices(tile: &VisibleTile, grid_cells: u32) -> Vec<TileVerte
             let s = f64::from(col) / n_f;
             let (lat, lon, u_tex, v_tex, dx, dy) =
                 sample_tile_surface(tile.id, s, t).unwrap_or((0.0, 0.0, s, t, 0.0, 0.0));
-            let pos_ecef = geodesy::world(Geodetic::surface(lat, lon));
+            let (pos_ecef, unit_normal) = geodesy::surface_ecef_and_normal(lat, lon);
             let rel_pos = (pos_ecef - origin).as_vec3().to_array();
-            let normal = geodesy::unit(lat, lon).as_vec3().to_array();
+            let normal = unit_normal.as_vec3().to_array();
             let grid_rel = if is_polar {
                 [(dx - anchor_a) as f32, (dy - anchor_b) as f32]
             } else {

@@ -8,16 +8,29 @@
 //! redaction helpers directly.
 
 use std::fmt;
+use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use veldmap_net::{
     CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, LiveBasemapSpec, NetError,
-    sanitize_url_for_display,
+    is_valid_gibs_date, sanitize_url_for_display,
 };
 use veldmap_storage::{
     DEFAULT_DISK_CACHE_MAX_MB, MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB, StorageError,
     StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
 };
+
+/// Allowed slider range for Custom XYZ / TMS maximum zoom levels.
+pub const CUSTOM_MAX_LEVEL_RANGE: RangeInclusive<u8> = CUSTOM_MAX_LEVEL_MIN..=CUSTOM_MAX_LEVEL_MAX;
+
+/// Allowed slider range for the SQLite WAL tile disk cache budget in MiB.
+pub const DISK_CACHE_MAX_MB_RANGE: RangeInclusive<u64> =
+    MIN_DISK_CACHE_MAX_MB..=MAX_DISK_CACHE_MAX_MB;
+
+/// Validate an explicit `YYYY-MM-DD` UTC date string for NASA GIBS daily layers.
+pub fn validate_gibs_date(date: &str) -> bool {
+    is_valid_gibs_date(date.trim())
+}
 
 /// Current JSON schema version for [`AppSettings`].
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
@@ -224,7 +237,7 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::tests_support::TempTestRoot;
+    use crate::test_support::TempTestRoot;
 
     #[test]
     fn settings_round_trip_and_redact_api_key_userinfo_and_query_in_debug() {
