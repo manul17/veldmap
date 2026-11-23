@@ -5,21 +5,18 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 
-use veldmap_core::io::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileCache};
+use veldmap_core::sync::{CancelToken, lock_unpoisoned};
+use veldmap_core::tile::{SourceId, TileCache, TileStreamSpec};
 
 use crate::RasterError;
 
 /// Composite key identifying one decoded source chunk (TIFF tile/strip)
-/// partitioned by `(source, band, format, gutter, decode_rev, image, chunk_index)`
-/// so incompatible bands, formats, or revisions never alias.
+/// partitioned by `(source, spec, image, chunk_index)` so incompatible bands,
+/// formats, gutters, or revisions never alias.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkKey {
     pub source: SourceId,
-    pub band: BandKey,
-    pub format: PixelFormat,
-    pub gutter: u8,
-    pub decode_rev: u32,
+    pub spec: TileStreamSpec,
     pub image: usize,
     pub chunk_index: u32,
 }
@@ -39,110 +36,10 @@ impl DecodedChunk {
     }
 }
 
-#[derive(Clone, Debug)]
-enum ChunkFailure {
-    Cancelled,
-    Budget(veldmap_core::budget::BudgetError),
-    LimitExceeded {
-        width: u32,
-        height: u32,
-        estimated_bytes: u64,
-        limit_bytes: u64,
-    },
-    InvalidDimensions {
-        width: u32,
-        height: u32,
-    },
-    InvalidFormat(String),
-    UnsupportedFormat,
-    Io {
-        kind: std::io::ErrorKind,
-        message: String,
-    },
-    Decode(String),
-    Tiff(String),
-}
-
-impl ChunkFailure {
-    fn from_raster_error(err: &RasterError) -> Self {
-        match err {
-            RasterError::Cancelled => Self::Cancelled,
-            RasterError::Budget(b) => Self::Budget(b.clone()),
-            RasterError::LimitExceeded {
-                width,
-                height,
-                estimated_bytes,
-                limit_bytes,
-            } => Self::LimitExceeded {
-                width: *width,
-                height: *height,
-                estimated_bytes: *estimated_bytes,
-                limit_bytes: *limit_bytes,
-            },
-            RasterError::InvalidDimensions { width, height } => Self::InvalidDimensions {
-                width: *width,
-                height: *height,
-            },
-            RasterError::InvalidFormat(msg) => Self::InvalidFormat(msg.clone()),
-            RasterError::UnsupportedFormat => Self::UnsupportedFormat,
-            RasterError::Io(io_err) => {
-                if io_err.is_cancelled() {
-                    Self::Cancelled
-                } else {
-                    let kind = match io_err {
-                        veldmap_core::io::IoError::UnexpectedEof { .. } => {
-                            std::io::ErrorKind::UnexpectedEof
-                        }
-                        veldmap_core::io::IoError::InvalidInput(_) => {
-                            std::io::ErrorKind::InvalidInput
-                        }
-                        veldmap_core::io::IoError::Io(inner) => inner.kind(),
-                        veldmap_core::io::IoError::Cancelled => std::io::ErrorKind::Other,
-                    };
-                    Self::Io {
-                        kind,
-                        message: io_err.to_string(),
-                    }
-                }
-            }
-            RasterError::Decode(img_err) => Self::Decode(img_err.to_string()),
-            other => Self::Tiff(other.to_string()),
-        }
-    }
-
-    fn into_raster_error(self) -> RasterError {
-        match self {
-            Self::Cancelled => RasterError::Cancelled,
-            Self::Budget(b) => RasterError::Budget(b),
-            Self::LimitExceeded {
-                width,
-                height,
-                estimated_bytes,
-                limit_bytes,
-            } => RasterError::LimitExceeded {
-                width,
-                height,
-                estimated_bytes,
-                limit_bytes,
-            },
-            Self::InvalidDimensions { width, height } => {
-                RasterError::InvalidDimensions { width, height }
-            }
-            Self::InvalidFormat(msg) => RasterError::InvalidFormat(msg),
-            Self::UnsupportedFormat => RasterError::UnsupportedFormat,
-            Self::Io { kind, message } => RasterError::Io(veldmap_core::io::IoError::Io(
-                std::io::Error::new(kind, message),
-            )),
-            Self::Decode(msg) => RasterError::InvalidFormat(msg),
-            Self::Tiff(msg) => RasterError::Tiff(msg),
-        }
-    }
-}
-
 enum SlotState {
     Pending,
     Ready(Arc<DecodedChunk>),
-    Failed(ChunkFailure),
+    Failed(RasterError),
 }
 
 struct SingleflightSlot {
@@ -164,10 +61,10 @@ impl SingleflightSlot {
         self.cvar.notify_all();
     }
 
-    fn complete_err(&self, failure: ChunkFailure) {
+    fn complete_err(&self, err: RasterError) {
         let mut guard = lock_unpoisoned(&self.state);
         if matches!(*guard, SlotState::Pending) {
-            *guard = SlotState::Failed(failure);
+            *guard = SlotState::Failed(err);
             self.cvar.notify_all();
         }
     }
@@ -195,7 +92,7 @@ impl Drop for LeaderGuard<'_> {
                 guard.in_flight.remove(&self.key);
             }
         }
-        self.slot.complete_err(ChunkFailure::InvalidFormat(
+        self.slot.complete_err(RasterError::InvalidFormat(
             "chunk decode leader panicked or exited prematurely".to_string(),
         ));
     }
@@ -319,7 +216,6 @@ impl SharedChunkCache {
                         Ok(arc)
                     }
                     Ok(Err(err)) => {
-                        let failure = ChunkFailure::from_raster_error(&err);
                         {
                             let mut st = lock_unpoisoned(&self.state);
                             if let Some(cur) = st.in_flight.get(&key)
@@ -328,7 +224,7 @@ impl SharedChunkCache {
                                 st.in_flight.remove(&key);
                             }
                         }
-                        slot.complete_err(failure);
+                        slot.complete_err(err.clone());
                         guard.completed = true;
                         Err(err)
                     }
@@ -362,11 +258,11 @@ fn wait_for_slot(
     loop {
         match &*state {
             SlotState::Ready(chunk) => return Ok(Arc::clone(chunk)),
-            SlotState::Failed(failure) => {
+            SlotState::Failed(err) => {
                 if cancel.is_cancelled() {
                     return Err(RasterError::Cancelled);
                 }
-                return Err(failure.clone().into_raster_error());
+                return Err(err.clone());
             }
             SlotState::Pending => {
                 if cancel.is_cancelled() {

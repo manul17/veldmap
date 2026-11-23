@@ -1,29 +1,39 @@
-//! Safe positioned local-file [`ByteSource`] implementation using pooled
-//! `std::fs::File` handles and platform positioned reads (`pread` on Unix,
-//! `seek_read` short-read loop on Windows) without `memmap2`.
+//! Safe positioned local-file [`ByteSource`] implementation using lock-free
+//! POSIX `pread` on a single immutable file descriptor on Unix, and pooled
+//! `std::fs::File` handles with `seek_read` on Windows (avoiding `memmap2`).
 
 use std::fs::{File, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(not(unix))]
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
-use veldmap_core::io::{ByteSource, CancelToken, IoError, lock_unpoisoned};
+use veldmap_core::io::{ByteSource, IoError};
+use veldmap_core::sync::CancelToken;
+#[cfg(not(unix))]
+use veldmap_core::sync::lock_unpoisoned;
 
 use crate::StorageError;
 
-/// Maximum idle read-only `File` handles cached per [`LocalFileSource`].
+/// Maximum idle read-only `File` handles cached per [`LocalFileSource`] on
+/// platforms where positioned reads mutate the kernel file pointer.
+#[cfg(not(unix))]
 const MAX_POOLED_HANDLES: usize = 8;
 
 /// Thread-safe, caller-buffered positioned reader over a local file.
 ///
-/// Pools read-only `File` handles without ever holding the pool lock across
-/// disk I/O so multiple decoder threads read concurrently without sharing a
-/// single OS file cursor.
+/// On Unix, retains a single immutable open file descriptor and calls lock-free
+/// POSIX `pread(2)` (`FileExt::read_at`), eliminating pool contention and
+/// path-reopen inode skew. On Windows/other platforms, pools read-only `File`
+/// handles without holding the pool lock across disk I/O.
 pub struct LocalFileSource {
     path: PathBuf,
     len: u64,
     mtime_ns: Option<i128>,
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
     pool: Mutex<Vec<File>>,
 }
 
@@ -45,6 +55,9 @@ impl LocalFileSource {
             path: path_ref.to_path_buf(),
             len,
             mtime_ns,
+            #[cfg(unix)]
+            file,
+            #[cfg(not(unix))]
             pool: Mutex::new(vec![file]),
         })
     }
@@ -60,6 +73,7 @@ impl LocalFileSource {
         self.mtime_ns
     }
 
+    #[cfg(not(unix))]
     fn acquire_handle(&self) -> Result<PooledFile<'_>, IoError> {
         let maybe = lock_unpoisoned(&self.pool).pop();
         let file = match maybe {
@@ -74,12 +88,14 @@ impl LocalFileSource {
     }
 }
 
+#[cfg(not(unix))]
 struct PooledFile<'a> {
     pool: &'a Mutex<Vec<File>>,
     file: Option<File>,
     reusable: bool,
 }
 
+#[cfg(not(unix))]
 impl Drop for PooledFile<'_> {
     fn drop(&mut self) {
         if !self.reusable {
@@ -107,14 +123,21 @@ impl ByteSource for LocalFileSource {
             return Ok(0);
         }
 
-        let mut handle = self.acquire_handle()?;
-        let file = handle
-            .file
-            .as_mut()
-            .ok_or_else(|| IoError::InvalidInput("missing pooled file handle".to_string()))?;
-        let read = read_file_at(file, offset, buf, cancel)?;
-        handle.reusable = true;
-        Ok(read)
+        #[cfg(unix)]
+        {
+            read_file_at(&self.file, offset, buf, cancel)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut handle = self.acquire_handle()?;
+            let file = handle
+                .file
+                .as_mut()
+                .ok_or_else(|| IoError::InvalidInput("missing pooled file handle".to_string()))?;
+            let read = read_file_at(file, offset, buf, cancel)?;
+            handle.reusable = true;
+            Ok(read)
+        }
     }
 }
 
@@ -128,7 +151,7 @@ pub(crate) fn metadata_mtime_ns(meta: &Metadata) -> Option<i128> {
 
 #[cfg(unix)]
 fn read_file_at(
-    file: &mut File,
+    file: &File,
     offset: u64,
     buf: &mut [u8],
     cancel: &CancelToken,

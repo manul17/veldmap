@@ -32,12 +32,25 @@ fn tile_scheme_parent_respects_level_direction_without_inverting() {
 
     let pyr = TileScheme::RasterPyramid { max_level: 5 };
     assert!(pyr.as_planetary().is_none());
-    assert!(pyr.as_globe().is_none());
     assert_eq!(pyr.parent(5, 0, 0), None);
     assert_eq!(pyr.parent(6, 0, 0), None);
     assert_eq!(pyr.parent(0, 5, 7), Some((1, 2, 3)));
     assert_eq!(pyr.parent(4, 1, 1), Some((5, 0, 0)));
     assert!(pyr.coarseness_rank(5) < pyr.coarseness_rank(0));
+
+    // Fingerprint formatting & direct BLAKE3 -> SourceId derivation.
+    let fp = SourceFingerprint::from_digest([0xAB; 32]);
+    let hex = fp.to_hex();
+    assert_eq!(hex.len(), 64);
+    assert!(
+        hex.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+    assert!(format!("{fp:?}").contains("abababababab.."));
+    assert_eq!(
+        SourceId::from_fingerprint(&fp).0,
+        u64::from_le_bytes([0xAB; 8]) | (1u64 << 63)
+    );
 
     // RasterPyramid keys never convert to planetary QuadTileId and reject
     // out-of-range levels (`level > max_level`) as pinned roots.
@@ -195,7 +208,7 @@ fn grid_dims_sub_rect_and_coarsest_first_tie_breaking_are_deterministic() {
         [0.75, 0.5, 0.25, 0.125]
     );
 
-    let fp = crate::io::SourceFingerprint::from_digest([0xAB; 32]);
+    let fp = SourceFingerprint::from_digest([0xAB; 32]);
     let fp_id = SourceId::from_fingerprint(&fp);
     assert_ne!(fp_id, SourceId::BUNDLED_BASEMAP);
     assert_eq!(SourceId::from(&fp), fp_id);

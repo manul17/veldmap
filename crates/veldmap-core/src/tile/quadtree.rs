@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use glam::DVec3;
 
 use crate::geo::camera::Camera;
-use crate::geo::cull::{Ball, Frame as CullFrame};
+use crate::geo::cull::{Ball, CullFrustum};
 use crate::geo::geodesy;
 use crate::geo::projection::web_mercator_lat_deg;
 use crate::geo::sag;
@@ -167,38 +167,6 @@ pub fn describe_tile(id: QuadTileId, config: &QuadtreeConfig) -> Option<VisibleT
     describe_tile_with_samples(id, config).map(|described| described.tile)
 }
 
-/// Intentionally factors the 5x5 grid into 5 lat + 5 lon trig evaluations
-/// (`10 sin_cos + 5 sqrt` instead of `50 sin_cos + 25 sqrt` per visited node).
-fn fill_separable_grid(
-    lats_deg: [f64; 5],
-    lons_deg: [f64; 5],
-    samples: &mut [DVec3; 25],
-    sample_units: &mut [DVec3; 25],
-) {
-    let e2 = geodesy::WGS84.eccentricity_sq();
-    let one_minus_e2 = 1.0 - e2;
-    let mut lat_cache = [(0.0_f64, 0.0_f64, 0.0_f64); 5];
-    for (slot, lat_deg) in lat_cache.iter_mut().zip(lats_deg) {
-        let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
-        let curvature = geodesy::SEMI_MAJOR_M / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-        *slot = (sin_lat, cos_lat, curvature);
-    }
-    let mut lon_cache = [(0.0_f64, 0.0_f64); 5];
-    for (slot, lon_deg) in lon_cache.iter_mut().zip(lons_deg) {
-        *slot = lon_deg.to_radians().sin_cos();
-    }
-    let mut idx = 0usize;
-    for &(sin_lat, cos_lat, curvature) in &lat_cache {
-        let eq = curvature * cos_lat;
-        let z = curvature * one_minus_e2 * sin_lat;
-        for &(sin_lon, cos_lon) in &lon_cache {
-            sample_units[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
-            samples[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
-            idx += 1;
-        }
-    }
-}
-
 fn sample_geodetic_grid(
     id: QuadTileId,
     grid_cells: f64,
@@ -210,7 +178,7 @@ fn sample_geodetic_grid(
         .map(|row| lerp_f64(b.lat_north_deg, b.lat_south_deg, f64::from(row) * 0.25));
     let lons = [0u32, 1, 2, 3, 4]
         .map(|col| lerp_f64(b.lon_west_deg, b.lon_east_deg, f64::from(col) * 0.25));
-    fill_separable_grid(lats, lons, samples, sample_units);
+    geodesy::WGS84.fill_separable_surface_grid(lats, lons, samples, sample_units);
 
     if b.lat_north_deg >= b.raw_lat_north_deg && b.lat_south_deg <= b.raw_lat_south_deg {
         return Some(0.0);
@@ -240,7 +208,7 @@ fn sample_web_mercator_grid(
         .map(|row| web_mercator_lat_deg(lerp_f64(merc_n, merc_s, f64::from(row) * 0.25)));
     let lons =
         [0u32, 1, 2, 3, 4].map(|col| lerp_f64(lon_west_deg, lon_east_deg, f64::from(col) * 0.25));
-    fill_separable_grid(lats, lons, samples, sample_units);
+    geodesy::WGS84.fill_separable_surface_grid(lats, lons, samples, sample_units);
 
     // Evaluate the most equatorial mesh cell directly so non-linear
     // Mercator stretching at coarse z=0..1 does not underestimate sag.
@@ -270,8 +238,8 @@ fn sample_polar_cap_grid(
         let t = f64::from(row) * 0.25;
         for col in 0..5u32 {
             let s = f64::from(col) * 0.25;
-            let (lat, lon, _, _, _, _) = sample_tile_surface(id, s, t)?;
-            let (ecef, unit) = geodesy::surface_ecef_and_normal(lat, lon);
+            let sample = sample_tile_surface(id, s, t)?;
+            let (ecef, unit) = geodesy::surface_ecef_and_normal(sample.lat_deg, sample.lon_deg);
             sample_units[idx] = unit;
             samples[idx] = ecef;
             idx += 1;
@@ -363,7 +331,7 @@ fn describe_tile_with_samples(id: QuadTileId, config: &QuadtreeConfig) -> Option
     })
 }
 
-fn tile_visible(frustum: &CullFrame, described: &DescribedTile) -> bool {
+fn tile_visible(frustum: &CullFrustum, described: &DescribedTile) -> bool {
     // Only apply the 5x5 sample horizon shortcut once subcells are small enough
     // that spherical-trapezoid circumradius stays within `1.15 * half_diag`;
     // coarse planetary roots (z = 0..1) rely solely on their enclosing `Ball`.
@@ -560,7 +528,7 @@ fn neighbor_id(id: QuadTileId, dx: i32, dy: i32) -> Option<QuadTileId> {
 
 fn balance_2_to_1(
     leaves: &mut HashMap<QuadTileId, VisibleTile>,
-    frustum: &CullFrame,
+    frustum: &CullFrustum,
     config: &QuadtreeConfig,
 ) {
     loop {

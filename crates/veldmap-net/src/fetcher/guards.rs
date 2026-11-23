@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit};
-use veldmap_core::io::lock_unpoisoned;
+use veldmap_core::sync::lock_unpoisoned;
 use veldmap_core::tile::TileKey;
 
 use super::state::PipelineState;
@@ -90,7 +90,7 @@ impl Drop for PermitGuard {
 
 #[cfg(test)]
 mod tests {
-    use veldmap_core::io::CancelToken;
+    use veldmap_core::sync::CancelToken;
     use veldmap_core::tile::{PlanetaryScheme, QuadTileId};
 
     use crate::basemap::LiveBasemapSpec;

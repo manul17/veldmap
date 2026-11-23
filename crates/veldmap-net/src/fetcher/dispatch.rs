@@ -1,17 +1,17 @@
 //! Two-stage disk-lookup and per-host HTTP dispatcher loop for
 //! [`super::LiveTilePipeline`].
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::OwnedSemaphorePermit;
-use veldmap_core::io::{CancelToken, lock_unpoisoned};
+use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::TileKey;
 
 use crate::TileBlobStore;
 use crate::basemap::LiveBasemapSpec;
 use crate::http::PermitDenied;
-use crate::redact::extract_host;
 
 use super::PipelineContext;
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
@@ -25,7 +25,6 @@ const MAX_CONCURRENT_DISK_LOOKUPS: usize = 4;
 pub(super) struct HttpFetchInput {
     pub(super) key: TileKey,
     pub(super) spec: Arc<LiveBasemapSpec>,
-    pub(super) url: String,
     pub(super) host: String,
     pub(super) cancel: CancelToken,
 }
@@ -89,7 +88,8 @@ fn plan_http_tasks(
     earliest_wakeup: &mut Option<Instant>,
 ) -> Vec<HttpTask> {
     let active_source = spec.source_id();
-    let multi_host = spec.uses_subdomains();
+    let total_hosts = spec.host_count();
+    let mut denied_hosts: HashSet<&str> = HashSet::with_capacity(total_hosts);
     let mut deferred_http = Vec::new();
     let mut tasks = Vec::new();
 
@@ -97,20 +97,23 @@ fn plan_http_tasks(
         let Some(id) = key.quad_id() else {
             continue;
         };
-        let Ok(url) = spec.resolve_url(id) else {
+        if spec.validate_tile(id).is_err() {
             st.insert_failure(key, FailureMarker::Terminal);
             continue;
-        };
-        let host = extract_host(&url);
-        match ctx.host_limiters.try_acquire_permit(&host, now) {
+        }
+        let host = spec.host_for(id);
+        if denied_hosts.contains(host) {
+            deferred_http.push(key);
+            continue;
+        }
+        match ctx.host_limiters.try_acquire_permit(host, now) {
             Ok(permit) => {
                 let (generation, cancel) = st.register_http_in_flight(key, &ctx.shutdown);
                 tasks.push(HttpTask {
                     input: HttpFetchInput {
                         key,
                         spec: Arc::clone(spec),
-                        url,
-                        host,
+                        host: host.to_owned(),
                         cancel,
                     },
                     generation,
@@ -120,20 +123,22 @@ fn plan_http_tasks(
             Err(PermitDenied::Cooldown(until)) => {
                 *earliest_wakeup = min_instant(*earliest_wakeup, until);
                 deferred_http.push(key);
-                if !multi_host {
+                denied_hosts.insert(host);
+                if denied_hosts.len() >= total_hosts {
                     break;
                 }
             }
             Err(PermitDenied::Saturated) => {
                 deferred_http.push(key);
-                if !multi_host {
+                denied_hosts.insert(host);
+                if denied_hosts.len() >= total_hosts {
                     break;
                 }
             }
         }
     }
 
-    st.restore_deferred_http(deferred_http, multi_host);
+    st.restore_deferred_http(deferred_http);
     tasks
 }
 

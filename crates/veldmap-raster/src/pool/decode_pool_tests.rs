@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use image::{ImageBuffer, ImageFormat, Rgba};
-use veldmap_core::tile::{PlanetaryScheme, QuadTileId, SourceId};
+use veldmap_core::tile::{BandKey, PixelFormat, PlanetaryScheme, QuadTileId, SourceId, StreamKey};
 
 use crate::decode_map_tile_with_mipmaps;
 
@@ -18,8 +18,8 @@ fn make_png(color: [u8; 4]) -> Vec<u8> {
     out
 }
 
-fn tile_key(level: u8, x: u32, y: u32) -> TileKey {
-    TileKey::display_quad(
+fn tile_key(level: u8, x: u32, y: u32) -> DecodeJobKey {
+    DecodeJobKey::Tile(TileKey::display_quad(
         SourceId::from_stable_key("decode-test"),
         QuadTileId {
             scheme: PlanetaryScheme::WebMercator,
@@ -27,7 +27,7 @@ fn tile_key(level: u8, x: u32, y: u32) -> TileKey {
             x,
             y,
         },
-    )
+    ))
 }
 
 fn default_queue() -> Arc<(Mutex<DecodeQueue>, Condvar)> {
@@ -79,7 +79,7 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
         lock_unpoisoned(&shared.0)
             .jobs
             .iter()
-            .all(|j| j.key.level == 5)
+            .all(|j| j.key.coarseness_rank() == 5)
     );
 
     // Coarser incoming job (level 0) evicts one level 5 job and is admitted.
@@ -112,7 +112,7 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
         cancel: tok.clone(),
         work: Box::new(|| {}),
     }));
-    let peer_key = TileKey::display_quad(
+    let peer_key = DecodeJobKey::Tile(TileKey::display_quad(
         SourceId::new(1),
         QuadTileId {
             scheme: PlanetaryScheme::WebMercator,
@@ -120,7 +120,7 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
             x: 0,
             y: 0,
         },
-    );
+    ));
     assert!(!peer_handle.submit(DecodeJob {
         key: peer_key,
         queued_bytes: 0,
@@ -200,6 +200,90 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
         tx_q.jobs.iter().any(|j| j.key == fine_key),
         "failed byte-cap admission must not evict finer queued jobs"
     );
+}
+
+#[test]
+fn pass_job_keys_deduplicate_and_two_lane_threads_carry_distinct_names() {
+    let shared = default_queue();
+    let handle = DecodePoolHandle {
+        shared: Arc::clone(&shared),
+    };
+    let tok = CancelToken::new();
+    let pass_key = StreamKey {
+        source: SourceId::new(42),
+        band: BandKey::Display,
+        format: PixelFormat::Rgba8UnormSrgb,
+        gutter: 0,
+    };
+    assert!(handle.submit(DecodeJob {
+        key: pass_key.into(),
+        queued_bytes: 0,
+        cancel: tok.clone(),
+        work: Box::new(|| {}),
+    }));
+    assert!(!handle.submit(DecodeJob {
+        key: DecodeJobKey::Pass(pass_key),
+        queued_bytes: 0,
+        cancel: tok.clone(),
+        work: Box::new(|| {}),
+    }));
+
+    let shutdown = CancelToken::new();
+    let pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig {
+            fast: DecodePoolConfig {
+                worker_count: 1,
+                ..DecodePoolConfig::default()
+            },
+            bulk: DecodePoolConfig {
+                worker_count: 1,
+                ..DecodePoolConfig::default()
+            },
+        },
+        shutdown.clone(),
+    );
+    let two_handle = pool.handle();
+    let (fast_tx, fast_rx) = mpsc::channel();
+    let (bulk_tx, bulk_rx) = mpsc::channel();
+    assert!(two_handle.submit(
+        DecodeLane::Fast,
+        DecodeJob {
+            key: tile_key(0, 0, 0),
+            queued_bytes: 0,
+            cancel: shutdown.child_token(),
+            work: Box::new(move || {
+                let name = thread::current().name().unwrap_or("").to_string();
+                let _ = fast_tx.send(name);
+            }),
+        }
+    ));
+    assert!(two_handle.submit(
+        DecodeLane::Bulk,
+        DecodeJob {
+            key: DecodeJobKey::Pass(pass_key),
+            queued_bytes: 0,
+            cancel: shutdown.child_token(),
+            work: Box::new(move || {
+                let name = thread::current().name().unwrap_or("").to_string();
+                let _ = bulk_tx.send(name);
+            }),
+        }
+    ));
+    let fast_name = fast_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fast thread name");
+    let bulk_name = bulk_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("bulk thread name");
+    assert!(
+        fast_name.starts_with("veldmap-decode-fast-"),
+        "fast_name={fast_name}"
+    );
+    assert!(
+        bulk_name.starts_with("veldmap-decode-bulk-"),
+        "bulk_name={bulk_name}"
+    );
+    pool.shutdown();
 }
 
 #[test]

@@ -2,13 +2,15 @@
 
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
-use veldmap_core::budget::{DecodePeak, MemoryBudget};
-use veldmap_core::io::{BufferedByteReader, CancelToken, IoError};
+use veldmap_core::budget::MemoryBudget;
+use veldmap_core::io::{BufferedByteReader, IoError};
+use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
-use crate::band::SampleType;
-use crate::grid;
-use crate::radiometry::{DisplayMapping, PixelLayout, Samples};
+use crate::pipeline::band::SampleType;
+use crate::pipeline::grid;
+use crate::pipeline::peak::DecodePeak;
+use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples};
 
 const DECODED_COMPRESSIONS: [u16; 7] = [
     1,      // None
@@ -33,16 +35,11 @@ pub(super) fn map_tiff_error(err: tiff::TiffError, cancel: &CancelToken) -> Rast
         {
             RasterError::Cancelled
         }
-        tiff::TiffError::IoError(io_err) => RasterError::Io(IoError::Io(std::io::Error::new(
+        tiff::TiffError::IoError(io_err) => RasterError::from(IoError::Io(std::io::Error::new(
             io_err.kind(),
             io_err.to_string(),
         ))),
-        tiff::TiffError::LimitsExceeded => RasterError::LimitExceeded {
-            width: 0,
-            height: 0,
-            estimated_bytes: 0,
-            limit_bytes: 0,
-        },
+        tiff::TiffError::LimitsExceeded => RasterError::DecoderLimitsExceeded(err.to_string()),
         _ => RasterError::Tiff(err.to_string()),
     }
 }

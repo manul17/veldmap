@@ -1,12 +1,14 @@
 //! Sampled BLAKE3 content fingerprinting (`len || head_64k || mid_64k || tail_64k`)
-//! and in-memory `(path, len, mtime_ns)` stat cache with explicit reload/bypass
-//! support.
+//! and bounded in-memory `(path, len, mtime_ns)` stat cache with explicit
+//! reload/bypass support.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use veldmap_core::io::{ByteSource, CancelToken, IoError, SourceFingerprint, lock_unpoisoned};
+use veldmap_core::io::{ByteSource, IoError};
+use veldmap_core::sync::{CancelToken, lock_unpoisoned};
+use veldmap_core::tile::SourceFingerprint;
 
 use crate::StorageError;
 use crate::file_source::{LocalFileSource, metadata_mtime_ns};
@@ -14,9 +16,13 @@ use crate::file_source::{LocalFileSource, metadata_mtime_ns};
 /// Edge/midpoint sample window size (`64 KiB`).
 pub const FINGERPRINT_SAMPLE_BYTES: u64 = 64 * 1024;
 
+/// Maximum stat entries retained in [`LocalFingerprintCache`] so long-running
+/// sessions cannot grow the in-memory cache without bound.
+const MAX_FINGERPRINT_CACHE_ENTRIES: usize = 1024;
+
 /// Compute non-overlapping `(offset, len)` sample windows covering
 /// `head_64k || mid_64k || tail_64k` for a stream of `total_len` bytes.
-pub fn sample_ranges(total_len: u64) -> Vec<(u64, usize)> {
+pub(crate) fn sample_ranges(total_len: u64) -> Vec<(u64, usize)> {
     let s = FINGERPRINT_SAMPLE_BYTES;
     if total_len == 0 {
         return Vec::new();
@@ -51,14 +57,20 @@ pub fn fingerprint_byte_source(
     source: &dyn ByteSource,
     cancel: &CancelToken,
 ) -> Result<SourceFingerprint, IoError> {
+    if cancel.is_cancelled() {
+        return Err(IoError::Cancelled);
+    }
     let total_len = source.len();
     let mut hasher = blake3::Hasher::new();
     hasher.update(&total_len.to_le_bytes());
 
-    let mut scratch = vec![0u8; FINGERPRINT_SAMPLE_BYTES as usize];
-    for (offset, size) in sample_ranges(total_len) {
-        source.read_exact_at(offset, &mut scratch[..size], cancel)?;
-        hasher.update(&scratch[..size]);
+    let ranges = sample_ranges(total_len);
+    if !ranges.is_empty() {
+        let mut scratch = vec![0u8; FINGERPRINT_SAMPLE_BYTES as usize];
+        for (offset, size) in ranges {
+            source.read_exact_at(offset, &mut scratch[..size], cancel)?;
+            hasher.update(&scratch[..size]);
+        }
     }
     Ok(SourceFingerprint::from_digest(
         *hasher.finalize().as_bytes(),
@@ -72,9 +84,9 @@ struct CachedStat {
     fingerprint: SourceFingerprint,
 }
 
-/// In-memory `(path, len, mtime_ns)` stat cache avoiding repeated BLAKE3 reads
-/// when re-opening unchanged local files, with explicit bypass/invalidation for
-/// UI "Reload / bypass cache" actions.
+/// Bounded in-memory `(path, len, mtime_ns)` stat cache avoiding repeated
+/// BLAKE3 reads when re-opening unchanged local files, with explicit
+/// bypass/invalidation for UI "Reload / bypass cache" actions.
 #[derive(Default)]
 pub struct LocalFingerprintCache {
     entries: Mutex<HashMap<PathBuf, CachedStat>>,
@@ -104,6 +116,9 @@ impl LocalFingerprintCache {
         bypass_cache: bool,
         cancel: &CancelToken,
     ) -> Result<SourceFingerprint, StorageError> {
+        if cancel.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let meta = std::fs::metadata(&key)?;
         if !meta.is_file() {
@@ -126,11 +141,11 @@ impl LocalFingerprintCache {
             }
         }
 
+        if cancel.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
         let source = LocalFileSource::open(&key)?;
-        let fingerprint = fingerprint_byte_source(&source, cancel).map_err(|err| match err {
-            IoError::Io(io_err) => StorageError::Io(io_err),
-            other => StorageError::Io(other.into_std_io()),
-        })?;
+        let fingerprint = fingerprint_byte_source(&source, cancel)?;
 
         // Re-stat after hashing so concurrent in-place edits or replacements
         // during the read never cache a torn `(mtime_ns, fingerprint)` pair.
@@ -142,6 +157,9 @@ impl LocalFingerprintCache {
 
         let mut guard = lock_unpoisoned(&self.entries);
         if post_stable {
+            if !guard.contains_key(&key) && guard.len() >= MAX_FINGERPRINT_CACHE_ENTRIES {
+                guard.clear();
+            }
             guard.insert(
                 key,
                 CachedStat {
@@ -185,7 +203,7 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use veldmap_core::io::{CountingByteSource, MemoryByteSource};
+    use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 
     use super::*;
     use crate::test_support::TestTempDir;
@@ -209,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_detects_mid_changes_and_stat_cache_honors_bypass() {
+    fn fingerprint_detects_mid_changes_and_stat_cache_honors_bypass_and_cancel() {
         let cancel = CancelToken::new();
         let mut data = vec![0x11u8; (4 * FINGERPRINT_SAMPLE_BYTES) as usize];
         let fp1 = fingerprint_byte_source(&MemoryByteSource::from_vec(data.clone()), &cancel)
@@ -243,6 +261,15 @@ mod tests {
             .get_or_compute_with_bypass(&path, true, &cancel)
             .expect("bypass");
         assert_eq!(cached2, fp2);
+
+        // Pre-cancelled token returns typed `StorageError::Cancelled` without I/O.
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        assert!(
+            cache
+                .get_or_compute(&path, &cancelled)
+                .is_err_and(|e| e.is_cancelled())
+        );
 
         // Same length rewrite with a different byte in head; bypass catches it even if coarse mtime ties.
         data[0] ^= 0x55;

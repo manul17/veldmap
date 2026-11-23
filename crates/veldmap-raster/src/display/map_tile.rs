@@ -7,7 +7,8 @@ use image::{ColorType, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Lim
 use veldmap_core::tile::{DecodedTile, PixelFormat};
 
 use crate::RasterError;
-use crate::mipmap::generate_linear_mipmaps;
+
+use super::mipmap::generate_linear_mipmaps;
 
 /// Maximum single map-tile dimension accepted by [`decode_map_tile`].
 const MAX_MAP_TILE_DIM: u32 = 2048;
@@ -52,7 +53,7 @@ fn map_image_err(
             estimated_bytes,
             limit_bytes,
         },
-        other => RasterError::Decode(other),
+        other => RasterError::Decode(std::sync::Arc::new(other)),
     }
 }
 

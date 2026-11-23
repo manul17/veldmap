@@ -1,11 +1,11 @@
-use veldmap_core::tile::{BandKey, PlanetaryScheme, QuadTileId, TileScheme};
+use veldmap_core::tile::{BandKey, PixelFormat, PlanetaryScheme, QuadTileId, TileScheme};
 
 use crate::basemap_policy::{bundled_tile_key, source_tile_key};
 
 use super::*;
 
 #[test]
-fn pending_uploads_clear_source_and_queued_byte_cap_preserve_roots() {
+fn pending_uploads_enforces_byte_cap_on_enqueue_and_preserves_roots() {
     let mut pending = PendingUploads::with_max_queued_bytes(10);
     let tx = pending.sender().expect("sender");
     let live_a = SourceId::from_stable_key("live-a");
@@ -36,18 +36,9 @@ fn pending_uploads_clear_source_and_queued_byte_cap_preserve_roots() {
     assert_eq!(pending.count_for_source(SourceId::BUNDLED_BASEMAP), 1);
     assert_eq!(pending.queued_bytes(), 4);
 
-    // Push two finer non-pinned tiles (4 B each -> 12 B > 10 B cap):
-    // enforcing the cap must drop the finest non-pinned tile (z=3) while
-    // keeping the pinned root (z=0) and coarser z=1 tile (8 B <= 10 B).
-    let k_z1 = source_tile_key(
-        live_a,
-        QuadTileId {
-            scheme: PlanetaryScheme::WebMercator,
-            level: 1,
-            x: 0,
-            y: 0,
-        },
-    );
+    // Send finer z=3 first (8 B total <= 10 B), then coarser z=1 (would be 12 B > 10 B):
+    // enqueue-time backpressure MUST immediately evict finest non-pinned z=3 without
+    // requiring any UI drain, preserving pinned root z=0 and coarser z=1.
     let k_z3 = source_tile_key(
         live_a,
         QuadTileId {
@@ -57,15 +48,51 @@ fn pending_uploads_clear_source_and_queued_byte_cap_preserve_roots() {
             y: 0,
         },
     );
-    pending.insert_queued(k_z1, tile_4b.clone());
-    pending.insert_queued(k_z3, tile_4b);
-    assert_eq!(pending.queued_bytes(), 12);
-
-    pending.enforce_queued_byte_cap(&[SourceId::BUNDLED_BASEMAP]);
+    let k_z1 = source_tile_key(
+        live_a,
+        QuadTileId {
+            scheme: PlanetaryScheme::WebMercator,
+            level: 1,
+            x: 0,
+            y: 0,
+        },
+    );
+    tx.send((k_z3, tile_4b.clone())).expect("send z3");
     assert_eq!(pending.queued_bytes(), 8);
+    assert!(pending.contains(&k_z3));
+
+    tx.send((k_z1, tile_4b.clone())).expect("send z1");
+    assert_eq!(
+        pending.queued_bytes(),
+        8,
+        "enqueue must enforce max_queued_bytes without UI drain"
+    );
     assert!(pending.contains(&k_bundled));
     assert!(pending.contains(&k_z1));
     assert!(!pending.contains(&k_z3));
+
+    // Burst of 100 fine tiles with NO UI drain must stay strictly bounded <= 10 B.
+    for x in 0..100u32 {
+        let fine = source_tile_key(
+            live_a,
+            QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 8,
+                x,
+                y: 0,
+            },
+        );
+        tx.send((fine, tile_4b.clone())).expect("send burst");
+        assert!(pending.queued_bytes() <= 10);
+    }
+    assert!(pending.contains(&k_bundled));
+    assert!(pending.contains(&k_z1));
+
+    // Closing the queue rejects further sends and frees all queued bytes.
+    pending.close();
+    assert_eq!(pending.queued_bytes(), 0);
+    assert!(pending.sender().is_none());
+    assert_eq!(tx.send((k_z1, tile_4b)), Err(UploadChannelClosed));
 }
 
 #[test]

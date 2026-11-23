@@ -1,15 +1,18 @@
-//! Durable atomic state persistence, injectable storage paths, and crash-safe
-//! SQLite WAL LRU tile disk caching for VeldMap.
+//! Durable atomic state persistence, injectable storage paths, platform host
+//! RAM probing, positioned local file I/O, BLAKE3 fingerprinting, and
+//! crash-safe SQLite WAL LRU tile disk caching for VeldMap.
 //!
 //! Focused strictly on storage mechanics: application-level preference and
 //! session schemas live in `veldmap-app` and persist through
 //! [`read_json_or_default_with_backup`] / [`write_json_durable_private`].
 
 use thiserror::Error;
+use veldmap_core::io::IoError;
 
 mod atomic;
 mod file_source;
 mod fingerprint;
+mod host;
 mod paths;
 mod tile_cache;
 
@@ -18,9 +21,8 @@ pub use atomic::{
     write_atomic_durable_private, write_json_durable, write_json_durable_private,
 };
 pub use file_source::LocalFileSource;
-pub use fingerprint::{
-    FINGERPRINT_SAMPLE_BYTES, LocalFingerprintCache, fingerprint_byte_source, sample_ranges,
-};
+pub use fingerprint::{FINGERPRINT_SAMPLE_BYTES, LocalFingerprintCache, fingerprint_byte_source};
+pub use host::{detect_host_ram_bytes, detect_memory_budget};
 pub use paths::StoragePaths;
 pub use tile_cache::{
     DiskCacheStats, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES, TileBlobEncoding,
@@ -65,6 +67,8 @@ pub(crate) mod test_support {
 /// Errors produced by durable storage and disk cache operations.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("storage operation cancelled")]
+    Cancelled,
     #[error("unable to determine platform application directories")]
     NoPlatformDirs,
     #[error("invalid storage path: {0}")]
@@ -77,4 +81,21 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("SQLite cache error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+}
+
+impl StorageError {
+    /// Return whether this error represents task cancellation.
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
+impl From<IoError> for StorageError {
+    fn from(err: IoError) -> Self {
+        match err {
+            IoError::Cancelled => Self::Cancelled,
+            IoError::Io(io_err) => Self::Io(io_err),
+            other => Self::Io(other.into_std_io()),
+        }
+    }
 }

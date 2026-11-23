@@ -78,7 +78,7 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         UploadPassParams {
             pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
             observed_source: Some(SourceId::BUNDLED_BASEMAP),
-            wanted: None,
+            wanted: &[],
             protected: None,
             byte_budget: 1,
             time_budget: Duration::from_millis(0),
@@ -116,7 +116,7 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         UploadPassParams {
             pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
             observed_source: Some(SourceId::BUNDLED_BASEMAP),
-            wanted: None,
+            wanted: &[],
             protected: None,
             byte_budget: 1024 * 1024,
             time_budget: Duration::from_secs(1),
@@ -145,7 +145,7 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         UploadPassParams {
             pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
             observed_source: Some(SourceId::BUNDLED_BASEMAP),
-            wanted: None,
+            wanted: &[],
             protected: None,
             byte_budget: 1024 * 1024,
             time_budget: Duration::from_secs(1),
@@ -302,7 +302,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         UploadPassParams {
             pinned_root_sources: &pinned_live,
             observed_source: Some(live_source),
-            wanted: Some(&HashSet::from([live_root])),
+            wanted: &[&HashSet::from([live_root])],
             protected: Some(&fallback_snap.carrier_keys),
             byte_budget: 1024 * 1024,
             time_budget: Duration::from_secs(1),
@@ -333,7 +333,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         UploadPassParams {
             pinned_root_sources: &pinned_live,
             observed_source: Some(live_source),
-            wanted: Some(&HashSet::from([south_polar_root])),
+            wanted: &[&HashSet::from([south_polar_root])],
             protected: Some(&all_protected),
             byte_budget: 1024 * 1024,
             time_budget: Duration::from_secs(1),
@@ -378,7 +378,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         UploadPassParams {
             pinned_root_sources: &pinned_live,
             observed_source: Some(live_source),
-            wanted: Some(&HashSet::from([south_polar_root])),
+            wanted: &[&HashSet::from([south_polar_root])],
             protected: Some(&live_snap.carrier_keys),
             byte_budget: 1024 * 1024,
             time_budget: Duration::from_secs(1),

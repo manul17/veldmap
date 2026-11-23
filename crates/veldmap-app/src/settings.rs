@@ -12,26 +12,28 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use veldmap_net::{
-    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, fmt_redacted_custom_xyz_fields, is_valid_gibs_date,
+    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, is_valid_gibs_date,
+    redact_secret_label, sanitize_url_for_display,
 };
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
 };
 
 /// Default disk cache cap in mebibytes (`512 MiB`).
-pub const DEFAULT_DISK_CACHE_MAX_MB: u64 = 512;
+pub(crate) const DEFAULT_DISK_CACHE_MAX_MB: u64 = 512;
 
 /// Minimum configurable disk cache cap in mebibytes (`16 MiB`).
-pub const MIN_DISK_CACHE_MAX_MB: u64 = 16;
+pub(crate) const MIN_DISK_CACHE_MAX_MB: u64 = 16;
 
 /// Maximum configurable disk cache cap in mebibytes (`16 GiB`).
-pub const MAX_DISK_CACHE_MAX_MB: u64 = 16 * 1024;
+pub(crate) const MAX_DISK_CACHE_MAX_MB: u64 = 16 * 1024;
 
 /// Allowed slider range for Custom XYZ / TMS maximum zoom levels.
-pub const CUSTOM_MAX_LEVEL_RANGE: RangeInclusive<u8> = CUSTOM_MAX_LEVEL_MIN..=CUSTOM_MAX_LEVEL_MAX;
+pub(crate) const CUSTOM_MAX_LEVEL_RANGE: RangeInclusive<u8> =
+    CUSTOM_MAX_LEVEL_MIN..=CUSTOM_MAX_LEVEL_MAX;
 
 /// Allowed slider range for the SQLite WAL tile disk cache budget in MiB.
-pub const DISK_CACHE_MAX_MB_RANGE: RangeInclusive<u64> =
+pub(crate) const DISK_CACHE_MAX_MB_RANGE: RangeInclusive<u64> =
     MIN_DISK_CACHE_MAX_MB..=MAX_DISK_CACHE_MAX_MB;
 
 /// Validate an explicit `YYYY-MM-DD` UTC date string for NASA GIBS daily layers.
@@ -39,12 +41,20 @@ pub(crate) fn validate_gibs_date(date: &str) -> bool {
     is_valid_gibs_date(date.trim())
 }
 
+/// Validate a user-supplied Custom XYZ / TMS URL template without exposing
+/// `veldmap-net` directly to UI widgets.
+pub(crate) fn validate_custom_url_template(template: &str) -> Result<(), String> {
+    veldmap_net::validate_custom_url_template(template)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
 /// Current JSON schema version for [`AppSettings`].
-pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SETTINGS_SCHEMA_VERSION: u32 = 1;
 
 /// Default explicit UTC date (`YYYY-MM-DD`) for NASA GIBS daily reflectance
 /// layers.
-pub const DEFAULT_GIBS_DATE: &str = "2024-07-01";
+pub(crate) const DEFAULT_GIBS_DATE: &str = "2024-07-01";
 
 /// Active planetary basemap selection persisted across sessions.
 ///
@@ -53,7 +63,7 @@ pub const DEFAULT_GIBS_DATE: &str = "2024-07-01";
 /// discarding the entire `settings.json` file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum BasemapSelection {
+pub(crate) enum BasemapSelection {
     /// Bundled public-domain NASA Blue Marble (`z = 0..3` Geodetic + `z = 0` PolarCap).
     #[default]
     BundledBlueMarble,
@@ -94,8 +104,30 @@ impl<'de> Deserialize<'de> for BasemapSelection {
 }
 
 impl BasemapSelection {
+    /// All selectable basemap presets in toolbar display order.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::BundledBlueMarble,
+        Self::NasaGibsBlueMarble,
+        Self::NasaGibsViirs,
+        Self::EoxSentinel2Cloudless,
+        Self::CustomXyz,
+        Self::EllipsoidOnly,
+    ];
+
+    /// Short human-readable label for toolbar dropdowns and settings UI.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::BundledBlueMarble => "Offline Blue Marble",
+            Self::NasaGibsBlueMarble => "NASA GIBS Blue Marble",
+            Self::NasaGibsViirs => "NASA GIBS VIIRS True Color",
+            Self::EoxSentinel2Cloudless => "EOX Sentinel-2 Cloudless",
+            Self::CustomXyz => "Custom XYZ / TMS",
+            Self::EllipsoidOnly => "Ellipsoid-only",
+        }
+    }
+
     /// Whether this selection streams tiles over HTTP(S).
-    pub const fn is_live(self) -> bool {
+    pub(crate) const fn is_live(self) -> bool {
         matches!(
             self,
             Self::NasaGibsBlueMarble
@@ -109,13 +141,13 @@ impl BasemapSelection {
 /// User-configured Custom XYZ / TMS basemap settings.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct CustomXyzSettings {
-    pub name: String,
-    pub url_template: String,
-    pub api_key: String,
-    pub tms_flip_y: bool,
-    pub max_level: u8,
-    pub attribution: String,
+pub(crate) struct CustomXyzSettings {
+    pub(crate) name: String,
+    pub(crate) url_template: String,
+    pub(crate) api_key: String,
+    pub(crate) tms_flip_y: bool,
+    pub(crate) max_level: u8,
+    pub(crate) attribution: String,
 }
 
 impl Default for CustomXyzSettings {
@@ -131,32 +163,49 @@ impl Default for CustomXyzSettings {
     }
 }
 
+impl CustomXyzSettings {
+    /// Borrow fields as a `veldmap-net` [`CustomBasemapConfig`].
+    pub(crate) fn as_net_config(&self) -> CustomBasemapConfig<'_> {
+        CustomBasemapConfig {
+            name: &self.name,
+            url_template: &self.url_template,
+            api_key: &self.api_key,
+            tms_flip_y: self.tms_flip_y,
+            max_level: self.max_level,
+            attribution: &self.attribution,
+        }
+    }
+}
+
 impl fmt::Debug for CustomXyzSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("CustomXyzSettings");
-        fmt_redacted_custom_xyz_fields(
-            &mut s,
-            &self.name,
-            &self.url_template,
-            &self.api_key,
-            self.tms_flip_y,
-            self.max_level,
-            &self.attribution,
-        );
-        s.finish()
+        f.debug_struct("CustomXyzSettings")
+            .field("name", &self.name)
+            .field(
+                "url_template",
+                &sanitize_url_for_display(&self.url_template),
+            )
+            .field(
+                "api_key",
+                &redact_secret_label(Some(&self.api_key), "<empty>"),
+            )
+            .field("tms_flip_y", &self.tms_flip_y)
+            .field("max_level", &self.max_level)
+            .field("attribution", &self.attribution)
+            .finish()
     }
 }
 
 /// Durable user application settings saved at `StoragePaths::settings_path()`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AppSettings {
-    pub version: u32,
-    pub active_basemap: BasemapSelection,
-    pub gibs_date: String,
-    pub custom_xyz: CustomXyzSettings,
-    pub disk_cache_max_mb: u64,
-    pub show_graticule: bool,
+pub(crate) struct AppSettings {
+    pub(crate) version: u32,
+    pub(crate) active_basemap: BasemapSelection,
+    pub(crate) gibs_date: String,
+    pub(crate) custom_xyz: CustomXyzSettings,
+    pub(crate) disk_cache_max_mb: u64,
+    pub(crate) show_graticule: bool,
 }
 
 impl Default for AppSettings {
@@ -174,7 +223,7 @@ impl Default for AppSettings {
 
 impl AppSettings {
     /// Clamp numeric settings and sanitize fields loaded from disk.
-    pub fn normalize(&mut self) {
+    pub(crate) fn normalize(&mut self) {
         self.version = SETTINGS_SCHEMA_VERSION;
         self.custom_xyz.max_level = self
             .custom_xyz
@@ -192,7 +241,7 @@ impl AppSettings {
     }
 
     /// Configured disk cache cap in bytes.
-    pub fn disk_cache_max_bytes(&self) -> u64 {
+    pub(crate) fn disk_cache_max_bytes(&self) -> u64 {
         self.disk_cache_max_mb
             .clamp(MIN_DISK_CACHE_MAX_MB, MAX_DISK_CACHE_MAX_MB)
             .saturating_mul(1024 * 1024)
@@ -200,7 +249,7 @@ impl AppSettings {
 
     /// Load settings from `paths.settings_path()`, falling back to defaults if
     /// missing or malformed (backing up corrupt JSON to `settings.json.corrupt`).
-    pub fn load_or_default(paths: &StoragePaths) -> Self {
+    pub(crate) fn load_or_default(paths: &StoragePaths) -> Self {
         let mut settings: Self = read_json_or_default_with_backup(&paths.settings_path());
         settings.normalize();
         settings
@@ -208,7 +257,7 @@ impl AppSettings {
 
     /// Persist settings durably via `write_json_durable_private` (`0600` on
     /// Unix so optional Custom XYZ API keys are owner-readable only).
-    pub fn save(&self, paths: &StoragePaths) -> Result<(), StorageError> {
+    pub(crate) fn save(&self, paths: &StoragePaths) -> Result<(), StorageError> {
         let mut normalized = self.clone();
         normalized.normalize();
         write_json_durable_private(&paths.settings_path(), &normalized)

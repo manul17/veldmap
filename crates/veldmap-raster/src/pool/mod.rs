@@ -1,15 +1,18 @@
 //! Generic bounded `std::thread` CPU decode pool with panic isolation,
 //! configurable job-count + byte queue capping, coarsest-first priority
-//! scheduling, deduplication by `TileKey`, immediate cancellation checks,
-//! outside-mutex drop hygiene, and deterministic shutdown joining.
+//! scheduling, deduplication by [`DecodeJobKey`] (`TileKey` or `PassKey`),
+//! immediate cancellation checks, outside-mutex drop hygiene, and deterministic
+//! shutdown joining.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::io::{CancelGuard, CancelToken, lock_unpoisoned};
+use veldmap_core::sync::{CancelGuard, CancelToken, lock_unpoisoned};
 use veldmap_core::tile::TileKey;
+
+use crate::pipeline::scheduler::PassKey;
 
 /// Default maximum queued decode jobs awaiting a CPU worker.
 pub const DEFAULT_MAX_PENDING_DECODE_JOBS: usize = 128;
@@ -38,10 +41,68 @@ impl Default for DecodePoolConfig {
     }
 }
 
+/// Deduplication and scheduling identity for a [`DecodeJob`], cleanly
+/// distinguishing single-tile fast jobs from `PassKey`-scoped bulk cascade jobs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DecodeJobKey {
+    Tile(TileKey),
+    Pass(PassKey),
+}
+
+impl From<TileKey> for DecodeJobKey {
+    fn from(key: TileKey) -> Self {
+        Self::Tile(key)
+    }
+}
+
+impl From<PassKey> for DecodeJobKey {
+    fn from(key: PassKey) -> Self {
+        Self::Pass(key)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DecodeJobPriority(DecodeJobKey);
+
+impl Ord for DecodeJobPriority {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.0, other.0) {
+            (DecodeJobKey::Tile(a), DecodeJobKey::Tile(b)) => {
+                a.coarsest_first_key().cmp(&b.coarsest_first_key())
+            }
+            (DecodeJobKey::Pass(a), DecodeJobKey::Pass(b)) => a.cmp(&b),
+            (DecodeJobKey::Tile(_), DecodeJobKey::Pass(_)) => std::cmp::Ordering::Less,
+            (DecodeJobKey::Pass(_), DecodeJobKey::Tile(_)) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for DecodeJobPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl DecodeJobKey {
+    /// Coarseness rank (smaller = higher priority). Pass jobs run at equal
+    /// rank `0` and never evict one another.
+    const fn coarseness_rank(self) -> u8 {
+        match self {
+            Self::Tile(key) => key.scheme.coarseness_rank(key.level),
+            Self::Pass(_) => 0,
+        }
+    }
+
+    /// Total deterministic priority key (smaller = dispatched first).
+    const fn priority_key(self) -> DecodeJobPriority {
+        DecodeJobPriority(self)
+    }
+}
+
 /// Single prioritized, byte-accounted CPU decode job submitted to
 /// [`DecodePoolHandle`].
 pub struct DecodeJob {
-    pub key: TileKey,
+    pub key: DecodeJobKey,
     /// Accounted payload/working bytes charged against `max_pending_bytes`.
     pub queued_bytes: usize,
     pub cancel: CancelToken,
@@ -99,7 +160,7 @@ impl DecodeQueue {
     /// Plan eviction victims transactionally before mutating the queue so
     /// rejecting an incoming job never destroys valid finer queued jobs
     /// (always permitting a single job into an empty queue).
-    fn plan_evictions(&self, key: &TileKey, incoming_bytes: usize) -> Option<Vec<usize>> {
+    fn plan_evictions(&self, key: DecodeJobKey, incoming_bytes: usize) -> Option<Vec<usize>> {
         let needs_eviction = !self.jobs.is_empty()
             && (self.jobs.len() >= self.max_pending_jobs
                 || self.queued_bytes.saturating_add(incoming_bytes) > self.max_pending_bytes);
@@ -107,21 +168,21 @@ impl DecodeQueue {
             return Some(Vec::new());
         }
 
-        let incoming_coarse = key.scheme.coarseness_rank(key.level);
+        let incoming_coarse = key.coarseness_rank();
         let mut candidates: Vec<(usize, _, usize)> = self
             .jobs
             .iter()
             .enumerate()
             .filter_map(|(idx, j)| {
-                let victim_coarse = j.key.scheme.coarseness_rank(j.key.level);
+                let victim_coarse = j.key.coarseness_rank();
                 (incoming_coarse < victim_coarse).then_some((
                     idx,
-                    j.key.coarsest_first_key(),
+                    j.key.priority_key(),
                     j.queued_bytes,
                 ))
             })
             .collect();
-        // Finest-first victim order (highest `coarsest_first_key` first).
+        // Finest-first victim order (highest priority tuple first).
         candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
 
         let mut remaining_jobs = self.jobs.len();
@@ -155,7 +216,7 @@ impl DecodeQueue {
             to_drop.push(job);
             return false;
         }
-        let Some(mut victims) = self.plan_evictions(&job.key, job.queued_bytes) else {
+        let Some(mut victims) = self.plan_evictions(job.key, job.queued_bytes) else {
             to_drop.push(job);
             return false;
         };
@@ -178,10 +239,10 @@ pub struct DecodePoolHandle {
 
 impl DecodePoolHandle {
     /// Enqueue a CPU decode job. Prunes cancelled jobs, deduplicates by
-    /// `TileKey`, and enforces both `max_pending_jobs` and `max_pending_bytes`
-    /// caps while always dropping evicted or rejected `DecodeJob`s OUTSIDE
-    /// `DecodeQueue`'s mutex to avoid lock-order deadlocks with caller drop
-    /// guards.
+    /// [`DecodeJobKey`], and enforces both `max_pending_jobs` and
+    /// `max_pending_bytes` caps while always dropping evicted or rejected
+    /// `DecodeJob`s OUTSIDE `DecodeQueue`'s mutex to avoid lock-order deadlocks
+    /// with caller drop guards.
     pub fn submit(&self, job: DecodeJob) -> bool {
         if job.cancel.is_cancelled() {
             return false;
@@ -212,6 +273,16 @@ pub struct DecodePool {
 impl DecodePool {
     /// Spawn a bounded CPU decode pool configured by `config`.
     pub fn spawn(config: DecodePoolConfig, shutdown: CancelToken) -> Self {
+        Self::spawn_named("veldmap-tile-decode", config, shutdown)
+    }
+
+    /// Spawn a bounded CPU decode pool with explicit worker thread name prefix
+    /// (`"{thread_prefix}-{idx}"`).
+    pub fn spawn_named(
+        thread_prefix: &str,
+        config: DecodePoolConfig,
+        shutdown: CancelToken,
+    ) -> Self {
         let count = config.worker_count.clamp(1, 8);
         let shared = Arc::new((
             Mutex::new(DecodeQueue::new(
@@ -242,7 +313,7 @@ impl DecodePool {
             let stop = shutdown.clone();
 
             match thread::Builder::new()
-                .name(format!("veldmap-tile-decode-{idx}"))
+                .name(format!("{thread_prefix}-{idx}"))
                 .spawn(move || {
                     loop {
                         let (job, cancelled_batch) = {
@@ -263,7 +334,7 @@ impl DecodePool {
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, j)| !j.cancel.is_cancelled())
-                                .min_by_key(|(_, j)| j.key.coarsest_first_key())
+                                .min_by_key(|(_, j)| j.key.priority_key())
                                 .map(|(i, _)| i);
                             match best_idx {
                                 Some(i) => (Some(queue.swap_remove_job(i)), Vec::new()),
@@ -357,26 +428,27 @@ pub enum DecodeLane {
     Bulk,
 }
 
-/// Configuration for [`TwoLaneDecodePool::spawn`].
+/// Configuration for [`TwoLaneDecodePool::spawn`], nesting per-lane
+/// [`DecodePoolConfig`] settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TwoLaneDecodePoolConfig {
-    pub fast_workers: usize,
-    pub bulk_workers: usize,
-    pub max_pending_fast_jobs: usize,
-    pub max_pending_fast_bytes: usize,
-    pub max_pending_bulk_jobs: usize,
-    pub max_pending_bulk_bytes: usize,
+    pub fast: DecodePoolConfig,
+    pub bulk: DecodePoolConfig,
 }
 
 impl Default for TwoLaneDecodePoolConfig {
     fn default() -> Self {
         Self {
-            fast_workers: 3,
-            bulk_workers: 2,
-            max_pending_fast_jobs: DEFAULT_MAX_PENDING_DECODE_JOBS,
-            max_pending_fast_bytes: DEFAULT_MAX_PENDING_DECODE_BYTES,
-            max_pending_bulk_jobs: 64,
-            max_pending_bulk_bytes: DEFAULT_MAX_PENDING_DECODE_BYTES,
+            fast: DecodePoolConfig {
+                worker_count: 3,
+                max_pending_jobs: DEFAULT_MAX_PENDING_DECODE_JOBS,
+                max_pending_bytes: DEFAULT_MAX_PENDING_DECODE_BYTES,
+            },
+            bulk: DecodePoolConfig {
+                worker_count: 2,
+                max_pending_jobs: 64,
+                max_pending_bytes: DEFAULT_MAX_PENDING_DECODE_BYTES,
+            },
         }
     }
 }
@@ -384,11 +456,10 @@ impl Default for TwoLaneDecodePoolConfig {
 impl TwoLaneDecodePoolConfig {
     /// Derive lane pending byte caps from startup [`MemoryBudget`].
     pub fn from_budget(budget: &MemoryBudget) -> Self {
-        Self {
-            max_pending_fast_bytes: budget.fast_lane_pending_bytes,
-            max_pending_bulk_bytes: budget.bulk_lane_pending_bytes,
-            ..Self::default()
-        }
+        let mut cfg = Self::default();
+        cfg.fast.max_pending_bytes = budget.fast_lane_pending_bytes;
+        cfg.bulk.max_pending_bytes = budget.bulk_lane_pending_bytes;
+        cfg
     }
 }
 
@@ -430,19 +501,19 @@ pub struct TwoLaneDecodePool {
 impl TwoLaneDecodePool {
     /// Spawn independent fast and bulk decode lanes governed by `shutdown`.
     pub fn spawn(config: TwoLaneDecodePoolConfig, shutdown: CancelToken) -> Self {
-        let fast = DecodePool::spawn(
+        let fast = DecodePool::spawn_named(
+            "veldmap-decode-fast",
             DecodePoolConfig {
-                worker_count: config.fast_workers.clamp(1, 8),
-                max_pending_jobs: config.max_pending_fast_jobs,
-                max_pending_bytes: config.max_pending_fast_bytes,
+                worker_count: config.fast.worker_count.clamp(1, 8),
+                ..config.fast
             },
             shutdown.clone(),
         );
-        let bulk = DecodePool::spawn(
+        let bulk = DecodePool::spawn_named(
+            "veldmap-decode-bulk",
             DecodePoolConfig {
-                worker_count: config.bulk_workers.clamp(1, 4),
-                max_pending_jobs: config.max_pending_bulk_jobs,
-                max_pending_bytes: config.max_pending_bulk_bytes,
+                worker_count: config.bulk.worker_count.clamp(1, 4),
+                ..config.bulk
             },
             shutdown,
         );

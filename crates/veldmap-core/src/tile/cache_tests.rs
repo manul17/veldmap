@@ -157,7 +157,7 @@ fn appetite_cap_and_proportional_budget_stay_strictly_below_half() {
     assert!(cap1 * 2 < cache.max_bytes());
     assert!(cap2 * 4 < cache.max_bytes());
     assert!(cap4 * 8 < cache.max_bytes());
-    assert!(cache.max_tiles_for_pyramid(1, 256 * 256 * 4) < 512);
+    assert!(cache.pyramid_byte_cap(1) / (256 * 256 * 4) < 512);
 
     // Heterogeneous multi-band weights: basemap (349 KiB) + 3x R32Float (1 MiB each) + SCL (256 KiB).
     let w_base = 350_000u64;
@@ -170,15 +170,29 @@ fn appetite_cap_and_proportional_budget_stay_strictly_below_half() {
     assert!(c_f32 > c_base && c_base > c_scl);
     assert!((c_base + 3 * c_f32 + c_scl) * 2 < cache.max_bytes());
     assert!(
-        cache.max_tiles_for_weighted_pyramid(w_f32, total_w, w_f32 as usize) > 0,
-        "R32Float band must receive proportional tile slots"
+        c_f32 >= w_f32 as usize,
+        "R32Float band must receive proportional byte cap"
     );
     assert_eq!(cache.proportional_pyramid_byte_cap(0, total_w), 0);
 
     let small: TileCache<TileKey, u8> = TileCache::new(1000);
-    let per_pyr = small.max_tiles_for_pyramid(4, 200);
-    assert_eq!(per_pyr, 0);
-    assert!(per_pyr * 4 * 200 * 2 < small.max_bytes());
+    let per_pyr_bytes = small.pyramid_byte_cap(4);
+    assert!(per_pyr_bytes * 4 * 2 < small.max_bytes());
+
+    // Shrinking `max_bytes` via `set_max_bytes` evicts LRU entries cleanly.
+    let mut shrinkable = TileCache::new(300);
+    let ka = make_key(TileScheme::WebMercator, 0, 0, 0);
+    let kb = make_key(TileScheme::WebMercator, 1, 0, 0);
+    let kc = make_key(TileScheme::WebMercator, 1, 1, 0);
+    shrinkable.insert(ka, "a", 100).expect("a");
+    shrinkable.insert(kb, "b", 100).expect("b");
+    shrinkable.insert(kc, "c", 100).expect("c");
+    assert_eq!(shrinkable.total_bytes(), 300);
+    let evicted = shrinkable.set_max_bytes(150);
+    assert_eq!(evicted, vec![(ka, "a"), (kb, "b")]);
+    assert_eq!(shrinkable.max_bytes(), 150);
+    assert_eq!(shrinkable.total_bytes(), 100);
+    assert!(shrinkable.contains(&kc));
 }
 
 #[test]

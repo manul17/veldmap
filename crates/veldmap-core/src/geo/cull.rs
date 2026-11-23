@@ -53,7 +53,7 @@ impl Ball {
 /// Conservative frustum + Reverse-Z near-plane + ellipsoidal-horizon culling
 /// frame in `f64` ECEF metres (exact for surface geometry at `height_m <= 0`).
 #[derive(Clone, Copy, Debug)]
-pub struct Frame {
+pub struct CullFrustum {
     inward: [DVec3; 4],
     eye: DVec3,
     forward: DVec3,
@@ -62,7 +62,7 @@ pub struct Frame {
     horizon: f64,
 }
 
-impl Frame {
+impl CullFrustum {
     /// Extract the four side frustum planes, the Reverse-Z near plane, and the
     /// exact WGS84 ellipsoidal tangent horizon plane from a rotation-only
     /// `DMat4` view-projection matrix and `f64` eye in ECEF metres.

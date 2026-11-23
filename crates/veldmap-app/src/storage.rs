@@ -1,17 +1,19 @@
 //! Application-wide storage ownership (`AppStorage`): platform storage paths,
 //! persisted [`AppSettings`], shared SQLite WAL [`TileDiskCache`], and the
-//! serialized off-UI-thread `DiskCacheWorker`.
+//! serialized off-UI-thread `DiskCacheWorker` (handling SQLite maintenance AND
+//! durable `settings.json` saves off the UI thread).
 //!
-//! Stays completely decoupled from `veldmap-net` (using `veldmap_core::io::Wakeup`
-//! and `TileDiskCache::write_generation()`) so local/offline storage never
-//! depends on HTTP streaming.
+//! Stays completely decoupled from `veldmap-net` (using
+//! `veldmap_core::sync::Wakeup` and `TileDiskCache::write_generation()`) so
+//! local/offline storage never depends on HTTP streaming.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use veldmap_core::io::{Wakeup, lock_unpoisoned};
+use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 use veldmap_storage::{DiskCacheStats, StoragePaths, TileDiskCache};
 
 use crate::settings::AppSettings;
@@ -23,7 +25,7 @@ const DISK_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// Typed asynchronous maintenance outcome reported by [`DiskCacheWorker`]
 /// (formatted into user-facing copy by the UI layer).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DiskCacheNotice {
+pub(crate) enum DiskCacheNotice {
     Cleared,
     ClearFailed(String),
     WorkerUnavailable,
@@ -32,66 +34,84 @@ pub enum DiskCacheNotice {
 
 /// Snapshot of asynchronous disk cache stats and maintenance state.
 #[derive(Clone, Debug, Default)]
-pub struct DiskCacheStatus {
-    pub available: bool,
-    pub stats: Option<DiskCacheStats>,
-    pub busy: bool,
-    pub notice: Option<DiskCacheNotice>,
-    pub clear_gen: u64,
+pub(crate) struct DiskCacheStatus {
+    pub(crate) available: bool,
+    pub(crate) stats: Option<DiskCacheStats>,
+    pub(crate) busy: bool,
+    pub(crate) notice: Option<DiskCacheNotice>,
 }
 
 enum DiskCacheCmd {
     RefreshStats,
     SetMaxBytes(u64),
     Clear,
+    SaveSettings(AppSettings),
 }
 
-/// Serialized off-UI-thread worker handling SQLite stats, cap changes, and
-/// full clears in FIFO order (never blocking the egui frame loop and joined
-/// deterministically on shutdown).
+/// Serialized off-UI-thread worker handling SQLite stats, cap changes, full
+/// clears, and durable `settings.json` writes in FIFO order (never blocking
+/// the egui frame loop and draining cleanly before joining on shutdown).
 struct DiskCacheWorker {
     tx: Option<Sender<DiskCacheCmd>>,
     state: Arc<Mutex<DiskCacheStatus>>,
+    clear_gen: Arc<AtomicU64>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl DiskCacheWorker {
-    fn spawn(cache: Arc<TileDiskCache>, wakeup: Wakeup) -> Option<Self> {
+    fn spawn(
+        cache: Option<Arc<TileDiskCache>>,
+        paths: Option<StoragePaths>,
+        wakeup: Wakeup,
+    ) -> Option<Self> {
+        if cache.is_none() && paths.is_none() {
+            return None;
+        }
         let (tx, rx) = mpsc::channel::<DiskCacheCmd>();
         let state = Arc::new(Mutex::new(DiskCacheStatus {
-            available: true,
+            available: cache.is_some(),
             stats: None,
             busy: false,
             notice: None,
-            clear_gen: 0,
         }));
+        let clear_gen = Arc::new(AtomicU64::new(0));
         let worker_state = Arc::clone(&state);
+        let worker_clear_gen = Arc::clone(&clear_gen);
         let handle = match thread::Builder::new()
             .name("veldmap-disk-cache-ui".to_owned())
             .spawn(move || {
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         DiskCacheCmd::RefreshStats => {
-                            if let Ok(stats) = cache.stats() {
+                            if let Some(cache) = &cache
+                                && let Ok(stats) = cache.stats()
+                            {
                                 lock_unpoisoned(&worker_state).stats = Some(stats);
                                 (wakeup)();
                             }
                         }
                         DiskCacheCmd::SetMaxBytes(max_bytes) => {
-                            if let Err(err) = cache.set_max_bytes(max_bytes) {
-                                tracing::warn!(
-                                    error = %err,
-                                    "Failed to update SQLite disk cache budget"
-                                );
+                            if let Some(cache) = &cache {
+                                if let Err(err) = cache.set_max_bytes(max_bytes) {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "Failed to update SQLite disk cache budget"
+                                    );
+                                }
+                                if let Ok(stats) = cache.stats() {
+                                    lock_unpoisoned(&worker_state).stats = Some(stats);
+                                }
+                                (wakeup)();
                             }
-                            if let Ok(stats) = cache.stats() {
-                                lock_unpoisoned(&worker_state).stats = Some(stats);
-                            }
-                            (wakeup)();
                         }
                         DiskCacheCmd::Clear => {
+                            let Some(cache) = &cache else {
+                                lock_unpoisoned(&worker_state).busy = false;
+                                continue;
+                            };
                             let res = cache.clear();
                             let stats = cache.stats().ok();
+                            let succeeded = res.is_ok();
                             {
                                 let mut st = lock_unpoisoned(&worker_state);
                                 st.busy = false;
@@ -101,7 +121,6 @@ impl DiskCacheWorker {
                                 match res {
                                     Ok(()) => {
                                         st.notice = Some(DiskCacheNotice::Cleared);
-                                        st.clear_gen = st.clear_gen.wrapping_add(1);
                                     }
                                     Err(err) => {
                                         st.notice =
@@ -109,7 +128,17 @@ impl DiskCacheWorker {
                                     }
                                 }
                             }
+                            if succeeded {
+                                worker_clear_gen.fetch_add(1, Ordering::Release);
+                            }
                             (wakeup)();
+                        }
+                        DiskCacheCmd::SaveSettings(settings) => {
+                            if let Some(paths) = &paths
+                                && let Err(err) = settings.save(paths)
+                            {
+                                tracing::warn!(error = %err, "Failed to persist user settings");
+                            }
                         }
                     }
                 }
@@ -124,12 +153,17 @@ impl DiskCacheWorker {
         Some(Self {
             tx: Some(tx),
             state,
+            clear_gen,
             handle: Some(handle),
         })
     }
 
     fn snapshot(&self) -> DiskCacheStatus {
         lock_unpoisoned(&self.state).clone()
+    }
+
+    fn clear_gen(&self) -> u64 {
+        self.clear_gen.load(Ordering::Acquire)
     }
 
     fn clear_notice(&self) {
@@ -148,6 +182,12 @@ impl DiskCacheWorker {
         }
     }
 
+    fn request_save_settings(&self, settings: AppSettings) -> bool {
+        self.tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(DiskCacheCmd::SaveSettings(settings)).is_ok())
+    }
+
     fn request_clear(&self) {
         let Some(tx) = &self.tx else {
             let mut st = lock_unpoisoned(&self.state);
@@ -157,7 +197,7 @@ impl DiskCacheWorker {
         };
         {
             let mut st = lock_unpoisoned(&self.state);
-            if st.busy {
+            if !st.available || st.busy {
                 return;
             }
             st.busy = true;
@@ -189,8 +229,8 @@ impl Drop for DiskCacheWorker {
 }
 
 /// Top-level application owner for platform paths, persisted [`AppSettings`],
-/// shared SQLite WAL [`TileDiskCache`], and asynchronous cache maintenance.
-pub struct AppStorage {
+/// shared SQLite WAL [`TileDiskCache`], and asynchronous cache/settings I/O.
+pub(crate) struct AppStorage {
     paths: Option<StoragePaths>,
     settings: AppSettings,
     disk_cache: Option<Arc<TileDiskCache>>,
@@ -203,7 +243,7 @@ pub struct AppStorage {
 impl AppStorage {
     /// Load persisted user settings and open the shared SQLite WAL tile disk
     /// cache under `paths` (or platform defaults when `None`).
-    pub fn open(wakeup: Wakeup, paths: Option<StoragePaths>) -> Self {
+    pub(crate) fn open(wakeup: Wakeup, paths: Option<StoragePaths>) -> Self {
         let resolved_paths = paths.or_else(|| match StoragePaths::system_default() {
             Ok(p) => Some(p),
             Err(err) => {
@@ -233,9 +273,11 @@ impl AppStorage {
             }
         });
 
-        let disk_worker = disk_cache
-            .as_ref()
-            .and_then(|cache| DiskCacheWorker::spawn(Arc::clone(cache), wakeup));
+        let disk_worker = DiskCacheWorker::spawn(
+            disk_cache.as_ref().map(Arc::clone),
+            resolved_paths.clone(),
+            wakeup,
+        );
 
         Self {
             paths: resolved_paths,
@@ -248,18 +290,18 @@ impl AppStorage {
         }
     }
 
-    pub fn settings(&self) -> &AppSettings {
+    pub(crate) fn settings(&self) -> &AppSettings {
         &self.settings
     }
 
-    pub fn disk_cache(&self) -> Option<Arc<TileDiskCache>> {
+    pub(crate) fn disk_cache(&self) -> Option<Arc<TileDiskCache>> {
         self.disk_cache.as_ref().map(Arc::clone)
     }
 
-    /// Update and durably persist [`AppSettings`] when changed, forwarding any
-    /// disk-cache cap change to the off-UI-thread maintenance worker. Returns
-    /// `true` if settings changed.
-    pub fn update_settings(&mut self, mut next: AppSettings) -> bool {
+    /// Update and durably persist [`AppSettings`] asynchronously when changed,
+    /// forwarding any disk-cache cap change to the off-UI-thread maintenance
+    /// worker. Returns `true` if settings changed.
+    pub(crate) fn update_settings(&mut self, mut next: AppSettings) -> bool {
         next.normalize();
         let prev_cache_bytes = self.settings.disk_cache_max_bytes();
         let changed = next != self.settings;
@@ -278,16 +320,22 @@ impl AppStorage {
         true
     }
 
-    /// Mutate `AppSettings` in place, normalize, and persist durably if changed.
-    pub fn mutate_settings(&mut self, edit: impl FnOnce(&mut AppSettings)) -> bool {
+    /// Mutate `AppSettings` in place, normalize, and enqueue durable
+    /// persistence if changed.
+    pub(crate) fn mutate_settings(&mut self, edit: impl FnOnce(&mut AppSettings)) -> bool {
         let mut next = self.settings.clone();
         edit(&mut next);
         self.update_settings(next)
     }
 
-    /// Persist the current [`AppSettings`] durably via
-    /// `write_json_durable_private()`.
+    /// Enqueue durable persistence of [`AppSettings`] onto [`DiskCacheWorker`],
+    /// falling back to direct write only if the worker is unavailable.
     fn save_settings(&self) {
+        if let Some(worker) = &self.disk_worker
+            && worker.request_save_settings(self.settings.clone())
+        {
+            return;
+        }
         if let Some(paths) = &self.paths
             && let Err(err) = self.settings.save(paths)
         {
@@ -296,8 +344,8 @@ impl AppStorage {
     }
 
     /// Cached off-UI-thread disk cache status & stats snapshot (zero SQLite
-    /// blocking on the UI thread).
-    pub fn disk_cache_status(&self) -> DiskCacheStatus {
+    /// blocking on the UI thread). Call only when Settings is open.
+    pub(crate) fn disk_cache_status(&self) -> DiskCacheStatus {
         self.disk_worker
             .as_ref()
             .map(DiskCacheWorker::snapshot)
@@ -305,7 +353,7 @@ impl AppStorage {
     }
 
     /// Clear transient disk cache notice (e.g. when reopening Settings).
-    pub fn clear_disk_cache_notice(&self) {
+    pub(crate) fn clear_disk_cache_notice(&self) {
         if let Some(worker) = &self.disk_worker {
             worker.clear_notice();
         }
@@ -313,7 +361,7 @@ impl AppStorage {
 
     /// Enqueue an asynchronous SQLite disk cache clear on the maintenance
     /// worker thread (never stalls the UI thread).
-    pub fn request_clear_disk_cache(&self) {
+    pub(crate) fn request_clear_disk_cache(&self) {
         if let Some(worker) = &self.disk_worker {
             worker.request_clear();
         }
@@ -323,7 +371,7 @@ impl AppStorage {
     /// only when `force_refresh` is `true` (e.g. Settings just opened) or when
     /// `TileDiskCache::write_generation()` advances and at least
     /// `DISK_STATS_REFRESH_INTERVAL` has elapsed (zero idle queries/repaints).
-    pub fn maybe_refresh_disk_stats(&mut self, force_refresh: bool) {
+    pub(crate) fn maybe_refresh_disk_stats(&mut self, force_refresh: bool) {
         let (Some(worker), Some(cache)) = (&self.disk_worker, &self.disk_cache) else {
             return;
         };
@@ -339,13 +387,13 @@ impl AppStorage {
         }
     }
 
-    /// Poll whether an asynchronous disk cache clear has completed since the
-    /// last check.
-    pub fn poll_clear_completed(&mut self) -> bool {
+    /// Lock-free atomic check whether an asynchronous disk cache clear has
+    /// completed since the last check.
+    pub(crate) fn poll_clear_completed(&mut self) -> bool {
         let Some(worker) = &self.disk_worker else {
             return false;
         };
-        let clear_gen = worker.snapshot().clear_gen;
+        let clear_gen = worker.clear_gen();
         if clear_gen != self.last_handled_clear_gen {
             self.last_handled_clear_gen = clear_gen;
             return true;
@@ -354,16 +402,17 @@ impl AppStorage {
     }
 
     /// Phase 1 of deterministic shutdown: close maintenance command channel
-    /// before joining threads.
-    pub fn begin_shutdown(&mut self) {
+    /// before joining threads (all already-queued saves drain in FIFO order).
+    pub(crate) fn begin_shutdown(&mut self) {
         if let Some(worker) = &mut self.disk_worker {
             worker.close_channel();
         }
     }
 
     /// Phase 2 of deterministic shutdown: join the maintenance worker thread
-    /// cleanly so the final `Arc<TileDiskCache>` flushes touches on drop.
-    pub fn finish_shutdown(&mut self) {
+    /// cleanly so pending `SaveSettings` writes flush and the final
+    /// `Arc<TileDiskCache>` flushes touches on drop.
+    pub(crate) fn finish_shutdown(&mut self) {
         if let Some(worker) = &mut self.disk_worker {
             worker.join();
         }

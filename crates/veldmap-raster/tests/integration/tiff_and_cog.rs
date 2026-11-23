@@ -1,138 +1,20 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use ::tiff::encoder::{TiffEncoder, colortype};
+use ::tiff::encoder::TiffEncoder;
 use ::tiff::tags::Tag;
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
-use veldmap_core::io::{CancelToken, CountingByteSource, MemoryByteSource, SourceFingerprint};
-use veldmap_raster::pyramid::{self, RASTER_TILE_SIZE};
-use veldmap_raster::resample::halve_rgba8;
-use veldmap_raster::{DecodeContext, SharedChunkCache, TiffSource};
+use veldmap_core::io::ByteSource;
+use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
+use veldmap_core::sync::CancelToken;
+use veldmap_raster::{
+    DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RASTER_TILE_SIZE, RasterError, SharedChunkCache,
+    TiffSource, has_tiff_magic, tile_extent,
+};
+
+use crate::common::{build_stripped_tiff, build_tiled_cog, fake_fingerprint, rgb_pattern};
 
 const WINDOW: u64 = 64 * 1024;
-
-fn fake_fingerprint(bytes: &[u8]) -> SourceFingerprint {
-    let mut digest = [0u8; 32];
-    for (i, b) in bytes.iter().take(32).enumerate() {
-        digest[i] = *b;
-    }
-    digest[31] ^= (bytes.len() & 0xFF) as u8;
-    SourceFingerprint::from_digest(digest)
-}
-
-fn rgb_pattern(width: u32, height: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity((width * height * 3) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            out.push((x * 7 + y * 3) as u8);
-            out.push((x ^ y) as u8);
-            out.push(((x * y) / 97) as u8);
-        }
-    }
-    out
-}
-
-fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
-    rgb.chunks_exact(3)
-        .flat_map(|px| [px[0], px[1], px[2], 255])
-        .collect()
-}
-
-fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4)
-        .flat_map(|px| [px[0], px[1], px[2]])
-        .collect()
-}
-
-fn tile_bytes(rgb: &[u8], width: u32, height: u32, tx: u32, ty: u32) -> Vec<u8> {
-    let mut out = vec![0u8; (RASTER_TILE_SIZE * RASTER_TILE_SIZE * 3) as usize];
-    for row in 0..RASTER_TILE_SIZE {
-        let y = ty * RASTER_TILE_SIZE + row;
-        if y >= height {
-            break;
-        }
-        let x0 = tx * RASTER_TILE_SIZE;
-        let x1 = (x0 + RASTER_TILE_SIZE).min(width);
-        let from = ((y * width + x0) * 3) as usize;
-        let len = ((x1 - x0) * 3) as usize;
-        let to = (row * RASTER_TILE_SIZE * 3) as usize;
-        out[to..to + len].copy_from_slice(&rgb[from..from + len]);
-    }
-    out
-}
-
-/// Build an uncompressed tiled TIFF with `levels` 2x2-halved overview IFDs,
-/// returning `(bytes, base_tile_byte_ranges, ifd_offsets)`.
-fn build_tiled_cog(width: u32, height: u32, levels: u32) -> (Vec<u8>, Vec<(u64, u64)>, Vec<u64>) {
-    let mut file = Cursor::new(Vec::new());
-    let mut base_tiles = Vec::new();
-    let mut ifds = Vec::new();
-    {
-        let mut encoder = TiffEncoder::new(&mut file).expect("tiff encoder");
-        let mut rgb = rgb_pattern(width, height);
-        let (mut w, mut h) = (width, height);
-
-        for level in 0..=levels {
-            let mut dir = encoder.image_directory().expect("image_directory");
-            if level > 0 {
-                dir.write_tag(Tag::NewSubfileType, 1u32).expect("subfile");
-            }
-            dir.write_tag(Tag::ImageWidth, w).expect("width");
-            dir.write_tag(Tag::ImageLength, h).expect("height");
-            dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-                .expect("bps");
-            dir.write_tag(Tag::Compression, 1u16).expect("compression");
-            dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-                .expect("photometric");
-            dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("spp");
-            dir.write_tag(Tag::PlanarConfiguration, 1u16)
-                .expect("planar");
-            dir.write_tag(Tag::TileWidth, RASTER_TILE_SIZE).expect("tw");
-            dir.write_tag(Tag::TileLength, RASTER_TILE_SIZE)
-                .expect("th");
-
-            let (across, down) = (w.div_ceil(RASTER_TILE_SIZE), h.div_ceil(RASTER_TILE_SIZE));
-            let mut offsets = Vec::new();
-            let mut counts = Vec::new();
-            for ty in 0..down {
-                for tx in 0..across {
-                    let tile = tile_bytes(&rgb, w, h, tx, ty);
-                    let at = dir.write_data(&tile[..]).expect("write tile");
-                    offsets.push(at as u32);
-                    counts.push(tile.len() as u32);
-                    if level == 0 {
-                        base_tiles.push((at, tile.len() as u64));
-                    }
-                }
-            }
-            dir.write_tag(Tag::TileOffsets, &offsets[..]).expect("offs");
-            dir.write_tag(Tag::TileByteCounts, &counts[..])
-                .expect("cnts");
-            let finish = dir.finish_with_offsets().expect("finish ifd");
-            ifds.push(u64::from(finish.offset));
-
-            rgb = rgba_to_rgb(&halve_rgba8(&rgb_to_rgba(&rgb), w, h));
-            w = pyramid::level_size(w, 1);
-            h = pyramid::level_size(h, 1);
-        }
-    }
-    (file.into_inner(), base_tiles, ifds)
-}
-
-fn build_stripped_tiff(width: u32, height: u32, rows_per_strip: u32) -> Vec<u8> {
-    let mut file = Cursor::new(Vec::new());
-    {
-        let mut encoder = TiffEncoder::new(&mut file).expect("tiff encoder");
-        let mut image = encoder
-            .new_image::<colortype::RGB8>(width, height)
-            .expect("new_image");
-        image.rows_per_strip(rows_per_strip).expect("rows");
-        image
-            .write_data(&rgb_pattern(width, height))
-            .expect("write stripped");
-    }
-    file.into_inner()
-}
 
 fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 < b.0 + b.1 && b.0 < a.0 + a.1
@@ -152,7 +34,7 @@ fn near_head_or_ifd(span: (u64, u64), ifds: &[u64]) -> bool {
 }
 
 #[test]
-fn describing_reads_only_header_and_ifds_and_pointwise_reads_own_chunk() {
+fn describing_reads_only_header_and_ifds_and_pointwise_reuses_pooled_decoder() {
     let levels = 2;
     let (file, base_tiles, ifds) =
         build_tiled_cog(2 * RASTER_TILE_SIZE, 2 * RASTER_TILE_SIZE, levels);
@@ -162,17 +44,18 @@ fn describing_reads_only_header_and_ifds_and_pointwise_reads_own_chunk() {
     let counting = Arc::new(CountingByteSource::new(Arc::new(
         MemoryByteSource::from_vec(file),
     )));
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
 
     let src = TiffSource::open(
-        Arc::clone(&counting) as Arc<dyn veldmap_core::io::ByteSource>,
+        Arc::clone(&counting) as Arc<dyn ByteSource>,
         fp,
         &budget,
         &cancel,
     )
     .expect("open COG");
-    assert_eq!(src.grid().overviews.len(), levels as usize);
+    assert_eq!(src.overview_count(), levels as usize);
+    assert!(src.is_tiled());
 
     let describe_stats = counting.snapshot();
     assert!(
@@ -239,13 +122,33 @@ fn describing_reads_only_header_and_ifds_and_pointwise_reads_own_chunk() {
             "tile (1,1) read unrelated range {range:?} (own={own:?})"
         );
     }
+
+    // A second pointwise miss on the SAME IFD reuses the pooled Decoder without
+    // re-reading offset 0 (TIFF header) or re-walking IFDs.
+    counting.reset();
+    let tile2 = src
+        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .expect("decode tile (0,0)");
+    assert_eq!(
+        (tile2.width(), tile2.height()),
+        (RASTER_TILE_SIZE, RASTER_TILE_SIZE)
+    );
+    let second_stats = counting.snapshot();
+    assert!(
+        !second_stats.spans.iter().any(|s| s.offset == 0),
+        "pooled Decoder must not re-read TIFF header on same-IFD miss: {:?}",
+        second_stats.spans
+    );
+    // Direct path also tracks `region + tile` working bytes on `DecodeBudgetTracker`.
+    assert!(tracker.peak_bytes() > 0);
+    assert_eq!(tracker.active_bytes(), 0);
 }
 
 #[test]
 fn direct_overview_matches_sequential_pass_on_halved_cog() {
     let (file, _, _) = build_tiled_cog(2 * RASTER_TILE_SIZE, 2 * RASTER_TILE_SIZE, 1);
     let fp = fake_fingerprint(&file);
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
     let src = TiffSource::open(
         Arc::new(MemoryByteSource::from_vec(file)),
@@ -288,7 +191,7 @@ fn direct_overview_matches_sequential_pass_on_halved_cog() {
         MemoryByteSource::from_vec(stripped),
     )));
     let s_src = TiffSource::open(
-        Arc::clone(&s_counting) as Arc<dyn veldmap_core::io::ByteSource>,
+        Arc::clone(&s_counting) as Arc<dyn ByteSource>,
         s_fp,
         &budget,
         &cancel,
@@ -339,7 +242,7 @@ fn direct_overview_matches_sequential_pass_on_halved_cog() {
 
 #[test]
 fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
     let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
     let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
@@ -370,9 +273,6 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         dir.write_tag(Tag::StripOffsets, &[at][..]).expect("tag");
         dir.write_tag(Tag::StripByteCounts, &[data.len() as u64][..])
             .expect("tag");
-        // GeoKeyDirectory: ModelType=1 (Projected), RasterType=2 (PixelIsPoint),
-        // ProjectedCSType=32637, ProjNatOriginLat (3081) -> DoubleParams[0],
-        // GTCitationGeoKey (1026) -> AsciiParams[0..7].
         let geokeys: [u16; 24] = [
             1, 1, 0, 5, // header: 5 keys
             1024, 0, 1, 1, // GTModelTypeGeoKey = Projected
@@ -391,15 +291,15 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
             10.0,
             0.0,
             0.0,
-            500_000.0, // x = 10*i + 500000
+            500_000.0,
             0.0,
             -10.0,
             0.0,
-            6_000_000.0, // y = -10*j + 6000000
+            6_000_000.0,
             0.0,
             0.0,
             0.0,
-            0.0, //
+            0.0,
             0.0,
             0.0,
             0.0,
@@ -410,7 +310,7 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         dir.finish().expect("finish");
     }
     let big_bytes = big_buf.into_inner();
-    assert!(veldmap_raster::tiff::has_tiff_magic(&big_bytes));
+    assert!(has_tiff_magic(&big_bytes));
     let big_src = TiffSource::open(
         Arc::new(MemoryByteSource::from_vec(big_bytes.clone())),
         fake_fingerprint(&big_bytes),
@@ -426,7 +326,6 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
     assert_eq!(placement.epsg, Some(32637));
     assert_eq!(placement.geo_params.get_f64(3081), Some(55.75));
     assert_eq!(placement.geo_params.get_ascii(1026), Some("VeldMap"));
-    // PixelIsPoint shifts affine origin by half a pixel: 500000 - 5 = 499995, 6000000 + 5 = 6000005.
     assert!((placement.affine[2] - 499_995.0).abs() < 1e-9);
     assert!((placement.affine[5] - 6_000_005.0).abs() < 1e-9);
     let tile = big_src
@@ -438,10 +337,8 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
     let mut f32_buf = Cursor::new(Vec::new());
     let (w, h) = (4u32, 4u32);
     let floats: Vec<f32> = vec![
-        -9999.0, 10.0, 20.0, 30.0, // row 0 (col 0 = nodata)
-        40.0, 50.0, 60.0, 70.0, // row 1
-        80.0, 90.0, 100.0, 110.0, // row 2
-        120.0, 130.0, 140.0, 150.0, // row 3
+        -9999.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0,
+        140.0, 150.0,
     ];
     let mut predictor3_bytes = Vec::with_capacity((w * h * 4) as usize);
     for row in floats.chunks_exact(w as usize) {
@@ -465,9 +362,9 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         dir.write_tag(Tag::ImageWidth, w).expect("tag");
         dir.write_tag(Tag::ImageLength, h).expect("tag");
         dir.write_tag(Tag::BitsPerSample, 32u16).expect("tag");
-        dir.write_tag(Tag::SampleFormat, 3u16).expect("tag"); // IEEEFP
-        dir.write_tag(Tag::Compression, 50_000u16).expect("tag"); // ZSTD
-        dir.write_tag(Tag::Predictor, 3u16).expect("tag"); // FloatingPoint
+        dir.write_tag(Tag::SampleFormat, 3u16).expect("tag");
+        dir.write_tag(Tag::Compression, 50_000u16).expect("tag");
+        dir.write_tag(Tag::Predictor, 3u16).expect("tag");
         dir.write_tag(Tag::PhotometricInterpretation, 1u16)
             .expect("tag");
         dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("tag");
@@ -501,7 +398,7 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         "max 150.0 should stretch near white"
     );
 
-    // 3. Geographic (GTModelTypeGeoKey=2, foreign datum Pulkovo-42 4284) with PixelIsArea + 16-bit signed (i16) samples.
+    // 3. Geographic (GTModelTypeGeoKey=2, foreign datum Pulkovo-42 4284) + i16 samples.
     let mut i16_buf = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut i16_buf).expect("enc");
@@ -509,7 +406,7 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         dir.write_tag(Tag::ImageWidth, 4u32).expect("tag");
         dir.write_tag(Tag::ImageLength, 2u32).expect("tag");
         dir.write_tag(Tag::BitsPerSample, 16u16).expect("tag");
-        dir.write_tag(Tag::SampleFormat, 2u16).expect("tag"); // Int16
+        dir.write_tag(Tag::SampleFormat, 2u16).expect("tag");
         dir.write_tag(Tag::Compression, 1u16).expect("tag");
         dir.write_tag(Tag::PhotometricInterpretation, 1u16)
             .expect("tag");
@@ -517,7 +414,7 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
         dir.write_tag(Tag::RowsPerStrip, 2u32).expect("tag");
         dir.write_tag(Tag::GdalNodata, "-32768").expect("tag");
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4284]; // Geographic + Pulkovo-42
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4284];
         dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
             .expect("tag");
         dir.write_tag(Tag::ModelPixelScaleTag, &[0.5_f64, 0.25, 0.0][..])
@@ -666,17 +563,12 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         &cancel,
     )
     .expect("open 70-IFD TIFF");
-    assert_eq!(
-        many_src.grid().overviews.len(),
-        veldmap_raster::tiff::MAX_IFDS - 1
-    );
+    assert_eq!(many_src.overview_count(), MAX_IFDS - 1);
 }
 
 #[test]
 fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected() {
-    use veldmap_raster::RasterError;
-
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
 
     // 1. Untiled stripped TIFF exceeding `MAX_SOURCE_SIDE` must still be rejected.
@@ -684,7 +576,7 @@ fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected(
     {
         let mut enc = TiffEncoder::new(&mut untiled_buf).expect("enc");
         let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, veldmap_raster::tiff::MAX_SOURCE_SIDE + 1)
+        dir.write_tag(Tag::ImageWidth, MAX_SOURCE_SIDE + 1)
             .expect("w");
         dir.write_tag(Tag::ImageLength, 16u32).expect("h");
         dir.write_tag(Tag::BitsPerSample, 8u16).expect("bps");
@@ -716,7 +608,7 @@ fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected(
 
     // 2. Tiled BigTIFF/COG exceeding `MAX_SOURCE_SIDE` (70_000 x 1_024) opens
     //    and decodes pointwise cleanly using a shared 512x512 tile buffer.
-    let wide = veldmap_raster::tiff::MAX_SOURCE_SIDE + 4_464; // 70_000 px
+    let wide = MAX_SOURCE_SIDE + 4_464; // 70_000 px
     let height = 1_024u32;
     let across = wide.div_ceil(RASTER_TILE_SIZE);
     let down = height.div_ceil(RASTER_TILE_SIZE);
@@ -770,7 +662,7 @@ fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected(
         .expect("decode far-right edge tile");
     assert_eq!(
         (tile.width(), tile.height()),
-        (pyramid::tile_extent(across - 1, wide), RASTER_TILE_SIZE)
+        (tile_extent(across - 1, wide), RASTER_TILE_SIZE)
     );
     assert_eq!(&tile.data()[..4], &[173, 173, 173, 255]);
 }
@@ -780,8 +672,7 @@ fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
-    use veldmap_core::io::{ByteSource, IoError};
-    use veldmap_raster::RasterError;
+    use veldmap_core::io::IoError;
 
     struct BlockingTailSource {
         inner: MemoryByteSource,
@@ -814,8 +705,6 @@ fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
         }
     }
 
-    // Build a >64 KiB 16-bit tiled TIFF so `compute_mapping` issues a read past
-    // `BufferedByteReader`'s initial 64 KiB window.
     let mut buf = Cursor::new(Vec::new());
     let tile_offset: u64;
     {
@@ -850,7 +739,7 @@ fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
         hit: AtomicBool::new(false),
         release: release.clone(),
     });
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let src = Arc::new(
         TiffSource::open(
             Arc::clone(&gate) as Arc<dyn ByteSource>,

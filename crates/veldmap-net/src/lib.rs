@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use thiserror::Error;
-use veldmap_core::io::CancelToken;
+use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{PlanetaryScheme, QuadTileId, TileKey};
 
 mod basemap;
@@ -22,7 +22,22 @@ pub use basemap::{
     is_valid_gibs_date, validate_custom_url_template,
 };
 pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
-pub use redact::{fmt_redacted_custom_xyz_fields, redact_secret_label, sanitize_url_for_display};
+pub use redact::{redact_secret_label, sanitize_url_for_display};
+
+/// Structured error returned across the [`TileBlobStore`] seam.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum BlobStoreError {
+    #[error("blob store operation cancelled")]
+    Cancelled,
+    #[error("blob store error: {0}")]
+    Backend(String),
+}
+
+impl From<String> for BlobStoreError {
+    fn from(msg: String) -> Self {
+        Self::Backend(msg)
+    }
+}
 
 /// Minimal encoded-tile persistence boundary injected into
 /// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from concrete disk-cache
@@ -30,13 +45,13 @@ pub use redact::{fmt_redacted_custom_xyz_fields, redact_secret_label, sanitize_u
 /// maximum blob-size limits).
 pub trait TileBlobStore: Send + Sync + 'static {
     /// Fetch cached encoded tile bytes for `(source_key, id)`, if present.
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String>;
+    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, BlobStoreError>;
 
     /// Persist decode-validated encoded tile bytes for `(source_key, id)`.
-    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), String>;
+    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), BlobStoreError>;
 
     /// Delete one cached tile entry (e.g. if a cached payload fails decode).
-    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String>;
+    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), BlobStoreError>;
 }
 
 /// Typed decode failure reported through [`DecodeCompletion`].

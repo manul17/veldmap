@@ -36,10 +36,7 @@ fn sample_band_meta(
         .collect();
     PyramidMeta {
         source,
-        band,
-        format,
-        gutter,
-        decode_rev: 1,
+        spec: TileStreamSpec::new(band, format, gutter, 1),
         width: 4096,
         height: 4096,
         tile_size: 512,
@@ -61,28 +58,35 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
     let k1 = meta_a.tile_key(0, 1, 0);
     let k2 = meta_a.tile_key(1, 0, 0);
     assert_eq!(
-        sched.admit_pointwise_or_check_pass(&meta_a, 0, &[k0, k1], |_| false),
+        sched.admit_pointwise(&meta_a, 0, &[k0, k1], |_| false),
         vec![k0, k1]
     );
     // Duplicate in-flight or mismatched-level tiles are ignored, while matching-level tiles admit.
     assert!(
         sched
-            .admit_pointwise_or_check_pass(&meta_a, 0, &[k0, k2], |_| false)
+            .admit_pointwise(&meta_a, 0, &[k0, k2], |_| false)
             .is_empty()
     );
     let k0_dup = meta_a.tile_key(0, 2, 0);
     assert_eq!(
-        sched.admit_pointwise_or_check_pass(&meta_a, 0, &[k0, k0_dup, k0_dup], |_| false),
+        sched.admit_pointwise(&meta_a, 0, &[k0, k0_dup, k0_dup], |_| false),
         vec![k0_dup]
     );
     assert_eq!(
-        sched.admit_pointwise_or_check_pass(&meta_a, 1, &[k2], |_| false),
+        sched.admit_pointwise(&meta_a, 1, &[k2], |_| false),
         vec![k2]
     );
+    // Calling admit_pointwise on a Pass level returns empty without mutating state.
+    let pass_tile = meta_a.tile_key(3, 0, 0);
+    assert!(
+        sched
+            .admit_pointwise(&meta_a, 3, &[pass_tile], |_| false)
+            .is_empty()
+    );
+    assert!(!sched.is_in_flight(&pass_tile));
 
     // Only 1 active Serve::Pass per PassKey.
     let cancel1 = CancelToken::new();
-    let pass_tile = meta_a.tile_key(3, 0, 0);
     let pid1 = sched
         .begin_pass(pass_a, 3, Some(3), cancel1.clone(), vec![pass_tile])
         .expect("first pass succeeds");
@@ -103,7 +107,7 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
     assert!(sched.has_active_pass(pass_a));
     assert!(sched.has_any_active_pass(src_a));
 
-    // Zooming OUT (target=3, then suppose active pass was finer lvl 2 and target=3) cancels finer pass.
+    // Zooming OUT cancels finer pass.
     sched.finish_pass(pass_a, pid1, true);
     let cancel2 = CancelToken::new();
     let _pid2 = sched
@@ -120,7 +124,7 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
     assert!(!sched.has_active_pass(pass_a));
     assert!(!sched.has_any_active_pass(src_a));
 
-    // Shared `Pass { from: 0 }` cascade is NOT cancelled when zooming out to another level in the same pass.
+    // Shared `Pass { from: 0 }` cascade is NOT cancelled when zooming out within same pass.
     let cancel3 = CancelToken::new();
     let pid3 = sched
         .begin_pass(
@@ -154,11 +158,11 @@ fn multi_band_streams_under_same_source_schedule_and_forgive_independently() {
     let k_b04 = b04.tile_key(0, 0, 0);
     let k_scl = scl.tile_key(0, 0, 0);
     assert_eq!(
-        sched.admit_pointwise_or_check_pass(&b04, 0, &[k_b04, k_scl], |_| false),
+        sched.admit_pointwise(&b04, 0, &[k_b04, k_scl], |_| false),
         vec![k_b04]
     );
     assert_eq!(
-        sched.admit_pointwise_or_check_pass(&scl, 0, &[k_b04, k_scl], |_| false),
+        sched.admit_pointwise(&scl, 0, &[k_b04, k_scl], |_| false),
         vec![k_scl]
     );
 
@@ -216,7 +220,7 @@ fn terminal_and_repeated_failures_are_suppressed() {
     let k_retry = meta.tile_key(0, 1, 0);
 
     assert_eq!(
-        sched.admit_pointwise_or_check_pass(&meta, 0, &[k_term, k_retry], |_| false),
+        sched.admit_pointwise(&meta, 0, &[k_term, k_retry], |_| false),
         vec![k_term, k_retry]
     );
 
@@ -234,7 +238,7 @@ fn terminal_and_repeated_failures_are_suppressed() {
     );
     assert!(!sched.is_terminal_failed(&k_retry));
     assert_eq!(
-        sched.admit_pointwise_or_check_pass(&meta, 0, &[k_term, k_retry], |_| false),
+        sched.admit_pointwise(&meta, 0, &[k_term, k_retry], |_| false),
         vec![k_retry]
     );
     assert_eq!(
@@ -244,7 +248,7 @@ fn terminal_and_repeated_failures_are_suppressed() {
     assert!(sched.is_terminal_failed(&k_retry));
     assert!(
         sched
-            .admit_pointwise_or_check_pass(&meta, 0, &[k_term, k_retry], |_| false)
+            .admit_pointwise(&meta, 0, &[k_term, k_retry], |_| false)
             .is_empty()
     );
 
@@ -289,7 +293,7 @@ fn terminal_and_repeated_failures_are_suppressed() {
 }
 
 #[test]
-fn ladder_and_pass_only_recovery_avoid_redundant_passes_and_starvation() {
+fn ladder_unfitting_levels_and_pass_only_recovery_respect_budget_fits() {
     let mut meta = sample_meta(SourceId::new(33), 2, 5);
     for lvl in 2..5 {
         meta.levels[lvl].serve = ServeMode::Pass { from: 0 };
@@ -299,8 +303,28 @@ fn ladder_and_pass_only_recovery_avoid_redundant_passes_and_starvation() {
     // Pass target skips redundant coarser rungs sharing `Pass { from: 0 }`.
     assert_eq!(meta.ladder(3), vec![3]);
 
-    // Pass-only source admits a recovery pass after a single pass failure, then stops on 2nd failure.
+    // When no level fits, ladder must return empty and admissions must reject.
+    let mut unfitting = meta.clone();
+    for row in &mut unfitting.levels {
+        row.fits = false;
+    }
+    assert_eq!(unfitting.finest_fitting_level(), None);
+    assert!(unfitting.ladder(0).is_empty());
     let mut sched = TileScheduler::new();
+    let k_unfit = unfitting.tile_key(0, 0, 0);
+    assert!(
+        sched
+            .admit_pointwise(&unfitting, 0, &[k_unfit], |_| false)
+            .is_empty()
+    );
+    let k_unfit_pass = unfitting.tile_key(3, 0, 0);
+    assert!(
+        sched
+            .check_pass_candidates(&unfitting, 3, &[k_unfit_pass], |_| false)
+            .is_empty()
+    );
+
+    // Pass-only source admits a recovery pass after a single pass failure, then stops on 2nd failure.
     let pass_only = PyramidMeta {
         levels: (0..2)
             .map(|_| LevelPlan {
@@ -319,7 +343,7 @@ fn ladder_and_pass_only_recovery_avoid_redundant_passes_and_starvation() {
         .expect("pass 1");
     sched.finish_pass(pass_key, pid1, false);
     assert_eq!(
-        sched.admit_pointwise_or_check_pass(&pass_only, 1, &[k], |_| false),
+        sched.check_pass_candidates(&pass_only, 1, &[k], |_| false),
         vec![k]
     );
     let pid2 = sched
@@ -328,7 +352,7 @@ fn ladder_and_pass_only_recovery_avoid_redundant_passes_and_starvation() {
     sched.finish_pass(pass_key, pid2, false);
     assert!(
         sched
-            .admit_pointwise_or_check_pass(&pass_only, 1, &[k], |_| false)
+            .check_pass_candidates(&pass_only, 1, &[k], |_| false)
             .is_empty()
     );
 }

@@ -10,7 +10,9 @@ use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::geodesy;
-use veldmap_core::tile::{PlanetaryScheme, QuadTileId, VisibleTile, sample_tile_surface};
+use veldmap_core::tile::{
+    PlanetaryScheme, QuadTileId, TileSurfaceSample, VisibleTile, sample_tile_surface,
+};
 
 use super::uniforms::{
     TILE_KIND_GEO, TILE_KIND_POLAR_CLEAR_SCALE, TILE_KIND_POLAR_NORTH, TILE_KIND_POLAR_SOUTH,
@@ -28,11 +30,17 @@ pub(super) struct TileGridAnchor {
 impl TileGridAnchor {
     fn for_tile(id: QuadTileId) -> Self {
         match sample_tile_surface(id, 0.5, 0.5) {
-            Some((lat0, lon0, _, _, dx0, dy0)) => Self {
-                lat0,
-                lon0,
-                dx0,
-                dy0,
+            Some(TileSurfaceSample {
+                lat_deg,
+                lon_deg,
+                polar_dx,
+                polar_dy,
+                ..
+            }) => Self {
+                lat0: lat_deg,
+                lon0: lon_deg,
+                dx0: polar_dx,
+                dy0: polar_dy,
             },
             None => Self {
                 lat0: match id.scheme {
@@ -111,20 +119,20 @@ pub(super) fn tile_graticule_uniform(
 /// post-overlay procedural graticule.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
-pub struct TileVertex {
+pub(super) struct TileVertex {
     /// Surface (or skirt) position relative to the tile's CPU `f64` RTC origin
     /// (`(P_ecef_m - origin_ecef_m) as f32`, in metres).
-    pub rel_pos: [f32; 3],
+    pub(super) rel_pos: [f32; 3],
     /// Outward unit WGS84 ellipsoidal normal.
-    pub normal: [f32; 3],
+    pub(super) normal: [f32; 3],
     /// Tile-local UV coordinates in `[0, 1]^2` (transformed by per-draw
     /// `uv_rect` when sampling a coarser ancestor texture).
-    pub uv: [f32; 2],
+    pub(super) uv: [f32; 2],
     /// Tile-relative graticule coordinates computed in `f64` before casting to
     /// `f32`:
     /// - `Geodetic` / `WebMercator`: `(lon_deg - anchor_lon, lat_deg - anchor_lat)`
     /// - `PolarCap`: `(dx - anchor_dx, dy - anchor_dy)` in unit-disk coordinates
-    pub grid_rel: [f32; 2],
+    pub(super) grid_rel: [f32; 2],
 }
 
 const _: () = {
@@ -132,7 +140,7 @@ const _: () = {
 };
 
 impl TileVertex {
-    pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    pub(super) const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &wgpu::vertex_attr_array![
@@ -148,21 +156,21 @@ impl TileVertex {
 /// quadtree tile (both main planetary tiles and adaptive Polar Stereographic
 /// cap tiles).
 #[derive(Clone, Debug)]
-pub struct SharedTileIndices {
-    pub indices: Vec<u32>,
+pub(super) struct SharedTileIndices {
+    pub(super) indices: Vec<u32>,
     /// Index range covering the `grid_cells x grid_cells` surface quads only
     /// (used by the post-overlay `grid_pipeline` so skirts never draw graticule
     /// artifacts).
-    pub surface: Range<u32>,
+    pub(super) surface: Range<u32>,
     /// Full index range covering the surface quads plus all four downward
     /// skirts (used by `body_ellipsoid_pipeline` and `body_textured_pipeline`).
-    pub full: Range<u32>,
+    pub(super) full: Range<u32>,
 }
 
 impl SharedTileIndices {
     /// Build the shared static index buffer for a `grid_cells x grid_cells`
     /// tile with four perimeter skirt strips.
-    pub fn build(grid_cells: u32) -> Self {
+    pub(super) fn build(grid_cells: u32) -> Self {
         let n = grid_cells.max(1);
         let stride = n + 1;
         let surface_verts = stride * stride;
@@ -239,8 +247,21 @@ pub(super) fn build_tile_mesh_data(
         let t = f64::from(row) / n_f;
         for col in 0..=n {
             let s = f64::from(col) / n_f;
-            let (lat, lon, u_tex, v_tex, dx, dy) =
-                sample_tile_surface(tile.id, s, t).unwrap_or((0.0, 0.0, s, t, 0.0, 0.0));
+            let TileSurfaceSample {
+                lat_deg: lat,
+                lon_deg: lon,
+                u_tex,
+                v_tex,
+                polar_dx: dx,
+                polar_dy: dy,
+            } = sample_tile_surface(tile.id, s, t).unwrap_or(TileSurfaceSample {
+                lat_deg: 0.0,
+                lon_deg: 0.0,
+                u_tex: s,
+                v_tex: t,
+                polar_dx: 0.0,
+                polar_dy: 0.0,
+            });
             let (pos_ecef, unit_normal) = geodesy::surface_ecef_and_normal(lat, lon);
             let rel_pos = (pos_ecef - origin).as_vec3().to_array();
             let normal = unit_normal.as_vec3().to_array();

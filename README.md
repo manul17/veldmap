@@ -12,9 +12,9 @@ VeldMap is built in vertical slices tracked in [plan.md](plan.md):
 
 ## Workspace Layout
 
-- `crates/veldmap-core` — Pure domain logic (`geo`, `tile` including `scheduler`, `budget`, std-only `io::{CancelToken, Wakeup, byte_source}`; zero `egui`, `eframe`, `wgpu`, `image`, or network dependencies).
-- `crates/veldmap-raster` — Memory-bounded PNG/JPEG & GeoTIFF/BigTIFF/COG decoding (`tiff`, `band`, `grid`, `pyramid`, `resample`, `chunk_cache`), bounded CPU `DecodePool` / `TwoLaneDecodePool`, CPU linear-light mipmap generation, and virtual offline equirectangular basemap tiling.
-- `crates/veldmap-storage` — Injectable `StoragePaths`, durable atomic JSON persistence (`write_atomic_durable` / `write_atomic_durable_private`), positioned `LocalFileSource`, sampled BLAKE3 `LocalFingerprintCache`, and crash-safe vertically partitioned SQLite WAL LRU tile disk cache.
+- `crates/veldmap-core` — Pure `#![forbid(unsafe_code)]` domain logic (`geo`, `tile`, `budget`, `sync::{CancelToken, Wakeup}`, `io::{ByteSource, BufferedByteReader}`; zero OS probing, `egui`, `eframe`, `wgpu`, `image`, or network dependencies).
+- `crates/veldmap-raster` — Memory-bounded PNG/JPEG & GeoTIFF/BigTIFF/COG decoding (`TiffSource`, `SharedChunkCache`, `TileScheduler`, `DecodePeak`, pyramid/resampling/radiometry pipeline), bounded CPU `DecodePool` / `TwoLaneDecodePool`, CPU linear-light mipmap generation, and virtual offline equirectangular basemap tiling.
+- `crates/veldmap-storage` — Injectable `StoragePaths`, host-RAM budget detection (`detect_memory_budget`), durable atomic JSON persistence (`write_atomic_durable` / `write_atomic_durable_private`), positioned `LocalFileSource`, bounded sampled BLAKE3 `LocalFingerprintCache`, and crash-safe vertically partitioned SQLite WAL LRU tile disk cache.
 - `crates/veldmap-net` — Async `tokio` + `reqwest`/`rustls` (`ring`) live HTTP tile streaming, per-host concurrency limiting, pluggable `TileDecodeExecutor`/`TileBlobStore` seams, and NASA GIBS / EOX / Custom XYZ/TMS specs.
 - `crates/veldmap-app` — Native `eframe`/`egui` + `wgpu` desktop application (`[lib]` + `[[bin]]` so rendering and shader tests run headlessly), including user settings (`settings.rs`) and runtime storage/decode wiring.
 - `assets/` — Public-domain bundled assets and provenance notes ([assets/README.md](assets/README.md)).

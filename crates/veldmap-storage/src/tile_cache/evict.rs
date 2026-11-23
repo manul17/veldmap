@@ -1,12 +1,10 @@
 //! Batched O(log N) SQLite LRU eviction and incremental vacuum / WAL
 //! reclamation helpers for [`super::TileDiskCache`].
 
-use rusqlite::{Connection, Params, Statement, Transaction, params};
+use rusqlite::{Connection, Transaction};
 
 use super::EvictionReport;
-use super::schema::{
-    DELETE_META_BY_ID_SQL, SELECT_EVICT_BATCH_PROTECTED_SQL, SELECT_EVICT_BATCH_SQL,
-};
+use super::schema::{delete_meta_ids, select_evict_batch, set_cache_meta_totals};
 
 /// Eviction headroom divisor (`10` => evict down to `90%` of budget so
 /// subsequent inserts do not trigger eviction on every single tile).
@@ -29,22 +27,6 @@ pub(super) fn reclaim_space(conn: &Connection, is_file_backed: bool, full_vacuum
             "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES});"
         ));
     }
-}
-
-fn collect_eviction_batch<P: Params>(
-    stmt: &mut Statement<'_>,
-    query_params: P,
-) -> Result<Vec<(i64, u64)>, rusqlite::Error> {
-    let mut batch = Vec::with_capacity(EVICT_BATCH_ROWS as usize);
-    let rows = stmt.query_map(query_params, |r| {
-        let tile_id: i64 = r.get(0)?;
-        let sz: i64 = r.get(1)?;
-        Ok((tile_id, sz.max(0) as u64))
-    })?;
-    for row in rows {
-        batch.push(row?);
-    }
-    Ok(batch)
 }
 
 pub(super) struct EvictionOutcome {
@@ -75,42 +57,28 @@ pub(super) fn evict_in_tx(
     let mut evicted_bytes = 0u64;
     let mut evicted_ids = Vec::new();
 
-    // `ORDER BY last_used_ms ASC` (without `, tile_id ASC`) lets SQLite satisfy
-    // the query directly from covering index `idx_tile_meta_lru (last_used_ms,
-    // byte_size)` with zero temp B-tree sorting and zero table lookups.
-    let select_sql = if protect_id.is_some() {
-        SELECT_EVICT_BATCH_PROTECTED_SQL
-    } else {
-        SELECT_EVICT_BATCH_SQL
-    };
-    let mut select_stmt = tx.prepare(select_sql)?;
-    let mut delete_stmt = tx.prepare(DELETE_META_BY_ID_SQL)?;
-
     while total_bytes > target {
-        let batch = match protect_id {
-            Some(protected) => {
-                collect_eviction_batch(&mut select_stmt, params![EVICT_BATCH_ROWS, protected])?
-            }
-            None => collect_eviction_batch(&mut select_stmt, params![EVICT_BATCH_ROWS])?,
-        };
+        let batch = select_evict_batch(tx, EVICT_BATCH_ROWS, protect_id)?;
         if batch.is_empty() {
             break;
         }
 
+        let mut to_delete = Vec::with_capacity(batch.len());
         for (tile_id, sz) in batch {
             if total_bytes <= target {
                 break;
             }
-            delete_stmt.execute(params![tile_id])?;
+            to_delete.push(tile_id);
             evicted_ids.push(tile_id);
             total_bytes = total_bytes.saturating_sub(sz);
             tile_count = tile_count.saturating_sub(1);
             evicted_bytes = evicted_bytes.saturating_add(sz);
             evicted_tiles += 1;
         }
+        delete_meta_ids(tx, &to_delete)?;
     }
 
-    super::schema::set_cache_meta_totals(tx, total_bytes, tile_count)?;
+    set_cache_meta_totals(tx, total_bytes, tile_count)?;
 
     Ok(EvictionOutcome {
         report: EvictionReport {

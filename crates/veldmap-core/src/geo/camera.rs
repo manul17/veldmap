@@ -184,9 +184,9 @@ impl Camera {
     }
 
     /// Build a high-precision `f64` frustum + horizon culling frame.
-    pub fn frustum(&self, aspect: f64) -> cull::Frame {
+    pub fn frustum(&self, aspect: f64) -> cull::CullFrustum {
         let vp = self.view_projection(aspect);
-        cull::Frame::new(&vp, self.eye_ecef())
+        cull::CullFrustum::new(&vp, self.eye_ecef())
     }
 
     /// Orbit the globe by drag deltas `(dx, dy)` expressed as fractions of the

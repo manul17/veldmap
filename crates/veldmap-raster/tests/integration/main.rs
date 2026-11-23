@@ -4,8 +4,9 @@
 
 #![expect(
     clippy::expect_used,
-    reason = "integration test harness helpers panic on setup failure"
+    reason = "INVARIANT: integration test harness helpers panic on setup failure"
 )]
 
+mod common;
 mod stress_and_budget;
 mod tiff_and_cog;

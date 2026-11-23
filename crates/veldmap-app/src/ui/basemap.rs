@@ -3,30 +3,17 @@
 //!
 //! Strictly action-only: emits [`BasemapUiAction`] values back to `VeldmapApp`
 //! without mutating managers, storage, GPU caches, or upload channels directly
-//! from UI layout code.
+//! from UI layout code, and without importing `veldmap-net` directly.
 
 use eframe::egui;
-use veldmap_net::validate_custom_url_template;
 
 use super::{ERROR_TEXT_COLOR, TILE_ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 use crate::basemap::BasemapStatusSnapshot;
 use crate::settings::{
     AppSettings, BasemapSelection, CUSTOM_MAX_LEVEL_RANGE, CustomXyzSettings,
-    DISK_CACHE_MAX_MB_RANGE, validate_gibs_date,
+    DISK_CACHE_MAX_MB_RANGE, validate_custom_url_template, validate_gibs_date,
 };
 use crate::storage::{DiskCacheNotice, DiskCacheStatus};
-
-/// Short human-readable label for toolbar dropdowns and settings UI.
-pub const fn basemap_label(selection: BasemapSelection) -> &'static str {
-    match selection {
-        BasemapSelection::BundledBlueMarble => "Offline Blue Marble",
-        BasemapSelection::NasaGibsBlueMarble => "NASA GIBS Blue Marble",
-        BasemapSelection::NasaGibsViirs => "NASA GIBS VIIRS True Color",
-        BasemapSelection::EoxSentinel2Cloudless => "EOX Sentinel-2 Cloudless",
-        BasemapSelection::CustomXyz => "Custom XYZ / TMS",
-        BasemapSelection::EllipsoidOnly => "Ellipsoid-only",
-    }
-}
 
 fn format_disk_cache_notice(notice: &DiskCacheNotice) -> String {
     match notice {
@@ -46,15 +33,15 @@ fn format_disk_cache_notice(notice: &DiskCacheNotice) -> String {
 /// `show_graticule` or future workspace preferences) guarantees saving basemap
 /// settings can never silently clobber other user settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BasemapSettingsDraft {
-    pub active_basemap: BasemapSelection,
-    pub gibs_date: String,
-    pub custom_xyz: CustomXyzSettings,
-    pub disk_cache_max_mb: u64,
+pub(crate) struct BasemapSettingsDraft {
+    pub(crate) active_basemap: BasemapSelection,
+    pub(crate) gibs_date: String,
+    pub(crate) custom_xyz: CustomXyzSettings,
+    pub(crate) disk_cache_max_mb: u64,
 }
 
 impl BasemapSettingsDraft {
-    pub fn from_settings(settings: &AppSettings) -> Self {
+    pub(crate) fn from_settings(settings: &AppSettings) -> Self {
         Self {
             active_basemap: settings.active_basemap,
             gibs_date: settings.gibs_date.clone(),
@@ -63,7 +50,7 @@ impl BasemapSettingsDraft {
         }
     }
 
-    pub fn apply_into(&self, target: &mut AppSettings) {
+    pub(crate) fn apply_into(&self, target: &mut AppSettings) {
         target.active_basemap = self.active_basemap;
         target.gibs_date = self.gibs_date.clone();
         target.custom_xyz = self.custom_xyz.clone();
@@ -74,7 +61,7 @@ impl BasemapSettingsDraft {
 /// User intent emitted by basemap toolbar / settings widgets and applied by
 /// `VeldmapApp`.
 #[derive(Clone, Debug)]
-pub enum BasemapUiAction {
+pub(crate) enum BasemapUiAction {
     /// Switch the active basemap from the toolbar without clobbering unsaved
     /// draft edits in an open Settings window.
     SelectBasemap(BasemapSelection),
@@ -82,8 +69,6 @@ pub enum BasemapUiAction {
     ApplyDraft(BasemapSettingsDraft),
     /// Settings window opened this frame (triggers event-driven cache stats refresh).
     SettingsOpened,
-    /// Settings window closed this frame.
-    SettingsClosed,
     /// Request an asynchronous SQLite disk cache clear off the UI thread.
     ClearDiskCache,
     /// Dismiss any transient disk-cache status notice when opening Settings.
@@ -94,14 +79,14 @@ pub enum BasemapUiAction {
 
 /// Transient UI editing state for the Basemap & Cache Settings window.
 #[derive(Clone, Debug)]
-pub struct BasemapUiState {
+pub(crate) struct BasemapUiState {
     settings_open: bool,
     draft: BasemapSettingsDraft,
     cached_custom_validation: Option<(String, Result<(), String>)>,
 }
 
 impl BasemapUiState {
-    pub fn new(initial: &AppSettings) -> Self {
+    pub(crate) fn new(initial: &AppSettings) -> Self {
         Self {
             settings_open: false,
             draft: BasemapSettingsDraft::from_settings(initial),
@@ -110,19 +95,19 @@ impl BasemapUiState {
     }
 
     /// Whether the Basemap & Cache Settings window is currently open.
-    pub fn is_settings_open(&self) -> bool {
+    pub(crate) fn is_settings_open(&self) -> bool {
         self.settings_open
     }
 
     /// Update only the draft's `active_basemap` selection (preserving unsaved
     /// edits in an open Settings window).
-    pub fn set_draft_active_basemap(&mut self, selection: BasemapSelection) {
+    pub(crate) fn set_draft_active_basemap(&mut self, selection: BasemapSelection) {
         self.draft.active_basemap = selection;
     }
 
     /// Synchronize the Settings draft from persisted `AppSettings` and clear
     /// cached validation.
-    pub fn sync_from_settings(&mut self, settings: &AppSettings) {
+    pub(crate) fn sync_from_settings(&mut self, settings: &AppSettings) {
         self.draft = BasemapSettingsDraft::from_settings(settings);
         self.cached_custom_validation = None;
     }
@@ -145,9 +130,7 @@ impl BasemapUiState {
             .as_ref()
             .is_none_or(|(prev, _)| prev != &self.draft.custom_xyz.url_template);
         if needs_recompute {
-            let res = validate_custom_url_template(&self.draft.custom_xyz.url_template)
-                .map(|_| ())
-                .map_err(|err| err.to_string());
+            let res = validate_custom_url_template(&self.draft.custom_xyz.url_template);
             self.cached_custom_validation = Some((self.draft.custom_xyz.url_template.clone(), res));
         }
         match self.cached_custom_validation.as_ref() {
@@ -157,15 +140,6 @@ impl BasemapUiState {
         }
     }
 }
-
-const ALL_BASEMAPS: [BasemapSelection; 6] = [
-    BasemapSelection::BundledBlueMarble,
-    BasemapSelection::NasaGibsBlueMarble,
-    BasemapSelection::NasaGibsViirs,
-    BasemapSelection::EoxSentinel2Cloudless,
-    BasemapSelection::CustomXyz,
-    BasemapSelection::EllipsoidOnly,
-];
 
 fn show_live_status_badge(
     ui: &mut egui::Ui,
@@ -229,7 +203,7 @@ fn show_live_status_badge(
 
 /// Render toolbar basemap selector, live streaming / error / offline pill, and
 /// Settings button, returning any user actions to apply in `VeldmapApp`.
-pub fn show_toolbar_controls(
+pub(crate) fn show_toolbar_controls(
     ui: &mut egui::Ui,
     settings: &AppSettings,
     status: &BasemapStatusSnapshot,
@@ -239,12 +213,12 @@ pub fn show_toolbar_controls(
     let current = settings.active_basemap;
 
     egui::ComboBox::from_id_salt("basemap_selector")
-        .selected_text(basemap_label(current))
+        .selected_text(current.label())
         .width(175.0)
         .show_ui(ui, |ui| {
-            for option in ALL_BASEMAPS {
+            for option in BasemapSelection::ALL {
                 if ui
-                    .selectable_label(option == current, basemap_label(option))
+                    .selectable_label(option == current, option.label())
                     .clicked()
                     && option != current
                 {
@@ -269,7 +243,6 @@ pub fn show_toolbar_controls(
             ui_state.open_settings(settings, &mut actions);
         } else {
             ui_state.settings_open = false;
-            actions.push(BasemapUiAction::SettingsClosed);
         }
     }
 
@@ -429,7 +402,7 @@ fn show_disk_cache_section(
 
 /// Render the floating Basemap & Disk Cache Settings window when open,
 /// returning any user actions to apply in `VeldmapApp`.
-pub fn show_settings_window(
+pub(crate) fn show_settings_window(
     ctx: &egui::Context,
     settings: &AppSettings,
     disk_status: &DiskCacheStatus,
@@ -485,9 +458,6 @@ pub fn show_settings_window(
         });
 
     ui_state.settings_open = open;
-    if !open {
-        actions.push(BasemapUiAction::SettingsClosed);
-    }
     actions
 }
 

@@ -6,10 +6,6 @@
 
 use super::geodesy::SEMI_MAJOR_M;
 
-/// Maximum chord sagitta tolerance used for surface outline densification
-/// (metres). Keeps outline chords visually tight against the ellipsoid.
-pub const DEFAULT_SAG_TOLERANCE_M: f64 = 70.0;
-
 /// How far the midpoint of a spherical chord spanning `arc_deg` degrees dips
 /// below the surface, in metres.
 pub fn sag_m(arc_deg: f64) -> f64 {
@@ -23,13 +19,6 @@ pub fn sag_m(arc_deg: f64) -> f64 {
 pub fn max_chord_deg(tolerance_m: f64) -> f64 {
     let half_sag = (tolerance_m.max(0.0) / (2.0 * SEMI_MAJOR_M)).clamp(0.0, 1.0);
     4.0 * half_sag.sqrt().asin().to_degrees()
-}
-
-/// Shared maximum angular step along densified outline and footprint edges
-/// (half the sagitta limit chord so radial fill diagonals stay tight to the
-/// ellipsoid and footprint hit-testing matches drawn outlines).
-pub(crate) fn outline_max_edge_deg() -> f64 {
-    max_chord_deg(DEFAULT_SAG_TOLERANCE_M) * 0.5
 }
 
 #[cfg(test)]

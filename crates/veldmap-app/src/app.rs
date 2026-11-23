@@ -6,12 +6,12 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui_wgpu;
 use thiserror::Error;
-use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
-use veldmap_core::io::Wakeup;
+use veldmap_core::sync::Wakeup;
 use veldmap_core::tile::SourceId;
+use veldmap_storage::detect_memory_budget;
 
-use crate::basemap::BasemapManager;
+use crate::basemap::{BasemapManager, BasemapSyncOutcome};
 use crate::gpu_tiles::{
     DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
     UploadBatchReport, UploadPassParams,
@@ -71,8 +71,8 @@ impl Drop for VeldmapApp {
     fn drop(&mut self) {
         // Deterministic shutdown order:
         // 1. Cancel tokens / signal background workers
-        // 2. Drop completion channel receiver (`PendingUploads::close`)
-        // 3. Join CPU decode, bundled & disk-cache threads -> shut down `tokio::Runtime`
+        // 2. Close bounded upload queue (`PendingUploads::close`)
+        // 3. Join shared CPU decode pool & disk-cache worker -> shut down `tokio::Runtime`
         self.basemap.begin_shutdown();
         self.storage.begin_shutdown();
         self.pending_uploads.close();
@@ -118,7 +118,7 @@ impl VeldmapApp {
             egui_ctx.request_repaint();
         });
 
-        let budget = MemoryBudget::detect();
+        let budget = detect_memory_budget();
         let pending_uploads = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
         let done_tx = pending_uploads
             .sender()
@@ -131,6 +131,8 @@ impl VeldmapApp {
             wakeup,
             &budget,
         );
+        pending_uploads
+            .set_pinned_root_sources(&[basemap.active_source(), SourceId::BUNDLED_BASEMAP]);
         let basemap_ui = BasemapUiState::new(storage.settings());
 
         Ok(Self {
@@ -160,6 +162,20 @@ impl VeldmapApp {
             .reconcile_providers(&self.gpu_tile_cache, &self.pending_uploads);
     }
 
+    fn apply_basemap_sync(&mut self, outcome: BasemapSyncOutcome) -> bool {
+        if let Some(evict) = outcome.evict_source {
+            self.gpu_tile_cache.remove_source(evict);
+            self.pending_uploads.clear_source(evict);
+        }
+        if outcome.changed {
+            self.pending_uploads.set_pinned_root_sources(&[
+                self.basemap.active_source(),
+                SourceId::BUNDLED_BASEMAP,
+            ]);
+        }
+        outcome.changed
+    }
+
     fn apply_basemap_actions(&mut self, actions: Vec<BasemapUiAction>) -> (bool, bool) {
         let mut scene_changed = false;
         let mut needs_repaint = false;
@@ -169,11 +185,8 @@ impl VeldmapApp {
                     scene_changed |= self
                         .storage
                         .mutate_settings(|s| s.active_basemap = selection);
-                    scene_changed |= self.basemap.sync_settings(
-                        self.storage.settings(),
-                        &mut self.gpu_tile_cache,
-                        &mut self.pending_uploads,
-                    );
+                    let outcome = self.basemap.sync_settings(self.storage.settings());
+                    scene_changed |= self.apply_basemap_sync(outcome);
                     // Preserve unsaved edits in an open Settings window; only
                     // synchronize the active selection field.
                     self.basemap_ui
@@ -181,17 +194,13 @@ impl VeldmapApp {
                 }
                 BasemapUiAction::ApplyDraft(draft) => {
                     scene_changed |= self.storage.mutate_settings(|s| draft.apply_into(s));
-                    scene_changed |= self.basemap.sync_settings(
-                        self.storage.settings(),
-                        &mut self.gpu_tile_cache,
-                        &mut self.pending_uploads,
-                    );
+                    let outcome = self.basemap.sync_settings(self.storage.settings());
+                    scene_changed |= self.apply_basemap_sync(outcome);
                     self.basemap_ui.sync_from_settings(self.storage.settings());
                 }
                 BasemapUiAction::SettingsOpened => {
                     self.storage.maybe_refresh_disk_stats(true);
                 }
-                BasemapUiAction::SettingsClosed => {}
                 BasemapUiAction::ClearDiskCache => {
                     self.storage.request_clear_disk_cache();
                     needs_repaint = true;
@@ -221,6 +230,7 @@ impl VeldmapApp {
     fn drain_tile_uploads(&mut self) -> UploadBatchReport {
         let active_source = self.basemap.active_source();
         let pinned_sources = [active_source, SourceId::BUNDLED_BASEMAP];
+        let wanted = self.basemap.wanted_tile_sets();
         let protected = self
             .cached_snapshot
             .as_ref()
@@ -232,7 +242,7 @@ impl VeldmapApp {
             UploadPassParams {
                 pinned_root_sources: &pinned_sources,
                 observed_source: Some(active_source),
-                wanted: Some(self.basemap.wanted_tiles()),
+                wanted: &wanted,
                 protected,
                 byte_budget: DEFAULT_UPLOAD_BYTE_BUDGET,
                 time_budget: DEFAULT_UPLOAD_TIME_BUDGET,
@@ -258,12 +268,12 @@ impl VeldmapApp {
         let active_source = self.basemap.active_source();
         let textured = self.basemap.is_textured();
         let show_graticule = self.storage.settings().show_graticule;
-        let layer_key = active_source.0 ^ (u64::from(textured) << 62);
         let key = SnapshotKey::new(
             &self.camera,
             [width_px, height_px],
             pixels_per_point,
-            layer_key,
+            active_source,
+            textured,
             show_graticule,
             self.scene_generation,
         );
@@ -439,6 +449,7 @@ impl eframe::App for VeldmapApp {
 
         // Top toolbar and Settings window.
         let mut basemap_changed = false;
+        let mut graticule_changed = false;
         let basemap_status = self.basemap.status_snapshot();
         let (toolbar_actions, graticule_toggled) = toolbar::show_top_toolbar(
             ui,
@@ -454,27 +465,27 @@ impl eframe::App for VeldmapApp {
         needs_repaint |= tb_repaint;
 
         if let Some(show_graticule) = graticule_toggled {
-            basemap_changed |= self
+            graticule_changed |= self
                 .storage
                 .mutate_settings(|s| s.show_graticule = show_graticule);
         }
 
         if self.basemap_ui.is_settings_open() {
             self.storage.maybe_refresh_disk_stats(false);
+            let disk_status = self.storage.disk_cache_status();
+            let settings_actions = basemap_ui::show_settings_window(
+                &ctx,
+                self.storage.settings(),
+                &disk_status,
+                &mut self.basemap_ui,
+            );
+            let (st_changed, st_repaint) = self.apply_basemap_actions(settings_actions);
+            basemap_changed |= st_changed;
+            needs_repaint |= st_repaint;
         }
 
-        let disk_status = self.storage.disk_cache_status();
-        let settings_actions = basemap_ui::show_settings_window(
-            &ctx,
-            self.storage.settings(),
-            &disk_status,
-            &mut self.basemap_ui,
-        );
-        let (st_changed, st_repaint) = self.apply_basemap_actions(settings_actions);
-        basemap_changed |= st_changed;
-        needs_repaint |= st_repaint;
-
-        if basemap_changed {
+        let scene_changed = basemap_changed || graticule_changed;
+        if scene_changed {
             self.scene_generation = self.scene_generation.wrapping_add(1);
         }
 
@@ -514,12 +525,12 @@ impl eframe::App for VeldmapApp {
         }
 
         // Request a follow-up repaint only for active flights, camera changes,
-        // viewport resizes, basemap/action changes, budget-deferred uploads, or
+        // viewport resizes, scene/action changes, budget-deferred uploads, or
         // partial upload progress that may have unprotected a deferred tile.
         if self.camera.is_flying()
             || self.camera != camera_before
             || self.last_viewport_rect != rect_before
-            || basemap_changed
+            || scene_changed
             || needs_repaint
             || upload_report.remaining_ready > 0
             || (upload_report.uploaded > 0 && upload_report.deferred_protected > 0)

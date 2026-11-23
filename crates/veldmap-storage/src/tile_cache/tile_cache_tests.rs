@@ -102,13 +102,15 @@ fn pragmas_schema_version_and_covering_lru_index_are_configured() {
         .prepare(
             "EXPLAIN QUERY PLAN
              SELECT tile_id, byte_size FROM tile_meta
-             WHERE tile_id != ?2
+             WHERE tile_id != ?1
              ORDER BY last_used_ms ASC
-             LIMIT ?1",
+             LIMIT ?2",
         )
         .expect("explain");
     let details: Vec<String> = stmt
-        .query_map(params![EVICT_BATCH_ROWS, 1i64], |r| r.get::<_, String>(3))
+        .query_map(rusqlite::params![1i64, EVICT_BATCH_ROWS], |r| {
+            r.get::<_, String>(3)
+        })
         .expect("query plan")
         .map(|r| r.expect("plan row"))
         .collect();

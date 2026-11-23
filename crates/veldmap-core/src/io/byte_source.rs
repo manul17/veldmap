@@ -1,18 +1,15 @@
-//! Synchronous caller-buffered positioned I/O (`ByteSource`), read
-//! amplification instrumentation (`CountingByteSource`), buffered `Read + Seek`
-//! adapter (`BufferedByteReader`), and opaque [`SourceFingerprint`].
+//! Synchronous caller-buffered positioned I/O (`ByteSource`) and buffered
+//! `Read + Seek` adapter (`BufferedByteReader`).
 //!
 //! Avoids memory-mapped files (`memmap2`) to prevent `SIGBUS` UB on truncated,
 //! removable, or network-backed inputs.
 
-use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use super::{CancelToken, lock_unpoisoned};
+use crate::sync::CancelToken;
 
 /// Default internal buffer size for [`BufferedByteReader`] (`64 KiB`).
 pub const DEFAULT_READER_BUFFER_BYTES: usize = 64 * 1024;
@@ -108,125 +105,6 @@ pub trait ByteSource: Send + Sync {
     }
 }
 
-/// In-memory [`ByteSource`] backed by a shared byte slice.
-#[derive(Clone, Debug)]
-pub struct MemoryByteSource {
-    bytes: Arc<[u8]>,
-}
-
-impl MemoryByteSource {
-    /// Wrap an owned `Vec<u8>` as a [`MemoryByteSource`].
-    pub fn from_vec(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes: Arc::from(bytes),
-        }
-    }
-
-    /// Wrap a shared slice as a [`MemoryByteSource`].
-    pub fn new(bytes: Arc<[u8]>) -> Self {
-        Self { bytes }
-    }
-}
-
-impl ByteSource for MemoryByteSource {
-    fn len(&self) -> u64 {
-        self.bytes.len() as u64
-    }
-
-    fn read_at(&self, offset: u64, buf: &mut [u8], cancel: &CancelToken) -> Result<usize, IoError> {
-        if cancel.is_cancelled() {
-            return Err(IoError::Cancelled);
-        }
-        if buf.is_empty() || offset >= self.bytes.len() as u64 {
-            return Ok(0);
-        }
-        let start = offset as usize;
-        let avail = self.bytes.len() - start;
-        let count = avail.min(buf.len());
-        buf[..count].copy_from_slice(&self.bytes[start..start + count]);
-        Ok(count)
-    }
-}
-
-/// Recorded positioned read span captured by [`CountingByteSource`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ByteReadSpan {
-    pub offset: u64,
-    pub len: usize,
-}
-
-/// Snapshot of I/O activity observed by [`CountingByteSource`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReadStats {
-    pub read_calls: u64,
-    pub bytes_read: u64,
-    pub spans: Vec<ByteReadSpan>,
-}
-
-/// Instrumentation wrapper around any [`ByteSource`] recording read calls,
-/// byte counts, and exact `(offset, len)` spans for read-amplification tests.
-pub struct CountingByteSource {
-    inner: Arc<dyn ByteSource>,
-    read_calls: AtomicU64,
-    bytes_read: AtomicU64,
-    spans: std::sync::Mutex<Vec<ByteReadSpan>>,
-}
-
-impl CountingByteSource {
-    /// Wrap `inner` with positioned read accounting.
-    pub fn new(inner: Arc<dyn ByteSource>) -> Self {
-        Self {
-            inner,
-            read_calls: AtomicU64::new(0),
-            bytes_read: AtomicU64::new(0),
-            spans: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Total `read_at` calls issued so far.
-    pub fn read_calls(&self) -> u64 {
-        self.read_calls.load(Ordering::Acquire)
-    }
-
-    /// Total bytes returned by `read_at` calls so far.
-    pub fn bytes_read(&self) -> u64 {
-        self.bytes_read.load(Ordering::Acquire)
-    }
-
-    /// Snapshot read counts and exact `(offset, len)` spans.
-    pub fn snapshot(&self) -> ReadStats {
-        let spans = lock_unpoisoned(&self.spans).clone();
-        ReadStats {
-            read_calls: self.read_calls(),
-            bytes_read: self.bytes_read(),
-            spans,
-        }
-    }
-
-    /// Clear recorded counters and spans.
-    pub fn reset(&self) {
-        self.read_calls.store(0, Ordering::Release);
-        self.bytes_read.store(0, Ordering::Release);
-        lock_unpoisoned(&self.spans).clear();
-    }
-}
-
-impl ByteSource for CountingByteSource {
-    fn len(&self) -> u64 {
-        self.inner.len()
-    }
-
-    fn read_at(&self, offset: u64, buf: &mut [u8], cancel: &CancelToken) -> Result<usize, IoError> {
-        let n = self.inner.read_at(offset, buf, cancel)?;
-        self.read_calls.fetch_add(1, Ordering::AcqRel);
-        self.bytes_read.fetch_add(n as u64, Ordering::AcqRel);
-        if n > 0 {
-            lock_unpoisoned(&self.spans).push(ByteReadSpan { offset, len: n });
-        }
-        Ok(n)
-    }
-}
-
 /// Synchronous buffered `std::io::Read + std::io::Seek` adapter over a
 /// positioned [`ByteSource`].
 ///
@@ -264,6 +142,12 @@ impl BufferedByteReader {
             buf_offset: 0,
             buf_len: 0,
         }
+    }
+
+    /// Replace the active [`CancelToken`] (used when checking out/returning a
+    /// pooled decoder so a cancelled request never poisons reuse).
+    pub fn set_cancel(&mut self, cancel: CancelToken) {
+        self.cancel = cancel;
     }
 
     /// Return the current logical stream position.
@@ -367,50 +251,6 @@ impl Seek for BufferedByteReader {
     }
 }
 
-/// Opaque 256-bit content fingerprint uniquely identifying a raster byte stream
-/// (sampled BLAKE3 digest for local files, or metadata digest for remote COGs).
-///
-/// Formats as 64 lowercase ASCII hex characters, which always satisfies strict
-/// disk-cache `source_key` validation (`<= 128` safe ASCII bytes).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SourceFingerprint([u8; 32]);
-
-impl SourceFingerprint {
-    /// Wrap a 32-byte digest into an opaque [`SourceFingerprint`].
-    pub const fn from_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
-    }
-
-    /// Borrow the raw 32-byte digest.
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Encode as 64 lowercase hexadecimal ASCII characters.
-    pub fn to_hex(&self) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(64);
-        for &byte in &self.0 {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        out
-    }
-}
-
-impl fmt::Display for SourceFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_hex())
-    }
-}
-
 #[cfg(test)]
 #[path = "byte_source_tests.rs"]
 mod tests;
-
-impl fmt::Debug for SourceFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let hex = self.to_hex();
-        write!(f, "SourceFingerprint({}..)", &hex[..12])
-    }
-}

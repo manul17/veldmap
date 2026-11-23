@@ -9,8 +9,8 @@ use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, Til
 
 use crate::NetError;
 use crate::redact::{
-    fmt_redacted_custom_xyz_fields, parse_url_authority, percent_encode_variants,
-    redact_secret_label, sanitize_url_for_display, sanitize_urls_in_text,
+    extract_host, parse_url_authority, percent_encode_variants, redact_secret_label,
+    sanitize_url_for_display, sanitize_urls_in_text, strip_http_scheme,
 };
 
 /// Minimum allowed custom XYZ/TMS maximum zoom level.
@@ -91,17 +91,17 @@ pub struct CustomBasemapConfig<'a> {
 
 impl fmt::Debug for CustomBasemapConfig<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("CustomBasemapConfig");
-        fmt_redacted_custom_xyz_fields(
-            &mut s,
-            self.name,
-            self.url_template,
-            self.api_key,
-            self.tms_flip_y,
-            self.max_level,
-            self.attribution,
-        );
-        s.finish()
+        f.debug_struct("CustomBasemapConfig")
+            .field("name", &self.name)
+            .field("url_template", &sanitize_url_for_display(self.url_template))
+            .field(
+                "api_key",
+                &redact_secret_label(Some(self.api_key), "<empty>"),
+            )
+            .field("tms_flip_y", &self.tms_flip_y)
+            .field("max_level", &self.max_level)
+            .field("attribution", &self.attribution)
+            .finish()
     }
 }
 
@@ -119,6 +119,10 @@ pub struct LiveBasemapSpec {
     scheme: GlobeScheme,
     max_level: u8,
     url_template: String,
+    /// Precomputed lowercased `host[:port]` entries (1 entry normally, or 3
+    /// entries for `{s}` subdomain templates) so HTTP dispatch avoids per-tile
+    /// URL expansion and string allocations under `PipelineState`'s mutex.
+    hosts: Vec<String>,
     tms_flip_y: bool,
     api_key: Option<String>,
 }
@@ -161,7 +165,7 @@ pub fn validate_custom_url_template(url_template: &str) -> Result<&str, NetError
             "URL template must not contain whitespace or control characters".to_owned(),
         ));
     }
-    if !template.starts_with("https://") && !template.starts_with("http://") {
+    if strip_http_scheme(template).is_none() {
         return Err(NetError::InvalidUrlTemplate(
             "URL template must start with https:// or http://".to_owned(),
         ));
@@ -185,6 +189,21 @@ pub fn validate_custom_url_template(url_template: &str) -> Result<&str, NetError
         ));
     }
     Ok(template)
+}
+
+fn precompute_hosts(url_template: &str) -> Vec<String> {
+    if url_template.contains("{s}") {
+        let mut hosts: Vec<String> = SUBDOMAINS
+            .iter()
+            .map(|sub| extract_host(&url_template.replace("{s}", sub)))
+            .collect();
+        if hosts.iter().all(|h| h == &hosts[0]) {
+            hosts.truncate(1);
+        }
+        hosts
+    } else {
+        vec![extract_host(url_template)]
+    }
 }
 
 impl LiveBasemapSpec {
@@ -213,22 +232,36 @@ impl LiveBasemapSpec {
         self.max_level
     }
 
-    /// Whether the URL template expands `{s}` across multiple subdomain hosts.
-    pub(crate) fn uses_subdomains(&self) -> bool {
-        self.url_template.contains("{s}")
+    /// Precomputed lowercased `host[:port]` key for `id` (zero allocations).
+    pub(crate) fn host_for(&self, id: QuadTileId) -> &str {
+        if self.hosts.len() == 1 {
+            &self.hosts[0]
+        } else {
+            let sub_idx =
+                ((u64::from(id.x) + u64::from(id.y)) % (self.hosts.len() as u64)) as usize;
+            &self.hosts[sub_idx]
+        }
+    }
+
+    /// Number of distinct precomputed host entries (1 normally, or 3 for `{s}`).
+    pub(crate) fn host_count(&self) -> usize {
+        self.hosts.len()
     }
 
     /// NASA GIBS Blue Marble Shaded Relief + Bathymetry (`GoogleMapsCompatible_Level8`,
     /// static, Public Domain).
     pub fn nasa_gibs_blue_marble() -> Self {
         let cache_key = "nasa-gibs-bluemarble-l8".to_owned();
+        let url_template = GIBS_BLUE_MARBLE_URL_TEMPLATE.to_owned();
+        let hosts = precompute_hosts(&url_template);
         Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
             attribution: "Imagery: NASA GIBS / Blue Marble (Public Domain)".to_owned(),
             scheme: GlobeScheme::WebMercator,
             max_level: GIBS_BLUE_MARBLE_MAX_LEVEL,
-            url_template: GIBS_BLUE_MARBLE_URL_TEMPLATE.to_owned(),
+            url_template,
+            hosts,
             tms_flip_y: false,
             api_key: None,
         }
@@ -242,13 +275,16 @@ impl LiveBasemapSpec {
             return Err(NetError::InvalidDate(trimmed.to_owned()));
         }
         let cache_key = format!("nasa-gibs-viirs-l9-{trimmed}");
+        let url_template = GIBS_VIIRS_URL_TEMPLATE.replace("{time}", trimmed);
+        let hosts = precompute_hosts(&url_template);
         Ok(Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
             attribution: format!("Imagery: NASA GIBS / VIIRS SNPP {trimmed} (Public Domain)"),
             scheme: GlobeScheme::WebMercator,
             max_level: GIBS_VIIRS_MAX_LEVEL,
-            url_template: GIBS_VIIRS_URL_TEMPLATE.replace("{time}", trimmed),
+            url_template,
+            hosts,
             tms_flip_y: false,
             api_key: None,
         })
@@ -257,13 +293,16 @@ impl LiveBasemapSpec {
     /// EOX Sentinel-2 Cloudless 2023 (`WebMercator`, CC BY 4.0, `max_level = 14`).
     pub fn eox_sentinel2_cloudless() -> Self {
         let cache_key = "eox-s2cloudless-2023-3857".to_owned();
+        let url_template = EOX_S2_URL_TEMPLATE.to_owned();
+        let hosts = precompute_hosts(&url_template);
         Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
             attribution: "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (CC BY 4.0, modified Copernicus Sentinel data)".to_owned(),
             scheme: GlobeScheme::WebMercator,
             max_level: EOX_S2_MAX_LEVEL,
-            url_template: EOX_S2_URL_TEMPLATE.to_owned(),
+            url_template,
+            hosts,
             tms_flip_y: false,
             api_key: None,
         }
@@ -295,6 +334,8 @@ impl LiveBasemapSpec {
             cfg.attribution.trim().to_owned()
         };
         let api_key = (!cfg.api_key.trim().is_empty()).then(|| cfg.api_key.trim().to_owned());
+        let url_template = template.to_owned();
+        let hosts = precompute_hosts(&url_template);
 
         Ok(Self {
             source_id: SourceId::from_stable_key(&cache_key),
@@ -302,7 +343,8 @@ impl LiveBasemapSpec {
             attribution,
             scheme: GlobeScheme::WebMercator,
             max_level,
-            url_template: template.to_owned(),
+            url_template,
+            hosts,
             tms_flip_y: cfg.tms_flip_y,
             api_key,
         })

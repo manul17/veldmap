@@ -77,6 +77,41 @@ impl Ellipsoid {
         (ecef, normal)
     }
 
+    /// Evaluate a separable `N x N` grid of surface (`height_m = 0.0`) ECEF
+    /// points and outward unit normals, factoring trigonometry into `N` lat and
+    /// `N` lon evaluations instead of `N^2`.
+    pub fn fill_separable_surface_grid<const N: usize>(
+        &self,
+        lats_deg: [f64; N],
+        lons_deg: [f64; N],
+        samples: &mut [DVec3],
+        normals: &mut [DVec3],
+    ) {
+        debug_assert!(samples.len() >= N * N && normals.len() >= N * N);
+        let e2 = self.eccentricity_sq();
+        let one_minus_e2 = 1.0 - e2;
+        let mut lat_cache = [(0.0_f64, 0.0_f64, 0.0_f64); N];
+        for (slot, lat_deg) in lat_cache.iter_mut().zip(lats_deg) {
+            let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
+            let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+            *slot = (sin_lat, cos_lat, curvature);
+        }
+        let mut lon_cache = [(0.0_f64, 0.0_f64); N];
+        for (slot, lon_deg) in lon_cache.iter_mut().zip(lons_deg) {
+            *slot = lon_deg.to_radians().sin_cos();
+        }
+        let mut idx = 0usize;
+        for &(sin_lat, cos_lat, curvature) in &lat_cache {
+            let eq = curvature * cos_lat;
+            let z = curvature * one_minus_e2 * sin_lat;
+            for &(sin_lon, cos_lon) in &lon_cache {
+                normals[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+                samples[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
+                idx += 1;
+            }
+        }
+    }
+
     /// Convert `f64` ECEF Cartesian coordinates in **metres** back to 3D
     /// geodetic `(lat_deg, lon_deg, height_m)` using Fukushima's (2006)
     /// Halley-accelerated method.

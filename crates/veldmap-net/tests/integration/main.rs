@@ -4,7 +4,7 @@
 
 #![expect(
     clippy::expect_used,
-    reason = "integration test harness helpers panic on setup failure"
+    reason = "INVARIANT: integration test harness helpers panic on setup failure"
 )]
 
 mod basemap;

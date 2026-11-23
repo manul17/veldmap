@@ -2,7 +2,7 @@
 //! fractional window area resampling (`resample_rgba8_window`), and nodata
 //! color bleeding (`bleed_alpha`).
 
-use crate::mipmap::{
+use crate::color::{
     average_srgb_rgba8_block, linear_to_srgb_lut, linear_to_srgb_u8, srgb_to_linear_lut,
 };
 
@@ -54,17 +54,6 @@ pub struct Window {
     pub y0: f64,
     pub x1: f64,
     pub y1: f64,
-}
-
-/// Area-weighted resampling of an entire `sw x sh` RGBA8 buffer to `dw x dh`.
-pub fn resample_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
-    let whole = Window {
-        x0: 0.0,
-        y0: 0.0,
-        x1: f64::from(sw),
-        y1: f64::from(sh),
-    };
-    resample_rgba8_window(src, sw, sh, whole, dw, dh)
 }
 
 /// Area-weighted resampling of fractional `window` inside `src` (`sw x sh`) to
@@ -201,6 +190,16 @@ pub fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resample_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+        let whole = Window {
+            x0: 0.0,
+            y0: 0.0,
+            x1: f64::from(sw),
+            y1: f64::from(sh),
+        };
+        resample_rgba8_window(src, sw, sh, whole, dw, dh)
+    }
 
     fn solid(w: u32, h: u32, value: u8) -> Vec<u8> {
         vec![value; (w * h * 4) as usize]

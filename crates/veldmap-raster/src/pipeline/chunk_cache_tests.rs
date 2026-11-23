@@ -7,10 +7,12 @@ use super::*;
 fn test_key(idx: u32) -> ChunkKey {
     ChunkKey {
         source: SourceId::new(9),
-        band: BandKey::Display,
-        format: PixelFormat::Rgba8UnormSrgb,
-        gutter: 0,
-        decode_rev: 1,
+        spec: TileStreamSpec::new(
+            veldmap_core::tile::BandKey::Display,
+            veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
+            0,
+            1,
+        ),
         image: 0,
         chunk_index: idx,
     }

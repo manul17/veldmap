@@ -18,11 +18,12 @@ use veldmap_core::tile::{
 };
 
 use crate::RasterError;
-use crate::map_tile::decode_rgb8_limited;
-use crate::mipmap::{
-    LINEAR_TO_SRGB_LUT_LEN, downsample_rgb8_srgb_wrap_x_2x, generate_linear_mipmaps,
-    linear_to_srgb_lut, mix_2x2_srgb_rgb, srgb_to_linear_lut,
+use crate::color::{
+    LINEAR_TO_SRGB_LUT_LEN, linear_to_srgb_lut, mix_2x2_srgb_rgb, srgb_to_linear_lut,
 };
+
+use super::map_tile::decode_rgb8_limited;
+use super::mipmap::{downsample_rgb8_srgb_wrap_x_2x, generate_linear_mipmaps};
 
 /// Maximum single virtual tile dimension accepted by [`BundledBasemap::render_tile_sized`].
 const MAX_BASEMAP_TILE_DIM: u32 = 2048;
@@ -45,13 +46,19 @@ pub struct BundledBasemapConfig {
     pub polar_max_level: u8,
 }
 
+impl BundledBasemapConfig {
+    /// Default bundled basemap tiling configuration (`256 px`, `max_level = 3`,
+    /// `polar_max_level = 0`).
+    pub const DEFAULT: Self = Self {
+        tile_px: 256,
+        max_level: 3,
+        polar_max_level: 0,
+    };
+}
+
 impl Default for BundledBasemapConfig {
     fn default() -> Self {
-        Self {
-            tile_px: 256,
-            max_level: 3,
-            polar_max_level: 0,
-        }
+        Self::DEFAULT
     }
 }
 

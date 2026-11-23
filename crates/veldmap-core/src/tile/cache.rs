@@ -63,11 +63,18 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.max_bytes
     }
 
-    /// Raise the configured maximum byte budget to at least `min_bytes`.
-    pub fn ensure_max_bytes(&mut self, min_bytes: usize) {
-        if min_bytes > self.max_bytes {
-            self.max_bytes = min_bytes;
+    /// Adjust the configured maximum byte budget, returning any evicted LRU
+    /// entries when shrinking below the current total.
+    pub fn set_max_bytes(&mut self, max_bytes: usize) -> Vec<(K, V)> {
+        self.max_bytes = max_bytes;
+        let mut evicted = Vec::new();
+        while self.total_bytes > self.max_bytes {
+            let Some(item) = self.pop_lru() else {
+                break;
+            };
+            evicted.push(item);
         }
+        evicted
     }
 
     /// Return whether `key` is currently cached (without updating recency).
@@ -392,33 +399,6 @@ impl<V> TileCache<TileKey, V> {
         usize::try_from(scaled).unwrap_or(half_strict)
     }
 
-    fn tile_count_for_cap(&self, cap: usize, tile_bytes: usize) -> usize {
-        if tile_bytes == 0 || tile_bytes > self.max_bytes {
-            return 0;
-        }
-        cap / tile_bytes
-    }
-
-    /// Maximum tile count allowed for one active pyramid given `tile_bytes`,
-    /// strictly honoring the `< 50%` byte appetite cap (returns `0` if even one
-    /// tile would exceed the per-pyramid cap).
-    pub fn max_tiles_for_pyramid(&self, active_pyramids: usize, tile_bytes: usize) -> usize {
-        self.tile_count_for_cap(self.pyramid_byte_cap(active_pyramids), tile_bytes)
-    }
-
-    /// Maximum tile count allowed for one weighted pyramid given `tile_bytes`,
-    /// strictly honoring [`Self::proportional_pyramid_byte_cap`].
-    pub fn max_tiles_for_weighted_pyramid(
-        &self,
-        pyramid_weight: u64,
-        total_weight: u64,
-        tile_bytes: usize,
-    ) -> usize {
-        self.tile_count_for_cap(
-            self.proportional_pyramid_byte_cap(pyramid_weight, total_weight),
-            tile_bytes,
-        )
-    }
     fn find_carrier_slot(&self, key: &TileKey) -> Option<(TileKey, usize)> {
         let mut cursor = Some(*key);
         while let Some(cur) = cursor {

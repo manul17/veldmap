@@ -2,13 +2,13 @@
 //! and [`MemoryBudget`].
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::tile::{LevelPlan, ServeMode};
 
-use crate::grid::Grid;
-use crate::pyramid;
+use super::grid::Grid;
+use super::pyramid;
+use super::scheduler::{LevelPlan, ServeMode};
 
 /// Build the per-level serving plan (`0..level_count`) for a chunked raster.
-pub(super) fn build_chunked_level_table(
+pub(crate) fn build_chunked_level_table(
     grid: &Grid,
     width: u32,
     height: u32,

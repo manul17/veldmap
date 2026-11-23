@@ -1,114 +1,16 @@
-//! Shared sRGB <-> linear-light lookup tables and CPU linear-light mipmap
-//! generation for `Rgba8UnormSrgb` tiles.
-//!
-//! Precomputing linear-light mipmaps on CPU lets `GpuTile` textures remain
-//! strictly `TEXTURE_BINDING | COPY_DST` (no `RENDER_ATTACHMENT` mipgen pass)
-//! while pairing with `MipmapFilterMode::Linear` on the globe tile sampler.
-
-use std::sync::OnceLock;
+//! CPU linear-light mipmap generation for `Rgba8UnormSrgb` tiles and
+//! equirectangular horizontal-wrap 2x RGB8 downsampling.
 
 use veldmap_core::tile::{DecodedTile, PixelFormat, max_mip_levels, mip_dimensions};
 
-/// Size of the linear-to-sRGB lookup table (`8 KiB`, fits in L1 cache and
-/// round-trips all 256 sRGB code values without `powf` in inner pixel loops).
-pub(crate) const LINEAR_TO_SRGB_LUT_LEN: usize = 8192;
-
-pub(crate) fn srgb_to_linear_lut() -> &'static [f32; 256] {
-    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut table = [0.0_f32; 256];
-        for (i, slot) in table.iter_mut().enumerate() {
-            let s = (i as f32) / 255.0;
-            *slot = if s <= 0.04045 {
-                s / 12.92
-            } else {
-                ((s + 0.055) / 1.055).powf(2.4)
-            };
-        }
-        table
-    })
-}
-
-pub(crate) fn linear_to_srgb_lut() -> &'static [u8; LINEAR_TO_SRGB_LUT_LEN] {
-    static LUT: OnceLock<[u8; LINEAR_TO_SRGB_LUT_LEN]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut table = [0u8; LINEAR_TO_SRGB_LUT_LEN];
-        let denom = (LINEAR_TO_SRGB_LUT_LEN - 1) as f32;
-        for (i, slot) in table.iter_mut().enumerate() {
-            let x = (i as f32) / denom;
-            let s = if x <= 0.003_130_8 {
-                x * 12.92
-            } else {
-                1.055 * x.powf(1.0 / 2.4) - 0.055
-            };
-            *slot = (s * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        table
-    })
-}
-
-#[inline]
-pub(crate) fn linear_to_srgb_u8(linear: f32, lut: &[u8; LINEAR_TO_SRGB_LUT_LEN]) -> u8 {
-    let x = linear.clamp(0.0, 1.0);
-    if x <= 0.003_130_8 {
-        (x * (12.92 * 255.0)).round() as u8
-    } else {
-        let idx = ((x * ((LINEAR_TO_SRGB_LUT_LEN - 1) as f32)) + 0.5) as usize;
-        lut[idx.min(LINEAR_TO_SRGB_LUT_LEN - 1)]
-    }
-}
-
-#[inline]
-pub(crate) fn mix_2x2_srgb_rgb(
-    src: &[u8],
-    offsets: [usize; 4],
-    weights: [f32; 4],
-    to_lin: &[f32; 256],
-    to_srgb: &[u8; LINEAR_TO_SRGB_LUT_LEN],
-    out: &mut [u8],
-) {
-    for ch in 0..3 {
-        let lin = to_lin[usize::from(src[offsets[0] + ch])] * weights[0]
-            + to_lin[usize::from(src[offsets[1] + ch])] * weights[1]
-            + to_lin[usize::from(src[offsets[2] + ch])] * weights[2]
-            + to_lin[usize::from(src[offsets[3] + ch])] * weights[3];
-        out[ch] = linear_to_srgb_u8(lin, to_srgb);
-    }
-}
-
-/// Alpha-weighted linear-light 2x2 sRGB average across `count <= 4` pixel
-/// byte offsets in `src`, writing RGBA8 to `out`.
-#[inline]
-pub(crate) fn average_srgb_rgba8_block(
-    src: &[u8],
-    offsets: &[usize],
-    to_lin: &[f32; 256],
-    to_srgb: &[u8; LINEAR_TO_SRGB_LUT_LEN],
-    out: &mut [u8],
-) {
-    let mut a_sum = 0.0_f64;
-    let mut lin_rgb = [0.0_f64; 3];
-    for &off in offsets {
-        let a = f64::from(src[off + 3]) / 255.0;
-        a_sum += a;
-        for (ch, acc) in lin_rgb.iter_mut().enumerate() {
-            *acc += f64::from(to_lin[usize::from(src[off + ch])]) * a;
-        }
-    }
-    if a_sum <= 1e-9 {
-        out[..4].copy_from_slice(&[0, 0, 0, 0]);
-        return;
-    }
-    for (ch, acc) in lin_rgb.iter().enumerate() {
-        out[ch] = linear_to_srgb_u8((*acc / a_sum) as f32, to_srgb);
-    }
-    let count = offsets.len().max(1) as f64;
-    out[3] = ((a_sum / count) * 255.0).round().clamp(0.0, 255.0) as u8;
-}
+use crate::color::{
+    LINEAR_TO_SRGB_LUT_LEN, average_srgb_rgba8_block, linear_to_srgb_lut, mix_2x2_srgb_rgb,
+    srgb_to_linear_lut,
+};
 
 /// Downsample an opaque packed `Rgb8` sRGB image 2x in linear light, wrapping
 /// horizontally for equirectangular continuity.
-pub(crate) fn downsample_rgb8_srgb_wrap_x_2x(
+pub(super) fn downsample_rgb8_srgb_wrap_x_2x(
     src: &[u8],
     src_w: u32,
     src_h: u32,
@@ -237,8 +139,6 @@ mod tests {
 
     #[test]
     fn generates_full_linear_light_mip_chain_and_avoids_dark_srgb_collapse() {
-        // 4x4 checkerboard of pure black (0) and pure white (255).
-        // Linear average is 0.5 -> sRGB ~188 (whereas naive gamma average is 128).
         let mut data = Vec::with_capacity(4 * 4 * 4);
         for y in 0..4 {
             for x in 0..4 {
@@ -270,7 +170,6 @@ mod tests {
 
     #[test]
     fn transparent_neighbors_do_not_darken_opaque_rgb_and_non_srgb_is_untouched() {
-        // 2x2: one bright green opaque pixel + three transparent black pixels.
         let data = vec![
             0, 255, 0, 255, 0, 0, 0, 0, //
             0, 0, 0, 0, 0, 0, 0, 0,
@@ -284,20 +183,17 @@ mod tests {
         assert_eq!(mip1[2], 0);
         assert!(mip1[3].abs_diff(64) <= 1, "alpha={}", mip1[3]);
 
-        // Non-power-of-two 5x3 tile produces valid 5x3 -> 2x1 -> 1x1 chain.
         let mut npot =
             DecodedTile::try_new(5, 3, PixelFormat::Rgba8UnormSrgb, vec![200u8; 5 * 3 * 4])
                 .expect("valid npot");
         generate_linear_mipmaps(&mut npot);
         assert_eq!(npot.mip_level_count(), 3);
 
-        // Scientific R32Float tiles do not get sRGB mipmaps.
         let mut sci =
             DecodedTile::try_new(4, 4, PixelFormat::R32Float, vec![0u8; 4 * 4 * 4]).expect("sci");
         generate_linear_mipmaps(&mut sci);
         assert_eq!(sci.mip_level_count(), 1);
 
-        // Padded partial-edge and guttered sRGB tiles skip mip generation.
         let mut padded = DecodedTile::try_with_valid_region(
             4,
             4,
@@ -323,14 +219,5 @@ mod tests {
         .expect("guttered");
         generate_linear_mipmaps(&mut guttered);
         assert_eq!(guttered.mip_level_count(), 1);
-    }
-
-    #[test]
-    fn srgb_linear_luts_roundtrip_all_code_values() {
-        let to_lin = srgb_to_linear_lut();
-        let to_srgb = linear_to_srgb_lut();
-        for v in 0..=255u8 {
-            assert_eq!(linear_to_srgb_u8(to_lin[usize::from(v)], to_srgb), v);
-        }
     }
 }

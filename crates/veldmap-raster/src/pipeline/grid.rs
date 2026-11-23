@@ -4,15 +4,17 @@
 
 use std::sync::Arc;
 
-use veldmap_core::budget::{DecodePeak, MemoryBudget};
-use veldmap_core::io::CancelToken;
+use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
+use veldmap_core::sync::CancelToken;
+use veldmap_core::tile::PixelFormat;
 
 use crate::RasterError;
-pub use crate::cascade::TileEmit;
-use crate::cascade::{self, Cascade};
-use crate::chunk_cache::DecodedChunk;
-use crate::pyramid::{self, RASTER_TILE_SIZE};
-use crate::resample::{Window, bleed_alpha, resample_rgba8_window};
+
+use super::cascade::{self, Cascade, TileEmit};
+use super::chunk_cache::DecodedChunk;
+use super::peak::DecodePeak;
+use super::pyramid::{self, RASTER_TILE_SIZE};
+use super::resample::{Window, bleed_alpha, resample_rgba8_window};
 
 /// Minimum chunk pixel area eligible for pointwise random access.
 pub const MIN_CHUNK_PIXELS: u64 = 32 * 32;
@@ -92,11 +94,6 @@ impl Grid {
         best
     }
 
-    /// Return whether `level` qualifies for pointwise random access under `budget`.
-    pub fn pointwise(&self, base: (u32, u32), level: u8, budget: &MemoryBudget) -> bool {
-        self.footprint(base, level, budget).is_some()
-    }
-
     /// Compute the pointwise reading footprint for `level`, or `None` when the
     /// level must be served via sequential pass.
     pub fn footprint(
@@ -130,7 +127,7 @@ impl Grid {
         let rw = side(num_x, den_x, sw, aligned_x);
         let rh = side(num_y, den_y, sh, aligned_y);
         let region_pixels = rw.saturating_mul(rh);
-        if region_pixels > budget.region_cap_pixels {
+        if region_pixels > budget.region_cap_pixels_for(PixelFormat::Rgba8UnormSrgb) {
             return None;
         }
 
@@ -151,7 +148,9 @@ impl Grid {
         chunk_working_bytes(chunk.0, chunk.1, self.depth, true)
     }
 
-    /// Estimated working memory peak for pointwise reading at `level`.
+    /// Estimated per-operation working memory peak for pointwise reading at
+    /// `level` (`region + fresh chunk + output tile`; excludes the independent
+    /// fixed-cap global [`SharedChunkCache`]).
     pub fn direct_peak(
         &self,
         base: (u32, u32),
@@ -162,10 +161,9 @@ impl Grid {
         let tile = u64::from(RASTER_TILE_SIZE) * u64::from(RASTER_TILE_SIZE) * 4;
         Some(
             DecodePeak::new()
-                .with("chunk cache", budget.decoded_chunk_cache_bytes as u64)
-                .with("region", fp.region_pixels * 4)
+                .with("region", fp.region_pixels.saturating_mul(4))
                 .with("fresh chunk", self.chunk_bytes(self.chunk_of(fp.image)))
-                .with("tile", tile * 2),
+                .with("tile", tile),
         )
     }
 
@@ -315,18 +313,20 @@ pub trait Chunked {
 }
 
 /// Parameters governing a [`direct`] pointwise tile read.
-pub struct DirectRead<'a> {
+pub(crate) struct DirectRead<'a> {
     pub grid: &'a Grid,
     pub base: (u32, u32),
     pub level: u8,
     pub wants: &'a [(u32, u32)],
     pub budget: &'a MemoryBudget,
+    pub budget_tracker: &'a DecodeBudgetTracker,
     pub cancel: &'a CancelToken,
 }
 
 /// Pointwise reading: decode only the chunks intersecting `req.wants` at
-/// `req.level`.
-pub fn direct<S: Chunked>(
+/// `req.level`, reserving `region + tile` working memory against
+/// `req.budget_tracker` without nesting leases across chunk singleflight.
+pub(crate) fn direct<S: Chunked>(
     source: &mut S,
     req: &DirectRead<'_>,
     emit: TileEmit<'_>,
@@ -348,6 +348,9 @@ pub fn direct<S: Chunked>(
         });
     }
     let across = sw.div_ceil(cw);
+    let region_cap_pixels = req
+        .budget
+        .region_cap_pixels_for(PixelFormat::Rgba8UnormSrgb);
 
     for &(tx, ty) in req.wants {
         if req.cancel.is_cancelled() {
@@ -373,45 +376,61 @@ pub fn direct<S: Chunked>(
                 req.level
             )));
         }
-        if u64::from(rw) * u64::from(rh) > req.budget.region_cap_pixels {
+        if u64::from(rw) * u64::from(rh) > region_cap_pixels {
             return Err(RasterError::LimitExceeded {
                 width: rw,
                 height: rh,
                 estimated_bytes: u64::from(rw) * u64::from(rh) * 4,
-                limit_bytes: req.budget.region_cap_pixels * 4,
+                limit_bytes: req.budget.region_cap_bytes,
             });
         }
         let (sx0, sy0) = (sx0 as u32, sy0 as u32);
 
-        let mut region = vec![0u8; (rw as usize) * (rh as usize) * 4];
+        // Fetch intersecting chunks BEFORE acquiring the region+tile working
+        // lease so chunk singleflight and per-chunk reservations never nest
+        // leases or risk AB-BA deadlock under tight decode budgets.
+        let mut chunks = Vec::new();
         for cy in sy0 / ch..=(sy0 + rh - 1) / ch {
             for cx in sx0 / cw..=(sx0 + rw - 1) / cw {
                 if req.cancel.is_cancelled() {
                     return Err(RasterError::Cancelled);
                 }
                 let chunk = source.chunk(image, cy * across + cx, req.cancel)?;
-                let (chunk_x, chunk_y) = (cx * cw, cy * ch);
-                let ix0 = sx0.max(chunk_x);
-                let iy0 = sy0.max(chunk_y);
-                let ix1 = (sx0 + rw).min(chunk_x + chunk.width);
-                let iy1 = (sy0 + rh).min(chunk_y + chunk.height);
-                if ix0 >= ix1 || iy0 >= iy1 {
-                    continue;
-                }
-                let run = ((ix1 - ix0) as usize) * 4;
-                for y in iy0..iy1 {
-                    let src_off = (((y - chunk_y) as usize) * (chunk.width as usize)
-                        + ((ix0 - chunk_x) as usize))
-                        * 4;
-                    let dst_off =
-                        (((y - sy0) as usize) * (rw as usize) + ((ix0 - sx0) as usize)) * 4;
-                    region[dst_off..dst_off + run]
-                        .copy_from_slice(&chunk.data[src_off..src_off + run]);
-                }
+                chunks.push((cx * cw, cy * ch, chunk));
+            }
+        }
+
+        let region_bytes = u64::from(rw)
+            .saturating_mul(u64::from(rh))
+            .saturating_mul(4);
+        let tile_bytes = u64::from(tw)
+            .saturating_mul(u64::from(th))
+            .saturating_mul(4);
+        let _work_lease = req
+            .budget_tracker
+            .reserve_blocking(region_bytes.saturating_add(tile_bytes), req.cancel)?;
+
+        let mut region = vec![0u8; (rw as usize) * (rh as usize) * 4];
+        for (chunk_x, chunk_y, chunk) in chunks {
+            let ix0 = sx0.max(chunk_x);
+            let iy0 = sy0.max(chunk_y);
+            let ix1 = (sx0 + rw).min(chunk_x + chunk.width);
+            let iy1 = (sy0 + rh).min(chunk_y + chunk.height);
+            if ix0 >= ix1 || iy0 >= iy1 {
+                continue;
+            }
+            let run = ((ix1 - ix0) as usize) * 4;
+            for y in iy0..iy1 {
+                let src_off = (((y - chunk_y) as usize) * (chunk.width as usize)
+                    + ((ix0 - chunk_x) as usize))
+                    * 4;
+                let dst_off = (((y - sy0) as usize) * (rw as usize) + ((ix0 - sx0) as usize)) * 4;
+                region[dst_off..dst_off + run].copy_from_slice(&chunk.data[src_off..src_off + run]);
             }
         }
 
         let mut tile = resample_rgba8_window(&region, rw, rh, window, tw, th);
+        drop(region);
         bleed_alpha(&mut tile, tw, th);
         emit(req.level, tx, ty, tw, th, tile)?;
     }
@@ -420,11 +439,12 @@ pub fn direct<S: Chunked>(
 }
 
 /// Sequential top-to-bottom pass over the base IFD feeding `Cascade`.
-pub fn pass<S: Chunked>(
+///
+/// Callers must admit/reserve `grid.pass_peak(base)` before invoking `pass`.
+pub(crate) fn pass<S: Chunked>(
     source: &mut S,
     grid: &Grid,
     base: (u32, u32),
-    budget: &MemoryBudget,
     cancel: &CancelToken,
     emit: TileEmit<'_>,
 ) -> Result<(), RasterError> {
@@ -435,7 +455,6 @@ pub fn pass<S: Chunked>(
     }
     let across = width.div_ceil(cw);
     let down = height.div_ceil(ch);
-    grid.pass_peak(base).admit(budget.decode_working_bytes)?;
 
     let mut cascade = Cascade::new(0, width, height);
     let mut bled_emit = |lvl: u8,
@@ -511,5 +530,31 @@ mod tests {
         let r_gdal = region_of((0, 0), (500, 313), (8000, 5000), (500, 312), 4);
         assert_eq!(r_gdal.sy1, 312);
         assert!((r_gdal.window.y1 - 312.4992).abs() < 1e-9);
+    }
+
+    #[test]
+    fn direct_peak_does_not_double_count_global_chunk_cache() {
+        let mut budget = MemoryBudget::for_host_ram(16 * 1024 * 1024 * 1024);
+        // Even when decode_working_bytes <= decoded_chunk_cache_bytes, a small
+        // tiled 1024x1024 source must still fit pointwise because SharedChunkCache
+        // has its own independent startup cap.
+        budget.decoded_chunk_cache_bytes = 64 * 1024 * 1024;
+        budget.decode_working_bytes = 32 * 1024 * 1024;
+        let g = Grid {
+            tiled: true,
+            chunk: (256, 256),
+            overviews: Vec::new(),
+            depth: 4,
+        };
+        let peak = g
+            .direct_peak((1024, 1024), 0, &budget)
+            .expect("level 0 qualifies pointwise");
+        assert!(
+            peak.total() < 8 * 1024 * 1024,
+            "direct_peak must not include 64 MiB global chunk cache; got {} B ({})",
+            peak.total(),
+            peak.note()
+        );
+        assert!(peak.fits(budget.decode_working_bytes));
     }
 }

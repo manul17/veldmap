@@ -16,8 +16,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::io::CancelToken;
-use crate::tile::key::{BandKey, PixelFormat, SourceId, TileKey, TileScheme};
+use veldmap_core::sync::CancelToken;
+use veldmap_core::tile::{
+    BandKey, PixelFormat, SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec,
+};
 
 /// How one pyramid level is produced from its underlying source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,44 +46,13 @@ pub struct LevelPlan {
 /// Identifies one independent raster pyramid stream (`source`, `band`,
 /// `format`, `gutter`) so multi-band sources sharing a single [`SourceId`]
 /// schedule and forgive sequential passes independently per band.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PassKey {
-    pub source: SourceId,
-    pub band: BandKey,
-    pub format: PixelFormat,
-    pub gutter: u8,
-}
-
-impl PassKey {
-    /// Construct a [`PassKey`] for `(source, band, format, gutter)`.
-    pub const fn new(source: SourceId, band: BandKey, format: PixelFormat, gutter: u8) -> Self {
-        Self {
-            source,
-            band,
-            format,
-            gutter,
-        }
-    }
-
-    /// Extract the [`PassKey`] identifying `key`'s band/format/gutter stream.
-    pub const fn from_tile_key(key: &TileKey) -> Self {
-        Self {
-            source: key.source,
-            band: key.band,
-            format: key.format,
-            gutter: key.gutter,
-        }
-    }
-}
+pub type PassKey = StreamKey;
 
 /// Scheduler-facing description of one raster pyramid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PyramidMeta {
     pub source: SourceId,
-    pub band: BandKey,
-    pub format: PixelFormat,
-    pub gutter: u8,
-    pub decode_rev: u32,
+    pub spec: TileStreamSpec,
     pub width: u32,
     pub height: u32,
     pub tile_size: u32,
@@ -93,12 +64,12 @@ pub struct PyramidMeta {
 impl PyramidMeta {
     /// Return the [`PassKey`] identifying this pyramid stream.
     pub const fn pass_key(&self) -> PassKey {
-        PassKey {
-            source: self.source,
-            band: self.band,
-            format: self.format,
-            gutter: self.gutter,
-        }
+        PassKey::new(
+            self.source,
+            self.spec.band,
+            self.spec.format,
+            self.spec.gutter,
+        )
     }
 
     /// Coarsest apex level index (`levels.len().saturating_sub(1)`).
@@ -113,13 +84,13 @@ impl PyramidMeta {
         }
     }
 
-    /// Finest level index whose `LevelPlan::fits` is `true` (falling back to
-    /// `max_level()` when none fits).
-    pub fn finest_fitting_level(&self) -> u8 {
+    /// Finest level index whose `LevelPlan::fits` is `true`, or `None` when
+    /// no level fits within the configured memory budget.
+    pub fn finest_fitting_level(&self) -> Option<u8> {
         self.levels
             .iter()
             .position(|row| row.fits)
-            .map_or_else(|| self.max_level(), |idx| idx as u8)
+            .map(|idx| idx as u8)
     }
 
     /// Return the [`LevelPlan`] for `level`, if in range.
@@ -142,17 +113,25 @@ impl PyramidMeta {
     }
 
     /// Progressive ladder of fitting levels from `max_level()` down to
-    /// `target_level` (clamped to `[finest_fitting_level(), max_level()]`),
+    /// `target_level` (clamped to `[finest_fitting_level, max_level()]`),
     /// keeping at most one coarsest representative per distinct `ServeMode::Pass`
     /// cascade so redundant full-file passes are skipped.
+    ///
+    /// Returns an empty `Vec` when no level has `fits == true`.
     pub fn ladder(&self, target_level: u8) -> Vec<u8> {
-        if self.levels.is_empty() {
+        let Some(min_fit) = self.finest_fitting_level() else {
             return Vec::new();
-        }
+        };
         let top = self.max_level();
-        let min_fit = self.finest_fitting_level().min(top);
         let target = target_level.clamp(min_fit, top);
-        let goal_pass = self.pass_from(target);
+        let target_plan = match self.level(target) {
+            Some(plan) if plan.fits => Some(plan),
+            _ => None,
+        };
+        let goal_pass = target_plan.and_then(|plan| match plan.serve {
+            ServeMode::Pass { from } => Some(from),
+            ServeMode::Pointwise => None,
+        });
 
         let mut rungs = Vec::new();
         let mut seen_passes = HashSet::new();
@@ -175,23 +154,25 @@ impl PyramidMeta {
                 }
             }
         }
-        rungs.push(target);
+        if target_plan.is_some() {
+            rungs.push(target);
+        }
         rungs
     }
 
     /// Construct the canonical [`TileKey`] for `(level, x, y)`.
     pub fn tile_key(&self, level: u8, x: u32, y: u32) -> TileKey {
-        TileKey {
-            source: self.source,
-            band: self.band,
-            scheme: self.scheme(),
-            format: self.format,
-            gutter: self.gutter,
-            decode_rev: self.decode_rev,
-            level,
-            x,
-            y,
-        }
+        TileKey::from_stream(self.source, self.spec, self.scheme(), level, x, y)
+    }
+
+    /// Band selector of this pyramid stream.
+    pub const fn band(&self) -> BandKey {
+        self.spec.band
+    }
+
+    /// Pixel format of this pyramid stream.
+    pub const fn format(&self) -> PixelFormat {
+        self.spec.format
     }
 }
 
@@ -287,39 +268,20 @@ impl TileScheduler {
         )
     }
 
-    /// Filter `candidates` down to unique tiles matching `meta` at `level`
-    /// that are not cached, not already in-flight, and not suppressed, marking
-    /// admitted pointwise keys as in-flight.
-    ///
-    /// For `ServeMode::Pointwise` levels, multiple concurrent batches are
-    /// admitted regardless of whether other pointwise tiles are already
-    /// in-flight. For `ServeMode::Pass` levels, returns empty when a pass is
-    /// already active for `meta.pass_key()` and permits first-time pass-failed
-    /// tiles to trigger a recovery pass so pass-only sources cannot permanently
-    /// starve.
-    pub fn admit_pointwise_or_check_pass(
-        &mut self,
+    fn filter_candidates(
+        &self,
         meta: &PyramidMeta,
         level: u8,
         candidates: &[TileKey],
-        is_cached: impl Fn(&TileKey) -> bool,
+        is_cached: &impl Fn(&TileKey) -> bool,
+        is_pointwise: bool,
     ) -> Vec<TileKey> {
-        let Some(plan) = meta.level(level) else {
-            return Vec::new();
-        };
-        let is_pointwise = plan.serve == ServeMode::Pointwise;
-        if !is_pointwise && self.has_active_pass(meta.pass_key()) {
-            return Vec::new();
-        }
         let expected_scheme = meta.scheme();
         let mut seen = HashSet::new();
-        let mut admitted = Vec::new();
+        let mut eligible = Vec::new();
         for &key in candidates {
             if key.source != meta.source
-                || key.band != meta.band
-                || key.format != meta.format
-                || key.gutter != meta.gutter
-                || key.decode_rev != meta.decode_rev
+                || key.stream_spec() != meta.spec
                 || key.scheme != expected_scheme
                 || key.level != level
                 || !seen.insert(key)
@@ -334,12 +296,62 @@ impl TileScheduler {
             if is_cached(&key) || self.in_flight.contains(&key) || suppressed {
                 continue;
             }
-            if is_pointwise {
-                self.in_flight.insert(key);
-            }
-            admitted.push(key);
+            eligible.push(key);
+        }
+        eligible
+    }
+
+    /// Admit unique fitting `ServeMode::Pointwise` tiles at `level` that are
+    /// not cached, not already in-flight, and not suppressed, marking admitted
+    /// keys as in-flight.
+    ///
+    /// Returns empty if `level` does not exist, does not fit (`!plan.fits`), or
+    /// is not served pointwise.
+    pub fn admit_pointwise(
+        &mut self,
+        meta: &PyramidMeta,
+        level: u8,
+        candidates: &[TileKey],
+        is_cached: impl Fn(&TileKey) -> bool,
+    ) -> Vec<TileKey> {
+        let Some(plan) = meta.level(level) else {
+            return Vec::new();
+        };
+        if !plan.fits || plan.serve != ServeMode::Pointwise {
+            return Vec::new();
+        }
+        let admitted = self.filter_candidates(meta, level, candidates, &is_cached, true);
+        for &key in &admitted {
+            self.in_flight.insert(key);
         }
         admitted
+    }
+
+    /// Read-only check returning unique fitting `ServeMode::Pass` candidates at
+    /// `level` that warrant launching a sequential pass (callers then pass the
+    /// result into [`Self::begin_pass`]).
+    ///
+    /// Returns empty if `level` does not fit, is not `ServeMode::Pass`, or a
+    /// pass is already active for `meta.pass_key()`. Permits first-time
+    /// pass-failed tiles to trigger a recovery pass so pass-only sources never
+    /// permanently starve.
+    pub fn check_pass_candidates(
+        &self,
+        meta: &PyramidMeta,
+        level: u8,
+        candidates: &[TileKey],
+        is_cached: impl Fn(&TileKey) -> bool,
+    ) -> Vec<TileKey> {
+        let Some(plan) = meta.level(level) else {
+            return Vec::new();
+        };
+        if !plan.fits
+            || !matches!(plan.serve, ServeMode::Pass { .. })
+            || self.has_active_pass(meta.pass_key())
+        {
+            return Vec::new();
+        }
+        self.filter_candidates(meta, level, candidates, &is_cached, false)
     }
 
     /// Begin the single active `ServeMode::Pass` for `key` at `level`

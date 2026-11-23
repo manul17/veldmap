@@ -3,8 +3,9 @@
 //! 2x2 block alignment and predictable working memory (`bytes`).
 
 use crate::RasterError;
-use crate::pyramid::{self, RASTER_TILE_SIZE};
-use crate::resample::halve_rgba8;
+
+use super::pyramid::{self, RASTER_TILE_SIZE};
+use super::resample::halve_rgba8;
 
 /// Callback invoked whenever a cascade tile `(level, tx, ty, w, h, rgba8)`
 /// is completed.

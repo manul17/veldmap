@@ -120,11 +120,11 @@ fn per_tile_rtc_preserves_sub_millimetre_precision_at_2m_zoom() {
     let v0 = verts[0];
     let v1 = verts[1];
     let step_rtc_m = f64::from((Vec3::from(v1.rel_pos) - Vec3::from(v0.rel_pos)).length());
-    let (lat0, lon0, _, _, _, _) = sample_tile_surface(tile.id, 0.0, 0.0).expect("sample 0");
-    let (lat1, lon1, _, _, _, _) =
+    let s0 = sample_tile_surface(tile.id, 0.0, 0.0).expect("sample 0");
+    let s1 =
         sample_tile_surface(tile.id, 1.0 / f64::from(DEFAULT_GRID_CELLS), 0.0).expect("sample 1");
-    let step_exact_m = geodesy::world(Geodetic::surface(lat0, lon0))
-        .distance(geodesy::world(Geodetic::surface(lat1, lon1)));
+    let step_exact_m = geodesy::world(Geodetic::surface(s0.lat_deg, s0.lon_deg))
+        .distance(geodesy::world(Geodetic::surface(s1.lat_deg, s1.lon_deg)));
     assert!(
         (step_rtc_m - step_exact_m).abs() < 1e-4,
         "RTC vertex step drifted: rtc={step_rtc_m} m vs exact={step_exact_m} m"

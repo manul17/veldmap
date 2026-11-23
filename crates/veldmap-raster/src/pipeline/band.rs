@@ -1,8 +1,12 @@
-//! Unified raster band metadata (`BandInfo`), sample types, and GeoTIFF-ready
-//! georeference models (`GeoTie`, `GeoPlacement`, `GeoKeyParams`,
-//! `RasterDescription`).
+//! Unified raster band metadata (`BandInfo`), sample types, and georeference
+//! models (`GeoTie`, `GeoPlacement`, `GeoKeyParams`, `RasterDescription`).
+//!
+//! Raw GeoTIFF binary tag parsing (`GeoKeyDirectoryTag` / `34735`–`34737`)
+//! lives in `crate::tiff::georef`.
 
-use veldmap_core::tile::{BandKey, LevelPlan, PixelFormat};
+use veldmap_core::tile::{BandKey, PixelFormat};
+
+use super::scheduler::LevelPlan;
 
 /// Raw numeric sample storage type of a decoded raster band.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,7 +82,7 @@ pub struct GeoTie {
 /// Validate that `(lat, lon)` falls within geographic bounds (`|lat| <= 90`,
 /// `|lon| <= 360`, both finite) so out-of-range or NaN/Inf tie tags never reach
 /// globe geometry.
-pub fn is_valid_lat_lon(lat: f64, lon: f64) -> bool {
+pub(crate) fn is_valid_lat_lon(lat: f64, lon: f64) -> bool {
     lat.is_finite()
         && lon.is_finite()
         && (-90.0..=90.0).contains(&lat)
@@ -106,8 +110,7 @@ impl GeoRasterType {
     }
 }
 
-/// Parsed raw GeoTIFF key directory entry resolved against `GeoDoubleParamsTag`
-/// (`34736`) and `GeoAsciiParamsTag` (`34737`).
+/// Parsed raw GeoTIFF key directory entry value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GeoKeyValue {
     Short(u16),
@@ -115,8 +118,8 @@ pub enum GeoKeyValue {
     Ascii(String),
 }
 
-/// Parsed GeoTIFF key directory preserving resolved `GeoDoubleParamsTag` and
-/// `GeoAsciiParamsTag` parameters for downstream CRS resolution.
+/// Parsed GeoTIFF key directory preserving resolved double/ASCII parameters
+/// for downstream CRS resolution.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GeoKeyParams {
     pub model_type: Option<u16>,
@@ -127,71 +130,6 @@ pub struct GeoKeyParams {
 }
 
 impl GeoKeyParams {
-    /// Parse raw `GeoKeyDirectoryTag` (`34735`), `GeoDoubleParamsTag` (`34736`),
-    /// and `GeoAsciiParamsTag` (`34737`) payloads.
-    pub fn parse(raw_keys: &[u16], double_params: &[f64], ascii_params: &str) -> Self {
-        let mut out = Self::default();
-
-        let Some(&num_keys_raw) = raw_keys.get(3) else {
-            return out;
-        };
-        let Some(entries) = raw_keys.get(4..) else {
-            return out;
-        };
-
-        let num_keys = usize::from(num_keys_raw);
-        let ascii_bytes = ascii_params.as_bytes();
-
-        for entry in entries.chunks_exact(4).take(num_keys) {
-            let id = entry[0];
-            let location = entry[1];
-            let count = usize::from(entry[2]);
-            let offset_or_val = entry[3];
-
-            let value = match location {
-                0 => Some(GeoKeyValue::Short(offset_or_val)),
-                34736 => {
-                    let start = usize::from(offset_or_val);
-                    let end = start.saturating_add(count);
-                    double_params
-                        .get(start..end)
-                        .filter(|vals| vals.iter().all(|v| v.is_finite()))
-                        .map(|vals| GeoKeyValue::Double(vals.to_vec()))
-                }
-                34737 => {
-                    let start = usize::from(offset_or_val);
-                    let end = start.saturating_add(count);
-                    // `tiff::Decoder::get_tag_ascii_string` truncates at the first NUL byte,
-                    // so the final key's `count` may extend 1 byte past `ascii_bytes.len()`.
-                    let slice = ascii_bytes.get(start..end).or_else(|| {
-                        (start <= ascii_bytes.len() && end == ascii_bytes.len() + 1)
-                            .then(|| &ascii_bytes[start..])
-                    });
-                    slice
-                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                        .map(|s| {
-                            GeoKeyValue::Ascii(s.trim_end_matches(['|', '\0']).trim().to_string())
-                        })
-                }
-                _ => None,
-            };
-
-            if let Some(val) = value {
-                match (id, &val) {
-                    (1024, GeoKeyValue::Short(v)) => out.model_type = Some(*v),
-                    (1025, GeoKeyValue::Short(2)) => out.raster_type = GeoRasterType::PixelIsPoint,
-                    (1025, GeoKeyValue::Short(1)) => out.raster_type = GeoRasterType::PixelIsArea,
-                    (2048, GeoKeyValue::Short(v)) => out.geographic_crs = Some(*v),
-                    (3072, GeoKeyValue::Short(v)) => out.projected_crs = Some(*v),
-                    _ => {}
-                }
-                out.keys.push((id, val));
-            }
-        }
-
-        out
-    }
-
     /// Look up a short (`u16`) GeoKey value by numeric ID.
     pub fn get_u16(&self, id: u16) -> Option<u16> {
         self.keys.iter().find_map(|(k, v)| match (k, v) {
@@ -200,7 +138,7 @@ impl GeoKeyParams {
         })
     }
 
-    /// Look up a `f64` scalar GeoKey value resolved from `GeoDoubleParamsTag`.
+    /// Look up a `f64` scalar GeoKey value.
     pub fn get_f64(&self, id: u16) -> Option<f64> {
         self.keys.iter().find_map(|(k, v)| match (k, v) {
             (key, GeoKeyValue::Double(vals)) if *key == id => vals.first().copied(),
@@ -208,7 +146,7 @@ impl GeoKeyParams {
         })
     }
 
-    /// Look up an ASCII GeoKey string resolved from `GeoAsciiParamsTag`.
+    /// Look up an ASCII GeoKey string.
     pub fn get_ascii(&self, id: u16) -> Option<&str> {
         self.keys.iter().find_map(|(k, v)| match (k, v) {
             (key, GeoKeyValue::Ascii(s)) if *key == id => Some(s.as_str()),
@@ -226,8 +164,6 @@ pub struct GeoPlacement {
     /// where `(i, j)` are pixel top-left corner coordinates (`j` increasing
     /// southward, with `PixelIsPoint` half-pixel shift already removed).
     pub affine: [f64; 6],
-    /// Non-WGS84 geographic datum EPSG code if declared (e.g. Pulkovo-42 `4284`).
-    pub foreign_datum_epsg: Option<u16>,
     pub geo_params: GeoKeyParams,
 }
 
@@ -244,29 +180,4 @@ pub struct RasterDescription {
     pub foreign_datum_epsg: Option<u16>,
     pub binding_trouble: Option<String>,
     pub levels: Vec<LevelPlan>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn geokey_parse_respects_count_and_nul_stripped_ascii_tail() {
-        // NumberOfKeys = 3, followed by trailing zero padding that must be ignored.
-        let raw_keys = [
-            1, 1, 0, 3, // header
-            1024, 0, 1, 1, // ModelType = Projected
-            3073, 34737, 8,
-            4, // PCSCitation starting at 4, count 8 (includes stripped trailing NUL)
-            3080, 34736, 1, 0, // ProjFalseOriginLong
-            0, 0, 0, 0, // trailing padding ignored
-        ];
-        let doubles = [39.0_f64, f64::NAN];
-        let ascii = "Foo|Zone 37"; // length 11; slice 4..12 extends 1 past len because NUL was stripped
-        let parsed = GeoKeyParams::parse(&raw_keys, &doubles, ascii);
-        assert_eq!(parsed.model_type, Some(1));
-        assert_eq!(parsed.get_ascii(3073), Some("Zone 37"));
-        assert_eq!(parsed.get_f64(3080), Some(39.0));
-        assert_eq!(parsed.keys.len(), 3);
-    }
 }

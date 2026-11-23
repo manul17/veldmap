@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use veldmap_core::io::{CancelToken, Wakeup, lock_unpoisoned};
+use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, TileKey};
 use veldmap_net::{
-    CustomBasemapConfig, DecodeFailure, DecodeRequest, FetcherConfig, LiveBasemapSpec,
-    LiveTilePipeline, TileBlobStore, TileDecodeExecutor,
+    BlobStoreError, CustomBasemapConfig, DecodeFailure, DecodeRequest, FetcherConfig,
+    LiveBasemapSpec, LiveTilePipeline, TileBlobStore, TileDecodeExecutor,
 };
 
 type BlobMapKey = (String, PlanetaryScheme, u8, u32, u32);
@@ -22,14 +22,14 @@ struct MemBlobStore {
 }
 
 impl TileBlobStore for MemBlobStore {
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String> {
+    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, BlobStoreError> {
         let map = lock_unpoisoned(&self.map);
         Ok(map
             .get(&(source_key.to_owned(), id.scheme, id.level, id.x, id.y))
             .cloned())
     }
 
-    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), String> {
+    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), BlobStoreError> {
         let mut map = lock_unpoisoned(&self.map);
         map.insert(
             (source_key.to_owned(), id.scheme, id.level, id.x, id.y),
@@ -38,7 +38,7 @@ impl TileBlobStore for MemBlobStore {
         Ok(())
     }
 
-    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String> {
+    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), BlobStoreError> {
         let mut map = lock_unpoisoned(&self.map);
         map.remove(&(source_key.to_owned(), id.scheme, id.level, id.x, id.y));
         Ok(())
@@ -350,6 +350,10 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
         hits_before_cache,
         "disk cache hit must trigger 0 HTTP requests"
     );
+    let disk_deadline = Instant::now() + Duration::from_secs(2);
+    while pipeline.status().completed_from_disk < 1 && Instant::now() < disk_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(pipeline.status().completed_from_disk >= 1);
 
     pipeline.shutdown();

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, Semaphore};
-use veldmap_core::io::{CancelToken, Wakeup, lock_unpoisoned};
+use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::TileKey;
 
 use crate::basemap::LiveBasemapSpec;
@@ -31,13 +31,13 @@ use self::state::PipelineState;
 /// retrying a tile.
 const DEFAULT_TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 
-/// Maximum concurrent blocking disk-cache write tasks (`cache.put()`) so burst
-/// completions never pile up unbounded Tokio blocking threads on SQLite's
-/// writer mutex.
-const MAX_CONCURRENT_DISK_WRITES: usize = 4;
+/// Maximum concurrent blocking disk-cache write/delete tasks (`cache.put()` /
+/// `cache.delete()`) so burst completions serialize cleanly without piling up
+/// contending Tokio blocking threads on a single-writer backend.
+const MAX_CONCURRENT_DISK_WRITES: usize = 1;
 
-/// Maximum total pending + active post-decode disk-cache write tasks so SQLite
-/// stalls never accumulate unbounded queued tasks and buffered tile payloads.
+/// Maximum total pending + active post-decode disk-cache write/delete tasks so
+/// slow disk writes never accumulate unbounded queued tasks and payloads.
 const MAX_QUEUED_DISK_WRITES: usize = 32;
 
 /// Configuration for [`LiveTilePipeline`].
@@ -186,7 +186,7 @@ impl LiveTilePipeline {
     /// (retaining active-source coarsest roots `key.is_root_of(active_source)`).
     ///
     /// Preserves already-checked tiles waiting in `pending_http` so they never
-    /// bounce back to SQLite disk lookups on every frame/upload. Strictly
+    /// bounce back to disk-cache lookups on every frame/upload. Strictly
     /// filters out `PolarCap` keys and any `level > spec.max_level()`.
     pub fn reconcile_wanted<F>(&self, wanted: &HashSet<TileKey>, is_ready: F)
     where

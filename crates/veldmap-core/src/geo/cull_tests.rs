@@ -39,7 +39,7 @@ fn view_proj_from(lat: f64, lon: f64, height_m: f64, aspect: f64) -> (DMat4, DVe
 #[test]
 fn a_point_inside_the_frame_clears_every_plane() {
     let (view_proj, eye) = view_proj_from(30.0, 20.0, 5_000_000.0, 1.5);
-    let frame = Frame::new(&view_proj, eye);
+    let frame = CullFrustum::new(&view_proj, eye);
     let (mut inside, mut outside) = (0, 0);
     for lat in (-80..=80).step_by(5) {
         for lon in (-180..180).step_by(5) {
@@ -73,7 +73,7 @@ fn the_horizon_matches_the_oblate_wgs84_ellipsoid_tangent_plane() {
         (45.0, 80_000_000.0),
     ] {
         let (vp, eye) = view_proj_from(lat_cam, 0.0, height_m, 1.5);
-        let frame = Frame::new(&vp, eye);
+        let frame = CullFrustum::new(&vp, eye);
 
         for lat in (-89..=89).step_by(2) {
             for lon in [0.0, 90.0, 180.0, -90.0] {
@@ -100,7 +100,7 @@ fn the_horizon_matches_the_oblate_wgs84_ellipsoid_tangent_plane() {
 #[test]
 fn a_ball_reaching_into_the_frame_is_admitted_though_its_centre_is_out() {
     let (view_proj, eye) = view_proj_from(30.0, 20.0, 5_000_000.0, 1.5);
-    let frame = Frame::new(&view_proj, eye);
+    let frame = CullFrustum::new(&view_proj, eye);
     let outside = at(60.0, 20.0, 0.0);
     let deficit = frame
         .inward
@@ -150,7 +150,7 @@ fn a_ball_covers_every_point_it_was_built_on() {
 fn reverse_z_near_plane_culls_balls_behind_near_and_admits_straddling_balls() {
     let height_m = 100.0;
     let (view_proj, eye) = view_proj_from(45.0, 20.0, height_m, 1.5);
-    let frame = Frame::new(&view_proj, eye);
+    let frame = CullFrustum::new(&view_proj, eye);
     let forward = -eye.normalize();
     let near = height_m * 0.5;
 
@@ -188,7 +188,7 @@ fn reverse_z_near_plane_culls_balls_behind_near_and_admits_straddling_balls() {
 #[test]
 fn degenerate_zero_eye_produces_no_nan_in_horizon_plane() {
     let (view_proj, _) = view_proj_from(0.0, 0.0, 1000.0, 1.5);
-    let frame = Frame::new(&view_proj, DVec3::ZERO);
+    let frame = CullFrustum::new(&view_proj, DVec3::ZERO);
     assert!(frame.towards.is_finite());
     assert!(!frame.horizon_margin(at(0.0, 0.0, 0.0)).is_nan());
 }

@@ -1,68 +1,38 @@
-use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ::tiff::encoder::TiffEncoder;
-use ::tiff::tags::Tag;
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
-use veldmap_core::io::{CancelToken, CountingByteSource, MemoryByteSource, SourceFingerprint};
-use veldmap_core::tile::{BandKey, PixelFormat, PlanetaryScheme, QuadTileId, SourceId, TileKey};
-use veldmap_raster::pyramid::RASTER_TILE_SIZE;
+use veldmap_core::io::ByteSource;
+use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
+use veldmap_core::sync::CancelToken;
+use veldmap_core::tile::{
+    BandKey, PixelFormat, PlanetaryScheme, QuadTileId, SourceFingerprint, SourceId, StreamKey,
+    TileKey,
+};
 use veldmap_raster::{
-    DecodeContext, DecodeJob, DecodeLane, SharedChunkCache, TiffSource, TwoLaneDecodePool,
+    DecodeContext, DecodeJob, DecodeJobKey, DecodeLane, DecodePoolConfig, RASTER_TILE_SIZE,
+    ServeMode, SharedChunkCache, TiffSource, TileScheduler, TwoLaneDecodePool,
     TwoLaneDecodePoolConfig,
 };
 
-fn build_multi_tile_tiff(tiles_x: u32, tiles_y: u32, chunk_side: u32) -> Vec<u8> {
-    let width = tiles_x * chunk_side;
-    let height = tiles_y * chunk_side;
-    let mut file = Cursor::new(Vec::new());
-    {
-        let mut enc = TiffEncoder::new(&mut file).expect("enc");
-        let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, width).expect("tag");
-        dir.write_tag(Tag::ImageLength, height).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-            .expect("tag");
-        dir.write_tag(Tag::Compression, 1u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-        dir.write_tag(Tag::TileWidth, chunk_side).expect("tag");
-        dir.write_tag(Tag::TileLength, chunk_side).expect("tag");
+use crate::common::build_multi_tile_tiff;
 
-        let chunk_bytes = (chunk_side * chunk_side * 3) as usize;
-        let mut offsets = Vec::new();
-        let mut counts = Vec::new();
-        for ty in 0..tiles_y {
-            for tx in 0..tiles_x {
-                let pattern = vec![((tx * 37 + ty * 17) & 0xFF) as u8; chunk_bytes];
-                let at = dir.write_data(&pattern[..]).expect("write");
-                offsets.push(at as u32);
-                counts.push(pattern.len() as u32);
-            }
-        }
-        dir.write_tag(Tag::TileOffsets, &offsets[..]).expect("tag");
-        dir.write_tag(Tag::TileByteCounts, &counts[..])
-            .expect("tag");
-        dir.finish().expect("finish");
+fn fast_tile_key(x: u32) -> TileKey {
+    TileKey {
+        band: BandKey::Index(0),
+        format: PixelFormat::Rgba8UnormSrgb,
+        ..TileKey::display_quad(
+            SourceId::new(77),
+            QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 4,
+                x,
+                y: 0,
+            },
+        )
     }
-    file.into_inner()
-}
-
-fn dummy_key(x: u32) -> TileKey {
-    TileKey::display_quad(
-        SourceId::new(77),
-        QuadTileId {
-            scheme: PlanetaryScheme::WebMercator,
-            level: 4,
-            x,
-            y: 0,
-        },
-    )
 }
 
 #[test]
@@ -72,11 +42,11 @@ fn concurrent_decode_respects_memory_cap_and_deduplicates_shared_chunks() {
     let counting = Arc::new(CountingByteSource::new(Arc::new(
         MemoryByteSource::from_vec(raw),
     )));
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
     let src = Arc::new(
         TiffSource::open(
-            Arc::clone(&counting) as Arc<dyn veldmap_core::io::ByteSource>,
+            Arc::clone(&counting) as Arc<dyn ByteSource>,
             SourceFingerprint::from_digest([5u8; 32]),
             &budget,
             &cancel,
@@ -153,7 +123,7 @@ fn concurrent_decode_respects_memory_cap_and_deduplicates_shared_chunks() {
 #[test]
 fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
     let raw = build_multi_tile_tiff(2, 2, RASTER_TILE_SIZE);
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
     let src = Arc::new(
         TiffSource::open(
@@ -170,9 +140,14 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
     let shutdown = CancelToken::new();
     let pool = TwoLaneDecodePool::spawn(
         TwoLaneDecodePoolConfig {
-            fast_workers: 2,
-            bulk_workers: 2,
-            ..TwoLaneDecodePoolConfig::default()
+            fast: DecodePoolConfig {
+                worker_count: 2,
+                ..DecodePoolConfig::default()
+            },
+            bulk: DecodePoolConfig {
+                worker_count: 2,
+                ..DecodePoolConfig::default()
+            },
         },
         shutdown.clone(),
     );
@@ -189,10 +164,16 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
         let started = Arc::clone(&bulk_started);
         let rel = release_bulk.clone();
         let pass_cancel = shutdown.child_token();
+        let pass_key = StreamKey {
+            source: SourceId::new(100 + u64::from(x)),
+            band: BandKey::Display,
+            format: PixelFormat::Rgba8UnormSrgb,
+            gutter: 0,
+        };
         assert!(handle.submit(
             DecodeLane::Bulk,
             DecodeJob {
-                key: dummy_key(x),
+                key: DecodeJobKey::Pass(pass_key),
                 queued_bytes: 1024,
                 cancel: pass_cancel.clone(),
                 work: Box::new(move || {
@@ -236,11 +217,7 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
         assert!(handle.submit(
             DecodeLane::Fast,
             DecodeJob {
-                key: TileKey {
-                    band: BandKey::Index(0),
-                    format: PixelFormat::Rgba8UnormSrgb,
-                    ..dummy_key(x)
-                },
+                key: DecodeJobKey::Tile(fast_tile_key(x)),
                 queued_bytes: 256,
                 cancel: fast_cancel.clone(),
                 work: Box::new(move || {
@@ -272,10 +249,8 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
 
 #[test]
 fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
-    use veldmap_core::tile::{ServeMode, TileScheduler};
-
     let raw = build_multi_tile_tiff(2, 2, RASTER_TILE_SIZE);
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
     let src = Arc::new(
         TiffSource::open(
@@ -302,11 +277,11 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
     for lvl in meta.ladder(0) {
         let plan = meta.level(lvl).expect("level in range");
         let k0 = meta.tile_key(lvl, 0, 0);
-        let admitted = sched.admit_pointwise_or_check_pass(&meta, lvl, &[k0], |_| false);
-        assert_eq!(admitted, vec![k0]);
 
         match plan.serve {
             ServeMode::Pointwise => {
+                let admitted = sched.admit_pointwise(&meta, lvl, &[k0], |_| false);
+                assert_eq!(admitted, vec![k0]);
                 let tile = src
                     .decode_pointwise_tile(k0.level, k0.x, k0.y, &ctx)
                     .expect("pointwise decode");
@@ -317,6 +292,8 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
                 sched.on_tile_arrived(&k0);
             }
             ServeMode::Pass { from } => {
+                let pending = sched.check_pass_candidates(&meta, lvl, &[k0], |_| false);
+                assert_eq!(pending, vec![k0]);
                 let pass_key = meta.pass_key();
                 let pass_cancel = CancelToken::new();
                 let pass_id = sched
@@ -337,7 +314,7 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
 #[test]
 fn concurrent_pass_and_pointwise_under_tight_budget_never_deadlock() {
     let raw = build_multi_tile_tiff(2, 2, RASTER_TILE_SIZE);
-    let budget = MemoryBudget::detect();
+    let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
     let src = Arc::new(
         TiffSource::open(
@@ -351,7 +328,7 @@ fn concurrent_pass_and_pointwise_under_tight_budget_never_deadlock() {
 
     // Budget is large enough for the pass alone, NOT pass + chunk simultaneously,
     // exercising sequential non-deadlocking handoff between pass and pointwise.
-    let pass_total = src.grid().pass_peak((1024, 1024)).total();
+    let pass_total = src.pass_peak_bytes();
     let tracker = Arc::new(DecodeBudgetTracker::new(pass_total));
     let chunk_cache = Arc::new(SharedChunkCache::new(budget.decoded_chunk_cache_bytes));
     let barrier = Arc::new(Barrier::new(2));

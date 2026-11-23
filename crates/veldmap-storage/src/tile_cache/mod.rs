@@ -21,19 +21,18 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use veldmap_core::io::lock_unpoisoned;
+use rusqlite::{Connection, TransactionBehavior};
+use veldmap_core::sync::lock_unpoisoned;
 
 use crate::StorageError;
 
 use self::evict::{evict_in_tx, reclaim_space};
 use self::key::EncodedKey;
 use self::schema::{
-    CLEAR_BLOBS_SQL, CLEAR_META_SQL, DELETE_META_BY_ID_SQL, DELETE_SOURCE_META_SQL,
-    SELECT_META_ID_BYTES_SQL, SELECT_TILE_BLOB_SQL, TOUCH_META_SQL, UPSERT_BLOB_SQL,
-    UPSERT_META_SQL, decrement_cache_meta, is_corrupt_sqlite_error, open_and_init_file_db,
-    open_read_only_connection, read_cache_meta_totals, recreate_file_db, reset_cache_meta,
-    set_cache_meta_totals, sidecar_path,
+    CLEAR_BLOBS_SQL, CLEAR_META_SQL, decrement_cache_meta, delete_meta_by_id, delete_source_meta,
+    flush_touches_in_tx, is_corrupt_sqlite_error, open_and_init_file_db, open_read_only_connection,
+    read_cache_meta_totals, recreate_file_db, reset_cache_meta, select_meta_id_bytes,
+    select_tile_blob, set_cache_meta_totals, sidecar_path, upsert_tile_blob, upsert_tile_meta,
 };
 
 pub use self::key::{DiskTileKey, TileBlobEncoding, valid_source_key};
@@ -65,23 +64,6 @@ pub struct DiskCacheStats {
     pub max_bytes: u64,
 }
 
-fn flush_touches_in_tx(
-    tx: &rusqlite::Transaction<'_>,
-    touches: &HashMap<i64, i64>,
-) -> Result<(), rusqlite::Error> {
-    if touches.is_empty() {
-        return Ok(());
-    }
-    // Updates `tile_meta` only (never `tile_blobs`), so read-hit LRU touches
-    // never rewrite BLOB overflow pages. Guarded with `last_used_ms < ?1` so a
-    // buffered touch can never roll back a newer timestamp on a reused tile_id.
-    let mut stmt = tx.prepare(TOUCH_META_SQL)?;
-    for (&tile_id, &ts) in touches {
-        stmt.execute(params![ts, tile_id])?;
-    }
-    Ok(())
-}
-
 fn upsert_tile_and_update_meta(
     tx: &rusqlite::Transaction<'_>,
     enc: &EncodedKey<'_>,
@@ -90,22 +72,10 @@ fn upsert_tile_and_update_meta(
     new_bytes: u64,
     ts_ms: i64,
 ) -> Result<(i64, u64, u64), rusqlite::Error> {
-    let prev_bytes: Option<i64> = {
-        let mut stmt = tx.prepare(SELECT_META_ID_BYTES_SQL)?;
-        stmt.query_row(enc.key_params(), |r| r.get(1)).optional()?
-    };
-
-    let encoding_raw = i64::from(encoding as u8);
-    let byte_size = new_bytes as i64;
-    let inserted_id: i64 = {
-        let mut stmt = tx.prepare(UPSERT_META_SQL)?;
-        stmt.query_row(enc.upsert_params(&encoding_raw, &byte_size, &ts_ms), |r| {
-            r.get(0)
-        })?
-    };
-
-    tx.prepare(UPSERT_BLOB_SQL)?
-        .execute(params![inserted_id, payload])?;
+    let prev_bytes = select_meta_id_bytes(tx, enc)?.map(|(_, sz)| sz);
+    let inserted_id =
+        upsert_tile_meta(tx, enc, i64::from(encoding as u8), new_bytes as i64, ts_ms)?;
+    upsert_tile_blob(tx, inserted_id, payload)?;
 
     let old = prev_bytes.unwrap_or(0).max(0) as u64;
     let count_delta = u64::from(prev_bytes.is_none());
@@ -354,11 +324,7 @@ impl TileDiskCache {
         expected_encoding: Option<TileBlobEncoding>,
     ) -> Result<Option<(TileBlobEncoding, Vec<u8>)>, StorageError> {
         let enc = EncodedKey::from_key(key)?;
-        let row: Option<(i64, i64, Vec<u8>)> = self.with_reader(|conn| {
-            let mut stmt = conn.prepare(SELECT_TILE_BLOB_SQL)?;
-            stmt.query_row(enc.key_params(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional()
-        })?;
+        let row = self.with_reader(|conn| select_tile_blob(conn, &enc))?;
 
         if let Some((tile_id, encoding_raw, payload)) = row {
             let Some(encoding) = TileBlobEncoding::from_i64(encoding_raw) else {
@@ -474,15 +440,10 @@ impl TileDiskCache {
         let enc = EncodedKey::from_key(key)?;
         let mut conn = lock_unpoisoned(&self.writer);
         let deleted_id = self.with_write_tx(&mut conn, |tx| {
-            let prev: Option<(i64, i64)> = {
-                let mut stmt = tx.prepare(SELECT_META_ID_BYTES_SQL)?;
-                stmt.query_row(enc.key_params(), |r| Ok((r.get(0)?, r.get(1)?)))
-                    .optional()?
-            };
-            let Some((tile_id, sz)) = prev else {
+            let Some((tile_id, sz)) = select_meta_id_bytes(tx, &enc)? else {
                 return Ok(None);
             };
-            tx.execute(DELETE_META_BY_ID_SQL, params![tile_id])?;
+            delete_meta_by_id(tx, tile_id)?;
             decrement_cache_meta(tx, sz, 1)?;
             Ok(Some(tile_id))
         })?;
@@ -541,17 +502,7 @@ impl TileDiskCache {
         }
         let mut conn = lock_unpoisoned(&self.writer);
         let deleted_ids = self.with_write_tx(&mut conn, |tx| {
-            let mut stmt = tx.prepare(DELETE_SOURCE_META_SQL)?;
-            let rows = stmt.query_map(params![source_key], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            let mut ids = Vec::new();
-            let mut removed_bytes = 0i64;
-            for row in rows {
-                let (tile_id, byte_size) = row?;
-                ids.push(tile_id);
-                removed_bytes = removed_bytes.saturating_add(byte_size.max(0));
-            }
+            let (ids, removed_bytes) = delete_source_meta(tx, source_key)?;
             if !ids.is_empty() {
                 decrement_cache_meta(tx, removed_bytes, ids.len() as i64)?;
             }

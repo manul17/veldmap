@@ -29,7 +29,7 @@ pub struct Ring {
 
 /// Spherical bounding circle around a set of footprint rings.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Frame {
+pub struct FootprintBounds {
     pub lat: f64,
     pub lon: f64,
     /// Angular radius in degrees of arc (`1 deg ~ 111 km`).
@@ -37,14 +37,14 @@ pub struct Frame {
 }
 
 /// Compute the spherical framing circle enclosing `rings`, or `None` if empty.
-pub fn frame(rings: &[Ring]) -> Option<Frame> {
+pub fn frame(rings: &[Ring]) -> Option<FootprintBounds> {
     let first = rings.iter().flat_map(|ring| &ring.points).next()?;
     let (lat, lon) = middle(points(rings)).unwrap_or((first.lat, first.lon));
     let radius_deg = points(rings)
         .map(|point| geodesy::separation((lat, lon), point))
         .fold(0.0, f64::max);
 
-    Some(Frame {
+    Some(FootprintBounds {
         lat,
         lon: wrap(lon),
         radius_deg,
@@ -67,8 +67,11 @@ fn angles(ring: &Ring) -> Vec<(f64, f64)> {
     ring.points.iter().map(|p| (p.lat, p.lon)).collect()
 }
 
+/// Default chord sagitta tolerance used for geodesic ring densification.
+const FOOTPRINT_SAG_TOLERANCE_M: f64 = 70.0;
+
 fn traced(ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let max_edge_deg = sag::outline_max_edge_deg();
+    let max_edge_deg = sag::max_chord_deg(FOOTPRINT_SAG_TOLERANCE_M) * 0.5;
 
     let mut out = Vec::with_capacity(ring.len());
     for (at, &from) in ring.iter().enumerate() {

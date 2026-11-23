@@ -1,14 +1,48 @@
-//! Coarsest-first deduplicated `TileKey` priority queue backed by a
-//! reverse-sorted `Vec` so `pop()` yields the coarsest key in O(1).
+//! Coarsest-first deduplicated `TileKey` priority queue backed by a `BTreeSet`
+//! for O(log N) insertion, deduplication, lookup, and coarsest-first pop.
 
-use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashSet};
 
 use veldmap_core::tile::TileKey;
 
+/// Total-ordering wrapper over [`TileKey`] ordered strictly coarsest-first,
+/// with `(coarsest_first_key(), level)` injective with `Eq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OrderedTileKey(TileKey);
+
+impl OrderedTileKey {
+    fn sort_tuple(
+        &self,
+    ) -> (
+        u8,
+        veldmap_core::tile::TileScheme,
+        u32,
+        u32,
+        veldmap_core::tile::SourceId,
+        veldmap_core::tile::TileStreamSpec,
+        u8,
+    ) {
+        let (rank, scheme, y, x, source, spec) = self.0.coarsest_first_key();
+        (rank, scheme, y, x, source, spec, self.0.level)
+    }
+}
+
+impl Ord for OrderedTileKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sort_tuple().cmp(&other.sort_tuple())
+    }
+}
+
+impl PartialOrd for OrderedTileKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct CoarsestTileQueue {
-    items: Vec<TileKey>,
+    items: BTreeSet<OrderedTileKey>,
 }
 
 impl CoarsestTileQueue {
@@ -25,56 +59,34 @@ impl CoarsestTileQueue {
     }
 
     pub(super) fn pop(&mut self) -> Option<TileKey> {
-        self.items.pop()
+        self.items.pop_first().map(|entry| entry.0)
     }
 
     pub(super) fn contains(&self, key: &TileKey) -> bool {
-        let sort_key = Reverse(key.coarsest_first_key());
-        self.items
-            .binary_search_by_key(&sort_key, |k| Reverse(k.coarsest_first_key()))
-            .is_ok()
+        self.items.contains(&OrderedTileKey(*key))
     }
 
-    /// Insert a single `TileKey` into the reverse-sorted queue without
-    /// duplicating entries or re-sorting the entire `Vec`.
+    /// Insert a single `TileKey` into the queue without duplicating entries.
     pub(super) fn insert_unique(&mut self, key: TileKey) -> bool {
-        let sort_key = Reverse(key.coarsest_first_key());
-        match self
-            .items
-            .binary_search_by_key(&sort_key, |k| Reverse(k.coarsest_first_key()))
-        {
-            Ok(_) => false,
-            Err(idx) => {
-                self.items.insert(idx, key);
-                true
-            }
-        }
+        self.items.insert(OrderedTileKey(key))
     }
 
-    /// Batch-insert keys (skipping keys already present) and restore
-    /// coarsest-at-end ordering.
+    /// Batch-insert keys (skipping keys already present).
     pub(super) fn push_unique(&mut self, keys: impl IntoIterator<Item = TileKey>) -> bool {
-        let mut iter = keys.into_iter().peekable();
-        if iter.peek().is_none() {
-            return false;
-        }
-        let mut existing: HashSet<TileKey> = self.items.iter().copied().collect();
         let mut added = false;
-        for key in iter {
-            if existing.insert(key) {
-                self.items.push(key);
+        for key in keys {
+            if self.items.insert(OrderedTileKey(key)) {
                 added = true;
             }
-        }
-        if added {
-            Self::sort_coarsest_at_end(&mut self.items);
         }
         added
     }
 
-    pub(super) fn replace_sorted(&mut self, mut keys: Vec<TileKey>) {
-        Self::sort_coarsest_at_end(&mut keys);
-        self.items = keys;
+    pub(super) fn replace_sorted(&mut self, keys: impl IntoIterator<Item = TileKey>) {
+        self.items.clear();
+        for key in keys {
+            self.items.insert(OrderedTileKey(key));
+        }
     }
 
     pub(super) fn retain_and_collect(
@@ -82,37 +94,27 @@ impl CoarsestTileQueue {
         mut keep: impl FnMut(&TileKey) -> bool,
     ) -> HashSet<TileKey> {
         let mut retained = HashSet::new();
-        self.items.retain(|key| {
-            let ok = keep(key);
+        self.items.retain(|entry| {
+            let ok = keep(&entry.0);
             if ok {
-                retained.insert(*key);
+                retained.insert(entry.0);
             }
             ok
         });
         retained
     }
 
-    pub(super) fn restore_deferred(&mut self, deferred: Vec<TileKey>, multi_host: bool) {
-        if deferred.is_empty() {
-            return;
-        }
-        // `deferred` was popped coarsest-first from the back of the queue;
-        // reversing restores ascending-priority order without a full sort for
-        // single-host short-circuits, and sorting when mixed.
-        if multi_host {
-            self.items.extend(deferred);
-            Self::sort_coarsest_at_end(&mut self.items);
-        } else {
-            self.items.extend(deferred.into_iter().rev());
+    pub(super) fn restore_deferred(&mut self, deferred: Vec<TileKey>) {
+        for key in deferred {
+            self.items.insert(OrderedTileKey(key));
         }
     }
 
     pub(super) fn drain(&mut self) -> Vec<TileKey> {
-        self.items.drain(..).collect()
-    }
-
-    fn sort_coarsest_at_end(queue: &mut [TileKey]) {
-        queue.sort_by_key(|k| Reverse(k.coarsest_first_key()));
+        std::mem::take(&mut self.items)
+            .into_iter()
+            .map(|entry| entry.0)
+            .collect()
     }
 }
 
@@ -133,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_unique_maintains_coarsest_at_end_order() {
+    fn insert_unique_maintains_coarsest_first_order() {
         let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
         let mut queue = CoarsestTileQueue::default();
         let k0 = wm_key(&spec, 0, 0, 0);

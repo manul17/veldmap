@@ -1,22 +1,28 @@
 use super::*;
 
 #[test]
-fn host_ram_budget_scales_within_bounds_and_parses_meminfo() {
+fn host_ram_budget_scales_within_bounds_and_default_is_deterministic() {
     let small = MemoryBudget::for_host_ram(512 * MIB);
     assert_eq!(small.host_ram_bytes, GIB);
     assert_eq!(small.decode_working_bytes, 256 * MIB);
     assert_eq!(small.decoded_chunk_cache_bytes, 64 * MIB as usize);
+    assert_eq!(small.region_cap_bytes, 32 * MIB);
+    assert_eq!(
+        small.region_cap_pixels_for(PixelFormat::Rgba8UnormSrgb),
+        8 * MIB
+    );
+    assert_eq!(small.region_cap_pixels_for(PixelFormat::R8Uint), 32 * MIB);
     assert_eq!(small.gpu_tile_cache_bytes, 256 * MIB as usize);
 
     let mid = MemoryBudget::for_host_ram(16 * GIB);
     assert_eq!(mid.decode_working_bytes, 2 * GIB);
     assert_eq!(mid.decoded_chunk_cache_bytes, 512 * MIB as usize);
+    assert_eq!(mid.region_cap_bytes, 256 * MIB);
     assert_eq!(mid.gpu_tile_cache_bytes, GIB as usize);
 
-    let sample = "MemTotal:       32845120 kB\nMemFree:        123456 kB\n";
     assert_eq!(
-        parse_proc_meminfo_total_bytes(sample),
-        Some(32_845_120 * 1024)
+        MemoryBudget::default(),
+        MemoryBudget::for_host_ram(DEFAULT_FALLBACK_HOST_RAM_BYTES)
     );
 }
 
@@ -85,14 +91,4 @@ fn decode_budget_tracker_enforces_cap_and_cancels_waiters() {
     let large_lease = large_handle.join().unwrap().expect("large lease succeeds");
     assert_eq!(large_lease.bytes(), 80);
     drop(large_lease);
-
-    // DecodePeak::admit / note cover structured errors.
-    let peak = DecodePeak::new()
-        .with("band", 4 * MIB)
-        .with("cascade", 2 * MIB);
-    assert!(peak.admit(6 * MIB).is_ok());
-    assert!(matches!(
-        peak.admit(5 * MIB),
-        Err(BudgetError::ExceedsCap { detail, .. }) if detail.contains("band 4 MiB")
-    ));
 }

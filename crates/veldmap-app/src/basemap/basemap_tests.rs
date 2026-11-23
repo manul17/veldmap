@@ -1,6 +1,6 @@
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::camera::Camera;
-use veldmap_core::tile::{TileScheme, traverse};
+use veldmap_core::tile::{DecodedTile, TileScheme, traverse};
 use veldmap_net::{DecodeCompletion, DecodeFailure, DecodeRequest};
 use veldmap_raster::{DecodePool, DecodePoolConfig};
 use veldmap_storage::StoragePaths;
@@ -12,7 +12,7 @@ use crate::storage::AppStorage;
 use crate::test_support::TempTestRoot;
 
 #[test]
-fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {
+fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
     let root = TempTestRoot::new("ellipsoid-and-errors");
     let paths = StoragePaths::with_root(root.path());
     let initial = AppSettings {
@@ -25,7 +25,6 @@ fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {
     let mut storage = AppStorage::open(Arc::clone(&wakeup), Some(paths));
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
-    let mut gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
     let mut manager = BasemapManager::new(
         storage.settings(),
         storage.disk_cache(),
@@ -41,12 +40,18 @@ fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {
         0,
         "EllipsoidOnly must not seed bundled roots"
     );
+    assert!(
+        !manager.bundled_provider.is_basemap_decoded(),
+        "EllipsoidOnly must not eagerly decode bundled JPEG"
+    );
 
     let mut bad_date = initial.clone();
     bad_date.active_basemap = BasemapSelection::NasaGibsViirs;
     bad_date.gibs_date = "2024-02-30".to_owned();
     storage.update_settings(bad_date);
-    manager.sync_settings(storage.settings(), &mut gpu_cache, &mut pending);
+    let outcome = manager.sync_settings(storage.settings());
+    assert!(outcome.changed);
+    assert_eq!(outcome.evict_source, None);
     assert!(manager.status_snapshot().config_error.is_some());
     assert_eq!(manager.active_source(), SourceId::BUNDLED_BASEMAP);
     assert_eq!(manager.attribution(), Some(BUNDLED_ATTRIBUTION));
@@ -55,7 +60,8 @@ fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {
     bad_custom.active_basemap = BasemapSelection::CustomXyz;
     bad_custom.custom_xyz.url_template = "ftp://bad/{z}/{x}/{y}".to_owned();
     storage.update_settings(bad_custom);
-    manager.sync_settings(storage.settings(), &mut gpu_cache, &mut pending);
+    let outcome = manager.sync_settings(storage.settings());
+    assert!(outcome.changed);
     assert!(manager.status_snapshot().config_error.is_some());
     assert_eq!(manager.active_source(), SourceId::BUNDLED_BASEMAP);
 
@@ -67,14 +73,14 @@ fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {
 }
 
 #[test]
-fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_flush() {
+fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_eviction_intent() {
     let root = TempTestRoot::new("schedule");
     let paths = StoragePaths::with_root(root.path());
     let wakeup: Wakeup = Arc::new(|| {});
     let mut storage = AppStorage::open(Arc::clone(&wakeup), Some(paths));
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
-    let mut gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
+    let gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
     let mut manager = BasemapManager::new(
         storage.settings(),
         storage.disk_cache(),
@@ -84,7 +90,9 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_flush
     );
 
     storage.mutate_settings(|s| s.active_basemap = BasemapSelection::NasaGibsBlueMarble);
-    manager.sync_settings(storage.settings(), &mut gpu_cache, &mut pending);
+    let first_switch = manager.sync_settings(storage.settings());
+    assert!(first_switch.changed);
+    assert_eq!(first_switch.evict_source, None);
     let gibs_source = manager.active_source();
     assert_ne!(gibs_source, SourceId::BUNDLED_BASEMAP);
 
@@ -130,7 +138,12 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_flush
     assert_eq!(manager.observed_live_tile_bytes, 2 * 1024 * 1024);
 
     storage.mutate_settings(|s| s.active_basemap = BasemapSelection::EoxSentinel2Cloudless);
-    manager.sync_settings(storage.settings(), &mut gpu_cache, &mut pending);
+    let second_switch = manager.sync_settings(storage.settings());
+    assert!(second_switch.changed);
+    assert_eq!(second_switch.evict_source, Some(gibs_source));
+    if let Some(evict) = second_switch.evict_source {
+        pending.clear_source(evict);
+    }
     assert!(!pending.contains(&stale_key));
     assert_eq!(manager.observed_live_tile_bytes, 0);
 
@@ -143,9 +156,8 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_flush
 
 #[test]
 fn rejected_or_cancelled_decode_request_signals_aborted() {
-    use std::sync::mpsc;
-
-    let (done_tx, _done_rx) = mpsc::channel();
+    let uploads = PendingUploads::new();
+    let done_tx = uploads.sender().expect("sender");
     let shutdown = CancelToken::new();
     let pool = DecodePool::spawn(
         DecodePoolConfig {

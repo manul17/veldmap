@@ -1,15 +1,86 @@
-//! GeoTIFF / GDAL georeference and nodata tag parsing.
+//! GeoTIFF / GDAL georeference, `GeoKeyDirectoryTag` (`34735`–`34737`), and
+//! nodata tag parsing.
 
 use tiff::decoder::Decoder;
 use tiff::tags::Tag;
-use veldmap_core::io::{BufferedByteReader, CancelToken};
+use veldmap_core::io::BufferedByteReader;
+use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
-use crate::band::{GeoKeyParams, GeoPlacement, GeoTie, is_valid_lat_lon};
+use crate::pipeline::band::{
+    GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie, is_valid_lat_lon,
+};
 
 use super::tags::{
     is_missing_tag, map_tiff_error, read_tag_ascii_opt, read_tag_f64_vec_opt, read_tag_u16_vec_opt,
 };
+
+/// Parse raw `GeoKeyDirectoryTag` (`34735`), `GeoDoubleParamsTag` (`34736`),
+/// and `GeoAsciiParamsTag` (`34737`) payloads.
+pub(crate) fn parse_geokeys(
+    raw_keys: &[u16],
+    double_params: &[f64],
+    ascii_params: &str,
+) -> GeoKeyParams {
+    let mut out = GeoKeyParams::default();
+
+    let Some(&num_keys_raw) = raw_keys.get(3) else {
+        return out;
+    };
+    let Some(entries) = raw_keys.get(4..) else {
+        return out;
+    };
+
+    let num_keys = usize::from(num_keys_raw);
+    let ascii_bytes = ascii_params.as_bytes();
+
+    for entry in entries.chunks_exact(4).take(num_keys) {
+        let id = entry[0];
+        let location = entry[1];
+        let count = usize::from(entry[2]);
+        let offset_or_val = entry[3];
+
+        let value = match location {
+            0 => Some(GeoKeyValue::Short(offset_or_val)),
+            34736 => {
+                let start = usize::from(offset_or_val);
+                let end = start.saturating_add(count);
+                double_params
+                    .get(start..end)
+                    .filter(|vals| vals.iter().all(|v| v.is_finite()))
+                    .map(|vals| GeoKeyValue::Double(vals.to_vec()))
+            }
+            34737 => {
+                let start = usize::from(offset_or_val);
+                let end = start.saturating_add(count);
+                // `tiff::Decoder::get_tag_ascii_string` truncates at the first NUL byte,
+                // so the final key's `count` may extend 1 byte past `ascii_bytes.len()`.
+                let slice = ascii_bytes.get(start..end).or_else(|| {
+                    (start <= ascii_bytes.len() && end == ascii_bytes.len() + 1)
+                        .then(|| &ascii_bytes[start..])
+                });
+                slice
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .map(|s| GeoKeyValue::Ascii(s.trim_end_matches(['|', '\0']).trim().to_string()))
+            }
+            _ => None,
+        };
+
+        if let Some(val) = value {
+            match (id, &val) {
+                (1024, GeoKeyValue::Short(v)) => out.model_type = Some(*v),
+                (1025, GeoKeyValue::Short(2)) => out.raster_type = GeoRasterType::PixelIsPoint,
+                (1025, GeoKeyValue::Short(1)) => out.raster_type = GeoRasterType::PixelIsArea,
+                (2048, GeoKeyValue::Short(v)) => out.geographic_crs = Some(*v),
+                (3072, GeoKeyValue::Short(v)) => out.projected_crs = Some(*v),
+                _ => {}
+            }
+            out.keys.push((id, val));
+        }
+    }
+
+    out
+}
 
 pub(super) fn parse_gdal_nodata(
     decoder: &mut Decoder<BufferedByteReader>,
@@ -47,22 +118,14 @@ pub(super) fn georef(
     let raw_keys = read_tag_u16_vec_opt(decoder, Tag::GeoKeyDirectoryTag, cancel)?;
     let double_params = read_tag_f64_vec_opt(decoder, Tag::GeoDoubleParamsTag, cancel)?;
     let ascii_params = read_tag_ascii_opt(decoder, Tag::GeoAsciiParamsTag, cancel)?;
-    let geo_params = GeoKeyParams::parse(&raw_keys, &double_params, &ascii_params);
+    let geo_params = parse_geokeys(&raw_keys, &double_params, &ascii_params);
 
     let points = read_tag_f64_vec_opt(decoder, Tag::ModelTiepointTag, cancel)?;
     let scale = read_tag_f64_vec_opt(decoder, Tag::ModelPixelScaleTag, cancel)?;
     let matrix = read_tag_f64_vec_opt(decoder, Tag::ModelTransformationTag, cancel)?;
 
     let foreign_datum_epsg = foreign_datum(&geo_params);
-    let placement = geo_placement(
-        &geo_params,
-        foreign_datum_epsg,
-        &points,
-        &scale,
-        &matrix,
-        width,
-        height,
-    );
+    let placement = geo_placement(&geo_params, &points, &scale, &matrix, width, height);
     let ties = geo_ties(&geo_params, &points, &scale, &matrix, width, height);
 
     let carries = !points.is_empty() || !scale.is_empty() || !matrix.is_empty();
@@ -130,7 +193,6 @@ pub(super) fn affine_from_matrix(matrix: &[f64], half: f64) -> Option<[f64; 6]> 
 
 pub(super) fn geo_placement(
     geo_params: &GeoKeyParams,
-    foreign_datum_epsg: Option<u16>,
     points: &[f64],
     scale: &[f64],
     matrix: &[f64],
@@ -170,7 +232,6 @@ pub(super) fn geo_placement(
     Some(GeoPlacement {
         epsg,
         affine,
-        foreign_datum_epsg,
         geo_params: geo_params.clone(),
     })
 }
@@ -256,4 +317,27 @@ pub(super) fn geo_ties(
     }
 
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geokey_parse_respects_count_and_nul_stripped_ascii_tail() {
+        let raw_keys = [
+            1, 1, 0, 3, // header
+            1024, 0, 1, 1, // ModelType = Projected
+            3073, 34737, 8, 4, // PCSCitation starting at 4, count 8 (stripped NUL)
+            3080, 34736, 1, 0, // ProjFalseOriginLong
+            0, 0, 0, 0, // trailing padding ignored
+        ];
+        let doubles = [39.0_f64, f64::NAN];
+        let ascii = "Foo|Zone 37";
+        let parsed = parse_geokeys(&raw_keys, &doubles, ascii);
+        assert_eq!(parsed.model_type, Some(1));
+        assert_eq!(parsed.get_ascii(3073), Some("Zone 37"));
+        assert_eq!(parsed.get_f64(3080), Some(39.0));
+        assert_eq!(parsed.keys.len(), 3);
+    }
 }

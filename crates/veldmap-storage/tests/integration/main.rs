@@ -4,7 +4,7 @@
 
 #![expect(
     clippy::expect_used,
-    reason = "integration test harness helpers panic on setup failure"
+    reason = "INVARIANT: integration test harness helpers panic on setup failure"
 )]
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use veldmap_core::io::{ByteSource, CancelToken};
+use veldmap_core::io::ByteSource;
+use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileKey, TileScheme};
 use veldmap_storage::{
     DiskTileKey, LocalFileSource, LocalFingerprintCache, StoragePaths, TileBlobEncoding,

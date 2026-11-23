@@ -1,45 +1,53 @@
-//! Native raster decoding, bounded CPU decode pool, linear-light mipmap
-//! generation, and virtual offline equirectangular basemap tiling for VeldMap.
+//! Native raster decoding, bounded CPU decode pools, linear-light mipmap
+//! generation, virtual offline equirectangular basemap tiling, and analytical
+//! GeoTIFF/BigTIFF/COG pyramid decoding for VeldMap.
 //!
 //! Keeps `veldmap-core` permanently free of image/codec dependencies and keeps
 //! `veldmap-net` decoupled from raster codecs via an injected decode executor.
+
+use std::sync::Arc;
 
 use thiserror::Error;
 use veldmap_core::budget::BudgetError;
 use veldmap_core::io::IoError;
 use veldmap_core::tile::PlanetaryScheme;
 
-pub mod band;
-mod basemap;
-mod cascade;
-pub mod chunk_cache;
-mod decode_pool;
-pub mod grid;
-mod map_tile;
-mod mipmap;
-pub mod pyramid;
-mod radiometry;
-pub mod resample;
-pub mod tiff;
+mod color;
+mod display;
+mod pipeline;
+mod pool;
+mod tiff;
 
-pub use band::{
+pub use display::{
+    BundledBasemap, BundledBasemapConfig, decode_map_tile, decode_map_tile_with_mipmaps,
+    generate_linear_mipmaps,
+};
+pub use pipeline::DecodeContext;
+pub use pipeline::band::{
     BandInfo, GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie, RasterDescription,
     SampleType,
 };
-pub use basemap::{BundledBasemap, BundledBasemapConfig};
-pub use chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
-pub use decode_pool::{
-    DEFAULT_MAX_PENDING_DECODE_BYTES, DEFAULT_MAX_PENDING_DECODE_JOBS, DecodeJob, DecodeLane,
-    DecodePool, DecodePoolConfig, DecodePoolHandle, TwoLaneDecodePool, TwoLaneDecodePoolConfig,
-    TwoLaneDecodePoolHandle,
+pub use pipeline::chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
+pub use pipeline::peak::DecodePeak;
+pub use pipeline::pyramid::{
+    RASTER_TILE_SIZE, cell_image_rect, cell_uv, grid_dim, level_count, level_size, tile_extent,
 };
-pub use map_tile::{decode_map_tile, decode_map_tile_with_mipmaps};
-pub use mipmap::generate_linear_mipmaps;
-pub use pyramid::RASTER_TILE_SIZE;
-pub use tiff::{DecodeContext, TiffSource};
+pub use pipeline::scheduler::{
+    LevelPlan, PassBusy, PassKey, PyramidMeta, ServeMode, TileFailureOutcome, TileScheduler,
+};
+pub use pool::{
+    DEFAULT_MAX_PENDING_DECODE_BYTES, DEFAULT_MAX_PENDING_DECODE_JOBS, DecodeJob, DecodeJobKey,
+    DecodeLane, DecodePool, DecodePoolConfig, DecodePoolHandle, TwoLaneDecodePool,
+    TwoLaneDecodePoolConfig, TwoLaneDecodePoolHandle,
+};
+pub use tiff::{MAX_IFDS, MAX_SOURCE_SIDE, TIFF_DECODE_REV, TiffSource, has_tiff_magic};
 
 /// Errors returned by raster tile decoders and virtual tile providers.
-#[derive(Debug, Error)]
+///
+/// Cancellation from `IoError::Cancelled` or `BudgetError::Cancelled` is
+/// normalized into [`Self::Cancelled`] via explicit `From` implementations so
+/// schedulers and caches never have to match three cancellation shapes.
+#[derive(Clone, Debug, Error)]
 pub enum RasterError {
     #[error("raster decode cancelled")]
     Cancelled,
@@ -49,12 +57,14 @@ pub enum RasterError {
     InvalidFormat(String),
     #[error("TIFF decode error: {0}")]
     Tiff(String),
+    #[error("codec decoder limits exceeded: {0}")]
+    DecoderLimitsExceeded(String),
     #[error("I/O error: {0}")]
-    Io(#[from] IoError),
+    Io(#[source] Arc<IoError>),
     #[error("memory budget exceeded: {0}")]
-    Budget(#[from] BudgetError),
+    Budget(BudgetError),
     #[error("image decode failed: {0}")]
-    Decode(#[from] image::ImageError),
+    Decode(#[source] Arc<image::ImageError>),
     #[error("invalid decoded image dimensions {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },
     #[error("image {width}x{height} exceeds decode limits ({estimated_bytes} B > {limit_bytes} B)")]
@@ -71,4 +81,36 @@ pub enum RasterError {
         x: u32,
         y: u32,
     },
+}
+
+impl RasterError {
+    /// Return whether this error represents task cancellation.
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
+impl From<IoError> for RasterError {
+    fn from(err: IoError) -> Self {
+        if err.is_cancelled() {
+            Self::Cancelled
+        } else {
+            Self::Io(Arc::new(err))
+        }
+    }
+}
+
+impl From<BudgetError> for RasterError {
+    fn from(err: BudgetError) -> Self {
+        match err {
+            BudgetError::Cancelled => Self::Cancelled,
+            other => Self::Budget(other),
+        }
+    }
+}
+
+impl From<image::ImageError> for RasterError {
+    fn from(err: image::ImageError) -> Self {
+        Self::Decode(Arc::new(err))
+    }
 }

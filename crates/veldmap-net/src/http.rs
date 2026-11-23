@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use veldmap_core::io::lock_unpoisoned;
+use veldmap_core::sync::lock_unpoisoned;
 
 use crate::NetError;
 

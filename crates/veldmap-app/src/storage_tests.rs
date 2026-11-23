@@ -9,12 +9,12 @@ use crate::settings::BasemapSelection;
 use crate::test_support::TempTestRoot;
 
 #[test]
-fn update_settings_skips_noop_writes_and_persists_changes() {
+fn update_settings_skips_noop_writes_and_flushes_async_saves_on_shutdown() {
     let dir = TempTestRoot::new("storage-noop");
     let paths = StoragePaths::with_root(dir.path());
     let settings_path = paths.settings_path();
     let wakeup: Wakeup = Arc::new(|| {});
-    let mut storage = AppStorage::open(wakeup, Some(paths));
+    let mut storage = AppStorage::open(wakeup, Some(paths.clone()));
 
     // No-op update must return false and avoid creating settings.json unnecessarily.
     let same = storage.settings().clone();
@@ -24,16 +24,24 @@ fn update_settings_skips_noop_writes_and_persists_changes() {
         "no-op update_settings should not fsync unchanged settings"
     );
 
-    // Real mutation persists settings.json and updates cap.
+    // Real mutation enqueues async durable save and updates cap.
     assert!(storage.mutate_settings(|s| {
         s.active_basemap = BasemapSelection::EoxSentinel2Cloudless;
         s.disk_cache_max_mb = 128;
     }));
-    assert!(settings_path.exists());
     assert_eq!(storage.settings().disk_cache_max_mb, 128);
 
+    // Deterministic shutdown drains the worker queue and flushes settings.json durably.
     storage.begin_shutdown();
     storage.finish_shutdown();
+
+    assert!(settings_path.exists());
+    let reloaded = AppSettings::load_or_default(&paths);
+    assert_eq!(
+        reloaded.active_basemap,
+        BasemapSelection::EoxSentinel2Cloudless
+    );
+    assert_eq!(reloaded.disk_cache_max_mb, 128);
 }
 
 #[test]
@@ -61,7 +69,7 @@ fn disk_cache_worker_handles_refresh_cap_clear_and_disconnected_recovery() {
     assert_eq!(stats.tile_count, 1);
     assert_eq!(stats.payload_bytes, 256);
 
-    // Async clear empties the DB, clears busy flag, sets notice, and bumps clear_gen.
+    // Async clear empties the DB, clears busy flag, sets notice, and bumps atomic clear_gen.
     assert!(!storage.poll_clear_completed());
     storage.request_clear_disk_cache();
     let deadline = Instant::now() + Duration::from_secs(2);

@@ -23,6 +23,11 @@ use super::viewport::{LastRenderKey, OffscreenTarget, RenderParams, ViewportStat
 /// ~1,000 cached `16 x 16` tiles).
 const DEFAULT_MESH_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Upper ceiling for transient mesh-cache expansion during dense horizon views
+/// (`64 MiB`). Once frame demand subsides, `set_max_bytes` restores the budget
+/// back toward [`DEFAULT_MESH_CACHE_BYTES`].
+const MAX_MESH_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 struct CachedTileMesh {
     buffer: wgpu::Buffer,
     grid_anchor: TileGridAnchor,
@@ -260,8 +265,9 @@ impl GlobeRenderer {
         self.ensure_grid_cells(device, snapshot.grid_cells);
         let stride = (self.grid_cells + 1) as usize;
         let single_tile_bytes = (stride * stride + 4 * stride) * std::mem::size_of::<TileVertex>();
-        self.tile_meshes
-            .ensure_max_bytes(snapshot.tiles.len().saturating_mul(single_tile_bytes));
+        let needed_bytes = snapshot.tiles.len().saturating_mul(single_tile_bytes);
+        let target_cap = needed_bytes.clamp(DEFAULT_MESH_CACHE_BYTES, MAX_MESH_CACHE_BYTES);
+        let _ = self.tile_meshes.set_max_bytes(target_cap);
 
         for draw in &snapshot.tiles {
             let id = draw.visible.id;

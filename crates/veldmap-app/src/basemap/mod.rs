@@ -1,6 +1,6 @@
 //! Live + offline basemap orchestration extracted from `app.rs`.
 //!
-//! Coordinates the bundled offline NASA Blue Marble worker
+//! Coordinates the lazy bundled offline NASA Blue Marble provider
 //! ([`BundledBasemapProvider`]), the shared `veldmap-raster` CPU decode pool
 //! ([`DecodePool`]), and the async HTTP streaming pipeline
 //! (`LiveTilePipeline`), enforcing:
@@ -9,8 +9,8 @@
 //! - `0` live HTTP requests above per-source `max_level`
 //! - Seamless Frame-1 & offline fallback to bundled Blue Marble tiles
 //! - Shared `< 50%` VRAM appetite capping across bundled + live tiles
-//! - Deterministic shutdown (`CancelToken` -> close `PendingUploads` rx -> join
-//!   bundled/decode threads -> shut down `tokio::Runtime`)
+//! - Deterministic shutdown (`CancelToken` -> close `PendingUploads` -> join
+//!   shared CPU decode pool -> shut down `tokio::Runtime`)
 
 mod adapters;
 pub(crate) mod bundled;
@@ -18,17 +18,16 @@ pub mod policy;
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::io::{CancelToken, Wakeup};
+use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::{
-    DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey,
-    max_mip_levels, mip_chain_byte_size,
+    PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey, max_mip_levels,
+    mip_chain_byte_size,
 };
 use veldmap_net::{
-    CustomBasemapConfig, FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError, NetworkStatus,
-    TileBlobStore, TileDecodeExecutor,
+    FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError, NetworkStatus, TileBlobStore,
+    TileDecodeExecutor,
 };
 use veldmap_raster::{DecodePool, DecodePoolConfig};
 use veldmap_storage::TileDiskCache;
@@ -38,38 +37,42 @@ use self::bundled::{
     BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, BundledBasemapProvider,
 };
 use self::policy::BasemapCarrierPolicy;
-use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport};
+use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSender};
 use crate::settings::{AppSettings, BasemapSelection, CustomXyzSettings};
 
 /// Attribution string displayed for the bundled public-domain Blue Marble
 /// offline basemap.
-pub const BUNDLED_ATTRIBUTION: &str = "Imagery: NASA Blue Marble Next Generation (Public Domain)";
+pub(crate) const BUNDLED_ATTRIBUTION: &str =
+    "Imagery: NASA Blue Marble Next Generation (Public Domain)";
 
 /// Plain read-only basemap status view model passed to UI toolbar controls so
 /// `basemap_ui` never depends directly on [`BasemapManager`].
 #[derive(Clone, Debug, Default)]
-pub struct BasemapStatusSnapshot {
-    pub network: NetworkStatus,
-    pub live_pipeline_error: Option<String>,
-    pub config_error: Option<String>,
+pub(crate) struct BasemapStatusSnapshot {
+    pub(crate) network: NetworkStatus,
+    pub(crate) live_pipeline_error: Option<String>,
+    pub(crate) config_error: Option<String>,
+}
+
+/// Explicit outcome returned by [`BasemapManager::sync_settings`] so the
+/// caller (`VeldmapApp`) owns GPU cache and upload queue mutations directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BasemapSyncOutcome {
+    pub(crate) changed: bool,
+    pub(crate) evict_source: Option<SourceId>,
 }
 
 /// Build a [`LiveBasemapSpec`] from user [`CustomXyzSettings`].
-pub fn custom_live_spec(custom: &CustomXyzSettings) -> Result<LiveBasemapSpec, NetError> {
-    LiveBasemapSpec::custom(CustomBasemapConfig {
-        name: &custom.name,
-        url_template: &custom.url_template,
-        api_key: &custom.api_key,
-        tms_flip_y: custom.tms_flip_y,
-        max_level: custom.max_level,
-        attribution: &custom.attribution,
-    })
+pub(crate) fn custom_live_spec(custom: &CustomXyzSettings) -> Result<LiveBasemapSpec, NetError> {
+    LiveBasemapSpec::custom(custom.as_net_config())
 }
 
 /// Resolve the active [`LiveBasemapSpec`] from persisted [`AppSettings`],
 /// returning `Ok(None)` for offline (`BundledBlueMarble`) or `EllipsoidOnly`
 /// modes.
-pub fn spec_from_settings(settings: &AppSettings) -> Result<Option<LiveBasemapSpec>, NetError> {
+pub(crate) fn spec_from_settings(
+    settings: &AppSettings,
+) -> Result<Option<LiveBasemapSpec>, NetError> {
     match settings.active_basemap {
         BasemapSelection::BundledBlueMarble | BasemapSelection::EllipsoidOnly => Ok(None),
         BasemapSelection::NasaGibsBlueMarble => Ok(Some(LiveBasemapSpec::nasa_gibs_blue_marble())),
@@ -84,8 +87,8 @@ pub fn spec_from_settings(settings: &AppSettings) -> Result<Option<LiveBasemapSp
 }
 
 /// Coordinates offline bundled + live HTTP basemap streaming without owning
-/// application-wide storage or settings state.
-pub struct BasemapManager {
+/// application-wide storage, GPU cache, or upload queue state.
+pub(crate) struct BasemapManager {
     active_basemap: BasemapSelection,
     bundled_provider: BundledBasemapProvider,
     decode_shutdown: CancelToken,
@@ -97,7 +100,6 @@ pub struct BasemapManager {
     observed_live_tile_bytes: usize,
     wanted_bundled: HashSet<TileKey>,
     wanted_live: HashSet<TileKey>,
-    wanted_all: HashSet<TileKey>,
 }
 
 impl Drop for BasemapManager {
@@ -110,15 +112,13 @@ impl Drop for BasemapManager {
 impl BasemapManager {
     /// Initialize basemap orchestration using initial `settings` and an
     /// optional shared SQLite [`TileDiskCache`] from [`crate::storage::AppStorage`].
-    pub fn new(
+    pub(crate) fn new(
         settings: &AppSettings,
         disk_cache: Option<Arc<TileDiskCache>>,
-        done_tx: Sender<(TileKey, DecodedTile)>,
+        done_tx: UploadSender,
         wakeup: Wakeup,
         budget: &MemoryBudget,
     ) -> Self {
-        let bundled_provider = BundledBasemapProvider::spawn(done_tx.clone(), Arc::clone(&wakeup));
-
         let decode_threads = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(2)
@@ -130,6 +130,12 @@ impl BasemapManager {
                 max_pending_bytes: budget.fast_lane_pending_bytes,
                 ..DecodePoolConfig::default()
             },
+            decode_shutdown.clone(),
+        );
+        let bundled_provider = BundledBasemapProvider::new(
+            decode_pool.handle(),
+            done_tx.clone(),
+            Arc::clone(&wakeup),
             decode_shutdown.clone(),
         );
         let decode_executor: Arc<dyn TileDecodeExecutor> = Arc::new(RasterDecodeExecutor {
@@ -166,7 +172,6 @@ impl BasemapManager {
             observed_live_tile_bytes: 0,
             wanted_bundled: HashSet::new(),
             wanted_live: HashSet::new(),
-            wanted_all: HashSet::new(),
         };
 
         manager.sync_active_spec(settings);
@@ -179,13 +184,13 @@ impl BasemapManager {
 
     /// Whether the globe should render textured imagery (`false` for
     /// `EllipsoidOnly`).
-    pub fn is_textured(&self) -> bool {
+    pub(crate) fn is_textured(&self) -> bool {
         self.active_basemap != BasemapSelection::EllipsoidOnly
     }
 
     /// Active primary [`SourceId`] passed into `DrawSnapshot::build` and
     /// [`PendingUploads::drain_and_upload`].
-    pub fn active_source(&self) -> SourceId {
+    pub(crate) fn active_source(&self) -> SourceId {
         match &self.active_live_spec {
             Some(spec) => spec.source_id(),
             None => SourceId::BUNDLED_BASEMAP,
@@ -193,12 +198,12 @@ impl BasemapManager {
     }
 
     /// Pure carrier-routing policy matching the active basemap source.
-    pub fn carrier_policy(&self) -> BasemapCarrierPolicy {
+    pub(crate) fn carrier_policy(&self) -> BasemapCarrierPolicy {
         BasemapCarrierPolicy::new(self.active_source())
     }
 
     /// Active planetary [`QuadtreeConfig`] matched to the selected basemap.
-    pub fn quadtree_config(&self) -> QuadtreeConfig {
+    pub(crate) fn quadtree_config(&self) -> QuadtreeConfig {
         match &self.active_live_spec {
             Some(spec) => {
                 // Live basemaps stream 256px WebMercator/Geodetic tiles up to
@@ -219,7 +224,7 @@ impl BasemapManager {
 
     /// Visible attribution string for the active basemap (`None` for
     /// `EllipsoidOnly`).
-    pub fn attribution(&self) -> Option<&str> {
+    pub(crate) fn attribution(&self) -> Option<&str> {
         match self.active_basemap {
             BasemapSelection::EllipsoidOnly => None,
             BasemapSelection::BundledBlueMarble => Some(BUNDLED_ATTRIBUTION),
@@ -231,7 +236,7 @@ impl BasemapManager {
     }
 
     /// Snapshot toolbar-visible live streaming / config error state.
-    pub fn status_snapshot(&self) -> BasemapStatusSnapshot {
+    pub(crate) fn status_snapshot(&self) -> BasemapStatusSnapshot {
         BasemapStatusSnapshot {
             network: self
                 .live_pipeline
@@ -243,15 +248,15 @@ impl BasemapManager {
         }
     }
 
-    /// Combined wanted set (active live + bundled/polar fallback) for
-    /// [`PendingUploads::drain_and_upload`].
-    pub fn wanted_tiles(&self) -> &HashSet<TileKey> {
-        &self.wanted_all
+    /// Borrow both active wanted sets (live + bundled/polar fallback) without
+    /// duplicating them into a merged `HashSet`.
+    pub(crate) fn wanted_tile_sets(&self) -> [&HashSet<TileKey>; 2] {
+        [&self.wanted_live, &self.wanted_bundled]
     }
 
     /// Update observed live tile byte size from an upload batch so VRAM
     /// appetite budgeting accounts for 512 px / `@2x` Custom XYZ tiles cleanly.
-    pub fn record_upload_report(&mut self, report: &UploadBatchReport) {
+    pub(crate) fn record_upload_report(&mut self, report: &UploadBatchReport) {
         if report.max_active_tile_bytes > 0 && self.active_live_spec.is_some() {
             self.observed_live_tile_bytes = self
                 .observed_live_tile_bytes
@@ -260,22 +265,16 @@ impl BasemapManager {
     }
 
     /// Retry failed/offline live tile requests immediately.
-    pub fn retry_live(&self) {
+    pub(crate) fn retry_live(&self) {
         if let Some(pipeline) = &self.live_pipeline {
             pipeline.retry_failed();
         }
     }
 
     /// Synchronize active basemap providers with updated [`AppSettings`],
-    /// evicting GPU tiles from the previous live source if changed and
-    /// switching the live pipeline. Returns `true` when the active basemap
-    /// source or mode changed.
-    pub fn sync_settings(
-        &mut self,
-        settings: &AppSettings,
-        gpu_cache: &mut GpuTileCache,
-        pending_uploads: &mut PendingUploads,
-    ) -> bool {
+    /// returning explicit eviction intent so the caller (`VeldmapApp`) owns
+    /// GPU cache and upload queue purging.
+    pub(crate) fn sync_settings(&mut self, settings: &AppSettings) -> BasemapSyncOutcome {
         let prev_source = self.active_source();
         let prev_mode = self.active_basemap;
         self.active_basemap = settings.active_basemap;
@@ -283,17 +282,16 @@ impl BasemapManager {
         self.sync_active_spec(settings);
         let next_source = self.active_source();
 
+        let mut evict_source = None;
         if prev_source != next_source {
-            // Keep bundled fallback tiles warm in VRAM; purge stale tiles from
-            // the previous live source so VRAM stays clean across switches.
+            // Keep bundled fallback tiles warm in VRAM; instruct caller to
+            // purge stale tiles from the previous live source.
             if prev_source != SourceId::BUNDLED_BASEMAP {
-                gpu_cache.remove_source(prev_source);
-                pending_uploads.clear_source(prev_source);
+                evict_source = Some(prev_source);
             }
             self.observed_live_tile_bytes = 0;
             self.wanted_live.clear();
             self.wanted_bundled.clear();
-            self.wanted_all.clear();
             if self.is_textured() {
                 self.bundled_provider
                     .seed_roots(self.quadtree_config().scheme);
@@ -303,7 +301,10 @@ impl BasemapManager {
                 .seed_roots(self.quadtree_config().scheme);
         }
 
-        prev_source != next_source || prev_mode != self.active_basemap
+        BasemapSyncOutcome {
+            changed: prev_source != next_source || prev_mode != self.active_basemap,
+            evict_source,
+        }
     }
 
     fn sync_active_spec(&mut self, settings: &AppSettings) {
@@ -328,7 +329,7 @@ impl BasemapManager {
     /// Schedule missing visible tiles (identified purely by their planetary
     /// `QuadTileId`s, keeping `basemap` decoupled from `render::DrawSnapshot`)
     /// for both the bundled offline provider and the active live HTTP pipeline.
-    pub fn schedule_for_tiles(
+    pub(crate) fn schedule_for_tiles(
         &mut self,
         visible_tex_ids: impl IntoIterator<Item = QuadTileId>,
         gpu_cache: &GpuTileCache,
@@ -337,7 +338,6 @@ impl BasemapManager {
     ) {
         self.wanted_bundled.clear();
         self.wanted_live.clear();
-        self.wanted_all.clear();
 
         if !self.is_textured() {
             self.reconcile_providers(gpu_cache, pending_uploads);
@@ -365,9 +365,6 @@ impl BasemapManager {
                 total_appetite_bytes.saturating_sub(bundled_total_bytes),
             );
         }
-
-        self.wanted_all.extend(self.wanted_live.iter().copied());
-        self.wanted_all.extend(self.wanted_bundled.iter().copied());
 
         self.reconcile_providers(gpu_cache, pending_uploads);
 
@@ -492,7 +489,7 @@ impl BasemapManager {
     }
 
     /// Reconcile both background providers after GPU tile uploads complete.
-    pub fn reconcile_providers(
+    pub(crate) fn reconcile_providers(
         &mut self,
         gpu_cache: &GpuTileCache,
         pending_uploads: &PendingUploads,
@@ -506,9 +503,9 @@ impl BasemapManager {
     }
 
     /// Phase 1 of deterministic shutdown: cancel `CancelToken`s immediately
-    /// and signal background workers BEFORE dropping `PendingUploads`'s rx.
-    pub fn begin_shutdown(&mut self) {
-        self.bundled_provider.signal_shutdown();
+    /// and signal background workers BEFORE closing `PendingUploads`.
+    pub(crate) fn begin_shutdown(&mut self) {
+        self.bundled_provider.cancel_all();
         if let Some(pipeline) = &self.live_pipeline {
             pipeline.signal_shutdown();
         }
@@ -516,9 +513,8 @@ impl BasemapManager {
     }
 
     /// Phase 2 of deterministic shutdown (after `PendingUploads::close()`):
-    /// join CPU decode & bundled threads, then shut down `tokio::Runtime`.
-    pub fn finish_shutdown(&mut self) {
-        self.bundled_provider.join();
+    /// join the shared CPU decode pool, then shut down `tokio::Runtime`.
+    pub(crate) fn finish_shutdown(&mut self) {
         if let Some(pool) = self.decode_pool.take() {
             pool.shutdown();
         }

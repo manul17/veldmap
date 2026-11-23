@@ -1,6 +1,9 @@
 //! Unified `Copy` tile addressing (`TileKey`, `QuadTileId`, `TileScheme`,
-//! `BandKey`, `PixelFormat`, `SourceId`) shared by planetary basemaps, polar
-//! caps, and local/cloud raster pyramids.
+//! `BandKey`, `PixelFormat`, `SourceId`, `SourceFingerprint`, `TileStreamSpec`,
+//! `StreamKey`) shared by planetary basemaps, polar caps, and local/cloud
+//! raster pyramids.
+
+use std::fmt;
 
 /// Deterministic 64-bit FNV-1a hash used for stable `Copy` source/band keys.
 pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -14,6 +17,50 @@ pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
         i += 1;
     }
     hash
+}
+
+/// Opaque 256-bit content fingerprint uniquely identifying a raster byte stream
+/// (sampled BLAKE3 digest for local files, or metadata digest for remote COGs).
+///
+/// Formats as 64 lowercase ASCII hex characters, which always satisfies strict
+/// disk-cache `source_key` validation (`<= 128` safe ASCII bytes).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceFingerprint([u8; 32]);
+
+impl SourceFingerprint {
+    /// Wrap a 32-byte digest into an opaque [`SourceFingerprint`].
+    pub const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    /// Borrow the raw 32-byte digest.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Encode as 64 lowercase hexadecimal ASCII characters.
+    pub fn to_hex(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(64);
+        for &byte in &self.0 {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+}
+
+impl fmt::Display for SourceFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl fmt::Debug for SourceFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hex = self.to_hex();
+        write!(f, "SourceFingerprint({}..)", &hex[..12])
+    }
 }
 
 /// Compact identifier for a tile data source (bundled basemap, live XYZ/TMS
@@ -38,14 +85,18 @@ impl SourceId {
         Self(fnv1a_64(key.as_bytes()) | (1u64 << 63))
     }
 
-    /// Derive a deterministic [`SourceId`] from a content [`crate::io::SourceFingerprint`].
-    pub const fn from_fingerprint(fingerprint: &crate::io::SourceFingerprint) -> Self {
-        Self(fnv1a_64(fingerprint.as_bytes()) | (1u64 << 63))
+    /// Derive a deterministic [`SourceId`] directly from the first 8 bytes of
+    /// a uniform 256-bit [`SourceFingerprint`] digest, setting the high bit so
+    /// it never collides with reserved constants.
+    pub const fn from_fingerprint(fingerprint: &SourceFingerprint) -> Self {
+        let b = fingerprint.as_bytes();
+        let low = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        Self(low | (1u64 << 63))
     }
 }
 
-impl From<&crate::io::SourceFingerprint> for SourceId {
-    fn from(fingerprint: &crate::io::SourceFingerprint) -> Self {
+impl From<&SourceFingerprint> for SourceId {
+    fn from(fingerprint: &SourceFingerprint) -> Self {
         Self::from_fingerprint(fingerprint)
     }
 }
@@ -89,6 +140,72 @@ impl PixelFormat {
             Self::Rgba8UnormSrgb | Self::R32Float => 4,
             Self::R8Uint => 1,
             Self::R16Uint => 2,
+        }
+    }
+}
+
+/// Source-independent stream-partitioning descriptor (`band`, `format`,
+/// `gutter`, `decode_rev`) shared across `TileKey`, `DiskTileKey`,
+/// `PyramidMeta`, and `ChunkKey` so cache/key comparisons stay in lockstep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TileStreamSpec {
+    pub band: BandKey,
+    pub format: PixelFormat,
+    /// Border gutter width in texels (`0` for standard tiles, `1` for DEM
+    /// relief tiles) so guttered and unguttered tiles never alias in caches.
+    pub gutter: u8,
+    pub decode_rev: u32,
+}
+
+impl TileStreamSpec {
+    /// Canonical display stream (`BandKey::Display`, `Rgba8UnormSrgb`,
+    /// `gutter = 0`, `decode_rev = 0`).
+    pub const DISPLAY: Self = Self {
+        band: BandKey::Display,
+        format: PixelFormat::Rgba8UnormSrgb,
+        gutter: 0,
+        decode_rev: 0,
+    };
+
+    /// Construct a stream descriptor.
+    pub const fn new(band: BandKey, format: PixelFormat, gutter: u8, decode_rev: u32) -> Self {
+        Self {
+            band,
+            format,
+            gutter,
+            decode_rev,
+        }
+    }
+}
+
+/// Identifies one independent raster pyramid stream (`source`, `band`,
+/// `format`, `gutter`) independent of `decode_rev`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamKey {
+    pub source: SourceId,
+    pub band: BandKey,
+    pub format: PixelFormat,
+    pub gutter: u8,
+}
+
+impl StreamKey {
+    /// Construct a [`StreamKey`] for `(source, band, format, gutter)`.
+    pub const fn new(source: SourceId, band: BandKey, format: PixelFormat, gutter: u8) -> Self {
+        Self {
+            source,
+            band,
+            format,
+            gutter,
+        }
+    }
+
+    /// Extract the [`StreamKey`] identifying `key`'s band/format/gutter stream.
+    pub const fn from_tile_key(key: &TileKey) -> Self {
+        Self {
+            source: key.source,
+            band: key.band,
+            format: key.format,
+            gutter: key.gutter,
         }
     }
 }
@@ -231,16 +348,6 @@ impl TileScheme {
         }
     }
 
-    /// Narrow to main-globe [`GlobeScheme`], returning `None` for `PolarCap` or
-    /// `RasterPyramid`.
-    pub const fn as_globe(self) -> Option<GlobeScheme> {
-        match self {
-            Self::WebMercator => Some(GlobeScheme::WebMercator),
-            Self::Geodetic => Some(GlobeScheme::Geodetic),
-            Self::PolarCap { .. } | Self::RasterPyramid { .. } => None,
-        }
-    }
-
     /// Return the grid dimensions `(cols, rows)` at `level` for planetary
     /// schemes, or `None` for raster pyramids (whose dimensions depend on the
     /// underlying raster) or out-of-range shift levels.
@@ -268,10 +375,13 @@ impl TileScheme {
                     Some((level + 1, x >> 1, y >> 1))
                 }
             }
-            _ => match self.as_planetary() {
-                Some(planetary) => planetary.parent(level, x, y),
-                None => None,
-            },
+            Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => {
+                if level == 0 {
+                    None
+                } else {
+                    Some((level - 1, x >> 1, y >> 1))
+                }
+            }
         }
     }
 
@@ -280,7 +390,7 @@ impl TileScheme {
     pub const fn coarseness_rank(self, level: u8) -> u8 {
         match self {
             Self::RasterPyramid { max_level } => max_level.saturating_sub(level),
-            _ => level,
+            Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => level,
         }
     }
 
@@ -296,7 +406,9 @@ impl TileScheme {
                     coarser_level.checked_sub(finer_level)
                 }
             }
-            _ => finer_level.checked_sub(coarser_level),
+            Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => {
+                finer_level.checked_sub(coarser_level)
+            }
         }
     }
 }
@@ -437,17 +549,52 @@ impl TileKey {
     /// `PixelFormat::Rgba8UnormSrgb`, `gutter = 0`, `decode_rev = 0`) for
     /// `(source, id)`.
     pub const fn display_quad(source: SourceId, id: QuadTileId) -> Self {
+        Self::from_stream(
+            source,
+            TileStreamSpec::DISPLAY,
+            id.scheme.into_tile_scheme(),
+            id.level,
+            id.x,
+            id.y,
+        )
+    }
+
+    /// Build a [`TileKey`] from `(source, spec, scheme, level, x, y)`.
+    pub const fn from_stream(
+        source: SourceId,
+        spec: TileStreamSpec,
+        scheme: TileScheme,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Self {
         Self {
             source,
-            band: BandKey::Display,
-            scheme: id.scheme.into_tile_scheme(),
-            format: PixelFormat::Rgba8UnormSrgb,
-            gutter: 0,
-            decode_rev: 0,
-            level: id.level,
-            x: id.x,
-            y: id.y,
+            band: spec.band,
+            scheme,
+            format: spec.format,
+            gutter: spec.gutter,
+            decode_rev: spec.decode_rev,
+            level,
+            x,
+            y,
         }
+    }
+
+    /// Extract the source-independent [`TileStreamSpec`] partitioning fields.
+    pub const fn stream_spec(&self) -> TileStreamSpec {
+        TileStreamSpec {
+            band: self.band,
+            format: self.format,
+            gutter: self.gutter,
+            decode_rev: self.decode_rev,
+        }
+    }
+
+    /// Extract the [`StreamKey`] identifying this tile's band/format/gutter
+    /// stream independent of `decode_rev`.
+    pub const fn stream_key(&self) -> StreamKey {
+        StreamKey::from_tile_key(self)
     }
 
     /// Extract the planetary geometric `(scheme, level, x, y)` identifier,
@@ -473,7 +620,9 @@ impl TileKey {
         }
         match self.scheme {
             TileScheme::RasterPyramid { max_level } => self.level == max_level,
-            _ => self.level == 0,
+            TileScheme::WebMercator | TileScheme::Geodetic | TileScheme::PolarCap { .. } => {
+                self.level == 0
+            }
         }
     }
 
@@ -481,30 +630,15 @@ impl TileKey {
     ///
     /// Orders by `(coarseness_rank, scheme, y, x)` first so multi-band tiles
     /// (`B04`, `B08`, `SCL`) interleave at each spatial cell, then breaks ties
-    /// deterministically by `(source, band, format, gutter, decode_rev)`.
-    pub const fn coarsest_first_key(
-        &self,
-    ) -> (
-        u8,
-        TileScheme,
-        u32,
-        u32,
-        SourceId,
-        BandKey,
-        PixelFormat,
-        u8,
-        u32,
-    ) {
+    /// deterministically by `(source, stream_spec)`.
+    pub const fn coarsest_first_key(&self) -> (u8, TileScheme, u32, u32, SourceId, TileStreamSpec) {
         (
             self.scheme.coarseness_rank(self.level),
             self.scheme,
             self.y,
             self.x,
             self.source,
-            self.band,
-            self.format,
-            self.gutter,
-            self.decode_rev,
+            self.stream_spec(),
         )
     }
 
@@ -527,18 +661,15 @@ impl TileKey {
     ///
     /// Intended for unguttered (`gutter == 0`) power-of-two quadtrees. Returns
     /// `None` if `ancestor` is not a valid ancestor of `self`, differs in
-    /// source/band/scheme/format/gutter/decode_rev, or if `gutter != 0`
-    /// (guttered tiles and clipped `RasterPyramid` edge tiles should resolve
-    /// carriers via `TileCache::find_carrier` and compute UVs from the
-    /// carrier's `(width, height, valid_w, valid_h, gutter)`).
+    /// source/scheme/stream_spec, or if `gutter != 0` (guttered tiles and
+    /// clipped `RasterPyramid` edge tiles should resolve carriers via
+    /// `TileCache::find_carrier` and compute UVs from the carrier's
+    /// `(width, height, valid_w, valid_h, gutter)`).
     pub fn sub_rect_in_ancestor(&self, ancestor: &Self) -> Option<[f32; 4]> {
         if self.source != ancestor.source
-            || self.band != ancestor.band
             || self.scheme != ancestor.scheme
-            || self.format != ancestor.format
-            || self.gutter != ancestor.gutter
+            || self.stream_spec() != ancestor.stream_spec()
             || self.gutter != 0
-            || self.decode_rev != ancestor.decode_rev
         {
             return None;
         }

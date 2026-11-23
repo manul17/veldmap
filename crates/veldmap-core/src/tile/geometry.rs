@@ -25,9 +25,21 @@ pub struct LatLonTileBounds {
     pub raw_lat_south_deg: f64,
 }
 
+/// Surface sample evaluated at mesh-local fractions `(s, t)` on a planetary tile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TileSurfaceSample {
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub u_tex: f64,
+    pub v_tex: f64,
+    /// Stereographic polar disk `(dx, dy)` coordinates (`0.0` outside polar caps).
+    pub polar_dx: f64,
+    pub polar_dy: f64,
+}
+
 /// Compute geographic `(lon_west_deg, lon_east_deg)` bounds for column `x` of `cols`.
 #[inline]
-pub fn tile_lon_bounds(x: u32, cols: u32) -> (f64, f64) {
+pub(crate) fn tile_lon_bounds(x: u32, cols: u32) -> (f64, f64) {
     let cols_f = f64::from(cols);
     let west = -180.0 + 360.0 * f64::from(x) / cols_f;
     let east = -180.0 + 360.0 * (f64::from(x) + 1.0) / cols_f;
@@ -36,7 +48,7 @@ pub fn tile_lon_bounds(x: u32, cols: u32) -> (f64, f64) {
 
 /// Linearly interpolate along a 1D interval `[start, end]` at fraction `t`.
 #[inline]
-pub fn lerp_f64(start: f64, end: f64, t: f64) -> f64 {
+pub(crate) fn lerp_f64(start: f64, end: f64, t: f64) -> f64 {
     start + (end - start) * t
 }
 
@@ -125,40 +137,56 @@ pub fn polar_cap_point(north: bool, u: f64, v: f64) -> (f64, f64, f64, f64) {
     (lat_deg, lon_deg, dx, dy)
 }
 
-/// Evaluate a surface point `(lat_deg, lon_deg, u_tex, v_tex, dx, dy)` on any
-/// planetary tile (`Geodetic`, `WebMercator`, or `PolarCap`) at mesh-local
-/// fractions `(s, t) in [0, 1]^2` (`s`: west->east / left->right,
-/// `t`: north->south / top->bottom).
-pub fn sample_tile_surface(
-    id: QuadTileId,
-    s: f64,
-    t: f64,
-) -> Option<(f64, f64, f64, f64, f64, f64)> {
+/// Evaluate a [`TileSurfaceSample`] on any planetary tile (`Geodetic`,
+/// `WebMercator`, or `PolarCap`) at mesh-local fractions `(s, t) in [0, 1]^2`
+/// (`s`: west->east / left->right, `t`: north->south / top->bottom).
+pub fn sample_tile_surface(id: QuadTileId, s: f64, t: f64) -> Option<TileSurfaceSample> {
     match id.scheme {
         PlanetaryScheme::Geodetic => {
             let b = lat_lon_bounds(id)?;
-            let lon = lerp_f64(b.lon_west_deg, b.lon_east_deg, s);
-            let lat = lerp_f64(b.lat_north_deg, b.lat_south_deg, t);
+            let lon_deg = lerp_f64(b.lon_west_deg, b.lon_east_deg, s);
+            let lat_deg = lerp_f64(b.lat_north_deg, b.lat_south_deg, t);
             let raw_span = (b.raw_lat_north_deg - b.raw_lat_south_deg).max(1e-12);
-            let v_tex = (b.raw_lat_north_deg - lat) / raw_span;
-            Some((lat, lon, s, v_tex, 0.0, 0.0))
+            let v_tex = (b.raw_lat_north_deg - lat_deg) / raw_span;
+            Some(TileSurfaceSample {
+                lat_deg,
+                lon_deg,
+                u_tex: s,
+                v_tex,
+                polar_dx: 0.0,
+                polar_dy: 0.0,
+            })
         }
         PlanetaryScheme::WebMercator => {
             let (cols, rows) = id.checked_grid_dims()?;
             let (lon_west_deg, lon_east_deg) = tile_lon_bounds(id.x, cols);
-            let lon = lerp_f64(lon_west_deg, lon_east_deg, s);
+            let lon_deg = lerp_f64(lon_west_deg, lon_east_deg, s);
             let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
             let merc = lerp_f64(merc_n, merc_s, t);
-            let lat = web_mercator_lat_deg(merc);
-            Some((lat, lon, s, t, 0.0, 0.0))
+            let lat_deg = web_mercator_lat_deg(merc);
+            Some(TileSurfaceSample {
+                lat_deg,
+                lon_deg,
+                u_tex: s,
+                v_tex: t,
+                polar_dx: 0.0,
+                polar_dy: 0.0,
+            })
         }
         PlanetaryScheme::PolarCap { north } => {
             let (n, _) = id.checked_grid_dims()?;
             let n_f = f64::from(n);
             let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
             let v = -1.0 + 2.0 * (f64::from(id.y) + t) / n_f;
-            let (lat, lon, dx, dy) = polar_cap_point(north, u, v);
-            Some((lat, lon, s, t, dx, dy))
+            let (lat_deg, lon_deg, polar_dx, polar_dy) = polar_cap_point(north, u, v);
+            Some(TileSurfaceSample {
+                lat_deg,
+                lon_deg,
+                u_tex: s,
+                v_tex: t,
+                polar_dx,
+                polar_dy,
+            })
         }
     }
 }
@@ -183,8 +211,6 @@ mod tests {
 
     #[test]
     fn lat_lon_bounds_handles_polar_clamping_cap_exclusion_and_out_of_range() {
-        // Level-0 Geodetic tiles clamp north/south to +/- WEB_MERCATOR_LIMIT_DEG
-        // while keeping unclamped raw latitudes for texture UV mapping.
         let geo0 = QuadTileId {
             scheme: PlanetaryScheme::Geodetic,
             level: 0,
@@ -199,7 +225,6 @@ mod tests {
         assert!((b.lat_north_deg - WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
         assert!((b.lat_south_deg + WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
 
-        // At z=6 (rows=64, 2.8125 deg/row), row 0 covers [87.1875, 90] -> fully inside polar cap.
         let inside_cap = QuadTileId {
             scheme: PlanetaryScheme::Geodetic,
             level: 6,
@@ -208,7 +233,6 @@ mod tests {
         };
         assert!(lat_lon_bounds(inside_cap).is_none());
 
-        // PolarCap and out-of-range tiles return None.
         assert!(
             lat_lon_bounds(QuadTileId {
                 scheme: PlanetaryScheme::PolarCap { north: true },
@@ -237,15 +261,16 @@ mod tests {
             x: 0,
             y: 0,
         };
-        let (lat_n, lon_w, u0, v0, _, _) =
-            sample_tile_surface(geo0, 0.0, 0.0).expect("north-west corner");
-        let (lat_s, lon_e, u1, v1, _, _) =
-            sample_tile_surface(geo0, 1.0, 1.0).expect("south-east corner");
-        assert!((lat_n - WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
-        assert!((lat_s + WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
-        assert_eq!((lon_w, lon_e, u0, u1), (-180.0, 0.0, 0.0, 1.0));
+        let nw = sample_tile_surface(geo0, 0.0, 0.0).expect("north-west corner");
+        let se = sample_tile_surface(geo0, 1.0, 1.0).expect("south-east corner");
+        assert!((nw.lat_deg - WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
+        assert!((se.lat_deg + WEB_MERCATOR_LIMIT_DEG).abs() < 1e-12);
+        assert_eq!(
+            (nw.lon_deg, se.lon_deg, nw.u_tex, se.u_tex),
+            (-180.0, 0.0, 0.0, 1.0)
+        );
         let expected_v0 = (90.0 - WEB_MERCATOR_LIMIT_DEG) / 180.0;
-        assert!((v0 - expected_v0).abs() < 1e-12);
-        assert!((v1 - (1.0 - expected_v0)).abs() < 1e-12);
+        assert!((nw.v_tex - expected_v0).abs() < 1e-12);
+        assert!((se.v_tex - (1.0 - expected_v0)).abs() < 1e-12);
     }
 }

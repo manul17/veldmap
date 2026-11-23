@@ -1,6 +1,5 @@
-//! Startup host-RAM-scaled fixed per-cache memory budgets (`MemoryBudget`),
-//! named working-memory peak estimation (`DecodePeak`), and thread-safe active
-//! decode memory reservation (`DecodeBudgetTracker`).
+//! Pure host-RAM-scaled per-cache memory budgets (`MemoryBudget`) and
+//! thread-safe active decode memory reservation (`DecodeBudgetTracker`).
 //!
 //! Avoids lock-reentrant cross-cache shrinking by assigning independent fixed
 //! startup caps to each cache and decoding lane.
@@ -10,7 +9,8 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use thiserror::Error;
 
-use crate::io::{CancelToken, lock_unpoisoned};
+use crate::sync::{CancelToken, lock_unpoisoned};
+use crate::tile::PixelFormat;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -23,15 +23,15 @@ pub const DEFAULT_FALLBACK_HOST_RAM_BYTES: u64 = 8 * GIB;
 /// caches and decode lanes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryBudget {
-    /// Detected or configured physical host RAM in bytes.
+    /// Configured physical host RAM in bytes (clamped to `[1 GiB, 256 GiB]`).
     pub host_ram_bytes: u64,
     /// Concurrent active decode working-memory ceiling in bytes.
     pub decode_working_bytes: u64,
     /// Bounded LRU decoded-chunk cache byte cap for pointwise raster reads.
     pub decoded_chunk_cache_bytes: usize,
-    /// Per-tile source region ceiling in pixels (derived as half of the chunk
-    /// cache at 4 bytes/pixel so pointwise reads stay bounded).
-    pub region_cap_pixels: u64,
+    /// Per-tile source region ceiling in bytes (half of the chunk cache so
+    /// pointwise reads stay bounded across all pixel formats).
+    pub region_cap_bytes: u64,
     /// Fast/pointwise decode lane pending-queue byte cap.
     pub fast_lane_pending_bytes: usize,
     /// Bulk/pass/full-image decode lane pending-queue byte cap.
@@ -48,7 +48,7 @@ impl MemoryBudget {
         let ram = host_ram_bytes.clamp(GIB, 256 * GIB);
         let decode_working_bytes = (ram / 8).clamp(256 * MIB, 2 * GIB);
         let decoded_chunk_cache_bytes = (decode_working_bytes / 4).clamp(64 * MIB, 512 * MIB);
-        let region_cap_pixels = decoded_chunk_cache_bytes / 8;
+        let region_cap_bytes = decoded_chunk_cache_bytes / 2;
         let lane_pending = (ram / 128).clamp(32 * MIB, 128 * MIB) as usize;
         let gpu_tile_cache_bytes = (ram / 16).clamp(256 * MIB, GIB) as usize;
         let queued_upload_bytes = (ram / 128).clamp(64 * MIB, 128 * MIB) as usize;
@@ -57,7 +57,7 @@ impl MemoryBudget {
             host_ram_bytes: ram,
             decode_working_bytes,
             decoded_chunk_cache_bytes: decoded_chunk_cache_bytes as usize,
-            region_cap_pixels,
+            region_cap_bytes,
             fast_lane_pending_bytes: lane_pending,
             bulk_lane_pending_bytes: lane_pending,
             gpu_tile_cache_bytes,
@@ -65,53 +65,18 @@ impl MemoryBudget {
         }
     }
 
-    /// Detect physical host RAM and derive startup caps, falling back cleanly
-    /// to [`DEFAULT_FALLBACK_HOST_RAM_BYTES`] (`8 GiB`) if unsupported.
-    pub fn detect() -> Self {
-        Self::for_host_ram(detect_host_ram_bytes().unwrap_or(DEFAULT_FALLBACK_HOST_RAM_BYTES))
+    /// Derive the per-tile source region pixel ceiling for a concrete
+    /// [`PixelFormat`] from [`Self::region_cap_bytes`].
+    pub const fn region_cap_pixels_for(&self, format: PixelFormat) -> u64 {
+        self.region_cap_bytes / (format.bytes_per_pixel() as u64)
     }
 }
 
 impl Default for MemoryBudget {
+    /// Deterministic default budget assuming [`DEFAULT_FALLBACK_HOST_RAM_BYTES`].
     fn default() -> Self {
-        Self::detect()
+        Self::for_host_ram(DEFAULT_FALLBACK_HOST_RAM_BYTES)
     }
-}
-
-fn detect_host_ram_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-        parse_proc_meminfo_total_bytes(&contents)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let text = std::str::from_utf8(&out.stdout).ok()?.trim();
-        text.parse::<u64>().ok()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_meminfo_total_bytes(meminfo: &str) -> Option<u64> {
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kib_str = rest.split_whitespace().next()?;
-            let kib = kib_str.parse::<u64>().ok()?;
-            return kib.checked_mul(1024);
-        }
-    }
-    None
 }
 
 /// Errors returned when admitting or reserving decode working memory.
@@ -125,68 +90,6 @@ pub enum BudgetError {
     },
     #[error("memory budget reservation cancelled")]
     Cancelled,
-}
-
-/// Named working-memory peak breakdown for one decode operation or pyramid
-/// level row.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DecodePeak {
-    terms: Vec<(&'static str, u64)>,
-}
-
-impl DecodePeak {
-    /// Construct an empty peak accumulator.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add a named cost term in bytes.
-    pub fn with(mut self, what: &'static str, bytes: u64) -> Self {
-        self.terms.push((what, bytes));
-        self
-    }
-
-    /// Return the named terms slice.
-    pub fn terms(&self) -> &[(&'static str, u64)] {
-        &self.terms
-    }
-
-    /// Sum of all named terms in bytes (saturating on overflow).
-    pub fn total(&self) -> u64 {
-        self.terms
-            .iter()
-            .map(|(_, bytes)| *bytes)
-            .fold(0u64, u64::saturating_add)
-    }
-
-    /// Return whether `total() <= limit_bytes`.
-    pub fn fits(&self, limit_bytes: u64) -> bool {
-        self.total() <= limit_bytes
-    }
-
-    /// Validate that `total() <= limit_bytes`, returning a structured
-    /// [`BudgetError::ExceedsCap`] naming every component when refused.
-    pub fn admit(&self, limit_bytes: u64) -> Result<(), BudgetError> {
-        let requested = self.total();
-        if requested <= limit_bytes {
-            Ok(())
-        } else {
-            Err(BudgetError::ExceedsCap {
-                requested,
-                cap: limit_bytes,
-                detail: self.note(),
-            })
-        }
-    }
-
-    /// Human-readable summary of terms (e.g. `"band 128 MiB, cascade 48 MiB"`).
-    pub fn note(&self) -> String {
-        self.terms
-            .iter()
-            .map(|(what, bytes)| format!("{what} {} MiB", bytes / MIB))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
 }
 
 #[derive(Default)]

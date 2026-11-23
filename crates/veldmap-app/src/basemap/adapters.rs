@@ -2,13 +2,16 @@
 //! storage- and codec-agnostic traits (`TileBlobStore` and `TileDecodeExecutor`).
 
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 
-use veldmap_core::io::{CancelToken, Wakeup};
-use veldmap_core::tile::{DecodedTile, QuadTileId, TileKey};
-use veldmap_net::{DecodeFailure, DecodeRequest, TileBlobStore, TileDecodeExecutor};
-use veldmap_raster::{DecodeJob, DecodePoolHandle, decode_map_tile_with_mipmaps};
-use veldmap_storage::{DiskTileKey, TileDiskCache};
+use veldmap_core::sync::{CancelToken, Wakeup};
+use veldmap_core::tile::QuadTileId;
+use veldmap_net::{
+    BlobStoreError, DecodeFailure, DecodeRequest, TileBlobStore, TileDecodeExecutor,
+};
+use veldmap_raster::{DecodeJob, DecodeJobKey, DecodePoolHandle, decode_map_tile_with_mipmaps};
+use veldmap_storage::{DiskTileKey, StorageError, TileDiskCache};
+
+use crate::gpu_tiles::UploadSender;
 
 /// Adapter bridging `veldmap-storage`'s [`TileDiskCache`] into `veldmap-net`'s
 /// storage-agnostic [`TileBlobStore`] trait.
@@ -24,25 +27,30 @@ impl SqliteBlobStore {
             id.y,
         )
     }
+
+    fn map_err(err: StorageError) -> BlobStoreError {
+        if err.is_cancelled() {
+            BlobStoreError::Cancelled
+        } else {
+            BlobStoreError::Backend(err.to_string())
+        }
+    }
 }
 
 impl TileBlobStore for SqliteBlobStore {
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String> {
+    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, BlobStoreError> {
         let key = Self::disk_key(source_key, id);
-        self.0.get(&key).map_err(|e| e.to_string())
+        self.0.get(&key).map_err(Self::map_err)
     }
 
-    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), String> {
+    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), BlobStoreError> {
         let key = Self::disk_key(source_key, id);
-        self.0
-            .put(&key, payload)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.0.put(&key, payload).map(|_| ()).map_err(Self::map_err)
     }
 
-    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String> {
+    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), BlobStoreError> {
         let key = Self::disk_key(source_key, id);
-        self.0.delete(&key).map(|_| ()).map_err(|e| e.to_string())
+        self.0.delete(&key).map(|_| ()).map_err(Self::map_err)
     }
 }
 
@@ -50,7 +58,7 @@ impl TileBlobStore for SqliteBlobStore {
 /// `veldmap-net`'s codec-agnostic [`TileDecodeExecutor`] trait.
 pub(crate) struct RasterDecodeExecutor {
     pub(crate) pool: DecodePoolHandle,
-    pub(crate) done_tx: Sender<(TileKey, DecodedTile)>,
+    pub(crate) done_tx: UploadSender,
     pub(crate) wakeup: Wakeup,
     pub(crate) shutdown: CancelToken,
 }
@@ -67,7 +75,7 @@ impl TileDecodeExecutor for RasterDecodeExecutor {
         let on_decoded = req.on_decoded;
 
         self.pool.submit(DecodeJob {
-            key,
+            key: DecodeJobKey::Tile(key),
             queued_bytes,
             cancel: req.cancel,
             work: Box::new(move || match decode_map_tile_with_mipmaps(&bytes) {

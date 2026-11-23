@@ -1,4 +1,5 @@
 use super::*;
+use crate::io::testing::CountingByteSource;
 
 #[test]
 fn buffered_reader_caches_window_and_counting_source_tracks_spans() {
@@ -61,18 +62,9 @@ fn buffered_reader_caches_window_and_counting_source_tracks_spans() {
     assert_eq!(four, [0, 1, 2, 3]);
     assert_eq!(counting.read_calls(), calls_after_first);
 
-    // Fingerprint formatting produces 64 safe lowercase hex chars.
-    let fp = SourceFingerprint::from_digest([0xAB; 32]);
-    let hex = fp.to_hex();
-    assert_eq!(hex.len(), 64);
-    assert!(
-        hex.bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    );
-    assert!(format!("{fp:?}").contains("abababababab.."));
-
     // Cancelled reads fail promptly (including `std::io::Read::read_exact`,
-    // which must NOT spin on `ErrorKind::Interrupted`).
+    // which must NOT spin on `ErrorKind::Interrupted`), and `set_cancel`
+    // rebinds cleanly for pooled reuse.
     let reader_cancel = CancelToken::new();
     let mut cancel_reader = BufferedByteReader::with_capacity(
         Arc::new(ChunkySource(payload.clone())),
@@ -93,6 +85,11 @@ fn buffered_reader_caches_window_and_counting_source_tracks_spans() {
             .and_then(|e| e.downcast_ref::<IoError>())
             .is_some_and(IoError::is_cancelled)
     );
+    cancel_reader.set_cancel(CancelToken::new());
+    cancel_reader
+        .read_exact(&mut after_cancel)
+        .expect("reader recovers after set_cancel");
+    assert_eq!(after_cancel, payload[4..12]);
 
     // Out-of-window backward seek, SeekFrom::Current/End, and large-read bypass.
     let mut nav_reader = BufferedByteReader::with_capacity(

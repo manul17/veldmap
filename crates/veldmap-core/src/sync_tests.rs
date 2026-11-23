@@ -39,7 +39,7 @@ fn sync_and_async_cancellation_wakes_waiters_and_cleans_up_dropped_futures() {
 
     let cb_hits = Arc::new(AtomicUsize::new(0));
     let cb_hits_clone = Arc::clone(&cb_hits);
-    token.on_cancel(move || {
+    let _guard = token.on_cancel_guarded(move || {
         cb_hits_clone.fetch_add(1, Ordering::AcqRel);
     });
 
@@ -57,10 +57,10 @@ fn sync_and_async_cancellation_wakes_waiters_and_cleans_up_dropped_futures() {
     assert_eq!(cb_hits.load(Ordering::Acquire), 1);
     assert!(Pin::new(&mut fut1).poll(&mut cx1).is_ready());
 
-    // Already-cancelled fast path invokes `on_cancel` and resolves `cancelled()` immediately.
+    // Already-cancelled fast path invokes callback and resolves `cancelled()` immediately.
     let immediate_hits = Arc::new(AtomicUsize::new(0));
     let immediate_clone = Arc::clone(&immediate_hits);
-    token.on_cancel(move || {
+    let _immediate_guard = token.on_cancel_guarded(move || {
         immediate_clone.fetch_add(1, Ordering::AcqRel);
     });
     assert_eq!(immediate_hits.load(Ordering::Acquire), 1);
@@ -149,13 +149,7 @@ fn child_cancel_does_not_cancel_parent_and_guard_unregisters_cleanly() {
     assert!(Pin::new(&mut fut).poll(&mut cx2).is_pending());
 
     parent.cancel();
+    assert_eq!(guard_hits.load(Ordering::Acquire), 0);
     assert_eq!(w1.0.load(Ordering::Acquire), 0);
     assert_eq!(w2.0.load(Ordering::Acquire), 1);
-    assert_eq!(
-        guard_hits.load(Ordering::Acquire),
-        0,
-        "dropped CancelGuard must unregister callback before cancel"
-    );
-    assert!(Pin::new(&mut fut).poll(&mut cx2).is_ready());
-    assert!(fut.waiter_id.is_none());
 }

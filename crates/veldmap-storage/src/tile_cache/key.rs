@@ -1,7 +1,7 @@
 //! Composite tile cache keys, payload encoding tags, and SQLite column
 //! encoders for [`super::TileDiskCache`].
 
-use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme};
+use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme, TileStreamSpec};
 
 use crate::StorageError;
 
@@ -83,8 +83,7 @@ pub struct DiskTileKey {
 }
 
 impl DiskTileKey {
-    /// Construct a display-track (`BandKey::Display`, `Rgba8UnormSrgb`,
-    /// `gutter = 0`, `decode_rev = 0`) disk cache key.
+    /// Construct a display-track (`TileStreamSpec::DISPLAY`) disk cache key.
     pub fn new(
         source_key: impl Into<String>,
         scheme: TileScheme,
@@ -92,13 +91,25 @@ impl DiskTileKey {
         x: u32,
         y: u32,
     ) -> Self {
+        Self::from_stream(source_key, TileStreamSpec::DISPLAY, scheme, level, x, y)
+    }
+
+    /// Construct a disk cache key from a [`TileStreamSpec`] and tile coordinates.
+    pub fn from_stream(
+        source_key: impl Into<String>,
+        spec: TileStreamSpec,
+        scheme: TileScheme,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Self {
         Self {
             source_key: source_key.into(),
-            band: BandKey::Display,
+            band: spec.band,
             scheme,
-            format: PixelFormat::Rgba8UnormSrgb,
-            gutter: 0,
-            decode_rev: 0,
+            format: spec.format,
+            gutter: spec.gutter,
+            decode_rev: spec.decode_rev,
             level,
             x,
             y,
@@ -108,17 +119,14 @@ impl DiskTileKey {
     /// Construct a full multi-band / multi-format disk cache key from a
     /// [`TileKey`] and its stable ASCII `source_key` / fingerprint string.
     pub fn from_tile_key(source_key: impl Into<String>, key: &TileKey) -> Self {
-        Self {
-            source_key: source_key.into(),
-            band: key.band,
-            scheme: key.scheme,
-            format: key.format,
-            gutter: key.gutter,
-            decode_rev: key.decode_rev,
-            level: key.level,
-            x: key.x,
-            y: key.y,
-        }
+        Self::from_stream(
+            source_key,
+            key.stream_spec(),
+            key.scheme,
+            key.level,
+            key.x,
+            key.y,
+        )
     }
 }
 

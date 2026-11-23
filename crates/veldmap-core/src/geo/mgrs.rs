@@ -8,7 +8,7 @@ use super::projection::System;
 
 /// Sentinel-2 granule frame in its UTM zone (`y1` is the northern edge).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Frame {
+pub struct MgrsGranuleFrame {
     pub zone: u32,
     pub south: bool,
     pub x0: f64,
@@ -214,7 +214,7 @@ fn square_origin(
 
 /// Compute the Sentinel-2 109.8 km granule frame in UTM metres for a
 /// 5-character tile code such as `"40WFC"`.
-pub fn frame(tile: &str) -> Result<Frame, MgrsError> {
+pub fn frame(tile: &str) -> Result<MgrsGranuleFrame, MgrsError> {
     let bytes = tile.as_bytes();
     if !tile.is_ascii() || bytes.len() != 5 {
         return Err(MgrsError::InvalidFormat(tile.to_owned()));
@@ -225,7 +225,7 @@ pub fn frame(tile: &str) -> Result<Frame, MgrsError> {
     let origin = square_origin(zone, bytes[2], bytes[3], bytes[4])?;
 
     let y1 = origin.northing + SQUARE_M;
-    Ok(Frame {
+    Ok(MgrsGranuleFrame {
         zone: origin.zone,
         south: origin.south,
         x0: origin.easting,
