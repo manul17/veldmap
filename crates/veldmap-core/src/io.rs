@@ -13,6 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
+#[path = "byte_source.rs"]
+pub mod byte_source;
+
+pub use byte_source::{
+    BufferedByteReader, ByteReadSpan, ByteSource, CountingByteSource, DEFAULT_READER_BUFFER_BYTES,
+    IoError, MemoryByteSource, ReadStats, SourceFingerprint,
+};
+
 type CancelCallback = Box<dyn FnOnce() + Send + 'static>;
 
 #[derive(Default)]

@@ -8,6 +8,7 @@ pub mod decoded;
 pub mod geometry;
 pub mod key;
 pub mod quadtree;
+pub mod scheduler;
 
 pub use cache::TileCache;
 pub use decoded::{
@@ -24,4 +25,7 @@ pub use key::{
 pub use quadtree::{
     DEFAULT_GRID_CELLS, DEFAULT_POLAR_MAX_TEX_LEVEL, DEFAULT_TILE_PX, QuadtreeConfig, VisibleTile,
     describe_tile, traverse,
+};
+pub use scheduler::{
+    LevelPlan, PassBusy, PyramidMeta, ServeMode, TileFailureOutcome, TileScheduler,
 };

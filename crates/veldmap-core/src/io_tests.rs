@@ -159,3 +159,84 @@ fn child_cancel_does_not_cancel_parent_and_guard_unregisters_cleanly() {
     assert!(Pin::new(&mut fut).poll(&mut cx2).is_ready());
     assert!(fut.waiter_id.is_none());
 }
+
+#[test]
+fn buffered_reader_caches_window_and_counting_source_tracks_spans() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    struct ChunkySource(Vec<u8>);
+    impl ByteSource for ChunkySource {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(
+            &self,
+            offset: u64,
+            buf: &mut [u8],
+            cancel: &CancelToken,
+        ) -> Result<usize, IoError> {
+            if cancel.is_cancelled() {
+                return Err(IoError::Cancelled);
+            }
+            if offset >= self.0.len() as u64 || buf.is_empty() {
+                return Ok(0);
+            }
+            // Simulate short reads (at most 5 bytes per call).
+            let start = offset as usize;
+            let n = (self.0.len() - start).min(buf.len()).min(5);
+            buf[..n].copy_from_slice(&self.0[start..start + n]);
+            Ok(n)
+        }
+    }
+
+    let payload: Vec<u8> = (0..128u8).collect();
+    let base: Arc<dyn ByteSource> = Arc::new(ChunkySource(payload.clone()));
+    let counting = Arc::new(CountingByteSource::new(base));
+    let cancel = CancelToken::new();
+
+    // `read_exact_at` loops across short reads cleanly.
+    let mut exact = [0u8; 17];
+    counting
+        .read_exact_at(10, &mut exact, &cancel)
+        .expect("read_exact_at succeeds across short reads");
+    assert_eq!(&exact, &payload[10..27]);
+    assert!(counting.read_calls() >= 4);
+
+    // `BufferedByteReader` satisfies small sequential & backward reads from its window.
+    counting.reset();
+    let mut reader = BufferedByteReader::with_capacity(
+        Arc::clone(&counting) as Arc<dyn ByteSource>,
+        cancel.clone(),
+        64,
+    );
+    let mut two = [0u8; 2];
+    reader.read_exact(&mut two).expect("read first two");
+    assert_eq!(two, [0, 1]);
+    let calls_after_first = counting.read_calls();
+    reader
+        .seek(SeekFrom::Start(0))
+        .expect("seek back inside window");
+    let mut four = [0u8; 4];
+    reader.read_exact(&mut four).expect("read inside window");
+    assert_eq!(four, [0, 1, 2, 3]);
+    assert_eq!(counting.read_calls(), calls_after_first);
+
+    // Fingerprint formatting produces 64 safe lowercase hex chars and non-zero SourceId.
+    let fp = SourceFingerprint::from_digest([0xAB; 32]);
+    let hex = fp.to_hex();
+    assert_eq!(hex.len(), 64);
+    assert!(
+        hex.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+    assert_ne!(fp.to_source_id(), crate::tile::SourceId::BUNDLED_BASEMAP);
+    assert!(format!("{fp:?}").contains("abababababab.."));
+
+    // Cancelled reads fail promptly.
+    cancel.cancel();
+    assert!(
+        counting
+            .read_at(0, &mut two, &cancel)
+            .is_err_and(|e| e.is_cancelled())
+    );
+}

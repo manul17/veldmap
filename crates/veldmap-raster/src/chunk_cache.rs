@@ -1,0 +1,529 @@
+//! Bounded LRU decoded-chunk cache with panic- and cancel-safe singleflight
+//! deduplication across concurrent tile decode workers.
+
+use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Condvar, Mutex};
+
+use veldmap_core::io::{CancelToken, lock_unpoisoned};
+use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileCache};
+
+use crate::RasterError;
+
+/// Composite key identifying one decoded source chunk (TIFF tile/strip)
+/// partitioned by `(source, band, format, gutter, decode_rev, image, chunk_index)`
+/// so incompatible bands, formats, or revisions never alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChunkKey {
+    pub source: SourceId,
+    pub band: BandKey,
+    pub format: PixelFormat,
+    pub gutter: u8,
+    pub decode_rev: u32,
+    pub image: usize,
+    pub chunk_index: u32,
+}
+
+/// Decoded RGBA8 chunk payload with its valid dimensions `(width, height)`.
+#[derive(Clone, Debug)]
+pub struct DecodedChunk {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DecodedChunk {
+    /// Byte size accounted against [`SharedChunkCache`].
+    pub fn byte_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ChunkFailure {
+    Cancelled,
+    Budget(veldmap_core::budget::BudgetError),
+    LimitExceeded {
+        width: u32,
+        height: u32,
+        estimated_bytes: u64,
+        limit_bytes: u64,
+    },
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+    },
+    InvalidFormat(String),
+    Tiff(String),
+}
+
+impl ChunkFailure {
+    fn from_raster_error(err: &RasterError) -> Self {
+        match err {
+            RasterError::Cancelled => Self::Cancelled,
+            RasterError::Budget(b) => Self::Budget(b.clone()),
+            RasterError::LimitExceeded {
+                width,
+                height,
+                estimated_bytes,
+                limit_bytes,
+            } => Self::LimitExceeded {
+                width: *width,
+                height: *height,
+                estimated_bytes: *estimated_bytes,
+                limit_bytes: *limit_bytes,
+            },
+            RasterError::InvalidDimensions { width, height } => Self::InvalidDimensions {
+                width: *width,
+                height: *height,
+            },
+            RasterError::InvalidFormat(msg) => Self::InvalidFormat(msg.clone()),
+            RasterError::Io(io_err) if io_err.is_cancelled() => Self::Cancelled,
+            other => Self::Tiff(other.to_string()),
+        }
+    }
+
+    fn into_raster_error(self) -> RasterError {
+        match self {
+            Self::Cancelled => RasterError::Cancelled,
+            Self::Budget(b) => RasterError::Budget(b),
+            Self::LimitExceeded {
+                width,
+                height,
+                estimated_bytes,
+                limit_bytes,
+            } => RasterError::LimitExceeded {
+                width,
+                height,
+                estimated_bytes,
+                limit_bytes,
+            },
+            Self::InvalidDimensions { width, height } => {
+                RasterError::InvalidDimensions { width, height }
+            }
+            Self::InvalidFormat(msg) => RasterError::InvalidFormat(msg),
+            Self::Tiff(msg) => RasterError::Tiff(msg),
+        }
+    }
+}
+
+enum SlotState {
+    Pending,
+    Ready(Arc<DecodedChunk>),
+    Failed(ChunkFailure),
+}
+
+struct SingleflightSlot {
+    state: Mutex<SlotState>,
+    cvar: Condvar,
+}
+
+impl SingleflightSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SlotState::Pending),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn complete_ok(&self, chunk: Arc<DecodedChunk>) {
+        let mut guard = lock_unpoisoned(&self.state);
+        *guard = SlotState::Ready(chunk);
+        self.cvar.notify_all();
+    }
+
+    fn complete_err(&self, failure: ChunkFailure) {
+        let mut guard = lock_unpoisoned(&self.state);
+        if matches!(*guard, SlotState::Pending) {
+            *guard = SlotState::Failed(failure);
+            self.cvar.notify_all();
+        }
+    }
+}
+
+struct LeaderGuard<'a> {
+    state: &'a Mutex<CacheState>,
+    key: ChunkKey,
+    slot: Arc<SingleflightSlot>,
+    completed: bool,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // Remove the in-flight slot only if it still points to this leader's
+        // `SingleflightSlot`, then wake any waiting followers cleanly.
+        {
+            let mut guard = lock_unpoisoned(self.state);
+            if let Some(current) = guard.in_flight.get(&self.key)
+                && Arc::ptr_eq(current, &self.slot)
+            {
+                guard.in_flight.remove(&self.key);
+            }
+        }
+        self.slot.complete_err(ChunkFailure::InvalidFormat(
+            "chunk decode leader panicked or exited prematurely".to_string(),
+        ));
+    }
+}
+
+struct CacheState {
+    lru: TileCache<ChunkKey, Arc<DecodedChunk>>,
+    in_flight: HashMap<ChunkKey, Arc<SingleflightSlot>>,
+    hits: u64,
+    misses: u64,
+    dedup_waits: u64,
+}
+
+/// Thread-safe bounded LRU decoded-chunk cache with panic/cancel-safe
+/// singleflight deduplication.
+pub struct SharedChunkCache {
+    state: Mutex<CacheState>,
+}
+
+impl SharedChunkCache {
+    /// Construct a new decoded-chunk cache bounded by `max_bytes`.
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            state: Mutex::new(CacheState {
+                lru: TileCache::new(max_bytes),
+                in_flight: HashMap::new(),
+                hits: 0,
+                misses: 0,
+                dedup_waits: 0,
+            }),
+        }
+    }
+
+    /// Configured maximum byte budget.
+    pub fn max_bytes(&self) -> usize {
+        lock_unpoisoned(&self.state).lru.max_bytes()
+    }
+
+    /// Currently cached bytes across all stored chunks.
+    pub fn total_bytes(&self) -> usize {
+        lock_unpoisoned(&self.state).lru.total_bytes()
+    }
+
+    /// Cache statistics `(hits, misses, dedup_waits)`.
+    pub fn stats(&self) -> (u64, u64, u64) {
+        let guard = lock_unpoisoned(&self.state);
+        (guard.hits, guard.misses, guard.dedup_waits)
+    }
+
+    /// Remove all cached chunks belonging to `source`.
+    pub fn invalidate_source(&self, source: SourceId) {
+        let removed = lock_unpoisoned(&self.state)
+            .lru
+            .remove_where(|k| k.source == source);
+        drop(removed);
+    }
+
+    /// Look up `key` in the cache, join an active singleflight decode if one is
+    /// already running, or run `decode` once as the leader and publish to all
+    /// waiters.
+    pub fn get_or_decode(
+        &self,
+        key: ChunkKey,
+        cancel: &CancelToken,
+        decode: impl FnOnce() -> Result<DecodedChunk, RasterError>,
+    ) -> Result<Arc<DecodedChunk>, RasterError> {
+        if cancel.is_cancelled() {
+            return Err(RasterError::Cancelled);
+        }
+
+        enum Role {
+            Hit(Arc<DecodedChunk>),
+            Leader(Arc<SingleflightSlot>),
+            Follower(Arc<SingleflightSlot>),
+        }
+
+        let role = {
+            let mut guard = lock_unpoisoned(&self.state);
+            if let Some(chunk) = guard.lru.get(&key).map(Arc::clone) {
+                guard.hits += 1;
+                Role::Hit(chunk)
+            } else if let Some(slot) = guard.in_flight.get(&key).map(Arc::clone) {
+                guard.dedup_waits += 1;
+                Role::Follower(slot)
+            } else {
+                guard.misses += 1;
+                let slot = Arc::new(SingleflightSlot::new());
+                guard.in_flight.insert(key, Arc::clone(&slot));
+                Role::Leader(slot)
+            }
+        };
+
+        match role {
+            Role::Hit(chunk) => Ok(chunk),
+            Role::Follower(slot) => wait_for_slot(&slot, cancel),
+            Role::Leader(slot) => {
+                let mut guard = LeaderGuard {
+                    state: &self.state,
+                    key,
+                    slot: Arc::clone(&slot),
+                    completed: false,
+                };
+
+                let outcome = catch_unwind(AssertUnwindSafe(decode));
+                match outcome {
+                    Ok(Ok(chunk)) => {
+                        let byte_size = chunk.byte_size();
+                        let arc = Arc::new(chunk);
+                        let evicted = {
+                            let mut st = lock_unpoisoned(&self.state);
+                            if let Some(cur) = st.in_flight.get(&key)
+                                && Arc::ptr_eq(cur, &slot)
+                            {
+                                st.in_flight.remove(&key);
+                            }
+                            st.lru.insert(key, Arc::clone(&arc), byte_size).ok()
+                        };
+                        drop(evicted);
+                        slot.complete_ok(Arc::clone(&arc));
+                        guard.completed = true;
+                        Ok(arc)
+                    }
+                    Ok(Err(err)) => {
+                        let failure = ChunkFailure::from_raster_error(&err);
+                        {
+                            let mut st = lock_unpoisoned(&self.state);
+                            if let Some(cur) = st.in_flight.get(&key)
+                                && Arc::ptr_eq(cur, &slot)
+                            {
+                                st.in_flight.remove(&key);
+                            }
+                        }
+                        slot.complete_err(failure);
+                        guard.completed = true;
+                        Err(err)
+                    }
+                    Err(_) => {
+                        // Drop `guard` cleanly: removes `in_flight` and notifies waiters.
+                        drop(guard);
+                        Err(RasterError::InvalidFormat(
+                            "chunk decoder panicked".to_string(),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn wait_for_slot(
+    slot: &Arc<SingleflightSlot>,
+    cancel: &CancelToken,
+) -> Result<Arc<DecodedChunk>, RasterError> {
+    if cancel.is_cancelled() {
+        return Err(RasterError::Cancelled);
+    }
+    let wake_slot = Arc::clone(slot);
+    let _cancel_guard = cancel.on_cancel_guarded(move || {
+        let _lock = lock_unpoisoned(&wake_slot.state);
+        wake_slot.cvar.notify_all();
+    });
+
+    let mut state = lock_unpoisoned(&slot.state);
+    loop {
+        match &*state {
+            SlotState::Ready(chunk) => return Ok(Arc::clone(chunk)),
+            SlotState::Failed(failure) => {
+                if cancel.is_cancelled() {
+                    return Err(RasterError::Cancelled);
+                }
+                return Err(failure.clone().into_raster_error());
+            }
+            SlotState::Pending => {
+                if cancel.is_cancelled() {
+                    return Err(RasterError::Cancelled);
+                }
+                state = match slot.cvar.wait(state) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn test_key(idx: u32) -> ChunkKey {
+        ChunkKey {
+            source: SourceId::new(9),
+            band: BandKey::Display,
+            format: PixelFormat::Rgba8UnormSrgb,
+            gutter: 0,
+            decode_rev: 1,
+            image: 0,
+            chunk_index: idx,
+        }
+    }
+
+    #[test]
+    fn singleflight_deduplicates_concurrent_callers_and_recovers_from_leader_panic() {
+        let cache = Arc::new(SharedChunkCache::new(1024 * 1024));
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let cancel = CancelToken::new();
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let calls = Arc::clone(&decode_calls);
+                let cancel = cancel.clone();
+                thread::spawn(move || {
+                    cache.get_or_decode(test_key(0), &cancel, || {
+                        calls.fetch_add(1, Ordering::AcqRel);
+                        thread::sleep(Duration::from_millis(25));
+                        Ok(DecodedChunk {
+                            data: vec![42u8; 64],
+                            width: 4,
+                            height: 4,
+                        })
+                    })
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let chunk = h.join().unwrap().expect("shared chunk");
+            assert_eq!(chunk.data.len(), 64);
+        }
+        assert_eq!(decode_calls.load(Ordering::Acquire), 1);
+
+        // Leader panic must unblock all followers with Err rather than deadlocking,
+        // and clean up `in_flight` so a subsequent retry can succeed.
+        let panicking_cache = Arc::clone(&cache);
+        let cancel_p = CancelToken::new();
+        let leader = {
+            let cache = Arc::clone(&panicking_cache);
+            let c = cancel_p.clone();
+            thread::spawn(move || {
+                cache.get_or_decode(test_key(1), &c, || -> Result<DecodedChunk, RasterError> {
+                    thread::sleep(Duration::from_millis(20));
+                    panic!("simulated decoder panic");
+                })
+            })
+        };
+        let follower = {
+            let cache = Arc::clone(&panicking_cache);
+            let c = cancel_p.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(5));
+                cache.get_or_decode(test_key(1), &c, || {
+                    unreachable!("follower should not decode")
+                })
+            })
+        };
+        assert!(leader.join().unwrap().is_err());
+        assert!(follower.join().unwrap().is_err());
+
+        // Subsequent call on key(1) retries cleanly.
+        let recovered = cache
+            .get_or_decode(test_key(1), &CancelToken::new(), || {
+                Ok(DecodedChunk {
+                    data: vec![7u8; 16],
+                    width: 2,
+                    height: 2,
+                })
+            })
+            .expect("retry after panic succeeds");
+        assert_eq!(recovered.data[0], 7);
+    }
+
+    #[test]
+    fn follower_cancellation_returns_promptly_without_stalling() {
+        let cache = Arc::new(SharedChunkCache::new(1024 * 1024));
+        let leader_started = Arc::new(AtomicUsize::new(0));
+        let leader_done = CancelToken::new();
+
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let started = Arc::clone(&leader_started);
+            let done = leader_done.clone();
+            thread::spawn(move || {
+                cache.get_or_decode(test_key(2), &CancelToken::new(), || {
+                    started.store(1, Ordering::Release);
+                    while !done.is_cancelled() {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(DecodedChunk {
+                        data: vec![9u8; 16],
+                        width: 2,
+                        height: 2,
+                    })
+                })
+            })
+        };
+
+        while leader_started.load(Ordering::Acquire) == 0 {
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let follower_cancel = CancelToken::new();
+        let fc_clone = follower_cancel.clone();
+        let follower = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                cache.get_or_decode(test_key(2), &fc_clone, || {
+                    unreachable!("follower must join leader")
+                })
+            })
+        };
+        thread::sleep(Duration::from_millis(15));
+        follower_cancel.cancel();
+        let follower_res = follower.join().unwrap();
+        assert!(matches!(follower_res, Err(RasterError::Cancelled)));
+
+        leader_done.cancel();
+        assert!(leader.join().unwrap().is_ok());
+
+        // Leader cancellation must propagate as RasterError::Cancelled to an uncancelled follower.
+        let leader2_started = Arc::new(AtomicUsize::new(0));
+        let leader2_cancel = CancelToken::new();
+        let leader2 = {
+            let cache = Arc::clone(&cache);
+            let started = Arc::clone(&leader2_started);
+            let c = leader2_cancel.clone();
+            thread::spawn(move || {
+                cache.get_or_decode(test_key(3), &c, || {
+                    started.store(1, Ordering::Release);
+                    while !c.is_cancelled() {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(RasterError::Cancelled)
+                })
+            })
+        };
+        while leader2_started.load(Ordering::Acquire) == 0 {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let follower2 = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                cache.get_or_decode(test_key(3), &CancelToken::new(), || {
+                    unreachable!("follower must join leader")
+                })
+            })
+        };
+        thread::sleep(Duration::from_millis(10));
+        leader2_cancel.cancel();
+        assert!(matches!(
+            leader2.join().unwrap(),
+            Err(RasterError::Cancelled)
+        ));
+        assert!(matches!(
+            follower2.join().unwrap(),
+            Err(RasterError::Cancelled)
+        ));
+    }
+}

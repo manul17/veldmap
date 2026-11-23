@@ -8,12 +8,18 @@
 use thiserror::Error;
 
 mod atomic;
+mod file_source;
+mod fingerprint;
 mod paths;
 mod tile_cache;
 
 pub use atomic::{
     read_json_or_default, read_json_or_default_with_backup, write_atomic_durable,
     write_atomic_durable_private, write_json_durable, write_json_durable_private,
+};
+pub use file_source::LocalFileSource;
+pub use fingerprint::{
+    FINGERPRINT_SAMPLE_BYTES, LocalFingerprintCache, fingerprint_byte_source, sample_ranges,
 };
 pub use paths::StoragePaths;
 pub use tile_cache::{

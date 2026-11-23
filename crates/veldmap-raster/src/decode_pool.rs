@@ -7,6 +7,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
+use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{CancelGuard, CancelToken, lock_unpoisoned};
 use veldmap_core::tile::TileKey;
 
@@ -334,6 +335,124 @@ impl DecodePool {
 impl Drop for DecodePool {
     fn drop(&mut self) {
         self.shutdown_inner();
+    }
+}
+
+/// Execution lane for [`TwoLaneDecodePool`], isolating small pointwise tiled
+/// reads from slow sequential passes and full-image decodes so neither starves
+/// or head-of-line blocks the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DecodeLane {
+    /// Pointwise COG/basemap tile decodes (fast, small bounded chunks).
+    Fast,
+    /// Sequential raster passes and full-image decodes (bulk, long-running).
+    Bulk,
+}
+
+/// Configuration for [`TwoLaneDecodePool::spawn`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TwoLaneDecodePoolConfig {
+    pub fast_workers: usize,
+    pub bulk_workers: usize,
+    pub max_pending_fast_jobs: usize,
+    pub max_pending_fast_bytes: usize,
+    pub max_pending_bulk_jobs: usize,
+    pub max_pending_bulk_bytes: usize,
+}
+
+impl Default for TwoLaneDecodePoolConfig {
+    fn default() -> Self {
+        Self {
+            fast_workers: 3,
+            bulk_workers: 2,
+            max_pending_fast_jobs: DEFAULT_MAX_PENDING_DECODE_JOBS,
+            max_pending_fast_bytes: DEFAULT_MAX_PENDING_DECODE_BYTES,
+            max_pending_bulk_jobs: 64,
+            max_pending_bulk_bytes: DEFAULT_MAX_PENDING_DECODE_BYTES,
+        }
+    }
+}
+
+impl TwoLaneDecodePoolConfig {
+    /// Derive lane pending byte caps from startup [`MemoryBudget`].
+    pub fn from_budget(budget: &MemoryBudget) -> Self {
+        Self {
+            max_pending_fast_bytes: budget.fast_lane_pending_bytes,
+            max_pending_bulk_bytes: budget.bulk_lane_pending_bytes,
+            ..Self::default()
+        }
+    }
+}
+
+/// Cloneable producer handle for submitting work to either [`DecodeLane`] of a
+/// [`TwoLaneDecodePool`].
+#[derive(Clone)]
+pub struct TwoLaneDecodePoolHandle {
+    fast: DecodePoolHandle,
+    bulk: DecodePoolHandle,
+}
+
+impl TwoLaneDecodePoolHandle {
+    /// Submit `job` onto `lane`.
+    pub fn submit(&self, lane: DecodeLane, job: DecodeJob) -> bool {
+        match lane {
+            DecodeLane::Fast => self.fast.submit(job),
+            DecodeLane::Bulk => self.bulk.submit(job),
+        }
+    }
+
+    /// Borrow the fast/pointwise lane handle directly.
+    pub fn fast(&self) -> &DecodePoolHandle {
+        &self.fast
+    }
+
+    /// Borrow the bulk/pass/full-image lane handle directly.
+    pub fn bulk(&self) -> &DecodePoolHandle {
+        &self.bulk
+    }
+}
+
+/// Owned two-lane bounded CPU decode pool preventing bulk passes and
+/// full-image decodes from head-of-line blocking fast pointwise tile reads.
+pub struct TwoLaneDecodePool {
+    fast: DecodePool,
+    bulk: DecodePool,
+}
+
+impl TwoLaneDecodePool {
+    /// Spawn independent fast and bulk decode lanes governed by `shutdown`.
+    pub fn spawn(config: TwoLaneDecodePoolConfig, shutdown: CancelToken) -> Self {
+        let fast = DecodePool::spawn(
+            DecodePoolConfig {
+                worker_count: config.fast_workers.clamp(1, 8),
+                max_pending_jobs: config.max_pending_fast_jobs,
+                max_pending_bytes: config.max_pending_fast_bytes,
+            },
+            shutdown.clone(),
+        );
+        let bulk = DecodePool::spawn(
+            DecodePoolConfig {
+                worker_count: config.bulk_workers.clamp(1, 4),
+                max_pending_jobs: config.max_pending_bulk_jobs,
+                max_pending_bytes: config.max_pending_bulk_bytes,
+            },
+            shutdown,
+        );
+        Self { fast, bulk }
+    }
+
+    /// Return a cloneable handle targeting both lanes.
+    pub fn handle(&self) -> TwoLaneDecodePoolHandle {
+        TwoLaneDecodePoolHandle {
+            fast: self.fast.handle(),
+            bulk: self.bulk.handle(),
+        }
+    }
+
+    /// Close both queues and deterministically join all worker threads.
+    pub fn shutdown(self) {
+        self.fast.shutdown();
+        self.bulk.shutdown();
     }
 }
 
