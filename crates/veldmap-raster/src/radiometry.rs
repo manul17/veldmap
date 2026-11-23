@@ -43,15 +43,6 @@ impl Samples<'_> {
             Self::F32(v) => v[i],
         }
     }
-
-    fn alpha(&self, i: usize) -> u8 {
-        match self {
-            Self::U8(v) => v[i],
-            Self::U16(v) => (v[i] >> 8) as u8,
-            Self::I16(v) => v[i].clamp(0, 255) as u8,
-            Self::F32(v) => (v[i] * 255.0).round().clamp(0.0, 255.0) as u8,
-        }
-    }
 }
 
 /// Pixel channel interpretation for display mapping.
@@ -116,7 +107,7 @@ pub fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
 /// File-wide display mapping (`[lo, hi] -> [0, 255]` + optional raw `nodata`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplayMapping {
-    stretch: Option<(f32, f32)>,
+    stretch: Option<(f64, f64)>,
     nodata: Option<f32>,
 }
 
@@ -130,7 +121,7 @@ impl DisplayMapping {
     }
 
     /// Linear `[lo, hi] -> [0, 255]` display stretch with optional raw `nodata`.
-    pub fn stretched(lo: f32, hi: f32, nodata: Option<f32>) -> Self {
+    pub fn stretched(lo: f64, hi: f64, nodata: Option<f32>) -> Self {
         Self {
             stretch: Some((lo, hi)),
             nodata,
@@ -144,7 +135,12 @@ impl DisplayMapping {
         }
 
         let (lo, hi) = self.stretch.unwrap_or((0.0, 255.0));
-        let scale = if hi > lo { 255.0 / (hi - lo) } else { 0.0 };
+        let span = hi - lo;
+        let scale = if span > 0.0 && span.is_finite() {
+            255.0 / span
+        } else {
+            0.0
+        };
         let PixelLayout {
             channels,
             colors,
@@ -152,45 +148,68 @@ impl DisplayMapping {
         } = pixel;
 
         let count = pixels.min(samples.len() / channels);
-        let mut rgba = Vec::with_capacity(count * 4);
-        for px in 0..count {
-            let at = px * channels;
-            let mut void = true;
-            let mut broken = false;
-            let mut bytes = [0u8; 3];
-            for (c, byte) in bytes.iter_mut().enumerate().take(colors) {
-                let v = samples.get(at + c);
-                broken |= !v.is_finite();
-                void &= !is_data(v, self.nodata);
-                *byte = ((v - lo) * scale).round().clamp(0.0, 255.0) as u8;
-            }
-            if void || broken {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-                continue;
-            }
-            if colors == 1 {
-                (bytes[1], bytes[2]) = (bytes[0], bytes[0]);
-            }
-            rgba.extend_from_slice(&bytes);
-            rgba.push(if has_alpha {
-                samples.alpha(at + channels - 1)
-            } else {
-                255
-            });
+        let mut rgba = vec![0u8; count * 4];
+        let nodata = self.nodata;
+
+        macro_rules! map_slice {
+            ($slice:expr, |$raw:ident| $to_f32:expr, |$a_raw:ident| $to_alpha:expr) => {
+                for (px, dst) in rgba.chunks_exact_mut(4).enumerate() {
+                    let at = px * channels;
+                    let mut void = true;
+                    let mut broken = false;
+                    let mut bytes = [0u8; 3];
+                    for (c, byte) in bytes.iter_mut().enumerate().take(colors) {
+                        let $raw = $slice[at + c];
+                        let v: f32 = $to_f32;
+                        broken |= !v.is_finite();
+                        void &= !is_data(v, nodata);
+                        *byte = ((f64::from(v) - lo) * scale).round().clamp(0.0, 255.0) as u8;
+                    }
+                    let alpha = if has_alpha {
+                        let $a_raw = $slice[at + channels - 1];
+                        match $to_alpha {
+                            Some(a) => a,
+                            None => {
+                                broken = true;
+                                0
+                            }
+                        }
+                    } else {
+                        255
+                    };
+                    if void || broken {
+                        continue;
+                    }
+                    if colors == 1 {
+                        (bytes[1], bytes[2]) = (bytes[0], bytes[0]);
+                    }
+                    dst[..3].copy_from_slice(&bytes);
+                    dst[3] = alpha;
+                }
+            };
+        }
+
+        match samples {
+            Samples::U8(s) => map_slice!(s, |x| f32::from(x), |a| Some(a)),
+            Samples::U16(s) => map_slice!(s, |x| f32::from(x), |a| Some((a >> 8) as u8)),
+            Samples::I16(s) => map_slice!(s, |x| f32::from(x), |a| Some((a.max(0) >> 7) as u8)),
+            Samples::F32(s) => map_slice!(s, |x| x, |a| a
+                .is_finite()
+                .then(|| (a * 255.0).round().clamp(0.0, 255.0) as u8)),
         }
         rgba
     }
 }
 
-/// Compute `[2%, 98%]` percentile display bounds from `values` (`None` if empty).
-/// Expands flat constant fields symmetrically around the constant value so flat
-/// valid data renders mid-gray rather than transparent/black.
-pub fn percentile_stretch(values: &mut [f32]) -> Option<(f32, f32)> {
+/// Compute `[2%, 98%]` percentile display bounds in `f64` from `values`
+/// (`None` if empty). Expands flat constant fields symmetrically around the
+/// constant value so flat valid data renders mid-gray rather than black.
+pub fn percentile_stretch(values: &mut [f32]) -> Option<(f64, f64)> {
     if values.is_empty() {
         return None;
     }
     values.sort_unstable_by(f32::total_cmp);
-    let at = |q: f64| values[((values.len() - 1) as f64 * q).round() as usize];
+    let at = |q: f64| f64::from(values[((values.len() - 1) as f64 * q).round() as usize]);
     let (lo, hi) = (at(0.02), at(0.98));
     if hi > lo {
         return Some((lo, hi));
@@ -218,8 +237,8 @@ mod tests {
         assert_eq!(&out[..4], &[0, 0, 0, 0]);
         assert_eq!(&out[4..], &[0, 0, 1, 255]);
 
-        // Flat field lands mid-scale rather than black.
-        for val in [0.0f32, 42.0, -273.15, 1.0e7] {
+        // Flat field lands mid-scale rather than black (including f32::MAX).
+        for val in [0.0f32, 42.0, -273.15, 1.0e7, f32::MAX] {
             let mut vals = vec![val; 10];
             let (lo, hi) = percentile_stretch(&mut vals).expect("non-empty");
             assert!(hi > lo);
@@ -232,5 +251,22 @@ mod tests {
             assert_eq!(px[3], 255);
         }
         assert_eq!(percentile_stretch(&mut []), None);
+
+        // Large finite f32 ranges must not overflow `hi - lo` to infinity, and non-finite alpha clears pixel.
+        let wide = DisplayMapping::stretched(-2.0e38, 2.0e38, None);
+        let out_wide = wide.rgba(&Samples::F32(&[0.0]), PixelLayout::named(1), 1);
+        assert!((120..=135).contains(&out_wide[0]));
+        let inf_alpha = DisplayMapping::stretched(0.0, 1.0, None).rgba(
+            &Samples::F32(&[0.5, f32::INFINITY]),
+            PixelLayout::named(2),
+            1,
+        );
+        assert_eq!(inf_alpha, vec![0, 0, 0, 0]);
+        let nan_alpha = DisplayMapping::stretched(0.0, 1.0, None).rgba(
+            &Samples::F32(&[0.5, f32::NAN]),
+            PixelLayout::named(2),
+            1,
+        );
+        assert_eq!(nan_alpha, vec![0, 0, 0, 0]);
     }
 }

@@ -132,23 +132,44 @@ impl LocalFingerprintCache {
             other => StorageError::Io(other.into_std_io()),
         })?;
 
+        // Re-stat after hashing so concurrent in-place edits or replacements
+        // during the read never cache a torn `(mtime_ns, fingerprint)` pair.
+        let post_stable = std::fs::metadata(&key).ok().is_some_and(|post| {
+            source.mtime_ns().is_some()
+                && post.len() == source.len()
+                && metadata_mtime_ns(&post) == source.mtime_ns()
+        });
+
         let mut guard = lock_unpoisoned(&self.entries);
-        guard.insert(
-            key,
-            CachedStat {
-                len: source.len(),
-                mtime_ns: source.mtime_ns(),
-                fingerprint,
-            },
-        );
+        if post_stable {
+            guard.insert(
+                key,
+                CachedStat {
+                    len: source.len(),
+                    mtime_ns: source.mtime_ns(),
+                    fingerprint,
+                },
+            );
+        } else {
+            guard.remove(&key);
+        }
         Ok(fingerprint)
     }
 
     /// Invalidate any cached entry for `path`.
     pub fn invalidate(&self, path: &Path) {
-        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical = std::fs::canonicalize(path).ok().or_else(|| {
+            let name = path.file_name()?;
+            let parent = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            std::fs::canonicalize(parent).ok().map(|p| p.join(name))
+        });
         let mut guard = lock_unpoisoned(&self.entries);
-        guard.remove(&key);
+        if let Some(key) = canonical {
+            guard.remove(&key);
+        }
         guard.remove(path);
     }
 
@@ -233,5 +254,11 @@ mod tests {
             .get_or_compute_with_bypass(&path, true, &cancel)
             .expect("recomputed");
         assert_ne!(recomputed, fp2);
+
+        // Deleting the file before `invalidate` still removes the canonicalized cache entry.
+        std::fs::remove_file(&path).expect("remove");
+        cache.invalidate(&path);
+        assert!(lock_unpoisoned(&cache.entries).is_empty());
+        cache.clear();
     }
 }

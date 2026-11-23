@@ -5,6 +5,7 @@
 //! Avoids lock-reentrant cross-cache shrinking by assigning independent fixed
 //! startup caps to each cache and decoding lane.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
 use thiserror::Error;
@@ -192,6 +193,28 @@ impl DecodePeak {
 struct TrackerState {
     active_bytes: u64,
     peak_bytes: u64,
+    next_ticket: u64,
+    waiters: VecDeque<u64>,
+}
+
+struct WaiterGuard<'a> {
+    inner: &'a TrackerInner,
+    ticket: Option<u64>,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        let mut state = lock_unpoisoned(&self.inner.state);
+        if let Some(pos) = state.waiters.iter().position(|&t| t == ticket) {
+            state.waiters.remove(pos);
+            if !state.waiters.is_empty() {
+                self.inner.cvar.notify_all();
+            }
+        }
+    }
 }
 
 struct TrackerInner {
@@ -237,7 +260,7 @@ impl DecodeBudgetTracker {
     /// Attempt to reserve `bytes` immediately without blocking.
     ///
     /// Returns `Err(BudgetError::ExceedsCap)` when `bytes > cap_bytes()`,
-    /// `Ok(None)` when sufficient budget is currently occupied by in-flight work,
+    /// `Ok(None)` when sufficient budget is occupied or queued ahead,
     /// or `Ok(Some(lease))` on success.
     pub fn try_reserve(&self, bytes: u64) -> Result<Option<BudgetLease>, BudgetError> {
         if bytes > self.inner.cap_bytes {
@@ -248,7 +271,9 @@ impl DecodeBudgetTracker {
             });
         }
         let mut state = lock_unpoisoned(&self.inner.state);
-        if state.active_bytes.saturating_add(bytes) > self.inner.cap_bytes {
+        if !state.waiters.is_empty()
+            || bytes > self.inner.cap_bytes.saturating_sub(state.active_bytes)
+        {
             return Ok(None);
         }
         state.active_bytes += bytes;
@@ -259,9 +284,9 @@ impl DecodeBudgetTracker {
         }))
     }
 
-    /// Block until `bytes` can be reserved within `cap_bytes()` or `cancel`
-    /// triggers. Returns `Err(BudgetError::ExceedsCap)` immediately if
-    /// `bytes > cap_bytes()`.
+    /// Block in FIFO waiter order until `bytes` can be reserved within
+    /// `cap_bytes()` or `cancel` triggers. Returns `Err(BudgetError::ExceedsCap)`
+    /// immediately if `bytes > cap_bytes()`.
     pub fn reserve_blocking(
         &self,
         bytes: u64,
@@ -277,21 +302,46 @@ impl DecodeBudgetTracker {
         if cancel.is_cancelled() {
             return Err(BudgetError::Cancelled);
         }
+        if let Some(lease) = self.try_reserve(bytes)? {
+            return Ok(lease);
+        }
 
         let wake_inner = Arc::clone(&self.inner);
-        let _guard = cancel.on_cancel_guarded(move || {
+        let _cancel_guard = cancel.on_cancel_guarded(move || {
             let _lock = lock_unpoisoned(&wake_inner.state);
             wake_inner.cvar.notify_all();
         });
 
+        // Declared BEFORE `state` so on cancel/panic `state` drops first and
+        // `WaiterGuard::drop` never re-locks `self.inner.state` while held.
+        let mut waiter_guard = WaiterGuard {
+            inner: &self.inner,
+            ticket: None,
+        };
+
         let mut state = lock_unpoisoned(&self.inner.state);
+        if cancel.is_cancelled() {
+            return Err(BudgetError::Cancelled);
+        }
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        state.waiters.push_back(ticket);
+        waiter_guard.ticket = Some(ticket);
+
         loop {
             if cancel.is_cancelled() {
                 return Err(BudgetError::Cancelled);
             }
-            if state.active_bytes.saturating_add(bytes) <= self.inner.cap_bytes {
+            if state.waiters.front() == Some(&ticket)
+                && bytes <= self.inner.cap_bytes.saturating_sub(state.active_bytes)
+            {
+                state.waiters.pop_front();
+                waiter_guard.ticket = None;
                 state.active_bytes += bytes;
                 state.peak_bytes = state.peak_bytes.max(state.active_bytes);
+                if !state.waiters.is_empty() {
+                    self.inner.cvar.notify_all();
+                }
                 return Ok(BudgetLease {
                     inner: Arc::clone(&self.inner),
                     bytes,
@@ -391,5 +441,41 @@ mod tests {
 
         drop(lease2);
         assert_eq!(tracker.active_bytes(), 0);
+
+        // Large cap (`u64::MAX`) must never overflow or wrap in try_reserve/reserve_blocking.
+        let huge = DecodeBudgetTracker::new(u64::MAX);
+        let h1 = huge.try_reserve(100).unwrap().expect("reserve 100");
+        assert!(huge.try_reserve(u64::MAX - 50).unwrap().is_none());
+        drop(h1);
+
+        // FIFO waiter queue prevents small concurrent reservations from starving a large pass.
+        let fifo = DecodeBudgetTracker::new(100);
+        let held = fifo.try_reserve(60).unwrap().expect("hold 60");
+        let (tx_queued, rx_queued) = std::sync::mpsc::channel();
+        let fifo_large = fifo.clone();
+        let large_handle = std::thread::spawn(move || {
+            let _ = tx_queued.send(());
+            fifo_large.reserve_blocking(80, &CancelToken::new())
+        });
+        rx_queued.recv().unwrap();
+        // Wait until the large waiter is enqueued, then verify small try_reserve yields to it.
+        while lock_unpoisoned(&fifo.inner.state).waiters.is_empty() {
+            std::thread::yield_now();
+        }
+        assert!(fifo.try_reserve(20).unwrap().is_none());
+        drop(held);
+        let large_lease = large_handle.join().unwrap().expect("large lease succeeds");
+        assert_eq!(large_lease.bytes(), 80);
+        drop(large_lease);
+
+        // DecodePeak::admit / note cover structured errors.
+        let peak = DecodePeak::new()
+            .with("band", 4 * MIB)
+            .with("cascade", 2 * MIB);
+        assert!(peak.admit(6 * MIB).is_ok());
+        assert!(matches!(
+            peak.admit(5 * MIB),
+            Err(BudgetError::ExceedsCap { detail, .. }) if detail.contains("band 4 MiB")
+        ));
     }
 }

@@ -175,6 +175,12 @@ fn describing_reads_only_header_and_ifds_and_pointwise_reads_own_chunk() {
     assert_eq!(src.grid().overviews.len(), levels as usize);
 
     let describe_stats = counting.snapshot();
+    assert!(
+        describe_stats.read_calls <= 1 + 3 * (levels as u64 + 1),
+        "describe issued {} read_at calls (expected <= {})",
+        describe_stats.read_calls,
+        1 + 3 * (levels as u64 + 1)
+    );
     let base_total: u64 = base_tiles.iter().map(|t| t.1).sum();
     let over_base: u64 = describe_stats
         .spans
@@ -197,7 +203,7 @@ fn describing_reads_only_header_and_ifds_and_pointwise_reads_own_chunk() {
         );
     }
 
-    // Pointwise read of tile (0, 1, 1) touches only chunk (1, 1) + IFDs.
+    // Pointwise read of tile (0, 1, 1) touches only chunk (1, 1) + IFDs and decodes expected pixels.
     counting.reset();
     let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
     let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
@@ -214,6 +220,8 @@ fn describing_reads_only_header_and_ifds_and_pointwise_reads_own_chunk() {
         (tile.width(), tile.height()),
         (RASTER_TILE_SIZE, RASTER_TILE_SIZE)
     );
+    // Pixel (512, 512) in `rgb_pattern` has RGB = (0, 0, (512*512/97) & 0xFF = 142).
+    assert_eq!(&tile.data()[..4], &[0, 0, 142, 255]);
 
     let own = base_tiles[3];
     let read_stats = counting.snapshot();
@@ -272,24 +280,61 @@ fn direct_overview_matches_sequential_pass_on_halved_cog() {
         pass_lvl1.expect("pass produced lvl 1").as_slice()
     );
 
-    // Stripped TIFF sequential pass emits every pyramid level.
+    // Stripped TIFF sequential pass emits every pyramid level and reads file once.
     let stripped = build_stripped_tiff(2 * RASTER_TILE_SIZE, 2 * RASTER_TILE_SIZE, 64);
+    let s_len = stripped.len() as u64;
     let s_fp = fake_fingerprint(&stripped);
+    let s_counting = Arc::new(CountingByteSource::new(Arc::new(
+        MemoryByteSource::from_vec(stripped),
+    )));
     let s_src = TiffSource::open(
-        Arc::new(MemoryByteSource::from_vec(stripped)),
+        Arc::clone(&s_counting) as Arc<dyn veldmap_core::io::ByteSource>,
         s_fp,
         &budget,
         &cancel,
     )
     .expect("open stripped");
+    s_counting.reset();
     let mut emitted = Vec::new();
     s_src
-        .produce_pass(&ctx, &mut |lvl, tx, ty, _, _, _| {
+        .produce_pass(&ctx, &mut |lvl, tx, ty, w, h, rgba| {
+            assert_eq!(rgba.len(), (w * h * 4) as usize);
             emitted.push((lvl, tx, ty));
             Ok(())
         })
         .expect("stripped pass");
     assert_eq!(emitted.len(), 5);
+    assert!(
+        s_counting.snapshot().bytes_read <= s_len + 2 * WINDOW,
+        "sequential pass read {} B for {} B file",
+        s_counting.snapshot().bytes_read,
+        s_len
+    );
+
+    // Non-power-of-two (700x600) raster: direct level-1 output matches sequential pass edge-for-edge.
+    let npot = build_stripped_tiff(700, 600, 600);
+    let npot_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(npot.clone())),
+        fake_fingerprint(&npot),
+        &budget,
+        &cancel,
+    )
+    .expect("open NPOT");
+    let npot_direct = npot_src
+        .decode_pointwise_tile(1, 0, 0, &ctx)
+        .expect("direct NPOT lvl 1");
+    let mut npot_pass = None;
+    npot_src
+        .produce_pass(&ctx, &mut |lvl, tx, ty, w, h, rgba| {
+            if (lvl, tx, ty) == (1, 0, 0) {
+                npot_pass = Some((w, h, rgba));
+            }
+            Ok(())
+        })
+        .expect("pass NPOT");
+    let (pw, ph, p_rgba) = npot_pass.expect("NPOT pass emitted level 1");
+    assert_eq!((pw, ph), (350, 300));
+    assert_eq!(npot_direct.data(), p_rgba.as_slice());
 }
 
 #[test]
@@ -449,12 +494,14 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         .expect("decode ZSTD Predictor=3 Float32");
     assert_eq!(f32_tile.data()[3], 0, "nodata -9999 must be transparent");
     assert_eq!(f32_tile.data()[7], 255, "valid 10.0 pixel must be opaque");
+    assert!(f32_tile.data()[4] < f32_tile.data()[8]);
+    assert!(f32_tile.data()[8] < f32_tile.data()[15 * 4]);
     assert!(
         f32_tile.data()[15 * 4] >= 245,
         "max 150.0 should stretch near white"
     );
 
-    // 3. Geographic (GTModelTypeGeoKey=2) with PixelIsArea + 16-bit signed (i16) samples.
+    // 3. Geographic (GTModelTypeGeoKey=2, foreign datum Pulkovo-42 4284) with PixelIsArea + 16-bit signed (i16) samples.
     let mut i16_buf = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut i16_buf).expect("enc");
@@ -470,7 +517,7 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
         dir.write_tag(Tag::RowsPerStrip, 2u32).expect("tag");
         dir.write_tag(Tag::GdalNodata, "-32768").expect("tag");
-        let geokeys: [u16; 8] = [1, 1, 0, 1, 1024, 0, 1, 2]; // Geographic
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4284]; // Geographic + Pulkovo-42
         dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
             .expect("tag");
         dir.write_tag(Tag::ModelPixelScaleTag, &[0.5_f64, 0.25, 0.0][..])
@@ -481,7 +528,7 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         )
         .expect("tag");
         let i16_vals: [i16; 8] = [-32768, -100, 0, 100, 200, 300, 400, 500];
-        let raw_bytes: Vec<u8> = i16_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let raw_bytes: Vec<u8> = i16_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let at = dir.write_data(&raw_bytes[..]).expect("write");
         dir.write_tag(Tag::StripOffsets, &[at as u32][..])
             .expect("tag");
@@ -497,6 +544,7 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         &cancel,
     )
     .expect("open geographic i16 TIFF");
+    assert_eq!(i16_src.description().foreign_datum_epsg, Some(4284));
     assert_eq!(i16_src.description().ties.len(), 4);
     assert!((i16_src.description().ties[3].lon - 12.0).abs() < 1e-9);
     assert!((i16_src.description().ties[3].lat - 49.5).abs() < 1e-9);
@@ -505,6 +553,50 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         .expect("decode i16");
     assert_eq!(i16_tile.data()[3], 0, "i16 nodata must be transparent");
     assert_eq!(i16_tile.data()[7], 255);
+    assert!(i16_tile.data()[4] < i16_tile.data()[12]);
+    assert!(i16_tile.data()[12] < i16_tile.data()[7 * 4]);
+
+    // 3b. Gray + Alpha (BlackIsZero, SamplesPerPixel=2, ExtraSamples=2) preserves alpha channel.
+    let mut ga_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut ga_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        dir.write_tag(Tag::ImageWidth, 2u32).expect("tag");
+        dir.write_tag(Tag::ImageLength, 1u32).expect("tag");
+        dir.write_tag(Tag::BitsPerSample, &[8u16, 8][..])
+            .expect("tag");
+        dir.write_tag(Tag::Compression, 1u16).expect("tag");
+        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
+            .expect("tag");
+        dir.write_tag(Tag::SamplesPerPixel, 2u16).expect("tag");
+        dir.write_tag(Tag::ExtraSamples, &[2u16][..]).expect("tag");
+        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
+        dir.write_tag(Tag::RowsPerStrip, 1u32).expect("tag");
+        let at = dir.write_data(&[200u8, 0, 120, 255][..]).expect("write");
+        dir.write_tag(Tag::StripOffsets, &[at as u32][..])
+            .expect("tag");
+        dir.write_tag(Tag::StripByteCounts, &[4u32][..])
+            .expect("tag");
+        dir.finish().expect("finish");
+    }
+    let ga_bytes = ga_buf.into_inner();
+    let ga_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(ga_bytes.clone())),
+        fake_fingerprint(&ga_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open Gray+Alpha");
+    assert!(ga_src.description().bands[0].has_alpha);
+    let ga_tile = ga_src
+        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .expect("decode Gray+Alpha");
+    assert_eq!(
+        ga_tile.data()[3],
+        0,
+        "transparent Gray+Alpha pixel keeps alpha 0"
+    );
+    assert_eq!(&ga_tile.data()[4..], &[120, 120, 120, 255]);
 
     // 4. PlanarConfiguration = 2 is rejected cleanly at open time.
     let mut planar_buf = Cursor::new(Vec::new());

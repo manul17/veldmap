@@ -45,30 +45,32 @@ pub fn bytes(base_w: u32, base_h: u32) -> u64 {
 
 fn bands_bytes(base_w: u32, base_h: u32) -> u64 {
     levels(base_w, base_h)
-        .map(|(w, rows)| u64::from(w) * rows * 4)
+        .map(|(w, rows, _)| u64::from(w) * rows * 4)
         .sum()
 }
 
 fn flush_bytes(base_w: u32, base_h: u32) -> u64 {
     let halves: u64 = levels(base_w, base_h)
-        .map(|(w, rows)| u64::from(w.div_ceil(2)) * rows.div_ceil(2) * 4)
+        .filter(|(_, _, is_apex)| !is_apex)
+        .map(|(w, rows, _)| u64::from(w.div_ceil(2)) * rows.div_ceil(2) * 4)
         .sum();
     let tile = levels(base_w, base_h)
-        .map(|(w, rows)| u64::from(w.min(RASTER_TILE_SIZE)) * rows * 4)
+        .map(|(w, rows, _)| u64::from(w.min(RASTER_TILE_SIZE)) * rows * 4)
         .max()
         .unwrap_or(0);
     halves.saturating_add(tile)
 }
 
-fn levels(base_w: u32, base_h: u32) -> impl Iterator<Item = (u32, u64)> {
+fn levels(base_w: u32, base_h: u32) -> impl Iterator<Item = (u32, u64, bool)> {
     let (mut w, mut h) = (base_w, base_h);
     let mut done = false;
     std::iter::from_fn(move || {
         if done || w == 0 || h == 0 {
             return None;
         }
-        let item = (w, u64::from(h.min(RASTER_TILE_SIZE)));
-        done = w.max(h) <= RASTER_TILE_SIZE;
+        let is_apex = w.max(h) <= RASTER_TILE_SIZE;
+        let item = (w, u64::from(h.min(RASTER_TILE_SIZE)), is_apex);
+        done = is_apex;
         w = w.div_ceil(2);
         h = h.div_ceil(2);
         Some(item)
@@ -127,6 +129,17 @@ impl Cascade {
         emit: TileEmit<'_>,
     ) -> Result<(), RasterError> {
         let width = self.bands[i].width as usize;
+        let expected_len = (nrows as usize)
+            .checked_mul(width)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| RasterError::InvalidFormat("cascade row slice size overflow".into()))?;
+        if data.len() < expected_len {
+            return Err(RasterError::InvalidFormat(format!(
+                "cascade level {} expected at least {expected_len} bytes for {nrows} rows, got {}",
+                self.bands[i].level,
+                data.len()
+            )));
+        }
         let mut fed = 0u32;
         while fed < nrows {
             let band = &mut self.bands[i];
@@ -190,5 +203,54 @@ impl Cascade {
             self.feed(i + 1, &half_buf, hrows, emit)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cascade_handles_non_tile_row_batches_npot_dims_and_short_slices() {
+        let (w, h) = (700u32, 600u32);
+        let mut cascade = Cascade::new(0, w, h);
+        assert!(
+            cascade
+                .push_rows(&[0u8; 8], 1, &mut |_, _, _, _, _, _| Ok(()))
+                .is_err()
+        );
+
+        let mut emitted = Vec::new();
+        let row_bytes = (w as usize) * 4;
+        // Feed in 130-row batches (non-divisor of 512) to exercise multi-band flushing.
+        let mut fed = 0u32;
+        while fed < h {
+            let n = (h - fed).min(130);
+            let buf = vec![42u8; (n as usize) * row_bytes];
+            cascade
+                .push_rows(&buf, n, &mut |lvl, tx, ty, tw, th, rgba| {
+                    emitted.push((lvl, tx, ty, tw, th, rgba.len()));
+                    Ok(())
+                })
+                .expect("push_rows");
+            fed += n;
+        }
+        cascade
+            .finish(&mut |lvl, tx, ty, tw, th, rgba| {
+                emitted.push((lvl, tx, ty, tw, th, rgba.len()));
+                Ok(())
+            })
+            .expect("finish");
+
+        // Level 0: 2x2 = 4 tiles; Level 1 (350x300 <= 512): 1 apex tile.
+        assert_eq!(emitted.len(), 5);
+        assert!(emitted.contains(&(1, 0, 0, 350, 300, 350 * 300 * 4)));
+        assert!(bytes(w, h) > bands_bytes(w, h));
+        // Apex-only raster has zero halving buffer cost.
+        assert_eq!(
+            flush_bytes(256, 256),
+            256 * 256 * 4,
+            "apex-only flush_bytes must not count halving"
+        );
     }
 }

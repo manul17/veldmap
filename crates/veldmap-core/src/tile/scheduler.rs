@@ -96,9 +96,10 @@ impl PyramidMeta {
         }
     }
 
-    /// Progressive ladder of levels from `max_level()` down to `target_level`
-    /// (clamped to `[finest_fitting_level(), max_level()]`), skipping coarser
-    /// levels that would trigger redundant full-file passes.
+    /// Progressive ladder of fitting levels from `max_level()` down to
+    /// `target_level` (clamped to `[finest_fitting_level(), max_level()]`),
+    /// keeping at most one coarsest representative per distinct `ServeMode::Pass`
+    /// cascade so redundant full-file passes are skipped.
     pub fn ladder(&self, target_level: u8) -> Vec<u8> {
         if self.levels.is_empty() {
             return Vec::new();
@@ -108,13 +109,27 @@ impl PyramidMeta {
         let target = target_level.clamp(min_fit, top);
         let goal_pass = self.pass_from(target);
 
-        let mut rungs: Vec<u8> = ((target + 1)..=top)
-            .rev()
-            .filter(|&lvl| {
-                let from = self.pass_from(lvl);
-                from.is_none() || from == goal_pass || (lvl == top && from == Some(top))
-            })
-            .collect();
+        let mut rungs = Vec::new();
+        let mut seen_passes = HashSet::new();
+        if target < top {
+            for lvl_u16 in (u16::from(target) + 1..=u16::from(top)).rev() {
+                let lvl = lvl_u16 as u8;
+                let Some(plan) = self.level(lvl) else {
+                    continue;
+                };
+                if !plan.fits {
+                    continue;
+                }
+                match plan.serve {
+                    ServeMode::Pointwise => rungs.push(lvl),
+                    ServeMode::Pass { from } => {
+                        if Some(from) != goal_pass && seen_passes.insert(from) {
+                            rungs.push(lvl);
+                        }
+                    }
+                }
+            }
+        }
         rungs.push(target);
         rungs
     }
@@ -150,14 +165,22 @@ pub enum TileFailureOutcome {
     /// First transient failure: removed from in-flight and eligible for one retry.
     RetryEligible,
     /// Terminal rejection or second consecutive failure: suppressed permanently
-    /// until `forgive_transient_failures` (for single-pass forgiveness) or
+    /// until `forgive_single_pass_failures` (for single-pass forgiveness) or
     /// `reset_source`.
     TerminalFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureState {
+    RetriedOnce,
+    TransientPassSuppressed,
+    Permanent,
 }
 
 struct ActivePass {
     pass_id: u64,
     level: u8,
+    pass_from: Option<u8>,
     cancel: CancelToken,
     tiles: Vec<TileKey>,
 }
@@ -169,9 +192,7 @@ pub struct TileScheduler {
     next_pass_id: u64,
     active_passes: HashMap<SourceId, ActivePass>,
     in_flight: HashSet<TileKey>,
-    retried_once: HashSet<TileKey>,
-    transient_failed: HashSet<TileKey>,
-    permanent_failed: HashSet<TileKey>,
+    failures: HashMap<TileKey, FailureState>,
 }
 
 impl Default for TileScheduler {
@@ -187,9 +208,7 @@ impl TileScheduler {
             next_pass_id: 1,
             active_passes: HashMap::new(),
             in_flight: HashSet::new(),
-            retried_once: HashSet::new(),
-            transient_failed: HashSet::new(),
-            permanent_failed: HashSet::new(),
+            failures: HashMap::new(),
         }
     }
 
@@ -211,17 +230,21 @@ impl TileScheduler {
     /// Return whether `key` is permanently or transiently suppressed from
     /// re-requesting.
     pub fn is_terminal_failed(&self, key: &TileKey) -> bool {
-        self.permanent_failed.contains(key) || self.transient_failed.contains(key)
+        matches!(
+            self.failures.get(key),
+            Some(FailureState::Permanent | FailureState::TransientPassSuppressed)
+        )
     }
 
-    /// Filter `candidates` down to tiles that are not cached, not already
-    /// in-flight, and not failed/suppressed, marking admitted keys as
-    /// in-flight.
+    /// Filter `candidates` down to unique tiles belonging to `(meta.source, level)`
+    /// that are not cached, not already in-flight, and not suppressed, marking
+    /// admitted pointwise keys as in-flight.
     ///
     /// For `ServeMode::Pointwise` levels, multiple concurrent batches are
     /// admitted regardless of whether other pointwise tiles are already
     /// in-flight. For `ServeMode::Pass` levels, returns empty when a pass is
-    /// already active for `meta.source`.
+    /// already active for `meta.source` and permits first-time pass-failed tiles
+    /// to trigger a recovery pass so pass-only sources cannot permanently starve.
     pub fn admit_pointwise_or_check_pass(
         &mut self,
         meta: &PyramidMeta,
@@ -229,15 +252,28 @@ impl TileScheduler {
         candidates: &[TileKey],
         is_cached: impl Fn(&TileKey) -> bool,
     ) -> Vec<TileKey> {
-        if !meta.is_pointwise(level) && self.has_active_pass(meta.source) {
+        let Some(plan) = meta.level(level) else {
+            return Vec::new();
+        };
+        let is_pointwise = plan.serve == ServeMode::Pointwise;
+        if !is_pointwise && self.has_active_pass(meta.source) {
             return Vec::new();
         }
+        let mut seen = HashSet::new();
         let mut admitted = Vec::new();
         for &key in candidates {
-            if is_cached(&key) || self.in_flight.contains(&key) || self.is_terminal_failed(&key) {
+            if key.source != meta.source || key.level != level || !seen.insert(key) {
                 continue;
             }
-            if meta.is_pointwise(key.level) {
+            let suppressed = if is_pointwise {
+                self.is_terminal_failed(&key)
+            } else {
+                matches!(self.failures.get(&key), Some(FailureState::Permanent))
+            };
+            if is_cached(&key) || self.in_flight.contains(&key) || suppressed {
+                continue;
+            }
+            if is_pointwise {
                 self.in_flight.insert(key);
             }
             admitted.push(key);
@@ -245,7 +281,8 @@ impl TileScheduler {
         admitted
     }
 
-    /// Begin the single active `ServeMode::Pass` for `source` at `level`.
+    /// Begin the single active `ServeMode::Pass` for `source` at `level`
+    /// (with optional shared cascade root `pass_from`).
     ///
     /// Returns `Err(PassBusy)` if another sequential pass is already active
     /// for `source`. `ServeMode::Pointwise` requests must NOT call this method
@@ -254,6 +291,7 @@ impl TileScheduler {
         &mut self,
         source: SourceId,
         level: u8,
+        pass_from: Option<u8>,
         cancel: CancelToken,
         tiles: Vec<TileKey>,
     ) -> Result<u64, PassBusy> {
@@ -274,6 +312,7 @@ impl TileScheduler {
             ActivePass {
                 pass_id,
                 level,
+                pass_from,
                 cancel,
                 tiles,
             },
@@ -281,17 +320,24 @@ impl TileScheduler {
         Ok(pass_id)
     }
 
-    /// Update the desired target level for `source`.
+    /// Update the desired target level (and its `pass_from`, if served via
+    /// `ServeMode::Pass`) for `source`.
     ///
-    /// Preserves coarser in-flight passes (`pass.level >= target_level`) so
-    /// zooming in never discards half-decoded ancestor passes. Cancels an active
-    /// pass only when it is strictly finer than the new target
-    /// (`pass.level < target_level`).
-    pub fn update_target(&mut self, source: SourceId, target_level: u8) -> bool {
-        let should_cancel = self
-            .active_passes
-            .get(&source)
-            .is_some_and(|pass| pass.level < target_level);
+    /// Preserves coarser in-flight passes (`pass.level >= target_level`) and
+    /// active passes sharing the same cascade `pass_from` (e.g. `Pass { from: 0 }`)
+    /// so zooming never discards valid ancestor or shared-cascade work. Cancels
+    /// an active pass only when it is strictly finer than `target_level` and
+    /// does not cover `target_pass_from`.
+    pub fn update_target(
+        &mut self,
+        source: SourceId,
+        target_level: u8,
+        target_pass_from: Option<u8>,
+    ) -> bool {
+        let should_cancel = self.active_passes.get(&source).is_some_and(|pass| {
+            pass.level < target_level
+                && !(target_pass_from.is_some() && pass.pass_from == target_pass_from)
+        });
         if !should_cancel {
             return false;
         }
@@ -321,12 +367,15 @@ impl TileScheduler {
         if let Some(pass) = self.active_passes.remove(&source) {
             for key in pass.tiles {
                 if self.in_flight.remove(&key) && !succeeded {
-                    if self.retried_once.insert(key) {
-                        self.transient_failed.insert(key);
-                    } else {
-                        self.transient_failed.remove(&key);
-                        self.permanent_failed.insert(key);
-                    }
+                    let next = match self.failures.get(&key) {
+                        None => FailureState::TransientPassSuppressed,
+                        Some(
+                            FailureState::RetriedOnce
+                            | FailureState::TransientPassSuppressed
+                            | FailureState::Permanent,
+                        ) => FailureState::Permanent,
+                    };
+                    self.failures.insert(key, next);
                 }
             }
             if succeeded {
@@ -339,9 +388,7 @@ impl TileScheduler {
     /// flags.
     pub fn on_tile_arrived(&mut self, key: &TileKey) {
         self.in_flight.remove(key);
-        self.retried_once.remove(key);
-        self.transient_failed.remove(key);
-        self.permanent_failed.remove(key);
+        self.failures.remove(key);
     }
 
     /// Record failure for `key`.
@@ -353,25 +400,34 @@ impl TileScheduler {
     pub fn on_tile_failed(&mut self, key: &TileKey, terminal: bool) -> TileFailureOutcome {
         self.in_flight.remove(key);
         if terminal {
-            self.retried_once.remove(key);
-            self.transient_failed.remove(key);
-            self.permanent_failed.insert(*key);
+            self.failures.insert(*key, FailureState::Permanent);
             return TileFailureOutcome::TerminalFailed;
         }
-        if self.retried_once.insert(*key) {
-            TileFailureOutcome::RetryEligible
-        } else {
-            self.transient_failed.remove(key);
-            self.permanent_failed.insert(*key);
-            TileFailureOutcome::TerminalFailed
+        match self.failures.get(key) {
+            None => {
+                self.failures.insert(*key, FailureState::RetriedOnce);
+                TileFailureOutcome::RetryEligible
+            }
+            Some(
+                FailureState::RetriedOnce
+                | FailureState::TransientPassSuppressed
+                | FailureState::Permanent,
+            ) => {
+                self.failures.insert(*key, FailureState::Permanent);
+                TileFailureOutcome::TerminalFailed
+            }
         }
     }
 
     /// Forgive tiles of `source` that only failed once in a prior broken pass
-    /// so a subsequent healthy pass can retry them without ever forgiving
-    /// permanently rejected or twice-failed tiles.
+    /// (demoting them to `RetriedOnce` so a subsequent healthy pass allows one
+    /// retry while a second failure becomes permanent).
     pub fn forgive_single_pass_failures(&mut self, source: SourceId) {
-        self.transient_failed.retain(|key| key.source != source);
+        for (key, state) in &mut self.failures {
+            if key.source == source && *state == FailureState::TransientPassSuppressed {
+                *state = FailureState::RetriedOnce;
+            }
+        }
     }
 
     /// Cancel any active pass for `source` and drop all in-flight/failure state
@@ -381,9 +437,7 @@ impl TileScheduler {
             pass.cancel.cancel();
         }
         self.in_flight.retain(|k| k.source != source);
-        self.retried_once.retain(|k| k.source != source);
-        self.transient_failed.retain(|k| k.source != source);
-        self.permanent_failed.retain(|k| k.source != source);
+        self.failures.retain(|k, _| k.source != source);
     }
 }
 
@@ -435,9 +489,19 @@ mod tests {
             sched.admit_pointwise_or_check_pass(&meta_a, 0, &[k0, k1], |_| false),
             vec![k0, k1]
         );
-        // Duplicate in-flight tile is deduplicated, while another pointwise tile admits.
+        // Duplicate in-flight or mismatched-level tiles are ignored, while matching-level tiles admit.
+        assert!(
+            sched
+                .admit_pointwise_or_check_pass(&meta_a, 0, &[k0, k2], |_| false)
+                .is_empty()
+        );
+        let k0_dup = meta_a.tile_key(0, 2, 0);
         assert_eq!(
-            sched.admit_pointwise_or_check_pass(&meta_a, 0, &[k0, k2], |_| false),
+            sched.admit_pointwise_or_check_pass(&meta_a, 0, &[k0, k0_dup, k0_dup], |_| false),
+            vec![k0_dup]
+        );
+        assert_eq!(
+            sched.admit_pointwise_or_check_pass(&meta_a, 1, &[k2], |_| false),
             vec![k2]
         );
 
@@ -445,21 +509,21 @@ mod tests {
         let cancel1 = CancelToken::new();
         let pass_tile = meta_a.tile_key(3, 0, 0);
         let pid1 = sched
-            .begin_pass(src_a, 3, cancel1.clone(), vec![pass_tile])
+            .begin_pass(src_a, 3, Some(3), cancel1.clone(), vec![pass_tile])
             .expect("first pass succeeds");
         assert!(
             sched
-                .begin_pass(src_a, 2, CancelToken::new(), vec![])
+                .begin_pass(src_a, 2, Some(2), CancelToken::new(), vec![])
                 .is_err()
         );
         // Another source can run its own pass concurrently.
         let pid_b = sched
-            .begin_pass(src_b, 2, CancelToken::new(), vec![])
+            .begin_pass(src_b, 2, Some(2), CancelToken::new(), vec![])
             .expect("independent source pass succeeds");
         assert_ne!(pid1, pid_b);
 
         // Zooming IN (target=1 < active_pass_level=3) does NOT cancel coarser pass.
-        assert!(!sched.update_target(src_a, 1));
+        assert!(!sched.update_target(src_a, 1, None));
         assert!(!cancel1.is_cancelled());
         assert!(sched.has_active_pass(src_a));
 
@@ -467,11 +531,32 @@ mod tests {
         sched.finish_pass(src_a, pid1, true);
         let cancel2 = CancelToken::new();
         let _pid2 = sched
-            .begin_pass(src_a, 2, cancel2.clone(), vec![meta_a.tile_key(2, 0, 0)])
+            .begin_pass(
+                src_a,
+                2,
+                Some(2),
+                cancel2.clone(),
+                vec![meta_a.tile_key(2, 0, 0)],
+            )
             .expect("new pass after finish");
-        assert!(sched.update_target(src_a, 3));
+        assert!(sched.update_target(src_a, 3, Some(3)));
         assert!(cancel2.is_cancelled());
         assert!(!sched.has_active_pass(src_a));
+
+        // Shared `Pass { from: 0 }` cascade is NOT cancelled when zooming out to another level in the same pass.
+        let cancel3 = CancelToken::new();
+        let pid3 = sched
+            .begin_pass(
+                src_a,
+                2,
+                Some(0),
+                cancel3.clone(),
+                vec![meta_a.tile_key(2, 0, 0)],
+            )
+            .expect("shared cascade pass");
+        assert!(!sched.update_target(src_a, 3, Some(0)));
+        assert!(!cancel3.is_cancelled());
+        sched.finish_pass(src_a, pid3, true);
     }
 
     #[test]
@@ -519,6 +604,7 @@ mod tests {
             .begin_pass(
                 meta.source,
                 2,
+                Some(2),
                 CancelToken::new(),
                 vec![meta.tile_key(2, 0, 0)],
             )
@@ -530,7 +616,7 @@ mod tests {
         // First-time pass failure is suppressed until a healthy pass forgives it once.
         let k_pass = meta.tile_key(1, 0, 0);
         let pid_fail = sched
-            .begin_pass(meta.source, 1, CancelToken::new(), vec![k_pass])
+            .begin_pass(meta.source, 1, None, CancelToken::new(), vec![k_pass])
             .expect("begin failing pass");
         sched.finish_pass(meta.source, pid_fail, false);
         assert!(sched.is_terminal_failed(&k_pass));
@@ -538,11 +624,62 @@ mod tests {
             .begin_pass(
                 meta.source,
                 2,
+                Some(2),
                 CancelToken::new(),
                 vec![meta.tile_key(2, 0, 0)],
             )
             .expect("begin healing pass");
         sched.finish_pass(meta.source, pid_heal, true);
         assert!(!sched.is_terminal_failed(&k_pass));
+        // Second failure after forgiveness escalates permanently.
+        assert_eq!(
+            sched.on_tile_failed(&k_pass, false),
+            TileFailureOutcome::TerminalFailed
+        );
+        assert!(sched.is_terminal_failed(&k_pass));
+    }
+
+    #[test]
+    fn ladder_and_pass_only_recovery_avoid_redundant_passes_and_starvation() {
+        let mut meta = sample_meta(SourceId::new(33), 2, 5);
+        for lvl in 2..5 {
+            meta.levels[lvl].serve = ServeMode::Pass { from: 0 };
+        }
+        // Pointwise target keeps apex pass once + pointwise rungs.
+        assert_eq!(meta.ladder(0), vec![4, 1, 0]);
+        // Pass target skips redundant coarser rungs sharing `Pass { from: 0 }`.
+        assert_eq!(meta.ladder(3), vec![3]);
+
+        // Pass-only source admits a recovery pass after a single pass failure, then stops on 2nd failure.
+        let mut sched = TileScheduler::new();
+        let pass_only = PyramidMeta {
+            levels: (0..2)
+                .map(|_| LevelPlan {
+                    serve: ServeMode::Pass { from: 0 },
+                    source_pixels: 512 * 512,
+                    estimated_peak_bytes: 1024,
+                    fits: true,
+                })
+                .collect(),
+            ..meta
+        };
+        let k = pass_only.tile_key(1, 0, 0);
+        let pid1 = sched
+            .begin_pass(pass_only.source, 1, Some(0), CancelToken::new(), vec![k])
+            .expect("pass 1");
+        sched.finish_pass(pass_only.source, pid1, false);
+        assert_eq!(
+            sched.admit_pointwise_or_check_pass(&pass_only, 1, &[k], |_| false),
+            vec![k]
+        );
+        let pid2 = sched
+            .begin_pass(pass_only.source, 1, Some(0), CancelToken::new(), vec![k])
+            .expect("pass 2");
+        sched.finish_pass(pass_only.source, pid2, false);
+        assert!(
+            sched
+                .admit_pointwise_or_check_pass(&pass_only, 1, &[k], |_| false)
+                .is_empty()
+        );
     }
 }

@@ -107,14 +107,18 @@ impl DecodeQueue {
             return Some(Vec::new());
         }
 
-        let incoming_rank = key.coarsest_first_key();
+        let incoming_coarse = key.scheme.coarseness_rank(key.level);
         let mut candidates: Vec<(usize, _, usize)> = self
             .jobs
             .iter()
             .enumerate()
             .filter_map(|(idx, j)| {
-                let rank = j.key.coarsest_first_key();
-                (incoming_rank < rank).then_some((idx, rank, j.queued_bytes))
+                let victim_coarse = j.key.scheme.coarseness_rank(j.key.level);
+                (incoming_coarse < victim_coarse).then_some((
+                    idx,
+                    j.key.coarsest_first_key(),
+                    j.queued_bytes,
+                ))
             })
             .collect();
         // Finest-first victim order (highest `coarsest_first_key` first).
@@ -316,7 +320,7 @@ impl DecodePool {
         self.shutdown_inner();
     }
 
-    fn shutdown_inner(&mut self) {
+    fn close_queue(&self) {
         let drained = {
             let (lock, cvar) = &*self.shared;
             let mut queue = lock_unpoisoned(lock);
@@ -326,6 +330,10 @@ impl DecodePool {
             drained
         };
         drop(drained);
+    }
+
+    fn shutdown_inner(&mut self) {
+        self.close_queue();
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
@@ -449,10 +457,22 @@ impl TwoLaneDecodePool {
         }
     }
 
-    /// Close both queues and deterministically join all worker threads.
-    pub fn shutdown(self) {
-        self.fast.shutdown();
-        self.bulk.shutdown();
+    /// Close both queues before deterministically joining all worker threads.
+    pub fn shutdown(mut self) {
+        self.shutdown_inner();
+    }
+
+    fn shutdown_inner(&mut self) {
+        self.fast.close_queue();
+        self.bulk.close_queue();
+        self.fast.shutdown_inner();
+        self.bulk.shutdown_inner();
+    }
+}
+
+impl Drop for TwoLaneDecodePool {
+    fn drop(&mut self) {
+        self.shutdown_inner();
     }
 }
 

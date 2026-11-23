@@ -95,6 +95,39 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
         assert!(q.jobs.iter().any(|j| j.key == tile_key(0, 0, 0)));
     }
 
+    // Equal-coarseness incoming job (level 0 with smaller source) must NOT evict peer level-0 jobs.
+    let peer_shared = Arc::new((Mutex::new(DecodeQueue::new(2, 1024)), Condvar::new()));
+    let peer_handle = DecodePoolHandle {
+        shared: Arc::clone(&peer_shared),
+    };
+    assert!(peer_handle.submit(DecodeJob {
+        key: tile_key(0, 0, 0),
+        queued_bytes: 0,
+        cancel: tok.clone(),
+        work: Box::new(|| {}),
+    }));
+    assert!(peer_handle.submit(DecodeJob {
+        key: tile_key(0, 1, 0),
+        queued_bytes: 0,
+        cancel: tok.clone(),
+        work: Box::new(|| {}),
+    }));
+    let peer_key = TileKey::display_quad(
+        SourceId::new(1),
+        QuadTileId {
+            scheme: PlanetaryScheme::WebMercator,
+            level: 0,
+            x: 0,
+            y: 0,
+        },
+    );
+    assert!(!peer_handle.submit(DecodeJob {
+        key: peer_key,
+        queued_bytes: 0,
+        cancel: tok.clone(),
+        work: Box::new(|| {}),
+    }));
+
     // Encoded byte cap (`DEFAULT_MAX_PENDING_DECODE_BYTES`) prevents unbounded
     // payload accumulation even with fewer than `DEFAULT_MAX_PENDING_DECODE_JOBS` jobs.
     let byte_shared = default_queue();

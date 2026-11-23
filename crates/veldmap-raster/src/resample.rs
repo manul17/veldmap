@@ -87,8 +87,8 @@ pub fn resample_rgba8_window(
         return src.to_vec();
     }
 
-    let x_spans = spans(window.x0, window.x1.min(f64::from(sw)), dw);
-    let y_spans = spans(window.y0, window.y1.min(f64::from(sh)), dh);
+    let x_spans = spans(window.x0, window.x1, dw);
+    let y_spans = spans(window.y0, window.y1, dh);
 
     let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
     for (dy, &(y0, y1)) in y_spans.iter().enumerate() {
@@ -96,11 +96,11 @@ pub fn resample_rgba8_window(
             let mut rgb = [0f64; 3];
             let mut alpha = 0f64;
             let mut area = 0f64;
-            let mut sy = y0.floor() as u32;
+            let mut sy = y0.max(0.0).floor() as u32;
             while f64::from(sy) < y1 && sy < sh {
                 let wy = overlap(sy, y0, y1);
                 let row = (sy as usize) * (sw as usize) * 4;
-                let mut sx = x0.floor() as u32;
+                let mut sx = x0.max(0.0).floor() as u32;
                 while f64::from(sx) < x1 && sx < sw {
                     let wx = overlap(sx, x0, x1);
                     let px = row + (sx as usize) * 4;

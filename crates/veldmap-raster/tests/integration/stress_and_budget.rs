@@ -113,12 +113,15 @@ fn concurrent_decode_respects_memory_cap_and_deduplicates_shared_chunks() {
         })
         .collect();
 
-    for h in handles {
+    for (i, h) in handles.into_iter().enumerate() {
         let tile = h.join().expect("join worker").expect("concurrent decode");
         assert_eq!(
             (tile.width(), tile.height()),
             (RASTER_TILE_SIZE, RASTER_TILE_SIZE)
         );
+        let (tx, ty) = (i as u32 % 2, (i as u32 / 2) % 2);
+        let expected = ((tx * 37 + ty * 17) & 0xFF) as u8;
+        assert_eq!(&tile.data()[..4], &[expected, expected, expected, 255]);
     }
 
     assert_eq!(tracker.active_bytes(), 0);
@@ -137,10 +140,33 @@ fn concurrent_decode_respects_memory_cap_and_deduplicates_shared_chunks() {
         4,
         "remaining 4 callers must share or hit cache"
     );
+    // 4 singleflight leaders each read 1 chunk (512*512*3 B) + small header/IFD windows,
+    // well below an un-deduplicated 8-worker read (~6.29 MB).
+    let stats = counting.snapshot();
+    assert!(
+        stats.bytes_read <= 4 * (512 * 512 * 3) + 4 * 3 * 64 * 1024 + 64 * 1024,
+        "unexpectedly high read bytes under contention: {}",
+        stats.bytes_read
+    );
 }
 
 #[test]
 fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
+    let raw = build_multi_tile_tiff(2, 2, RASTER_TILE_SIZE);
+    let budget = MemoryBudget::detect();
+    let cancel = CancelToken::new();
+    let src = Arc::new(
+        TiffSource::open(
+            Arc::new(MemoryByteSource::from_vec(raw)),
+            SourceFingerprint::from_digest([7u8; 32]),
+            &budget,
+            &cancel,
+        )
+        .expect("open"),
+    );
+    let chunk_cache = Arc::new(SharedChunkCache::new(budget.decoded_chunk_cache_bytes));
+    let tracker = Arc::new(DecodeBudgetTracker::new(budget.decode_working_bytes));
+
     let shutdown = CancelToken::new();
     let pool = TwoLaneDecodePool::spawn(
         TwoLaneDecodePoolConfig {
@@ -155,21 +181,38 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
     let bulk_started = Arc::new(AtomicUsize::new(0));
     let release_bulk = CancelToken::new();
 
-    // Saturate all 2 bulk workers with long-running work.
+    // Saturate all 2 bulk workers with real `TiffSource::produce_pass` calls paused mid-emit.
     for x in 0..2u32 {
+        let src = Arc::clone(&src);
+        let cache = Arc::clone(&chunk_cache);
+        let tracker = Arc::clone(&tracker);
         let started = Arc::clone(&bulk_started);
         let rel = release_bulk.clone();
+        let pass_cancel = shutdown.child_token();
         assert!(handle.submit(
             DecodeLane::Bulk,
             DecodeJob {
                 key: dummy_key(x),
                 queued_bytes: 1024,
-                cancel: shutdown.child_token(),
+                cancel: pass_cancel.clone(),
                 work: Box::new(move || {
-                    started.fetch_add(1, Ordering::AcqRel);
-                    while !rel.is_cancelled() {
-                        thread::sleep(Duration::from_millis(5));
-                    }
+                    let ctx = DecodeContext {
+                        chunk_cache: &cache,
+                        budget_tracker: &tracker,
+                        budget: &budget,
+                        cancel: &pass_cancel,
+                    };
+                    let mut signaled = false;
+                    let _ = src.produce_pass(&ctx, &mut |_, _, _, _, _, _| {
+                        if !signaled {
+                            signaled = true;
+                            started.fetch_add(1, Ordering::AcqRel);
+                            while !rel.is_cancelled() {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                        }
+                        Ok(())
+                    });
                 }),
             }
         ));
@@ -182,9 +225,13 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
     }
     assert_eq!(bulk_started.load(Ordering::Acquire), 2);
 
-    // Submit fast-lane jobs while both bulk workers remain blocked: must complete promptly!
+    // Submit real fast-lane pointwise decodes while both bulk workers remain blocked.
     let (tx, rx) = mpsc::channel();
-    for x in 10..16u32 {
+    for x in 0..4u32 {
+        let src = Arc::clone(&src);
+        let cache = Arc::clone(&chunk_cache);
+        let tracker = Arc::clone(&tracker);
+        let fast_cancel = shutdown.child_token();
         let tx = tx.clone();
         assert!(handle.submit(
             DecodeLane::Fast,
@@ -195,21 +242,29 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
                     ..dummy_key(x)
                 },
                 queued_bytes: 256,
-                cancel: shutdown.child_token(),
+                cancel: fast_cancel.clone(),
                 work: Box::new(move || {
-                    let _ = tx.send(x);
+                    let ctx = DecodeContext {
+                        chunk_cache: &cache,
+                        budget_tracker: &tracker,
+                        budget: &budget,
+                        cancel: &fast_cancel,
+                    };
+                    let tile = src
+                        .decode_pointwise_tile(0, x % 2, x / 2, &ctx)
+                        .expect("fast decode");
+                    let _ = tx.send((tile.width(), tile.height()));
                 }),
             }
         ));
     }
 
-    let mut received = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(2);
-    while received.len() < 6 {
+    for _ in 0..4 {
         let rem = deadline.saturating_duration_since(Instant::now());
-        received.push(rx.recv_timeout(rem).expect("fast lane must not HoL stall"));
+        let dims = rx.recv_timeout(rem).expect("fast lane must not HoL stall");
+        assert_eq!(dims, (RASTER_TILE_SIZE, RASTER_TILE_SIZE));
     }
-    assert_eq!(received.len(), 6);
 
     release_bulk.cancel();
     pool.shutdown();
@@ -217,7 +272,7 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
 
 #[test]
 fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
-    use veldmap_core::tile::{LevelPlan, ServeMode, TileScheduler};
+    use veldmap_core::tile::{ServeMode, TileScheduler};
 
     let raw = build_multi_tile_tiff(2, 2, RASTER_TILE_SIZE);
     let budget = MemoryBudget::detect();
@@ -232,30 +287,8 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
         .expect("open"),
     );
 
-    let mut meta = src.pyramid_meta();
-    // Simulate a hybrid pyramid: level 0 pointwise, level 1 served by sequential pass.
-    meta.levels = vec![
-        LevelPlan {
-            serve: ServeMode::Pointwise,
-            source_pixels: 512 * 512,
-            estimated_peak_bytes: 4 * 1024 * 1024,
-            fits: true,
-        },
-        LevelPlan {
-            serve: ServeMode::Pass { from: 1 },
-            source_pixels: 1024 * 1024,
-            estimated_peak_bytes: 16 * 1024 * 1024,
-            fits: true,
-        },
-    ];
-
+    let meta = src.pyramid_meta();
     let mut sched = TileScheduler::new();
-    let k0 = meta.tile_key(0, 0, 0);
-    let k1 = meta.tile_key(0, 1, 0);
-    let admitted = sched.admit_pointwise_or_check_pass(&meta, 0, &[k0, k1], |_| false);
-    assert_eq!(admitted, vec![k0, k1]);
-
-    // Decode admitted tiles through DecodeContext and notify scheduler on arrival.
     let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
     let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
     let ctx = DecodeContext {
@@ -264,28 +297,40 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
         budget: &budget,
         cancel: &cancel,
     };
-    for key in admitted {
-        let tile = src
-            .decode_pointwise_tile(key.level, key.x, key.y, &ctx)
-            .expect("decode admitted tile");
-        assert_eq!(
-            (tile.width(), tile.height()),
-            (RASTER_TILE_SIZE, RASTER_TILE_SIZE)
-        );
-        sched.on_tile_arrived(&key);
-        assert!(!sched.is_in_flight(&key));
-    }
 
-    // Begin pass on level 1 and ensure zooming in to target 0 does not cancel it.
-    let pass_cancel = CancelToken::new();
-    let pass_key = meta.tile_key(1, 0, 0);
-    let pass_id = sched
-        .begin_pass(meta.source, 1, pass_cancel.clone(), vec![pass_key])
-        .expect("begin pass");
-    assert!(!sched.update_target(meta.source, 0));
-    assert!(!pass_cancel.is_cancelled());
-    sched.finish_pass(meta.source, pass_id, true);
-    assert!(!sched.has_active_pass(meta.source));
+    // Walk `meta.ladder(0)` and drive real `decode_pointwise_tile` / `produce_pass` per ServeMode.
+    for lvl in meta.ladder(0) {
+        let plan = meta.level(lvl).expect("level in range");
+        let k0 = meta.tile_key(lvl, 0, 0);
+        let admitted = sched.admit_pointwise_or_check_pass(&meta, lvl, &[k0], |_| false);
+        assert_eq!(admitted, vec![k0]);
+
+        match plan.serve {
+            ServeMode::Pointwise => {
+                let tile = src
+                    .decode_pointwise_tile(k0.level, k0.x, k0.y, &ctx)
+                    .expect("pointwise decode");
+                assert_eq!(
+                    (tile.width(), tile.height()),
+                    (RASTER_TILE_SIZE, RASTER_TILE_SIZE)
+                );
+                sched.on_tile_arrived(&k0);
+            }
+            ServeMode::Pass { from } => {
+                let pass_cancel = CancelToken::new();
+                let pass_id = sched
+                    .begin_pass(meta.source, lvl, Some(from), pass_cancel, vec![k0])
+                    .expect("begin pass");
+                src.produce_pass(&ctx, &mut |plvl, px, py, _, _, _| {
+                    sched.on_tile_arrived(&meta.tile_key(plvl, px, py));
+                    Ok(())
+                })
+                .expect("produce_pass");
+                sched.finish_pass(meta.source, pass_id, true);
+            }
+        }
+        assert!(!sched.is_in_flight(&k0));
+    }
 }
 
 #[test]

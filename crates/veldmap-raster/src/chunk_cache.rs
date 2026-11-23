@@ -54,6 +54,12 @@ enum ChunkFailure {
         height: u32,
     },
     InvalidFormat(String),
+    UnsupportedFormat,
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    Decode(String),
     Tiff(String),
 }
 
@@ -78,7 +84,28 @@ impl ChunkFailure {
                 height: *height,
             },
             RasterError::InvalidFormat(msg) => Self::InvalidFormat(msg.clone()),
-            RasterError::Io(io_err) if io_err.is_cancelled() => Self::Cancelled,
+            RasterError::UnsupportedFormat => Self::UnsupportedFormat,
+            RasterError::Io(io_err) => {
+                if io_err.is_cancelled() {
+                    Self::Cancelled
+                } else {
+                    let kind = match io_err {
+                        veldmap_core::io::IoError::UnexpectedEof { .. } => {
+                            std::io::ErrorKind::UnexpectedEof
+                        }
+                        veldmap_core::io::IoError::InvalidInput(_) => {
+                            std::io::ErrorKind::InvalidInput
+                        }
+                        veldmap_core::io::IoError::Io(inner) => inner.kind(),
+                        veldmap_core::io::IoError::Cancelled => std::io::ErrorKind::Other,
+                    };
+                    Self::Io {
+                        kind,
+                        message: io_err.to_string(),
+                    }
+                }
+            }
+            RasterError::Decode(img_err) => Self::Decode(img_err.to_string()),
             other => Self::Tiff(other.to_string()),
         }
     }
@@ -102,6 +129,11 @@ impl ChunkFailure {
                 RasterError::InvalidDimensions { width, height }
             }
             Self::InvalidFormat(msg) => RasterError::InvalidFormat(msg),
+            Self::UnsupportedFormat => RasterError::UnsupportedFormat,
+            Self::Io { kind, message } => RasterError::Io(veldmap_core::io::IoError::Io(
+                std::io::Error::new(kind, message),
+            )),
+            Self::Decode(msg) => RasterError::Tiff(msg),
             Self::Tiff(msg) => RasterError::Tiff(msg),
         }
     }

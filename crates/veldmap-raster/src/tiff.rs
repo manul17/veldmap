@@ -1,7 +1,7 @@
 //! GeoTIFF / BigTIFF / Cloud-Optimized GeoTIFF (COG) reader built over
 //! positioned [`ByteSource`] with explicit `tiff::decoder::Limits`,
 //! `MAX_IFDS` bounds, `GeoDoubleParamsTag`/`GeoAsciiParamsTag` parsing,
-//! `Predictor = 3` (Float32) & ZSTD support, and singleflight chunk caching.
+//! ZSTD & `Predictor = 3` (via `tiff`) support, and singleflight chunk caching.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -9,18 +9,17 @@ use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 use veldmap_core::budget::{DecodeBudgetTracker, DecodePeak, MemoryBudget};
 use veldmap_core::io::{
-    BufferedByteReader, ByteSource, CancelToken, SourceFingerprint, lock_unpoisoned,
+    BufferedByteReader, ByteSource, CancelToken, IoError, SourceFingerprint, lock_unpoisoned,
 };
 use veldmap_core::tile::{BandKey, DecodedTile, LevelPlan, PixelFormat, PyramidMeta, SourceId};
 
 use crate::RasterError;
 use crate::band::{
-    BandInfo, GeoKeyParams, GeoPlacement, GeoRasterType, GeoTie, RasterDescription, SampleType,
-    is_valid_lat_lon,
+    BandInfo, GeoKeyParams, GeoPlacement, GeoTie, RasterDescription, SampleType, is_valid_lat_lon,
 };
 use crate::chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
 use crate::grid::{self, Chunked, Grid, Overview};
-use crate::pyramid::{self, RASTER_TILE_SIZE};
+use crate::pyramid::RASTER_TILE_SIZE;
 use crate::radiometry::{self, DisplayMapping, PixelLayout, Samples, percentile_stretch};
 use crate::table;
 
@@ -40,15 +39,14 @@ pub const MAX_SOURCE_SIDE: u32 = 65_536;
 /// Current display decode revision encoded into `TileKey` and `ChunkKey`.
 pub const TIFF_DECODE_REV: u32 = 1;
 
-const DECODED_COMPRESSIONS: [(u16, &str); 8] = [
-    (1, "no compression"),
-    (4, "Fax4"),
-    (5, "LZW"),
-    (7, "JPEG"),
-    (8, "Deflate"),
-    (0x8005, "PackBits"),
-    (0x80B2, "Deflate (old code)"),
-    (0xC350, "ZSTD"),
+const DECODED_COMPRESSIONS: [u16; 7] = [
+    1,      // None
+    5,      // LZW
+    7,      // JPEG
+    8,      // Deflate
+    0x8005, // PackBits
+    0x80B2, // Deflate (old code)
+    0xC350, // ZSTD
 ];
 
 /// Return whether `head` begins with a classic TIFF or BigTIFF signature.
@@ -61,7 +59,6 @@ fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
     let mut limits = Limits::default();
     limits.decoding_buffer_size = budget.decode_working_bytes.min(256 * 1024 * 1024) as usize;
     limits.intermediate_buffer_size = 128 * 1024 * 1024;
-    limits.ifd_value_size = 4 * 1024 * 1024;
     limits
 }
 
@@ -122,20 +119,27 @@ impl TiffSource {
             });
         }
 
-        ensure_chunky(&mut decoder)?;
-        let (pixel_layout, sample_bits, sample_type) = ensure_readable(&mut decoder)?;
+        ensure_chunky(&mut decoder, cancel)?;
+        let (pixel_layout, sample_bits, sample_type) = ensure_readable(&mut decoder, cancel)?;
         let tiled = decoder.get_tag_unsigned::<u32>(Tag::TileWidth).is_ok();
-        let depth = depth_of(&mut decoder)?;
-        let chunk = chunk_grid(&mut decoder, budget).unwrap_or((width, height));
+        let depth = depth_of_layout(pixel_layout, sample_bits);
+        let chunk = chunk_grid(&mut decoder, budget, depth, cancel)?;
 
-        let nodata_f64 = decoder
-            .get_tag_ascii_string(Tag::GdalNodata)
-            .ok()
-            .and_then(|s| s.trim().trim_end_matches('\0').parse::<f64>().ok())
-            .filter(|v| v.is_finite());
-        let nodata = nodata_f64.map(|v| v as f32);
+        let nodata_f64 = parse_gdal_nodata(&mut decoder, cancel)?;
+        let nodata = nodata_f64.and_then(|v| {
+            if v.is_nan() {
+                None
+            } else {
+                Some(v.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32)
+            }
+        });
 
-        let (ties, placement, binding_trouble) = georef(&mut decoder, width, height);
+        let ParsedGeoref {
+            ties,
+            placement,
+            foreign_datum_epsg,
+            trouble: binding_trouble,
+        } = georef(&mut decoder, width, height, cancel)?;
 
         let mut overviews = Vec::new();
         let mut ifd_index = 0usize;
@@ -157,16 +161,39 @@ impl TiffSource {
             if !is_overview(subfile) {
                 continue;
             }
-            if ensure_chunky(&mut decoder).is_err() || ensure_readable(&mut decoder).is_err() {
-                continue;
+            match (
+                ensure_chunky(&mut decoder, cancel),
+                ensure_readable(&mut decoder, cancel),
+            ) {
+                (Ok(()), Ok((o_layout, o_bits, o_type))) => {
+                    if o_layout != pixel_layout || o_bits != sample_bits || o_type != sample_type {
+                        continue;
+                    }
+                }
+                (Err(RasterError::Cancelled), _) | (_, Err(RasterError::Cancelled)) => {
+                    return Err(RasterError::Cancelled);
+                }
+                _ => {
+                    if cancel.is_cancelled() {
+                        return Err(RasterError::Cancelled);
+                    }
+                    continue;
+                }
             }
             let Ok((ow, oh)) = decoder.dimensions() else {
+                if cancel.is_cancelled() {
+                    return Err(RasterError::Cancelled);
+                }
                 continue;
             };
             if ow == 0 || oh == 0 {
                 continue;
             }
-            let ochunk = chunk_grid(&mut decoder, budget).unwrap_or((ow, oh));
+            let ochunk = match chunk_grid(&mut decoder, budget, depth, cancel) {
+                Ok(c) => c,
+                Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
+                Err(_) => continue,
+            };
             overviews.push(Overview {
                 image: ifd_index,
                 width: ow,
@@ -209,6 +236,7 @@ impl TiffSource {
             )],
             ties,
             placement,
+            foreign_datum_epsg,
             binding_trouble,
             levels,
         };
@@ -453,8 +481,8 @@ impl<'a> TiffChunkReader<'a> {
         decoder
             .seek_to_image(image)
             .map_err(|e| map_tiff_error(e, cancel))?;
-        ensure_chunky(decoder)?;
-        let (layout, _, _) = model(decoder.colortype().map_err(|e| map_tiff_error(e, cancel))?)?;
+        ensure_chunky(decoder, cancel)?;
+        let (layout, _, _) = ensure_readable(decoder, cancel)?;
         self.aimed_image = Some((image, layout));
         Ok((decoder, layout))
     }
@@ -527,9 +555,18 @@ fn map_tiff_error(err: tiff::TiffError, cancel: &CancelToken) -> RasterError {
         return RasterError::Cancelled;
     }
     match &err {
-        tiff::TiffError::IoError(io_err) if io_err.kind() == std::io::ErrorKind::Interrupted => {
+        tiff::TiffError::IoError(io_err)
+            if io_err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<IoError>())
+                .is_some_and(IoError::is_cancelled) =>
+        {
             RasterError::Cancelled
         }
+        tiff::TiffError::IoError(io_err) => RasterError::Io(IoError::Io(std::io::Error::new(
+            io_err.kind(),
+            io_err.to_string(),
+        ))),
         tiff::TiffError::LimitsExceeded => RasterError::LimitExceeded {
             width: 0,
             height: 0,
@@ -546,10 +583,21 @@ fn is_overview(subfile_type: u32) -> bool {
     subfile_type & REDUCED != 0 && subfile_type & MASK == 0
 }
 
-fn ensure_chunky(decoder: &mut Decoder<BufferedByteReader>) -> Result<(), RasterError> {
-    let planar = decoder
-        .get_tag_unsigned::<u16>(Tag::PlanarConfiguration)
-        .unwrap_or(1);
+fn ensure_chunky(
+    decoder: &mut Decoder<BufferedByteReader>,
+    cancel: &CancelToken,
+) -> Result<(), RasterError> {
+    let planar = match decoder.get_tag_unsigned::<u16>(Tag::PlanarConfiguration) {
+        Ok(v) => v,
+        Err(tiff::TiffError::FormatError(tiff::TiffFormatError::RequiredTagNotFound(_))) => 1,
+        Err(err) => {
+            if cancel.is_cancelled() {
+                return Err(RasterError::Cancelled);
+            }
+            let _ = err;
+            1
+        }
+    };
     if planar != 1 {
         return Err(RasterError::Tiff(
             "planar sample layout (PlanarConfiguration != 1) is not supported yet".to_string(),
@@ -558,13 +606,14 @@ fn ensure_chunky(decoder: &mut Decoder<BufferedByteReader>) -> Result<(), Raster
     Ok(())
 }
 
-fn model(color: tiff::ColorType) -> Result<(PixelLayout, u8, SampleType), RasterError> {
+fn model(
+    decoder: &mut Decoder<BufferedByteReader>,
+    color: tiff::ColorType,
+    cancel: &CancelToken,
+) -> Result<(PixelLayout, u8, SampleType), RasterError> {
     match color {
         tiff::ColorType::Gray(bits) => {
             Ok((PixelLayout::named(1), bits, sample_type_from_bits(bits)?))
-        }
-        tiff::ColorType::GrayA(bits) => {
-            Ok((PixelLayout::named(2), bits, sample_type_from_bits(bits)?))
         }
         tiff::ColorType::RGB(bits) => {
             Ok((PixelLayout::named(3), bits, sample_type_from_bits(bits)?))
@@ -575,11 +624,32 @@ fn model(color: tiff::ColorType) -> Result<(PixelLayout, u8, SampleType), Raster
         tiff::ColorType::Multiband {
             bit_depth,
             num_samples,
-        } => Ok((
-            PixelLayout::stack(usize::from(num_samples)),
-            bit_depth,
-            sample_type_from_bits(bit_depth)?,
-        )),
+        } => {
+            let photometric = match decoder.get_tag_unsigned::<u16>(Tag::PhotometricInterpretation)
+            {
+                Ok(v) => Some(v),
+                Err(_) if cancel.is_cancelled() => return Err(RasterError::Cancelled),
+                Err(_) => None,
+            };
+            if photometric == Some(0) && num_samples > 1 {
+                return Err(RasterError::Tiff(
+                    "WhiteIsZero with multiple samples is not supported".to_string(),
+                ));
+            }
+            let layout = if num_samples == 2 && photometric == Some(1) {
+                let extra = decoder
+                    .get_tag_u16_vec(Tag::ExtraSamples)
+                    .unwrap_or_default();
+                if extra.iter().any(|&v| v == 1 || v == 2) {
+                    PixelLayout::named(2)
+                } else {
+                    PixelLayout::stack(usize::from(num_samples))
+                }
+            } else {
+                PixelLayout::stack(usize::from(num_samples))
+            };
+            Ok((layout, bit_depth, sample_type_from_bits(bit_depth)?))
+        }
         other => Err(RasterError::Tiff(format!(
             "color model {other:?} is not supported"
         ))),
@@ -597,25 +667,21 @@ fn sample_type_from_bits(bits: u8) -> Result<SampleType, RasterError> {
     }
 }
 
-fn depth_of(decoder: &mut Decoder<BufferedByteReader>) -> Result<u32, RasterError> {
-    let (layout, bits, _) = model(
-        decoder
-            .colortype()
-            .map_err(|e| RasterError::Tiff(e.to_string()))?,
-    )?;
-    Ok(layout.channels as u32 * u32::from(bits.div_ceil(8)))
+const fn depth_of_layout(layout: PixelLayout, bits: u8) -> u32 {
+    layout.channels as u32 * bits.div_ceil(8) as u32
 }
 
 fn chunk_grid(
     decoder: &mut Decoder<BufferedByteReader>,
     budget: &MemoryBudget,
+    depth: u32,
+    cancel: &CancelToken,
 ) -> Result<(u32, u32), RasterError> {
-    ensure_chunky(decoder)?;
+    ensure_chunky(decoder, cancel)?;
     let (cw, ch) = decoder.chunk_dimensions();
     if cw == 0 || ch == 0 {
         return Err(RasterError::Tiff("zero TIFF chunk dimensions".to_string()));
     }
-    let depth = depth_of(decoder)?;
     DecodePeak::new()
         .with(
             "fresh chunk",
@@ -627,11 +693,10 @@ fn chunk_grid(
 
 fn ensure_readable(
     decoder: &mut Decoder<BufferedByteReader>,
+    cancel: &CancelToken,
 ) -> Result<(PixelLayout, u8, SampleType), RasterError> {
-    let color = decoder
-        .colortype()
-        .map_err(|e| RasterError::Tiff(e.to_string()))?;
-    let (layout, bits, mut stype) = model(color)?;
+    let color = decoder.colortype().map_err(|e| map_tiff_error(e, cancel))?;
+    let (layout, bits, mut stype) = model(decoder, color, cancel)?;
     if bits < 8 {
         return Err(RasterError::Tiff(format!(
             "{bits} bits per sample cannot unpack directly into pixels"
@@ -649,7 +714,7 @@ fn ensure_decodable(decoder: &mut Decoder<BufferedByteReader>) -> Result<(), Ras
     let code = decoder
         .get_tag_unsigned::<u16>(Tag::Compression)
         .unwrap_or(1);
-    if DECODED_COMPRESSIONS.iter().any(|(known, _)| *known == code) {
+    if DECODED_COMPRESSIONS.contains(&code) {
         return Ok(());
     }
     Err(RasterError::Tiff(format!(
@@ -734,17 +799,26 @@ fn compute_mapping(
     if cw == 0 || ch == 0 {
         return Ok(DisplayMapping::identity(nodata));
     }
-    let (pixel, _, _) = model(decoder.colortype().map_err(|e| map_tiff_error(e, cancel))?)?;
+    let (pixel, _, _) = ensure_readable(&mut decoder, cancel)?;
 
     let total = u64::from(w.div_ceil(cw)) * u64::from(h.div_ceil(ch));
     let mut picks = Vec::new();
-    for raw_idx in [0, total / 3, (2 * total) / 3, total.saturating_sub(1)] {
-        if let Ok(idx) = u32::try_from(raw_idx) {
-            picks.push(idx);
+    if total > 0 {
+        let count = total.min(9);
+        if count == 1 {
+            picks.push(0);
+        } else {
+            for i in 0..count {
+                let raw_idx = (i * (total - 1)) / (count - 1);
+                if let Ok(idx) = u32::try_from(raw_idx) {
+                    picks.push(idx);
+                }
+            }
         }
+        picks.dedup();
     }
-    picks.dedup();
 
+    let target_per_chunk = (radiometry::STRETCH_SAMPLES / picks.len().max(1)).max(1);
     let mut values = Vec::new();
     for index in picks {
         if cancel.is_cancelled() {
@@ -758,7 +832,9 @@ fn compute_mapping(
             .map_err(|e| map_tiff_error(e, cancel))?;
         let samples = typed_samples(&raw)?;
         let pixels = samples.len() / pixel.channels.max(1);
-        let step = (pixels * 4 / radiometry::STRETCH_SAMPLES).max(1);
+        let step = (pixels * pixel.colors().max(1))
+            .div_ceil(target_per_chunk)
+            .max(1);
         for at in (0..pixels).step_by(step) {
             for channel in 0..pixel.colors() {
                 let v = samples.get(at * pixel.channels + channel);
@@ -768,6 +844,7 @@ fn compute_mapping(
             }
         }
     }
+    values.truncate(radiometry::STRETCH_SAMPLES);
 
     Ok(match percentile_stretch(&mut values) {
         Some((lo, hi)) => DisplayMapping::stretched(lo, hi, nodata),
@@ -775,33 +852,93 @@ fn compute_mapping(
     })
 }
 
+fn parse_gdal_nodata(
+    decoder: &mut Decoder<BufferedByteReader>,
+    cancel: &CancelToken,
+) -> Result<Option<f64>, RasterError> {
+    let raw = match decoder.get_tag_ascii_string(Tag::GdalNodata) {
+        Ok(s) => s,
+        Err(tiff::TiffError::FormatError(tiff::TiffFormatError::RequiredTagNotFound(_))) => {
+            return Ok(None);
+        }
+        Err(_) if cancel.is_cancelled() => return Err(RasterError::Cancelled),
+        Err(_) => return Ok(None),
+    };
+    let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if trimmed.eq_ignore_ascii_case("nan") {
+        return Ok(Some(f64::NAN));
+    }
+    Ok(trimmed.parse::<f64>().ok().filter(|v| v.is_finite()))
+}
+
+fn read_tag_u16_vec_opt(
+    decoder: &mut Decoder<BufferedByteReader>,
+    tag: Tag,
+    cancel: &CancelToken,
+) -> Result<Vec<u16>, RasterError> {
+    match decoder.get_tag_u16_vec(tag) {
+        Ok(v) => Ok(v),
+        Err(_) if cancel.is_cancelled() => Err(RasterError::Cancelled),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+fn read_tag_f64_vec_opt(
+    decoder: &mut Decoder<BufferedByteReader>,
+    tag: Tag,
+    cancel: &CancelToken,
+) -> Result<Vec<f64>, RasterError> {
+    match decoder.get_tag_f64_vec(tag) {
+        Ok(v) => Ok(v),
+        Err(_) if cancel.is_cancelled() => Err(RasterError::Cancelled),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+fn read_tag_ascii_opt(
+    decoder: &mut Decoder<BufferedByteReader>,
+    tag: Tag,
+    cancel: &CancelToken,
+) -> Result<String, RasterError> {
+    match decoder.get_tag_ascii_string(tag) {
+        Ok(v) => Ok(v),
+        Err(_) if cancel.is_cancelled() => Err(RasterError::Cancelled),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+struct ParsedGeoref {
+    ties: Vec<GeoTie>,
+    placement: Option<GeoPlacement>,
+    foreign_datum_epsg: Option<u16>,
+    trouble: Option<String>,
+}
+
 fn georef(
     decoder: &mut Decoder<BufferedByteReader>,
     width: u32,
     height: u32,
-) -> (Vec<GeoTie>, Option<GeoPlacement>, Option<String>) {
-    let raw_keys = decoder
-        .get_tag_u16_vec(Tag::GeoKeyDirectoryTag)
-        .unwrap_or_default();
-    let double_params = decoder
-        .get_tag_f64_vec(Tag::GeoDoubleParamsTag)
-        .unwrap_or_default();
-    let ascii_params = decoder
-        .get_tag_ascii_string(Tag::GeoAsciiParamsTag)
-        .unwrap_or_default();
+    cancel: &CancelToken,
+) -> Result<ParsedGeoref, RasterError> {
+    let raw_keys = read_tag_u16_vec_opt(decoder, Tag::GeoKeyDirectoryTag, cancel)?;
+    let double_params = read_tag_f64_vec_opt(decoder, Tag::GeoDoubleParamsTag, cancel)?;
+    let ascii_params = read_tag_ascii_opt(decoder, Tag::GeoAsciiParamsTag, cancel)?;
     let geo_params = GeoKeyParams::parse(&raw_keys, &double_params, &ascii_params);
 
-    let points = decoder
-        .get_tag_f64_vec(Tag::ModelTiepointTag)
-        .unwrap_or_default();
-    let scale = decoder
-        .get_tag_f64_vec(Tag::ModelPixelScaleTag)
-        .unwrap_or_default();
-    let matrix = decoder
-        .get_tag_f64_vec(Tag::ModelTransformationTag)
-        .unwrap_or_default();
+    let points = read_tag_f64_vec_opt(decoder, Tag::ModelTiepointTag, cancel)?;
+    let scale = read_tag_f64_vec_opt(decoder, Tag::ModelPixelScaleTag, cancel)?;
+    let matrix = read_tag_f64_vec_opt(decoder, Tag::ModelTransformationTag, cancel)?;
 
-    let placement = geo_placement(&geo_params, &points, &scale, &matrix, width, height);
+    let foreign_datum_epsg = foreign_datum(&geo_params);
+    let placement = geo_placement(
+        &geo_params,
+        foreign_datum_epsg,
+        &points,
+        &scale,
+        &matrix,
+        width,
+        height,
+    );
     let ties = geo_ties(&geo_params, &points, &scale, &matrix, width, height);
 
     let carries = !points.is_empty() || !scale.is_empty() || !matrix.is_empty();
@@ -816,15 +953,36 @@ fn georef(
         )
     });
 
-    (ties, placement, trouble)
+    Ok(ParsedGeoref {
+        ties,
+        placement,
+        foreign_datum_epsg,
+        trouble,
+    })
 }
 
 fn foreign_datum(geo_params: &GeoKeyParams) -> Option<u16> {
     const WGS84: [u16; 3] = [4326, 4979, 4055];
     const UNSAID: [u16; 2] = [0, 32767];
-    geo_params
+    if let Some(code) = geo_params
         .geographic_crs
         .filter(|code| !WGS84.contains(code) && !UNSAID.contains(code))
+    {
+        return Some(code);
+    }
+    // Check GeogGeodeticDatumGeoKey (2050): 6326 = WGS 84.
+    if let Some(datum) = geo_params
+        .get_u16(2050)
+        .filter(|code| *code != 6326 && !UNSAID.contains(code))
+    {
+        return Some(datum);
+    }
+    // Pulkovo 1942 Gauss-Kruger zones (EPSG:28401..=28499) imply Pulkovo-42 (4284)
+    // even when GeoKey 2048 is omitted.
+    if matches!(geo_params.projected_crs, Some(28400..=28499)) {
+        return Some(4284);
+    }
+    None
 }
 
 fn usable_step(scale: &[f64]) -> bool {
@@ -848,6 +1006,7 @@ fn affine_from_matrix(matrix: &[f64], half: f64) -> Option<[f64; 6]> {
 
 fn geo_placement(
     geo_params: &GeoKeyParams,
+    foreign_datum_epsg: Option<u16>,
     points: &[f64],
     scale: &[f64],
     matrix: &[f64],
@@ -887,7 +1046,7 @@ fn geo_placement(
     Some(GeoPlacement {
         epsg,
         affine,
-        foreign_datum_epsg: foreign_datum(geo_params),
+        foreign_datum_epsg,
         geo_params: geo_params.clone(),
     })
 }
@@ -905,9 +1064,9 @@ fn geo_ties(
     }
     let half = geo_params.raster_type.half_pixel_shift();
     let finite_ties = |ties: Vec<GeoTie>| -> Vec<GeoTie> {
-        let valid = ties.iter().all(|t| {
-            t.px.is_finite() && t.py.is_finite() && t.lat.is_finite() && t.lon.is_finite()
-        });
+        let valid = ties
+            .iter()
+            .all(|t| t.px.is_finite() && t.py.is_finite() && is_valid_lat_lon(t.lat, t.lon));
         if valid { ties } else { Vec::new() }
     };
 
@@ -921,10 +1080,7 @@ fn geo_ties(
                 lat: tie[4],
             })
             .collect();
-        if ties.iter().all(|t| is_valid_lat_lon(t.lat, t.lon)) {
-            return finite_ties(ties);
-        }
-        return Vec::new();
+        return finite_ties(ties);
     }
 
     if let (Some(tie), true) = (points.get(..6), usable_step(scale)) {
@@ -976,14 +1132,4 @@ fn geo_ties(
     }
 
     Vec::new()
-}
-
-/// Convert `GeoRasterType` to boolean `PixelIsPoint` for callers.
-pub const fn is_pixel_is_point(raster_type: GeoRasterType) -> bool {
-    matches!(raster_type, GeoRasterType::PixelIsPoint)
-}
-
-/// Helper verifying pyramid sizing matches `pyramid::level_count`.
-pub fn pyramid_level_count(width: u32, height: u32) -> u32 {
-    pyramid::level_count(width, height)
 }

@@ -29,8 +29,6 @@ pub enum IoError {
         requested: usize,
         read: usize,
     },
-    #[error("read offset {offset} exceeds source length {len}")]
-    OutOfBounds { offset: u64, len: u64 },
     #[error("invalid I/O argument: {0}")]
     InvalidInput(String),
     #[error("I/O error: {0}")]
@@ -44,13 +42,15 @@ impl IoError {
     }
 
     /// Convert into `std::io::Error` for `std::io::Read`/`Seek` adapters.
+    ///
+    /// Uses `ErrorKind::Other` (never `ErrorKind::Interrupted`) for
+    /// [`Self::Cancelled`] so `std::io::Read::read_exact` / `read_to_end` abort
+    /// immediately instead of retrying in a loop.
     pub fn into_std_io(self) -> io::Error {
         match self {
-            Self::Cancelled => io::Error::new(io::ErrorKind::Interrupted, self),
+            Self::Cancelled => io::Error::other(self),
             Self::UnexpectedEof { .. } => io::Error::new(io::ErrorKind::UnexpectedEof, self),
-            Self::OutOfBounds { .. } | Self::InvalidInput(_) => {
-                io::Error::new(io::ErrorKind::InvalidInput, self)
-            }
+            Self::InvalidInput(_) => io::Error::new(io::ErrorKind::InvalidInput, self),
             Self::Io(err) => err,
         }
     }
@@ -86,6 +86,12 @@ pub trait ByteSource: Send + Sync {
                 return Err(IoError::Cancelled);
             }
             let n = self.read_at(cursor, buf, cancel)?;
+            if n > buf.len() {
+                return Err(IoError::InvalidInput(format!(
+                    "ByteSource::read_at returned {n} bytes for a {}-byte buffer",
+                    buf.len()
+                )));
+            }
             if n == 0 {
                 return Err(IoError::UnexpectedEof {
                     offset,
@@ -279,10 +285,20 @@ impl BufferedByteReader {
         if self.cancel.is_cancelled() {
             return Err(IoError::Cancelled.into_std_io());
         }
+        // Invalidate the cached window before calling `read_at` so a failed or
+        // short-written refill cannot leave stale metadata pointing at overwritten bytes.
+        self.buf_len = 0;
         let n = self
             .source
             .read_at(offset, &mut self.buf, &self.cancel)
             .map_err(IoError::into_std_io)?;
+        if n > self.buf.len() {
+            return Err(IoError::InvalidInput(format!(
+                "ByteSource::read_at returned {n} bytes for a {}-byte window",
+                self.buf.len()
+            ))
+            .into_std_io());
+        }
         self.buf_offset = offset;
         self.buf_len = n;
         Ok(n)
@@ -307,6 +323,13 @@ impl Read for BufferedByteReader {
                 .source
                 .read_at(self.pos, out, &self.cancel)
                 .map_err(IoError::into_std_io)?;
+            if n > out.len() {
+                return Err(IoError::InvalidInput(format!(
+                    "ByteSource::read_at returned {n} bytes for a {}-byte output buffer",
+                    out.len()
+                ))
+                .into_std_io());
+            }
             self.pos = self.pos.saturating_add(n as u64);
             return Ok(n);
         }

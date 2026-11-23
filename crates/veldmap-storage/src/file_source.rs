@@ -69,6 +69,7 @@ impl LocalFileSource {
         Ok(PooledFile {
             pool: &self.pool,
             file: Some(file),
+            reusable: false,
         })
     }
 }
@@ -76,10 +77,14 @@ impl LocalFileSource {
 struct PooledFile<'a> {
     pool: &'a Mutex<Vec<File>>,
     file: Option<File>,
+    reusable: bool,
 }
 
 impl Drop for PooledFile<'_> {
     fn drop(&mut self) {
+        if !self.reusable {
+            return;
+        }
         if let Some(file) = self.file.take() {
             let mut pool = lock_unpoisoned(self.pool);
             if pool.len() < MAX_POOLED_HANDLES {
@@ -107,7 +112,9 @@ impl ByteSource for LocalFileSource {
             .file
             .as_mut()
             .ok_or_else(|| IoError::InvalidInput("missing pooled file handle".to_string()))?;
-        read_file_at(file, offset, buf, cancel)
+        let read = read_file_at(file, offset, buf, cancel)?;
+        handle.reusable = true;
+        Ok(read)
     }
 }
 

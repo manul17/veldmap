@@ -232,7 +232,75 @@ fn buffered_reader_caches_window_and_counting_source_tracks_spans() {
     assert_ne!(fp.to_source_id(), crate::tile::SourceId::BUNDLED_BASEMAP);
     assert!(format!("{fp:?}").contains("abababababab.."));
 
-    // Cancelled reads fail promptly.
+    // Cancelled reads fail promptly (including `std::io::Read::read_exact`,
+    // which must NOT spin on `ErrorKind::Interrupted`).
+    let reader_cancel = CancelToken::new();
+    let mut cancel_reader = BufferedByteReader::with_capacity(
+        Arc::new(ChunkySource(payload.clone())),
+        reader_cancel.clone(),
+        16,
+    );
+    let mut head = [0u8; 4];
+    cancel_reader.read_exact(&mut head).expect("read head");
+    assert_eq!(head, [0, 1, 2, 3]);
+    reader_cancel.cancel();
+    let mut after_cancel = [0u8; 8];
+    let err = cancel_reader
+        .read_exact(&mut after_cancel)
+        .expect_err("cancelled read_exact must abort without spinning");
+    assert_ne!(err.kind(), std::io::ErrorKind::Interrupted);
+    assert!(
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<IoError>())
+            .is_some_and(IoError::is_cancelled)
+    );
+
+    // Out-of-window backward seek, SeekFrom::Current/End, and large-read bypass.
+    let mut nav_reader = BufferedByteReader::with_capacity(
+        Arc::clone(&counting) as Arc<dyn ByteSource>,
+        CancelToken::new(),
+        16,
+    );
+    let mut large = vec![0u8; 32];
+    nav_reader
+        .read_exact(&mut large)
+        .expect("large bypass read");
+    assert_eq!(large, &payload[0..32]);
+    assert_eq!(
+        nav_reader
+            .seek(SeekFrom::Current(-16))
+            .expect("seek current"),
+        16
+    );
+    let mut mid = [0u8; 4];
+    nav_reader
+        .read_exact(&mut mid)
+        .expect("read after seek back");
+    assert_eq!(mid, [16, 17, 18, 19]);
+    assert_eq!(nav_reader.seek(SeekFrom::End(-4)).expect("seek end"), 124);
+    nav_reader.read_exact(&mut mid).expect("read tail");
+    assert_eq!(mid, [124, 125, 126, 127]);
+
+    // Faulty ByteSource returning `n > buf.len()` fails cleanly instead of panicking.
+    struct OverlongSource;
+    impl ByteSource for OverlongSource {
+        fn len(&self) -> u64 {
+            64
+        }
+        fn read_at(&self, _: u64, buf: &mut [u8], _: &CancelToken) -> Result<usize, IoError> {
+            Ok(buf.len() + 1)
+        }
+    }
+    let overlong_tok = CancelToken::new();
+    let mut small = [0u8; 4];
+    assert!(matches!(
+        OverlongSource.read_exact_at(0, &mut small, &overlong_tok),
+        Err(IoError::InvalidInput(_))
+    ));
+    let mut bad_reader =
+        BufferedByteReader::with_capacity(Arc::new(OverlongSource), overlong_tok, 8);
+    assert!(bad_reader.read_exact(&mut small).is_err());
+
     cancel.cancel();
     assert!(
         counting
