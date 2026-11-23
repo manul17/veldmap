@@ -1,7 +1,6 @@
 //! Queue, in-flight tracking, and failure/backoff state machine for
 //! [`super::LiveTilePipeline`].
 
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +11,7 @@ use veldmap_core::tile::{SourceId, TileKey};
 use crate::basemap::LiveBasemapSpec;
 
 use super::NetworkStatus;
+use super::queue::CoarsestTileQueue;
 
 /// Upper bound on retained permanent/empty per-tile markers to prevent
 /// unbounded memory growth on sparse 404/204 layers over long sessions.
@@ -36,11 +36,10 @@ pub(super) struct PipelineState {
     /// Unready, active-source, contract-valid keys from the most recent
     /// `reconcile_wanted`, used by idle backoff retries and `retry_failed`.
     last_wanted: HashSet<TileKey>,
-    /// Coarsest-first queue awaiting fast local disk-cache lookup (stored
-    /// reverse-sorted so `pop()` yields the coarsest key in O(1)).
-    pending_disk: Vec<TileKey>,
+    /// Coarsest-first queue awaiting fast local disk-cache lookup.
+    pending_disk: CoarsestTileQueue,
     /// Coarsest-first queue of disk misses awaiting an HTTP per-host slot.
-    pending_http: Vec<TileKey>,
+    pending_http: CoarsestTileQueue,
     /// Active blocking disk-lookup tasks (bounded by `MAX_CONCURRENT_DISK_LOOKUPS`).
     disk_in_flight: usize,
     /// Tracks active `(generation, CancelToken)` from dispatch all the way
@@ -61,45 +60,6 @@ pub(super) struct PipelineState {
 }
 
 impl PipelineState {
-    pub(super) fn sort_queue_coarsest_at_end(queue: &mut [TileKey]) {
-        queue.sort_by_key(|k| Reverse(k.coarsest_first_key()));
-    }
-
-    /// Insert a single `TileKey` into a `coarsest_at_end`-sorted queue without
-    /// duplicating entries or re-sorting the entire `Vec`.
-    fn insert_unique_sorted(queue: &mut Vec<TileKey>, key: TileKey) -> bool {
-        let sort_key = Reverse(key.coarsest_first_key());
-        match queue.binary_search_by_key(&sort_key, |k| Reverse(k.coarsest_first_key())) {
-            Ok(_) => false,
-            Err(idx) => {
-                queue.insert(idx, key);
-                true
-            }
-        }
-    }
-
-    fn push_unique_sorted(
-        queue: &mut Vec<TileKey>,
-        keys: impl IntoIterator<Item = TileKey>,
-    ) -> bool {
-        let mut iter = keys.into_iter().peekable();
-        if iter.peek().is_none() {
-            return false;
-        }
-        let mut existing: HashSet<TileKey> = queue.iter().copied().collect();
-        let mut added = false;
-        for key in iter {
-            if existing.insert(key) {
-                queue.push(key);
-                added = true;
-            }
-        }
-        if added {
-            Self::sort_queue_coarsest_at_end(queue);
-        }
-        added
-    }
-
     fn is_suppressed(&self, key: &TileKey) -> bool {
         self.failures.contains_key(key) || self.backoffs.contains_key(key)
     }
@@ -112,6 +72,46 @@ impl PipelineState {
 
     fn is_queue_eligible(&self, key: &TileKey, active_source: SourceId) -> bool {
         key.source == active_source && !self.in_flight.contains_key(key) && !self.is_suppressed(key)
+    }
+
+    fn drain_expired_backoffs(&mut self, now: Instant) -> Vec<(TileKey, bool)> {
+        let mut expired = Vec::new();
+        self.backoffs.retain(|&key, entry| {
+            if entry.until <= now {
+                expired.push((key, entry.retry_disk));
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    }
+
+    fn requeue_eligible_entries(
+        &mut self,
+        active_source: SourceId,
+        entries: Vec<(TileKey, bool)>,
+    ) -> bool {
+        let mut disk_requeue = Vec::new();
+        let mut http_requeue = Vec::new();
+        for (key, retry_disk) in entries {
+            if key.source == active_source
+                && self.last_wanted.contains(&key)
+                && !self.in_flight.contains_key(&key)
+                && !self.failures.contains_key(&key)
+                && !self.pending_disk.contains(&key)
+                && !self.pending_http.contains(&key)
+            {
+                if retry_disk {
+                    disk_requeue.push(key);
+                } else {
+                    http_requeue.push(key);
+                }
+            }
+        }
+        let requeued_disk = self.pending_disk.push_unique(disk_requeue);
+        let requeued_http = self.pending_http.push_unique(http_requeue);
+        requeued_disk || requeued_http
     }
 
     pub(super) fn active_spec(&self) -> Option<Arc<LiveBasemapSpec>> {
@@ -180,22 +180,15 @@ impl PipelineState {
         // Drain expired backoffs (`until <= now`) and route `retry_disk: false`
         // directly to `pending_http` so expired HTTP retries never bounce back
         // through SQLite disk lookups.
-        let mut expired_http = Vec::new();
-        self.backoffs.retain(|&key, entry| {
-            if entry.until <= now {
-                if !entry.retry_disk {
-                    expired_http.push(key);
-                }
-                false
-            } else {
-                true
-            }
-        });
+        let expired_http: Vec<TileKey> = self
+            .drain_expired_backoffs(now)
+            .into_iter()
+            .filter_map(|(key, retry_disk)| (!retry_disk).then_some(key))
+            .collect();
 
         // Retain still-wanted / active-root entries already in `pending_http`
         // so disk misses never bounce back to `pending_disk`.
-        let mut already_in_http = HashSet::new();
-        {
+        let mut already_in_http = {
             let Self {
                 last_wanted,
                 failures,
@@ -204,20 +197,17 @@ impl PipelineState {
                 pending_http,
                 ..
             } = self;
-            pending_http.retain(|key| {
-                let keep = key.source == active_source
+            pending_http.retain_and_collect(|key| {
+                key.source == active_source
                     && !is_ready(key)
                     && !in_flight.contains_key(key)
                     && !failures.contains_key(key)
                     && !backoffs.contains_key(key)
-                    && (last_wanted.contains(key) || key.is_root_of(active_source));
-                if keep {
-                    already_in_http.insert(*key);
-                }
-                keep
-            });
-        }
+                    && (last_wanted.contains(key) || key.is_root_of(active_source))
+            })
+        };
 
+        let mut promoted_http = Vec::new();
         for key in expired_http {
             if key.source == active_source
                 && self.last_wanted.contains(&key)
@@ -226,9 +216,10 @@ impl PipelineState {
                 && !self.failures.contains_key(&key)
                 && already_in_http.insert(key)
             {
-                self.pending_http.push(key);
+                promoted_http.push(key);
             }
         }
+        self.pending_http.push_unique(promoted_http);
 
         let mut next_disk = Vec::new();
         for &key in &self.last_wanted {
@@ -240,24 +231,26 @@ impl PipelineState {
             }
             next_disk.push(key);
         }
-        Self::sort_queue_coarsest_at_end(&mut next_disk);
-        Self::sort_queue_coarsest_at_end(&mut self.pending_http);
-        self.pending_disk = next_disk;
+        self.pending_disk.replace_sorted(next_disk);
         Some(cancelled)
     }
 
     pub(super) fn retry_failed(&mut self) {
         // Preserve valid `204 Empty` markers across manual retries while
         // clearing all `Terminal` failures and active backoff timers.
-        let mut cleared_terminal = Vec::new();
+        let mut entries: Vec<(TileKey, bool)> = Vec::new();
         self.failures.retain(|&key, marker| match marker {
             FailureMarker::Empty => true,
             FailureMarker::Terminal => {
-                cleared_terminal.push(key);
+                entries.push((key, true));
                 false
             }
         });
-        let cleared_backoffs: Vec<(TileKey, BackoffEntry)> = self.backoffs.drain().collect();
+        entries.extend(
+            self.backoffs
+                .drain()
+                .map(|(key, entry)| (key, entry.retry_disk)),
+        );
 
         self.failed_count = 0;
         self.offline = false;
@@ -267,34 +260,7 @@ impl PipelineState {
             return;
         };
         let active_source = spec.source_id();
-        let queued_http: HashSet<TileKey> = self.pending_http.iter().copied().collect();
-
-        let is_eligible = |key: &TileKey| {
-            key.source == active_source
-                && self.last_wanted.contains(key)
-                && !self.in_flight.contains_key(key)
-                && !self.failures.contains_key(key)
-                && !queued_http.contains(key)
-        };
-
-        let mut disk_requeue = Vec::new();
-        let mut http_requeue = Vec::new();
-        for key in cleared_terminal {
-            if is_eligible(&key) {
-                disk_requeue.push(key);
-            }
-        }
-        for (key, entry) in cleared_backoffs {
-            if is_eligible(&key) {
-                if entry.retry_disk {
-                    disk_requeue.push(key);
-                } else {
-                    http_requeue.push(key);
-                }
-            }
-        }
-        Self::push_unique_sorted(&mut self.pending_disk, disk_requeue);
-        Self::push_unique_sorted(&mut self.pending_http, http_requeue);
+        self.requeue_eligible_entries(active_source, entries);
     }
 
     pub(super) fn status(&self) -> NetworkStatus {
@@ -327,12 +293,12 @@ impl PipelineState {
         if self.pending_disk.is_empty() {
             return;
         }
-        let drained: Vec<TileKey> = self.pending_disk.drain(..).collect();
+        let drained = self.pending_disk.drain();
         let eligible: Vec<TileKey> = drained
             .into_iter()
             .filter(|key| self.is_queue_eligible(key, active_source))
             .collect();
-        Self::push_unique_sorted(&mut self.pending_http, eligible);
+        self.pending_http.push_unique(eligible);
     }
 
     pub(super) fn pop_next_disk(
@@ -380,18 +346,7 @@ impl PipelineState {
     }
 
     pub(super) fn restore_deferred_http(&mut self, deferred: Vec<TileKey>, multi_host: bool) {
-        if deferred.is_empty() {
-            return;
-        }
-        // `deferred` was popped coarsest-first from the back of `pending_http`;
-        // reversing restores ascending-priority order cleanly without a full sort
-        // for single-host short-circuits, and sorting when mixed.
-        if multi_host {
-            self.pending_http.extend(deferred);
-            Self::sort_queue_coarsest_at_end(&mut self.pending_http);
-        } else {
-            self.pending_http.extend(deferred.into_iter().rev());
-        }
+        self.pending_http.restore_deferred(deferred, multi_host);
     }
 
     pub(super) fn remove_in_flight_if_gen(&mut self, key: &TileKey, generation: u64) -> bool {
@@ -417,7 +372,7 @@ impl PipelineState {
             return false;
         }
         if can_requeue && self.is_active_source(key.source) && !self.is_suppressed(&key) {
-            Self::insert_unique_sorted(&mut self.pending_http, key);
+            self.pending_http.insert_unique(key);
         }
         true
     }
@@ -551,40 +506,11 @@ impl PipelineState {
             return false;
         };
         let active_source = spec.source_id();
-        let mut expired = Vec::new();
-        self.backoffs.retain(|&key, entry| {
-            if entry.until <= now {
-                expired.push((key, entry.retry_disk));
-                false
-            } else {
-                true
-            }
-        });
+        let expired = self.drain_expired_backoffs(now);
         if expired.is_empty() {
             return false;
         }
-        let queued_disk: HashSet<TileKey> = self.pending_disk.iter().copied().collect();
-        let queued_http: HashSet<TileKey> = self.pending_http.iter().copied().collect();
-        let mut disk_requeue = Vec::new();
-        let mut http_requeue = Vec::new();
-        for (key, retry_disk) in expired {
-            if key.source == active_source
-                && self.last_wanted.contains(&key)
-                && !self.in_flight.contains_key(&key)
-                && !self.failures.contains_key(&key)
-                && !queued_disk.contains(&key)
-                && !queued_http.contains(&key)
-            {
-                if retry_disk {
-                    disk_requeue.push(key);
-                } else {
-                    http_requeue.push(key);
-                }
-            }
-        }
-        let requeued_disk = Self::push_unique_sorted(&mut self.pending_disk, disk_requeue);
-        let requeued_http = Self::push_unique_sorted(&mut self.pending_http, http_requeue);
-        requeued_disk || requeued_http
+        self.requeue_eligible_entries(active_source, expired)
     }
 
     /// Earliest backoff timestamp among currently wanted tiles (used by
@@ -672,20 +598,5 @@ mod tests {
         }
         assert!(st.failures.len() <= MAX_FAILURE_ENTRIES);
         assert!(st.backoffs.contains_key(&active_backoff));
-    }
-
-    #[test]
-    fn insert_unique_sorted_maintains_coarsest_at_end_order() {
-        let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
-        let mut queue = Vec::new();
-        let k0 = wm_key(&spec, 0, 0, 0);
-        let k1 = wm_key(&spec, 2, 1, 1);
-        let k2 = wm_key(&spec, 1, 0, 0);
-
-        assert!(PipelineState::insert_unique_sorted(&mut queue, k1));
-        assert!(PipelineState::insert_unique_sorted(&mut queue, k0));
-        assert!(PipelineState::insert_unique_sorted(&mut queue, k2));
-        assert!(!PipelineState::insert_unique_sorted(&mut queue, k1));
-        assert_eq!(queue, vec![k1, k2, k0]);
     }
 }

@@ -9,7 +9,8 @@ use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, Til
 
 use crate::NetError;
 use crate::redact::{
-    parse_url_authority, percent_encode_variants, sanitize_url_for_display, sanitize_urls_in_text,
+    fmt_redacted_custom_xyz_fields, parse_url_authority, percent_encode_variants,
+    redact_secret_label, sanitize_url_for_display, sanitize_urls_in_text,
 };
 
 /// Minimum allowed custom XYZ/TMS maximum zoom level.
@@ -90,21 +91,17 @@ pub struct CustomBasemapConfig<'a> {
 
 impl fmt::Debug for CustomBasemapConfig<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CustomBasemapConfig")
-            .field("name", &self.name)
-            .field("url_template", &sanitize_url_for_display(self.url_template))
-            .field(
-                "api_key",
-                &if self.api_key.is_empty() {
-                    "<empty>"
-                } else {
-                    "<redacted>"
-                },
-            )
-            .field("tms_flip_y", &self.tms_flip_y)
-            .field("max_level", &self.max_level)
-            .field("attribution", &self.attribution)
-            .finish()
+        let mut s = f.debug_struct("CustomBasemapConfig");
+        fmt_redacted_custom_xyz_fields(
+            &mut s,
+            self.name,
+            self.url_template,
+            self.api_key,
+            self.tms_flip_y,
+            self.max_level,
+            self.attribution,
+        );
+        s.finish()
     }
 }
 
@@ -140,11 +137,7 @@ impl fmt::Debug for LiveBasemapSpec {
             .field("tms_flip_y", &self.tms_flip_y)
             .field(
                 "api_key",
-                &if self.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
-                    "<redacted>"
-                } else {
-                    "<none>"
-                },
+                &redact_secret_label(self.api_key.as_deref(), "<none>"),
             )
             .finish()
     }

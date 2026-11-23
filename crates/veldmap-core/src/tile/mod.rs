@@ -15,8 +15,8 @@ pub use decoded::{
     DecodedTile, DecodedTileError, max_mip_levels, mip_chain_byte_size, mip_dimensions,
 };
 pub use geometry::{
-    LatLonTileBounds, POLAR_R_CAP, lat_lon_bounds, mercator_lat_deg, polar_cap_point,
-    sample_tile_surface, web_mercator_y_bounds,
+    LatLonTileBounds, POLAR_R_CAP, lat_lon_bounds, polar_cap_point, sample_tile_surface,
+    web_mercator_y_bounds,
 };
 pub use key::{
     BandKey, GlobeScheme, PixelFormat, PlanetaryScheme, QuadTileId, SourceId, TileKey, TileScheme,

@@ -12,7 +12,7 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use veldmap_net::{
-    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, is_valid_gibs_date, sanitize_url_for_display,
+    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, fmt_redacted_custom_xyz_fields, is_valid_gibs_date,
 };
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
@@ -133,24 +133,17 @@ impl Default for CustomXyzSettings {
 
 impl fmt::Debug for CustomXyzSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CustomXyzSettings")
-            .field("name", &self.name)
-            .field(
-                "url_template",
-                &sanitize_url_for_display(&self.url_template),
-            )
-            .field(
-                "api_key",
-                &if self.api_key.is_empty() {
-                    "<empty>"
-                } else {
-                    "<redacted>"
-                },
-            )
-            .field("tms_flip_y", &self.tms_flip_y)
-            .field("max_level", &self.max_level)
-            .field("attribution", &self.attribution)
-            .finish()
+        let mut s = f.debug_struct("CustomXyzSettings");
+        fmt_redacted_custom_xyz_fields(
+            &mut s,
+            &self.name,
+            &self.url_template,
+            &self.api_key,
+            self.tms_flip_y,
+            self.max_level,
+            &self.attribution,
+        );
+        s.finish()
     }
 }
 

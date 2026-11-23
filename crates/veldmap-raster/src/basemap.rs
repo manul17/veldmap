@@ -12,9 +12,9 @@
 
 use std::fmt;
 
+use veldmap_core::geo::projection::web_mercator_lat_deg;
 use veldmap_core::tile::{
-    DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, mercator_lat_deg, polar_cap_point,
-    web_mercator_y_bounds,
+    DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, polar_cap_point, web_mercator_y_bounds,
 };
 
 use crate::RasterError;
@@ -343,7 +343,7 @@ impl BundledBasemap {
             data,
             |t| {
                 let merc = merc_n + (merc_s - merc_n) * t;
-                let lat = mercator_lat_deg(merc);
+                let lat = web_mercator_lat_deg(merc);
                 // Local d(lat_deg)/d(merc) = (180 / pi) * cos(lat).
                 let dlat_per_px =
                     (180.0 / std::f64::consts::PI) * lat.to_radians().cos() * d_merc_per_px;

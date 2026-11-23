@@ -16,6 +16,20 @@ use crate::resample::{Window, bleed_alpha, resample_rgba8_window};
 /// Minimum chunk pixel area eligible for pointwise random access.
 pub const MIN_CHUNK_PIXELS: u64 = 32 * 32;
 
+/// Working memory in bytes for decoding a `dw x dh` chunk with `depth` raw
+/// bytes/pixel, optionally adding 4 bytes/pixel for RGBA8 display expansion.
+pub(crate) fn chunk_working_bytes(
+    dw: u32,
+    dh: u32,
+    depth: u32,
+    includes_rgba8_output: bool,
+) -> u64 {
+    let per_pixel = u64::from(depth).saturating_add(if includes_rgba8_output { 4 } else { 0 });
+    u64::from(dw)
+        .saturating_mul(u64::from(dh))
+        .saturating_mul(per_pixel)
+}
+
 /// Cost of reading one tile at a pointwise level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Footprint {
@@ -133,9 +147,7 @@ impl Grid {
 
     /// Peak memory of decoding one fresh chunk `(cw, ch)` before expansion.
     pub fn chunk_bytes(&self, chunk: (u32, u32)) -> u64 {
-        u64::from(chunk.0)
-            .saturating_mul(u64::from(chunk.1))
-            .saturating_mul(u64::from(self.depth).saturating_add(4))
+        chunk_working_bytes(chunk.0, chunk.1, self.depth, true)
     }
 
     /// Estimated working memory peak for pointwise reading at `level`.

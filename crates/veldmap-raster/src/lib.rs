@@ -11,16 +11,15 @@ use veldmap_core::tile::PlanetaryScheme;
 
 pub mod band;
 mod basemap;
-pub mod cascade;
+mod cascade;
 pub mod chunk_cache;
 mod decode_pool;
 pub mod grid;
 mod map_tile;
 mod mipmap;
 pub mod pyramid;
-pub mod radiometry;
+mod radiometry;
 pub mod resample;
-pub mod table;
 pub mod tiff;
 
 pub use band::{

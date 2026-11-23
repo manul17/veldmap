@@ -9,11 +9,10 @@ use glam::DVec3;
 use crate::geo::camera::Camera;
 use crate::geo::cull::{Ball, Frame as CullFrame};
 use crate::geo::geodesy;
+use crate::geo::projection::web_mercator_lat_deg;
 use crate::geo::sag;
 
-use super::geometry::{
-    lat_lon_bounds, mercator_lat_deg, sample_tile_surface, web_mercator_y_bounds,
-};
+use super::geometry::{lat_lon_bounds, sample_tile_surface, web_mercator_y_bounds};
 use super::key::{GlobeScheme, PlanetaryScheme, QuadTileId};
 
 /// Default mesh grid cells per quadtree tile side (`16 x 16` quads = 289
@@ -235,7 +234,7 @@ fn sample_web_mercator_grid(
     let cols_f = f64::from(cols);
     let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
     let lats = [0u32, 1, 2, 3, 4]
-        .map(|row| mercator_lat_deg(merc_n + (merc_s - merc_n) * (f64::from(row) * 0.25)));
+        .map(|row| web_mercator_lat_deg(merc_n + (merc_s - merc_n) * (f64::from(row) * 0.25)));
     let lons = [0u32, 1, 2, 3, 4]
         .map(|col| -180.0 + 360.0 * (f64::from(id.x) + f64::from(col) * 0.25) / cols_f);
     fill_separable_grid(lats, lons, samples, sample_units);
@@ -250,10 +249,11 @@ fn sample_web_mercator_grid(
     } else {
         merc_s + 0.5 * d_merc
     };
-    let cell_dlat = (mercator_lat_deg((merc_eq + 0.5 * d_merc).min(merc_n))
-        - mercator_lat_deg((merc_eq - 0.5 * d_merc).max(merc_s)))
+    let cell_dlat = (web_mercator_lat_deg((merc_eq + 0.5 * d_merc).min(merc_n))
+        - web_mercator_lat_deg((merc_eq - 0.5 * d_merc).max(merc_s)))
     .abs();
-    let cell_dlon = (360.0 / (cols_f * grid_cells)) * mercator_lat_deg(merc_eq).to_radians().cos();
+    let cell_dlon =
+        (360.0 / (cols_f * grid_cells)) * web_mercator_lat_deg(merc_eq).to_radians().cos();
     Some(cell_dlat.hypot(cell_dlon))
 }
 

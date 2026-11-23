@@ -1,16 +1,23 @@
-//! Alpha-weighted RGBA8 pyramid halving (`halve_rgba8`), fractional window
-//! area resampling (`resample_rgba8_window`), and nodata color bleeding
-//! (`bleed_alpha`).
+//! Alpha-weighted linear-light RGBA8 pyramid halving (`halve_rgba8`),
+//! fractional window area resampling (`resample_rgba8_window`), and nodata
+//! color bleeding (`bleed_alpha`).
 
-/// Alpha-weighted 2x2 block average (`w x h` -> `ceil(w/2) x ceil(h/2)`).
+use crate::mipmap::{
+    average_srgb_rgba8_block, linear_to_srgb_lut, linear_to_srgb_u8, srgb_to_linear_lut,
+};
+
+/// Alpha-weighted linear-light 2x2 sRGB block average
+/// (`w x h` -> `ceil(w/2) x ceil(h/2)`).
 ///
-/// Rounds to nearest and keeps fully transparent blocks deterministic `[0, 0, 0, 0]`.
+/// Keeps fully transparent blocks deterministic `[0, 0, 0, 0]`.
 pub fn halve_rgba8(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
     debug_assert_eq!(src.len(), (w as usize) * (h as usize) * 4);
 
+    let to_lin = srgb_to_linear_lut();
+    let to_srgb = linear_to_srgb_lut();
     let (dw, dh) = (w.div_ceil(2), h.div_ceil(2));
     let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
     for dy in 0..dh {
@@ -19,24 +26,22 @@ pub fn halve_rgba8(src: &[u8], w: u32, h: u32) -> Vec<u8> {
         for dx in 0..dw {
             let x0 = dx * 2;
             let x1 = (x0 + 2).min(w);
-            let mut rgb = [0u32; 3];
-            let mut alpha = 0u32;
+            let mut offsets = [0usize; 4];
+            let mut n = 0usize;
             for y in y0..y1 {
                 for x in x0..x1 {
-                    let px = ((y as usize) * (w as usize) + (x as usize)) * 4;
-                    let a = u32::from(src[px + 3]);
-                    for c in 0..3 {
-                        rgb[c] += u32::from(src[px + c]) * a;
-                    }
-                    alpha += a;
+                    offsets[n] = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                    n += 1;
                 }
             }
-            let area = (y1 - y0) * (x1 - x0);
             let out_px = ((dy as usize) * (dw as usize) + (dx as usize)) * 4;
-            for (c, out_c) in out[out_px..out_px + 3].iter_mut().enumerate() {
-                *out_c = (rgb[c] + alpha / 2).checked_div(alpha).unwrap_or(0) as u8;
-            }
-            out[out_px + 3] = ((alpha + area / 2) / area) as u8;
+            average_srgb_rgba8_block(
+                src,
+                &offsets[..n],
+                to_lin,
+                to_srgb,
+                &mut out[out_px..out_px + 4],
+            );
         }
     }
     out
@@ -87,6 +92,8 @@ pub fn resample_rgba8_window(
         return src.to_vec();
     }
 
+    let to_lin = srgb_to_linear_lut();
+    let to_srgb = linear_to_srgb_lut();
     let x_spans = spans(window.x0, window.x1, dw);
     let y_spans = spans(window.y0, window.y1, dh);
 
@@ -105,9 +112,9 @@ pub fn resample_rgba8_window(
                     let wx = overlap(sx, x0, x1);
                     let px = row + (sx as usize) * 4;
                     let w = wx * wy;
-                    let aw = f64::from(src[px + 3]) * w;
+                    let aw = (f64::from(src[px + 3]) / 255.0) * w;
                     for c in 0..3 {
-                        rgb[c] += f64::from(src[px + c]) * aw;
+                        rgb[c] += f64::from(to_lin[usize::from(src[px + c])]) * aw;
                     }
                     alpha += aw;
                     area += w;
@@ -117,16 +124,16 @@ pub fn resample_rgba8_window(
             }
             let out_px = (dy * (dw as usize) + dx) * 4;
             for c in 0..3 {
-                out[out_px + c] = if alpha == 0.0 {
+                out[out_px + c] = if alpha <= 1e-9 {
                     0
                 } else {
-                    (rgb[c] / alpha).round().clamp(0.0, 255.0) as u8
+                    linear_to_srgb_u8((rgb[c] / alpha) as f32, to_srgb)
                 };
             }
             out[out_px + 3] = if area == 0.0 {
                 0
             } else {
-                (alpha / area).round().clamp(0.0, 255.0) as u8
+                ((alpha / area) * 255.0).round().clamp(0.0, 255.0) as u8
             };
         }
     }
@@ -231,15 +238,29 @@ mod tests {
 
     #[test]
     fn halve_and_bleed_handle_transparency_and_edges() {
+        // Checkerboard [0, 255] averages to 0.5 in linear light (~188 sRGB, not 128).
+        let checker = [
+            0, 0, 0, 255, 255, 255, 255, 255, //
+            255, 255, 255, 255, 0, 0, 0, 255,
+        ];
+        let halved = halve_rgba8(&checker, 2, 2);
+        assert!(halved[0].abs_diff(188) <= 2 && halved[3] == 255);
+        let resampled = resample_rgba8(&checker, 2, 2, 1, 1);
+        assert!(resampled[0].abs_diff(188) <= 2 && resampled[3] == 255);
+
+        // 3x3 odd boundary keeps 2x2, 1x2, 2x1, and 1x1 edge cells exact in linear light.
         let mut src = Vec::new();
         for v in [10u8, 20, 30, 40, 50, 60, 70, 80, 90] {
             src.extend_from_slice(&[v, v, v, 255]);
         }
         let out = halve_rgba8(&src, 3, 3);
-        assert_eq!(&out[0..4], &[30, 30, 30, 255]);
-        assert_eq!(&out[4..8], &[45, 45, 45, 255]);
-        assert_eq!(&out[8..12], &[75, 75, 75, 255]);
+        assert_eq!(out.len(), 16);
         assert_eq!(&out[12..16], &[90, 90, 90, 255]);
+        assert!(
+            out[0] > 30 && out[0] < 40,
+            "linear avg > gamma 30: {}",
+            out[0]
+        );
 
         let mixed = [
             255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0,

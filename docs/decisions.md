@@ -16,7 +16,7 @@ Concise record of **implemented** architectural decisions—focusing on *why alt
 
 - **No `memmap2` for user files (banned in [deny.toml](../deny.toml)):** Memory-mapped I/O in Rust risks `SIGBUS` UB on truncated, removable, or network-backed files. Positioned I/O (`pread`/`seek_read`) with caller buffers is safe, portable, and mirrors HTTP Range reads. (Wayland SHM wrappers `smithay-client-toolkit` and `winit` remain exempted.)
 - **TLS via `rustls` + `ring`, no OpenSSL or heavy ORMs:** `openssl`/`openssl-sys` and `sqlx` are banned in [deny.toml](../deny.toml) to avoid cross-OS TLS linking issues and heavyweight ORM plumbing. `veldmap-net` explicitly configures `reqwest` with `rustls-no-provider` and `rustls`'s `ring` provider (compiled via `cc` with zero external CMake/NASM build tools while satisfying `deny.toml` SPDX checks).
-- **No external C geospatial libraries (`gdal`/`proj`); self-contained bundled SQLite for ephemeral tile cache:** Default builds avoid external C system libraries (`gdal`, `proj`, `libhdf5`) and keep `veldmap-core` permanently pure-Rust, while self-contained `cc`-compiled crates (`ring` for TLS and `rusqlite` `bundled` for the ephemeral tile cache, `§6`) remain allowed when justified.
+- **No external C geospatial libraries (`gdal`/`proj`); self-contained bundled SQLite & ZSTD:** Default builds avoid external C system libraries (`gdal`, `proj`, `libhdf5`) and keep `veldmap-core` permanently pure-Rust, while self-contained `cc`-compiled crates (`ring` for TLS, `rusqlite` `bundled` for the ephemeral tile cache §6, and `zstd-sys` via `tiff`'s `zstd` feature §7) remain allowed when justified.
 
 ## 3. Smooth WGS84 Ellipsoid (`height = 0.0`), Reverse-Z & 2 m Floor
 

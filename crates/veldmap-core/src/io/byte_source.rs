@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use crate::io::{CancelToken, lock_unpoisoned};
-use crate::tile::SourceId;
+use super::{CancelToken, lock_unpoisoned};
 
 /// Default internal buffer size for [`BufferedByteReader`] (`64 KiB`).
 pub const DEFAULT_READER_BUFFER_BYTES: usize = 64 * 1024;
@@ -397,11 +396,6 @@ impl SourceFingerprint {
         }
         out
     }
-
-    /// Derive a deterministic [`SourceId`] from this fingerprint.
-    pub fn to_source_id(&self) -> SourceId {
-        SourceId::from_stable_key(&self.to_hex())
-    }
 }
 
 impl fmt::Display for SourceFingerprint {
@@ -409,6 +403,10 @@ impl fmt::Display for SourceFingerprint {
         f.write_str(&self.to_hex())
     }
 }
+
+#[cfg(test)]
+#[path = "byte_source_tests.rs"]
+mod tests;
 
 impl fmt::Debug for SourceFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

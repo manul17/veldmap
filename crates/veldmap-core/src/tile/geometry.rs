@@ -25,12 +25,6 @@ pub struct LatLonTileBounds {
     pub raw_lat_south_deg: f64,
 }
 
-/// Convert Web Mercator Y radians (`[-pi, +pi]`) to geodetic latitude in degrees.
-#[inline]
-pub fn mercator_lat_deg(merc: f64) -> f64 {
-    web_mercator_lat_deg(merc)
-}
-
 /// Compute Web Mercator north/south Y coordinates `(merc_n, merc_s)` in radians
 /// for tile row `y` out of `rows` rows.
 #[inline]
@@ -73,8 +67,8 @@ pub fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
         }
         PlanetaryScheme::WebMercator => {
             let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
-            let lat_north_deg = mercator_lat_deg(merc_n);
-            let lat_south_deg = mercator_lat_deg(merc_s);
+            let lat_north_deg = web_mercator_lat_deg(merc_n);
+            let lat_south_deg = web_mercator_lat_deg(merc_s);
             Some(LatLonTileBounds {
                 lon_west_deg,
                 lon_east_deg,
@@ -142,7 +136,7 @@ pub fn sample_tile_surface(
             let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
             let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
             let merc = merc_n + (merc_s - merc_n) * t;
-            let lat = mercator_lat_deg(merc);
+            let lat = web_mercator_lat_deg(merc);
             Some((lat, lon, s, t, 0.0, 0.0))
         }
         PlanetaryScheme::PolarCap { north } => {
@@ -165,9 +159,9 @@ mod tests {
         let (n0, s0) = web_mercator_y_bounds(0, 1);
         assert!((n0 - std::f64::consts::PI).abs() < 1e-12);
         assert!((s0 + std::f64::consts::PI).abs() < 1e-12);
-        assert!((mercator_lat_deg(n0) - WEB_MERCATOR_LIMIT_DEG).abs() < 1e-6);
-        assert!((mercator_lat_deg(s0) + WEB_MERCATOR_LIMIT_DEG).abs() < 1e-6);
-        assert!(mercator_lat_deg(0.0).abs() < 1e-12);
+        assert!((web_mercator_lat_deg(n0) - WEB_MERCATOR_LIMIT_DEG).abs() < 1e-6);
+        assert!((web_mercator_lat_deg(s0) + WEB_MERCATOR_LIMIT_DEG).abs() < 1e-6);
+        assert!(web_mercator_lat_deg(0.0).abs() < 1e-12);
 
         let (n1, s1) = web_mercator_y_bounds(0, 2);
         assert!((n1 - std::f64::consts::PI).abs() < 1e-12);

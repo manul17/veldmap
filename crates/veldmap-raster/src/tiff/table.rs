@@ -8,7 +8,7 @@ use crate::grid::Grid;
 use crate::pyramid;
 
 /// Build the per-level serving plan (`0..level_count`) for a chunked raster.
-pub fn build_chunked_level_table(
+pub(super) fn build_chunked_level_table(
     grid: &Grid,
     width: u32,
     height: u32,

@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - **Rust toolchain:** Rust `1.95` or newer (Rust 2024 edition). The repository pins the exact toolchain and components (`rustfmt`, `clippy`) in [rust-toolchain.toml](../rust-toolchain.toml).
-- **C compiler (`cc`):** Required by self-contained bundled native crates (`libsqlite3-sys` for the SQLite tile cache and `ring` for TLS—no external C system libraries or CMake required): `build-essential` on Debian/Ubuntu, Xcode Command Line Tools on macOS, or MSVC Build Tools on Windows.
+- **C compiler (`cc`):** Required by self-contained bundled native crates (`libsqlite3-sys` for the SQLite tile cache, `ring` for TLS, and `zstd-sys` via `tiff`'s `zstd` feature—no external C system libraries or CMake required): `build-essential` on Debian/Ubuntu, Xcode Command Line Tools on macOS, or MSVC Build Tools on Windows.
 - **Graphics driver:** A Vulkan, DirectX 12, or Metal driver (`wgpu::Backends::PRIMARY` minus `BROWSER_WEBGPU`). OpenGL/GLES and WebGPU are intentionally unsupported.
 - **Linux system libraries:** X11/Wayland development headers are needed to compile `eframe`/`winit`:
 

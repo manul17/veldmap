@@ -37,6 +37,17 @@ impl SourceId {
     pub const fn from_stable_key(key: &str) -> Self {
         Self(fnv1a_64(key.as_bytes()) | (1u64 << 63))
     }
+
+    /// Derive a deterministic [`SourceId`] from a content [`crate::io::SourceFingerprint`].
+    pub fn from_fingerprint(fingerprint: &crate::io::SourceFingerprint) -> Self {
+        Self::from_stable_key(&fingerprint.to_hex())
+    }
+}
+
+impl From<&crate::io::SourceFingerprint> for SourceId {
+    fn from(fingerprint: &crate::io::SourceFingerprint) -> Self {
+        Self::from_fingerprint(fingerprint)
+    }
 }
 
 /// Deterministic, `Copy` band selector avoiding heap allocations in `TileKey`.

@@ -29,11 +29,6 @@ impl Samples<'_> {
         }
     }
 
-    /// Return `true` when the slice contains zero samples.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Read scalar sample `i` as `f32`.
     pub fn get(&self, i: usize) -> f32 {
         match self {

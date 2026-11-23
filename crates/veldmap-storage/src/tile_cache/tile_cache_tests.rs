@@ -5,7 +5,7 @@ use std::time::Duration;
 use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme};
 
 use super::evict::EVICT_BATCH_ROWS;
-use super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE};
+use super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE, init_connection};
 use super::*;
 use crate::test_support::TestTempDir;
 

@@ -31,9 +31,9 @@ use self::key::EncodedKey;
 use self::schema::{
     CLEAR_BLOBS_SQL, CLEAR_META_SQL, DELETE_META_BY_ID_SQL, DELETE_SOURCE_META_SQL,
     SELECT_META_ID_BYTES_SQL, SELECT_TILE_BLOB_SQL, TOUCH_META_SQL, UPSERT_BLOB_SQL,
-    UPSERT_META_SQL, decrement_cache_meta, init_connection, is_corrupt_sqlite_error,
-    open_and_init_file_db, open_read_only_connection, read_cache_meta_totals, remove_sqlite_files,
-    reset_cache_meta, set_cache_meta_totals, sidecar_path,
+    UPSERT_META_SQL, decrement_cache_meta, is_corrupt_sqlite_error, open_and_init_file_db,
+    open_read_only_connection, read_cache_meta_totals, recreate_file_db, reset_cache_meta,
+    set_cache_meta_totals, sidecar_path,
 };
 
 pub use self::key::{DiskTileKey, TileBlobEncoding, valid_source_key};
@@ -247,10 +247,7 @@ impl TileDiskCache {
                     error = %err,
                     "Corrupt ephemeral tile cache detected; deleting and recreating clean SQLite WAL cache"
                 );
-                remove_sqlite_files(&path);
-                let fresh = Connection::open(&path)?;
-                let max_ts = init_connection(&fresh, true, true)?;
-                (fresh, max_ts)
+                recreate_file_db(&path)?
             }
             Err(err) => return Err(StorageError::Sqlite(err)),
         };

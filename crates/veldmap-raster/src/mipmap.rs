@@ -59,7 +59,7 @@ pub(crate) fn linear_to_srgb_u8(linear: f32, lut: &[u8; LINEAR_TO_SRGB_LUT_LEN])
 }
 
 #[inline]
-fn mix_2x2_srgb_rgb(
+pub(crate) fn mix_2x2_srgb_rgb(
     src: &[u8],
     offsets: [usize; 4],
     weights: [f32; 4],
@@ -74,6 +74,36 @@ fn mix_2x2_srgb_rgb(
             + to_lin[usize::from(src[offsets[3] + ch])] * weights[3];
         out[ch] = linear_to_srgb_u8(lin, to_srgb);
     }
+}
+
+/// Alpha-weighted linear-light 2x2 sRGB average across `count <= 4` pixel
+/// byte offsets in `src`, writing RGBA8 to `out`.
+#[inline]
+pub(crate) fn average_srgb_rgba8_block(
+    src: &[u8],
+    offsets: &[usize],
+    to_lin: &[f32; 256],
+    to_srgb: &[u8; LINEAR_TO_SRGB_LUT_LEN],
+    out: &mut [u8],
+) {
+    let mut a_sum = 0.0_f64;
+    let mut lin_rgb = [0.0_f64; 3];
+    for &off in offsets {
+        let a = f64::from(src[off + 3]) / 255.0;
+        a_sum += a;
+        for (ch, acc) in lin_rgb.iter_mut().enumerate() {
+            *acc += f64::from(to_lin[usize::from(src[off + ch])]) * a;
+        }
+    }
+    if a_sum <= 1e-9 {
+        out[..4].copy_from_slice(&[0, 0, 0, 0]);
+        return;
+    }
+    for (ch, acc) in lin_rgb.iter().enumerate() {
+        out[ch] = linear_to_srgb_u8((*acc / a_sum) as f32, to_srgb);
+    }
+    let count = offsets.len().max(1) as f64;
+    out[3] = ((a_sum / count) * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 /// Downsample an opaque packed `Rgb8` sRGB image 2x in linear light, wrapping
@@ -147,32 +177,8 @@ fn downsample_rgba8_srgb_2x(
                 (sy1 * sw + sx1) * 4,
             ];
 
-            let a00 = f32::from(src[offsets[0] + 3]) / 255.0;
-            let a10 = f32::from(src[offsets[1] + 3]) / 255.0;
-            let a01 = f32::from(src[offsets[2] + 3]) / 255.0;
-            let a11 = f32::from(src[offsets[3] + 3]) / 255.0;
-            let a_sum = a00 + a10 + a01 + a11;
-
             let out = (y * dw + x) * 4;
-            if a_sum <= 1e-6 {
-                dst[out..out + 4].copy_from_slice(&[0, 0, 0, 0]);
-                continue;
-            }
-
-            // Alpha-weighted linear-light average prevents dark halo bleed from
-            // transparent border pixels while reducing to a pure 0.25 average
-            // for opaque satellite tiles.
-            let inv_a = 1.0 / a_sum;
-            let weights = [a00 * inv_a, a10 * inv_a, a01 * inv_a, a11 * inv_a];
-            mix_2x2_srgb_rgb(
-                src,
-                offsets,
-                weights,
-                to_lin,
-                to_srgb,
-                &mut dst[out..out + 3],
-            );
-            dst[out + 3] = ((a_sum * 0.25) * 255.0).round().clamp(0.0, 255.0) as u8;
+            average_srgb_rgba8_block(src, &offsets, to_lin, to_srgb, &mut dst[out..out + 4]);
         }
     }
 

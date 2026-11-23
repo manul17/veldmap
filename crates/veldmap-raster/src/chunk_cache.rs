@@ -133,7 +133,7 @@ impl ChunkFailure {
             Self::Io { kind, message } => RasterError::Io(veldmap_core::io::IoError::Io(
                 std::io::Error::new(kind, message),
             )),
-            Self::Decode(msg) => RasterError::Tiff(msg),
+            Self::Decode(msg) => RasterError::InvalidFormat(msg),
             Self::Tiff(msg) => RasterError::Tiff(msg),
         }
     }

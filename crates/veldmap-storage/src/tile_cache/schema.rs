@@ -261,6 +261,13 @@ pub(super) fn init_connection(
     Ok(max_ts.max(0))
 }
 
+pub(super) fn recreate_file_db(path: &Path) -> Result<(Connection, i64), rusqlite::Error> {
+    remove_sqlite_files(path);
+    let fresh = Connection::open(path)?;
+    let max_ts = init_connection(&fresh, true, true)?;
+    Ok((fresh, max_ts))
+}
+
 pub(super) fn open_and_init_file_db(path: &Path) -> Result<(Connection, i64), rusqlite::Error> {
     let conn = Connection::open(path)?;
     // Configure `busy_timeout` BEFORE probing PRAGMAs so multi-process WAL
@@ -276,10 +283,7 @@ pub(super) fn open_and_init_file_db(path: &Path) -> Result<(Connection, i64), ru
             "Upgrading ephemeral SQLite tile cache schema; recreating clean cache"
         );
         drop(conn);
-        remove_sqlite_files(path);
-        let fresh = Connection::open(path)?;
-        let max_ts = init_connection(&fresh, true, true)?;
-        return Ok((fresh, max_ts));
+        return recreate_file_db(path);
     }
     let max_ts = init_connection(&conn, true, page_count == 0)?;
     Ok((conn, max_ts))

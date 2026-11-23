@@ -45,23 +45,28 @@ pub fn bytes(base_w: u32, base_h: u32) -> u64 {
 
 fn bands_bytes(base_w: u32, base_h: u32) -> u64 {
     levels(base_w, base_h)
-        .map(|(w, rows, _)| u64::from(w) * rows * 4)
+        .map(|(w, h, _)| u64::from(w) * u64::from(h.min(RASTER_TILE_SIZE)) * 4)
         .sum()
 }
 
 fn flush_bytes(base_w: u32, base_h: u32) -> u64 {
     let halves: u64 = levels(base_w, base_h)
         .filter(|(_, _, is_apex)| !is_apex)
-        .map(|(w, rows, _)| u64::from(w.div_ceil(2)) * rows.div_ceil(2) * 4)
+        .map(|(w, h, _)| {
+            let rows = u64::from(h.min(RASTER_TILE_SIZE));
+            u64::from(w.div_ceil(2)) * rows.div_ceil(2) * 4
+        })
         .sum();
     let tile = levels(base_w, base_h)
-        .map(|(w, rows, _)| u64::from(w.min(RASTER_TILE_SIZE)) * rows * 4)
+        .map(|(w, h, _)| {
+            u64::from(w.min(RASTER_TILE_SIZE)) * u64::from(h.min(RASTER_TILE_SIZE)) * 4
+        })
         .max()
         .unwrap_or(0);
     halves.saturating_add(tile)
 }
 
-fn levels(base_w: u32, base_h: u32) -> impl Iterator<Item = (u32, u64, bool)> {
+fn levels(base_w: u32, base_h: u32) -> impl Iterator<Item = (u32, u32, bool)> {
     let (mut w, mut h) = (base_w, base_h);
     let mut done = false;
     std::iter::from_fn(move || {
@@ -69,7 +74,7 @@ fn levels(base_w: u32, base_h: u32) -> impl Iterator<Item = (u32, u64, bool)> {
             return None;
         }
         let is_apex = w.max(h) <= RASTER_TILE_SIZE;
-        let item = (w, u64::from(h.min(RASTER_TILE_SIZE)), is_apex);
+        let item = (w, h, is_apex);
         done = is_apex;
         w = w.div_ceil(2);
         h = h.div_ceil(2);
@@ -85,18 +90,10 @@ pub struct Cascade {
 impl Cascade {
     /// Allocate cascade bands from `base_level` up to the single-tile apex.
     pub fn new(base_level: u8, base_w: u32, base_h: u32) -> Self {
-        let mut bands = Vec::new();
-        let (mut w, mut h) = (base_w, base_h);
-        let mut level = base_level;
-        while w > 0 && h > 0 {
-            bands.push(CascadeBand::new(level, w, h));
-            if w.max(h) <= RASTER_TILE_SIZE {
-                break;
-            }
-            w = w.div_ceil(2);
-            h = h.div_ceil(2);
-            level = level.saturating_add(1);
-        }
+        let bands = levels(base_w, base_h)
+            .enumerate()
+            .map(|(idx, (w, h, _))| CascadeBand::new(base_level.saturating_add(idx as u8), w, h))
+            .collect();
         Self { bands }
     }
 

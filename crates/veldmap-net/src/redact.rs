@@ -175,6 +175,34 @@ fn trim_trailing_prose_punct(token: &str) -> usize {
     end
 }
 
+/// Return `"<redacted>"` when `secret` is non-empty, or `empty_label` otherwise.
+pub fn redact_secret_label(secret: Option<&str>, empty_label: &'static str) -> &'static str {
+    if secret.is_some_and(|s| !s.is_empty()) {
+        "<redacted>"
+    } else {
+        empty_label
+    }
+}
+
+/// Format common Custom XYZ/TMS basemap fields with URL and API-key redaction.
+pub fn fmt_redacted_custom_xyz_fields(
+    debug_struct: &mut std::fmt::DebugStruct<'_, '_>,
+    name: &str,
+    url_template: &str,
+    api_key: &str,
+    tms_flip_y: bool,
+    max_level: u8,
+    attribution: &str,
+) {
+    debug_struct
+        .field("name", &name)
+        .field("url_template", &sanitize_url_for_display(url_template))
+        .field("api_key", &redact_secret_label(Some(api_key), "<empty>"))
+        .field("tms_flip_y", &tms_flip_y)
+        .field("max_level", &max_level)
+        .field("attribution", &attribution);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

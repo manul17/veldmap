@@ -427,12 +427,22 @@ impl PendingUploads {
         self.retain_queued(|k| !predicate(k));
     }
 
+    #[cfg(test)]
     fn insert_queued(&mut self, key: TileKey, decoded: DecodedTile) {
+        Self::insert_queued_parts(&mut self.queued, &mut self.queued_bytes, key, decoded);
+    }
+
+    fn insert_queued_parts(
+        queued: &mut HashMap<TileKey, DecodedTile>,
+        queued_bytes: &mut usize,
+        key: TileKey,
+        decoded: DecodedTile,
+    ) {
         let added = decoded.byte_size();
-        if let Some(prev) = self.queued.insert(key, decoded) {
-            self.queued_bytes = self.queued_bytes.saturating_sub(prev.byte_size());
+        if let Some(prev) = queued.insert(key, decoded) {
+            *queued_bytes = queued_bytes.saturating_sub(prev.byte_size());
         }
-        self.queued_bytes = self.queued_bytes.saturating_add(added);
+        *queued_bytes = queued_bytes.saturating_add(added);
     }
 
     fn remove_queued(&mut self, key: &TileKey) -> Option<DecodedTile> {
@@ -462,11 +472,7 @@ impl PendingUploads {
         let Some(rx) = &self.rx else {
             return;
         };
-        let mut incoming = Vec::new();
-        while let Ok(item) = rx.try_recv() {
-            incoming.push(item);
-        }
-        for (key, decoded) in incoming {
+        while let Ok((key, decoded)) = rx.try_recv() {
             if cache.is_some_and(|c| c.contains(&key)) {
                 continue;
             }
@@ -476,7 +482,7 @@ impl PendingUploads {
             {
                 continue;
             }
-            self.insert_queued(key, decoded);
+            Self::insert_queued_parts(&mut self.queued, &mut self.queued_bytes, key, decoded);
         }
     }
 

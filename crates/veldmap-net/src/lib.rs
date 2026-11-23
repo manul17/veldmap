@@ -22,12 +22,12 @@ pub use basemap::{
     is_valid_gibs_date, validate_custom_url_template,
 };
 pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
-pub use redact::sanitize_url_for_display;
+pub use redact::{fmt_redacted_custom_xyz_fields, redact_secret_label, sanitize_url_for_display};
 
 /// Minimal encoded-tile persistence boundary injected into
-/// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from SQLite in
-/// `veldmap-storage` (note: keys must satisfy `veldmap-storage` source-key
-/// constraints and payloads exceeding its 16 MiB cap are skipped on write).
+/// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from concrete disk-cache
+/// backends (implementations may enforce source-key formatting rules and
+/// maximum blob-size limits).
 pub trait TileBlobStore: Send + Sync + 'static {
     /// Fetch cached encoded tile bytes for `(source_key, id)`, if present.
     fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String>;
