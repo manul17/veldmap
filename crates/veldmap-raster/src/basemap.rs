@@ -150,13 +150,7 @@ impl fmt::Debug for BundledBasemap {
 
 impl BundledBasemap {
     /// Decode a bundled global equirectangular PNG or JPEG (`-180..+180 deg`
-    /// west-to-east, `+90..-90 deg` north-to-south) directly into compact
-    /// `Rgb8` and build its linear-light mip pyramid using default settings.
-    pub fn from_encoded_bytes(bytes: &[u8]) -> Result<Self, RasterError> {
-        Self::from_encoded_bytes_with_config(bytes, BundledBasemapConfig::default())
-    }
-
-    /// Decode a bundled global equirectangular PNG or JPEG with explicit tiling
+    /// west-to-east, `+90..-90 deg` north-to-south) with explicit tiling
     /// limits (`tile_px`, `max_level`, `polar_max_level`).
     pub fn from_encoded_bytes_with_config(
         bytes: &[u8],
@@ -289,9 +283,35 @@ impl BundledBasemap {
         })
     }
 
+    fn render_pixel_grid<'a, RowState>(
+        ctx: &TileRenderContext<'_>,
+        data: &mut [u8],
+        mut row_setup: impl FnMut(f64) -> (&'a RgbLevel, RowState),
+        mut sample_lat_lon: impl FnMut(&RowState, f64) -> (f64, f64),
+    ) {
+        let tile_usize = ctx.tile_px as usize;
+        let tile_f = f64::from(ctx.tile_px);
+
+        for py in 0..tile_usize {
+            let t = (py as f64 + 0.5) / tile_f;
+            let (mip, row_state) = row_setup(t);
+            let row_off = py * tile_usize * 4;
+            for px in 0..tile_usize {
+                let s = (px as f64 + 0.5) / tile_f;
+                let (lat, lon) = sample_lat_lon(&row_state, s);
+                let off = row_off + px * 4;
+                data[off..off + 4].copy_from_slice(&mip.sample_bilinear_srgb_with_luts(
+                    lat,
+                    lon,
+                    ctx.to_lin,
+                    ctx.to_srgb,
+                ));
+            }
+        }
+    }
+
     fn render_geodetic_tile(&self, ctx: &TileRenderContext<'_>, data: &mut [u8]) {
         let (base_w, base_h) = self.dimensions();
-        let tile_usize = ctx.tile_px as usize;
         let tile_f = f64::from(ctx.tile_px);
         let cols_f = f64::from(ctx.cols);
         let rows_f = f64::from(ctx.rows);
@@ -299,82 +319,59 @@ impl BundledBasemap {
         let scale_y = f64::from(base_h) / (rows_f * tile_f);
         let mip = self.select_mip(scale_x.max(scale_y));
 
-        for py in 0..tile_usize {
-            let t = (py as f64 + 0.5) / tile_f;
-            let lat = 90.0 - 180.0 * (f64::from(ctx.id.y) + t) / rows_f;
-            let row_off = py * tile_usize * 4;
-            for px in 0..tile_usize {
-                let s = (px as f64 + 0.5) / tile_f;
+        Self::render_pixel_grid(
+            ctx,
+            data,
+            |t| (mip, 90.0 - 180.0 * (f64::from(ctx.id.y) + t) / rows_f),
+            |&lat, s| {
                 let lon = -180.0 + 360.0 * (f64::from(ctx.id.x) + s) / cols_f;
-                let off = row_off + px * 4;
-                data[off..off + 4].copy_from_slice(&mip.sample_bilinear_srgb_with_luts(
-                    lat,
-                    lon,
-                    ctx.to_lin,
-                    ctx.to_srgb,
-                ));
-            }
-        }
+                (lat, lon)
+            },
+        );
     }
 
     fn render_web_mercator_tile(&self, ctx: &TileRenderContext<'_>, data: &mut [u8]) {
         let (base_w, base_h) = self.dimensions();
-        let tile_usize = ctx.tile_px as usize;
         let tile_f = f64::from(ctx.tile_px);
         let cols_f = f64::from(ctx.cols);
         let (merc_n, merc_s) = web_mercator_y_bounds(ctx.id.y, ctx.rows);
         let d_merc_per_px = (merc_n - merc_s) / tile_f;
         let scale_x = f64::from(base_w) / (cols_f * tile_f);
 
-        for py in 0..tile_usize {
-            let t = (py as f64 + 0.5) / tile_f;
-            let merc = merc_n + (merc_s - merc_n) * t;
-            let lat = mercator_lat_deg(merc);
-            // Local d(lat_deg)/d(merc) = (180 / pi) * cos(lat).
-            let dlat_per_px =
-                (180.0 / std::f64::consts::PI) * lat.to_radians().cos() * d_merc_per_px;
-            let scale_y = (f64::from(base_h) / 180.0) * dlat_per_px;
-            let mip = self.select_mip(scale_x.max(scale_y));
-            let row_off = py * tile_usize * 4;
-
-            for px in 0..tile_usize {
-                let s = (px as f64 + 0.5) / tile_f;
+        Self::render_pixel_grid(
+            ctx,
+            data,
+            |t| {
+                let merc = merc_n + (merc_s - merc_n) * t;
+                let lat = mercator_lat_deg(merc);
+                // Local d(lat_deg)/d(merc) = (180 / pi) * cos(lat).
+                let dlat_per_px =
+                    (180.0 / std::f64::consts::PI) * lat.to_radians().cos() * d_merc_per_px;
+                let scale_y = (f64::from(base_h) / 180.0) * dlat_per_px;
+                (self.select_mip(scale_x.max(scale_y)), lat)
+            },
+            |&lat, s| {
                 let lon = -180.0 + 360.0 * (f64::from(ctx.id.x) + s) / cols_f;
-                let off = row_off + px * 4;
-                data[off..off + 4].copy_from_slice(&mip.sample_bilinear_srgb_with_luts(
-                    lat,
-                    lon,
-                    ctx.to_lin,
-                    ctx.to_srgb,
-                ));
-            }
-        }
+                (lat, lon)
+            },
+        );
     }
 
     fn render_polar_cap_tile(&self, ctx: &TileRenderContext<'_>, north: bool, data: &mut [u8]) {
-        let tile_usize = ctx.tile_px as usize;
-        let tile_f = f64::from(ctx.tile_px);
         let cols_f = f64::from(ctx.cols);
         let rows_f = f64::from(ctx.rows);
         let mip = &self.levels[0];
 
-        for py in 0..tile_usize {
-            let t = (py as f64 + 0.5) / tile_f;
-            let v = -1.0 + 2.0 * (f64::from(ctx.id.y) + t) / rows_f;
-            let row_off = py * tile_usize * 4;
-            for px in 0..tile_usize {
-                let s = (px as f64 + 0.5) / tile_f;
+        Self::render_pixel_grid(
+            ctx,
+            data,
+            |t| (mip, -1.0 + 2.0 * (f64::from(ctx.id.y) + t) / rows_f),
+            |&v, s| {
                 let u = -1.0 + 2.0 * (f64::from(ctx.id.x) + s) / cols_f;
                 let (lat, lon, _, _) = polar_cap_point(north, u, v);
-                let off = row_off + px * 4;
-                data[off..off + 4].copy_from_slice(&mip.sample_bilinear_srgb_with_luts(
-                    lat,
-                    lon,
-                    ctx.to_lin,
-                    ctx.to_srgb,
-                ));
-            }
-        }
+                (lat, lon)
+            },
+        );
     }
 }
 

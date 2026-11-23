@@ -2,7 +2,8 @@
 //! RTC precision & coarse parent overzoom, and multi-LOD / polar seam tests.
 
 use veldmap_app::BUNDLED_MAX_LEVEL;
-use veldmap_app::gpu_tiles::{GpuTileCache, bundled_tile_key};
+use veldmap_app::basemap_policy::bundled_tile_key;
+use veldmap_app::gpu_tiles::GpuTileCache;
 use veldmap_app::render::GlobeRenderer;
 use veldmap_core::geo::camera::{Camera, MIN_HEIGHT_M};
 use veldmap_core::geo::projection::WEB_MERCATOR_LIMIT_DEG;

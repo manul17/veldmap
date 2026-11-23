@@ -15,7 +15,7 @@ use crate::redact::extract_host;
 
 use super::PipelineContext;
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
-use super::state::{FailureState, PipelineState};
+use super::state::{FailureMarker, PipelineState};
 use super::workers::{run_disk_lookup, run_http_fetch};
 
 /// Maximum concurrent blocking disk-cache lookup tasks so cached tiles stay
@@ -98,7 +98,7 @@ fn plan_http_tasks(
             continue;
         };
         let Ok(url) = spec.resolve_url(id) else {
-            st.insert_failure(key, FailureState::Terminal, now);
+            st.insert_failure(key, FailureMarker::Terminal);
             continue;
         };
         let host = extract_host(&url);

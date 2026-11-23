@@ -5,6 +5,8 @@
 
 pub mod app;
 pub(crate) mod basemap;
+mod basemap_adapters;
+pub mod basemap_policy;
 pub(crate) mod basemap_ui;
 pub(crate) mod bundled_basemap;
 pub mod gpu_tiles;

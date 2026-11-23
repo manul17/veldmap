@@ -2,7 +2,7 @@
 //! `WebMercator`, and adaptive `PolarCap`), shared by quadtree traversal,
 //! offline equirectangular tile resampling, and GPU mesh generation.
 
-use crate::geo::projection::WEB_MERCATOR_LIMIT_DEG;
+use crate::geo::projection::{WEB_MERCATOR_LIMIT_DEG, web_mercator_lat_deg};
 
 use super::key::{PlanetaryScheme, QuadTileId};
 
@@ -28,7 +28,7 @@ pub struct LatLonTileBounds {
 /// Convert Web Mercator Y radians (`[-pi, +pi]`) to geodetic latitude in degrees.
 #[inline]
 pub fn mercator_lat_deg(merc: f64) -> f64 {
-    merc.sinh().atan().to_degrees()
+    web_mercator_lat_deg(merc)
 }
 
 /// Compute Web Mercator north/south Y coordinates `(merc_n, merc_s)` in radians

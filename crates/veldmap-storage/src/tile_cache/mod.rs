@@ -29,8 +29,10 @@ use crate::StorageError;
 use self::evict::{evict_in_tx, reclaim_space};
 use self::key::EncodedKey;
 use self::schema::{
-    SELECT_META_ID_BYTES_SQL, SELECT_TILE_BLOB_SQL, UPSERT_META_SQL, decrement_cache_meta,
-    init_connection, is_corrupt_sqlite_error, open_and_init_file_db, open_read_only_connection,
+    CLEAR_BLOBS_SQL, CLEAR_META_SQL, DELETE_META_BY_ID_SQL, DELETE_SOURCE_META_SQL,
+    SELECT_META_ID_BYTES_SQL, SELECT_TILE_BLOB_SQL, SUM_SOURCE_BYTES_SQL, TOUCH_META_SQL,
+    UPSERT_BLOB_SQL, UPSERT_META_SQL, decrement_cache_meta, init_connection,
+    is_corrupt_sqlite_error, open_and_init_file_db, open_read_only_connection,
     read_cache_meta_totals, remove_sqlite_files, reset_cache_meta, set_cache_meta_totals,
     sidecar_path,
 };
@@ -74,9 +76,7 @@ fn flush_touches_in_tx(
     // Updates `tile_meta` only (never `tile_blobs`), so read-hit LRU touches
     // never rewrite BLOB overflow pages. Guarded with `last_used_ms < ?1` so a
     // buffered touch can never roll back a newer timestamp on a reused tile_id.
-    let mut stmt = tx.prepare(
-        "UPDATE tile_meta SET last_used_ms = ?1 WHERE tile_id = ?2 AND last_used_ms < ?1",
-    )?;
+    let mut stmt = tx.prepare(TOUCH_META_SQL)?;
     for (&tile_id, &ts) in touches {
         stmt.execute(params![ts, tile_id])?;
     }
@@ -118,12 +118,8 @@ fn upsert_tile_and_update_meta(
         )?
     };
 
-    tx.prepare(
-        "INSERT INTO tile_blobs (tile_id, payload)
-         VALUES (?1, ?2)
-         ON CONFLICT(tile_id) DO UPDATE SET payload = excluded.payload",
-    )?
-    .execute(params![inserted_id, payload])?;
+    tx.prepare(UPSERT_BLOB_SQL)?
+        .execute(params![inserted_id, payload])?;
 
     let old = prev_bytes.unwrap_or(0).max(0) as u64;
     let count_delta = u64::from(prev_bytes.is_none());
@@ -412,6 +408,15 @@ impl TileDiskCache {
             || max_bytes == 0
             || new_bytes > max_bytes
         {
+            tracing::debug!(
+                source_key = %key.source_key,
+                level = key.level,
+                x = key.x,
+                y = key.y,
+                payload_bytes = new_bytes,
+                max_bytes,
+                "Skipping disk cache put outside size bounds"
+            );
             let (total_bytes_after, _) = read_cache_meta_totals(&conn)?;
             return Ok(EvictionReport {
                 evicted_tiles: 0,
@@ -444,18 +449,22 @@ impl TileDiskCache {
     pub fn delete(&self, key: &DiskTileKey) -> Result<bool, StorageError> {
         let enc = EncodedKey::from_key(key)?;
         let mut conn = lock_unpoisoned(&self.writer);
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let prev: Option<(i64, i64)> = {
-            let mut stmt = tx.prepare(SELECT_META_ID_BYTES_SQL)?;
-            stmt.query_row(enc.key_params(), |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?
-        };
-        let Some((tile_id, sz)) = prev else {
+        let deleted_id = self.with_write_tx(&mut conn, |tx| {
+            let prev: Option<(i64, i64)> = {
+                let mut stmt = tx.prepare(SELECT_META_ID_BYTES_SQL)?;
+                stmt.query_row(enc.key_params(), |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?
+            };
+            let Some((tile_id, sz)) = prev else {
+                return Ok(None);
+            };
+            tx.execute(DELETE_META_BY_ID_SQL, params![tile_id])?;
+            decrement_cache_meta(tx, sz, 1)?;
+            Ok(Some(tile_id))
+        })?;
+        let Some(tile_id) = deleted_id else {
             return Ok(false);
         };
-        tx.execute("DELETE FROM tile_meta WHERE tile_id = ?1", params![tile_id])?;
-        decrement_cache_meta(&tx, sz, 1)?;
-        tx.commit()?;
         lock_unpoisoned(&self.pending_touches).remove(&tile_id);
         self.write_generation.fetch_add(1, Ordering::AcqRel);
         Ok(true)
@@ -507,15 +516,9 @@ impl TileDiskCache {
         }
         let mut conn = lock_unpoisoned(&self.writer);
         let deleted = self.with_write_tx(&mut conn, |tx| {
-            let removed_bytes: i64 = tx.query_row(
-                "SELECT COALESCE(SUM(byte_size), 0) FROM tile_meta WHERE source_key = ?1",
-                params![source_key],
-                |r| r.get(0),
-            )?;
-            let deleted = tx.execute(
-                "DELETE FROM tile_meta WHERE source_key = ?1",
-                params![source_key],
-            )?;
+            let removed_bytes: i64 =
+                tx.query_row(SUM_SOURCE_BYTES_SQL, params![source_key], |r| r.get(0))?;
+            let deleted = tx.execute(DELETE_SOURCE_META_SQL, params![source_key])?;
             decrement_cache_meta(tx, removed_bytes, deleted as i64)?;
             Ok(deleted)
         })?;
@@ -534,8 +537,8 @@ impl TileDiskCache {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // Delete blobs first to avoid per-row cascade work and allow SQLite's
             // table-truncate optimization.
-            tx.execute("DELETE FROM tile_blobs", [])?;
-            tx.execute("DELETE FROM tile_meta", [])?;
+            tx.execute(CLEAR_BLOBS_SQL, [])?;
+            tx.execute(CLEAR_META_SQL, [])?;
             reset_cache_meta(&tx)?;
             tx.commit()?;
         }

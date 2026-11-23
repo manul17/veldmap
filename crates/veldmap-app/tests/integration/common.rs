@@ -3,10 +3,10 @@
 
 use std::sync::{Arc, OnceLock, mpsc};
 
+use veldmap_app::basemap_policy::BasemapCarrierPolicy;
 use veldmap_app::gpu_tiles::GpuTileCache;
 use veldmap_app::render::{
-    BasemapCarrierPolicy, DrawSnapshot, GlobeRenderer, RenderParams, SnapshotBuildParams,
-    clamp_to_primary_backends,
+    DrawSnapshot, GlobeRenderer, RenderParams, SnapshotBuildParams, clamp_to_primary_backends,
 };
 use veldmap_app::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG};
 use veldmap_core::geo::camera::Camera;

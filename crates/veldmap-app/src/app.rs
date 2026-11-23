@@ -62,6 +62,7 @@ pub struct VeldmapApp {
     last_viewport_rect: Option<egui::Rect>,
     last_compass_rect: Option<egui::Rect>,
     last_viewport_height_px: f64,
+    last_viewport_aspect: f64,
     goto_input: String,
     goto_error: Option<String>,
 }
@@ -142,6 +143,7 @@ impl VeldmapApp {
             last_viewport_rect: None,
             last_compass_rect: None,
             last_viewport_height_px: 800.0,
+            last_viewport_aspect: 1.6,
             goto_input: String::new(),
             goto_error: None,
         })
@@ -220,18 +222,12 @@ impl VeldmapApp {
         }
     }
 
-    fn probe_pointer(
-        &self,
-        ctx: &egui::Context,
-        rect: egui::Rect,
-        pos: egui::Pos2,
-    ) -> Option<(f64, f64)> {
-        let (_, _, aspect) = viewport_pixels(ctx, rect);
+    fn probe_pointer(&self, rect: egui::Rect, pos: egui::Pos2) -> Option<(f64, f64)> {
         let width_pt = f64::from(rect.width()).max(1.0);
         let height_pt = f64::from(rect.height()).max(1.0);
         let nx = f64::from(pos.x - rect.left()) / width_pt;
         let ny = f64::from(pos.y - rect.top()) / height_pt;
-        self.camera.probe(nx, ny, aspect)
+        self.camera.probe(nx, ny, self.last_viewport_aspect)
     }
 
     /// Drain background tile completions and upload coarsest-first within the
@@ -388,7 +384,7 @@ impl VeldmapApp {
             self.cursor_geo = hover_pos.and_then(|pos| {
                 let over_compass = self.last_compass_rect.is_some_and(|c| c.contains(pos));
                 (rect.contains(pos) && !over_compass)
-                    .then(|| self.probe_pointer(ctx, rect, pos))
+                    .then(|| self.probe_pointer(rect, pos))
                     .flatten()
             });
         } else {
@@ -477,9 +473,10 @@ impl VeldmapApp {
                 if rect.is_positive() {
                     viewport_rect = Some(rect);
                     self.last_viewport_rect = Some(rect);
-                    let (width_px, height_px, _) = viewport_pixels(ctx, rect);
+                    let (width_px, height_px, aspect) = viewport_pixels(ctx, rect);
                     let height_pt = f64::from(rect.height()).max(1.0);
                     self.last_viewport_height_px = f64::from(height_px);
+                    self.last_viewport_aspect = aspect;
 
                     self.handle_viewport_input(ctx, &response, rect, height_pt);
 
@@ -499,7 +496,7 @@ impl VeldmapApp {
 
                     // Visible basemap attribution pill (NASA GIBS / EOX CC BY 4.0 / Custom).
                     if let Some(attr) = self.basemap.attribution() {
-                        basemap_ui::paint_attribution_badge(&painter, rect, attr);
+                        hud::paint_attribution_badge(&painter, rect, attr);
                     }
                 } else {
                     // Release cached snapshot references and stale viewport/compass

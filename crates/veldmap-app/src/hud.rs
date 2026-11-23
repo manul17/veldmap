@@ -261,6 +261,52 @@ pub fn show_north_compass(
     area_resp.inner
 }
 
+/// Paint a compact, high-contrast attribution pill in the bottom-right corner
+/// of the globe viewport so NASA GIBS and EOX CC BY 4.0 credits remain visible
+/// without overlapping the bottom-left metric scale bar at narrow widths.
+pub fn paint_attribution_badge(painter: &egui::Painter, rect: egui::Rect, attribution: &str) {
+    if attribution.is_empty() || rect.height() < 60.0 {
+        return;
+    }
+
+    let pad_x = 8.0;
+    let pad_y = 4.0;
+    let margin = 10.0;
+    let avail = available_right_overlay_width(rect.width(), pad_x, margin);
+    if avail < 100.0 {
+        return;
+    }
+
+    let font = egui::FontId::proportional(11.0);
+    let max_width = avail.min(560.0);
+    let galley = painter.layout(
+        attribution.to_owned(),
+        font,
+        egui::Color32::from_rgba_unmultiplied(235, 240, 246, 235),
+        max_width,
+    );
+
+    let size = galley.size() + egui::vec2(pad_x * 2.0, pad_y * 2.0);
+    let badge_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.right() - margin - size.x,
+            rect.bottom() - margin - size.y,
+        ),
+        size,
+    );
+
+    painter.rect_filled(
+        badge_rect,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(10, 16, 26, 175),
+    );
+    painter.galley(
+        badge_rect.min + egui::vec2(pad_x, pad_y),
+        galley,
+        egui::Color32::WHITE,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

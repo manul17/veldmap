@@ -87,7 +87,6 @@ struct PipelineContext {
     disk_put_sem: Arc<Semaphore>,
     decoder: Arc<dyn TileDecodeExecutor>,
     wakeup: Wakeup,
-    rt_handle: tokio::runtime::Handle,
     max_tile_bytes: usize,
     transient_retry_backoff: Duration,
 }
@@ -145,7 +144,6 @@ impl LiveTilePipeline {
             disk_put_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_DISK_WRITES)),
             decoder,
             wakeup,
-            rt_handle: runtime.handle().clone(),
             max_tile_bytes: config.max_tile_bytes,
             transient_retry_backoff: config.transient_retry_backoff,
         });

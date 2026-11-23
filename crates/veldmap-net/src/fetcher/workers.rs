@@ -9,89 +9,75 @@ use veldmap_core::tile::{QuadTileId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
 use crate::http::{FetchFailure, FetchOutcome, download_capped};
-use crate::{DecodeRequest, TileBlobStore};
+use crate::{DecodeCompletion, DecodeFailure, DecodeRequest, TileBlobStore};
 
 use super::PipelineContext;
 use super::dispatch::HttpFetchInput;
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
-use super::state::FailureState;
 
 /// Short silent cooldown before re-attempting a tile whose decode submission
-/// was rejected under CPU decode-pool backpressure.
+/// was rejected or evicted under CPU decode-pool backpressure.
 const DECODE_BACKPRESSURE_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Submit `request` to the injected [`crate::TileDecodeExecutor`]; if rejected
-/// under backpressure while still active and uncancelled, schedule a short
-/// silent backoff (`DECODE_BACKPRESSURE_BACKOFF`) routing back to
-/// `pending_disk` (when `retry_disk` is `true`, avoiding unnecessary HTTP
-/// traffic for cached tiles) or `pending_http` so rejected tiles neither vanish
-/// nor spin in a tight retry loop while the decode pool drains.
-fn submit_or_requeue(ctx: &PipelineContext, request: DecodeRequest, retry_disk: bool) {
-    let key = request.key;
-    let cancel = request.cancel.clone();
-    if ctx.decoder.submit(request) {
-        return;
-    }
-    if cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
-        return;
-    }
-    let scheduled = lock_unpoisoned(&ctx.state).schedule_decode_backpressure(
+fn schedule_decode_backpressure(
+    ctx: &PipelineContext,
+    key: TileKey,
+    guard: &mut InFlightGuard,
+    retry_disk: bool,
+) {
+    if lock_unpoisoned(&ctx.state).schedule_decode_backpressure(
         key,
+        guard.generation,
         DECODE_BACKPRESSURE_BACKOFF,
         retry_disk,
         Instant::now(),
-    );
-    if scheduled {
+    ) {
+        guard.disarm();
         ctx.notify.notify_one();
     }
 }
 
-struct DecodeOutcomeContext<'a> {
-    ctx: &'a Arc<PipelineContext>,
-    spec: &'a Arc<LiveBasemapSpec>,
+/// Submit encoded tile bytes to the injected [`crate::TileDecodeExecutor`] and
+/// await its [`DecodeCompletion`] inside the owning Tokio task.
+///
+/// Rejections, post-acceptance queue evictions, or decoder panics all route to
+/// [`schedule_decode_backpressure`] unless cancelled/shutting down.
+async fn submit_and_await_decode(
+    ctx: &PipelineContext,
     key: TileKey,
-    id: QuadTileId,
-    cancel: &'a CancelToken,
-}
+    bytes: Arc<[u8]>,
+    cancel: &CancelToken,
+    mut guard: InFlightGuard,
+    retry_disk: bool,
+) -> Option<(InFlightGuard, Result<(), DecodeFailure>)> {
+    let (on_decoded, rx) = DecodeCompletion::channel();
+    let req = DecodeRequest {
+        key,
+        bytes,
+        cancel: cancel.clone(),
+        on_decoded,
+    };
 
-fn handle_disk_decode_result(
-    cb: &DecodeOutcomeContext<'_>,
-    cache: &Arc<dyn TileBlobStore>,
-    guard: InFlightGuard,
-    outcome: Result<(), String>,
-) {
-    match outcome {
-        Ok(()) => {
-            let _guard = guard;
-            lock_unpoisoned(&cb.ctx.state).mark_completed(cb.key, true);
+    if !ctx.decoder.submit(req) {
+        if !cancel.is_cancelled() && !ctx.shutdown.is_cancelled() {
+            schedule_decode_backpressure(ctx, key, &mut guard, retry_disk);
         }
-        Err(err) => {
-            tracing::debug!(
-                key = ?cb.key,
-                error = %err,
-                "Cached disk tile failed decode; deleting corrupt entry and falling back to HTTP"
-            );
-            // Keep `guard` alive inside the blocking delete task so `delete`
-            // strictly happens-before re-queueing into `pending_http`.
-            let del_ctx = Arc::clone(cb.ctx);
-            let del_cache = Arc::clone(cache);
-            let del_source_key = cb.spec.cache_key().to_owned();
-            let del_cancel = cb.cancel.clone();
-            let key = cb.key;
-            let id = cb.id;
-            cb.ctx.rt_handle.spawn_blocking(move || {
-                if let Err(del_err) = del_cache.delete(&del_source_key, id) {
-                    tracing::debug!(
-                        ?key,
-                        error = %del_err,
-                        "Failed to delete corrupt cached tile entry"
-                    );
-                }
-                let mut guard = guard;
-                promote_to_http(&del_ctx, key, &del_cancel, &mut guard);
-            });
-        }
+        return None;
     }
+
+    let outcome = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        res = rx.recv() => res,
+    };
+
+    if matches!(outcome, Err(DecodeFailure::Aborted)) {
+        if !cancel.is_cancelled() && !ctx.shutdown.is_cancelled() {
+            schedule_decode_backpressure(ctx, key, &mut guard, retry_disk);
+        }
+        return None;
+    }
+
+    Some((guard, outcome))
 }
 
 pub(super) async fn run_disk_lookup(
@@ -124,26 +110,37 @@ pub(super) async fn run_disk_lookup(
 
     match disk_res {
         Ok(Ok(Some(bytes))) => {
-            let cb_ctx = Arc::clone(&ctx);
-            let cb_cache = Arc::clone(&cache);
-            let cb_cancel = cancel.clone();
-            let cb_spec = Arc::clone(&spec);
-            let req = DecodeRequest {
-                key,
-                bytes: Arc::from(bytes),
-                cancel,
-                on_decoded: Box::new(move |outcome| {
-                    let cb = DecodeOutcomeContext {
-                        ctx: &cb_ctx,
-                        spec: &cb_spec,
-                        key,
-                        id,
-                        cancel: &cb_cancel,
-                    };
-                    handle_disk_decode_result(&cb, &cb_cache, guard, outcome);
-                }),
+            let Some((mut guard, outcome)) =
+                submit_and_await_decode(&ctx, key, Arc::from(bytes), &cancel, guard, true).await
+            else {
+                return;
             };
-            submit_or_requeue(&ctx, req, true);
+            match outcome {
+                Ok(()) => {
+                    let _guard = guard;
+                    lock_unpoisoned(&ctx.state).mark_completed(key, true);
+                }
+                Err(DecodeFailure::InvalidPayload(err)) => {
+                    tracing::debug!(
+                        ?key,
+                        error = %err,
+                        "Cached disk tile failed decode; deleting corrupt entry and falling back to HTTP"
+                    );
+                    let del_source_key = spec.cache_key().to_owned();
+                    let del_res =
+                        tokio::task::spawn_blocking(move || cache.delete(&del_source_key, id))
+                            .await;
+                    if let Ok(Err(del_err)) = del_res {
+                        tracing::debug!(
+                            ?key,
+                            error = %del_err,
+                            "Failed to delete corrupt cached tile entry"
+                        );
+                    }
+                    promote_to_http(&ctx, key, &cancel, &mut guard);
+                }
+                Err(DecodeFailure::Aborted) => {}
+            }
         }
         Ok(Ok(None)) => promote_to_http(&ctx, key, &cancel, &mut guard),
         Ok(Err(err)) => {
@@ -199,7 +196,7 @@ fn persist_validated_tile_async(
     let source_key = spec.cache_key().to_owned();
     let put_sem = Arc::clone(&ctx.disk_put_sem);
     let shutdown = ctx.shutdown.clone();
-    ctx.rt_handle.spawn(async move {
+    tokio::spawn(async move {
         let _queue_permit = queue_permit;
         let permit = tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -222,32 +219,6 @@ fn persist_validated_tile_async(
         })
         .await;
     });
-}
-
-fn handle_http_decode_result(
-    cb: &DecodeOutcomeContext<'_>,
-    guard: InFlightGuard,
-    bytes_for_cache: Arc<[u8]>,
-    outcome: Result<(), String>,
-) {
-    let _guard = guard;
-    match outcome {
-        Ok(()) => {
-            lock_unpoisoned(&cb.ctx.state).mark_completed(cb.key, false);
-            persist_validated_tile_async(cb.ctx, cb.spec, cb.key, cb.id, bytes_for_cache);
-        }
-        Err(err) => {
-            let safe_msg = cb.spec.redact_secrets(&err);
-            record_failure(
-                cb.ctx,
-                cb.cancel,
-                cb.key,
-                FailureState::Terminal,
-                false,
-                Some(safe_msg),
-            );
-        }
-    }
 }
 
 pub(super) async fn run_http_fetch(
@@ -288,44 +259,34 @@ pub(super) async fn run_http_fetch(
         Ok(FetchOutcome::Payload(bytes)) => {
             let shared_bytes: Arc<[u8]> = Arc::from(bytes);
             let bytes_for_cache = Arc::clone(&shared_bytes);
-            let cb_ctx = Arc::clone(&ctx);
-            let cb_cancel = cancel.clone();
-            let cb_spec = Arc::clone(&spec);
-            let req = DecodeRequest {
-                key,
-                bytes: shared_bytes,
-                cancel,
-                on_decoded: Box::new(move |outcome| {
-                    let cb = DecodeOutcomeContext {
-                        ctx: &cb_ctx,
-                        spec: &cb_spec,
-                        key,
-                        id,
-                        cancel: &cb_cancel,
-                    };
-                    handle_http_decode_result(&cb, guard, bytes_for_cache, outcome);
-                }),
+            let Some((_guard, outcome)) =
+                submit_and_await_decode(&ctx, key, shared_bytes, &cancel, guard, false).await
+            else {
+                return;
             };
-            submit_or_requeue(&ctx, req, false);
+            match outcome {
+                Ok(()) => {
+                    lock_unpoisoned(&ctx.state).mark_completed(key, false);
+                    persist_validated_tile_async(&ctx, &spec, key, id, bytes_for_cache);
+                }
+                Err(DecodeFailure::InvalidPayload(err)) => {
+                    let safe_msg = spec.redact_secrets(&err);
+                    record_terminal_failure(&ctx, &cancel, key, Some(safe_msg));
+                }
+                Err(DecodeFailure::Aborted) => {}
+            }
         }
         Ok(FetchOutcome::Empty204) => {
             // Valid empty/nodata tile: suppress infinite refetch without
             // bumping `failed_count` or displaying an error badge.
             if !cancel.is_cancelled() {
-                lock_unpoisoned(&ctx.state).mark_empty_204(key, Instant::now());
+                lock_unpoisoned(&ctx.state).mark_empty_204(key);
             }
         }
         Err(FetchFailure::Terminal(msg)) => {
             let safe_msg = spec.redact_secrets(&msg);
             tracing::debug!(?key, error = %safe_msg, "Terminal HTTP tile failure");
-            record_failure(
-                &ctx,
-                &cancel,
-                key,
-                FailureState::Terminal,
-                false,
-                Some(safe_msg),
-            );
+            record_terminal_failure(&ctx, &cancel, key, Some(safe_msg));
         }
         Err(FetchFailure::Transient {
             msg,
@@ -346,34 +307,31 @@ pub(super) async fn run_http_fetch(
                 error = %safe_msg,
                 "Transient HTTP tile failure"
             );
-            record_failure(
-                &ctx,
-                &cancel,
-                key,
-                FailureState::BackoffUntil {
+            if !cancel.is_cancelled() {
+                let should_wake = lock_unpoisoned(&ctx.state).mark_transient_backoff(
+                    key,
                     until,
-                    retry_disk: false,
-                },
-                offline,
-                Some(safe_msg),
-            );
+                    offline,
+                    Some(safe_msg),
+                );
+                if should_wake {
+                    (ctx.wakeup)();
+                }
+            }
         }
     }
 }
 
-fn record_failure(
+fn record_terminal_failure(
     ctx: &PipelineContext,
     cancel: &CancelToken,
     key: TileKey,
-    failure: FailureState,
-    offline: bool,
     error_msg: Option<String>,
 ) {
     if cancel.is_cancelled() {
         return;
     }
-    let should_wake =
-        lock_unpoisoned(&ctx.state).mark_failure(key, failure, offline, error_msg, Instant::now());
+    let should_wake = lock_unpoisoned(&ctx.state).mark_terminal_failure(key, error_msg);
     if should_wake {
         (ctx.wakeup)();
     }

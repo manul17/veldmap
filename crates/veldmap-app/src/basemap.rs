@@ -22,20 +22,18 @@ use veldmap_core::tile::{
     max_mip_levels, mip_chain_byte_size,
 };
 use veldmap_net::{
-    CustomBasemapConfig, DecodeRequest, FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError,
-    NetworkStatus, TileBlobStore, TileDecodeExecutor,
+    CustomBasemapConfig, FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError, NetworkStatus,
+    TileBlobStore, TileDecodeExecutor,
 };
-use veldmap_raster::{
-    DecodeJob, DecodePool, DecodePoolConfig, DecodePoolHandle, decode_map_tile_with_mipmaps,
-};
-use veldmap_storage::{DiskTileKey, TileDiskCache};
+use veldmap_raster::{DecodePool, DecodePoolConfig};
+use veldmap_storage::TileDiskCache;
 
+use crate::basemap_adapters::{RasterDecodeExecutor, SqliteBlobStore};
+use crate::basemap_policy::BasemapCarrierPolicy;
 use crate::bundled_basemap::{
     BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, BundledBasemapProvider,
 };
-use crate::gpu_tiles::{
-    BasemapCarrierPolicy, GpuTileCache, PendingUploads, UploadBatchReport, bundled_tile_key,
-};
+use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport};
 use crate::settings::{AppSettings, BasemapSelection, CustomXyzSettings};
 
 /// Attribution string displayed for the bundled public-domain Blue Marble
@@ -49,128 +47,6 @@ pub struct BasemapStatusSnapshot {
     pub network: NetworkStatus,
     pub live_pipeline_error: Option<String>,
     pub config_error: Option<String>,
-}
-
-/// Adapter bridging `veldmap-storage`'s [`TileDiskCache`] into `veldmap-net`'s
-/// storage-agnostic [`TileBlobStore`] trait.
-struct SqliteBlobStore(Arc<TileDiskCache>);
-
-impl SqliteBlobStore {
-    fn disk_key(source_key: &str, id: QuadTileId) -> DiskTileKey {
-        DiskTileKey::new(
-            source_key,
-            id.scheme.into_tile_scheme(),
-            id.level,
-            id.x,
-            id.y,
-        )
-    }
-}
-
-impl TileBlobStore for SqliteBlobStore {
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String> {
-        let key = Self::disk_key(source_key, id);
-        self.0.get(&key).map_err(|e| e.to_string())
-    }
-
-    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), String> {
-        let key = Self::disk_key(source_key, id);
-        self.0
-            .put(&key, payload)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String> {
-        let key = Self::disk_key(source_key, id);
-        self.0.delete(&key).map(|_| ()).map_err(|e| e.to_string())
-    }
-}
-
-type DecodeCallback = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
-
-/// Ensures `on_decoded(Err(...))` is delivered if the decode closure unwinds
-/// inside `DecodePool`'s single `catch_unwind` boundary (avoiding nested
-/// `catch_unwind` calls).
-struct DecodePanicGuard {
-    on_decoded: Option<DecodeCallback>,
-}
-
-impl DecodePanicGuard {
-    fn disarm(mut self) {
-        self.on_decoded = None;
-    }
-
-    fn complete(mut self, outcome: Result<(), String>) {
-        if let Some(cb) = self.on_decoded.take() {
-            cb(outcome);
-        }
-    }
-}
-
-impl Drop for DecodePanicGuard {
-    fn drop(&mut self) {
-        if let Some(cb) = self.on_decoded.take() {
-            cb(Err("tile decoder panicked".to_owned()));
-        }
-    }
-}
-
-/// Adapter bridging `veldmap-raster`'s generic [`DecodePoolHandle`] into
-/// `veldmap-net`'s codec-agnostic [`TileDecodeExecutor`] trait.
-struct RasterDecodeExecutor {
-    pool: DecodePoolHandle,
-    done_tx: Sender<(TileKey, DecodedTile)>,
-    wakeup: Wakeup,
-    shutdown: CancelToken,
-}
-
-impl TileDecodeExecutor for RasterDecodeExecutor {
-    fn submit(&self, req: DecodeRequest) -> bool {
-        let key = req.key;
-        let queued_bytes = req.bytes.len();
-        let cancel = req.cancel.clone();
-        let done_tx = self.done_tx.clone();
-        let wakeup = Arc::clone(&self.wakeup);
-        let shutdown = self.shutdown.clone();
-        let bytes = req.bytes;
-        let on_decoded = req.on_decoded;
-
-        self.pool.submit(DecodeJob {
-            key,
-            queued_bytes,
-            cancel: req.cancel,
-            work: Box::new(move || {
-                // Construct the panic guard inside `work` so rejected, evicted,
-                // cancelled, or shutdown-drained jobs never report a decoder panic.
-                let guard = DecodePanicGuard {
-                    on_decoded: Some(on_decoded),
-                };
-                match decode_map_tile_with_mipmaps(&bytes) {
-                    Ok(tile) => {
-                        if cancel.is_cancelled() || shutdown.is_cancelled() {
-                            guard.disarm();
-                            return;
-                        }
-                        if done_tx.send((key, tile)).is_err() {
-                            guard.disarm();
-                            return;
-                        }
-                        guard.complete(Ok(()));
-                        (wakeup)();
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            ?key,
-                            error = %err,
-                            "Failed to decode map tile payload"
-                        );
-                        guard.complete(Err(err.to_string()));
-                    }
-                }
-            }),
-        })
-    }
 }
 
 /// Build a [`LiveBasemapSpec`] from user [`CustomXyzSettings`].
@@ -532,7 +408,7 @@ impl BasemapManager {
                     record_bundled_candidate(policy.primary_key(polar_id));
                 } else {
                     let (clamped_live, _) = tex_id.clamp_to_level(spec.max_level());
-                    let live_key = spec.tile_key(clamped_live);
+                    let live_key = policy.primary_key(clamped_live);
                     if seen_live.insert(live_key) {
                         if gpu_cache.contains(&live_key) {
                             out.cached_live_wanted += 1;
@@ -555,7 +431,7 @@ impl BasemapManager {
             }
         } else {
             for tex_id in visible_tex_ids {
-                record_bundled_candidate(bundled_tile_key(tex_id));
+                record_bundled_candidate(policy.primary_key(tex_id));
             }
         }
 

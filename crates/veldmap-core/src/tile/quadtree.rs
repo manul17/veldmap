@@ -11,7 +11,9 @@ use crate::geo::cull::{Ball, Frame as CullFrame};
 use crate::geo::geodesy;
 use crate::geo::sag;
 
-use super::geometry::{lat_lon_bounds, mercator_lat_deg, polar_cap_point, web_mercator_y_bounds};
+use super::geometry::{
+    lat_lon_bounds, mercator_lat_deg, sample_tile_surface, web_mercator_y_bounds,
+};
 use super::key::{GlobeScheme, PlanetaryScheme, QuadTileId};
 
 /// Default mesh grid cells per quadtree tile side (`16 x 16` quads = 289
@@ -257,20 +259,15 @@ fn sample_web_mercator_grid(
 
 fn sample_polar_cap_grid(
     id: QuadTileId,
-    north: bool,
     samples: &mut [DVec3; 25],
     sample_units: &mut [DVec3; 25],
 ) -> Option<()> {
-    let (n, _) = id.checked_grid_dims()?;
-    let n_f = f64::from(n);
     let mut idx = 0usize;
     for row in 0..5u32 {
         let t = f64::from(row) * 0.25;
-        let v = -1.0 + 2.0 * (f64::from(id.y) + t) / n_f;
         for col in 0..5u32 {
             let s = f64::from(col) * 0.25;
-            let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
-            let (lat, lon, _, _) = polar_cap_point(north, u, v);
+            let (lat, lon, _, _, _, _) = sample_tile_surface(id, s, t)?;
             let (ecef, unit) = geodesy::surface_ecef_and_normal(lat, lon);
             sample_units[idx] = unit;
             samples[idx] = ecef;
@@ -317,8 +314,8 @@ fn describe_tile_with_samples(id: QuadTileId, config: &QuadtreeConfig) -> Option
             0.0,
             sample_web_mercator_grid(id, grid_cells, &mut samples, &mut sample_units)?,
         ),
-        PlanetaryScheme::PolarCap { north } => {
-            sample_polar_cap_grid(id, north, &mut samples, &mut sample_units)?;
+        PlanetaryScheme::PolarCap { .. } => {
+            sample_polar_cap_grid(id, &mut samples, &mut sample_units)?;
             (0.0, 0.0)
         }
     };

@@ -7,7 +7,8 @@ use std::sync::Arc;
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, traverse};
 
-use crate::gpu_tiles::{BasemapCarrierPolicy, GpuTile, GpuTileCache};
+use crate::basemap_policy::BasemapCarrierPolicy;
+use crate::gpu_tiles::{GpuTile, GpuTileCache};
 
 use super::adaptive_grid_step_deg;
 

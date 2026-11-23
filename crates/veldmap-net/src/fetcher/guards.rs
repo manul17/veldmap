@@ -109,8 +109,6 @@ mod tests {
             y: 0,
         });
 
-        let tok1 = CancelToken::new();
-        let tok2 = CancelToken::new();
         let shut = CancelToken::new();
         let (gen1, _) = {
             let mut st = lock_unpoisoned(&state);
@@ -121,7 +119,6 @@ mod tests {
             let mut st = lock_unpoisoned(&state);
             st.register_http_in_flight(key, &shut)
         };
-        let _ = (tok1, tok2);
         drop(guard1);
 
         let mut st = lock_unpoisoned(&state);

@@ -4,6 +4,9 @@
 use rusqlite::{Connection, Params, Statement, Transaction, params};
 
 use super::EvictionReport;
+use super::schema::{
+    DELETE_META_BY_ID_SQL, SELECT_EVICT_BATCH_PROTECTED_SQL, SELECT_EVICT_BATCH_SQL,
+};
 
 /// Eviction headroom divisor (`10` => evict down to `90%` of budget so
 /// subsequent inserts do not trigger eviction on every single tile).
@@ -67,17 +70,12 @@ pub(super) fn evict_in_tx(
     // the query directly from covering index `idx_tile_meta_lru (last_used_ms,
     // byte_size)` with zero temp B-tree sorting and zero table lookups.
     let select_sql = if protect_id.is_some() {
-        "SELECT tile_id, byte_size FROM tile_meta
-         WHERE tile_id != ?2
-         ORDER BY last_used_ms ASC
-         LIMIT ?1"
+        SELECT_EVICT_BATCH_PROTECTED_SQL
     } else {
-        "SELECT tile_id, byte_size FROM tile_meta
-         ORDER BY last_used_ms ASC
-         LIMIT ?1"
+        SELECT_EVICT_BATCH_SQL
     };
     let mut select_stmt = tx.prepare(select_sql)?;
-    let mut delete_stmt = tx.prepare("DELETE FROM tile_meta WHERE tile_id = ?1")?;
+    let mut delete_stmt = tx.prepare(DELETE_META_BY_ID_SQL)?;
 
     while total_bytes > target {
         let batch = match protect_id {

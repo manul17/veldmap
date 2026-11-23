@@ -1,4 +1,6 @@
-use veldmap_core::tile::{BandKey, PlanetaryScheme, TileScheme};
+use veldmap_core::tile::{BandKey, PlanetaryScheme, QuadTileId, TileScheme};
+
+use crate::basemap_policy::{bundled_tile_key, source_tile_key};
 
 use super::*;
 

@@ -12,7 +12,6 @@ mod pipelines;
 mod snapshot;
 mod viewport;
 
-pub use crate::gpu_tiles::BasemapCarrierPolicy;
 pub use globe::GlobeRenderer;
 pub use snapshot::{DrawSnapshot, DrawTile, SnapshotBuildParams};
 pub use viewport::RenderParams;

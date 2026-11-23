@@ -64,6 +64,39 @@ pub(super) const UPSERT_META_SQL: &str = "INSERT INTO tile_meta (
        last_used_ms = excluded.last_used_ms
      RETURNING tile_id";
 
+/// Schema-coupled upsert into `tile_blobs`.
+pub(super) const UPSERT_BLOB_SQL: &str = "INSERT INTO tile_blobs (tile_id, payload)
+     VALUES (?1, ?2)
+     ON CONFLICT(tile_id) DO UPDATE SET payload = excluded.payload";
+
+/// Debounced LRU timestamp update on `tile_meta`.
+pub(super) const TOUCH_META_SQL: &str =
+    "UPDATE tile_meta SET last_used_ms = ?1 WHERE tile_id = ?2 AND last_used_ms < ?1";
+
+/// Delete one row by `tile_id` (cascading to `tile_blobs`).
+pub(super) const DELETE_META_BY_ID_SQL: &str = "DELETE FROM tile_meta WHERE tile_id = ?1";
+
+/// Sum stored payload bytes for one `source_key`.
+pub(super) const SUM_SOURCE_BYTES_SQL: &str =
+    "SELECT COALESCE(SUM(byte_size), 0) FROM tile_meta WHERE source_key = ?1";
+
+/// Delete all rows for one `source_key` (cascading to `tile_blobs`).
+pub(super) const DELETE_SOURCE_META_SQL: &str = "DELETE FROM tile_meta WHERE source_key = ?1";
+
+/// Truncate-friendly deletion of all cached blobs and metadata.
+pub(super) const CLEAR_BLOBS_SQL: &str = "DELETE FROM tile_blobs";
+pub(super) const CLEAR_META_SQL: &str = "DELETE FROM tile_meta";
+
+/// Covering-index LRU eviction queries (`idx_tile_meta_lru`).
+pub(super) const SELECT_EVICT_BATCH_SQL: &str = "SELECT tile_id, byte_size FROM tile_meta
+     ORDER BY last_used_ms ASC
+     LIMIT ?1";
+
+pub(super) const SELECT_EVICT_BATCH_PROTECTED_SQL: &str = "SELECT tile_id, byte_size FROM tile_meta
+     WHERE tile_id != ?2
+     ORDER BY last_used_ms ASC
+     LIMIT ?1";
+
 pub(super) fn read_cache_meta_totals(conn: &Connection) -> Result<(u64, u64), rusqlite::Error> {
     let (total_bytes, tile_count): (i64, i64) = conn.query_row(
         "SELECT total_bytes, tile_count FROM cache_meta WHERE id = 1",

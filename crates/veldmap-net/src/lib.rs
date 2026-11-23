@@ -25,8 +25,9 @@ pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
 pub use redact::sanitize_url_for_display;
 
 /// Minimal encoded-tile persistence boundary injected into
-/// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from SQLite and
-/// application settings types in `veldmap-storage`.
+/// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from SQLite in
+/// `veldmap-storage` (note: keys must satisfy `veldmap-storage` source-key
+/// constraints and payloads exceeding its 16 MiB cap are skipped on write).
 pub trait TileBlobStore: Send + Sync + 'static {
     /// Fetch cached encoded tile bytes for `(source_key, id)`, if present.
     fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String>;
@@ -38,10 +39,58 @@ pub trait TileBlobStore: Send + Sync + 'static {
     fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String>;
 }
 
-/// Completion callback executed by a [`TileDecodeExecutor`] after decode
-/// finishes (`Ok(())` after forwarding the decoded tile, or `Err(msg)` if
-/// decode failed or panicked).
-pub type DecodeCompletion = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+/// Typed decode failure reported through [`DecodeCompletion`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeFailure {
+    /// Encoded payload was malformed or exceeded decoder bounds (terminal for
+    /// HTTP fetches; deletes corrupt disk entries).
+    InvalidPayload(String),
+    /// Decode execution was cancelled, evicted from the decode queue under
+    /// pressure, or panicked before finishing (never marked terminal).
+    Aborted,
+}
+
+/// Receiver half of [`DecodeCompletion::channel`].
+pub struct DecodeCompletionRx(tokio::sync::oneshot::Receiver<Result<(), DecodeFailure>>);
+
+impl DecodeCompletionRx {
+    /// Non-blocking poll for completion, returning `Some(Err(DecodeFailure::Aborted))`
+    /// if the sender was dropped without calling [`DecodeCompletion::complete`].
+    pub fn try_recv(&mut self) -> Option<Result<(), DecodeFailure>> {
+        match self.0.try_recv() {
+            Ok(res) => Some(res),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Some(Err(DecodeFailure::Aborted))
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+        }
+    }
+
+    pub(crate) async fn recv(self) -> Result<(), DecodeFailure> {
+        self.0.await.unwrap_or(Err(DecodeFailure::Aborted))
+    }
+}
+
+/// Oneshot completion handle passed inside [`DecodeRequest`].
+///
+/// Dropping this handle without calling [`Self::complete`] automatically
+/// signals [`DecodeFailure::Aborted`] to the awaiting [`LiveTilePipeline`]
+/// worker, ensuring queue evictions or worker panics never orphan `in_flight`
+/// tiles.
+pub struct DecodeCompletion(tokio::sync::oneshot::Sender<Result<(), DecodeFailure>>);
+
+impl DecodeCompletion {
+    /// Create a linked `(DecodeCompletion, DecodeCompletionRx)` pair.
+    pub fn channel() -> (Self, DecodeCompletionRx) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Self(tx), DecodeCompletionRx(rx))
+    }
+
+    /// Report the decode result back to the awaiting [`LiveTilePipeline`] task.
+    pub fn complete(self, outcome: Result<(), DecodeFailure>) {
+        let _ = self.0.send(outcome);
+    }
+}
 
 /// Single encoded-tile decode request submitted from [`LiveTilePipeline`] to
 /// an injected [`TileDecodeExecutor`].

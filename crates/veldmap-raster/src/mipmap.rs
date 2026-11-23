@@ -58,6 +58,24 @@ pub(crate) fn linear_to_srgb_u8(linear: f32, lut: &[u8; LINEAR_TO_SRGB_LUT_LEN])
     }
 }
 
+#[inline]
+fn mix_2x2_srgb_rgb(
+    src: &[u8],
+    offsets: [usize; 4],
+    weights: [f32; 4],
+    to_lin: &[f32; 256],
+    to_srgb: &[u8; LINEAR_TO_SRGB_LUT_LEN],
+    out: &mut [u8],
+) {
+    for ch in 0..3 {
+        let lin = to_lin[usize::from(src[offsets[0] + ch])] * weights[0]
+            + to_lin[usize::from(src[offsets[1] + ch])] * weights[1]
+            + to_lin[usize::from(src[offsets[2] + ch])] * weights[2]
+            + to_lin[usize::from(src[offsets[3] + ch])] * weights[3];
+        out[ch] = linear_to_srgb_u8(lin, to_srgb);
+    }
+}
+
 /// Downsample an opaque packed `Rgb8` sRGB image 2x in linear light, wrapping
 /// horizontally for equirectangular continuity.
 pub(crate) fn downsample_rgb8_srgb_wrap_x_2x(
@@ -86,14 +104,14 @@ pub(crate) fn downsample_rgb8_srgb_wrap_x_2x(
                 (sy1 * sw + sx1) * 3,
             ];
             let out = (y * dw + x) * 3;
-            for ch in 0..3 {
-                let avg = 0.25
-                    * offsets
-                        .iter()
-                        .map(|&o| to_lin[usize::from(src[o + ch])])
-                        .sum::<f32>();
-                dst[out + ch] = linear_to_srgb_u8(avg, to_srgb);
-            }
+            mix_2x2_srgb_rgb(
+                src,
+                offsets,
+                [0.25; 4],
+                to_lin,
+                to_srgb,
+                &mut dst[out..out + 3],
+            );
         }
     }
 
@@ -122,15 +140,17 @@ fn downsample_rgba8_srgb_2x(
             let sx0 = (x * 2).min(sw - 1);
             let sx1 = (sx0 + 1).min(sw - 1);
 
-            let o00 = (sy0 * sw + sx0) * 4;
-            let o10 = (sy0 * sw + sx1) * 4;
-            let o01 = (sy1 * sw + sx0) * 4;
-            let o11 = (sy1 * sw + sx1) * 4;
+            let offsets = [
+                (sy0 * sw + sx0) * 4,
+                (sy0 * sw + sx1) * 4,
+                (sy1 * sw + sx0) * 4,
+                (sy1 * sw + sx1) * 4,
+            ];
 
-            let a00 = f32::from(src[o00 + 3]) / 255.0;
-            let a10 = f32::from(src[o10 + 3]) / 255.0;
-            let a01 = f32::from(src[o01 + 3]) / 255.0;
-            let a11 = f32::from(src[o11 + 3]) / 255.0;
+            let a00 = f32::from(src[offsets[0] + 3]) / 255.0;
+            let a10 = f32::from(src[offsets[1] + 3]) / 255.0;
+            let a01 = f32::from(src[offsets[2] + 3]) / 255.0;
+            let a11 = f32::from(src[offsets[3] + 3]) / 255.0;
             let a_sum = a00 + a10 + a01 + a11;
 
             let out = (y * dw + x) * 4;
@@ -143,14 +163,15 @@ fn downsample_rgba8_srgb_2x(
             // transparent border pixels while reducing to a pure 0.25 average
             // for opaque satellite tiles.
             let inv_a = 1.0 / a_sum;
-            for ch in 0..3 {
-                let lin = (to_lin[usize::from(src[o00 + ch])] * a00
-                    + to_lin[usize::from(src[o10 + ch])] * a10
-                    + to_lin[usize::from(src[o01 + ch])] * a01
-                    + to_lin[usize::from(src[o11 + ch])] * a11)
-                    * inv_a;
-                dst[out + ch] = linear_to_srgb_u8(lin, to_srgb);
-            }
+            let weights = [a00 * inv_a, a10 * inv_a, a01 * inv_a, a11 * inv_a];
+            mix_2x2_srgb_rgb(
+                src,
+                offsets,
+                weights,
+                to_lin,
+                to_srgb,
+                &mut dst[out..out + 3],
+            );
             dst[out + 3] = ((a_sum * 0.25) * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }

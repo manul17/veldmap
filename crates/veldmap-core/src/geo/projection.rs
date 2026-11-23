@@ -158,6 +158,13 @@ const WEB_MERCATOR_RADIUS_M: f64 = SEMI_MAJOR_M;
 /// Maximum latitude of the square Web Mercator domain (`atan(sinh(pi))`).
 pub const WEB_MERCATOR_LIMIT_DEG: f64 = 85.051_128_779_806_59;
 
+/// Convert normalized Web Mercator Y radians (`[-pi, +pi]`) to geodetic
+/// latitude in degrees.
+#[inline]
+pub fn web_mercator_lat_deg(merc_rad: f64) -> f64 {
+    merc_rad.sinh().atan().to_degrees()
+}
+
 impl Projection {
     /// Look up a projection by EPSG (or regional MSK-61) code.
     pub fn from_epsg(code: u32) -> Option<Self> {
@@ -188,9 +195,8 @@ impl Projection {
             Self::Transverse(system) => system.to_geodetic(easting, northing),
             Self::WebMercator => {
                 let lon = (easting / WEB_MERCATOR_RADIUS_M).to_degrees();
-                let phi = 2.0 * (northing / WEB_MERCATOR_RADIUS_M).exp().atan()
-                    - std::f64::consts::FRAC_PI_2;
-                (phi.to_degrees(), lon)
+                let lat = web_mercator_lat_deg(northing / WEB_MERCATOR_RADIUS_M);
+                (lat, lon)
             }
         }
     }

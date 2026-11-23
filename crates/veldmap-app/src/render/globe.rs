@@ -5,21 +5,19 @@ use std::ops::Range;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
-use veldmap_core::tile::{
-    DEFAULT_GRID_CELLS, POLAR_R_CAP, PixelFormat, PlanetaryScheme, QuadTileId, TileCache,
-    sample_tile_surface,
-};
+use veldmap_core::tile::{DEFAULT_GRID_CELLS, POLAR_R_CAP, PixelFormat, QuadTileId, TileCache};
 use wgpu::util::DeviceExt;
 
 use crate::gpu_tiles::GpuTile;
 
 use super::CLEAR_COLOR_LINEAR;
-use super::mesh::{SharedTileIndices, TileVertex, build_tile_mesh_data};
+use super::mesh::{
+    SharedTileIndices, TileGridAnchor, TileVertex, build_tile_mesh_data, tile_graticule_uniform,
+};
 use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
 use super::viewport::{
-    CameraUniform, LastRenderKey, OffscreenTarget, RenderParams, TILE_KIND_GEO,
-    TILE_KIND_POLAR_CLEAR_SCALE, TILE_KIND_POLAR_NORTH, TILE_KIND_POLAR_SOUTH, TileUniform,
+    CameraUniform, LastRenderKey, OffscreenTarget, RenderParams, TILE_KIND_GEO, TileUniform,
     ViewportState,
 };
 
@@ -29,56 +27,7 @@ const DEFAULT_MESH_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 struct CachedTileMesh {
     buffer: wgpu::Buffer,
-    grid_anchor: (f64, f64),
-}
-
-fn tile_graticule_uniform(
-    id: QuadTileId,
-    cached_anchor: Option<(f64, f64)>,
-    step_deg: f64,
-) -> (f32, [f32; 4]) {
-    match id.scheme {
-        PlanetaryScheme::PolarCap { north } => {
-            let (lat0, lon0, dx0, dy0) = sample_tile_surface(id, 0.5, 0.5)
-                .map(|(lat, lon, _, _, dx, dy)| (lat, lon, dx, dy))
-                .unwrap_or((if north { 90.0 } else { -90.0 }, 0.0, 0.0, 0.0));
-            let colat_phase = (90.0 - lat0.abs()).rem_euclid(step_deg);
-            let lon_phase = lon0.rem_euclid(step_deg);
-
-            // Use cancellation-free relative longitude deltas when the tile's
-            // disk center is strictly clear of the pole (`rho0 > 4 * tile_half_diag`).
-            let rho0 = dx0.hypot(dy0);
-            let n = f64::from(1u32 << id.level.min(30));
-            let tile_half_diag = std::f64::consts::SQRT_2 / n;
-            let clear_of_pole = id.level >= 2 && rho0 > 4.0 * tile_half_diag;
-            let sign = if north {
-                TILE_KIND_POLAR_NORTH
-            } else {
-                TILE_KIND_POLAR_SOUTH
-            };
-            let kind = if clear_of_pole {
-                sign * TILE_KIND_POLAR_CLEAR_SCALE
-            } else {
-                sign
-            };
-            (
-                kind,
-                [dx0 as f32, dy0 as f32, colat_phase as f32, lon_phase as f32],
-            )
-        }
-        PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => {
-            let (anchor_a, anchor_b) = cached_anchor.unwrap_or((0.0, 0.0));
-            // Wrap tile anchor phase modulo `grid_step_deg` in f64 on CPU so
-            // `f32` fragment arithmetic preserves sub-millimetre accuracy even
-            // at `2 m` altitude.
-            let lon_phase = anchor_a.rem_euclid(step_deg);
-            let lat_phase = anchor_b.rem_euclid(step_deg);
-            (
-                TILE_KIND_GEO,
-                [lon_phase as f32, lat_phase as f32, 0.0, 0.0],
-            )
-        }
-    }
+    grid_anchor: TileGridAnchor,
 }
 
 /// Standalone offscreen `wgpu` WGS84 quadtree globe renderer.

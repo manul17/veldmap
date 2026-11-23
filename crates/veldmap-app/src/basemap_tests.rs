@@ -1,9 +1,11 @@
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{TileScheme, traverse};
+use veldmap_net::{DecodeCompletion, DecodeFailure, DecodeRequest};
+use veldmap_raster::{DecodePool, DecodePoolConfig};
 use veldmap_storage::StoragePaths;
 
 use super::*;
-use crate::gpu_tiles::source_tile_key;
+use crate::basemap_policy::{bundled_tile_key, source_tile_key};
 use crate::storage::AppStorage;
 use crate::test_support::TempTestRoot;
 
@@ -127,8 +129,7 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_flush
 }
 
 #[test]
-fn rejected_or_cancelled_decode_request_does_not_report_panic() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+fn rejected_or_cancelled_decode_request_signals_aborted() {
     use std::sync::mpsc;
 
     let (done_tx, _done_rx) = mpsc::channel();
@@ -150,8 +151,7 @@ fn rejected_or_cancelled_decode_request_does_not_report_panic() {
 
     let cancel = CancelToken::new();
     cancel.cancel();
-    let invoked = Arc::new(AtomicBool::new(false));
-    let invoked_cb = Arc::clone(&invoked);
+    let (on_decoded, mut rx) = DecodeCompletion::channel();
     let key = bundled_tile_key(QuadTileId {
         scheme: PlanetaryScheme::WebMercator,
         level: 0,
@@ -162,14 +162,13 @@ fn rejected_or_cancelled_decode_request_does_not_report_panic() {
         key,
         bytes: Arc::from([0u8; 4]),
         cancel,
-        on_decoded: Box::new(move |_| {
-            invoked_cb.store(true, Ordering::SeqCst);
-        }),
+        on_decoded,
     });
     assert!(!accepted);
-    assert!(
-        !invoked.load(Ordering::SeqCst),
-        "rejected decode job must not fire on_decoded"
+    assert_eq!(
+        rx.try_recv(),
+        Some(Err(DecodeFailure::Aborted)),
+        "rejected decode job must drop its completion handle as Aborted"
     );
     shutdown.cancel();
     pool.shutdown();

@@ -1,6 +1,7 @@
 //! Queue, in-flight tracking, and failure/backoff state machine for
 //! [`super::LiveTilePipeline`].
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,19 +13,21 @@ use crate::basemap::LiveBasemapSpec;
 
 use super::NetworkStatus;
 
-/// Upper bound on retained per-tile failure/empty markers to prevent unbounded
-/// memory growth on sparse 404 layers over long sessions.
+/// Upper bound on retained permanent/empty per-tile markers to prevent
+/// unbounded memory growth on sparse 404/204 layers over long sessions.
 pub(super) const MAX_FAILURE_ENTRIES: usize = 4096;
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum FailureState {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FailureMarker {
     Terminal,
     /// HTTP `204 No Content`: suppresses infinite refetch without flagging an error.
     Empty,
-    BackoffUntil {
-        until: Instant,
-        retry_disk: bool,
-    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BackoffEntry {
+    pub(super) until: Instant,
+    pub(super) retry_disk: bool,
 }
 
 #[derive(Default)]
@@ -45,7 +48,11 @@ pub(super) struct PipelineState {
     /// spawn and pan/switch cancels queued decode jobs immediately.
     in_flight: HashMap<TileKey, (u64, CancelToken)>,
     next_gen: u64,
-    failures: HashMap<TileKey, FailureState>,
+    /// Permanent (`Terminal`) or valid-empty (`204 No Content`) tile markers.
+    failures: HashMap<TileKey, FailureMarker>,
+    /// Active retry cooldowns (kept separate from `failures` so cap pruning
+    /// never drops retries and `retry_failed` preserves valid `204` markers).
+    backoffs: HashMap<TileKey, BackoffEntry>,
     completed_from_disk: u64,
     completed_from_net: u64,
     failed_count: u64,
@@ -55,16 +62,33 @@ pub(super) struct PipelineState {
 
 impl PipelineState {
     pub(super) fn sort_queue_coarsest_at_end(queue: &mut [TileKey]) {
-        queue.sort_by_key(|k| std::cmp::Reverse(k.coarsest_first_key()));
+        queue.sort_by_key(|k| Reverse(k.coarsest_first_key()));
+    }
+
+    /// Insert a single `TileKey` into a `coarsest_at_end`-sorted queue without
+    /// duplicating entries or re-sorting the entire `Vec`.
+    fn insert_unique_sorted(queue: &mut Vec<TileKey>, key: TileKey) -> bool {
+        let sort_key = Reverse(key.coarsest_first_key());
+        match queue.binary_search_by_key(&sort_key, |k| Reverse(k.coarsest_first_key())) {
+            Ok(_) => false,
+            Err(idx) => {
+                queue.insert(idx, key);
+                true
+            }
+        }
     }
 
     fn push_unique_sorted(
         queue: &mut Vec<TileKey>,
         keys: impl IntoIterator<Item = TileKey>,
     ) -> bool {
+        let mut iter = keys.into_iter().peekable();
+        if iter.peek().is_none() {
+            return false;
+        }
         let mut existing: HashSet<TileKey> = queue.iter().copied().collect();
         let mut added = false;
-        for key in keys {
+        for key in iter {
             if existing.insert(key) {
                 queue.push(key);
                 added = true;
@@ -76,11 +100,8 @@ impl PipelineState {
         added
     }
 
-    fn prune_expired_backoff_markers(&mut self, now: Instant) {
-        self.failures.retain(|_, f| match f {
-            FailureState::Terminal | FailureState::Empty => true,
-            FailureState::BackoffUntil { until, .. } => *until > now,
-        });
+    fn is_suppressed(&self, key: &TileKey) -> bool {
+        self.failures.contains_key(key) || self.backoffs.contains_key(key)
     }
 
     fn is_active_source(&self, source: SourceId) -> bool {
@@ -90,9 +111,7 @@ impl PipelineState {
     }
 
     fn is_queue_eligible(&self, key: &TileKey, active_source: SourceId) -> bool {
-        key.source == active_source
-            && !self.in_flight.contains_key(key)
-            && !self.failures.contains_key(key)
+        key.source == active_source && !self.in_flight.contains_key(key) && !self.is_suppressed(key)
     }
 
     pub(super) fn active_spec(&self) -> Option<Arc<LiveBasemapSpec>> {
@@ -111,6 +130,7 @@ impl PipelineState {
         self.pending_disk.clear();
         self.pending_http.clear();
         self.failures.clear();
+        self.backoffs.clear();
         self.failed_count = 0;
         self.offline = false;
         self.last_error = None;
@@ -145,8 +165,6 @@ impl PipelineState {
             keep
         });
 
-        self.prune_expired_backoff_markers(now);
-
         self.last_wanted.clear();
         for &key in wanted {
             if key.source == active_source
@@ -159,6 +177,21 @@ impl PipelineState {
             }
         }
 
+        // Drain expired backoffs (`until <= now`) and route `retry_disk: false`
+        // directly to `pending_http` so expired HTTP retries never bounce back
+        // through SQLite disk lookups.
+        let mut expired_http = Vec::new();
+        self.backoffs.retain(|&key, entry| {
+            if entry.until <= now {
+                if !entry.retry_disk {
+                    expired_http.push(key);
+                }
+                false
+            } else {
+                true
+            }
+        });
+
         // Retain still-wanted / active-root entries already in `pending_http`
         // so disk misses never bounce back to `pending_disk`.
         let mut already_in_http = HashSet::new();
@@ -166,6 +199,7 @@ impl PipelineState {
             let Self {
                 last_wanted,
                 failures,
+                backoffs,
                 in_flight,
                 pending_http,
                 ..
@@ -175,6 +209,7 @@ impl PipelineState {
                     && !is_ready(key)
                     && !in_flight.contains_key(key)
                     && !failures.contains_key(key)
+                    && !backoffs.contains_key(key)
                     && (last_wanted.contains(key) || key.is_root_of(active_source));
                 if keep {
                     already_in_http.insert(*key);
@@ -183,10 +218,22 @@ impl PipelineState {
             });
         }
 
+        for key in expired_http {
+            if key.source == active_source
+                && self.last_wanted.contains(&key)
+                && !is_ready(&key)
+                && !self.in_flight.contains_key(&key)
+                && !self.failures.contains_key(&key)
+                && already_in_http.insert(key)
+            {
+                self.pending_http.push(key);
+            }
+        }
+
         let mut next_disk = Vec::new();
         for &key in &self.last_wanted {
             if self.in_flight.contains_key(&key)
-                || self.failures.contains_key(&key)
+                || self.is_suppressed(&key)
                 || already_in_http.contains(&key)
             {
                 continue;
@@ -200,7 +247,18 @@ impl PipelineState {
     }
 
     pub(super) fn retry_failed(&mut self) {
-        let cleared: Vec<TileKey> = self.failures.drain().map(|(k, _)| k).collect();
+        // Preserve valid `204 Empty` markers across manual retries while
+        // clearing all `Terminal` failures and active backoff timers.
+        let mut cleared_terminal = Vec::new();
+        self.failures.retain(|&key, marker| match marker {
+            FailureMarker::Empty => true,
+            FailureMarker::Terminal => {
+                cleared_terminal.push(key);
+                false
+            }
+        });
+        let cleared_backoffs: Vec<(TileKey, BackoffEntry)> = self.backoffs.drain().collect();
+
         self.failed_count = 0;
         self.offline = false;
         self.last_error = None;
@@ -210,16 +268,33 @@ impl PipelineState {
         };
         let active_source = spec.source_id();
         let queued_http: HashSet<TileKey> = self.pending_http.iter().copied().collect();
-        let to_requeue: Vec<TileKey> = cleared
-            .into_iter()
-            .filter(|key| {
-                key.source == active_source
-                    && self.last_wanted.contains(key)
-                    && !self.in_flight.contains_key(key)
-                    && !queued_http.contains(key)
-            })
-            .collect();
-        Self::push_unique_sorted(&mut self.pending_disk, to_requeue);
+
+        let is_eligible = |key: &TileKey| {
+            key.source == active_source
+                && self.last_wanted.contains(key)
+                && !self.in_flight.contains_key(key)
+                && !self.failures.contains_key(key)
+                && !queued_http.contains(key)
+        };
+
+        let mut disk_requeue = Vec::new();
+        let mut http_requeue = Vec::new();
+        for key in cleared_terminal {
+            if is_eligible(&key) {
+                disk_requeue.push(key);
+            }
+        }
+        for (key, entry) in cleared_backoffs {
+            if is_eligible(&key) {
+                if entry.retry_disk {
+                    disk_requeue.push(key);
+                } else {
+                    http_requeue.push(key);
+                }
+            }
+        }
+        Self::push_unique_sorted(&mut self.pending_disk, disk_requeue);
+        Self::push_unique_sorted(&mut self.pending_http, http_requeue);
     }
 
     pub(super) fn status(&self) -> NetworkStatus {
@@ -341,8 +416,8 @@ impl PipelineState {
         if !self.remove_in_flight_if_gen(&key, generation) {
             return false;
         }
-        if can_requeue && self.is_active_source(key.source) && !self.failures.contains_key(&key) {
-            Self::push_unique_sorted(&mut self.pending_http, [key]);
+        if can_requeue && self.is_active_source(key.source) && !self.is_suppressed(&key) {
+            Self::insert_unique_sorted(&mut self.pending_http, key);
         }
         true
     }
@@ -365,27 +440,50 @@ impl PipelineState {
         }
     }
 
-    pub(super) fn mark_empty_204(&mut self, key: TileKey, now: Instant) {
+    pub(super) fn mark_empty_204(&mut self, key: TileKey) {
         if !self.is_active_source(key.source) {
             return;
         }
         self.last_wanted.remove(&key);
-        self.insert_failure(key, FailureState::Empty, now);
+        self.insert_failure(key, FailureMarker::Empty);
         self.offline = false;
     }
 
-    pub(super) fn mark_failure(
+    pub(super) fn mark_terminal_failure(
         &mut self,
         key: TileKey,
-        failure: FailureState,
-        offline: bool,
         error_msg: Option<String>,
-        now: Instant,
     ) -> bool {
         if !self.is_active_source(key.source) {
             return false;
         }
-        self.insert_failure(key, failure, now);
+        self.insert_failure(key, FailureMarker::Terminal);
+        self.failed_count = self.failed_count.saturating_add(1);
+        if let Some(msg) = error_msg {
+            self.last_error = Some(msg);
+        }
+        true
+    }
+
+    pub(super) fn mark_transient_backoff(
+        &mut self,
+        key: TileKey,
+        until: Instant,
+        offline: bool,
+        error_msg: Option<String>,
+    ) -> bool {
+        if !self.is_active_source(key.source) {
+            return false;
+        }
+        if !self.failures.contains_key(&key) {
+            self.backoffs.insert(
+                key,
+                BackoffEntry {
+                    until,
+                    retry_disk: false,
+                },
+            );
+        }
         self.failed_count = self.failed_count.saturating_add(1);
         if offline {
             self.offline = true;
@@ -399,22 +497,24 @@ impl PipelineState {
     pub(super) fn schedule_decode_backpressure(
         &mut self,
         key: TileKey,
+        generation: u64,
         backoff: Duration,
         retry_disk: bool,
         now: Instant,
     ) -> bool {
+        if !self.remove_in_flight_if_gen(&key, generation) {
+            return false;
+        }
         if self.is_active_source(key.source)
             && self.last_wanted.contains(&key)
-            && !self.in_flight.contains_key(&key)
-            && !self.failures.contains_key(&key)
+            && !self.is_suppressed(&key)
         {
-            self.insert_failure(
+            self.backoffs.insert(
                 key,
-                FailureState::BackoffUntil {
+                BackoffEntry {
                     until: now + backoff,
                     retry_disk,
                 },
-                now,
             );
             true
         } else {
@@ -422,38 +522,43 @@ impl PipelineState {
         }
     }
 
-    pub(super) fn insert_failure(&mut self, key: TileKey, failure: FailureState, now: Instant) {
+    pub(super) fn insert_failure(&mut self, key: TileKey, marker: FailureMarker) {
+        self.backoffs.remove(&key);
         if self.failures.len() >= MAX_FAILURE_ENTRIES && !self.failures.contains_key(&key) {
-            self.prune_expired_backoff_markers(now);
+            let wanted = &self.last_wanted;
+            self.failures.retain(|k, _| wanted.contains(k));
             if self.failures.len() >= MAX_FAILURE_ENTRIES {
-                let wanted = &self.last_wanted;
-                self.failures.retain(|k, _| wanted.contains(k));
-            }
-            if self.failures.len() >= MAX_FAILURE_ENTRIES
-                && let Some(&evict_key) = self.failures.keys().next()
-            {
-                self.failures.remove(&evict_key);
+                let evict_key = self
+                    .failures
+                    .iter()
+                    .find(|(_, m)| **m == FailureMarker::Terminal)
+                    .map(|(k, _)| *k)
+                    .or_else(|| self.failures.keys().next().copied());
+                if let Some(evict_key) = evict_key {
+                    self.failures.remove(&evict_key);
+                }
             }
         }
-        self.failures.insert(key, failure);
+        self.failures.insert(key, marker);
     }
 
-    /// Prune all expired `BackoffUntil <= now` markers and re-enqueue any that
-    /// are still in `last_wanted` into `pending_disk` or `pending_http`.
+    /// Prune all expired backoff entries (`until <= now`) and re-enqueue any
+    /// that are still in `last_wanted` into `pending_disk` or `pending_http`.
     /// Returns whether new work was queued.
     pub(super) fn prune_expired_backoffs(&mut self, now: Instant) -> bool {
         let Some(spec) = self.active_spec.as_ref() else {
-            self.failures.clear();
+            self.backoffs.clear();
             return false;
         };
         let active_source = spec.source_id();
         let mut expired = Vec::new();
-        self.failures.retain(|&key, f| match f {
-            FailureState::BackoffUntil { until, retry_disk } if *until <= now => {
-                expired.push((key, *retry_disk));
+        self.backoffs.retain(|&key, entry| {
+            if entry.until <= now {
+                expired.push((key, entry.retry_disk));
                 false
+            } else {
+                true
             }
-            _ => true,
         });
         if expired.is_empty() {
             return false;
@@ -466,6 +571,7 @@ impl PipelineState {
             if key.source == active_source
                 && self.last_wanted.contains(&key)
                 && !self.in_flight.contains_key(&key)
+                && !self.failures.contains_key(&key)
                 && !queued_disk.contains(&key)
                 && !queued_http.contains(&key)
             {
@@ -481,18 +587,13 @@ impl PipelineState {
         requeued_disk || requeued_http
     }
 
-    /// Earliest `BackoffUntil` timestamp among currently wanted tiles (used by
+    /// Earliest backoff timestamp among currently wanted tiles (used by
     /// `dispatcher_loop` to self-wake for idle retries without busy-spinning).
     pub(super) fn earliest_wanted_backoff(&self, now: Instant) -> Option<Instant> {
-        self.failures
+        self.backoffs
             .iter()
-            .filter_map(|(k, f)| match f {
-                FailureState::BackoffUntil { until, .. }
-                    if *until > now && self.last_wanted.contains(k) =>
-                {
-                    Some(*until)
-                }
-                _ => None,
+            .filter_map(|(k, entry)| {
+                (entry.until > now && self.last_wanted.contains(k)).then_some(entry.until)
             })
             .min()
     }
@@ -516,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_state_enforces_failure_cap_and_requeues_expired_backoffs() {
+    fn pipeline_state_separates_failures_and_preserves_204_empty_on_retry() {
         let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
         let mut st = PipelineState {
             active_spec: Some(Arc::clone(&spec)),
@@ -525,23 +626,26 @@ mod tests {
         let now = Instant::now();
         let http_key = wm_key(&spec, 4, 1, 2);
         let disk_key = wm_key(&spec, 4, 2, 2);
+        let empty_key = wm_key(&spec, 4, 3, 2);
+        let terminal_key = wm_key(&spec, 4, 4, 2);
+
         st.last_wanted.insert(http_key);
         st.last_wanted.insert(disk_key);
-        st.insert_failure(
+        st.last_wanted.insert(terminal_key);
+
+        st.backoffs.insert(
             http_key,
-            FailureState::BackoffUntil {
+            BackoffEntry {
                 until: now - Duration::from_secs(1),
                 retry_disk: false,
             },
-            now,
         );
-        st.insert_failure(
+        st.backoffs.insert(
             disk_key,
-            FailureState::BackoffUntil {
+            BackoffEntry {
                 until: now - Duration::from_secs(1),
                 retry_disk: true,
             },
-            now,
         );
         assert!(st.prune_expired_backoffs(now));
         assert!(st.pending_http.contains(&http_key));
@@ -549,11 +653,39 @@ mod tests {
         assert!(st.pending_disk.contains(&disk_key));
         assert!(!st.pending_http.contains(&disk_key));
 
-        // Filling beyond MAX_FAILURE_ENTRIES prunes non-wanted entries without exceeding cap.
+        // 204 Empty markers survive retry_failed while Terminal markers re-queue.
+        st.mark_empty_204(empty_key);
+        st.last_wanted.insert(empty_key);
+        st.mark_terminal_failure(terminal_key, Some("bad".to_owned()));
+        st.retry_failed();
+        assert_eq!(st.failures.get(&empty_key), Some(&FailureMarker::Empty));
+        assert!(!st.failures.contains_key(&terminal_key));
+        assert!(st.pending_disk.contains(&terminal_key));
+
+        // Filling beyond MAX_FAILURE_ENTRIES caps failures without evicting active backoffs.
+        let active_backoff = wm_key(&spec, 5, 0, 0);
+        st.last_wanted.insert(active_backoff);
+        st.mark_transient_backoff(active_backoff, now + Duration::from_secs(10), false, None);
         for i in 0..(MAX_FAILURE_ENTRIES as u32 + 16) {
             let k = wm_key(&spec, 12, i, 0);
-            st.insert_failure(k, FailureState::Terminal, now);
+            st.insert_failure(k, FailureMarker::Terminal);
         }
         assert!(st.failures.len() <= MAX_FAILURE_ENTRIES);
+        assert!(st.backoffs.contains_key(&active_backoff));
+    }
+
+    #[test]
+    fn insert_unique_sorted_maintains_coarsest_at_end_order() {
+        let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
+        let mut queue = Vec::new();
+        let k0 = wm_key(&spec, 0, 0, 0);
+        let k1 = wm_key(&spec, 2, 1, 1);
+        let k2 = wm_key(&spec, 1, 0, 0);
+
+        assert!(PipelineState::insert_unique_sorted(&mut queue, k1));
+        assert!(PipelineState::insert_unique_sorted(&mut queue, k0));
+        assert!(PipelineState::insert_unique_sorted(&mut queue, k2));
+        assert!(!PipelineState::insert_unique_sorted(&mut queue, k1));
+        assert_eq!(queue, vec![k1, k2, k0]);
     }
 }

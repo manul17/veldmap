@@ -2,7 +2,7 @@ use super::*;
 use crate::geo::camera::MIN_HEIGHT_M;
 use crate::geo::geodesy::Geodetic;
 use crate::geo::projection::WEB_MERCATOR_LIMIT_DEG;
-use crate::tile::geometry::{POLAR_R_CAP, sample_tile_surface};
+use crate::tile::geometry::{POLAR_R_CAP, polar_cap_point, sample_tile_surface};
 
 #[test]
 fn decoupled_lod_subdivides_past_max_tex_level_with_zero_requests_above_cap() {

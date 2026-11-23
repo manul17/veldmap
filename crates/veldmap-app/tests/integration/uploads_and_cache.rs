@@ -5,9 +5,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use veldmap_app::BUNDLED_MAX_LEVEL;
-use veldmap_app::gpu_tiles::{
-    GpuTileCache, PendingUploads, UploadPassParams, bundled_tile_key, source_tile_key,
-};
+use veldmap_app::basemap_policy::{bundled_tile_key, source_tile_key};
+use veldmap_app::gpu_tiles::{GpuTileCache, PendingUploads, UploadPassParams};
 use veldmap_app::render::GlobeRenderer;
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{

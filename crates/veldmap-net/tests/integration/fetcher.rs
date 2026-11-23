@@ -8,8 +8,8 @@ use tokio::net::TcpListener;
 use veldmap_core::io::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, TileKey};
 use veldmap_net::{
-    CustomBasemapConfig, DecodeRequest, FetcherConfig, LiveBasemapSpec, LiveTilePipeline,
-    TileBlobStore, TileDecodeExecutor,
+    CustomBasemapConfig, DecodeFailure, DecodeRequest, FetcherConfig, LiveBasemapSpec,
+    LiveTilePipeline, TileBlobStore, TileDecodeExecutor,
 };
 
 type BlobMapKey = (String, PlanetaryScheme, u8, u32, u32);
@@ -71,11 +71,13 @@ impl TileDecodeExecutor for TestDecodeExecutor {
             )
             .expect("synthetic tile");
             if self.done_tx.send((req.key, tile)).is_ok() {
-                (req.on_decoded)(Ok(()));
+                req.on_decoded.complete(Ok(()));
                 (self.wakeup)();
             }
         } else {
-            (req.on_decoded)(Err("corrupt test tile payload".to_owned()));
+            req.on_decoded.complete(Err(DecodeFailure::InvalidPayload(
+                "corrupt test tile payload".to_owned(),
+            )));
         }
         true
     }
@@ -609,5 +611,59 @@ fn cancel_token_aborts_slow_inflight_request_promptly_on_shutdown() {
         "shutdown should abort slow HTTP promptly, took {elapsed:?}"
     );
 
+    server.shutdown();
+}
+
+struct DropFirstDecodeExecutor {
+    dropped_once: AtomicUsize,
+    inner: TestDecodeExecutor,
+}
+
+impl TileDecodeExecutor for DropFirstDecodeExecutor {
+    fn submit(&self, req: DecodeRequest) -> bool {
+        if self.dropped_once.fetch_add(1, Ordering::AcqRel) == 0 {
+            // Simulate post-acceptance queue eviction or panic dropping `DecodeRequest`.
+            drop(req);
+            return true;
+        }
+        self.inner.submit(req)
+    }
+}
+
+#[test]
+fn dropped_or_evicted_decode_request_requeues_instead_of_orphaning() {
+    let payload = make_valid_tile_bytes(5);
+    let server =
+        spawn_mock_server(move |_, _| MockResponse::ok_tile(payload.clone(), Duration::ZERO));
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let wakeup: Wakeup = Arc::new(|| {});
+    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(DropFirstDecodeExecutor {
+        dropped_once: AtomicUsize::new(0),
+        inner: TestDecodeExecutor {
+            done_tx,
+            wakeup: Arc::clone(&wakeup),
+        },
+    });
+    let pipeline = LiveTilePipeline::spawn(FetcherConfig::default(), None, decoder, wakeup)
+        .expect("spawn pipeline");
+    let spec = custom_spec(server.addr, 1);
+    pipeline.set_active_spec(Some(spec.clone()));
+
+    let k0 = spec.tile_key(QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 0,
+        x: 0,
+        y: 0,
+    });
+    pipeline.reconcile_wanted(&HashSet::from([k0]), |_| false);
+
+    let (got_key, _) = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("evicted decode must re-queue via backoff and complete");
+    assert_eq!(got_key, k0);
+    assert_eq!(pipeline.status().failed_count, 0);
+
+    pipeline.shutdown();
     server.shutdown();
 }
