@@ -6,6 +6,7 @@
 //! from UI layout code.
 
 use eframe::egui;
+use veldmap_net::validate_custom_url_template;
 
 use crate::basemap::BasemapStatusSnapshot;
 use crate::hud;
@@ -79,6 +80,10 @@ pub enum BasemapUiAction {
     SelectBasemap(BasemapSelection),
     /// Commit edited basemap/cache settings from the Settings window.
     ApplyDraft(BasemapSettingsDraft),
+    /// Settings window opened this frame (triggers event-driven cache stats refresh).
+    SettingsOpened,
+    /// Settings window closed this frame.
+    SettingsClosed,
     /// Request an asynchronous SQLite disk cache clear off the UI thread.
     ClearDiskCache,
     /// Dismiss any transient disk-cache status notice when opening Settings.
@@ -91,27 +96,22 @@ pub enum BasemapUiAction {
 #[derive(Clone, Debug)]
 pub struct BasemapUiState {
     settings_open: bool,
-    was_settings_open: bool,
     draft: BasemapSettingsDraft,
-    cached_custom_validation: Option<(CustomXyzSettings, Result<(), String>)>,
+    cached_custom_validation: Option<(String, Result<(), String>)>,
 }
 
 impl BasemapUiState {
     pub fn new(initial: &AppSettings) -> Self {
         Self {
             settings_open: false,
-            was_settings_open: false,
             draft: BasemapSettingsDraft::from_settings(initial),
             cached_custom_validation: None,
         }
     }
 
-    /// Return `(is_open, just_opened)` transition state for event-driven stats
-    /// refreshes so `AppStorage` stays decoupled from UI window visibility.
-    pub fn poll_settings_window_state(&mut self) -> (bool, bool) {
-        let just_opened = self.settings_open && !self.was_settings_open;
-        self.was_settings_open = self.settings_open;
-        (self.settings_open, just_opened)
+    /// Whether the Basemap & Cache Settings window is currently open.
+    pub fn is_settings_open(&self) -> bool {
+        self.settings_open
     }
 
     /// Update only the draft's `active_basemap` selection (preserving unsaved
@@ -127,21 +127,18 @@ impl BasemapUiState {
         self.cached_custom_validation = None;
     }
 
-    /// Return cached validation result for `draft.custom_xyz`, recomputing
-    /// only when any field of `custom_xyz` changes.
+    /// Return cached validation result for `draft.custom_xyz.url_template`,
+    /// recomputing only when the URL template changes.
     fn custom_validation(&mut self) -> Result<(), &str> {
         let needs_recompute = self
             .cached_custom_validation
             .as_ref()
-            .is_none_or(|(prev, _)| prev != &self.draft.custom_xyz);
+            .is_none_or(|(prev, _)| prev != &self.draft.custom_xyz.url_template);
         if needs_recompute {
-            let res = self
-                .draft
-                .custom_xyz
-                .to_live_spec()
+            let res = validate_custom_url_template(&self.draft.custom_xyz.url_template)
                 .map(|_| ())
                 .map_err(|err| err.to_string());
-            self.cached_custom_validation = Some((self.draft.custom_xyz.clone(), res));
+            self.cached_custom_validation = Some((self.draft.custom_xyz.url_template.clone(), res));
         }
         match self.cached_custom_validation.as_ref() {
             Some((_, Ok(()))) => Ok(()),
@@ -248,11 +245,15 @@ pub fn show_toolbar_controls(
                     if option == BasemapSelection::CustomXyz
                         && settings.custom_xyz.url_template.trim().is_empty()
                     {
-                        if !ui_state.settings_open {
+                        let was_open = ui_state.settings_open;
+                        if !was_open {
                             ui_state.sync_from_settings(settings);
                         }
                         ui_state.draft.active_basemap = BasemapSelection::CustomXyz;
                         ui_state.settings_open = true;
+                        if !was_open {
+                            actions.push(BasemapUiAction::SettingsOpened);
+                        }
                         actions.push(BasemapUiAction::ClearDiskCacheNotice);
                     } else {
                         actions.push(BasemapUiAction::SelectBasemap(option));
@@ -269,7 +270,10 @@ pub fn show_toolbar_controls(
         ui_state.settings_open = !ui_state.settings_open;
         if ui_state.settings_open {
             ui_state.sync_from_settings(settings);
+            actions.push(BasemapUiAction::SettingsOpened);
             actions.push(BasemapUiAction::ClearDiskCacheNotice);
+        } else {
+            actions.push(BasemapUiAction::SettingsClosed);
         }
     }
 
@@ -385,7 +389,7 @@ fn show_disk_cache_section(
     disk_cache_max_mb: &mut u64,
     actions: &mut Vec<BasemapUiAction>,
 ) {
-    ui.heading("SQLite WAL Tile Disk Cache");
+    ui.heading("Tile Disk Cache");
     if disk_status.available {
         if let Some(stats) = disk_status.stats {
             let used_mb = (stats.payload_bytes as f64) / (1024.0 * 1024.0);
@@ -489,6 +493,9 @@ pub fn show_settings_window(
         });
 
     ui_state.settings_open = open;
+    if !open {
+        actions.push(BasemapUiAction::SettingsClosed);
+    }
     actions
 }
 
@@ -500,8 +507,10 @@ pub fn paint_attribution_badge(painter: &egui::Painter, rect: egui::Rect, attrib
         return;
     }
 
-    let scale_bar_reserve = hud::scale_bar_reserved_width(rect.width());
-    let avail = rect.width() - scale_bar_reserve - 26.0; // 16 pad_x*2 + 10 right margin
+    let pad_x = 8.0;
+    let pad_y = 4.0;
+    let margin = 10.0;
+    let avail = hud::available_right_overlay_width(rect.width(), pad_x, margin);
     if avail < 100.0 {
         return;
     }
@@ -515,10 +524,7 @@ pub fn paint_attribution_badge(painter: &egui::Painter, rect: egui::Rect, attrib
         max_width,
     );
 
-    let pad_x = 8.0;
-    let pad_y = 4.0;
     let size = galley.size() + egui::vec2(pad_x * 2.0, pad_y * 2.0);
-    let margin = 10.0;
     let badge_rect = egui::Rect::from_min_size(
         egui::pos2(
             rect.right() - margin - size.x,

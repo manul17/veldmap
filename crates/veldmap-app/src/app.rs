@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use eframe::egui;
-use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
+use eframe::egui_wgpu;
 use thiserror::Error;
 use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
 use veldmap_core::geo::coords::parse_location;
@@ -18,9 +18,9 @@ use crate::gpu_tiles::{
     GpuTileCache, PendingUploads, UploadBatchReport, UploadPassParams,
 };
 use crate::hud;
-use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams, SnapshotBuildParams};
-use crate::settings::BasemapSelection;
+use crate::render::{DrawSnapshot, GlobeRenderer, SnapshotBuildParams};
 use crate::storage::AppStorage;
+use crate::viewport_bridge::{GlobePaintCallback, SnapshotKey, viewport_pixels};
 
 /// Logical scroll points mapped to one discrete globe zoom notch.
 const SCROLL_PT_PER_STEP: f64 = 48.0;
@@ -35,103 +35,6 @@ fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
         f64::from(scroll_y) / SCROLL_PT_PER_STEP
     } else {
         0.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SnapshotKey {
-    eye_bits: [u64; 3],
-    up_bits: [u64; 3],
-    width_px: u32,
-    height_px: u32,
-    ppp_bits: u32,
-    basemap: BasemapSelection,
-    active_source: SourceId,
-    show_graticule: bool,
-    scene_generation: u64,
-}
-
-struct SnapshotKeyInput<'a> {
-    camera: &'a Camera,
-    width_px: u32,
-    height_px: u32,
-    pixels_per_point: f32,
-    basemap: BasemapSelection,
-    active_source: SourceId,
-    show_graticule: bool,
-    scene_generation: u64,
-}
-
-impl SnapshotKey {
-    fn from_input(input: SnapshotKeyInput<'_>) -> Self {
-        let eye = input.camera.eye_ecef();
-        let (_, up, _) = input.camera.basis();
-        Self {
-            eye_bits: eye.to_array().map(f64::to_bits),
-            up_bits: up.to_array().map(f64::to_bits),
-            width_px: input.width_px,
-            height_px: input.height_px,
-            ppp_bits: input.pixels_per_point.to_bits(),
-            basemap: input.basemap,
-            active_source: input.active_source,
-            show_graticule: input.show_graticule,
-            scene_generation: input.scene_generation,
-        }
-    }
-}
-
-/// `egui_wgpu` paint callback bridging an immutable `Arc<DrawSnapshot>` into
-/// the offscreen [`GlobeRenderer`].
-struct GlobePaintCallback {
-    rect: egui::Rect,
-    snapshot: Arc<DrawSnapshot>,
-}
-
-impl CallbackTrait for GlobePaintCallback {
-    fn prepare(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        screen_descriptor: &ScreenDescriptor,
-        egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() else {
-            return Vec::new();
-        };
-
-        let vp = egui::epaint::ViewportInPixels::from_points(
-            &self.rect,
-            screen_descriptor.pixels_per_point,
-            screen_descriptor.size_in_pixels,
-        );
-        if vp.width_px <= 0 || vp.height_px <= 0 {
-            renderer.sweep_stale_bind_groups();
-            return Vec::new();
-        }
-
-        renderer.render_if_dirty(
-            device,
-            queue,
-            egui_encoder,
-            RenderParams {
-                width: vp.width_px as u32,
-                height: vp.height_px as u32,
-                snapshot: &self.snapshot,
-            },
-        );
-        Vec::new()
-    }
-
-    fn paint(
-        &self,
-        _info: egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        callback_resources: &CallbackResources,
-    ) {
-        if let Some(renderer) = callback_resources.get::<GlobeRenderer>() {
-            renderer.composite_into(render_pass);
-        }
     }
 }
 
@@ -244,6 +147,12 @@ impl VeldmapApp {
         })
     }
 
+    fn retry_and_reconcile(&mut self) {
+        self.basemap.retry_live();
+        self.basemap
+            .reconcile_providers(&self.gpu_tile_cache, &self.pending_uploads);
+    }
+
     fn apply_basemap_actions(&mut self, actions: Vec<BasemapUiAction>) -> (bool, bool) {
         let mut scene_changed = false;
         let mut needs_repaint = false;
@@ -272,6 +181,10 @@ impl VeldmapApp {
                     );
                     self.basemap_ui.sync_from_settings(self.storage.settings());
                 }
+                BasemapUiAction::SettingsOpened => {
+                    self.storage.maybe_refresh_disk_stats(true);
+                }
+                BasemapUiAction::SettingsClosed => {}
                 BasemapUiAction::ClearDiskCache => {
                     self.storage.request_clear_disk_cache();
                     needs_repaint = true;
@@ -280,9 +193,7 @@ impl VeldmapApp {
                     self.storage.clear_disk_cache_notice();
                 }
                 BasemapUiAction::RetryLive => {
-                    self.basemap.retry_live();
-                    self.basemap
-                        .reconcile_providers(&self.gpu_tile_cache, &self.pending_uploads);
+                    self.retry_and_reconcile();
                     needs_repaint = true;
                 }
             }
@@ -309,34 +220,13 @@ impl VeldmapApp {
         }
     }
 
-    /// Estimate physical viewport dimensions from `egui::Context` during
-    /// `App::ui` (where `egui_wgpu::ScreenDescriptor::size_in_pixels` is not
-    /// exposed yet; `GlobePaintCallback::prepare` uses the exact framebuffer
-    /// size during rendering).
-    fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (u32, u32, f64) {
-        let ppp = ctx.pixels_per_point();
-        let screen_rect = ctx.content_rect();
-        let screen_px = [
-            (screen_rect.width() * ppp).round().max(1.0) as u32,
-            (screen_rect.height() * ppp).round().max(1.0) as u32,
-        ];
-        let vp = egui::epaint::ViewportInPixels::from_points(&rect, ppp, screen_px);
-        let width_px = vp.width_px.max(1) as u32;
-        let height_px = vp.height_px.max(1) as u32;
-        (
-            width_px,
-            height_px,
-            f64::from(width_px) / f64::from(height_px),
-        )
-    }
-
     fn probe_pointer(
         &self,
         ctx: &egui::Context,
         rect: egui::Rect,
         pos: egui::Pos2,
     ) -> Option<(f64, f64)> {
-        let (_, _, aspect) = Self::viewport_pixels(ctx, rect);
+        let (_, _, aspect) = viewport_pixels(ctx, rect);
         let width_pt = f64::from(rect.width()).max(1.0);
         let height_pt = f64::from(rect.height()).max(1.0);
         let nx = f64::from(pos.x - rect.left()) / width_pt;
@@ -386,16 +276,15 @@ impl VeldmapApp {
         let active_source = self.basemap.active_source();
         let selection = self.storage.settings().active_basemap;
         let show_graticule = self.storage.settings().show_graticule;
-        let key = SnapshotKey::from_input(SnapshotKeyInput {
-            camera: &self.camera,
-            width_px,
-            height_px,
+        let key = SnapshotKey::new(
+            &self.camera,
+            [width_px, height_px],
             pixels_per_point,
-            basemap: selection,
+            selection,
             active_source,
             show_graticule,
-            scene_generation: self.scene_generation,
-        });
+            self.scene_generation,
+        );
         if let Some((cached_key, snapshot)) = &self.cached_snapshot
             && *cached_key == key
         {
@@ -588,7 +477,7 @@ impl VeldmapApp {
                 if rect.is_positive() {
                     viewport_rect = Some(rect);
                     self.last_viewport_rect = Some(rect);
-                    let (width_px, height_px, _) = Self::viewport_pixels(ctx, rect);
+                    let (width_px, height_px, _) = viewport_pixels(ctx, rect);
                     let height_pt = f64::from(rect.height()).max(1.0);
                     self.last_viewport_height_px = f64::from(height_px);
 
@@ -633,9 +522,7 @@ impl eframe::App for VeldmapApp {
         let mut needs_repaint = false;
         let mut reconciled_this_frame = false;
         if self.storage.poll_clear_completed() {
-            self.basemap.retry_live();
-            self.basemap
-                .reconcile_providers(&self.gpu_tile_cache, &self.pending_uploads);
+            self.retry_and_reconcile();
             reconciled_this_frame = true;
             needs_repaint = true;
         }
@@ -666,10 +553,8 @@ impl eframe::App for VeldmapApp {
                 .mutate_settings(|s| s.show_graticule = show_graticule);
         }
 
-        // Event-driven off-UI-thread SQLite stats refresh (zero idle queries).
-        let (settings_open, settings_just_opened) = self.basemap_ui.poll_settings_window_state();
-        if settings_open {
-            self.storage.maybe_refresh_disk_stats(settings_just_opened);
+        if self.basemap_ui.is_settings_open() {
+            self.storage.maybe_refresh_disk_stats(false);
         }
 
         let disk_status = self.storage.disk_cache_status();

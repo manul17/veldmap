@@ -103,50 +103,24 @@ impl SharedTileIndices {
         //   south: [surface_verts + stride .. surface_verts + 2 * stride)
         //   west:  [surface_verts + 2 * stride .. surface_verts + 3 * stride)
         //   east:  [surface_verts + 3 * stride .. surface_verts + 4 * stride)
-        let north_base = surface_verts;
-        let south_base = surface_verts + stride;
-        let west_base = surface_verts + 2 * stride;
-        let east_base = surface_verts + 3 * stride;
-
-        // 2. North edge skirt (row = 0, col = 0..n): faces outward north.
-        for col in 0..n {
-            let s0 = col;
-            let s1 = col + 1;
-            let k0 = north_base + col;
-            let k1 = north_base + col + 1;
-            indices.extend_from_slice(&[s0, s1, k0]);
-            indices.extend_from_slice(&[s1, k1, k0]);
-        }
-
-        // 3. South edge skirt (row = n, col = 0..n): faces outward south.
-        let south_row = n * stride;
-        for col in 0..n {
-            let s0 = south_row + col;
-            let s1 = south_row + col + 1;
-            let k0 = south_base + col;
-            let k1 = south_base + col + 1;
-            indices.extend_from_slice(&[s0, k0, s1]);
-            indices.extend_from_slice(&[s1, k0, k1]);
-        }
-
-        // 4. West edge skirt (col = 0, row = 0..n): faces outward west.
-        for row in 0..n {
-            let s0 = row * stride;
-            let s1 = (row + 1) * stride;
-            let k0 = west_base + row;
-            let k1 = west_base + row + 1;
-            indices.extend_from_slice(&[s0, k0, s1]);
-            indices.extend_from_slice(&[s1, k0, k1]);
-        }
-
-        // 5. East edge skirt (col = n, row = 0..n): faces outward east.
-        for row in 0..n {
-            let s0 = row * stride + n;
-            let s1 = (row + 1) * stride + n;
-            let k0 = east_base + row;
-            let k1 = east_base + row + 1;
-            indices.extend_from_slice(&[s0, s1, k0]);
-            indices.extend_from_slice(&[s1, k1, k0]);
+        let skirt_edges = [
+            (0u32, 1u32, surface_verts, false),
+            (n * stride, 1u32, surface_verts + stride, true),
+            (0u32, stride, surface_verts + 2 * stride, true),
+            (n, stride, surface_verts + 3 * stride, false),
+        ];
+        for (surf_start, surf_step, skirt_base, flip_winding) in skirt_edges {
+            for i in 0..n {
+                let s0 = surf_start + i * surf_step;
+                let s1 = s0 + surf_step;
+                let k0 = skirt_base + i;
+                let k1 = skirt_base + i + 1;
+                if flip_winding {
+                    indices.extend_from_slice(&[s0, k0, s1, s1, k0, k1]);
+                } else {
+                    indices.extend_from_slice(&[s0, s1, k0, s1, k1, k0]);
+                }
+            }
         }
 
         let full_end = indices.len() as u32;
@@ -158,15 +132,18 @@ impl SharedTileIndices {
     }
 }
 
-/// Build the per-tile CPU `f64` RTC vertex buffer (surface grid + 4 downward
-/// skirts) for `tile`.
-pub fn build_tile_vertices(tile: &VisibleTile, grid_cells: u32) -> Vec<TileVertex> {
+/// Build per-tile CPU `f64` RTC vertex data (surface grid + 4 downward skirts)
+/// together with its cached `f64` graticule anchor `(anchor_a, anchor_b)` so
+/// `GlobeRenderer::upload_uniforms` does not re-sample
+/// `sample_tile_surface(id, 0.5, 0.5)`.
+pub fn build_tile_mesh_data(tile: &VisibleTile, grid_cells: u32) -> (Vec<TileVertex>, (f64, f64)) {
     let n = grid_cells.max(1);
     let stride = (n + 1) as usize;
     let total_verts = stride * stride + 4 * stride;
     let mut vertices = Vec::with_capacity(total_verts);
 
-    let (anchor_a, anchor_b) = tile_grid_anchor(tile.id).unwrap_or((0.0, 0.0));
+    let anchor = tile_grid_anchor(tile.id).unwrap_or((0.0, 0.0));
+    let (anchor_a, anchor_b) = anchor;
     let is_polar = matches!(tile.id.scheme, PlanetaryScheme::PolarCap { .. });
     let origin = tile.origin_ecef_m;
     let n_f = f64::from(n);
@@ -228,30 +205,24 @@ pub fn build_tile_vertices(tile: &VisibleTile, grid_cells: u32) -> Vec<TileVerte
         });
     };
 
-    // 2. North skirt (row = 0, col = 0..=n).
-    for col in 0..stride {
-        push_skirt(&mut vertices, col, stride + col);
-    }
-    // 3. South skirt (row = n, col = 0..=n).
-    let south_row = (n as usize) * stride;
-    let south_inner = ((n - 1) as usize) * stride;
-    for col in 0..stride {
-        push_skirt(&mut vertices, south_row + col, south_inner + col);
-    }
-    // 4. West skirt (col = 0, row = 0..=n).
-    for row in 0..stride {
-        push_skirt(&mut vertices, row * stride, row * stride + 1);
-    }
-    // 5. East skirt (col = n, row = 0..=n).
-    for row in 0..stride {
-        push_skirt(
-            &mut vertices,
-            row * stride + (n as usize),
-            row * stride + ((n - 1) as usize),
-        );
+    let n_usize = n as usize;
+    let edge_strips = [
+        (0usize, 1usize, stride, 1usize),                           // North
+        (n_usize * stride, 1usize, (n_usize - 1) * stride, 1usize), // South
+        (0usize, stride, 1usize, stride),                           // West
+        (n_usize, stride, n_usize - 1, stride),                     // East
+    ];
+    for (surf_start, surf_step, inner_start, inner_step) in edge_strips {
+        for i in 0..stride {
+            push_skirt(
+                &mut vertices,
+                surf_start + i * surf_step,
+                inner_start + i * inner_step,
+            );
+        }
     }
 
-    vertices
+    (vertices, anchor)
 }
 
 #[cfg(test)]

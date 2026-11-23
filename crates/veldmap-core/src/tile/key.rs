@@ -249,9 +249,6 @@ impl TileScheme {
     /// `level -> level + 1` toward `max_level`, so ancestor lookups and LRU
     /// ancestor touches never invert.
     pub const fn parent(self, level: u8, x: u32, y: u32) -> Option<(u8, u32, u32)> {
-        if let Some(planetary) = self.as_planetary() {
-            return planetary.parent(level, x, y);
-        }
         match self {
             Self::RasterPyramid { max_level } => {
                 if level >= max_level {
@@ -260,7 +257,10 @@ impl TileScheme {
                     Some((level + 1, x >> 1, y >> 1))
                 }
             }
-            Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => None,
+            _ => match self.as_planetary() {
+                Some(planetary) => planetary.parent(level, x, y),
+                None => None,
+            },
         }
     }
 
@@ -268,8 +268,8 @@ impl TileScheme {
     /// (for coarsest-first upload/scheduling priority queues).
     pub const fn coarseness_rank(self, level: u8) -> u8 {
         match self {
-            Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => level,
             Self::RasterPyramid { max_level } => max_level.saturating_sub(level),
+            _ => level,
         }
     }
 
@@ -278,9 +278,6 @@ impl TileScheme {
     /// either level exceeds `RasterPyramid::max_level`.
     pub const fn level_delta(self, finer_level: u8, coarser_level: u8) -> Option<u8> {
         match self {
-            Self::WebMercator | Self::Geodetic | Self::PolarCap { .. } => {
-                finer_level.checked_sub(coarser_level)
-            }
             Self::RasterPyramid { max_level } => {
                 if finer_level > max_level || coarser_level > max_level {
                     None
@@ -288,6 +285,7 @@ impl TileScheme {
                     coarser_level.checked_sub(finer_level)
                 }
             }
+            _ => finer_level.checked_sub(coarser_level),
         }
     }
 }
@@ -463,10 +461,8 @@ impl TileKey {
             return false;
         }
         match self.scheme {
-            TileScheme::WebMercator | TileScheme::Geodetic | TileScheme::PolarCap { .. } => {
-                self.level == 0
-            }
             TileScheme::RasterPyramid { max_level } => self.level == max_level,
+            _ => self.level == 0,
         }
     }
 
@@ -559,3 +555,7 @@ pub fn compose_uv_rect(outer: [f32; 4], inner: [f32; 4]) -> [f32; 4] {
         outer[3] * inner[3],
     ]
 }
+
+#[cfg(test)]
+#[path = "key_tests.rs"]
+mod tests;

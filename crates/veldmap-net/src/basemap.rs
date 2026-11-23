@@ -150,6 +150,50 @@ impl fmt::Debug for LiveBasemapSpec {
     }
 }
 
+/// Validate a custom XYZ/TMS URL template (scheme, non-empty host, absence of
+/// whitespace/control chars, and `{z}`, `{x}`, `{y}`/`{-y}` placeholders) and
+/// return the trimmed template slice on success.
+pub fn validate_custom_url_template(url_template: &str) -> Result<&str, NetError> {
+    let template = url_template.trim();
+    if template.is_empty() {
+        return Err(NetError::InvalidUrlTemplate(
+            "URL template must not be empty".to_owned(),
+        ));
+    }
+    if template
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(NetError::InvalidUrlTemplate(
+            "URL template must not contain whitespace or control characters".to_owned(),
+        ));
+    }
+    if !template.starts_with("https://") && !template.starts_with("http://") {
+        return Err(NetError::InvalidUrlTemplate(
+            "URL template must start with https:// or http://".to_owned(),
+        ));
+    }
+    let authority = parse_url_authority(template).ok_or_else(|| {
+        NetError::InvalidUrlTemplate("URL template must include a valid hostname".to_owned())
+    })?;
+    let host = authority.host;
+    if host.contains("{z}") || host.contains("{x}") || host.contains("{y}") || host.contains("{-y}")
+    {
+        return Err(NetError::InvalidUrlTemplate(
+            "URL template must include a valid hostname".to_owned(),
+        ));
+    }
+    let has_z = template.contains("{z}");
+    let has_x = template.contains("{x}");
+    let has_y = template.contains("{y}") || template.contains("{-y}");
+    if !has_z || !has_x || !has_y {
+        return Err(NetError::InvalidUrlTemplate(
+            "URL template must include {z}, {x}, and {y} (or {-y})".to_owned(),
+        ));
+    }
+    Ok(template)
+}
+
 impl LiveBasemapSpec {
     /// Stable [`SourceId`] derived from [`Self::cache_key`].
     pub const fn source_id(&self) -> SourceId {
@@ -237,46 +281,7 @@ impl LiveBasemapSpec {
     /// of whitespace/control characters, and required coordinate placeholders
     /// (`{z}`, `{x}`, `{y}` or `{-y}`).
     pub fn custom(cfg: CustomBasemapConfig<'_>) -> Result<Self, NetError> {
-        let template = cfg.url_template.trim();
-        if template.is_empty() {
-            return Err(NetError::InvalidUrlTemplate(
-                "URL template must not be empty".to_owned(),
-            ));
-        }
-        if template
-            .bytes()
-            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-        {
-            return Err(NetError::InvalidUrlTemplate(
-                "URL template must not contain whitespace or control characters".to_owned(),
-            ));
-        }
-        if !template.starts_with("https://") && !template.starts_with("http://") {
-            return Err(NetError::InvalidUrlTemplate(
-                "URL template must start with https:// or http://".to_owned(),
-            ));
-        }
-        let authority = parse_url_authority(template).ok_or_else(|| {
-            NetError::InvalidUrlTemplate("URL template must include a valid hostname".to_owned())
-        })?;
-        let host = authority.host;
-        if host.contains("{z}")
-            || host.contains("{x}")
-            || host.contains("{y}")
-            || host.contains("{-y}")
-        {
-            return Err(NetError::InvalidUrlTemplate(
-                "URL template must include a valid hostname".to_owned(),
-            ));
-        }
-        let has_z = template.contains("{z}");
-        let has_x = template.contains("{x}");
-        let has_y = template.contains("{y}") || template.contains("{-y}");
-        if !has_z || !has_x || !has_y {
-            return Err(NetError::InvalidUrlTemplate(
-                "URL template must include {z}, {x}, and {y} (or {-y})".to_owned(),
-            ));
-        }
+        let template = validate_custom_url_template(cfg.url_template)?;
         let max_level = cfg
             .max_level
             .clamp(CUSTOM_MAX_LEVEL_MIN, CUSTOM_MAX_LEVEL_MAX);

@@ -7,7 +7,15 @@ use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme};
 use super::evict::EVICT_BATCH_ROWS;
 use super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE};
 use super::*;
-use crate::TestTempDir;
+use crate::test_support::TestTempDir;
+
+fn open_in_memory_cache(max_bytes: u64) -> Result<TileDiskCache, StorageError> {
+    let conn = Connection::open_in_memory()?;
+    let max_ts = init_connection(&conn, false, true)?;
+    Ok(TileDiskCache::from_connection(
+        conn, None, max_bytes, max_ts,
+    ))
+}
 
 fn key(source: &str, level: u8, x: u32, y: u32) -> DiskTileKey {
     DiskTileKey::new(source, TileScheme::WebMercator, level, x, y)
@@ -31,7 +39,7 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
     assert!(!valid_source_key("a/b"));
 
     // Budget = 100 B, 10% headroom target = 90 B.
-    let cache = TileDiskCache::open_in_memory(100).expect("open mem cache");
+    let cache = open_in_memory_cache(100).expect("open mem cache");
     let k_a = key("eox", 12, 0, 0);
     let k_b = key("eox", 12, 1, 0);
     let k_c = key("eox", 12, 2, 0);
@@ -70,7 +78,7 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
 
 #[test]
 fn pragmas_schema_version_and_covering_lru_index_are_configured() {
-    let cache = TileDiskCache::open_in_memory(4096).expect("open mem");
+    let cache = open_in_memory_cache(4096).expect("open mem");
     let conn = lock_unpoisoned(&cache.writer);
 
     let page_size: i64 = conn
@@ -248,7 +256,7 @@ fn file_backed_open_waits_for_brief_external_lock_and_serves_concurrent_wal_read
 
 #[test]
 fn multi_band_format_gutter_and_encoding_never_alias() {
-    let cache = TileDiskCache::open_in_memory(16 * 1024).expect("open mem");
+    let cache = open_in_memory_cache(16 * 1024).expect("open mem");
     let source = "sentinel2-s36uvb";
     let base = TileKey {
         source: veldmap_core::tile::SourceId::from_stable_key(source),
@@ -318,7 +326,7 @@ fn multi_band_format_gutter_and_encoding_never_alias() {
 
 #[test]
 fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
-    let cache = TileDiskCache::open_in_memory(10_000).expect("open mem");
+    let cache = open_in_memory_cache(10_000).expect("open mem");
     let k = key("eox", 5, 1, 1);
 
     // Overwrite with larger then smaller payloads; byte & tile_count stay exact.
@@ -359,7 +367,7 @@ fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
 
 #[test]
 fn clear_source_removes_only_matching_source_without_orphan_blobs() {
-    let cache = TileDiskCache::open_in_memory(4096).expect("open mem");
+    let cache = open_in_memory_cache(4096).expect("open mem");
     let k1 = key("gibs", 1, 0, 0);
     let k2 = key("eox", 1, 0, 0);
     cache.put(&k1, &[1u8; 100]).expect("put k1");
@@ -377,7 +385,7 @@ fn clear_source_removes_only_matching_source_without_orphan_blobs() {
 
 #[test]
 fn large_tile_near_budget_never_self_evicts_and_delete_updates_total() {
-    let cache = TileDiskCache::open_in_memory(100).expect("open mem");
+    let cache = open_in_memory_cache(100).expect("open mem");
     let old = key("eox", 1, 0, 0);
     let big = key("eox", 1, 1, 0);
 
@@ -399,7 +407,7 @@ fn large_tile_near_budget_never_self_evicts_and_delete_updates_total() {
 
 #[test]
 fn concurrent_reads_and_writes_keep_budget_and_accounting_consistent() {
-    let cache = Arc::new(TileDiskCache::open_in_memory(4096).expect("open mem"));
+    let cache = Arc::new(open_in_memory_cache(4096).expect("open mem"));
     let mut threads = Vec::new();
     for tid in 0..4u32 {
         let c = Arc::clone(&cache);

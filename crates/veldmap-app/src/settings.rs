@@ -12,13 +12,20 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use veldmap_net::{
-    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, LiveBasemapSpec, NetError,
-    is_valid_gibs_date, sanitize_url_for_display,
+    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, is_valid_gibs_date, sanitize_url_for_display,
 };
 use veldmap_storage::{
-    DEFAULT_DISK_CACHE_MAX_MB, MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB, StorageError,
-    StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
+    StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
 };
+
+/// Default disk cache cap in mebibytes (`512 MiB`).
+pub const DEFAULT_DISK_CACHE_MAX_MB: u64 = 512;
+
+/// Minimum configurable disk cache cap in mebibytes (`16 MiB`).
+pub const MIN_DISK_CACHE_MAX_MB: u64 = 16;
+
+/// Maximum configurable disk cache cap in mebibytes (`16 GiB`).
+pub const MAX_DISK_CACHE_MAX_MB: u64 = 16 * 1024;
 
 /// Allowed slider range for Custom XYZ / TMS maximum zoom levels.
 pub const CUSTOM_MAX_LEVEL_RANGE: RangeInclusive<u8> = CUSTOM_MAX_LEVEL_MIN..=CUSTOM_MAX_LEVEL_MAX;
@@ -121,25 +128,6 @@ impl Default for CustomXyzSettings {
             max_level: 14,
             attribution: String::new(),
         }
-    }
-}
-
-impl CustomXyzSettings {
-    /// Borrow fields as a [`CustomBasemapConfig`] for `veldmap-net`.
-    pub fn as_basemap_config(&self) -> CustomBasemapConfig<'_> {
-        CustomBasemapConfig {
-            name: &self.name,
-            url_template: &self.url_template,
-            api_key: &self.api_key,
-            tms_flip_y: self.tms_flip_y,
-            max_level: self.max_level,
-            attribution: &self.attribution,
-        }
-    }
-
-    /// Validate and construct a [`LiveBasemapSpec`] directly from these settings.
-    pub fn to_live_spec(&self) -> Result<LiveBasemapSpec, NetError> {
-        LiveBasemapSpec::custom(self.as_basemap_config())
     }
 }
 

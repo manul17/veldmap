@@ -1,6 +1,30 @@
-use std::path::PathBuf;
-
 use super::*;
+
+fn basemap_from_rgba(
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> Result<BundledBasemap, RasterError> {
+    let px_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(RasterError::InvalidDimensions { width, height })?;
+    let expected = px_count
+        .checked_mul(4)
+        .ok_or(RasterError::InvalidDimensions { width, height })?;
+    if width == 0 || height == 0 || rgba.len() != expected {
+        return Err(RasterError::InvalidDimensions { width, height });
+    }
+    let mut rgb = Vec::with_capacity(px_count * 3);
+    for px in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&px[0..3]);
+    }
+    Ok(BundledBasemap::from_rgb_box(
+        width,
+        height,
+        rgb.into_boxed_slice(),
+        BundledBasemapConfig::default(),
+    ))
+}
 
 fn synthetic_quadrant_basemap() -> BundledBasemap {
     // Synthetic 128x64 equirectangular image with distinct N/S & E/W quadrants
@@ -33,7 +57,7 @@ fn synthetic_quadrant_basemap() -> BundledBasemap {
             rgba[off..off + 4].copy_from_slice(&color);
         }
     }
-    BundledBasemap::from_rgba(w, h, rgba).expect("build synthetic basemap")
+    basemap_from_rgba(w, h, rgba).expect("build synthetic basemap")
 }
 
 #[test]
@@ -139,16 +163,17 @@ fn renders_geodetic_web_mercator_and_polar_tiles_with_orientation_and_bounds_che
     );
 
     // 4. Out-of-range levels, OOB x/y, and invalid tile_px fail cleanly.
+    let cfg = basemap.config();
     for bad in [
         QuadTileId {
             scheme: PlanetaryScheme::Geodetic,
-            level: BUNDLED_MAX_LEVEL + 1,
+            level: cfg.max_level + 1,
             x: 0,
             y: 0,
         },
         QuadTileId {
             scheme: PlanetaryScheme::PolarCap { north: true },
-            level: BUNDLED_POLAR_MAX_LEVEL + 1,
+            level: cfg.polar_max_level + 1,
             x: 0,
             y: 0,
         },
@@ -184,46 +209,8 @@ fn renders_geodetic_web_mercator_and_polar_tiles_with_orientation_and_bounds_che
                 x: 0,
                 y: 0,
             },
-            MAX_MAP_TILE_DIM + 1,
+            MAX_BASEMAP_TILE_DIM + 1,
         ),
         Err(RasterError::InvalidDimensions { .. })
     ));
-}
-
-#[test]
-fn bundled_blue_marble_asset_decodes_and_preserves_geographic_landmarks() {
-    let asset_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/basemap/blue_marble_ng.jpg");
-    let bytes = std::fs::read(&asset_path).expect("read bundled blue marble asset");
-    let basemap = BundledBasemap::from_encoded_bytes(&bytes).expect("decode blue marble");
-    assert_eq!(basemap.dimensions(), (3600, 1800));
-    assert!(basemap.levels.len() >= 4, "expected base + 3 mip levels");
-
-    let to_lin = srgb_to_linear_lut();
-    let to_srgb = linear_to_srgb_lut();
-    // Verify exact sRGB -> linear -> sRGB LUT round-trip across all 256 values.
-    for v in 0..=255u8 {
-        assert_eq!(linear_to_srgb_u8(to_lin[usize::from(v)], to_srgb), v);
-    }
-
-    // South pole (Antarctica) must be bright white/ice.
-    let sp = basemap.levels[0].sample_bilinear_srgb_with_luts(-89.0, 0.0, to_lin, to_srgb);
-    assert!(
-        sp[0] > 200 && sp[1] > 200 && sp[2] > 200,
-        "south pole={sp:?}"
-    );
-
-    // Sahara desert (23 N, 13 E) must be bright tan (R > G > B).
-    let sahara = basemap.levels[0].sample_bilinear_srgb_with_luts(23.0, 13.0, to_lin, to_srgb);
-    assert!(
-        sahara[0] > 150 && sahara[0] > sahara[2].saturating_add(40),
-        "sahara={sahara:?}"
-    );
-
-    // Central Pacific (0 N, -150 E) must be deep ocean blue (B > R).
-    let pacific = basemap.levels[0].sample_bilinear_srgb_with_luts(0.0, -150.0, to_lin, to_srgb);
-    assert!(
-        pacific[2] > pacific[0].saturating_add(20) && pacific[0] < 40,
-        "pacific={pacific:?}"
-    );
 }

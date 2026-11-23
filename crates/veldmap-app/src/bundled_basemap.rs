@@ -11,7 +11,24 @@ use veldmap_core::io::{Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{
     DecodedTile, GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey,
 };
-use veldmap_raster::BundledBasemap;
+use veldmap_raster::{BundledBasemap, BundledBasemapConfig};
+
+/// Default tile size in pixels for the bundled offline global basemap.
+pub const BUNDLED_TILE_PX: u32 = 256;
+
+/// Maximum `Geodetic` / `WebMercator` zoom level served by the bundled offline
+/// NASA Blue Marble Next Generation asset (`3600 x 1800`).
+pub const BUNDLED_MAX_LEVEL: u8 = 3;
+
+/// Maximum `PolarCap` zoom level served by the bundled offline basemap.
+pub const BUNDLED_POLAR_MAX_LEVEL: u8 = 0;
+
+/// Tiling configuration matching [`BUNDLED_BASEMAP_JPEG`].
+pub const BUNDLED_BASEMAP_CONFIG: BundledBasemapConfig = BundledBasemapConfig {
+    tile_px: BUNDLED_TILE_PX,
+    max_level: BUNDLED_MAX_LEVEL,
+    polar_max_level: BUNDLED_POLAR_MAX_LEVEL,
+};
 
 /// Embedded public-domain NASA Blue Marble Next Generation equirectangular
 /// global basemap (`3600 x 1800` JPEG, see `assets/README.md`).
@@ -44,7 +61,10 @@ impl BundledBasemapProvider {
         let worker = match thread::Builder::new()
             .name("veldmap-bundled-basemap".to_owned())
             .spawn(move || {
-                let basemap = match BundledBasemap::from_encoded_bytes(BUNDLED_BASEMAP_JPEG) {
+                let basemap = match BundledBasemap::from_encoded_bytes_with_config(
+                    BUNDLED_BASEMAP_JPEG,
+                    BUNDLED_BASEMAP_CONFIG,
+                ) {
                     Ok(b) => b,
                     Err(err) => {
                         tracing::error!(error = %err, "Failed to decode bundled offline basemap");
@@ -277,5 +297,50 @@ mod tests {
         assert!(!provider.is_in_flight(&k_failed));
         assert!(provider.is_in_flight(&k_active));
         assert_eq!(provider.in_flight_count(), 1);
+    }
+
+    #[test]
+    fn bundled_blue_marble_asset_decodes_and_preserves_geographic_landmarks() {
+        let basemap = BundledBasemap::from_encoded_bytes_with_config(
+            BUNDLED_BASEMAP_JPEG,
+            BUNDLED_BASEMAP_CONFIG,
+        )
+        .expect("decode embedded blue marble");
+        assert_eq!(basemap.dimensions(), (3600, 1800));
+
+        // Sample z=0 Geodetic tiles and confirm polar Antarctica, Sahara, and
+        // central Pacific landmarks preserve expected colors.
+        let west = basemap
+            .render_tile(QuadTileId {
+                scheme: PlanetaryScheme::Geodetic,
+                level: 0,
+                x: 0,
+                y: 0,
+            })
+            .expect("west hemisphere");
+        let east = basemap
+            .render_tile(QuadTileId {
+                scheme: PlanetaryScheme::Geodetic,
+                level: 0,
+                x: 1,
+                y: 0,
+            })
+            .expect("east hemisphere");
+        let px = |tile: &DecodedTile, lat: f64, lon_start: f64| -> [u8; 4] {
+            let u = ((lon_start) / 180.0).clamp(0.0, 0.999);
+            let v = ((90.0 - lat) / 180.0).clamp(0.0, 0.999);
+            let x = (u * f64::from(tile.width())) as usize;
+            let y = (v * f64::from(tile.height())) as usize;
+            let off = (y * tile.width() as usize + x) * 4;
+            let d = tile.data();
+            [d[off], d[off + 1], d[off + 2], d[off + 3]]
+        };
+
+        let antarctica = px(&east, -85.0, 0.0);
+        assert!(antarctica[0] > 200 && antarctica[1] > 200 && antarctica[2] > 200);
+        let sahara = px(&east, 23.0, 13.0);
+        assert!(sahara[0] > 150 && sahara[0] > sahara[2].saturating_add(40));
+        let pacific = px(&west, 0.0, 30.0); // -150 deg relative to -180
+        assert!(pacific[2] > pacific[0].saturating_add(20) && pacific[0] < 40);
     }
 }

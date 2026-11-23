@@ -13,7 +13,6 @@
 //!   bundled/decode threads -> shut down `tokio::Runtime`)
 
 use std::collections::HashSet;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
@@ -23,19 +22,21 @@ use veldmap_core::tile::{
     max_mip_levels, mip_chain_byte_size,
 };
 use veldmap_net::{
-    DecodeRequest, FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError, NetworkStatus,
-    TileBlobStore, TileDecodeExecutor,
+    CustomBasemapConfig, DecodeRequest, FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError,
+    NetworkStatus, TileBlobStore, TileDecodeExecutor,
 };
 use veldmap_raster::{
-    BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, DecodeJob, DecodePool,
-    DecodePoolConfig, DecodePoolHandle, decode_map_tile_with_mipmaps,
+    DecodeJob, DecodePool, DecodePoolConfig, DecodePoolHandle, decode_map_tile_with_mipmaps,
 };
 use veldmap_storage::{DiskTileKey, TileDiskCache};
 
-use crate::bundled_basemap::BundledBasemapProvider;
-use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, bundled_tile_key};
-use crate::render::BasemapCarrierPolicy;
-use crate::settings::{AppSettings, BasemapSelection};
+use crate::bundled_basemap::{
+    BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, BundledBasemapProvider,
+};
+use crate::gpu_tiles::{
+    BasemapCarrierPolicy, GpuTileCache, PendingUploads, UploadBatchReport, bundled_tile_key,
+};
+use crate::settings::{AppSettings, BasemapSelection, CustomXyzSettings};
 
 /// Attribution string displayed for the bundled public-domain Blue Marble
 /// offline basemap.
@@ -54,26 +55,26 @@ pub struct BasemapStatusSnapshot {
 /// storage-agnostic [`TileBlobStore`] trait.
 struct SqliteBlobStore(Arc<TileDiskCache>);
 
-impl TileBlobStore for SqliteBlobStore {
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String> {
-        let key = DiskTileKey::new(
+impl SqliteBlobStore {
+    fn disk_key(source_key: &str, id: QuadTileId) -> DiskTileKey {
+        DiskTileKey::new(
             source_key,
             id.scheme.into_tile_scheme(),
             id.level,
             id.x,
             id.y,
-        );
+        )
+    }
+}
+
+impl TileBlobStore for SqliteBlobStore {
+    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, String> {
+        let key = Self::disk_key(source_key, id);
         self.0.get(&key).map_err(|e| e.to_string())
     }
 
     fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), String> {
-        let key = DiskTileKey::new(
-            source_key,
-            id.scheme.into_tile_scheme(),
-            id.level,
-            id.x,
-            id.y,
-        );
+        let key = Self::disk_key(source_key, id);
         self.0
             .put(&key, payload)
             .map(|_| ())
@@ -81,14 +82,37 @@ impl TileBlobStore for SqliteBlobStore {
     }
 
     fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), String> {
-        let key = DiskTileKey::new(
-            source_key,
-            id.scheme.into_tile_scheme(),
-            id.level,
-            id.x,
-            id.y,
-        );
+        let key = Self::disk_key(source_key, id);
         self.0.delete(&key).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+type DecodeCallback = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+
+/// Ensures `on_decoded(Err(...))` is delivered if the decode closure unwinds
+/// inside `DecodePool`'s single `catch_unwind` boundary (avoiding nested
+/// `catch_unwind` calls).
+struct DecodePanicGuard {
+    on_decoded: Option<DecodeCallback>,
+}
+
+impl DecodePanicGuard {
+    fn disarm(mut self) {
+        self.on_decoded = None;
+    }
+
+    fn complete(mut self, outcome: Result<(), String>) {
+        if let Some(cb) = self.on_decoded.take() {
+            cb(outcome);
+        }
+    }
+}
+
+impl Drop for DecodePanicGuard {
+    fn drop(&mut self) {
+        if let Some(cb) = self.on_decoded.take() {
+            cb(Err("tile decoder panicked".to_owned()));
+        }
     }
 }
 
@@ -117,35 +141,48 @@ impl TileDecodeExecutor for RasterDecodeExecutor {
             queued_bytes,
             cancel: req.cancel,
             work: Box::new(move || {
-                let decoded =
-                    catch_unwind(AssertUnwindSafe(|| decode_map_tile_with_mipmaps(&bytes)));
-                match decoded {
-                    Ok(Ok(tile)) => {
+                // Construct the panic guard inside `work` so rejected, evicted,
+                // cancelled, or shutdown-drained jobs never report a decoder panic.
+                let guard = DecodePanicGuard {
+                    on_decoded: Some(on_decoded),
+                };
+                match decode_map_tile_with_mipmaps(&bytes) {
+                    Ok(tile) => {
                         if cancel.is_cancelled() || shutdown.is_cancelled() {
+                            guard.disarm();
                             return;
                         }
                         if done_tx.send((key, tile)).is_err() {
+                            guard.disarm();
                             return;
                         }
-                        on_decoded(Ok(()));
+                        guard.complete(Ok(()));
                         (wakeup)();
                     }
-                    Ok(Err(err)) => {
+                    Err(err) => {
                         tracing::debug!(
                             ?key,
                             error = %err,
                             "Failed to decode map tile payload"
                         );
-                        on_decoded(Err(err.to_string()));
-                    }
-                    Err(_) => {
-                        tracing::error!(?key, "Tile decoder panicked; isolated worker continues");
-                        on_decoded(Err("tile decoder panicked".to_owned()));
+                        guard.complete(Err(err.to_string()));
                     }
                 }
             }),
         })
     }
+}
+
+/// Build a [`LiveBasemapSpec`] from user [`CustomXyzSettings`].
+pub fn custom_live_spec(custom: &CustomXyzSettings) -> Result<LiveBasemapSpec, NetError> {
+    LiveBasemapSpec::custom(CustomBasemapConfig {
+        name: &custom.name,
+        url_template: &custom.url_template,
+        api_key: &custom.api_key,
+        tms_flip_y: custom.tms_flip_y,
+        max_level: custom.max_level,
+        attribution: &custom.attribution,
+    })
 }
 
 /// Resolve the active [`LiveBasemapSpec`] from persisted [`AppSettings`],
@@ -161,7 +198,7 @@ pub fn spec_from_settings(settings: &AppSettings) -> Result<Option<LiveBasemapSp
         BasemapSelection::EoxSentinel2Cloudless => {
             Ok(Some(LiveBasemapSpec::eox_sentinel2_cloudless()))
         }
-        BasemapSelection::CustomXyz => settings.custom_xyz.to_live_spec().map(Some),
+        BasemapSelection::CustomXyz => custom_live_spec(&settings.custom_xyz).map(Some),
     }
 }
 
@@ -279,13 +316,22 @@ impl BasemapManager {
 
     /// Active planetary [`QuadtreeConfig`] matched to the selected basemap.
     pub fn quadtree_config(&self) -> QuadtreeConfig {
-        let mut cfg = match &self.active_live_spec {
-            Some(spec) => QuadtreeConfig::for_scheme(spec.scheme(), spec.max_level()),
-            None => QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL),
-        };
-        cfg.polar_max_tex_level = BUNDLED_POLAR_MAX_LEVEL;
-        cfg.tile_px = BUNDLED_TILE_PX;
-        cfg
+        match &self.active_live_spec {
+            Some(spec) => {
+                // Live basemaps stream 256px WebMercator/Geodetic tiles up to
+                // `spec.max_level()` and route polar caps to the bundled
+                // offline polar cap (`BUNDLED_POLAR_MAX_LEVEL`).
+                let mut cfg = QuadtreeConfig::for_scheme(spec.scheme(), spec.max_level());
+                cfg.polar_max_tex_level = BUNDLED_POLAR_MAX_LEVEL;
+                cfg
+            }
+            None => {
+                let mut cfg = QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL);
+                cfg.polar_max_tex_level = BUNDLED_POLAR_MAX_LEVEL;
+                cfg.tile_px = BUNDLED_TILE_PX;
+                cfg
+            }
+        }
     }
 
     /// Visible attribution string for the active basemap (`None` for
@@ -299,11 +345,6 @@ impl BasemapManager {
                 None => Some(BUNDLED_ATTRIBUTION),
             },
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn config_error(&self) -> Option<&str> {
-        self.config_error.as_deref()
     }
 
     /// Snapshot toolbar-visible live streaming / config error state.
@@ -420,39 +461,71 @@ impl BasemapManager {
             return;
         }
 
+        let candidates = self.collect_tile_candidates(visible_tex_ids, gpu_cache, pending_uploads);
+        let default_tile_bytes = Self::bundled_tile_byte_size();
+        let total_appetite_bytes = gpu_cache.pyramid_byte_cap(active_pyramids.max(1));
+
+        let (bundled_to_request, bundled_total_bytes) = self.plan_bundled_requests(
+            candidates.missing_bundled,
+            candidates.cached_bundled_wanted,
+            pending_uploads,
+            default_tile_bytes,
+            total_appetite_bytes,
+        );
+
+        if self.active_live_spec.is_some() {
+            self.admit_live_candidates(
+                candidates.live_candidates,
+                candidates.cached_live_wanted,
+                candidates.queued_live_wanted,
+                default_tile_bytes,
+                total_appetite_bytes.saturating_sub(bundled_total_bytes),
+            );
+        }
+
+        self.wanted_all.extend(self.wanted_live.iter().copied());
+        self.wanted_all.extend(self.wanted_bundled.iter().copied());
+
+        self.reconcile_providers(gpu_cache, pending_uploads);
+
+        for key in bundled_to_request {
+            self.bundled_provider.request(key);
+        }
+    }
+
+    fn bundled_tile_byte_size() -> usize {
         let mips = max_mip_levels(BUNDLED_TILE_PX, BUNDLED_TILE_PX);
-        let default_tile_bytes = mip_chain_byte_size(
+        mip_chain_byte_size(
             BUNDLED_TILE_PX,
             BUNDLED_TILE_PX,
             PixelFormat::Rgba8UnormSrgb,
             mips,
         )
-        .max(1);
-        let live_tile_bytes = default_tile_bytes.max(self.observed_live_tile_bytes);
-        let total_appetite_bytes = gpu_cache.pyramid_byte_cap(active_pyramids.max(1));
+        .max(1)
+    }
 
-        let mut missing_bundled = Vec::new();
-        let mut cached_bundled_wanted = 0usize;
-        let mut live_candidates = Vec::new();
-        let mut cached_live_wanted = 0usize;
-        let mut queued_live_wanted = 0usize;
-
+    fn collect_tile_candidates(
+        &mut self,
+        visible_tex_ids: impl IntoIterator<Item = QuadTileId>,
+        gpu_cache: &GpuTileCache,
+        pending_uploads: &PendingUploads,
+    ) -> ScheduledCandidates {
+        let mut out = ScheduledCandidates::default();
         let policy = self.carrier_policy();
         let wanted_bundled = &mut self.wanted_bundled;
         let bundled_provider = &self.bundled_provider;
         let mut record_bundled_candidate = |key: TileKey| {
             if wanted_bundled.insert(key) {
                 if gpu_cache.contains(&key) {
-                    cached_bundled_wanted += 1;
+                    out.cached_bundled_wanted += 1;
                 } else if !pending_uploads.contains(&key) && !bundled_provider.is_in_flight(&key) {
-                    missing_bundled.push(key);
+                    out.missing_bundled.push(key);
                 }
             }
         };
 
         if let Some(spec) = &self.active_live_spec {
             let mut seen_live = HashSet::new();
-
             for tex_id in visible_tex_ids {
                 if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. }) {
                     let (polar_id, _) = tex_id.clamp_to_level(BUNDLED_POLAR_MAX_LEVEL);
@@ -462,13 +535,13 @@ impl BasemapManager {
                     let live_key = spec.tile_key(clamped_live);
                     if seen_live.insert(live_key) {
                         if gpu_cache.contains(&live_key) {
-                            cached_live_wanted += 1;
+                            out.cached_live_wanted += 1;
                             self.wanted_live.insert(live_key);
                         } else if pending_uploads.contains(&live_key) {
-                            queued_live_wanted += 1;
+                            out.queued_live_wanted += 1;
                             self.wanted_live.insert(live_key);
                         } else {
-                            live_candidates.push(live_key);
+                            out.live_candidates.push(live_key);
                         }
                     }
 
@@ -486,6 +559,17 @@ impl BasemapManager {
             }
         }
 
+        out
+    }
+
+    fn plan_bundled_requests(
+        &self,
+        mut missing_bundled: Vec<TileKey>,
+        cached_bundled_wanted: usize,
+        pending_uploads: &PendingUploads,
+        default_tile_bytes: usize,
+        total_appetite_bytes: usize,
+    ) -> (Vec<TileKey>, usize) {
         let bundled_queued = pending_uploads.count_for_source(SourceId::BUNDLED_BASEMAP);
         let bundled_committed_tiles = cached_bundled_wanted
             .saturating_add(self.bundled_provider.in_flight_count())
@@ -502,26 +586,25 @@ impl BasemapManager {
         let bundled_total_bytes = bundled_committed_tiles
             .saturating_add(bundled_to_request.len())
             .saturating_mul(default_tile_bytes);
+        (bundled_to_request, bundled_total_bytes)
+    }
 
-        if self.active_live_spec.is_some() {
-            let live_appetite_bytes = total_appetite_bytes.saturating_sub(bundled_total_bytes);
-            let live_tile_cap = live_appetite_bytes / live_tile_bytes;
-            let live_budget = live_tile_cap
-                .saturating_sub(cached_live_wanted)
-                .saturating_sub(queued_live_wanted);
-            live_candidates.sort_by_key(TileKey::coarsest_first_key);
-            for k in live_candidates.into_iter().take(live_budget) {
-                self.wanted_live.insert(k);
-            }
-        }
-
-        self.wanted_all.extend(self.wanted_live.iter().copied());
-        self.wanted_all.extend(self.wanted_bundled.iter().copied());
-
-        self.reconcile_providers(gpu_cache, pending_uploads);
-
-        for key in bundled_to_request {
-            self.bundled_provider.request(key);
+    fn admit_live_candidates(
+        &mut self,
+        mut live_candidates: Vec<TileKey>,
+        cached_live_wanted: usize,
+        queued_live_wanted: usize,
+        default_tile_bytes: usize,
+        live_appetite_bytes: usize,
+    ) {
+        let live_tile_bytes = default_tile_bytes.max(self.observed_live_tile_bytes);
+        let live_tile_cap = live_appetite_bytes / live_tile_bytes;
+        let live_budget = live_tile_cap
+            .saturating_sub(cached_live_wanted)
+            .saturating_sub(queued_live_wanted);
+        live_candidates.sort_by_key(TileKey::coarsest_first_key);
+        for k in live_candidates.into_iter().take(live_budget) {
+            self.wanted_live.insert(k);
         }
     }
 
@@ -560,6 +643,15 @@ impl BasemapManager {
             pipeline.shutdown();
         }
     }
+}
+
+#[derive(Default)]
+struct ScheduledCandidates {
+    missing_bundled: Vec<TileKey>,
+    cached_bundled_wanted: usize,
+    live_candidates: Vec<TileKey>,
+    cached_live_wanted: usize,
+    queued_live_wanted: usize,
 }
 
 #[cfg(test)]

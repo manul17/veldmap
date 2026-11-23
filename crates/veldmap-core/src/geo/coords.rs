@@ -249,10 +249,10 @@ enum AngleUnit {
     Colon,
 }
 
-fn parse_angle(
-    clause: &str,
+fn strip_hemisphere<'a>(
+    clause: &'a str,
     original: &str,
-) -> Result<(f64, Option<Hemisphere>, bool), ParseLocationError> {
+) -> Result<(&'a str, Option<Hemisphere>), ParseLocationError> {
     let mut rest = clause.trim();
     let mut hemisphere = None;
 
@@ -281,6 +281,16 @@ fn parse_angle(
         }
     }
 
+    Ok((rest, hemisphere))
+}
+
+struct ScannedAngleSlots {
+    slots: [Option<f64>; 3],
+    has_dms_markers: bool,
+    count: usize,
+}
+
+fn scan_dms_slots(rest: &str, original: &str) -> Result<ScannedAngleSlots, ParseLocationError> {
     let mut slots: [Option<f64>; 3] = [None; 3];
     let mut next_slot = 0usize;
     let mut has_dms_markers = false;
@@ -351,7 +361,19 @@ fn parse_angle(
         count += 1;
     }
 
-    let Some(deg_raw) = slots[0] else {
+    Ok(ScannedAngleSlots {
+        slots,
+        has_dms_markers,
+        count,
+    })
+}
+
+fn assemble_angle(
+    scanned: ScannedAngleSlots,
+    hemisphere: Option<Hemisphere>,
+    original: &str,
+) -> Result<(f64, Option<Hemisphere>, bool), ParseLocationError> {
+    let Some(deg_raw) = scanned.slots[0] else {
         return Err(ParseLocationError::Unrecognized(original.to_owned()));
     };
 
@@ -365,16 +387,25 @@ fn parse_angle(
         1.0
     };
     let deg = deg_raw.abs();
-    let min = slots[1].unwrap_or(0.0);
-    let sec = slots[2].unwrap_or(0.0);
+    let min = scanned.slots[1].unwrap_or(0.0);
+    let sec = scanned.slots[2].unwrap_or(0.0);
     if !(0.0..60.0).contains(&min) || !(0.0..60.0).contains(&sec) {
         return Err(ParseLocationError::Unrecognized(original.to_owned()));
     }
 
     let mag = deg + min / 60.0 + sec / 3600.0;
     let sign = hemisphere.map_or(sign_from_deg, Hemisphere::sign);
-    let is_dms = count > 1 || has_dms_markers;
+    let is_dms = scanned.count > 1 || scanned.has_dms_markers;
     Ok((sign * mag, hemisphere, is_dms))
+}
+
+fn parse_angle(
+    clause: &str,
+    original: &str,
+) -> Result<(f64, Option<Hemisphere>, bool), ParseLocationError> {
+    let (rest, hemisphere) = strip_hemisphere(clause, original)?;
+    let scanned = scan_dms_slots(rest, original)?;
+    assemble_angle(scanned, hemisphere, original)
 }
 
 #[cfg(test)]

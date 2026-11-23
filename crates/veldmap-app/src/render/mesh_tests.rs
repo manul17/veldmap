@@ -51,7 +51,7 @@ fn all_planetary_and_polar_surface_triangles_have_outward_ccw_winding() {
 
     for id in samples {
         let tile = describe_tile(id, &cfg).expect("valid tile");
-        let verts = build_tile_vertices(&tile, DEFAULT_GRID_CELLS);
+        let (verts, _) = build_tile_mesh_data(&tile, DEFAULT_GRID_CELLS);
         let vcount = verts.len() as u32;
         assert!(shared.indices.iter().all(|&i| i < vcount));
 
@@ -114,7 +114,7 @@ fn per_tile_rtc_preserves_sub_millimetre_precision_at_2m_zoom() {
         &cfg,
     )
     .expect("z=16 tile");
-    let verts = build_tile_vertices(&tile, DEFAULT_GRID_CELLS);
+    let (verts, _) = build_tile_mesh_data(&tile, DEFAULT_GRID_CELLS);
 
     // Reconstruct two adjacent surface vertices via RTC and compare against f64 ECEF.
     let v0 = verts[0];
@@ -144,7 +144,7 @@ fn skirts_drop_inward_by_at_least_four_times_cell_sag() {
         &cfg,
     )
     .expect("tile");
-    let verts = build_tile_vertices(&tile, DEFAULT_GRID_CELLS);
+    let (verts, _) = build_tile_mesh_data(&tile, DEFAULT_GRID_CELLS);
     let stride = (DEFAULT_GRID_CELLS + 1) as usize;
     let north_skirt_start = stride * stride;
 

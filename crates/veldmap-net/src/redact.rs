@@ -65,21 +65,24 @@ pub(crate) fn percent_encode_variants(secret: &str) -> (String, String) {
     (upper, lower)
 }
 
+fn is_valid_url_scheme(scheme: &str) -> bool {
+    scheme
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
 /// Redact `user:pass@` authority credentials and `?query` strings from a URL
 /// or URL template so inline secrets never appear in `Debug` output, logs, or
 /// UI tooltips.
 pub fn sanitize_url_for_display(url: &str) -> String {
     let trimmed = url.trim();
-    let scheme_end = trimmed.find("://").filter(|&idx| {
-        let scheme = &trimmed[..idx];
-        scheme
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphabetic())
-            && scheme
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-    });
+    let scheme_end = trimmed
+        .find("://")
+        .filter(|&idx| is_valid_url_scheme(&trimmed[..idx]));
     let Some(scheme_idx) = scheme_end else {
         return match trimmed.split_once('?') {
             Some((base, _)) => format!("{base}?<redacted>"),
@@ -139,11 +142,7 @@ fn find_url_scheme_start(s: &str) -> Option<usize> {
             .rfind(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
             .map_or(0, |(idx, c)| idx + c.len_utf8());
         let scheme = &s[start..sep];
-        if scheme
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphabetic())
-        {
+        if is_valid_url_scheme(scheme) {
             return Some(start);
         }
         offset = sep + 3;

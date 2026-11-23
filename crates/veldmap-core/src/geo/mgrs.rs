@@ -64,12 +64,6 @@ fn band_bounds_deg(band: usize) -> (f64, f64) {
     (south_edge, south_edge + height)
 }
 
-#[cfg(test)]
-fn band_middle_deg(band: usize) -> f64 {
-    let (south_edge, north_edge) = band_bounds_deg(band);
-    (south_edge + north_edge) * 0.5
-}
-
 /// Extract a 5-character MGRS tile code (`_TxxABC_`) from a Sentinel-2 product
 /// name.
 pub fn tile_of(product_name: &str) -> Option<&str> {

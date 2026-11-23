@@ -1,17 +1,17 @@
 use super::*;
 
+fn band_middle_deg(band: usize) -> f64 {
+    let (south_edge, north_edge) = band_bounds_deg(band);
+    (south_edge + north_edge) * 0.5
+}
+
 #[test]
 fn every_band_fits_the_row_window_from_both_sides() {
     for (band, &letter) in BANDS.iter().enumerate() {
-        let height = if band == BANDS.len() - 1 {
-            LAST_BAND_DEG
-        } else {
-            BAND_DEG
-        };
-        let south = -80.0 + band as f64 * BAND_DEG;
+        let (south, north) = band_bounds_deg(band);
         let target = band_middle_deg(band).abs() * 110_946.0;
 
-        for (edge, side) in [(south, "south"), (south + height, "north")] {
+        for (edge, side) in [(south, "south"), (north, "north")] {
             let margin = ROW_CYCLE_M / 2.0 - (edge.abs() * 110_946.0 - target).abs();
             assert!(
                 margin > 250_000.0,

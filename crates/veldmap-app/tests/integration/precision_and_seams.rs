@@ -1,6 +1,7 @@
 //! Bundled NASA Blue Marble landmark rendering, 2 m close-up between-vertices
 //! RTC precision & coarse parent overzoom, and multi-LOD / polar seam tests.
 
+use veldmap_app::BUNDLED_MAX_LEVEL;
 use veldmap_app::gpu_tiles::{GpuTileCache, bundled_tile_key};
 use veldmap_app::render::GlobeRenderer;
 use veldmap_core::geo::camera::{Camera, MIN_HEIGHT_M};
@@ -8,7 +9,6 @@ use veldmap_core::geo::projection::WEB_MERCATOR_LIMIT_DEG;
 use veldmap_core::tile::{
     DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId,
 };
-use veldmap_raster::BUNDLED_MAX_LEVEL;
 
 use crate::common::{
     build_snapshot, is_clear_background, pixel_at, render_srgb, shared_bundled_basemap,

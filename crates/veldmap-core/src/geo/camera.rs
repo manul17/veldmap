@@ -72,6 +72,16 @@ impl Default for Camera {
     }
 }
 
+const NORTH_ALIGNED_DOT: f64 = 1.0 - 1e-12;
+
+fn sanitize_aspect(aspect: f64) -> f64 {
+    if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    }
+}
+
 impl Camera {
     /// Construct a North-up camera positioned over `(lat_deg, lon_deg)` at
     /// `height_m` metres above the WGS84 ellipsoid. Non-finite inputs fall back
@@ -167,11 +177,7 @@ impl Camera {
     /// Translation is intentionally omitted: vertices are shifted relative to
     /// the eye in `f64` via per-tile RTC offsets before multiplication.
     pub fn view_projection(&self, aspect: f64) -> DMat4 {
-        let aspect = if aspect.is_finite() && aspect > 0.0 {
-            aspect
-        } else {
-            1.0
-        };
+        let aspect = sanitize_aspect(aspect);
         let near = self.height_m * 0.5;
         perspective_infinite_reverse_rh(FOV_Y_DEG.to_radians(), aspect, near)
             * turn_to(self.basis())
@@ -242,6 +248,10 @@ impl Camera {
         let Some(slope) = self.slope_at(alpha) else {
             return;
         };
+        self.correct_zoom_hold(held, right, above, alpha, slope);
+    }
+
+    fn correct_zoom_hold(&mut self, held: DVec3, right: f64, above: f64, alpha: f64, slope: f64) {
         let across_slope = match self.arc_at(alpha) {
             Some(arc) if alpha > 0.0 => arc.tan() / alpha,
             _ => slope,
@@ -287,6 +297,16 @@ impl Camera {
         self.fly_to(lat_deg, lon_deg, height_m);
     }
 
+    fn make_flight(&self, to: DQuat, to_height_m: f64) -> Flight {
+        Flight {
+            from: orientation(self.at, self.up),
+            to,
+            from_height_m: self.height_m,
+            to_height_m,
+            passed_s: 0.0,
+        }
+    }
+
     /// Start a smooth North-up flight to `(lat_deg, lon_deg)` at `height_m`.
     pub fn fly_to(&mut self, lat_deg: f64, lon_deg: f64, height_m: f64) {
         if !(lat_deg.is_finite() && lon_deg.is_finite() && height_m.is_finite()) {
@@ -297,8 +317,8 @@ impl Camera {
         let height_m = height_m.clamp(HEIGHT_RANGE_M.0, HEIGHT_RANGE_M.1);
         let to = orientation(at, up);
 
-        let already_there = self.at.dot(at) > 1.0 - 1e-12
-            && self.up.dot(up) > 1.0 - 1e-12
+        let already_there = self.at.dot(at) > NORTH_ALIGNED_DOT
+            && self.up.dot(up) > NORTH_ALIGNED_DOT
             && (self.height_m - height_m).abs() <= height_m.max(1.0) * 1e-12;
         if already_there {
             self.flight = None;
@@ -312,13 +332,7 @@ impl Camera {
             return;
         }
 
-        self.flight = Some(Flight {
-            from: orientation(self.at, self.up),
-            to,
-            from_height_m: self.height_m,
-            to_height_m: height_m,
-            passed_s: 0.0,
-        });
+        self.flight = Some(self.make_flight(to, height_m));
     }
 
     /// Smoothly rotate the viewport back to North-up while keeping the current
@@ -326,17 +340,11 @@ impl Camera {
     /// started (`false` if already North-up).
     pub fn reset_north(&mut self) -> bool {
         let up = frame_up(self.at, self.up);
-        if self.up.dot(up) > 1.0 - 1e-12 {
+        if self.up.dot(up) > NORTH_ALIGNED_DOT {
             return false;
         }
         let to = orientation(self.at, up);
-        self.flight = Some(Flight {
-            from: orientation(self.at, self.up),
-            to,
-            from_height_m: self.height_m,
-            to_height_m: self.height_m,
-            passed_s: 0.0,
-        });
+        self.flight = Some(self.make_flight(to, self.height_m));
         true
     }
 
@@ -373,11 +381,7 @@ impl Camera {
     /// bottom-right. Non-positive or non-finite `aspect` falls back to `1.0`,
     /// matching [`Camera::view_projection`].
     pub fn ray(&self, x: f64, y: f64, aspect: f64) -> (DVec3, DVec3) {
-        let aspect = if aspect.is_finite() && aspect > 0.0 {
-            aspect
-        } else {
-            1.0
-        };
+        let aspect = sanitize_aspect(aspect);
         let (right, above) = frame_offset((x - 0.5) * aspect, 0.5 - y);
         (self.eye_ecef(), self.look(right, above))
     }

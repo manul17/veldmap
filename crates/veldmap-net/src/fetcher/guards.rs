@@ -49,13 +49,7 @@ impl Drop for InFlightGuard {
         }
         {
             let mut st = lock_unpoisoned(&self.state);
-            if st
-                .in_flight
-                .get(&self.key)
-                .is_some_and(|(gen_id, _)| *gen_id == self.generation)
-            {
-                st.in_flight.remove(&self.key);
-            }
+            st.remove_in_flight_if_gen(&self.key, self.generation);
         }
         self.notify.notify_one();
     }
@@ -72,7 +66,7 @@ impl Drop for DiskSlotGuard {
     fn drop(&mut self) {
         {
             let mut st = lock_unpoisoned(&self.state);
-            st.disk_in_flight = st.disk_in_flight.saturating_sub(1);
+            st.release_disk_slot();
         }
         self.notify.notify_one();
     }
@@ -117,22 +111,27 @@ mod tests {
 
         let tok1 = CancelToken::new();
         let tok2 = CancelToken::new();
-        {
+        let shut = CancelToken::new();
+        let (gen1, _) = {
             let mut st = lock_unpoisoned(&state);
-            st.in_flight.insert(key, (1, tok1));
-        }
-        let guard1 = InFlightGuard::new(Arc::clone(&state), key, 1, Arc::clone(&notify));
-        {
+            st.register_http_in_flight(key, &shut)
+        };
+        let guard1 = InFlightGuard::new(Arc::clone(&state), key, gen1, Arc::clone(&notify));
+        let (gen2, _) = {
             let mut st = lock_unpoisoned(&state);
-            st.in_flight.insert(key, (2, tok2));
-        }
+            st.register_http_in_flight(key, &shut)
+        };
+        let _ = (tok1, tok2);
         drop(guard1);
 
-        let st = lock_unpoisoned(&state);
-        assert_eq!(
-            st.in_flight.get(&key).map(|(g, _)| *g),
-            Some(2),
+        let mut st = lock_unpoisoned(&state);
+        assert!(
+            !st.remove_in_flight_if_gen(&key, gen1),
             "stale generation 1 guard must not remove generation 2 entry"
+        );
+        assert!(
+            st.remove_in_flight_if_gen(&key, gen2),
+            "generation 2 entry must still be present"
         );
     }
 }

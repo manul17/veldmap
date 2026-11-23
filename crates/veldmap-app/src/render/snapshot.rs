@@ -5,72 +5,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use veldmap_core::geo::camera::Camera;
-use veldmap_core::tile::{
-    PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey, VisibleTile, compose_uv_rect,
-    traverse,
-};
+use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, traverse};
 
-use crate::gpu_tiles::{GpuTile, GpuTileCache, bundled_tile_key, source_tile_key};
+use crate::gpu_tiles::{BasemapCarrierPolicy, GpuTile, GpuTileCache};
 
 use super::adaptive_grid_step_deg;
-
-/// Pure planetary basemap carrier-routing policy shared by [`DrawSnapshot::build`]
-/// and `BasemapManager::schedule_for_tiles`.
-///
-/// Enforces the explicit `PolarCap` + live-basemap contract:
-/// - `PolarCap` tiles always resolve against `SourceId::BUNDLED_BASEMAP` (never
-///   a live HTTP source).
-/// - Non-polar live tiles fall back to cached `SourceId::BUNDLED_BASEMAP`
-///   ancestors while streaming or offline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BasemapCarrierPolicy {
-    pub active_source: SourceId,
-}
-
-impl BasemapCarrierPolicy {
-    pub const fn new(active_source: SourceId) -> Self {
-        Self { active_source }
-    }
-
-    /// Primary [`TileKey`] serving `tex_id` under this basemap policy.
-    pub const fn primary_key(self, tex_id: QuadTileId) -> TileKey {
-        if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. }) {
-            bundled_tile_key(tex_id)
-        } else {
-            source_tile_key(self.active_source, tex_id)
-        }
-    }
-
-    /// Optional offline bundled fallback [`TileKey`] when `primary_key(tex_id)`
-    /// has no cached carrier in VRAM yet.
-    pub const fn fallback_key(self, tex_id: QuadTileId) -> Option<TileKey> {
-        if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. })
-            || self.active_source.0 == SourceId::BUNDLED_BASEMAP.0
-        {
-            None
-        } else {
-            Some(bundled_tile_key(tex_id))
-        }
-    }
-
-    /// Resolve the finest cached GPU carrier tile and composed UV sub-rectangle
-    /// for `(tex_id, uv_rect)`.
-    pub fn resolve_carrier(
-        self,
-        tex_id: QuadTileId,
-        uv_rect: [f32; 4],
-        gpu_cache: &mut GpuTileCache,
-    ) -> Option<(TileKey, [f32; 4], Arc<GpuTile>)> {
-        let primary = self.primary_key(tex_id);
-        if let Some((ck, c_uv, tile)) = gpu_cache.carrier(&primary) {
-            return Some((ck, compose_uv_rect(c_uv, uv_rect), tile));
-        }
-        let fallback = self.fallback_key(tex_id)?;
-        gpu_cache
-            .carrier(&fallback)
-            .map(|(ck, c_uv, tile)| (ck, compose_uv_rect(c_uv, uv_rect), tile))
-    }
-}
 
 /// Grouped inputs for [`DrawSnapshot::build`].
 #[derive(Clone, Copy, Debug)]

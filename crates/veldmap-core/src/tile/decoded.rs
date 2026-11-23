@@ -24,19 +24,18 @@ pub const fn mip_dimensions(width: u32, height: u32, mip_level: u32) -> (u32, u3
     if width == 0 || height == 0 {
         return (0, 0);
     }
-    let mw = if mip_level >= 32 {
-        1
-    } else {
-        let shifted = width >> mip_level;
-        if shifted == 0 { 1 } else { shifted }
-    };
-    let mh = if mip_level >= 32 {
-        1
-    } else {
-        let shifted = height >> mip_level;
-        if shifted == 0 { 1 } else { shifted }
-    };
-    (mw, mh)
+    (
+        mip_axis_dim(width, mip_level),
+        mip_axis_dim(height, mip_level),
+    )
+}
+
+const fn mip_axis_dim(dim: u32, mip_level: u32) -> u32 {
+    if mip_level >= 32 {
+        return 1;
+    }
+    let shifted = dim >> mip_level;
+    if shifted == 0 { 1 } else { shifted }
 }
 
 /// Exact unpacked byte size of a 2D tile texture with `mip_level_count` mip

@@ -1,10 +1,10 @@
 //! Offscreen sRGB/UNORM compositing parity, 0 idle re-renders, procedural
 //! graticule horizon discard & polar sharpness, and dropped-encoder recovery.
 
+use veldmap_app::BUNDLED_MAX_LEVEL;
 use veldmap_app::render::{GlobeRenderer, RenderParams};
 use veldmap_core::geo::camera::{Camera, MIN_HEIGHT_M};
 use veldmap_core::tile::{QuadtreeConfig, SourceId};
-use veldmap_raster::BUNDLED_MAX_LEVEL;
 
 use crate::common::{
     build_snapshot, is_clear_background, pixel_at, render_srgb, render_with, shared_headless_device,

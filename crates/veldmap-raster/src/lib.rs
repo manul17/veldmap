@@ -12,7 +12,7 @@ mod decode_pool;
 mod map_tile;
 mod mipmap;
 
-pub use basemap::{BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, BundledBasemap};
+pub use basemap::{BundledBasemap, BundledBasemapConfig};
 pub use decode_pool::{
     DEFAULT_MAX_PENDING_DECODE_BYTES, DEFAULT_MAX_PENDING_DECODE_JOBS, DecodeJob, DecodePool,
     DecodePoolConfig, DecodePoolHandle,

@@ -66,25 +66,20 @@ pub(super) fn evict_in_tx(
     // `ORDER BY last_used_ms ASC` (without `, tile_id ASC`) lets SQLite satisfy
     // the query directly from covering index `idx_tile_meta_lru (last_used_ms,
     // byte_size)` with zero temp B-tree sorting and zero table lookups.
-    let mut select_stmt = match protect_id {
-        Some(_) => tx.prepare(
-            "SELECT tile_id, byte_size FROM tile_meta
-             WHERE tile_id != ?2
-             ORDER BY last_used_ms ASC
-             LIMIT ?1",
-        )?,
-        None => tx.prepare(
-            "SELECT tile_id, byte_size FROM tile_meta
-             ORDER BY last_used_ms ASC
-             LIMIT ?1",
-        )?,
+    let select_sql = if protect_id.is_some() {
+        "SELECT tile_id, byte_size FROM tile_meta
+         WHERE tile_id != ?2
+         ORDER BY last_used_ms ASC
+         LIMIT ?1"
+    } else {
+        "SELECT tile_id, byte_size FROM tile_meta
+         ORDER BY last_used_ms ASC
+         LIMIT ?1"
     };
+    let mut select_stmt = tx.prepare(select_sql)?;
     let mut delete_stmt = tx.prepare("DELETE FROM tile_meta WHERE tile_id = ?1")?;
 
-    loop {
-        if total_bytes <= target {
-            break;
-        }
+    while total_bytes > target {
         let batch = match protect_id {
             Some(protected) => {
                 collect_eviction_batch(&mut select_stmt, params![EVICT_BATCH_ROWS, protected])?
@@ -107,10 +102,7 @@ pub(super) fn evict_in_tx(
         }
     }
 
-    tx.execute(
-        "UPDATE cache_meta SET total_bytes = ?1, tile_count = ?2 WHERE id = 1",
-        params![total_bytes as i64, tile_count as i64],
-    )?;
+    super::schema::set_cache_meta_totals(tx, total_bytes, tile_count)?;
 
     Ok(EvictionReport {
         evicted_tiles,

@@ -99,6 +99,13 @@ pub fn scale_bar_reserved_width(viewport_width_pt: f32) -> f32 {
     SCALE_BAR_MARGIN_PT + max_bar_w + SCALE_BAR_PAD_X_PT * 2.0 + SCALE_BAR_GAP_PT
 }
 
+/// Remaining horizontal width in logical points available to right-aligned
+/// bottom-edge viewport overlays (e.g. attribution pill) without colliding
+/// with the bottom-left scale bar.
+pub fn available_right_overlay_width(viewport_width_pt: f32, pad_x: f32, margin: f32) -> f32 {
+    viewport_width_pt - scale_bar_reserved_width(viewport_width_pt) - (pad_x * 2.0 + margin)
+}
+
 /// Paint a crisp floating dynamic metric scale bar in the bottom-left corner
 /// of `viewport_rect`.
 pub fn paint_scale_bar(painter: &egui::Painter, viewport_rect: egui::Rect, m_per_pt: f64) {

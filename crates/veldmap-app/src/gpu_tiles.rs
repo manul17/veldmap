@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use veldmap_core::tile::{DecodedTile, PixelFormat, QuadTileId, SourceId, TileCache, TileKey};
+use veldmap_core::tile::{
+    DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, SourceId, TileCache, TileKey,
+    compose_uv_rect,
+};
 
 /// Default GPU tile VRAM cache cap (`256 MiB`).
 pub const DEFAULT_GPU_TILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
@@ -226,50 +229,9 @@ impl GpuTileCache {
             return UploadInsertOutcome::RefusedByProtection;
         }
 
-        let mip_level_count = decoded.mip_level_count();
-        let bpp = decoded.format().bytes_per_pixel() as u32;
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("veldmap gpu tile"),
-            size: wgpu::Extent3d {
-                width: decoded.width(),
-                height: decoded.height(),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu_format(decoded.format()),
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        for mip_level in 0..mip_level_count {
-            let Some(mip_bytes) = decoded.mip_data(mip_level) else {
-                return UploadInsertOutcome::Rejected;
-            };
-            let (mw, mh) = decoded.mip_dims(mip_level);
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                mip_bytes,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(mw * bpp),
-                    rows_per_image: Some(mh),
-                },
-                wgpu::Extent3d {
-                    width: mw,
-                    height: mh,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let Some((texture, view)) = upload_tile_texture(device, queue, decoded) else {
+            return UploadInsertOutcome::Rejected;
+        };
         let tile_id = self.next_tile_id;
         self.next_tile_id = self.next_tile_id.wrapping_add(1);
         let tile = Arc::new(GpuTile {
@@ -296,6 +258,56 @@ impl GpuTileCache {
             Err(_) => UploadInsertOutcome::RefusedByProtection,
         }
     }
+}
+
+fn upload_tile_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    decoded: &DecodedTile,
+) -> Option<(wgpu::Texture, wgpu::TextureView)> {
+    let mip_level_count = decoded.mip_level_count();
+    let bpp = decoded.format().bytes_per_pixel() as u32;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("veldmap gpu tile"),
+        size: wgpu::Extent3d {
+            width: decoded.width(),
+            height: decoded.height(),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu_format(decoded.format()),
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    for mip_level in 0..mip_level_count {
+        let mip_bytes = decoded.mip_data(mip_level)?;
+        let (mw, mh) = decoded.mip_dims(mip_level);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            mip_bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(mw * bpp),
+                rows_per_image: Some(mh),
+            },
+            wgpu::Extent3d {
+                width: mw,
+                height: mh,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    Some((texture, view))
 }
 
 /// Parameters governing one frame's [`PendingUploads::drain_and_upload`] pass.
@@ -528,10 +540,21 @@ impl PendingUploads {
             return UploadBatchReport::default();
         }
 
-        // 4. Order remaining tiles deterministically coarsest-first.
+        // 4. Order remaining tiles deterministically coarsest-first and upload
+        //    within budget (note steps 1 & 2 already pruned cached keys).
         let mut order: Vec<TileKey> = self.queued.keys().copied().collect();
         order.sort_by_key(TileKey::coarsest_first_key);
+        self.upload_ordered_tiles(device, queue, cache, &params, order)
+    }
 
+    fn upload_ordered_tiles(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cache: &mut GpuTileCache,
+        params: &UploadPassParams<'_>,
+        order: Vec<TileKey>,
+    ) -> UploadBatchReport {
         let start = Instant::now();
         let mut uploaded = 0usize;
         let mut evicted = 0usize;
@@ -545,10 +568,6 @@ impl PendingUploads {
                 && (bytes_uploaded >= params.byte_budget || start.elapsed() >= params.time_budget)
             {
                 break;
-            }
-            if cache.contains(&key) {
-                let _ = self.remove_queued(&key);
-                continue;
             }
             let Some(decoded) = self.queued.get(&key) else {
                 continue;
@@ -586,6 +605,64 @@ impl PendingUploads {
             deferred_protected,
             max_active_tile_bytes,
         }
+    }
+}
+
+/// Pure planetary basemap carrier-routing policy shared by `DrawSnapshot::build`
+/// and `BasemapManager::schedule_for_tiles`.
+///
+/// Enforces the explicit `PolarCap` + live-basemap contract:
+/// - `PolarCap` tiles always resolve against `SourceId::BUNDLED_BASEMAP` (never
+///   a live HTTP source).
+/// - Non-polar live tiles fall back to cached `SourceId::BUNDLED_BASEMAP`
+///   ancestors while streaming or offline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BasemapCarrierPolicy {
+    pub active_source: SourceId,
+}
+
+impl BasemapCarrierPolicy {
+    pub const fn new(active_source: SourceId) -> Self {
+        Self { active_source }
+    }
+
+    /// Primary [`TileKey`] serving `tex_id` under this basemap policy.
+    pub const fn primary_key(self, tex_id: QuadTileId) -> TileKey {
+        if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. }) {
+            bundled_tile_key(tex_id)
+        } else {
+            source_tile_key(self.active_source, tex_id)
+        }
+    }
+
+    /// Optional offline bundled fallback [`TileKey`] when `primary_key(tex_id)`
+    /// has no cached carrier in VRAM yet.
+    pub const fn fallback_key(self, tex_id: QuadTileId) -> Option<TileKey> {
+        if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. })
+            || self.active_source.0 == SourceId::BUNDLED_BASEMAP.0
+        {
+            None
+        } else {
+            Some(bundled_tile_key(tex_id))
+        }
+    }
+
+    /// Resolve the finest cached GPU carrier tile and composed UV sub-rectangle
+    /// for `(tex_id, uv_rect)`.
+    pub fn resolve_carrier(
+        self,
+        tex_id: QuadTileId,
+        uv_rect: [f32; 4],
+        gpu_cache: &mut GpuTileCache,
+    ) -> Option<(TileKey, [f32; 4], Arc<GpuTile>)> {
+        let primary = self.primary_key(tex_id);
+        if let Some((ck, c_uv, tile)) = gpu_cache.carrier(&primary) {
+            return Some((ck, compose_uv_rect(c_uv, uv_rect), tile));
+        }
+        let fallback = self.fallback_key(tex_id)?;
+        gpu_cache
+            .carrier(&fallback)
+            .map(|(ck, c_uv, tile)| (ck, compose_uv_rect(c_uv, uv_rect), tile))
     }
 }
 

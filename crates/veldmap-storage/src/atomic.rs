@@ -222,7 +222,7 @@ pub fn read_json_or_default_with_backup<T: DeserializeOwned + Default>(path: &Pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestTempDir;
+    use crate::test_support::TestTempDir;
 
     #[test]
     fn write_atomic_durable_creates_overwrites_and_leaves_no_temp_files() {

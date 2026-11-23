@@ -94,6 +94,75 @@ impl DecodeQueue {
             }
         }
     }
+
+    /// Plan eviction victims transactionally before mutating the queue so
+    /// rejecting an incoming job never destroys valid finer queued jobs
+    /// (always permitting a single job into an empty queue).
+    fn plan_evictions(&self, key: &TileKey, incoming_bytes: usize) -> Option<Vec<usize>> {
+        let needs_eviction = !self.jobs.is_empty()
+            && (self.jobs.len() >= self.max_pending_jobs
+                || self.queued_bytes.saturating_add(incoming_bytes) > self.max_pending_bytes);
+        if !needs_eviction {
+            return Some(Vec::new());
+        }
+
+        let incoming_rank = key.coarsest_first_key();
+        let mut candidates: Vec<(usize, _, usize)> = self
+            .jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, j)| {
+                let rank = j.key.coarsest_first_key();
+                (incoming_rank < rank).then_some((idx, rank, j.queued_bytes))
+            })
+            .collect();
+        // Finest-first victim order (highest `coarsest_first_key` first).
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+
+        let mut remaining_jobs = self.jobs.len();
+        let mut remaining_bytes = self.queued_bytes;
+        let mut victims = Vec::new();
+        for (idx, _, bytes) in candidates {
+            if remaining_jobs == 0
+                || (remaining_jobs < self.max_pending_jobs
+                    && remaining_bytes.saturating_add(incoming_bytes) <= self.max_pending_bytes)
+            {
+                break;
+            }
+            remaining_jobs -= 1;
+            remaining_bytes = remaining_bytes.saturating_sub(bytes);
+            victims.push(idx);
+        }
+
+        let fits = remaining_jobs == 0
+            || (remaining_jobs < self.max_pending_jobs
+                && remaining_bytes.saturating_add(incoming_bytes) <= self.max_pending_bytes);
+        fits.then_some(victims)
+    }
+
+    fn admit_job(&mut self, job: DecodeJob, to_drop: &mut Vec<DecodeJob>) -> bool {
+        if self.closed {
+            to_drop.push(job);
+            return false;
+        }
+        self.prune_cancelled(to_drop);
+        if self.jobs.iter().any(|j| j.key == job.key) {
+            to_drop.push(job);
+            return false;
+        }
+        let Some(mut victims) = self.plan_evictions(&job.key, job.queued_bytes) else {
+            to_drop.push(job);
+            return false;
+        };
+        // Remove in descending index order so `swap_remove` never invalidates
+        // earlier planned indices.
+        victims.sort_unstable_by_key(|&idx| std::cmp::Reverse(idx));
+        for idx in victims {
+            to_drop.push(self.swap_remove_job(idx));
+        }
+        self.push_job(job);
+        true
+    }
 }
 
 /// Cloneable producer handle for submitting work to a [`DecodePool`].
@@ -116,82 +185,11 @@ impl DecodePoolHandle {
         let accepted = {
             let (lock, cvar) = &*self.shared;
             let mut queue = lock_unpoisoned(lock);
-            if queue.closed {
-                to_drop.push(job);
-                false
-            } else {
-                queue.prune_cancelled(&mut to_drop);
-
-                if queue.jobs.iter().any(|j| j.key == job.key) {
-                    to_drop.push(job);
-                    false
-                } else {
-                    let incoming_bytes = job.queued_bytes;
-                    let incoming_rank = job.key.coarsest_first_key();
-                    let max_jobs = queue.max_pending_jobs;
-                    let max_bytes = queue.max_pending_bytes;
-
-                    // Plan eviction victims transactionally before mutating the
-                    // queue so rejecting an incoming job never destroys valid
-                    // finer queued jobs (always permitting a single job into an
-                    // empty queue).
-                    let needs_eviction = !queue.jobs.is_empty()
-                        && (queue.jobs.len() >= max_jobs
-                            || queue.queued_bytes.saturating_add(incoming_bytes) > max_bytes);
-
-                    let planned_victims = if needs_eviction {
-                        let mut candidates: Vec<(usize, _, usize)> = queue
-                            .jobs
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, j)| {
-                                let rank = j.key.coarsest_first_key();
-                                (incoming_rank < rank).then_some((idx, rank, j.queued_bytes))
-                            })
-                            .collect();
-                        // Finest-first victim order (highest `coarsest_first_key` first).
-                        candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
-
-                        let mut remaining_jobs = queue.jobs.len();
-                        let mut remaining_bytes = queue.queued_bytes;
-                        let mut victims = Vec::new();
-                        for (idx, _, bytes) in candidates {
-                            if remaining_jobs == 0
-                                || (remaining_jobs < max_jobs
-                                    && remaining_bytes.saturating_add(incoming_bytes) <= max_bytes)
-                            {
-                                break;
-                            }
-                            remaining_jobs -= 1;
-                            remaining_bytes = remaining_bytes.saturating_sub(bytes);
-                            victims.push(idx);
-                        }
-
-                        let fits = remaining_jobs == 0
-                            || (remaining_jobs < max_jobs
-                                && remaining_bytes.saturating_add(incoming_bytes) <= max_bytes);
-                        fits.then_some(victims)
-                    } else {
-                        Some(Vec::new())
-                    };
-
-                    if let Some(mut victims) = planned_victims {
-                        // Remove in descending index order so `swap_remove` never
-                        // invalidates earlier planned indices.
-                        victims.sort_unstable_by_key(|&idx| std::cmp::Reverse(idx));
-                        for idx in victims {
-                            let evicted = queue.swap_remove_job(idx);
-                            to_drop.push(evicted);
-                        }
-                        queue.push_job(job);
-                        cvar.notify_one();
-                        true
-                    } else {
-                        to_drop.push(job);
-                        false
-                    }
-                }
+            let admitted = queue.admit_job(job, &mut to_drop);
+            if admitted {
+                cvar.notify_one();
             }
+            admitted
         };
         // Drop evicted/cancelled/rejected jobs AFTER releasing `DecodeQueue`'s lock.
         drop(to_drop);

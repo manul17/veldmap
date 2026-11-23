@@ -58,6 +58,48 @@ pub(crate) fn linear_to_srgb_u8(linear: f32, lut: &[u8; LINEAR_TO_SRGB_LUT_LEN])
     }
 }
 
+/// Downsample an opaque packed `Rgb8` sRGB image 2x in linear light, wrapping
+/// horizontally for equirectangular continuity.
+pub(crate) fn downsample_rgb8_srgb_wrap_x_2x(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+) -> (u32, u32, Vec<u8>) {
+    let to_lin = srgb_to_linear_lut();
+    let to_srgb = linear_to_srgb_lut();
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let dw = (sw / 2).max(1);
+    let dh = (sh / 2).max(1);
+    let mut dst = vec![0u8; dw * dh * 3];
+
+    for y in 0..dh {
+        let sy0 = (y * 2).min(sh - 1);
+        let sy1 = (sy0 + 1).min(sh - 1);
+        for x in 0..dw {
+            let sx0 = (x * 2).min(sw - 1);
+            let sx1 = (sx0 + 1) % sw;
+            let offsets = [
+                (sy0 * sw + sx0) * 3,
+                (sy0 * sw + sx1) * 3,
+                (sy1 * sw + sx0) * 3,
+                (sy1 * sw + sx1) * 3,
+            ];
+            let out = (y * dw + x) * 3;
+            for ch in 0..3 {
+                let avg = 0.25
+                    * offsets
+                        .iter()
+                        .map(|&o| to_lin[usize::from(src[o + ch])])
+                        .sum::<f32>();
+                dst[out + ch] = linear_to_srgb_u8(avg, to_srgb);
+            }
+        }
+    }
+
+    (dw as u32, dh as u32, dst)
+}
+
 fn downsample_rgba8_srgb_2x(
     src: &[u8],
     src_w: u32,
@@ -254,5 +296,14 @@ mod tests {
         .expect("guttered");
         generate_linear_mipmaps(&mut guttered);
         assert_eq!(guttered.mip_level_count(), 1);
+    }
+
+    #[test]
+    fn srgb_linear_luts_roundtrip_all_code_values() {
+        let to_lin = srgb_to_linear_lut();
+        let to_srgb = linear_to_srgb_lut();
+        for v in 0..=255u8 {
+            assert_eq!(linear_to_srgb_u8(to_lin[usize::from(v)], to_srgb), v);
+        }
     }
 }

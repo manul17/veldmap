@@ -157,6 +157,7 @@ pub(crate) enum FetchFailure {
     Transient {
         msg: String,
         offline: bool,
+        rate_limited: bool,
         retry_after: Option<Duration>,
     },
 }
@@ -171,6 +172,7 @@ pub(crate) async fn download_capped(
         FetchFailure::Transient {
             msg: err.to_string(),
             offline,
+            rate_limited: false,
             retry_after: None,
         }
     })?;
@@ -185,18 +187,20 @@ pub(crate) async fn download_capped(
         if matches!(code, 400 | 401 | 403 | 404 | 410 | 451) {
             return Err(FetchFailure::Terminal(msg));
         }
-        let retry_after = if matches!(code, 429 | 503) {
+        let rate_limited = matches!(code, 429 | 503);
+        let retry_after = if rate_limited {
             let hdr = resp
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok());
-            Some(parse_retry_after_seconds(hdr).unwrap_or(Duration::from_secs(15)))
+            parse_retry_after_seconds(hdr)
         } else {
             None
         };
         return Err(FetchFailure::Transient {
             msg,
             offline: false,
+            rate_limited,
             retry_after,
         });
     }
@@ -216,6 +220,7 @@ pub(crate) async fn download_capped(
     while let Some(chunk) = resp.chunk().await.map_err(|err| FetchFailure::Transient {
         msg: err.to_string(),
         offline: err.is_connect() || err.is_timeout(),
+        rate_limited: false,
         retry_after: None,
     })? {
         if buf.len().saturating_add(chunk.len()) > max_bytes {

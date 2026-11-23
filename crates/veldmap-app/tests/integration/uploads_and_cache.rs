@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use veldmap_app::BUNDLED_MAX_LEVEL;
 use veldmap_app::gpu_tiles::{
     GpuTileCache, PendingUploads, UploadPassParams, bundled_tile_key, source_tile_key,
 };
@@ -13,7 +14,7 @@ use veldmap_core::tile::{
     DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId,
     mip_chain_byte_size,
 };
-use veldmap_raster::{BUNDLED_MAX_LEVEL, generate_linear_mipmaps};
+use veldmap_raster::generate_linear_mipmaps;
 
 use crate::common::{
     build_snapshot, pixel_at, render_srgb, shared_bundled_basemap, shared_headless_device,

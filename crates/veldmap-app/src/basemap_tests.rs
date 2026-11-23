@@ -37,7 +37,7 @@ fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {
     bad_date.gibs_date = "2024-02-30".to_owned();
     storage.update_settings(bad_date);
     manager.sync_settings(storage.settings(), &mut gpu_cache, &mut pending);
-    assert!(manager.config_error().is_some());
+    assert!(manager.status_snapshot().config_error.is_some());
     assert_eq!(manager.active_source(), SourceId::BUNDLED_BASEMAP);
     assert_eq!(manager.attribution(), Some(BUNDLED_ATTRIBUTION));
 
@@ -46,7 +46,7 @@ fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {
     bad_custom.custom_xyz.url_template = "ftp://bad/{z}/{x}/{y}".to_owned();
     storage.update_settings(bad_custom);
     manager.sync_settings(storage.settings(), &mut gpu_cache, &mut pending);
-    assert!(manager.config_error().is_some());
+    assert!(manager.status_snapshot().config_error.is_some());
     assert_eq!(manager.active_source(), SourceId::BUNDLED_BASEMAP);
 
     manager.begin_shutdown();
@@ -124,4 +124,53 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_flush
     pending.close();
     manager.finish_shutdown();
     storage.finish_shutdown();
+}
+
+#[test]
+fn rejected_or_cancelled_decode_request_does_not_report_panic() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    let (done_tx, _done_rx) = mpsc::channel();
+    let shutdown = CancelToken::new();
+    let pool = DecodePool::spawn(
+        DecodePoolConfig {
+            worker_count: 1,
+            max_pending_jobs: 1,
+            max_pending_bytes: 1024,
+        },
+        shutdown.clone(),
+    );
+    let executor = RasterDecodeExecutor {
+        pool: pool.handle(),
+        done_tx,
+        wakeup: Arc::new(|| {}),
+        shutdown: shutdown.clone(),
+    };
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let invoked = Arc::new(AtomicBool::new(false));
+    let invoked_cb = Arc::clone(&invoked);
+    let key = bundled_tile_key(QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 0,
+        x: 0,
+        y: 0,
+    });
+    let accepted = executor.submit(DecodeRequest {
+        key,
+        bytes: Arc::from([0u8; 4]),
+        cancel,
+        on_decoded: Box::new(move |_| {
+            invoked_cb.store(true, Ordering::SeqCst);
+        }),
+    });
+    assert!(!accepted);
+    assert!(
+        !invoked.load(Ordering::SeqCst),
+        "rejected decode job must not fire on_decoded"
+    );
+    shutdown.cancel();
+    pool.shutdown();
 }

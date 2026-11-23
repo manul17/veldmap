@@ -97,6 +97,12 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         self.nodes[slot].as_ref().map(|n| &n.value)
     }
 
+    fn insert_front_entry(&mut self, key: K, value: V, byte_size: usize) {
+        let slot = self.insert_front_node(key, value, byte_size);
+        self.index.insert(key, slot);
+        self.total_bytes += byte_size;
+    }
+
     /// Insert or replace `key` with `value` occupying `byte_size` bytes,
     /// evicting least-recently-used entries in O(1) per eviction until
     /// `total_bytes() <= max_bytes()`.
@@ -123,9 +129,7 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
             evicted.push(victim);
         }
 
-        let slot = self.insert_front_node(key, value, byte_size);
-        self.index.insert(key, slot);
-        self.total_bytes += byte_size;
+        self.insert_front_entry(key, value, byte_size);
         Ok(evicted)
     }
 
@@ -220,9 +224,7 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
             }
         }
 
-        let slot = self.insert_front_node(key, value, byte_size);
-        self.index.insert(key, slot);
-        self.total_bytes += byte_size;
+        self.insert_front_entry(key, value, byte_size);
         Ok(evicted)
     }
 
@@ -390,14 +392,18 @@ impl<V> TileCache<TileKey, V> {
         usize::try_from(scaled).unwrap_or(half_strict)
     }
 
+    fn tile_count_for_cap(&self, cap: usize, tile_bytes: usize) -> usize {
+        if tile_bytes == 0 || tile_bytes > self.max_bytes {
+            return 0;
+        }
+        cap / tile_bytes
+    }
+
     /// Maximum tile count allowed for one active pyramid given `tile_bytes`,
     /// strictly honoring the `< 50%` byte appetite cap (returns `0` if even one
     /// tile would exceed the per-pyramid cap).
     pub fn max_tiles_for_pyramid(&self, active_pyramids: usize, tile_bytes: usize) -> usize {
-        if tile_bytes == 0 || tile_bytes > self.max_bytes {
-            return 0;
-        }
-        self.pyramid_byte_cap(active_pyramids) / tile_bytes
+        self.tile_count_for_cap(self.pyramid_byte_cap(active_pyramids), tile_bytes)
     }
 
     /// Maximum tile count allowed for one weighted pyramid given `tile_bytes`,
@@ -408,10 +414,10 @@ impl<V> TileCache<TileKey, V> {
         total_weight: u64,
         tile_bytes: usize,
     ) -> usize {
-        if tile_bytes == 0 || tile_bytes > self.max_bytes {
-            return 0;
-        }
-        self.proportional_pyramid_byte_cap(pyramid_weight, total_weight) / tile_bytes
+        self.tile_count_for_cap(
+            self.proportional_pyramid_byte_cap(pyramid_weight, total_weight),
+            tile_bytes,
+        )
     }
     fn find_carrier_slot(&self, key: &TileKey) -> Option<(TileKey, usize)> {
         let mut cursor = Some(*key);
@@ -424,13 +430,18 @@ impl<V> TileCache<TileKey, V> {
         None
     }
 
-    fn touch_carrier_and_ancestors(&mut self, carrier_key: TileKey, carrier_slot: usize) {
+    fn touch_and_borrow_carrier(
+        &mut self,
+        carrier_key: TileKey,
+        carrier_slot: usize,
+    ) -> Option<&V> {
         self.move_to_front(carrier_slot);
         let mut anc = carrier_key.parent();
         while let Some(cur) = anc {
             self.touch(&cur);
             anc = cur.parent();
         }
+        self.nodes[carrier_slot].as_ref().map(|n| &n.value)
     }
 
     /// Read-only check whether `key` or any of its coarser ancestors along
@@ -449,8 +460,7 @@ impl<V> TileCache<TileKey, V> {
     /// pixel dimensions and gutter metadata.
     pub fn find_carrier(&mut self, key: &TileKey) -> Option<(TileKey, &V)> {
         let (carrier_key, carrier_slot) = self.find_carrier_slot(key)?;
-        self.touch_carrier_and_ancestors(carrier_key, carrier_slot);
-        let value = self.nodes[carrier_slot].as_ref().map(|n| &n.value)?;
+        let value = self.touch_and_borrow_carrier(carrier_key, carrier_slot)?;
         Some((carrier_key, value))
     }
 
@@ -460,8 +470,11 @@ impl<V> TileCache<TileKey, V> {
     pub fn carrier(&mut self, key: &TileKey) -> Option<(TileKey, [f32; 4], &V)> {
         let (carrier_key, carrier_slot) = self.find_carrier_slot(key)?;
         let uv_rect = key.sub_rect_in_ancestor(&carrier_key)?;
-        self.touch_carrier_and_ancestors(carrier_key, carrier_slot);
-        let value = self.nodes[carrier_slot].as_ref().map(|n| &n.value)?;
+        let value = self.touch_and_borrow_carrier(carrier_key, carrier_slot)?;
         Some((carrier_key, uv_rect, value))
     }
 }
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod tests;

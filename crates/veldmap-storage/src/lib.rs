@@ -17,41 +17,42 @@ pub use atomic::{
 };
 pub use paths::StoragePaths;
 pub use tile_cache::{
-    DEFAULT_DISK_CACHE_MAX_MB, DiskCacheStats, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES,
-    MAX_DISK_CACHE_MAX_MB, MIN_DISK_CACHE_MAX_MB, TileBlobEncoding, TileDiskCache,
-    valid_source_key,
+    DiskCacheStats, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES, TileBlobEncoding,
+    TileDiskCache, valid_source_key,
 };
 
 #[cfg(test)]
-pub(crate) struct TestTempDir(pub(crate) std::path::PathBuf);
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
-impl TestTempDir {
-    pub(crate) fn new(label: &str) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "veldmap-storage-{label}-{}-{nanos}-{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp test dir");
-        Self(dir)
+    pub(crate) struct TestTempDir(pub(crate) PathBuf);
+
+    impl TestTempDir {
+        pub(crate) fn new(label: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "veldmap-storage-{label}-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp test dir");
+            Self(dir)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
     }
 
-    pub(crate) fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-#[cfg(test)]
-impl Drop for TestTempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 

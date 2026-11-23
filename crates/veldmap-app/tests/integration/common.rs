@@ -3,12 +3,12 @@
 
 use std::sync::{Arc, OnceLock, mpsc};
 
-use veldmap_app::BUNDLED_BASEMAP_JPEG;
 use veldmap_app::gpu_tiles::GpuTileCache;
 use veldmap_app::render::{
     BasemapCarrierPolicy, DrawSnapshot, GlobeRenderer, RenderParams, SnapshotBuildParams,
     clamp_to_primary_backends,
 };
+use veldmap_app::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG};
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{QuadtreeConfig, SourceId};
 use veldmap_raster::BundledBasemap;
@@ -21,7 +21,7 @@ pub(crate) fn shared_headless_device() -> Option<&'static (wgpu::Device, wgpu::Q
 pub(crate) fn shared_bundled_basemap() -> &'static BundledBasemap {
     static BASEMAP: OnceLock<BundledBasemap> = OnceLock::new();
     BASEMAP.get_or_init(|| {
-        BundledBasemap::from_encoded_bytes(BUNDLED_BASEMAP_JPEG)
+        BundledBasemap::from_encoded_bytes_with_config(BUNDLED_BASEMAP_JPEG, BUNDLED_BASEMAP_CONFIG)
             .expect("decode bundled NASA Blue Marble")
     })
 }

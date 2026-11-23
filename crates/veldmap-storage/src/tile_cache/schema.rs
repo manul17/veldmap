@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, params};
 
 /// Current SQLite schema version (`PRAGMA user_version`).
 ///
@@ -63,6 +63,50 @@ pub(super) const UPSERT_META_SQL: &str = "INSERT INTO tile_meta (
        byte_size = excluded.byte_size,
        last_used_ms = excluded.last_used_ms
      RETURNING tile_id";
+
+pub(super) fn read_cache_meta_totals(conn: &Connection) -> Result<(u64, u64), rusqlite::Error> {
+    let (total_bytes, tile_count): (i64, i64) = conn.query_row(
+        "SELECT total_bytes, tile_count FROM cache_meta WHERE id = 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((total_bytes.max(0) as u64, tile_count.max(0) as u64))
+}
+
+pub(super) fn set_cache_meta_totals(
+    tx: &Transaction<'_>,
+    total_bytes: u64,
+    tile_count: u64,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE cache_meta SET total_bytes = ?1, tile_count = ?2 WHERE id = 1",
+        params![total_bytes as i64, tile_count as i64],
+    )?;
+    Ok(())
+}
+
+pub(super) fn decrement_cache_meta(
+    tx: &Transaction<'_>,
+    removed_bytes: i64,
+    removed_count: i64,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE cache_meta
+         SET total_bytes = MAX(0, total_bytes - ?1),
+             tile_count  = MAX(0, tile_count - ?2)
+         WHERE id = 1",
+        params![removed_bytes, removed_count],
+    )?;
+    Ok(())
+}
+
+pub(super) fn reset_cache_meta(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE cache_meta SET total_bytes = 0, tile_count = 0 WHERE id = 1",
+        [],
+    )?;
+    Ok(())
+}
 
 pub(super) fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();

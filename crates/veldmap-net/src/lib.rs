@@ -19,7 +19,7 @@ mod redact;
 
 pub use basemap::{
     CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, LiveBasemapSpec,
-    is_valid_gibs_date,
+    is_valid_gibs_date, validate_custom_url_template,
 };
 pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
 pub use redact::sanitize_url_for_display;

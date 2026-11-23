@@ -9,13 +9,12 @@ use veldmap_core::tile::{DecodedTile, PixelFormat};
 use crate::RasterError;
 use crate::mipmap::generate_linear_mipmaps;
 
-/// Maximum single map-tile dimension accepted by [`decode_map_tile`] and
-/// [`crate::BundledBasemap::render_tile_sized`].
-pub(crate) const MAX_MAP_TILE_DIM: u32 = 2048;
+/// Maximum single map-tile dimension accepted by [`decode_map_tile`].
+const MAX_MAP_TILE_DIM: u32 = 2048;
 
 /// Maximum peak allocation budget for decoding a single map tile (`36 MiB`,
 /// covering a `2048 x 2048` RGB/PNG decode plus RGBA8 conversion).
-pub(crate) const MAX_MAP_TILE_ALLOC_BYTES: u64 = 36 * 1024 * 1024;
+const MAX_MAP_TILE_ALLOC_BYTES: u64 = 36 * 1024 * 1024;
 
 /// Decode raw PNG or JPEG map-tile bytes into tightly packed `Rgba8UnormSrgb`
 /// pixels under explicit dimension and peak-allocation limits.
@@ -57,6 +56,42 @@ fn map_image_err(
     }
 }
 
+fn checked_peak_bytes(
+    width: u32,
+    height: u32,
+    src_color: ColorType,
+    target: ColorType,
+    max_dim: u32,
+    max_alloc_bytes: u64,
+) -> Result<(u64, u64), RasterError> {
+    if width == 0 || height == 0 {
+        return Err(RasterError::InvalidDimensions { width, height });
+    }
+    let px_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(RasterError::InvalidDimensions { width, height })?;
+    let src_bytes = px_count
+        .checked_mul(u64::from(src_color.bytes_per_pixel()))
+        .ok_or(RasterError::InvalidDimensions { width, height })?;
+    let dst_bytes = px_count
+        .checked_mul(u64::from(target.bytes_per_pixel()))
+        .ok_or(RasterError::InvalidDimensions { width, height })?;
+
+    // When `src_color == target`, `.into_rgba8()` / `.into_rgb8()` moves the
+    // decoded buffer in place; otherwise reserve both buffers simultaneously.
+    let conversion_bytes = if src_color == target { 0 } else { dst_bytes };
+    let estimated_peak = src_bytes.saturating_add(conversion_bytes);
+    if width > max_dim || height > max_dim || estimated_peak > max_alloc_bytes {
+        return Err(RasterError::LimitExceeded {
+            width,
+            height,
+            estimated_bytes: estimated_peak,
+            limit_bytes: max_alloc_bytes,
+        });
+    }
+    Ok((conversion_bytes, estimated_peak))
+}
+
 fn decode_limited_for_target(
     bytes: &[u8],
     max_dim: u32,
@@ -81,35 +116,14 @@ fn decode_limited_for_target(
         .into_decoder()
         .map_err(|err| map_image_err(err, 0, 0, 0, max_alloc_bytes))?;
     let (width, height) = decoder.dimensions();
-    if width == 0 || height == 0 {
-        return Err(RasterError::InvalidDimensions { width, height });
-    }
-
-    let src_color = decoder.color_type();
-    let src_bpp = u64::from(src_color.bytes_per_pixel());
-    let dst_bpp = u64::from(target.bytes_per_pixel());
-    let px_count = u64::from(width)
-        .checked_mul(u64::from(height))
-        .ok_or(RasterError::InvalidDimensions { width, height })?;
-    let src_bytes = px_count
-        .checked_mul(src_bpp)
-        .ok_or(RasterError::InvalidDimensions { width, height })?;
-    let dst_bytes = px_count
-        .checked_mul(dst_bpp)
-        .ok_or(RasterError::InvalidDimensions { width, height })?;
-
-    // When `src_color == target`, `.into_rgba8()` / `.into_rgb8()` moves the
-    // decoded buffer in place; otherwise reserve both buffers simultaneously.
-    let conversion_bytes = if src_color == target { 0 } else { dst_bytes };
-    let estimated_peak = src_bytes.saturating_add(conversion_bytes);
-    if width > max_dim || height > max_dim || estimated_peak > max_alloc_bytes {
-        return Err(RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes: estimated_peak,
-            limit_bytes: max_alloc_bytes,
-        });
-    }
+    let (conversion_bytes, estimated_peak) = checked_peak_bytes(
+        width,
+        height,
+        decoder.color_type(),
+        target,
+        max_dim,
+        max_alloc_bytes,
+    )?;
 
     let final_decoder = if conversion_bytes == 0 {
         decoder

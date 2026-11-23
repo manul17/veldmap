@@ -12,8 +12,9 @@ pub(crate) mod hud;
 pub mod render;
 pub(crate) mod settings;
 pub(crate) mod storage;
+mod viewport_bridge;
 
-pub use bundled_basemap::BUNDLED_BASEMAP_JPEG;
+pub use bundled_basemap::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG, BUNDLED_MAX_LEVEL};
 
 #[cfg(test)]
 pub(crate) mod test_support {
