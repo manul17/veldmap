@@ -93,7 +93,7 @@ const SCALE_BAR_MAX_WIDTH_PT: f32 = 160.0;
 /// Horizontal screen width in logical points reserved on the bottom-left for
 /// the metric scale bar plus spacing, so right-aligned viewport overlays (e.g.
 /// the basemap attribution pill) never collide with it.
-pub fn scale_bar_reserved_width(viewport_width_pt: f32) -> f32 {
+pub(crate) fn scale_bar_reserved_width(viewport_width_pt: f32) -> f32 {
     let max_bar_w =
         (viewport_width_pt * 0.35).clamp(SCALE_BAR_MIN_WIDTH_PT, SCALE_BAR_MAX_WIDTH_PT);
     SCALE_BAR_MARGIN_PT + max_bar_w + SCALE_BAR_PAD_X_PT * 2.0 + SCALE_BAR_GAP_PT
@@ -102,7 +102,11 @@ pub fn scale_bar_reserved_width(viewport_width_pt: f32) -> f32 {
 /// Remaining horizontal width in logical points available to right-aligned
 /// bottom-edge viewport overlays (e.g. attribution pill) without colliding
 /// with the bottom-left scale bar.
-pub fn available_right_overlay_width(viewport_width_pt: f32, pad_x: f32, margin: f32) -> f32 {
+pub(crate) fn available_right_overlay_width(
+    viewport_width_pt: f32,
+    pad_x: f32,
+    margin: f32,
+) -> f32 {
     viewport_width_pt - scale_bar_reserved_width(viewport_width_pt) - (pad_x * 2.0 + margin)
 }
 

@@ -8,6 +8,7 @@
 use eframe::egui;
 use veldmap_net::validate_custom_url_template;
 
+use super::{ERROR_TEXT_COLOR, TILE_ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 use crate::basemap::BasemapStatusSnapshot;
 use crate::settings::{
     AppSettings, BasemapSelection, CUSTOM_MAX_LEVEL_RANGE, CustomXyzSettings,
@@ -126,6 +127,16 @@ impl BasemapUiState {
         self.cached_custom_validation = None;
     }
 
+    fn open_settings(&mut self, settings: &AppSettings, actions: &mut Vec<BasemapUiAction>) {
+        let was_open = self.settings_open;
+        if !was_open {
+            self.sync_from_settings(settings);
+            self.settings_open = true;
+            actions.push(BasemapUiAction::SettingsOpened);
+        }
+        actions.push(BasemapUiAction::ClearDiskCacheNotice);
+    }
+
     /// Return cached validation result for `draft.custom_xyz.url_template`,
     /// recomputing only when the URL template changes.
     fn custom_validation(&mut self) -> Result<(), &str> {
@@ -169,7 +180,7 @@ fn show_live_status_badge(
     if let Some(init_err) = status.live_pipeline_error.as_deref() {
         ui.label(
             egui::RichText::new("Live unavailable")
-                .color(egui::Color32::from_rgb(240, 185, 85))
+                .color(WARN_TEXT_COLOR)
                 .small(),
         )
         .on_hover_text(init_err);
@@ -179,12 +190,8 @@ fn show_live_status_badge(
             BasemapSelection::CustomXyz => "Invalid URL",
             _ => "Config error",
         };
-        ui.label(
-            egui::RichText::new(badge)
-                .color(egui::Color32::from_rgb(235, 110, 95))
-                .small(),
-        )
-        .on_hover_text(cfg_err);
+        ui.label(egui::RichText::new(badge).color(ERROR_TEXT_COLOR).small())
+            .on_hover_text(cfg_err);
     } else if net.offline {
         let hover = net
             .last_error
@@ -192,7 +199,7 @@ fn show_live_status_badge(
             .unwrap_or("Network unreachable; showing offline Blue Marble fallback");
         ui.label(
             egui::RichText::new("Offline (fallback)")
-                .color(egui::Color32::from_rgb(240, 185, 85))
+                .color(WARN_TEXT_COLOR)
                 .small(),
         )
         .on_hover_text(hover);
@@ -204,7 +211,7 @@ fn show_live_status_badge(
     {
         ui.label(
             egui::RichText::new("Tile error")
-                .color(egui::Color32::from_rgb(235, 145, 95))
+                .color(TILE_ERROR_TEXT_COLOR)
                 .small(),
         )
         .on_hover_text(err);
@@ -244,16 +251,8 @@ pub fn show_toolbar_controls(
                     if option == BasemapSelection::CustomXyz
                         && settings.custom_xyz.url_template.trim().is_empty()
                     {
-                        let was_open = ui_state.settings_open;
-                        if !was_open {
-                            ui_state.sync_from_settings(settings);
-                        }
+                        ui_state.open_settings(settings, &mut actions);
                         ui_state.draft.active_basemap = BasemapSelection::CustomXyz;
-                        ui_state.settings_open = true;
-                        if !was_open {
-                            actions.push(BasemapUiAction::SettingsOpened);
-                        }
-                        actions.push(BasemapUiAction::ClearDiskCacheNotice);
                     } else {
                         actions.push(BasemapUiAction::SelectBasemap(option));
                     }
@@ -266,12 +265,10 @@ pub fn show_toolbar_controls(
         .on_hover_text("Configure NASA GIBS date, Custom XYZ/TMS URL & API key, and disk cache")
         .clicked()
     {
-        ui_state.settings_open = !ui_state.settings_open;
-        if ui_state.settings_open {
-            ui_state.sync_from_settings(settings);
-            actions.push(BasemapUiAction::SettingsOpened);
-            actions.push(BasemapUiAction::ClearDiskCacheNotice);
+        if !ui_state.settings_open {
+            ui_state.open_settings(settings, &mut actions);
         } else {
+            ui_state.settings_open = false;
             actions.push(BasemapUiAction::SettingsClosed);
         }
     }
@@ -294,7 +291,7 @@ fn show_gibs_section(ui: &mut egui::Ui, ui_state: &mut BasemapUiState) -> bool {
     if !date_valid {
         ui.label(
             egui::RichText::new("Enter a valid YYYY-MM-DD date (e.g. 2024-07-01).")
-                .color(egui::Color32::from_rgb(240, 185, 85))
+                .color(WARN_TEXT_COLOR)
                 .small(),
         );
     }
@@ -373,11 +370,7 @@ fn show_custom_xyz_section(
         && (ui_state.draft.active_basemap == BasemapSelection::CustomXyz
             || !ui_state.draft.custom_xyz.url_template.trim().is_empty())
     {
-        ui.label(
-            egui::RichText::new(err)
-                .color(egui::Color32::from_rgb(235, 110, 95))
-                .small(),
-        );
+        ui.label(egui::RichText::new(err).color(ERROR_TEXT_COLOR).small());
     }
     custom_valid
 }

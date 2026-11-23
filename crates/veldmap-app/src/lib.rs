@@ -1,22 +1,20 @@
-//! Library surface of `veldmap-app` exposing `VeldmapApp` for the binary entry
-//! point plus the headless-testable rendering boundary (`render`, `gpu_tiles`,
-//! and [`BUNDLED_BASEMAP_JPEG`]) for GPU smoke tests and `naga` shader
-//! validation.
+//! Library surface of `veldmap-app` exposing [`VeldmapApp`] and [`AppError`]
+//! for the binary entry point plus the headless-testable rendering boundary
+//! (`render`, `gpu_tiles`, `basemap_policy`, [`BUNDLED_BASEMAP_CONFIG`], and
+//! [`BUNDLED_BASEMAP_JPEG`]) for GPU smoke tests and `naga` shader validation.
 
-pub mod app;
+mod app;
 pub(crate) mod basemap;
-mod basemap_adapters;
-pub mod basemap_policy;
-pub(crate) mod basemap_ui;
-pub(crate) mod bundled_basemap;
 pub mod gpu_tiles;
-pub(crate) mod hud;
 pub mod render;
 pub(crate) mod settings;
 pub(crate) mod storage;
+mod ui;
 mod viewport_bridge;
 
-pub use bundled_basemap::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG, BUNDLED_MAX_LEVEL};
+pub use app::{AppError, VeldmapApp};
+pub use basemap::bundled::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG, BUNDLED_MAX_LEVEL};
+pub use basemap::policy as basemap_policy;
 
 #[cfg(test)]
 pub(crate) mod test_support {

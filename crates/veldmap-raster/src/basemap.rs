@@ -21,7 +21,7 @@ use crate::RasterError;
 use crate::map_tile::decode_rgb8_limited;
 use crate::mipmap::{
     LINEAR_TO_SRGB_LUT_LEN, downsample_rgb8_srgb_wrap_x_2x, generate_linear_mipmaps,
-    linear_to_srgb_lut, linear_to_srgb_u8, srgb_to_linear_lut,
+    linear_to_srgb_lut, mix_2x2_srgb_rgb, srgb_to_linear_lut,
 };
 
 /// Maximum single virtual tile dimension accepted by [`BundledBasemap::render_tile_sized`].
@@ -120,13 +120,14 @@ impl RgbLevel {
         let w11 = tx * ty;
 
         let mut out = [255u8; 4];
-        for ch in 0..3 {
-            let lin = to_lin[usize::from(self.rgb[o00 + ch])] * w00
-                + to_lin[usize::from(self.rgb[o10 + ch])] * w10
-                + to_lin[usize::from(self.rgb[o01 + ch])] * w01
-                + to_lin[usize::from(self.rgb[o11 + ch])] * w11;
-            out[ch] = linear_to_srgb_u8(lin, to_srgb);
-        }
+        mix_2x2_srgb_rgb(
+            &self.rgb,
+            [o00, o10, o01, o11],
+            [w00, w10, w01, w11],
+            to_lin,
+            to_srgb,
+            &mut out,
+        );
         out
     }
 }

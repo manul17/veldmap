@@ -83,8 +83,7 @@ pub enum UploadInsertOutcome {
     Rejected,
 }
 
-/// VRAM-budgeted LRU cache of immutable `Arc<GpuTile>` instances owned on
-/// `VeldmapApp`.
+/// VRAM-budgeted LRU cache of immutable `Arc<GpuTile>` textures.
 pub struct GpuTileCache {
     cache: TileCache<TileKey, Arc<GpuTile>>,
     next_tile_id: u64,
@@ -349,7 +348,7 @@ fn is_pinned_root(key: &TileKey, pinned_root_sources: &[SourceId]) -> bool {
 }
 
 /// Multi-producer completion-channel owner and byte-capped, coarsest-first
-/// budgeted GPU tile upload queue owned on `VeldmapApp`.
+/// budgeted GPU tile upload queue.
 pub struct PendingUploads {
     tx: Option<Sender<(TileKey, DecodedTile)>>,
     rx: Option<Receiver<(TileKey, DecodedTile)>>,

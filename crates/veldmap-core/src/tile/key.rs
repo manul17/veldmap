@@ -39,8 +39,8 @@ impl SourceId {
     }
 
     /// Derive a deterministic [`SourceId`] from a content [`crate::io::SourceFingerprint`].
-    pub fn from_fingerprint(fingerprint: &crate::io::SourceFingerprint) -> Self {
-        Self::from_stable_key(&fingerprint.to_hex())
+    pub const fn from_fingerprint(fingerprint: &crate::io::SourceFingerprint) -> Self {
+        Self(fnv1a_64(fingerprint.as_bytes()) | (1u64 << 63))
     }
 }
 

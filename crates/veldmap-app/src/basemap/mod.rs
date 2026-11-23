@@ -12,10 +12,15 @@
 //! - Deterministic shutdown (`CancelToken` -> close `PendingUploads` rx -> join
 //!   bundled/decode threads -> shut down `tokio::Runtime`)
 
+mod adapters;
+pub(crate) mod bundled;
+pub mod policy;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
+use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{CancelToken, Wakeup};
 use veldmap_core::tile::{
     DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey,
@@ -28,11 +33,11 @@ use veldmap_net::{
 use veldmap_raster::{DecodePool, DecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
-use crate::basemap_adapters::{RasterDecodeExecutor, SqliteBlobStore};
-use crate::basemap_policy::BasemapCarrierPolicy;
-use crate::bundled_basemap::{
+use self::adapters::{RasterDecodeExecutor, SqliteBlobStore};
+use self::bundled::{
     BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, BundledBasemapProvider,
 };
+use self::policy::BasemapCarrierPolicy;
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport};
 use crate::settings::{AppSettings, BasemapSelection, CustomXyzSettings};
 
@@ -110,6 +115,7 @@ impl BasemapManager {
         disk_cache: Option<Arc<TileDiskCache>>,
         done_tx: Sender<(TileKey, DecodedTile)>,
         wakeup: Wakeup,
+        budget: &MemoryBudget,
     ) -> Self {
         let bundled_provider = BundledBasemapProvider::spawn(done_tx.clone(), Arc::clone(&wakeup));
 
@@ -121,6 +127,7 @@ impl BasemapManager {
         let decode_pool = DecodePool::spawn(
             DecodePoolConfig {
                 worker_count: decode_threads,
+                max_pending_bytes: budget.fast_lane_pending_bytes,
                 ..DecodePoolConfig::default()
             },
             decode_shutdown.clone(),

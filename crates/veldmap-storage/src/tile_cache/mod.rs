@@ -95,26 +95,13 @@ fn upsert_tile_and_update_meta(
         stmt.query_row(enc.key_params(), |r| r.get(1)).optional()?
     };
 
+    let encoding_raw = i64::from(encoding as u8);
+    let byte_size = new_bytes as i64;
     let inserted_id: i64 = {
         let mut stmt = tx.prepare(UPSERT_META_SQL)?;
-        stmt.query_row(
-            params![
-                enc.source_key,
-                enc.band_kind,
-                enc.band_id,
-                enc.scheme,
-                enc.format,
-                enc.gutter,
-                enc.decode_rev,
-                enc.level,
-                enc.x,
-                enc.y,
-                i64::from(encoding as u8),
-                new_bytes as i64,
-                ts_ms,
-            ],
-            |r| r.get(0),
-        )?
+        stmt.query_row(enc.upsert_params(&encoding_raw, &byte_size, &ts_ms), |r| {
+            r.get(0)
+        })?
     };
 
     tx.prepare(UPSERT_BLOB_SQL)?
@@ -166,6 +153,28 @@ impl ReaderPool {
             }
         }
         Ok(result?)
+    }
+}
+
+fn skipped_put_report(
+    key: &DiskTileKey,
+    new_bytes: u64,
+    max_bytes: u64,
+    total_bytes_after: u64,
+) -> EvictionReport {
+    tracing::debug!(
+        source_key = %key.source_key,
+        level = key.level,
+        x = key.x,
+        y = key.y,
+        payload_bytes = new_bytes,
+        max_bytes,
+        "Skipping disk cache put outside size bounds"
+    );
+    EvictionReport {
+        evicted_tiles: 0,
+        evicted_bytes: 0,
+        total_bytes_after,
     }
 }
 
@@ -252,8 +261,11 @@ impl TileDiskCache {
             Err(err) => return Err(StorageError::Sqlite(err)),
         };
 
+        let (total_bytes, _) = read_cache_meta_totals(&conn)?;
         let cache = Self::from_connection(conn, Some(path), max_bytes, max_ts);
-        let _ = cache.evict_if_needed()?;
+        if total_bytes > max_bytes {
+            let _ = cache.evict_if_needed()?;
+        }
         Ok(cache)
     }
 
@@ -396,29 +408,34 @@ impl TileDiskCache {
         payload: &[u8],
     ) -> Result<EvictionReport, StorageError> {
         let enc = EncodedKey::from_key(key)?;
-        let mut conn = lock_unpoisoned(&self.writer);
-        let max_bytes = self.max_bytes.load(Ordering::Acquire);
+        let pre_max_bytes = self.max_bytes.load(Ordering::Acquire);
         let new_bytes = payload.len() as u64;
         if payload.is_empty()
             || payload.len() > MAX_CACHED_TILE_BYTES
-            || max_bytes == 0
-            || new_bytes > max_bytes
+            || pre_max_bytes == 0
+            || new_bytes > pre_max_bytes
         {
-            tracing::debug!(
-                source_key = %key.source_key,
-                level = key.level,
-                x = key.x,
-                y = key.y,
-                payload_bytes = new_bytes,
-                max_bytes,
-                "Skipping disk cache put outside size bounds"
-            );
-            let (total_bytes_after, _) = read_cache_meta_totals(&conn)?;
-            return Ok(EvictionReport {
-                evicted_tiles: 0,
-                evicted_bytes: 0,
+            let (total_bytes_after, _) = self.with_reader(read_cache_meta_totals)?;
+            return Ok(skipped_put_report(
+                key,
+                new_bytes,
+                pre_max_bytes,
                 total_bytes_after,
-            });
+            ));
+        }
+
+        let mut conn = lock_unpoisoned(&self.writer);
+        // Re-check under `self.writer` so a concurrent `set_max_bytes()` cannot
+        // lower the cap between the lock-free pre-check and transaction commit.
+        let max_bytes = self.max_bytes.load(Ordering::Acquire);
+        if max_bytes == 0 || new_bytes > max_bytes {
+            let (total_bytes_after, _) = read_cache_meta_totals(&conn)?;
+            return Ok(skipped_put_report(
+                key,
+                new_bytes,
+                max_bytes,
+                total_bytes_after,
+            ));
         }
 
         let ts_ms = self.next_monotonic_ts();

@@ -1,11 +1,13 @@
+use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{TileScheme, traverse};
 use veldmap_net::{DecodeCompletion, DecodeFailure, DecodeRequest};
 use veldmap_raster::{DecodePool, DecodePoolConfig};
 use veldmap_storage::StoragePaths;
 
+use super::adapters::RasterDecodeExecutor;
+use super::policy::{bundled_tile_key, source_tile_key};
 use super::*;
-use crate::basemap_policy::{bundled_tile_key, source_tile_key};
 use crate::storage::AppStorage;
 use crate::test_support::TempTestRoot;
 
@@ -24,7 +26,13 @@ fn ellipsoid_only_does_not_seed_bundled_roots_and_invalid_configs_fall_back() {
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
     let mut gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
-    let mut manager = BasemapManager::new(storage.settings(), storage.disk_cache(), tx, wakeup);
+    let mut manager = BasemapManager::new(
+        storage.settings(),
+        storage.disk_cache(),
+        tx,
+        wakeup,
+        &MemoryBudget::default(),
+    );
 
     assert!(!manager.is_textured());
     assert_eq!(manager.attribution(), None);
@@ -67,8 +75,13 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_flush
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
     let mut gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
-    let mut manager =
-        BasemapManager::new(storage.settings(), storage.disk_cache(), tx.clone(), wakeup);
+    let mut manager = BasemapManager::new(
+        storage.settings(),
+        storage.disk_cache(),
+        tx.clone(),
+        wakeup,
+        &MemoryBudget::default(),
+    );
 
     storage.mutate_settings(|s| s.active_basemap = BasemapSelection::NasaGibsBlueMarble);
     manager.sync_settings(storage.settings(), &mut gpu_cache, &mut pending);

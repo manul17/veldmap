@@ -10,10 +10,11 @@ mod globe;
 pub(crate) mod mesh;
 mod pipelines;
 mod snapshot;
+mod uniforms;
 mod viewport;
 
 pub use globe::GlobeRenderer;
-pub use snapshot::{DrawSnapshot, DrawTile, SnapshotBuildParams};
+pub use snapshot::{DrawSnapshot, DrawTile, SnapshotBuildParams, TileCarrierPolicy};
 pub use viewport::RenderParams;
 
 /// Native desktop primary `wgpu` backends (Vulkan, DX12, Metal), explicitly

@@ -2,7 +2,7 @@
 //! [`super::GlobeRenderer`].
 
 use super::mesh::TileVertex;
-use super::viewport::{CameraUniform, TileUniform};
+use super::uniforms::{CameraUniform, TileUniform};
 use super::{COMPOSITE_WGSL, GLOBE_WGSL};
 
 struct GlobePipelineSpec<'a> {

@@ -1,7 +1,7 @@
 use eframe::egui;
 use eframe::egui_wgpu;
 use tracing_subscriber::EnvFilter;
-use veldmap_app::app::VeldmapApp;
+use veldmap_app::VeldmapApp;
 use veldmap_app::render::clamp_to_primary_backends;
 
 fn init_tracing() {

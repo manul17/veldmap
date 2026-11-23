@@ -1,5 +1,5 @@
-//! Immutable per-frame draw snapshots and shared basemap carrier-resolution
-//! policy (`PolarCap` -> bundled offline cap; live -> bundled offline fallback).
+//! Immutable per-frame draw snapshots decoupled from concrete layer/basemap
+//! policy implementations via [`TileCarrierPolicy`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -7,13 +7,23 @@ use std::sync::Arc;
 use veldmap_core::geo::camera::Camera;
 use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, traverse};
 
-use crate::basemap_policy::BasemapCarrierPolicy;
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
 
 use super::adaptive_grid_step_deg;
 
+/// Strategy resolving the finest cached GPU carrier tile and composed UV
+/// sub-rectangle for a visible quadtree texture tile.
+pub trait TileCarrierPolicy {
+    fn resolve_carrier(
+        &self,
+        tex_id: QuadTileId,
+        uv_rect: [f32; 4],
+        gpu_cache: &mut GpuTileCache,
+    ) -> Option<(TileKey, [f32; 4], Arc<GpuTile>)>;
+}
+
 /// Grouped inputs for [`DrawSnapshot::build`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct SnapshotBuildParams<'a> {
     pub camera: Camera,
     pub width_px: u32,
@@ -21,7 +31,7 @@ pub struct SnapshotBuildParams<'a> {
     pub pixels_per_point: f32,
     pub show_graticule: bool,
     pub textured: bool,
-    pub carrier_policy: BasemapCarrierPolicy,
+    pub carrier_policy: &'a dyn TileCarrierPolicy,
     pub generation: u64,
     pub config: &'a QuadtreeConfig,
 }

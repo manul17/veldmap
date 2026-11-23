@@ -287,7 +287,7 @@ impl AppStorage {
 
     /// Persist the current [`AppSettings`] durably via
     /// `write_json_durable_private()`.
-    pub fn save_settings(&self) {
+    fn save_settings(&self) {
         if let Some(paths) = &self.paths
             && let Err(err) = self.settings.save(paths)
         {

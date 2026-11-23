@@ -33,7 +33,7 @@ pub const BUNDLED_BASEMAP_CONFIG: BundledBasemapConfig = BundledBasemapConfig {
 /// Embedded public-domain NASA Blue Marble Next Generation equirectangular
 /// global basemap (`3600 x 1800` JPEG, see `assets/README.md`).
 pub const BUNDLED_BASEMAP_JPEG: &[u8] =
-    include_bytes!("../../../assets/basemap/blue_marble_ng.jpg");
+    include_bytes!("../../../../assets/basemap/blue_marble_ng.jpg");
 
 #[derive(Default)]
 struct WorkerQueue {

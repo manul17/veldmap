@@ -35,7 +35,7 @@ pub const DISK_CACHE_MAX_MB_RANGE: RangeInclusive<u64> =
     MIN_DISK_CACHE_MAX_MB..=MAX_DISK_CACHE_MAX_MB;
 
 /// Validate an explicit `YYYY-MM-DD` UTC date string for NASA GIBS daily layers.
-pub fn validate_gibs_date(date: &str) -> bool {
+pub(crate) fn validate_gibs_date(date: &str) -> bool {
     is_valid_gibs_date(date.trim())
 }
 

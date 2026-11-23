@@ -159,13 +159,37 @@ fn parse_hemisphere_char(ch: char) -> Option<Hemisphere> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AngleUnit {
+    Deg,
+    Min,
+    Sec,
+    Colon,
+}
+
+fn angle_unit_for_marker(ch: char) -> Option<AngleUnit> {
+    match ch {
+        '°' | 'º' | 'd' | 'D' => Some(AngleUnit::Deg),
+        '\'' | '′' | 'm' | 'M' => Some(AngleUnit::Min),
+        '"' | '″' | 's' | 'S' => Some(AngleUnit::Sec),
+        ':' => Some(AngleUnit::Colon),
+        _ => None,
+    }
+}
+
 fn contains_dms_marker(s: &str) -> bool {
     s.chars().any(|c| {
         matches!(
-            c,
-            '°' | 'º' | '\'' | '′' | '"' | '″' | ':' | 'd' | 'D' | 'm' | 'M'
-        )
+            angle_unit_for_marker(c),
+            Some(AngleUnit::Deg | AngleUnit::Min | AngleUnit::Colon)
+        ) || matches!(c, '"' | '″')
     })
+}
+
+fn has_digit_before_dms_seconds(ch: char, before: &str) -> bool {
+    matches!(ch, 's' | 'S')
+        && before.ends_with(|c: char| c.is_ascii_digit())
+        && contains_dms_marker(before)
 }
 
 fn is_prefix_hemisphere_start(s: &str) -> bool {
@@ -217,9 +241,7 @@ fn split_by_hemisphere(input: &str) -> Option<(&str, &str)> {
         }
         // Do not split on a seconds suffix (`8.5s`) before a real hemisphere or
         // inside a DMS clause.
-        if matches!(ch, 's' | 'S')
-            && before.ends_with(|c: char| c.is_ascii_digit())
-            && contains_dms_marker(before)
+        if has_digit_before_dms_seconds(ch, before)
             && (ch == 's'
                 || right
                     .chars()
@@ -235,18 +257,8 @@ fn split_by_hemisphere(input: &str) -> Option<(&str, &str)> {
 }
 
 fn is_seconds_suffix(last: char, before: &str) -> bool {
-    matches!(last, 's' | 'S')
-        && before.ends_with(|c: char| c.is_ascii_digit())
-        && contains_dms_marker(before)
+    has_digit_before_dms_seconds(last, before)
         && (last == 's' || before.chars().any(|c| matches!(c, 'd' | 'D' | 'm' | 'M')))
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AngleUnit {
-    Deg,
-    Min,
-    Sec,
-    Colon,
 }
 
 fn strip_hemisphere<'a>(
@@ -321,28 +333,13 @@ fn scan_dms_slots(rest: &str, original: &str) -> Result<ScannedAngleSlots, Parse
             return Err(ParseLocationError::Unrecognized(original.to_owned()));
         }
 
-        let unit = match chars.peek().map(|&(_, c)| c) {
-            Some('°' | 'º' | 'd' | 'D') => {
+        let unit = match chars.peek().map(|&(_, c)| (c, angle_unit_for_marker(c))) {
+            Some((_, Some(u))) => {
                 chars.next();
                 has_dms_markers = true;
-                Some(AngleUnit::Deg)
+                Some(u)
             }
-            Some('\'' | '′' | 'm' | 'M') => {
-                chars.next();
-                has_dms_markers = true;
-                Some(AngleUnit::Min)
-            }
-            Some('"' | '″' | 's' | 'S') => {
-                chars.next();
-                has_dms_markers = true;
-                Some(AngleUnit::Sec)
-            }
-            Some(':') => {
-                chars.next();
-                has_dms_markers = true;
-                Some(AngleUnit::Colon)
-            }
-            Some(c) if c.is_whitespace() => None,
+            Some((c, None)) if c.is_whitespace() => None,
             None => None,
             Some(_) => return Err(ParseLocationError::Unrecognized(original.to_owned())),
         };

@@ -6,20 +6,21 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui_wgpu;
 use thiserror::Error;
+use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
-use veldmap_core::geo::coords::parse_location;
 use veldmap_core::io::Wakeup;
 use veldmap_core::tile::SourceId;
 
 use crate::basemap::BasemapManager;
-use crate::basemap_ui::{self, BasemapUiAction, BasemapUiState};
 use crate::gpu_tiles::{
-    DEFAULT_GPU_TILE_CACHE_BYTES, DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET,
-    GpuTileCache, PendingUploads, UploadBatchReport, UploadPassParams,
+    DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
+    UploadBatchReport, UploadPassParams,
 };
-use crate::hud;
 use crate::render::{DrawSnapshot, GlobeRenderer, SnapshotBuildParams};
 use crate::storage::AppStorage;
+use crate::ui::basemap::{self as basemap_ui, BasemapUiAction, BasemapUiState};
+use crate::ui::hud;
+use crate::ui::toolbar::{self, GoToBarState};
 use crate::viewport_bridge::{GlobePaintCallback, SnapshotKey, viewport_pixels};
 
 /// Logical scroll points mapped to one discrete globe zoom notch.
@@ -63,8 +64,7 @@ pub struct VeldmapApp {
     last_compass_rect: Option<egui::Rect>,
     last_viewport_height_px: f64,
     last_viewport_aspect: f64,
-    goto_input: String,
-    goto_error: Option<String>,
+    goto_bar: GoToBarState,
 }
 
 impl Drop for VeldmapApp {
@@ -118,13 +118,19 @@ impl VeldmapApp {
             egui_ctx.request_repaint();
         });
 
-        let pending_uploads = PendingUploads::new();
+        let budget = MemoryBudget::detect();
+        let pending_uploads = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
         let done_tx = pending_uploads
             .sender()
             .ok_or(AppError::UploadChannelClosed)?;
         let storage = AppStorage::open(Arc::clone(&wakeup), None);
-        let basemap =
-            BasemapManager::new(storage.settings(), storage.disk_cache(), done_tx, wakeup);
+        let basemap = BasemapManager::new(
+            storage.settings(),
+            storage.disk_cache(),
+            done_tx,
+            wakeup,
+            &budget,
+        );
         let basemap_ui = BasemapUiState::new(storage.settings());
 
         Ok(Self {
@@ -132,7 +138,7 @@ impl VeldmapApp {
             device,
             queue,
             camera: Camera::default(),
-            gpu_tile_cache: GpuTileCache::new(DEFAULT_GPU_TILE_CACHE_BYTES),
+            gpu_tile_cache: GpuTileCache::new(budget.gpu_tile_cache_bytes),
             pending_uploads,
             storage,
             basemap,
@@ -144,8 +150,7 @@ impl VeldmapApp {
             last_compass_rect: None,
             last_viewport_height_px: 800.0,
             last_viewport_aspect: 1.6,
-            goto_input: String::new(),
-            goto_error: None,
+            goto_bar: GoToBarState::default(),
         })
     }
 
@@ -203,25 +208,6 @@ impl VeldmapApp {
         (scene_changed, needs_repaint)
     }
 
-    fn trigger_goto(&mut self) {
-        match parse_location(&self.goto_input) {
-            Ok(loc) => {
-                tracing::info!(
-                    lat = loc.lat_deg,
-                    lon = loc.lon_deg,
-                    radius_deg = loc.radius_deg,
-                    kind = ?loc.kind,
-                    "Flying camera to parsed location"
-                );
-                self.camera.focus(loc.lat_deg, loc.lon_deg, loc.radius_deg);
-                self.goto_error = None;
-            }
-            Err(err) => {
-                self.goto_error = Some(err.to_string());
-            }
-        }
-    }
-
     fn probe_pointer(&self, rect: egui::Rect, pos: egui::Pos2) -> Option<(f64, f64)> {
         let width_pt = f64::from(rect.width()).max(1.0);
         let height_pt = f64::from(rect.height()).max(1.0);
@@ -270,14 +256,14 @@ impl VeldmapApp {
         pixels_per_point: f32,
     ) -> (Arc<DrawSnapshot>, bool) {
         let active_source = self.basemap.active_source();
-        let selection = self.storage.settings().active_basemap;
+        let textured = self.basemap.is_textured();
         let show_graticule = self.storage.settings().show_graticule;
+        let layer_key = active_source.0 ^ (u64::from(textured) << 62);
         let key = SnapshotKey::new(
             &self.camera,
             [width_px, height_px],
             pixels_per_point,
-            selection,
-            active_source,
+            layer_key,
             show_graticule,
             self.scene_generation,
         );
@@ -287,8 +273,8 @@ impl VeldmapApp {
             return (Arc::clone(snapshot), false);
         }
 
-        let textured = self.basemap.is_textured();
         let quadtree_config = self.basemap.quadtree_config();
+        let policy = self.basemap.carrier_policy();
         let snapshot = Arc::new(DrawSnapshot::build(
             SnapshotBuildParams {
                 camera: self.camera,
@@ -297,7 +283,7 @@ impl VeldmapApp {
                 pixels_per_point,
                 show_graticule,
                 textured,
-                carrier_policy: self.basemap.carrier_policy(),
+                carrier_policy: &policy,
                 generation: self.scene_generation,
                 config: &quadtree_config,
             },
@@ -315,66 +301,6 @@ impl VeldmapApp {
         (snapshot, true)
     }
 
-    fn show_top_toolbar(&mut self, ui: &mut egui::Ui) -> (Vec<BasemapUiAction>, Option<bool>) {
-        let mut toolbar_actions = Vec::new();
-        let mut graticule_toggled = None;
-        egui::Panel::top("top_toolbar").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(veldmap_core::APP_NAME);
-                ui.separator();
-
-                ui.label("Go to:");
-                let text_edit = egui::TextEdit::singleline(&mut self.goto_input)
-                    .desired_width(170.0)
-                    .hint_text("DD, DMS, or MGRS (e.g. 47.23, 39.70 / 37UDQ)");
-                let edit_resp = ui.add(text_edit);
-                if edit_resp.changed() {
-                    self.goto_error = None;
-                }
-                let enter_pressed =
-                    edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("Fly").clicked() || enter_pressed {
-                    self.trigger_goto();
-                }
-
-                ui.separator();
-                let basemap_status = self.basemap.status_snapshot();
-                toolbar_actions = basemap_ui::show_toolbar_controls(
-                    ui,
-                    self.storage.settings(),
-                    &basemap_status,
-                    &mut self.basemap_ui,
-                );
-
-                ui.separator();
-                let mut show_graticule = self.storage.settings().show_graticule;
-                if ui.checkbox(&mut show_graticule, "Graticule").changed() {
-                    graticule_toggled = Some(show_graticule);
-                }
-
-                if let Some(err) = &self.goto_error {
-                    ui.separator();
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(err)
-                                .color(egui::Color32::from_rgb(235, 110, 95))
-                                .small(),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(err);
-                }
-
-                ui.separator();
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&self.adapter_label).weak()).truncate(),
-                )
-                .on_hover_text(&self.adapter_label);
-            });
-        });
-        (toolbar_actions, graticule_toggled)
-    }
-
     fn update_cursor_probe(&mut self, ctx: &egui::Context) {
         // Probe the current pointer against the previous frame's viewport rect
         // before laying out the bottom status bar so hover readouts stay in
@@ -390,32 +316,6 @@ impl VeldmapApp {
         } else {
             self.cursor_geo = None;
         }
-    }
-
-    fn show_status_bar(&self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("gis_status_bar").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let cursor_text = match self.cursor_geo {
-                    Some((lat, lon)) => format!("Cursor: {}", hud::format_lat_lon(lat, lon)),
-                    None => "Cursor: Off globe".to_owned(),
-                };
-                ui.monospace(cursor_text);
-                ui.separator();
-
-                let (clat, clon) = self.camera.center();
-                ui.monospace(format!("Center: {}", hud::format_lat_lon(clat, clon)));
-                ui.separator();
-
-                ui.monospace(format!(
-                    "Alt: {}",
-                    hud::format_distance_m(self.camera.height_m())
-                ));
-                ui.separator();
-
-                let mpp = self.camera.metres_per_pixel(self.last_viewport_height_px);
-                ui.monospace(format!("GSD: {}", hud::format_resolution(mpp)));
-            });
-        });
     }
 
     fn handle_viewport_input(
@@ -539,7 +439,16 @@ impl eframe::App for VeldmapApp {
 
         // Top toolbar and Settings window.
         let mut basemap_changed = false;
-        let (toolbar_actions, graticule_toggled) = self.show_top_toolbar(ui);
+        let basemap_status = self.basemap.status_snapshot();
+        let (toolbar_actions, graticule_toggled) = toolbar::show_top_toolbar(
+            ui,
+            &mut self.camera,
+            &mut self.goto_bar,
+            self.storage.settings(),
+            &basemap_status,
+            &mut self.basemap_ui,
+            &self.adapter_label,
+        );
         let (tb_changed, tb_repaint) = self.apply_basemap_actions(toolbar_actions);
         basemap_changed |= tb_changed;
         needs_repaint |= tb_repaint;
@@ -573,7 +482,12 @@ impl eframe::App for VeldmapApp {
         let camera_before = self.camera;
         let rect_before = self.last_viewport_rect;
 
-        self.show_status_bar(ui);
+        toolbar::show_status_bar(
+            ui,
+            self.cursor_geo,
+            &self.camera,
+            self.last_viewport_height_px,
+        );
         let (viewport_rect, viewport_reconciled) = self.show_globe_viewport(&ctx, ui);
         reconciled_this_frame |= viewport_reconciled;
 

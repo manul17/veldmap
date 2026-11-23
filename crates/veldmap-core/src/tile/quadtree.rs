@@ -12,7 +12,9 @@ use crate::geo::geodesy;
 use crate::geo::projection::web_mercator_lat_deg;
 use crate::geo::sag;
 
-use super::geometry::{lat_lon_bounds, sample_tile_surface, web_mercator_y_bounds};
+use super::geometry::{
+    lat_lon_bounds, lerp_f64, sample_tile_surface, tile_lon_bounds, web_mercator_y_bounds,
+};
 use super::key::{GlobeScheme, PlanetaryScheme, QuadTileId};
 
 /// Default mesh grid cells per quadtree tile side (`16 x 16` quads = 289
@@ -205,9 +207,9 @@ fn sample_geodetic_grid(
 ) -> Option<f64> {
     let b = lat_lon_bounds(id)?;
     let lats = [0u32, 1, 2, 3, 4]
-        .map(|row| b.lat_north_deg + (b.lat_south_deg - b.lat_north_deg) * (f64::from(row) * 0.25));
+        .map(|row| lerp_f64(b.lat_north_deg, b.lat_south_deg, f64::from(row) * 0.25));
     let lons = [0u32, 1, 2, 3, 4]
-        .map(|col| b.lon_west_deg + (b.lon_east_deg - b.lon_west_deg) * (f64::from(col) * 0.25));
+        .map(|col| lerp_f64(b.lon_west_deg, b.lon_east_deg, f64::from(col) * 0.25));
     fill_separable_grid(lats, lons, samples, sample_units);
 
     if b.lat_north_deg >= b.raw_lat_north_deg && b.lat_south_deg <= b.raw_lat_south_deg {
@@ -233,10 +235,11 @@ fn sample_web_mercator_grid(
     let (cols, rows) = id.checked_grid_dims()?;
     let cols_f = f64::from(cols);
     let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
+    let (lon_west_deg, lon_east_deg) = tile_lon_bounds(id.x, cols);
     let lats = [0u32, 1, 2, 3, 4]
-        .map(|row| web_mercator_lat_deg(merc_n + (merc_s - merc_n) * (f64::from(row) * 0.25)));
-    let lons = [0u32, 1, 2, 3, 4]
-        .map(|col| -180.0 + 360.0 * (f64::from(id.x) + f64::from(col) * 0.25) / cols_f);
+        .map(|row| web_mercator_lat_deg(lerp_f64(merc_n, merc_s, f64::from(row) * 0.25)));
+    let lons =
+        [0u32, 1, 2, 3, 4].map(|col| lerp_f64(lon_west_deg, lon_east_deg, f64::from(col) * 0.25));
     fill_separable_grid(lats, lons, samples, sample_units);
 
     // Evaluate the most equatorial mesh cell directly so non-linear

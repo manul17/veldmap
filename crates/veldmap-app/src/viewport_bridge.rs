@@ -6,10 +6,8 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor};
 use veldmap_core::geo::camera::Camera;
-use veldmap_core::tile::SourceId;
 
 use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams};
-use crate::settings::BasemapSelection;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotKey {
@@ -18,8 +16,7 @@ pub(crate) struct SnapshotKey {
     width_px: u32,
     height_px: u32,
     ppp_bits: u32,
-    basemap: BasemapSelection,
-    active_source: SourceId,
+    layer_key: u64,
     show_graticule: bool,
     scene_generation: u64,
 }
@@ -29,8 +26,7 @@ impl SnapshotKey {
         camera: &Camera,
         viewport_px: [u32; 2],
         pixels_per_point: f32,
-        basemap: BasemapSelection,
-        active_source: SourceId,
+        layer_key: u64,
         show_graticule: bool,
         scene_generation: u64,
     ) -> Self {
@@ -42,8 +38,7 @@ impl SnapshotKey {
             width_px: viewport_px[0],
             height_px: viewport_px[1],
             ppp_bits: pixels_per_point.to_bits(),
-            basemap,
-            active_source,
+            layer_key,
             show_graticule,
             scene_generation,
         }

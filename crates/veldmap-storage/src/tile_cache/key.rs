@@ -170,4 +170,16 @@ impl<'a> EncodedKey<'a> {
             &self.y,
         ]
     }
+
+    pub(super) fn upsert_params<'p>(
+        &'p self,
+        encoding: &'p i64,
+        new_bytes: &'p i64,
+        ts_ms: &'p i64,
+    ) -> [&'p dyn rusqlite::ToSql; 13] {
+        let [k0, k1, k2, k3, k4, k5, k6, k7, k8, k9] = self.key_params();
+        [
+            k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, encoding, new_bytes, ts_ms,
+        ]
+    }
 }

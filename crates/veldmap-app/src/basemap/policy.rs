@@ -7,6 +7,7 @@ use std::sync::Arc;
 use veldmap_core::tile::{PlanetaryScheme, QuadTileId, SourceId, TileKey, compose_uv_rect};
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
+use crate::render::TileCarrierPolicy;
 
 /// Pure planetary basemap carrier-routing policy shared by `DrawSnapshot::build`
 /// and `BasemapManager::schedule_for_tiles`.
@@ -63,6 +64,17 @@ impl BasemapCarrierPolicy {
         gpu_cache
             .carrier(&fallback)
             .map(|(ck, c_uv, tile)| (ck, compose_uv_rect(c_uv, uv_rect), tile))
+    }
+}
+
+impl TileCarrierPolicy for BasemapCarrierPolicy {
+    fn resolve_carrier(
+        &self,
+        tex_id: QuadTileId,
+        uv_rect: [f32; 4],
+        gpu_cache: &mut GpuTileCache,
+    ) -> Option<(TileKey, [f32; 4], Arc<GpuTile>)> {
+        BasemapCarrierPolicy::resolve_carrier(*self, tex_id, uv_rect, gpu_cache)
     }
 }
 

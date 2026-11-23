@@ -97,6 +97,7 @@ pub(crate) fn build_snapshot(
     config: &QuadtreeConfig,
     cache: Option<&mut GpuTileCache>,
 ) -> Arc<DrawSnapshot> {
+    let policy = BasemapCarrierPolicy::new(active_source);
     Arc::new(DrawSnapshot::build(
         SnapshotBuildParams {
             camera,
@@ -105,7 +106,7 @@ pub(crate) fn build_snapshot(
             pixels_per_point: 1.0,
             show_graticule,
             textured,
-            carrier_policy: BasemapCarrierPolicy::new(active_source),
+            carrier_policy: &policy,
             generation,
             config,
         },

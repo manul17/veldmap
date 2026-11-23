@@ -16,10 +16,8 @@ use super::mesh::{
 };
 use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
-use super::viewport::{
-    CameraUniform, LastRenderKey, OffscreenTarget, RenderParams, TILE_KIND_GEO, TileUniform,
-    ViewportState,
-};
+use super::uniforms::{CameraUniform, TILE_KIND_GEO, TileUniform};
+use super::viewport::{LastRenderKey, OffscreenTarget, RenderParams, ViewportState};
 
 /// Default VRAM budget for cached per-tile geometry vertex buffers (`16 MiB`,
 /// ~1,000 cached `16 x 16` tiles).

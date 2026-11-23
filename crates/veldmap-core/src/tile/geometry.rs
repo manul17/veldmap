@@ -25,6 +25,21 @@ pub struct LatLonTileBounds {
     pub raw_lat_south_deg: f64,
 }
 
+/// Compute geographic `(lon_west_deg, lon_east_deg)` bounds for column `x` of `cols`.
+#[inline]
+pub fn tile_lon_bounds(x: u32, cols: u32) -> (f64, f64) {
+    let cols_f = f64::from(cols);
+    let west = -180.0 + 360.0 * f64::from(x) / cols_f;
+    let east = -180.0 + 360.0 * (f64::from(x) + 1.0) / cols_f;
+    (west, east)
+}
+
+/// Linearly interpolate along a 1D interval `[start, end]` at fraction `t`.
+#[inline]
+pub fn lerp_f64(start: f64, end: f64, t: f64) -> f64 {
+    start + (end - start) * t
+}
+
 /// Compute Web Mercator north/south Y coordinates `(merc_n, merc_s)` in radians
 /// for tile row `y` out of `rows` rows.
 #[inline]
@@ -40,10 +55,8 @@ pub fn web_mercator_y_bounds(y: u32, rows: u32) -> (f64, f64) {
 /// the `|lat| >= WEB_MERCATOR_LIMIT_DEG` polar caps.
 pub fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
     let (cols, rows) = id.checked_grid_dims()?;
-    let cols_f = f64::from(cols);
     let rows_f = f64::from(rows);
-    let lon_west_deg = -180.0 + 360.0 * f64::from(id.x) / cols_f;
-    let lon_east_deg = -180.0 + 360.0 * f64::from(id.x + 1) / cols_f;
+    let (lon_west_deg, lon_east_deg) = tile_lon_bounds(id.x, cols);
 
     match id.scheme {
         PlanetaryScheme::Geodetic => {
@@ -124,18 +137,18 @@ pub fn sample_tile_surface(
     match id.scheme {
         PlanetaryScheme::Geodetic => {
             let b = lat_lon_bounds(id)?;
-            let lon = b.lon_west_deg + (b.lon_east_deg - b.lon_west_deg) * s;
-            let lat = b.lat_north_deg + (b.lat_south_deg - b.lat_north_deg) * t;
+            let lon = lerp_f64(b.lon_west_deg, b.lon_east_deg, s);
+            let lat = lerp_f64(b.lat_north_deg, b.lat_south_deg, t);
             let raw_span = (b.raw_lat_north_deg - b.raw_lat_south_deg).max(1e-12);
             let v_tex = (b.raw_lat_north_deg - lat) / raw_span;
             Some((lat, lon, s, v_tex, 0.0, 0.0))
         }
         PlanetaryScheme::WebMercator => {
             let (cols, rows) = id.checked_grid_dims()?;
-            let cols_f = f64::from(cols);
-            let lon = -180.0 + 360.0 * (f64::from(id.x) + s) / cols_f;
+            let (lon_west_deg, lon_east_deg) = tile_lon_bounds(id.x, cols);
+            let lon = lerp_f64(lon_west_deg, lon_east_deg, s);
             let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
-            let merc = merc_n + (merc_s - merc_n) * t;
+            let merc = lerp_f64(merc_n, merc_s, t);
             let lat = web_mercator_lat_deg(merc);
             Some((lat, lon, s, t, 0.0, 0.0))
         }

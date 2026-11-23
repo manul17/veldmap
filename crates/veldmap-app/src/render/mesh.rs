@@ -12,7 +12,7 @@ use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::geodesy;
 use veldmap_core::tile::{PlanetaryScheme, QuadTileId, VisibleTile, sample_tile_surface};
 
-use super::viewport::{
+use super::uniforms::{
     TILE_KIND_GEO, TILE_KIND_POLAR_CLEAR_SCALE, TILE_KIND_POLAR_NORTH, TILE_KIND_POLAR_SOUTH,
 };
 

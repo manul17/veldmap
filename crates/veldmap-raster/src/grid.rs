@@ -8,7 +8,8 @@ use veldmap_core::budget::{DecodePeak, MemoryBudget};
 use veldmap_core::io::CancelToken;
 
 use crate::RasterError;
-use crate::cascade::{self, Cascade, TileEmit};
+pub use crate::cascade::TileEmit;
+use crate::cascade::{self, Cascade};
 use crate::chunk_cache::DecodedChunk;
 use crate::pyramid::{self, RASTER_TILE_SIZE};
 use crate::resample::{Window, bleed_alpha, resample_rgba8_window};
