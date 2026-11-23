@@ -317,16 +317,17 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
                 sched.on_tile_arrived(&k0);
             }
             ServeMode::Pass { from } => {
+                let pass_key = meta.pass_key();
                 let pass_cancel = CancelToken::new();
                 let pass_id = sched
-                    .begin_pass(meta.source, lvl, Some(from), pass_cancel, vec![k0])
+                    .begin_pass(pass_key, lvl, Some(from), pass_cancel, vec![k0])
                     .expect("begin pass");
                 src.produce_pass(&ctx, &mut |plvl, px, py, _, _, _| {
                     sched.on_tile_arrived(&meta.tile_key(plvl, px, py));
                     Ok(())
                 })
                 .expect("produce_pass");
-                sched.finish_pass(meta.source, pass_id, true);
+                sched.finish_pass(pass_key, pass_id, true);
             }
         }
         assert!(!sched.is_in_flight(&k0));

@@ -3,7 +3,7 @@
 //! `MAX_IFDS` bounds, `GeoDoubleParamsTag`/`GeoAsciiParamsTag` parsing,
 //! ZSTD & `Predictor = 3` (via `tiff`) support, and singleflight chunk caching.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
@@ -33,7 +33,10 @@ pub const CLASSIC_MAGIC: [&[u8]; 2] = [b"II\x2a\x00", b"MM\x00\x2a"];
 /// malformed or pathological multi-IFD files.
 pub const MAX_IFDS: usize = 64;
 
-/// Maximum raster side dimension accepted by the GeoTIFF reader.
+/// Maximum raster side dimension accepted for untiled/stripped TIFF sources.
+///
+/// Tiled TIFFs/COGs may exceed this limit provided their chunk grid and at
+/// least one pyramid level fit within [`MemoryBudget`].
 pub const MAX_SOURCE_SIDE: u32 = 65_536;
 
 /// Current display decode revision encoded into `TileKey` and `ChunkKey`.
@@ -70,6 +73,30 @@ pub struct DecodeContext<'a> {
     pub cancel: &'a CancelToken,
 }
 
+enum MappingState {
+    Uncomputed,
+    InFlight,
+    Ready(DisplayMapping),
+}
+
+struct MappingFlightGuard<'a> {
+    state: &'a Mutex<MappingState>,
+    cv: &'a Condvar,
+    armed: bool,
+}
+
+impl Drop for MappingFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut guard = lock_unpoisoned(self.state);
+            if matches!(*guard, MappingState::InFlight) {
+                *guard = MappingState::Uncomputed;
+            }
+            self.cv.notify_all();
+        }
+    }
+}
+
 /// Thread-safe opened GeoTIFF/BigTIFF/COG source backed by a positioned
 /// [`ByteSource`].
 pub struct TiffSource {
@@ -82,8 +109,8 @@ pub struct TiffSource {
     nodata: Option<f32>,
     sample_bits: u8,
     limits: Limits,
-    mapping_lock: Mutex<()>,
-    mapping: OnceLock<DisplayMapping>,
+    mapping_state: Arc<Mutex<MappingState>>,
+    mapping_cv: Arc<Condvar>,
 }
 
 impl TiffSource {
@@ -110,18 +137,22 @@ impl TiffSource {
         if width == 0 || height == 0 {
             return Err(RasterError::InvalidDimensions { width, height });
         }
-        if width > MAX_SOURCE_SIDE || height > MAX_SOURCE_SIDE {
-            return Err(RasterError::LimitExceeded {
-                width,
-                height,
-                estimated_bytes: u64::from(width) * u64::from(height) * 4,
-                limit_bytes: u64::from(MAX_SOURCE_SIDE) * u64::from(MAX_SOURCE_SIDE) * 4,
-            });
-        }
 
         ensure_chunky(&mut decoder, cancel)?;
         let (pixel_layout, sample_bits, sample_type) = ensure_readable(&mut decoder, cancel)?;
         let tiled = decoder.get_tag_unsigned::<u32>(Tag::TileWidth).is_ok();
+        if !tiled && (width > MAX_SOURCE_SIDE || height > MAX_SOURCE_SIDE) {
+            return Err(RasterError::LimitExceeded {
+                width,
+                height,
+                estimated_bytes: u64::from(width)
+                    .saturating_mul(u64::from(height))
+                    .saturating_mul(4),
+                limit_bytes: u64::from(MAX_SOURCE_SIDE)
+                    .saturating_mul(u64::from(MAX_SOURCE_SIDE))
+                    .saturating_mul(4),
+            });
+        }
         let depth = depth_of_layout(pixel_layout, sample_bits);
         let chunk = chunk_grid(&mut decoder, budget, depth, cancel)?;
 
@@ -241,6 +272,12 @@ impl TiffSource {
             levels,
         };
 
+        let initial_mapping = if sample_bits <= 8 {
+            MappingState::Ready(DisplayMapping::identity(nodata))
+        } else {
+            MappingState::Uncomputed
+        };
+
         Ok(Self {
             byte_source,
             fingerprint,
@@ -251,8 +288,8 @@ impl TiffSource {
             nodata,
             sample_bits,
             limits,
-            mapping_lock: Mutex::new(()),
-            mapping: OnceLock::new(),
+            mapping_state: Arc::new(Mutex::new(initial_mapping)),
+            mapping_cv: Arc::new(Condvar::new()),
         })
     }
 
@@ -301,25 +338,63 @@ impl TiffSource {
         budget_tracker: &DecodeBudgetTracker,
         cancel: &CancelToken,
     ) -> Result<DisplayMapping, RasterError> {
-        if let Some(ready) = self.mapping.get() {
-            return Ok(*ready);
+        loop {
+            let mut state = lock_unpoisoned(&self.mapping_state);
+            match *state {
+                MappingState::Ready(ready) => return Ok(ready),
+                MappingState::Uncomputed => {
+                    if cancel.is_cancelled() {
+                        return Err(RasterError::Cancelled);
+                    }
+                    *state = MappingState::InFlight;
+                    drop(state);
+
+                    let mut guard = MappingFlightGuard {
+                        state: &self.mapping_state,
+                        cv: &self.mapping_cv,
+                        armed: true,
+                    };
+                    let computed = compute_mapping(
+                        &self.byte_source,
+                        self.limits.clone(),
+                        self.stats_ifd,
+                        self.nodata,
+                        self.sample_bits,
+                        self.grid.depth,
+                        budget_tracker,
+                        cancel,
+                    )?;
+                    let mut state = lock_unpoisoned(&self.mapping_state);
+                    *state = MappingState::Ready(computed);
+                    guard.armed = false;
+                    self.mapping_cv.notify_all();
+                    return Ok(computed);
+                }
+                MappingState::InFlight => {
+                    if cancel.is_cancelled() {
+                        return Err(RasterError::Cancelled);
+                    }
+                    let state_arc = Arc::clone(&self.mapping_state);
+                    let cv_arc = Arc::clone(&self.mapping_cv);
+                    let _cancel_guard = cancel.on_cancel_guarded(move || {
+                        let _guard = lock_unpoisoned(&state_arc);
+                        cv_arc.notify_all();
+                    });
+                    while matches!(*state, MappingState::InFlight) {
+                        if cancel.is_cancelled() {
+                            return Err(RasterError::Cancelled);
+                        }
+                        state = self
+                            .mapping_cv
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    if let MappingState::Ready(ready) = *state {
+                        return Ok(ready);
+                    }
+                }
+            }
         }
-        let _guard = lock_unpoisoned(&self.mapping_lock);
-        if let Some(ready) = self.mapping.get() {
-            return Ok(*ready);
-        }
-        let computed = compute_mapping(
-            &self.byte_source,
-            self.limits.clone(),
-            self.stats_ifd,
-            self.nodata,
-            self.sample_bits,
-            self.grid.depth,
-            budget_tracker,
-            cancel,
-        )?;
-        let _ = self.mapping.set(computed);
-        Ok(computed)
     }
 
     /// Produce one pointwise display tile `(level, tx, ty)` into a validated

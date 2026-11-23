@@ -133,7 +133,9 @@ impl Grid {
 
     /// Peak memory of decoding one fresh chunk `(cw, ch)` before expansion.
     pub fn chunk_bytes(&self, chunk: (u32, u32)) -> u64 {
-        u64::from(chunk.0) * u64::from(chunk.1) * (u64::from(self.depth) + 4)
+        u64::from(chunk.0)
+            .saturating_mul(u64::from(chunk.1))
+            .saturating_mul(u64::from(self.depth).saturating_add(4))
     }
 
     /// Estimated working memory peak for pointwise reading at `level`.
@@ -158,7 +160,12 @@ impl Grid {
     pub fn pass_peak(&self, base: (u32, u32)) -> DecodePeak {
         let (width, height) = base;
         DecodePeak::new()
-            .with("band", u64::from(width) * u64::from(self.chunk.1) * 4)
+            .with(
+                "band",
+                u64::from(width)
+                    .saturating_mul(u64::from(self.chunk.1))
+                    .saturating_mul(4),
+            )
             .with("fresh chunk", self.chunk_bytes(self.chunk))
             .with("cascade", cascade::bytes(width, height))
     }

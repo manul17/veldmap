@@ -381,6 +381,13 @@ fn clear_source_removes_only_matching_source_without_orphan_blobs() {
     assert_eq!(stats.payload_bytes, 200);
     assert_eq!(stats.tile_count, 1);
     assert_eq!(count_rows(&cache, "tile_blobs"), 1);
+    assert_eq!(cache.pending_touches.lock().unwrap().len(), 1);
+
+    assert_eq!(cache.clear_source("eox").expect("clear eox"), 1);
+    assert!(
+        cache.pending_touches.lock().unwrap().is_empty(),
+        "clear_source must leave pending_touches empty for deleted tile_ids"
+    );
 }
 
 #[test]

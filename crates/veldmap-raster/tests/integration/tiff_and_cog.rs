@@ -671,3 +671,243 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         veldmap_raster::tiff::MAX_IFDS - 1
     );
 }
+
+#[test]
+fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected() {
+    use veldmap_raster::RasterError;
+
+    let budget = MemoryBudget::detect();
+    let cancel = CancelToken::new();
+
+    // 1. Untiled stripped TIFF exceeding `MAX_SOURCE_SIDE` must still be rejected.
+    let mut untiled_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut untiled_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        dir.write_tag(Tag::ImageWidth, veldmap_raster::tiff::MAX_SOURCE_SIDE + 1)
+            .expect("w");
+        dir.write_tag(Tag::ImageLength, 16u32).expect("h");
+        dir.write_tag(Tag::BitsPerSample, 8u16).expect("bps");
+        dir.write_tag(Tag::Compression, 1u16).expect("comp");
+        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
+            .expect("photo");
+        dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("spp");
+        dir.write_tag(Tag::PlanarConfiguration, 1u16)
+            .expect("planar");
+        dir.write_tag(Tag::RowsPerStrip, 16u32).expect("rows");
+        let at = dir.write_data(&[0u8; 16][..]).expect("write");
+        dir.write_tag(Tag::StripOffsets, &[at as u32][..])
+            .expect("offs");
+        dir.write_tag(Tag::StripByteCounts, &[16u32][..])
+            .expect("cnts");
+        dir.finish().expect("finish");
+    }
+    let untiled_bytes = untiled_buf.into_inner();
+    let untiled_res = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(untiled_bytes.clone())),
+        fake_fingerprint(&untiled_bytes),
+        &budget,
+        &cancel,
+    );
+    assert!(matches!(
+        untiled_res,
+        Err(RasterError::LimitExceeded { .. })
+    ));
+
+    // 2. Tiled BigTIFF/COG exceeding `MAX_SOURCE_SIDE` (70_000 x 1_024) opens
+    //    and decodes pointwise cleanly using a shared 512x512 tile buffer.
+    let wide = veldmap_raster::tiff::MAX_SOURCE_SIDE + 4_464; // 70_000 px
+    let height = 1_024u32;
+    let across = wide.div_ceil(RASTER_TILE_SIZE);
+    let down = height.div_ceil(RASTER_TILE_SIZE);
+    let tile_count = (across * down) as usize;
+
+    let mut tiled_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new_big(&mut tiled_buf).expect("bigtiff enc");
+        let mut dir = enc.image_directory().expect("dir");
+        dir.write_tag(Tag::ImageWidth, wide).expect("w");
+        dir.write_tag(Tag::ImageLength, height).expect("h");
+        dir.write_tag(Tag::BitsPerSample, 8u16).expect("bps");
+        dir.write_tag(Tag::Compression, 1u16).expect("comp");
+        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
+            .expect("photo");
+        dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("spp");
+        dir.write_tag(Tag::PlanarConfiguration, 1u16)
+            .expect("planar");
+        dir.write_tag(Tag::TileWidth, RASTER_TILE_SIZE).expect("tw");
+        dir.write_tag(Tag::TileLength, RASTER_TILE_SIZE)
+            .expect("th");
+        let chunk = vec![173u8; (RASTER_TILE_SIZE * RASTER_TILE_SIZE) as usize];
+        let at = dir.write_data(&chunk[..]).expect("write shared tile");
+        let offsets = vec![at; tile_count];
+        let counts = vec![chunk.len() as u64; tile_count];
+        dir.write_tag(Tag::TileOffsets, &offsets[..]).expect("offs");
+        dir.write_tag(Tag::TileByteCounts, &counts[..])
+            .expect("cnts");
+        dir.finish().expect("finish");
+    }
+    let tiled_bytes = tiled_buf.into_inner();
+    let tiled_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(tiled_bytes.clone())),
+        fake_fingerprint(&tiled_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("wide tiled BigTIFF opens");
+    assert_eq!(tiled_src.description().width, wide);
+
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+    let tile = tiled_src
+        .decode_pointwise_tile(0, across - 1, 0, &ctx)
+        .expect("decode far-right edge tile");
+    assert_eq!(
+        (tile.width(), tile.height()),
+        (pyramid::tile_extent(across - 1, wide), RASTER_TILE_SIZE)
+    );
+    assert_eq!(&tile.data()[..4], &[173, 173, 173, 255]);
+}
+
+#[test]
+fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+    use veldmap_core::io::{ByteSource, IoError};
+    use veldmap_raster::RasterError;
+
+    struct BlockingTailSource {
+        inner: MemoryByteSource,
+        threshold: u64,
+        armed: AtomicBool,
+        hit: AtomicBool,
+        release: CancelToken,
+    }
+
+    impl ByteSource for BlockingTailSource {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+
+        fn read_at(
+            &self,
+            offset: u64,
+            buf: &mut [u8],
+            cancel: &CancelToken,
+        ) -> Result<usize, IoError> {
+            if self.armed.load(Ordering::Acquire)
+                && offset.saturating_add(buf.len() as u64) > self.threshold
+            {
+                self.hit.store(true, Ordering::Release);
+                while !self.release.is_cancelled() && !cancel.is_cancelled() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            self.inner.read_at(offset, buf, cancel)
+        }
+    }
+
+    // Build a >64 KiB 16-bit tiled TIFF so `compute_mapping` issues a read past
+    // `BufferedByteReader`'s initial 64 KiB window.
+    let mut buf = Cursor::new(Vec::new());
+    let tile_offset: u64;
+    {
+        let mut enc = TiffEncoder::new(&mut buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        dir.write_tag(Tag::ImageWidth, 256u32).expect("w");
+        dir.write_tag(Tag::ImageLength, 256u32).expect("h");
+        dir.write_tag(Tag::BitsPerSample, 16u16).expect("bps");
+        dir.write_tag(Tag::Compression, 1u16).expect("comp");
+        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
+            .expect("photo");
+        dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("spp");
+        dir.write_tag(Tag::PlanarConfiguration, 1u16)
+            .expect("planar");
+        dir.write_tag(Tag::TileWidth, 256u32).expect("tw");
+        dir.write_tag(Tag::TileLength, 256u32).expect("th");
+        let samples: Vec<u16> = (0..65_536u32).map(|v| (v % 4096) as u16).collect();
+        tile_offset = dir.write_data(&samples[..]).expect("write");
+        dir.write_tag(Tag::TileOffsets, &[tile_offset as u32][..])
+            .expect("offs");
+        dir.write_tag(Tag::TileByteCounts, &[(65_536u32 * 2)][..])
+            .expect("cnts");
+        dir.finish().expect("finish");
+    }
+    let raw = buf.into_inner();
+    let fp = fake_fingerprint(&raw);
+    let release = CancelToken::new();
+    let gate = Arc::new(BlockingTailSource {
+        inner: MemoryByteSource::from_vec(raw),
+        threshold: 64 * 1024,
+        armed: AtomicBool::new(false),
+        hit: AtomicBool::new(false),
+        release: release.clone(),
+    });
+    let budget = MemoryBudget::detect();
+    let src = Arc::new(
+        TiffSource::open(
+            Arc::clone(&gate) as Arc<dyn ByteSource>,
+            fp,
+            &budget,
+            &CancelToken::new(),
+        )
+        .expect("open 16-bit"),
+    );
+    gate.armed.store(true, Ordering::Release);
+
+    let chunk_cache = Arc::new(SharedChunkCache::new(budget.decoded_chunk_cache_bytes));
+    let tracker = Arc::new(DecodeBudgetTracker::new(budget.decode_working_bytes));
+
+    let leader = {
+        let src = Arc::clone(&src);
+        let cache = Arc::clone(&chunk_cache);
+        let tracker = Arc::clone(&tracker);
+        let b = budget;
+        thread::spawn(move || {
+            let cancel = CancelToken::new();
+            let ctx = DecodeContext {
+                chunk_cache: &cache,
+                budget_tracker: &tracker,
+                budget: &b,
+                cancel: &cancel,
+            };
+            src.decode_pointwise_tile(0, 0, 0, &ctx)
+        })
+    };
+
+    while !gate.hit.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let waiter_cancel = CancelToken::new();
+    let waiter = {
+        let src = Arc::clone(&src);
+        let cache = Arc::clone(&chunk_cache);
+        let tracker = Arc::clone(&tracker);
+        let c = waiter_cancel.clone();
+        let b = budget;
+        thread::spawn(move || {
+            let ctx = DecodeContext {
+                chunk_cache: &cache,
+                budget_tracker: &tracker,
+                budget: &b,
+                cancel: &c,
+            };
+            src.decode_pointwise_tile(0, 0, 0, &ctx)
+        })
+    };
+    thread::sleep(Duration::from_millis(15));
+    waiter_cancel.cancel();
+    let waiter_res = waiter.join().expect("join waiter");
+    assert!(matches!(waiter_res, Err(RasterError::Cancelled)));
+
+    release.cancel();
+    assert!(leader.join().expect("join leader").is_ok());
+}

@@ -76,12 +76,10 @@ pub(super) const TOUCH_META_SQL: &str =
 /// Delete one row by `tile_id` (cascading to `tile_blobs`).
 pub(super) const DELETE_META_BY_ID_SQL: &str = "DELETE FROM tile_meta WHERE tile_id = ?1";
 
-/// Sum stored payload bytes for one `source_key`.
-pub(super) const SUM_SOURCE_BYTES_SQL: &str =
-    "SELECT COALESCE(SUM(byte_size), 0) FROM tile_meta WHERE source_key = ?1";
-
-/// Delete all rows for one `source_key` (cascading to `tile_blobs`).
-pub(super) const DELETE_SOURCE_META_SQL: &str = "DELETE FROM tile_meta WHERE source_key = ?1";
+/// Delete all rows for one `source_key` (cascading to `tile_blobs`) and
+/// return `(tile_id, byte_size)` for `cache_meta` and `pending_touches` cleanup.
+pub(super) const DELETE_SOURCE_META_SQL: &str =
+    "DELETE FROM tile_meta WHERE source_key = ?1 RETURNING tile_id, byte_size";
 
 /// Truncate-friendly deletion of all cached blobs and metadata.
 pub(super) const CLEAR_BLOBS_SQL: &str = "DELETE FROM tile_blobs";

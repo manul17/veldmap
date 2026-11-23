@@ -27,5 +27,5 @@ pub use quadtree::{
     describe_tile, traverse,
 };
 pub use scheduler::{
-    LevelPlan, PassBusy, PyramidMeta, ServeMode, TileFailureOutcome, TileScheduler,
+    LevelPlan, PassBusy, PassKey, PyramidMeta, ServeMode, TileFailureOutcome, TileScheduler,
 };

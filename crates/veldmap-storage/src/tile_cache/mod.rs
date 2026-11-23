@@ -30,11 +30,10 @@ use self::evict::{evict_in_tx, reclaim_space};
 use self::key::EncodedKey;
 use self::schema::{
     CLEAR_BLOBS_SQL, CLEAR_META_SQL, DELETE_META_BY_ID_SQL, DELETE_SOURCE_META_SQL,
-    SELECT_META_ID_BYTES_SQL, SELECT_TILE_BLOB_SQL, SUM_SOURCE_BYTES_SQL, TOUCH_META_SQL,
-    UPSERT_BLOB_SQL, UPSERT_META_SQL, decrement_cache_meta, init_connection,
-    is_corrupt_sqlite_error, open_and_init_file_db, open_read_only_connection,
-    read_cache_meta_totals, remove_sqlite_files, reset_cache_meta, set_cache_meta_totals,
-    sidecar_path,
+    SELECT_META_ID_BYTES_SQL, SELECT_TILE_BLOB_SQL, TOUCH_META_SQL, UPSERT_BLOB_SQL,
+    UPSERT_META_SQL, decrement_cache_meta, init_connection, is_corrupt_sqlite_error,
+    open_and_init_file_db, open_read_only_connection, read_cache_meta_totals, remove_sqlite_files,
+    reset_cache_meta, set_cache_meta_totals, sidecar_path,
 };
 
 pub use self::key::{DiskTileKey, TileBlobEncoding, valid_source_key};
@@ -426,7 +425,7 @@ impl TileDiskCache {
         }
 
         let ts_ms = self.next_monotonic_ts();
-        let report = self.with_write_tx(&mut conn, |tx| {
+        let outcome = self.with_write_tx(&mut conn, |tx| {
             let (inserted_id, updated_total, updated_count) =
                 upsert_tile_and_update_meta(tx, &enc, encoding, payload, new_bytes, ts_ms)?;
             evict_in_tx(
@@ -437,12 +436,23 @@ impl TileDiskCache {
                 Some(inserted_id),
             )
         })?;
+        self.prune_pending_touches(&outcome.evicted_ids);
 
         self.write_generation.fetch_add(1, Ordering::AcqRel);
-        if report.evicted_tiles > 0 {
+        if outcome.report.evicted_tiles > 0 {
             reclaim_space(&conn, self.db_path.is_some(), false);
         }
-        Ok(report)
+        Ok(outcome.report)
+    }
+
+    fn prune_pending_touches(&self, tile_ids: &[i64]) {
+        if tile_ids.is_empty() {
+            return;
+        }
+        let mut touches = lock_unpoisoned(&self.pending_touches);
+        for id in tile_ids {
+            touches.remove(id);
+        }
     }
 
     /// Delete one tile entry (e.g. if a cached payload fails decode validation).
@@ -498,14 +508,15 @@ impl TileDiskCache {
         max_bytes: u64,
         full_vacuum: bool,
     ) -> Result<EvictionReport, StorageError> {
-        let report = self.with_write_tx(conn, |tx| {
+        let outcome = self.with_write_tx(conn, |tx| {
             let (current_bytes, current_count) = read_cache_meta_totals(tx)?;
             evict_in_tx(tx, current_bytes, current_count, max_bytes, None)
         })?;
-        if report.evicted_tiles > 0 {
+        self.prune_pending_touches(&outcome.evicted_ids);
+        if outcome.report.evicted_tiles > 0 {
             reclaim_space(conn, self.db_path.is_some(), full_vacuum);
         }
-        Ok(report)
+        Ok(outcome.report)
     }
 
     /// Remove all cached tiles for a specific `source_key`, returning the
@@ -515,13 +526,25 @@ impl TileDiskCache {
             return Err(StorageError::InvalidSourceKey(source_key.to_owned()));
         }
         let mut conn = lock_unpoisoned(&self.writer);
-        let deleted = self.with_write_tx(&mut conn, |tx| {
-            let removed_bytes: i64 =
-                tx.query_row(SUM_SOURCE_BYTES_SQL, params![source_key], |r| r.get(0))?;
-            let deleted = tx.execute(DELETE_SOURCE_META_SQL, params![source_key])?;
-            decrement_cache_meta(tx, removed_bytes, deleted as i64)?;
-            Ok(deleted)
+        let deleted_ids = self.with_write_tx(&mut conn, |tx| {
+            let mut stmt = tx.prepare(DELETE_SOURCE_META_SQL)?;
+            let rows = stmt.query_map(params![source_key], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            let mut ids = Vec::new();
+            let mut removed_bytes = 0i64;
+            for row in rows {
+                let (tile_id, byte_size) = row?;
+                ids.push(tile_id);
+                removed_bytes = removed_bytes.saturating_add(byte_size.max(0));
+            }
+            if !ids.is_empty() {
+                decrement_cache_meta(tx, removed_bytes, ids.len() as i64)?;
+            }
+            Ok(ids)
         })?;
+        self.prune_pending_touches(&deleted_ids);
+        let deleted = deleted_ids.len();
         if deleted > 0 {
             reclaim_space(&conn, self.db_path.is_some(), true);
             self.write_generation.fetch_add(1, Ordering::AcqRel);
