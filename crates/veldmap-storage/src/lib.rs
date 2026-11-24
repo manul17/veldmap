@@ -81,6 +81,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("SQLite cache error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("tile blob codec error: {0}")]
+    Codec(String),
 }
 
 impl StorageError {

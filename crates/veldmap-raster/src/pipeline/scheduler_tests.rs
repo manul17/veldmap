@@ -294,6 +294,30 @@ fn terminal_and_repeated_failures_are_suppressed() {
         TileFailureOutcome::TerminalFailed
     );
     assert!(sched.is_terminal_failed(&k_pass));
+
+    // Repeated cancellations/evictions via `cancel_in_flight` and `abort_pass`
+    // must clear in-flight state without ever promoting tiles to Permanent.
+    let k_cancel = meta.tile_key(0, 2, 0);
+    for _ in 0..5 {
+        assert_eq!(
+            sched.admit_pointwise(&meta, 0, &[k_cancel], |_| false),
+            vec![k_cancel]
+        );
+        assert!(sched.is_in_flight(&k_cancel));
+        sched.cancel_in_flight(&k_cancel);
+        assert!(!sched.is_in_flight(&k_cancel));
+        assert!(!sched.is_terminal_failed(&k_cancel));
+    }
+    let k_abort = meta.tile_key(2, 0, 0);
+    for _ in 0..5 {
+        let pid = sched
+            .begin_pass(pass_key, 2, Some(2), CancelToken::new(), vec![k_abort])
+            .expect("begin aborted pass");
+        sched.abort_pass(pass_key, pid);
+        assert!(!sched.has_active_pass(pass_key));
+        assert!(!sched.is_in_flight(&k_abort));
+        assert!(!sched.is_terminal_failed(&k_abort));
+    }
 }
 
 #[test]

@@ -8,7 +8,7 @@ Build VeldMap as a fast, purely native Rust desktop **Analytical Earth-Observati
 
 A simplified browser/mobile companion is intentionally deferred to a separate project later (enabled by keeping `veldmap-core` permanently UI/GPU/network-free).
 
-> **Document lifecycle:** `plan.md` is the vertical-slice roadmap and exit-criteria tracker (update `Next Step` as each slice closes). Future slices (`3A-1b`–`6`) are **working design hypotheses**—revise them freely as real code and benchmarks prove better designs. Settled "why not X" decisions and hard cross-slice invariants live in [docs/decisions.md](docs/decisions.md) once implemented; module details live in Rust `//!` docstrings (`cargo doc --document-private-items`).
+> **Document lifecycle:** `plan.md` is the vertical-slice roadmap and exit-criteria tracker (update `Next Step` as each slice closes). Future slices (`3A-2`–`6`) are **working design hypotheses**—revise them freely as real code and benchmarks prove better designs. Settled "why not X" decisions and hard cross-slice invariants live in [docs/decisions.md](docs/decisions.md) once implemented; module details live in Rust `//!` docstrings (`cargo doc --document-private-items`).
 
 ---
 
@@ -19,8 +19,8 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 1. **Natural workspace crate boundaries:** Keep `veldmap-core` a permanently pure leaf (`geo`, `tile` keys/LRU, std-only `sync`/`io` traits/`MemoryBudget`, `#![forbid(unsafe_code)]`, zero OS probing or `tokio`/`reqwest`/`image`/`tiff`/`egui`/`wgpu`). Split focused workspace crates (`veldmap-raster`, `veldmap-net`, `veldmap-storage`) along real dependency seams as subsystems land—avoiding feature-gated mega-crates.
 2. **Deadlock-free memory & deduplication invariants:** Bound CPU caches with startup host-RAM-scaled fixed per-cache caps (avoiding lock-reentrant cross-cache shrinking), bound decode working memory and queued upload bytes so small tiled reads never stall behind full-image decodes and large passes never starve, deduplicate concurrent chunk/block fetches with panic/cancel-safe singleflight (zero follower deadlocks or leader-cancel poisoning), and scale GPU tile VRAM budgets proportionally for multi-band EO working sets.
 3. **Codec safety & durability invariants:** Decoders enforce explicit dimension/memory/IFD/filter limits, panic isolation, and thread-safety audits before multi-threaded decode. Inject `StoragePaths`; use durable fsync'd atomic writes (closing handles before rename on Windows) for user/session/catalog state and crash-safe vertically partitioned (`tile_meta`/`tile_blobs`) SQLite WAL persistence for ephemeral tile caches. Add traits only where there is a real second implementation (`ByteSource`, `Signer`, raster decoders, tile providers). Keep default builds free of external C system-library setup requirements (self-contained `cc`-compiled crates like bundled SQLite, `ring`, or `zstd-sys` are acceptable when justified; external `libgdal`/`libproj`/`libhdf5` are avoided in default builds).
-4. **Treat `old/` as optional reference, retire cleanly after Slice 3A-1b:** Pre-deletion state is permanently preserved at annotated git tag `legacy-reference-snapshot` (for shallow clones: `git fetch origin tag legacy-reference-snapshot`); remaining files and known legacy UB/security porting hazards are tracked in [old/README.md](old/README.md). Design native modules cleanly rather than porting WASI-era decomposition verbatim. Never link from `docs/` into `old/`; retire `old/` completely after Slice 3A-1b (migrating the remaining `3A-2` PNG/JPEG and v1.1 `3C-1`/`4B`/`6` porting hazard checklists into `plan.md` first), with later slices consulting `git show legacy-reference-snapshot:old/...` on demand.
-5. **Code & test hygiene (every slice):** English only outside `old/` (CI-enforced; remove `old/` exclusion and `docs/ -> old/` link guard once `old/` retires at Slice 3A-1b). Keep cross-module, synthetic-file, mock-HTTP, and GPU/shader suites in grouped `tests/` harnesses (`tests/integration/main.rs`), short single-module unit tests (`<= ~100 LOC`) inline, and larger single-module unit suites in sibling `#[cfg(test)] #[path = "*_tests.rs"]` files. Rust 2024; verified by `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace`, isolated headless crate tests, `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items`, `cargo-deny`, `naga` SPV/HLSL/MSL codegen, headless offscreen `wgpu` smoke tests, and offline `lychee` link checks.
+4. **Legacy reference retired (`legacy-reference-snapshot` tag):** The legacy `old/` reference tree was completely retired from the working tree at the close of Slice 3A-1b, and its remaining `3A-2` / v1.1 (`3C-1`, `4B`, `6`) porting hazard checklists live below in this document. Pre-deletion state remains permanently preserved at annotated git tag `legacy-reference-snapshot` (`git show legacy-reference-snapshot:old/...`; for shallow clones: `git fetch origin tag legacy-reference-snapshot`). Design native modules cleanly rather than porting WASI-era decomposition verbatim.
+5. **Code & test hygiene (every slice):** English only across the entire repository (CI-enforced). Keep cross-module, synthetic-file, mock-HTTP, and GPU/shader suites in grouped `tests/` harnesses (`tests/integration/main.rs`), short single-module unit tests (`<= ~100 LOC`) inline, and larger single-module unit suites in sibling `#[cfg(test)] #[path = "*_tests.rs"]` files. Rust 2024; verified by `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace`, isolated headless crate tests, `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items`, `cargo-deny`, `naga` SPV/HLSL/MSL codegen, headless offscreen `wgpu` smoke tests, and offline `lychee` link checks.
 
 ---
 
@@ -35,13 +35,13 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 
 ## Release Roadmap & Vertical Slices
 
-> **Execution order:** Slices are grouped into four shippable milestones (`v0.2` → `v0.5` → `v1.0` → `v1.1`). Slice IDs (`2B`–`6`) match [old/README.md](old/README.md) retirement tracking verbatim.
+> **Execution order:** Slices are grouped into four shippable milestones (`v0.2` → `v0.5` → `v1.0` → `v1.1`).
 
 ---
 
 ### Milestone v0.2 — Planetary Basemaps & Local Precision Workstation
 
-#### Slice 3A-1 — Local GeoTIFF/COG Engine, `MemoryBudget` & Warp-Mesh Draping `[ ]`
+#### Slice 3A-1 — Local GeoTIFF/COG Engine, `MemoryBudget` & Warp-Mesh Draping `[x]`
 
 ##### Slice 3A-1a — Core Local GeoTIFF/COG Engine & `ByteSource` `[x]`
 - [x] **Sync `ByteSource` & `SourceFingerprint` (`veldmap-core` / `veldmap-storage`):**
@@ -52,25 +52,25 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
   - Bounded `MemoryBudget` + `DecodeBudgetTracker` (`veldmap-core`), `DecodePeak`, panic/cancel-safe `SharedChunkCache` (lossless `RasterError` propagation + leader-cancelled follower retry; sequential passes uncached to prevent AB-BA deadlocks), `TwoLaneDecodePool`, and `PassKey`-scoped `TileScheduler`.
   - Verified TIFF read amplification via `CountingByteSource` and concurrency/memory-bound stress tests (zero deadlocks, zero HoL stalls, `peak <= cap`).
 
-##### Slice 3A-1b — GPU Warp-Mesh Draping, Accuracy Regression, QOI Cache & `old/` Retirement `[ ]`
-- [ ] **Multi-layer `LayerStack` & `DrawSnapshot` generalization (`veldmap-app`):**
-  - Add an ordered `LayerStack` (basemap + raster overlays) inside `SceneState` and extend `DrawSnapshot` with ordered overlay draw entries (building on already-landed `SceneState`, `SnapshotKey`, and `TileCarrierPolicy`).
-  - Aggregate `wanted_tiles`, `pinned_root_sources`, and proportional VRAM appetite weights across active layers.
-- [ ] **Renderer modularization, post-body depth-less pass & warp-mesh draping (`veldmap-app`, `veldmap-core`):**
-  - Extract `overlay` out of `render/globe.rs` alongside a frame-wide dynamic uniform arena (preventing `queue.write_buffer(..., 0, ...)` clobbering across multi-pass scratch targets) and `PixelFormat`-partitioned bind-group layouts/caches (ready for `3B` non-filterable `R32Float` / `Uint`).
-  - Close Pass 1 (`Depth32Float`, `StoreOp::Discard` + `TRANSIENT_ATTACHMENT`) after the opaque globe body and render post-body overlays + procedural graticule in a **`depth_stencil_attachment: None` color pass (`LoadOp::Load`)** so Slice 5A interleaved analytical passes reuse the exact same overlay/graticule pipelines without duplication.
-  - Implement top-down lazy `DVec3` culling balls (preserving per-rung limb-culling margins) in `veldmap-core` and per-tile CPU `f64` RTC warp meshes (`16` segments at coarse UTM zone edges for `< 2 cm`; outward WGS84 normal winding for negative-determinant/south-up affines; exact CPU `f64` horizon-plane uniform `dot(in.world, horizon_towards) >= horizon_eye_margin` so coarse limb chords never leak back-hemisphere fragments), referencing `old/code/geo/overlay.rs`.
-- [ ] **Thin `RasterSource` seam, minimal opener/layer list, HUD & accuracy regression:**
-  - Introduce a thin format-agnostic `RasterSource` seam in `veldmap-raster` over `TiffSource` (ready for Slice 3A-2 PNG/JPEG and v1.1 codecs).
-  - Wire CLI file argument, drag-and-drop, a minimal File Open trigger, a basic Layer List (visibility, opacity, remove, zoom-to-extent), and a "Reload / bypass cache" trigger; wire `PassKey`-scoped `TileScheduler`, local overlay scheduling on `TwoLaneDecodePool` (`fast()`/`bulk()`), proportional `< 50%` VRAM appetite sharing, and native Windows `GlobalMemoryStatusEx` RAM detection in `veldmap-storage/src/host.rs`.
-  - Label HUD **viewport GSD** separately from **source pixel size** and add zoom-invariant CPU cursor readouts (display/RGB values in 3A-1b; raw physical DN/float readouts land with 3B).
-  - Rebuild `a_raster_lands_where_its_binding_puts_it` (CPU exact geometry + UV placement) verifying all 5 UTM 37 benchmark bindings & tolerances in [docs/decisions.md](docs/decisions.md) §4 (`< 10⁻³ px`, `< 2 mm` native, `< 2 cm` pyramid) plus a **second CRS fixture** and an end-to-end **`PixelIsArea` vs. `PixelIsPoint` (`GTRasterTypeGeoKey`)** half-pixel check.
-- [ ] **8-bit QOI disk cache & two-lane budget validation:**
-  - Add QOI disk caching (`TileBlobEncoding::Qoi`, pure-Rust `qoi` crate) in `TileDiskCache` for 8-bit `Rgba8UnormSrgb` tiles.
-  - Validate two-lane decode budgeting end-to-end (untiled/stripped GeoTIFF sequential `ServeMode::Pass` on `bulk()` never head-of-line blocks tiled COG `ServeMode::Pointwise` on `fast()`).
-- [ ] **Docs & complete `old/` retirement:**
-  - Update `docs/decisions.md` and `docs/limitations.md`.
-  - Migrate the remaining `3A-2` PNG/JPEG and v1.1 (`3C-1`, `4B`, `6`) legacy porting hazard checklists from `old/README.md` into `plan.md`, delete `old/` completely (later slices consult `git show legacy-reference-snapshot:old/...`; shallow clones run `git fetch origin tag legacy-reference-snapshot`), and clean up all remaining `old/` references (`.gitattributes`, `README.md`, `CONTRIBUTING.md`, `docs/README.md`, `plan.md` Principles 4–5 & Execution Order, and CI's `old/` Cyrillic carve-out + `docs/ -> old/` link guard).
+##### Slice 3A-1b — GPU Warp-Mesh Draping, Accuracy Regression, QOI Cache & `old/` Retirement `[x]`
+- [x] **Multi-layer `LayerStack` & `DrawSnapshot` generalization (`veldmap-app`):**
+  - Added ordered `LayerStack` + `OverlayManager` inside `SceneState` and extended `DrawSnapshot` with ordered `DrawOverlayLayer` / `DrawOverlayPatch` entries.
+  - Aggregated `wanted_tiles`, `pinned_root_sources`, and proportional VRAM appetite weights across basemap + active visible overlays.
+- [x] **Renderer modularization, post-body depth-less pass & warp-mesh draping (`veldmap-app`, `veldmap-core`):**
+  - Extracted `render/overlay.rs` + `shaders/overlay.wgsl` out of `render/globe.rs` alongside a frame-wide `DynamicUniformArena` and `PixelFormat`-partitioned `TileBindGroupCache` / layouts (ready for `3B` non-filterable `R32Float` / `Uint`).
+  - Closed Pass 1 (`Depth32Float`, `StoreOp::Discard` + `TRANSIENT_ATTACHMENT`) after the opaque globe body and moved post-body overlays + procedural graticule into a **`depth_stencil_attachment: None` color pass (`LoadOp::Load`)**.
+  - Implemented top-down lazy `DVec3` culling balls (`OverlayCullTree`, preserving per-rung limb-culling margins) in `veldmap-core` and per-tile CPU `f64` RTC warp meshes (`MIN_WARP_SEGMENTS = 16` for `< 2 cm` at coarse UTM zone edges; automatic outward WGS84 normal winding flip for negative-determinant/south-up affines; exact CPU `f64` horizon-plane uniform `dot(in.world, horizon_towards) >= horizon_eye_margin`).
+- [x] **Thin `RasterSource` seam, minimal opener/layer list, HUD & accuracy regression:**
+  - Introduced format-agnostic `RasterSource` trait + `frame_from_description` + zoom-invariant `sample_display_rgba` in `veldmap-raster` over `TiffSource`.
+  - Wired CLI file arguments, OS drag-and-drop, minimal File Open trigger, Layer List panel (visibility, opacity, zoom-to-extent, reload/bypass cache, remove), `PassKey`-scoped `TileScheduler` on `TwoLaneDecodePool` (`fast()`/`bulk()`), proportional `< 50%` VRAM appetite sharing, and native Windows `GlobalMemoryStatusEx` RAM detection in `veldmap-storage/src/host.rs`.
+  - Labeled HUD **Viewport GSD** separately from **Source px** and added non-blocking zoom-invariant CPU RGB cursor readouts.
+  - Rebuilt `a_raster_lands_where_its_binding_puts_it` (all 5 UTM 37 benchmarks + Gauss-Krüger `EPSG:28407` + Southern Hemisphere `EPSG:32737` at `< 10⁻³ px`, `< 2 mm` native, `< 2 cm` pyramid) plus end-to-end `PixelIsArea` vs. `PixelIsPoint` (`GTRasterTypeGeoKey`) half-pixel placement tests.
+- [x] **8-bit QOI disk cache & two-lane budget validation:**
+  - Added lossless QOI disk caching (`TileBlobEncoding::Qoi`, pure-Rust `qoi` crate, self-healing corrupt-entry purge) via `TileDiskCache::{put_qoi_rgba8, get_qoi_rgba8}`.
+  - Validated two-lane decode budgeting end-to-end (untiled stripped GeoTIFF `ServeMode::Pass` on `bulk()` never HoL-blocks tiled COG `ServeMode::Pointwise` on `fast()`).
+- [x] **Docs & complete `old/` retirement:**
+  - Updated `docs/decisions.md` (§8) and `docs/limitations.md`.
+  - Migrated remaining `3A-2` PNG/JPEG and v1.1 (`3C-1`, `4B`, `6`) legacy porting hazard checklists into `plan.md`, deleted `old/` completely, and removed all `old/` references and CI carve-outs.
 - **Exit criteria:**
   - *Automated CI:* `a_raster_lands_where_its_binding_puts_it` (all 5 UTM 37 benchmarks + 2nd CRS + `PixelIsArea`/`PixelIsPoint`), negative-determinant affine winding, exact horizon-plane limb test, COG `CountingByteSource` tests, memory-budget/singleflight/`TileScheduler` concurrency stress tests, `0` idle GPU re-render checks, and full 3-OS CI with `old/` removed pass.
   - *Manual QA:* Local GeoTIFF/BigTIFF/COG and cm-scale drone orthophotos open via CLI/drag-and-drop/Open trigger, toggle/reorder/remove cleanly in the Layer List, and drape accurately with responsive zooming and bounded RAM/VRAM/disk.
@@ -207,7 +207,18 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 
 ---
 
+## Migrated Legacy Porting Hazard Checklists (`legacy-reference-snapshot`)
+
+Audited safety, correctness, and architecture hazards preserved from retired `old/README.md` (consult `git show legacy-reference-snapshot:old/...` on demand; shallow clones: `git fetch origin tag legacy-reference-snapshot`). Do not port legacy code verbatim—resolve every item below when implementing the corresponding slice:
+
+- **Slice 3A-2 (`old/code/tiler/adapters/{full,png,jpeg}.rs`):** Enforce streaming row-by-row non-interlaced PNG vs. whole-frame Adam7 budget guards and `jpeg` pre-allocation budget checks (no `Rc`/`RefCell`).
+- **Slice 3C-1 (`old/code/tiler/adapters/{codec,excerpt,jp2}.rs`):** Audit `openjp2` for `static mut` thread safety/soundness (evaluate `hayro-jpeg2000` or `openjpeg-sys` `>= 2.5.4` if it fails); fix Stacked Borrows / drop-order UB (`Box::into_raw` + explicit `Drop`), `usize::MAX` EOF + `ErrorKind::Interrupted` retry, `catch_unwind` on `extern "C"` callbacks, `skip()` EOF bounds check, `COD` `levels <= 32` shift-overflow guard, PLT varint & TLM checked arithmetic + `keep <= part.len`, `MAX_PAD` cap, worker panic isolation, and gating zero-as-nodata on Sentinel-2 heuristics rather than all GMLJP2. Add 5/3 reversible round-trip and malformed/truncated `proptest` fuzz tests.
+- **Slice 4B (`old/code/network/download.rs`, `old/code/library/*`, `old/code/provider/*`):** Drop WASI `queued_sidecars` / async rescan state machines in favor of serialized sync `std::fs` metadata; enforce S3 path sanitization, Windows `\\?\` extended-length paths (`longPathAware`), unsigned `Range` header invariant on 401/403 re-sign, persisted `ETag` `If-Range`, HTTP 416 recovery, `File::try_lock()` + in-process lock map + explicit `unlock()`, `downloaded == total_size`, and credential/SigV4 redaction in `tracing` logs/errors.
+- **Slice 6 (`old/code/tiler/adapters/netcdf.rs`):** Read coordinates and `scale_factor`/`add_offset` in `f64`; check raw typed `_FillValue`/`missing_value`/`valid_range` *before* unpacking (mapping fill to `f32::NAN`); fail fast on unsupported HDF5 filters at `describe`; bound `Hdf5HandleCache` (`METADATA_CACHE` + `ROW_CACHE_CAP`) with fixed host-RAM-scaled caps.
+
+---
+
 ## Next Step
 
-- **Current state:** Phases 0–0.5, Slices 1, 2A, 2B, pre-3A architecture hardening (`SceneState`, `SnapshotKey`, `TileCarrierPolicy`, `LastRenderKey` `Arc::ptr_eq`, host-RAM-scaled `MemoryBudget` + `TwoLaneDecodePool::fast()` wiring, `ui/toolbar.rs`, `TRANSIENT_ATTACHMENT` depth), and **Slice 3A-1a** (`ByteSource`/`LocalFileSource`, sampled BLAKE3 `SourceFingerprint` + `LocalFingerprintCache`, `DecodeBudgetTracker`, `PassKey`-scoped `TileScheduler`, `BandInfo`/pyramid/resample/radiometry/cascade/grid, `TiffSource` GeoTIFF/BigTIFF/ZSTD-COG/`Predictor = 3` decoder, and leader-cancel-safe `SharedChunkCache`) are complete on `main` (see [Design Decisions](docs/decisions.md)).
-- **Immediate task:** Start **Slice 3A-1b — GPU Warp-Mesh Draping, Accuracy Regression, QOI Cache & `old/` Retirement** (ordered `LayerStack` + overlay `DrawSnapshot`, `overlay` extraction + dynamic uniform arena + `PixelFormat`-partitioned bind-group caches + post-body `depth_stencil_attachment: None` pass, CPU `f64` RTC warp meshes + exact horizon-plane uniform + lazy `DVec3` culling balls, `RasterSource` seam + minimal opener/Layer List + Windows RAM detection + 5 UTM 37 accuracy benchmarks, QOI disk cache, and full `old/` retirement).
+- **Current state:** Phases 0–0.5, Slices 1, 2A, 2B, and **Slice 3A-1 (`3A-1a` + `3A-1b`)** are complete on `main` (`ByteSource`/`LocalFileSource`, sampled BLAKE3 `SourceFingerprint` + `LocalFingerprintCache`, cross-OS `detect_memory_budget` including Windows `GlobalMemoryStatusEx`, `RasterSource` + `TiffSource`, `SharedChunkCache`, `TwoLaneDecodePool`, `PassKey`-scoped `TileScheduler`, `LayerStack`/`OverlayManager`, depth-less Pass 2 post-body warp-mesh draping with `DynamicUniformArena` + `PixelFormat`-partitioned bind-group caches + exact CPU `f64` horizon-plane uniform + lazy `DVec3` culling balls, CLI/drag-and-drop/Open/Layer List/HUD RGB cursor readout, QOI disk cache, full accuracy regression, and complete `old/` retirement; see [Design Decisions](docs/decisions.md)).
+- **Immediate task:** Start **Slice 3A-2 — Local Workstation UX, Drone RGB Codecs, Expanded Pure-Rust CRS & GeoJSON Overlay** (`rfd` pure-Rust `xdg-portal` native picker, Layer Manager reorder/inspector/banners, manual heading rotation & keyboard pan/zoom, minimal local session persistence, `YCbCr`/`WebP` GeoTIFF + PNG/JPEG world-file/`.prj` adapters, expanded pure-Rust CRS & explicit Helmert sign conventions, Karney geodesic measurement + RFC 7946 GeoJSON export, and read-only GeoJSON overlay).

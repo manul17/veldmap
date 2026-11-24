@@ -104,6 +104,11 @@ impl TileScheduler {
         self.in_flight.contains(key)
     }
 
+    /// Return the number of tiles currently in-flight for `source`.
+    pub fn in_flight_count_for_source(&self, source: SourceId) -> usize {
+        self.in_flight.iter().filter(|k| k.source == source).count()
+    }
+
     /// Return whether `key` is permanently or transiently suppressed from
     /// re-requesting.
     pub fn is_terminal_failed(&self, key: &TileKey) -> bool {
@@ -302,6 +307,31 @@ impl TileScheduler {
             }
             if succeeded {
                 self.forgive_single_pass_failures(key);
+            }
+        }
+    }
+
+    /// Record that `key` was cancelled or evicted from a decode queue before
+    /// producing an error, clearing its in-flight state without penalizing its
+    /// failure retry budget.
+    pub fn cancel_in_flight(&mut self, key: &TileKey) {
+        self.in_flight.remove(key);
+    }
+
+    /// Abort an active `ServeMode::Pass` (due to cancellation, zoom target
+    /// change, or queue eviction) without penalizing undelivered tiles toward
+    /// permanent suppression.
+    pub fn abort_pass(&mut self, key: PassKey, pass_id: u64) {
+        let matches = self
+            .active_passes
+            .get(&key)
+            .is_some_and(|p| p.pass_id == pass_id);
+        if !matches {
+            return;
+        }
+        if let Some(pass) = self.active_passes.remove(&key) {
+            for tile in pass.tiles {
+                self.in_flight.remove(&tile);
             }
         }
     }

@@ -1,6 +1,7 @@
 //! Thin `eframe::App` shell coordinating globe input, GIS HUD layout,
 //! storage persistence, and [`SceneState`] frame updates.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui;
@@ -16,6 +17,7 @@ use crate::scene::SceneState;
 use crate::storage::AppStorage;
 use crate::ui::basemap::{BasemapUiAction, BasemapUiState};
 use crate::ui::hud;
+use crate::ui::layers::{LayerUiAction, LayersPanelState, show_layers_panel};
 use crate::ui::show_settings_window;
 use crate::ui::toolbar::{self, GoToBarState, ToolbarAction, ToolbarInputs};
 use crate::viewport_bridge::{GlobePaintCallback, viewport_pixels};
@@ -58,6 +60,7 @@ pub struct VeldmapApp {
     scene: SceneState,
     storage: AppStorage,
     basemap_ui: BasemapUiState,
+    layers_ui: LayersPanelState,
     cursor_geo: Option<(f64, f64)>,
     last_viewport_rect: Option<egui::Rect>,
     last_compass_rect: Option<egui::Rect>,
@@ -82,6 +85,13 @@ impl Drop for VeldmapApp {
 
 impl VeldmapApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, AppError> {
+        Self::new_with_startup_files(cc, Vec::new())
+    }
+
+    pub fn new_with_startup_files(
+        cc: &eframe::CreationContext<'_>,
+        startup_files: Vec<PathBuf>,
+    ) -> Result<Self, AppError> {
         let render_state = cc.wgpu_render_state.as_ref().ok_or(AppError::MissingWgpu)?;
         let info = render_state.adapter.get_info();
         let adapter_label = format!("{} ({:?})", info.name, info.backend);
@@ -122,7 +132,7 @@ impl VeldmapApp {
         let scene = SceneState::new(storage.settings(), storage.disk_cache(), wakeup, &budget)?;
         let basemap_ui = BasemapUiState::new(storage.settings());
 
-        Ok(Self {
+        let mut app = Self {
             adapter_label,
             device,
             queue,
@@ -130,13 +140,78 @@ impl VeldmapApp {
             scene,
             storage,
             basemap_ui,
+            layers_ui: LayersPanelState::default(),
             cursor_geo: None,
             last_viewport_rect: None,
             last_compass_rect: None,
             last_viewport_height_px: 800.0,
             last_viewport_aspect: 1.6,
             goto_bar: GoToBarState::default(),
-        })
+        };
+
+        for path in startup_files {
+            app.open_overlay_path(&path, true);
+        }
+
+        Ok(app)
+    }
+
+    fn open_overlay_path(&mut self, path: &Path, fly_to: bool) -> bool {
+        match self.scene.open_overlay_file(path) {
+            Ok((_id, bounds)) => {
+                self.layers_ui.open = true;
+                self.layers_ui.clear_error();
+                self.layers_ui.path_input.clear();
+                self.layers_ui.open_prompt_visible = false;
+                if fly_to && let Some(b) = bounds {
+                    self.camera.focus(b.lat, b.lon, b.radius_deg.max(0.000_2));
+                }
+                true
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "Failed to open overlay file");
+                self.layers_ui.set_error(err);
+                true
+            }
+        }
+    }
+
+    fn apply_layer_actions(&mut self, actions: Vec<LayerUiAction>) -> bool {
+        let mut needs_repaint = false;
+        for action in actions {
+            match action {
+                LayerUiAction::OpenPath(path) => {
+                    needs_repaint |= self.open_overlay_path(&path, true);
+                }
+                LayerUiAction::ToggleVisibility(id, visible) => {
+                    needs_repaint |= self.scene.set_overlay_visible(id, visible);
+                }
+                LayerUiAction::SetOpacity(id, opacity) => {
+                    needs_repaint |= self.scene.set_overlay_opacity(id, opacity);
+                }
+                LayerUiAction::ZoomToExtent(bounds) => {
+                    self.camera
+                        .focus(bounds.lat, bounds.lon, bounds.radius_deg.max(0.000_2));
+                    needs_repaint = true;
+                }
+                LayerUiAction::ReloadBypassCache(id) => {
+                    match self.scene.reload_overlay_bypass_cache(id) {
+                        Ok(_) => {
+                            self.layers_ui.clear_error();
+                        }
+                        Err(err) => {
+                            tracing::warn!(?id, error = %err, "Failed to reload overlay");
+                            self.layers_ui.set_error(err);
+                        }
+                    }
+                    needs_repaint = true;
+                }
+                LayerUiAction::Remove(id) => {
+                    needs_repaint |= self.scene.remove_overlay(id);
+                }
+            }
+        }
+        needs_repaint
     }
 
     fn apply_basemap_action(&mut self, action: BasemapUiAction) -> bool {
@@ -330,20 +405,44 @@ impl eframe::App for VeldmapApp {
             self.camera.reset_north();
         }
 
+        // Handle OS drag-and-drop of local GeoTIFF/BigTIFF/COG files.
+        let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        for path in dropped_paths {
+            needs_repaint |= self.open_overlay_path(&path, true);
+        }
+
         // Top toolbar and Settings window.
         let basemap_status = self.scene.basemap_status();
+        let layer_summaries = self.scene.layer_summaries();
         let toolbar_actions = toolbar::show_top_toolbar(
             ui,
             ToolbarInputs {
                 settings: self.storage.settings(),
                 basemap_status: &basemap_status,
                 adapter_label: &self.adapter_label,
+                layer_count: layer_summaries.len(),
+                layers_open: self.layers_ui.open,
             },
             &mut self.goto_bar,
             &mut self.basemap_ui,
         );
         for action in toolbar_actions {
             match action {
+                ToolbarAction::OpenFileTrigger => {
+                    self.layers_ui.show_open_prompt();
+                    needs_repaint = true;
+                }
+                ToolbarAction::ToggleLayersPanel => {
+                    self.layers_ui.open = !self.layers_ui.open;
+                    needs_repaint = true;
+                }
                 ToolbarAction::FocusLocation(loc) => {
                     tracing::info!(
                         lat = loc.lat_deg,
@@ -379,15 +478,29 @@ impl eframe::App for VeldmapApp {
         }
 
         self.update_cursor_probe(&ctx);
+        let cursor_readout = match self.cursor_geo {
+            Some((lat, lon)) => self.scene.cursor_overlay_readout(lat, lon),
+            None => {
+                self.scene.cancel_cursor_readout();
+                None
+            }
+        };
+        let topmost_source_px = self.scene.topmost_visible_source_pixel_size_m();
         let camera_before = self.camera;
         let rect_before = self.last_viewport_rect;
 
         toolbar::show_status_bar(
             ui,
             self.cursor_geo,
+            cursor_readout.as_ref(),
+            topmost_source_px,
             &self.camera,
             self.last_viewport_height_px,
         );
+
+        let layer_actions = show_layers_panel(ui, &layer_summaries, &mut self.layers_ui);
+        needs_repaint |= self.apply_layer_actions(layer_actions);
+
         let (viewport_rect, viewport_reconciled) = self.show_globe_viewport(&ctx, ui);
         reconciled_this_frame |= viewport_reconciled;
 

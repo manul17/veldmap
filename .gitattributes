@@ -9,5 +9,3 @@
 *.sh text eol=lf
 *.png binary
 *.jpg binary
-
-old/** linguist-vendored

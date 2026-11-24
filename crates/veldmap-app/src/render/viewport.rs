@@ -1,12 +1,12 @@
 //! Pointer-identity dirty checks (`LastRenderKey`) and encapsulated
-//! per-viewport offscreen target / uniform buffer lifecycle for
+//! per-viewport offscreen target / uniform arena lifecycle for
 //! [`super::GlobeRenderer`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use super::DrawSnapshot;
-use super::uniforms::{CameraUniform, TileUniform};
+use super::uniforms::{CameraUniform, DynamicUniformArena};
 
 /// Parameters for a single offscreen globe frame.
 #[derive(Clone, Copy, Debug)]
@@ -53,14 +53,12 @@ pub(super) struct OffscreenTarget {
 }
 
 /// Per-viewport GPU buffers and offscreen targets grouped cleanly so resizing
-/// never recreates `camera_buffer` or `tile_uniform_buffer`.
+/// never recreates `camera_buffer` or the frame-wide `uniform_arena`.
 pub(super) struct ViewportState {
     target_format: wgpu::TextureFormat,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    tile_uniform_buffer: wgpu::Buffer,
-    tile_uniform_bind_group: wgpu::BindGroup,
-    tile_uniform_capacity: usize,
+    uniform_arena: DynamicUniformArena,
     offscreen: Option<OffscreenTarget>,
     last_render: Option<LastRenderKey>,
     /// Tracks whether the most recent offscreen pass reached `composite_into`.
@@ -73,7 +71,7 @@ impl ViewportState {
         target_format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
         tile_uniform_layout: &wgpu::BindGroupLayout,
-        tile_uniform_stride: u32,
+        overlay_uniform_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globe camera uniform"),
@@ -90,21 +88,14 @@ impl ViewportState {
             }],
         });
 
-        let initial_cap = 128usize;
-        let (tile_uniform_buffer, tile_uniform_bind_group) = Self::alloc_tile_uniforms(
-            device,
-            tile_uniform_layout,
-            tile_uniform_stride,
-            initial_cap,
-        );
+        let uniform_arena =
+            DynamicUniformArena::new(device, tile_uniform_layout, overlay_uniform_layout);
 
         Self {
             target_format,
             camera_buffer,
             camera_bind_group,
-            tile_uniform_buffer,
-            tile_uniform_bind_group,
-            tile_uniform_capacity: initial_cap,
+            uniform_arena,
             offscreen: None,
             last_render: None,
             pending_present: AtomicBool::new(false),
@@ -119,12 +110,12 @@ impl ViewportState {
         &self.camera_bind_group
     }
 
-    pub(super) fn tile_uniform_buffer(&self) -> &wgpu::Buffer {
-        &self.tile_uniform_buffer
+    pub(super) fn uniform_arena(&self) -> &DynamicUniformArena {
+        &self.uniform_arena
     }
 
-    pub(super) fn tile_uniform_bind_group(&self) -> &wgpu::BindGroup {
-        &self.tile_uniform_bind_group
+    pub(super) fn uniform_arena_mut(&mut self) -> &mut DynamicUniformArena {
+        &mut self.uniform_arena
     }
 
     pub(super) fn offscreen(&self) -> Option<&OffscreenTarget> {
@@ -245,50 +236,5 @@ impl ViewportState {
             depth_view,
             composite_bind_group,
         });
-    }
-
-    fn alloc_tile_uniforms(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        stride: u32,
-        capacity: usize,
-    ) -> (wgpu::Buffer, wgpu::BindGroup) {
-        let size = (capacity.max(1) as u64) * u64::from(stride);
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globe per-tile dynamic uniform"),
-            size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globe per-tile dynamic bind group"),
-            layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(std::mem::size_of::<TileUniform>() as u64),
-                }),
-            }],
-        });
-        (buffer, bind_group)
-    }
-
-    pub(super) fn ensure_tile_uniform_capacity(
-        &mut self,
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        stride: u32,
-        needed: usize,
-    ) {
-        if needed <= self.tile_uniform_capacity {
-            return;
-        }
-        let next_cap = needed.next_power_of_two().max(128);
-        let (buf, bg) = Self::alloc_tile_uniforms(device, layout, stride, next_cap);
-        self.tile_uniform_buffer = buf;
-        self.tile_uniform_bind_group = bg;
-        self.tile_uniform_capacity = next_cap;
     }
 }

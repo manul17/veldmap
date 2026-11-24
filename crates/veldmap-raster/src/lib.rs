@@ -24,8 +24,9 @@ pub use display::{
 };
 pub use pipeline::{
     BandInfo, DecodeContext, GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie,
-    LevelPlan, PassBusy, PassKey, PyramidMeta, RasterDescription, SampleType, ServeMode,
-    SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
+    LevelPlan, PassBusy, PassKey, PyramidMeta, RasterDescription, RasterSource, SampleType,
+    ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
+    frame_from_description,
 };
 pub use pool::{
     DecodeJob, DecodeJobKey, DecodeLane, DecodePool, DecodePoolConfig, DecodePoolHandle,

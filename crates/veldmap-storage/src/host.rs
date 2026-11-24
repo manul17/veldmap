@@ -23,10 +23,54 @@ pub fn detect_host_ram_bytes() -> Option<u64> {
         let text = std::str::from_utf8(&out.stdout).ok()?.trim();
         text.parse::<u64>().ok()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        detect_windows_ram_bytes()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         None
     }
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MemoryStatusEx {
+    dw_length: u32,
+    dw_memory_load: u32,
+    ull_total_phys: u64,
+    ull_avail_phys: u64,
+    ull_total_page_file: u64,
+    ull_avail_page_file: u64,
+    ull_total_virtual: u64,
+    ull_avail_virtual: u64,
+    ull_avail_extended_virtual: u64,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn detect_windows_ram_bytes() -> Option<u64> {
+    let mut status = MemoryStatusEx {
+        dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        dw_memory_load: 0,
+        ull_total_phys: 0,
+        ull_avail_phys: 0,
+        ull_total_page_file: 0,
+        ull_avail_page_file: 0,
+        ull_total_virtual: 0,
+        ull_avail_virtual: 0,
+        ull_avail_extended_virtual: 0,
+    };
+    // SAFETY: `status` is a properly initialized `MEMORYSTATUSEX` with
+    // `dw_length` set to its exact byte size, and `GlobalMemoryStatusEx` only
+    // writes into the provided buffer for the duration of the call.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0 && status.ull_total_phys > 0).then_some(status.ull_total_phys)
 }
 
 /// Detect physical host RAM and derive startup [`MemoryBudget`] caps, falling

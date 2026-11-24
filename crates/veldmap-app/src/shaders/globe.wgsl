@@ -17,6 +17,10 @@ struct CameraUniform {
     /// Polar cap stereographic disk scale `tan((90 - 85.05112878) / 2)`.
     polar_r_cap: f32,
     _pad0: f32,
+    /// Unit direction of the exact WGS84 ellipsoidal tangent horizon plane.
+    horizon_towards: vec3<f32>,
+    /// Eye-relative horizon threshold `horizon - dot(eye, horizon_towards)` (m).
+    horizon_eye_margin: f32,
 };
 
 struct TileUniform {

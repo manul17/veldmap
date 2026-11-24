@@ -13,4 +13,3 @@ Build instructions, design decisions, domain glossary, and current limitations. 
 
 - [plan.md](../plan.md) tracks the vertical-slice roadmap and working hypotheses for upcoming slices.
 - [decisions.md](decisions.md) records decisions only after they are proven in code (or for hard cross-slice invariants).
-- Documentation under `docs/` never links into the temporary `old/` reference directory.

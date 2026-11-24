@@ -1,13 +1,16 @@
 //! Scene/upload/decode-pool orchestration (`SceneState`) extracted from `app.rs`.
 //!
 //! Owns the GPU tile cache, bounded upload queue, shared two-lane CPU decode
-//! pool (`TwoLaneDecodePool`), basemap coordinator, cached immutable
-//! `DrawSnapshot`, and monotonic `scene_generation`.
+//! pool (`TwoLaneDecodePool`), basemap coordinator, ordered raster overlay
+//! `LayerStack` / `OverlayManager`, cached immutable `DrawSnapshot`, and
+//! monotonic `scene_generation`.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::camera::Camera;
+use veldmap_core::geo::footprint::FootprintBounds;
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::SourceId;
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
@@ -18,6 +21,7 @@ use crate::gpu_tiles::{
     DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
+use crate::layers::{CursorReadout, LayerId, LayerSummary, OverlayManager};
 use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
 use crate::settings::AppSettings;
 
@@ -55,20 +59,23 @@ impl SnapshotKey {
 }
 
 /// Coordinates tile caches, bounded GPU uploads, shared two-lane CPU decode
-/// threads, active basemap scheduling, and cached frame snapshots.
+/// threads, active basemap + raster overlay scheduling, and cached frame
+/// snapshots.
 pub(crate) struct SceneState {
     gpu_tile_cache: GpuTileCache,
     pending_uploads: PendingUploads,
     decode_shutdown: CancelToken,
     decode_pool: Option<TwoLaneDecodePool>,
     basemap: BasemapManager,
+    overlays: OverlayManager,
     cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
     scene_generation: u64,
 }
 
 impl SceneState {
-    /// Initialize GPU/upload caches, the shared two-lane CPU decode pool, and
-    /// basemap streaming from startup `budget` and persisted `settings`.
+    /// Initialize GPU/upload caches, the shared two-lane CPU decode pool,
+    /// basemap streaming, and local raster overlay management from startup
+    /// `budget` and persisted `settings`.
     pub(crate) fn new(
         settings: &AppSettings,
         disk_cache: Option<Arc<TileDiskCache>>,
@@ -88,10 +95,19 @@ impl SceneState {
 
         let basemap = BasemapManager::new(
             settings,
+            disk_cache.clone(),
+            done_tx.clone(),
+            Arc::clone(&wakeup),
+            decode_pool.handle().fast().clone(),
+            decode_shutdown.clone(),
+        );
+        let overlays = OverlayManager::new(
+            budget,
             disk_cache,
+            decode_pool.handle().fast().clone(),
+            decode_pool.handle().bulk().clone(),
             done_tx,
             wakeup,
-            decode_pool.handle().fast().clone(),
             decode_shutdown.clone(),
         );
 
@@ -101,6 +117,7 @@ impl SceneState {
             decode_shutdown,
             decode_pool: Some(decode_pool),
             basemap,
+            overlays,
             cached_snapshot: None,
             scene_generation: 1,
         };
@@ -108,8 +125,12 @@ impl SceneState {
         Ok(scene)
     }
 
-    fn pinned_root_sources(&self) -> [SourceId; 2] {
-        [self.basemap.active_source(), SourceId::BUNDLED_BASEMAP]
+    fn pinned_root_sources(&self) -> Vec<SourceId> {
+        let mut sources = vec![self.basemap.active_source(), SourceId::BUNDLED_BASEMAP];
+        self.overlays
+            .stack()
+            .extend_pinned_root_sources(&mut sources);
+        sources
     }
 
     fn sync_pinned_root_sources(&self) {
@@ -117,7 +138,8 @@ impl SceneState {
         self.pending_uploads.set_pinned_root_sources(&sources);
     }
 
-    /// Bump `scene_generation` after internal basemap or upload state changes.
+    /// Bump `scene_generation` after internal basemap, layer, or upload state
+    /// changes.
     fn mark_dirty(&mut self) {
         self.scene_generation = self.scene_generation.wrapping_add(1);
     }
@@ -136,6 +158,97 @@ impl SceneState {
     /// Snapshot toolbar-visible live streaming / config error status.
     pub(crate) fn basemap_status(&self) -> BasemapStatusSnapshot {
         self.basemap.status_snapshot()
+    }
+
+    /// Snapshot Layer List UI summaries for all loaded raster overlays.
+    pub(crate) fn layer_summaries(&self) -> Vec<LayerSummary> {
+        self.overlays.layer_summaries()
+    }
+
+    /// Open a local GeoTIFF/BigTIFF/COG overlay layer and return its ID and
+    /// geographic footprint bounds.
+    pub(crate) fn open_overlay_file(
+        &mut self,
+        path: &Path,
+    ) -> Result<(LayerId, Option<FootprintBounds>), String> {
+        let result = self.overlays.open_local_file(path, false)?;
+        self.sync_pinned_root_sources();
+        self.mark_dirty();
+        Ok(result)
+    }
+
+    /// Reload an existing overlay layer from disk, bypassing both the stat
+    /// fingerprint cache and any cached QOI disk tiles.
+    pub(crate) fn reload_overlay_bypass_cache(
+        &mut self,
+        id: LayerId,
+    ) -> Result<Option<FootprintBounds>, String> {
+        let bounds = self.overlays.reload_layer_bypass_cache(
+            id,
+            &mut self.gpu_tile_cache,
+            &mut self.pending_uploads,
+        )?;
+        self.sync_pinned_root_sources();
+        self.mark_dirty();
+        Ok(bounds)
+    }
+
+    /// Remove an overlay layer and reclaim its VRAM/pending/chunk state.
+    pub(crate) fn remove_overlay(&mut self, id: LayerId) -> bool {
+        let removed =
+            self.overlays
+                .remove_layer(id, &mut self.gpu_tile_cache, &mut self.pending_uploads);
+        if removed {
+            self.sync_pinned_root_sources();
+            self.mark_dirty();
+        }
+        removed
+    }
+
+    /// Toggle visibility of an overlay layer.
+    pub(crate) fn set_overlay_visible(&mut self, id: LayerId, visible: bool) -> bool {
+        let changed = self.overlays.set_visible(id, visible);
+        if changed {
+            self.sync_pinned_root_sources();
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    /// Set opacity (`0.0..=1.0`) of an overlay layer.
+    pub(crate) fn set_overlay_opacity(&mut self, id: LayerId, opacity: f32) -> bool {
+        let changed = self.overlays.set_opacity(id, opacity);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    /// Query the zoom-invariant native CPU display RGBA readout under
+    /// `(lat_deg, lon_deg)` on the topmost visible overlay.
+    pub(crate) fn cursor_overlay_readout(
+        &self,
+        lat_deg: f64,
+        lon_deg: f64,
+    ) -> Option<CursorReadout> {
+        self.overlays.query_cursor_readout(lat_deg, lon_deg)
+    }
+
+    /// Cancel any in-flight cursor readout probe (e.g. when moving off-globe).
+    pub(crate) fn cancel_cursor_readout(&self) {
+        self.overlays.cancel_cursor_readout();
+    }
+
+    /// Return the native source pixel size `(m_x, m_y)` of the topmost visible
+    /// overlay (used in the HUD when the cursor is not over a specific overlay).
+    pub(crate) fn topmost_visible_source_pixel_size_m(&self) -> Option<(f64, f64)> {
+        self.overlays
+            .stack()
+            .layers()
+            .iter()
+            .rev()
+            .find(|l| l.visible)
+            .and_then(|l| l.source_pixel_size_m)
     }
 
     /// Synchronize basemap providers with updated [`AppSettings`], purging any
@@ -173,7 +286,8 @@ impl SceneState {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> UploadBatchReport {
-        let wanted = self.basemap.wanted_tile_sets();
+        let mut wanted = self.basemap.wanted_tile_sets().to_vec();
+        self.overlays.stack().extend_wanted_tile_sets(&mut wanted);
         let protected = self
             .cached_snapshot
             .as_ref()
@@ -190,6 +304,7 @@ impl SceneState {
             },
         );
         self.basemap.record_upload_report(&report);
+        self.overlays.record_upload_report(&report);
         if report.uploaded > 0 {
             self.mark_dirty();
         }
@@ -226,7 +341,7 @@ impl SceneState {
         let policy = self.basemap.carrier_policy();
         let carrier =
             textured.then_some((&policy as &dyn TileCarrierPolicy, &mut self.gpu_tile_cache));
-        let snapshot = Arc::new(DrawSnapshot::build(
+        let mut snapshot_inner = DrawSnapshot::build(
             SnapshotBuildParams {
                 camera,
                 width_px,
@@ -236,17 +351,37 @@ impl SceneState {
                 config: &quadtree_config,
             },
             carrier,
-        ));
+        );
 
-        let weight = self.basemap.appetite_weight_bytes();
-        let appetite_bytes = self
+        let basemap_weight = if textured {
+            self.basemap.appetite_weight_bytes()
+        } else {
+            0
+        };
+        let overlay_weight = self.overlays.stack().total_appetite_weight_bytes();
+        let total_weight = basemap_weight.saturating_add(overlay_weight).max(1);
+
+        let overlay_layers = self.overlays.build_and_schedule(
+            &camera,
+            width_px,
+            height_px,
+            &mut self.gpu_tile_cache,
+            &self.pending_uploads,
+            total_weight,
+            &mut snapshot_inner.carrier_keys,
+        );
+        snapshot_inner.overlays = overlay_layers;
+
+        let snapshot = Arc::new(snapshot_inner);
+
+        let basemap_appetite_bytes = self
             .gpu_tile_cache
-            .proportional_pyramid_byte_cap(weight, weight);
+            .proportional_pyramid_byte_cap(basemap_weight, total_weight);
         self.basemap.schedule_for_tiles(
             snapshot.visible_tex_ids(),
             &self.gpu_tile_cache,
             &self.pending_uploads,
-            appetite_bytes,
+            basemap_appetite_bytes,
         );
 
         self.cached_snapshot = Some((key, Arc::clone(&snapshot)));
@@ -254,8 +389,9 @@ impl SceneState {
     }
 
     /// Phase 1 of deterministic shutdown: cancel all worker tokens and signal
-    /// live/bundled pipelines BEFORE closing `PendingUploads`.
+    /// live/bundled/overlay pipelines BEFORE closing `PendingUploads`.
     pub(crate) fn begin_shutdown(&mut self) {
+        self.overlays.begin_shutdown();
         self.basemap.begin_shutdown();
         self.decode_shutdown.cancel();
     }

@@ -16,6 +16,7 @@ pub(crate) mod radiometry;
 pub(crate) mod resample;
 pub(crate) mod scheduler;
 pub(crate) mod singleflight;
+pub(crate) mod source;
 
 pub use cascade::TileEmit;
 pub use chunk_cache::SharedChunkCache;
@@ -25,6 +26,7 @@ pub use metadata::{
 };
 pub use plan::{LevelPlan, PassKey, PyramidMeta, ServeMode};
 pub use scheduler::{PassBusy, TileFailureOutcome, TileScheduler};
+pub use source::{RasterSource, frame_from_description};
 
 /// Shared runtime context passed into analytical raster decoding calls.
 pub struct DecodeContext<'a> {

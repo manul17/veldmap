@@ -3,7 +3,7 @@
 
 use naga::back::{hlsl, msl, spv};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use veldmap_app::render::{COMPOSITE_WGSL, GLOBE_WGSL};
+use veldmap_app::render::{COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_WGSL};
 
 fn validate_and_compile_all_backends(name: &str, wgsl_source: &str) {
     let module = naga::front::wgsl::parse_str(wgsl_source).unwrap_or_else(|err| {
@@ -66,5 +66,6 @@ fn validate_and_compile_all_backends(name: &str, wgsl_source: &str) {
 #[test]
 fn globe_and_composite_shaders_compile_to_spv_hlsl_msl() {
     validate_and_compile_all_backends("globe.wgsl", GLOBE_WGSL);
+    validate_and_compile_all_backends("overlay.wgsl", OVERLAY_WGSL);
     validate_and_compile_all_backends("composite.wgsl", COMPOSITE_WGSL);
 }

@@ -36,9 +36,19 @@ fn main() -> eframe::Result<()> {
         );
     }
 
+    let startup_files: Vec<std::path::PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(std::path::PathBuf::from)
+        .collect();
+
     eframe::run_native(
         veldmap_core::APP_NAME,
         options,
-        Box::new(|cc| Ok(Box::new(VeldmapApp::new(cc)?))),
+        Box::new(move |cc| {
+            Ok(Box::new(VeldmapApp::new_with_startup_files(
+                cc,
+                startup_files,
+            )?))
+        }),
     )
 }

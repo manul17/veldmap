@@ -5,11 +5,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use veldmap_core::geo::camera::Camera;
+use veldmap_core::glam::DVec3;
 use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, traverse};
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
 
 use super::adaptive_grid_step_deg;
+use super::overlay::OverlayMeshKey;
 
 /// Strategy resolving the finest cached GPU carrier tile and composed UV
 /// sub-rectangle for a visible quadtree texture tile.
@@ -33,15 +35,39 @@ pub struct SnapshotBuildParams<'a> {
     pub config: &'a QuadtreeConfig,
 }
 
-/// Single tile draw entry inside an immutable [`DrawSnapshot`].
+/// Single planetary basemap tile draw entry inside an immutable
+/// [`DrawSnapshot`].
 #[derive(Clone, Debug)]
 pub struct DrawTile {
     pub visible: VisibleTile,
     /// Resolved GPU carrier texture (`None` in Ellipsoid-only mode or before
     /// any coarse ancestor tile has uploaded).
     pub texture: Option<Arc<GpuTile>>,
-    /// Final UV sub-rectangle in `texture`'s coordinate space.
+    /// Final UV sub-rectangle `(u_offset, v_offset, u_scale, v_scale)` in
+    /// `texture`'s coordinate space.
     pub uv_rect: [f32; 4],
+}
+
+/// Single draped raster overlay warp-mesh cell inside [`DrawOverlayLayer`].
+#[derive(Clone, Debug)]
+pub struct DrawOverlayPatch {
+    pub mesh_key: OverlayMeshKey,
+    pub origin_ecef_m: DVec3,
+    pub segments: u32,
+    pub flip_winding: bool,
+    /// Shared CPU RTC relative vertex positions (`(segments + 1)^2` entries)
+    /// uploaded lazily on cache miss in the overlay renderer.
+    pub rel_positions: Arc<[[f32; 3]]>,
+    /// Carrier UV sub-rectangle `(u_offset, v_offset, u_scale, v_scale)`.
+    pub uv_rect: [f32; 4],
+    pub texture: Arc<GpuTile>,
+}
+
+/// Ordered draped raster overlay layer in painter's order (bottom-to-top).
+#[derive(Clone, Debug)]
+pub struct DrawOverlayLayer {
+    pub opacity: f32,
+    pub patches: Vec<DrawOverlayPatch>,
 }
 
 /// Immutable per-frame draw snapshot built on the app thread (cached by
@@ -51,8 +77,13 @@ pub struct DrawTile {
 pub struct DrawSnapshot {
     pub camera: Camera,
     pub tiles: Vec<DrawTile>,
-    /// Exact GPU carrier tile keys referenced by `tiles`, used for active-frame
-    /// `TileCache` protection so uploads never evict currently visible tiles.
+    /// Ordered post-body draped raster overlays rendered bottom-to-top inside
+    /// Pass 2 (`depth_stencil_attachment: None`) before the procedural
+    /// graticule.
+    pub overlays: Vec<DrawOverlayLayer>,
+    /// Exact GPU carrier tile keys referenced by `tiles` and `overlays`, used
+    /// for active-frame `TileCache` protection so uploads never evict currently
+    /// visible tiles.
     pub carrier_keys: HashSet<TileKey>,
     pub grid_cells: u32,
     pub show_graticule: bool,
@@ -61,7 +92,7 @@ pub struct DrawSnapshot {
 }
 
 impl DrawSnapshot {
-    /// Iterator over the texture tile IDs needed by this snapshot.
+    /// Iterator over the texture tile IDs needed by the basemap quadtree.
     pub fn visible_tex_ids(&self) -> impl Iterator<Item = QuadTileId> + '_ {
         self.tiles.iter().map(|t| t.visible.tex_id)
     }
@@ -109,6 +140,7 @@ impl DrawSnapshot {
         Self {
             camera: params.camera,
             tiles,
+            overlays: Vec::new(),
             carrier_keys,
             grid_cells: params.config.grid_cells.max(1),
             show_graticule: params.show_graticule,

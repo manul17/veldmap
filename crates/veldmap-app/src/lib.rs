@@ -6,6 +6,7 @@
 mod app;
 mod basemap;
 pub mod gpu_tiles;
+mod layers;
 pub mod render;
 mod scene;
 mod settings;

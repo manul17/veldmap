@@ -7,6 +7,7 @@ pub mod cull;
 pub mod footprint;
 pub mod geodesy;
 pub mod mgrs;
+pub mod overlay;
 pub mod projection;
 pub mod sag;
 
@@ -16,4 +17,8 @@ pub use cull::{Ball, CullFrustum};
 pub use footprint::{FootprintBounds, GeoPoint, Ring};
 pub use geodesy::{Ellipsoid, Geodetic, WGS84};
 pub use mgrs::{MgrsError, MgrsGranuleFrame};
+pub use overlay::{
+    Frame, MAX_WARP_SEGMENTS, MIN_WARP_SEGMENTS, OverlayCullTree, Tie, TieGrid, WarpPatch,
+    build_warp_patch,
+};
 pub use projection::{Datum, Projection, System};

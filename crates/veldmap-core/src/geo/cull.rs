@@ -109,6 +109,25 @@ impl CullFrustum {
         }
     }
 
+    /// Exact WGS84 ellipsoidal tangent horizon plane `(towards, horizon)` in
+    /// `f64` ECEF metres, where a surface point `p` is on the visible
+    /// hemisphere iff `p.dot(towards) >= horizon`.
+    pub fn horizon_plane(&self) -> (DVec3, f64) {
+        (self.towards, self.horizon)
+    }
+
+    /// Eye-relative horizon threshold `horizon - eye.dot(towards)` in `f64`
+    /// metres.
+    ///
+    /// For an eye-relative fragment position `world = p - eye`, `p` lies on the
+    /// visible side of the WGS84 horizon iff
+    /// `world.dot(towards) >= horizon_eye_margin`. Evaluating the subtraction
+    /// in `f64` on CPU eliminates `f32` catastrophic cancellation at `2 m`
+    /// camera altitudes.
+    pub fn horizon_eye_margin(&self) -> f64 {
+        self.horizon - self.eye.dot(self.towards)
+    }
+
     /// Signed distance in metres of `point` above (`>= 0`) or below (`< 0`)
     /// the exact WGS84 ellipsoidal tangent horizon plane.
     pub fn horizon_margin(&self, point: DVec3) -> f64 {

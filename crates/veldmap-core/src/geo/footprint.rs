@@ -115,7 +115,7 @@ fn inside(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
 ///
 /// Pixel-centered global grids may fall half a pixel short of 360 degrees
 /// (for example `-179.9875 -> 179.9875`).
-const FULL_CIRCLE_DEG: f64 = 359.0;
+pub(crate) const FULL_CIRCLE_DEG: f64 = 359.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Along {
@@ -153,7 +153,7 @@ fn edge_span(from: (f64, f64), to: (f64, f64)) -> f64 {
 
 /// Point along an edge at fraction `t`, following a parallel, meridian, or
 /// great-circle arc according to the endpoint geometry.
-fn edge_point(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
+pub(crate) fn edge_point(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
     match along(from, to) {
         Along::Parallel => (from.0, from.1 + sweep(from, to) * t),
         Along::Meridian => (from.0 + (to.0 - from.0) * t, from.1),

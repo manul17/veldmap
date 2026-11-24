@@ -444,3 +444,88 @@ fn concurrent_reads_and_writes_keep_budget_and_accounting_consistent() {
     assert_eq!(stats.payload_bytes, stats.tile_count * 128);
     assert_eq!(count_rows(&cache, "tile_blobs") as u64, stats.tile_count);
 }
+
+#[test]
+fn qoi_rgba8_round_trips_and_purges_corrupt_entries() {
+    let (_dir, cache) = open_temp_cache("qoi-rgba8", 2 * 1024 * 1024);
+    let source = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let k = DiskTileKey::from_tile_key(
+        source,
+        &TileKey {
+            source: veldmap_core::tile::SourceId::from_stable_key(source),
+            band: BandKey::Display,
+            scheme: TileScheme::RasterPyramid { max_level: 3 },
+            format: PixelFormat::Rgba8UnormSrgb,
+            gutter: 0,
+            decode_rev: 1,
+            level: 0,
+            x: 2,
+            y: 1,
+        },
+    );
+
+    let (w, h) = (32u32, 24u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            rgba.extend_from_slice(&[
+                (x * 7) as u8,
+                (y * 11) as u8,
+                ((x ^ y) * 5) as u8,
+                if (x + y) % 5 == 0 { 0 } else { 255 },
+            ]);
+        }
+    }
+
+    cache.put_qoi_rgba8(&k, w, h, &rgba).expect("put qoi");
+    // `get()` only returns `EncodedImage`, so `Qoi` must not alias raw HTTP tiles.
+    assert!(cache.get(&k).expect("get encoded image").is_none());
+    assert_eq!(
+        cache.get_qoi_rgba8(&k).expect("get qoi"),
+        Some((w, h, rgba))
+    );
+
+    // Corrupt QOI bytes must self-heal by deleting the bad entry and returning None.
+    cache
+        .put_encoded(&k, TileBlobEncoding::Qoi, b"not-a-valid-qoi-stream")
+        .expect("put corrupt qoi");
+    assert!(cache.get_qoi_rgba8(&k).expect("corrupt qoi miss").is_none());
+    assert_eq!(cache.stats().expect("stats after purge").tile_count, 0);
+
+    // Oversized QOI header (e.g. bit-flip claiming 10000x10000 RGBA = 400 MiB)
+    // must be rejected BEFORE allocating pixels and purged cleanly.
+    let mut bad_header = Vec::with_capacity(22);
+    bad_header.extend_from_slice(b"qoif");
+    bad_header.extend_from_slice(&10_000u32.to_be_bytes());
+    bad_header.extend_from_slice(&10_000u32.to_be_bytes());
+    bad_header.push(4); // RGBA
+    bad_header.push(0); // sRGB
+    bad_header.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+    cache
+        .put_encoded(&k, TileBlobEncoding::Qoi, &bad_header)
+        .expect("put oversized qoi header");
+    assert!(
+        cache
+            .get_qoi_rgba8(&k)
+            .expect("oversized qoi header rejected")
+            .is_none()
+    );
+    assert_eq!(
+        cache
+            .stats()
+            .expect("stats after oversized purge")
+            .tile_count,
+        0
+    );
+
+    // Non-Rgba8 format is rejected.
+    let float_key = DiskTileKey {
+        format: PixelFormat::R32Float,
+        ..k
+    };
+    assert!(
+        cache
+            .put_qoi_rgba8(&float_key, 1, 1, &[0, 0, 0, 255])
+            .is_err()
+    );
+}

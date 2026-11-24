@@ -2,6 +2,7 @@
 
 pub(crate) mod basemap;
 pub(crate) mod hud;
+pub(crate) mod layers;
 mod settings_window;
 pub(crate) mod toolbar;
 

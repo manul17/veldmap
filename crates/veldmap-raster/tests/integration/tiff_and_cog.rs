@@ -802,3 +802,150 @@ fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
     release.cancel();
     assert!(leader.join().expect("join leader").is_ok());
 }
+
+#[test]
+fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() {
+    use veldmap_core::geo::geodesy::{Geodetic, WGS84};
+    use veldmap_core::geo::overlay::{build_warp_patch, evaluate_warp_patch_ecef};
+    use veldmap_core::geo::projection::Projection;
+    use veldmap_raster::{RasterSource, frame_from_description};
+
+    let build_geotiff = |raster_type_key: u16| -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut enc = TiffEncoder::new(&mut buf).expect("tiff encoder");
+            let mut dir = enc.image_directory().expect("dir");
+            let (w, h) = (64u32, 64u32);
+            dir.write_tag(Tag::ImageWidth, w).expect("tag");
+            dir.write_tag(Tag::ImageLength, h).expect("tag");
+            dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
+                .expect("tag");
+            dir.write_tag(Tag::Compression, 1u16).expect("tag");
+            dir.write_tag(Tag::PhotometricInterpretation, 2u16)
+                .expect("tag");
+            dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("tag");
+            dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
+            dir.write_tag(Tag::RowsPerStrip, h).expect("tag");
+            let data = rgb_pattern(w, h);
+            let at = dir.write_data(&data[..]).expect("write");
+            dir.write_tag(Tag::StripOffsets, &[at as u32][..])
+                .expect("tag");
+            dir.write_tag(Tag::StripByteCounts, &[data.len() as u32][..])
+                .expect("tag");
+            let geokeys: [u16; 16] = [
+                1,
+                1,
+                0,
+                3, // header: 3 keys
+                1024,
+                0,
+                1,
+                1, // GTModelTypeGeoKey = Projected
+                1025,
+                0,
+                1,
+                raster_type_key, // GTRasterTypeGeoKey
+                3072,
+                0,
+                1,
+                32637, // ProjectedCSTypeGeoKey = EPSG:32637
+            ];
+            dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+                .expect("tag");
+            // Pixel scale = 10 m/px; tiepoint pixel (0, 0) at (550_000, 5_250_000).
+            dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
+                .expect("tag");
+            dir.write_tag(
+                Tag::ModelTiepointTag,
+                &[0.0_f64, 0.0, 0.0, 550_000.0, 5_250_000.0, 0.0][..],
+            )
+            .expect("tag");
+            dir.finish().expect("finish");
+        }
+        buf.into_inner()
+    };
+
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
+    let bytes_area = build_geotiff(1);
+    let bytes_point = build_geotiff(2);
+    let src_area: Arc<dyn RasterSource> = Arc::new(
+        TiffSource::open(
+            Arc::new(MemoryByteSource::new(Arc::from(bytes_area.as_slice()))),
+            fake_fingerprint(&bytes_area),
+            &budget,
+            &cancel,
+        )
+        .expect("open PixelIsArea"),
+    );
+    let src_point: Arc<dyn RasterSource> = Arc::new(
+        TiffSource::open(
+            Arc::new(MemoryByteSource::new(Arc::from(bytes_point.as_slice()))),
+            fake_fingerprint(&bytes_point),
+            &budget,
+            &cancel,
+        )
+        .expect("open PixelIsPoint"),
+    );
+
+    let frame_area = frame_from_description(src_area.description()).expect("area frame");
+    let frame_point = frame_from_description(src_point.description()).expect("point frame");
+
+    let patch_area = build_warp_patch(&frame_area, 64, 64, [0.0, 0.0, 64.0, 64.0]);
+    let patch_point = build_warp_patch(&frame_point, 64, 64, [0.0, 0.0, 64.0, 64.0]);
+
+    let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
+    let geo_area = WGS84.from_ecef(evaluate_warp_patch_ecef(&patch_area, 0.0, 0.0));
+    let geo_point = WGS84.from_ecef(evaluate_warp_patch_ecef(&patch_point, 0.0, 0.0));
+    let (ea, na) = utm37.from_geodetic(geo_area.lat_deg, geo_area.lon_deg);
+    let (ep, np) = utm37.from_geodetic(geo_point.lat_deg, geo_point.lon_deg);
+
+    // PixelIsArea UL corner lands at (550_000, 5_250_000).
+    assert!((ea - 550_000.0).abs() < 0.002, "area easting={ea}");
+    assert!((na - 5_250_000.0).abs() < 0.002, "area northing={na}");
+    // PixelIsPoint shifts UL corner by exact (-0.5 px, +0.5 px) = (-5.0 m, +5.0 m).
+    assert!((ep - 549_995.0).abs() < 0.002, "point easting={ep}");
+    assert!((np - 5_250_005.0).abs() < 0.002, "point northing={np}");
+    let exact_pt_ul = WGS84.to_ecef(Geodetic::surface(
+        utm37.to_geodetic(549_995.0, 5_250_005.0).0,
+        utm37.to_geodetic(549_995.0, 5_250_005.0).1,
+    ));
+    let drawn_pt_ul = evaluate_warp_patch_ecef(&patch_point, 0.0, 0.0);
+    assert!(exact_pt_ul.distance(drawn_pt_ul) < 0.002);
+
+    // Zoom-invariant native base-IFD display readout matches synthetic RGB pattern.
+    let (px, py) = (17u32, 23u32);
+    let expected = [
+        (px * 7 + py * 3) as u8,
+        (px ^ py) as u8,
+        ((px * py) / 97) as u8,
+        255,
+    ];
+    assert_eq!(
+        src_area
+            .sample_display_rgba(px, py, &ctx)
+            .expect("sample area"),
+        Some(expected)
+    );
+    assert_eq!(
+        src_point
+            .sample_display_rgba(px, py, &ctx)
+            .expect("sample point"),
+        Some(expected)
+    );
+    assert_eq!(
+        src_area
+            .sample_display_rgba(64, 0, &ctx)
+            .expect("out of bounds"),
+        None
+    );
+}

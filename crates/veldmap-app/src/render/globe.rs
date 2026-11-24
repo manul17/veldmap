@@ -1,15 +1,19 @@
 //! Standalone offscreen `wgpu` WGS84 quadtree globe renderer (`GlobeRenderer`).
-
-use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+//!
+//! Renders in two distinct passes:
+//! 1. **Pass 1 (Opaque globe body):** `Rgba8UnormSrgb` color clear +
+//!    `Depth32Float` Reverse-Z (`TRANSIENT_ATTACHMENT`, `StoreOp::Discard`).
+//! 2. **Pass 2 (Post-body overlays + procedural graticule):**
+//!    `depth_stencil_attachment: None`, `LoadOp::Load` over the globe body so
+//!    draped raster warp meshes and future interleaved analytical passes share
+//!    the exact same depth-less color pipelines without duplicating shaders.
 
 use veldmap_core::tile::{POLAR_R_CAP, PixelFormat};
 
-use crate::gpu_tiles::GpuTile;
-
 use super::CLEAR_COLOR_LINEAR;
 use super::mesh::TileMeshCache;
-use super::pipelines::GlobePipelines;
+use super::overlay::OverlayRenderer;
+use super::pipelines::{GlobePipelines, TileBindGroupCache};
 use super::snapshot::DrawSnapshot;
 use super::uniforms::{CameraUniform, TILE_KIND_GEO, TileUniform, tile_graticule_uniform};
 use super::viewport::{RenderParams, ViewportState};
@@ -20,34 +24,39 @@ pub struct GlobeRenderer {
     /// Shared static quadtree index buffer + bounded LRU cache of per-tile
     /// CPU `f64` RTC vertex buffers.
     meshes: TileMeshCache,
-    /// Lightweight `BindGroup` cache keyed by `GpuTile::tile_id` and guarded
-    /// by `Weak<GpuTile>`, so evicted tiles are swept automatically without
-    /// losing eviction events across discarded `egui` passes.
-    tile_bind_groups: HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)>,
-    /// Reusable staging scratch buffer for dynamic per-tile uniforms.
-    uniform_staging: Vec<u8>,
+    /// Extracted post-body warp-mesh overlay renderer.
+    overlay: OverlayRenderer,
+    /// `PixelFormat`-partitioned `BindGroup` caches guarded by `Weak<GpuTile>`.
+    tile_bind_groups: TileBindGroupCache,
+    /// Per-frame dynamic uniform byte offsets for `snapshot.tiles`.
+    tile_uniform_offsets: Vec<u32>,
+    /// Per-frame dynamic uniform byte offsets for `snapshot.overlays`.
+    overlay_uniform_offsets: Vec<u32>,
     viewport: ViewportState,
 }
 
 impl GlobeRenderer {
-    /// Create all shared GPU pipelines, static quadtree index buffer, and
-    /// primary `ViewportState` targeting `target_format`.
+    /// Create all shared GPU pipelines, static quadtree index buffer, overlay
+    /// renderer, and primary `ViewportState` targeting `target_format`.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let pipelines = GlobePipelines::new(device, target_format);
         let meshes = TileMeshCache::new(device);
+        let overlay = OverlayRenderer::new(device, &pipelines);
         let viewport = ViewportState::new(
             device,
             target_format,
             &pipelines.camera_layout,
             &pipelines.tile_uniform_layout,
-            pipelines.tile_uniform_stride,
+            &pipelines.overlay_uniform_layout,
         );
 
         Self {
             pipelines,
             meshes,
-            tile_bind_groups: HashMap::new(),
-            uniform_staging: Vec::new(),
+            overlay,
+            tile_bind_groups: TileBindGroupCache::default(),
+            tile_uniform_offsets: Vec::new(),
+            overlay_uniform_offsets: Vec::new(),
             viewport,
         }
     }
@@ -55,11 +64,11 @@ impl GlobeRenderer {
     /// Drop cached `BindGroup` entries whose backing `GpuTile` has been
     /// evicted from `GpuTileCache` and released by all active snapshots.
     pub fn sweep_stale_bind_groups(&mut self) {
-        self.tile_bind_groups
-            .retain(|_, (weak, _)| weak.strong_count() > 0);
+        self.tile_bind_groups.sweep_stale();
     }
 
-    /// Number of currently cached tile texture bind groups.
+    /// Number of currently cached tile texture bind groups across all
+    /// `PixelFormat` partitions.
     pub fn cached_tile_bind_group_count(&self) -> usize {
         self.tile_bind_groups.len()
     }
@@ -95,7 +104,7 @@ impl GlobeRenderer {
         );
         self.prepare_tile_resources(device, params.snapshot);
         self.upload_uniforms(device, queue, width, height, params.snapshot);
-        self.record_offscreen_pass(encoder, params.snapshot);
+        self.record_offscreen_passes(encoder, params.snapshot);
         self.viewport.mark_rendered(width, height, params.snapshot);
         true
     }
@@ -118,43 +127,17 @@ impl GlobeRenderer {
 
         for draw in &snapshot.tiles {
             if let Some(gpu_tile) = &draw.texture {
-                if gpu_tile.format != PixelFormat::Rgba8UnormSrgb {
-                    tracing::warn!(
-                        tile_id = gpu_tile.tile_id,
-                        format = ?gpu_tile.format,
-                        "Skipping non-sRGB tile texture in filterable basemap pipeline"
-                    );
-                    continue;
-                }
-                let reuse =
-                    self.tile_bind_groups
-                        .get(&gpu_tile.tile_id)
-                        .is_some_and(|(weak, _)| {
-                            weak.strong_count() > 0
-                                && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
-                        });
-                if !reuse {
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("globe tile texture bind group"),
-                        layout: &self.pipelines.tile_texture_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&gpu_tile.view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(
-                                    &self.pipelines.tile_sampler,
-                                ),
-                            },
-                        ],
-                    });
-                    self.tile_bind_groups
-                        .insert(gpu_tile.tile_id, (Arc::downgrade(gpu_tile), bg));
-                }
+                self.tile_bind_groups
+                    .ensure(device, &self.pipelines, gpu_tile);
             }
         }
+
+        self.overlay.prepare_resources(
+            device,
+            &self.pipelines,
+            &mut self.tile_bind_groups,
+            snapshot,
+        );
     }
 
     fn upload_uniforms(
@@ -166,16 +149,20 @@ impl GlobeRenderer {
         snapshot: &DrawSnapshot,
     ) {
         let aspect = f64::from(width) / f64::from(height.max(1));
+        let vp = snapshot.camera.view_projection(aspect);
+        let eye = snapshot.camera.eye_ecef();
+        let frustum = veldmap_core::geo::CullFrustum::new(&vp, eye);
+        let (horizon_towards, _) = frustum.horizon_plane();
+        let horizon_eye_margin = frustum.horizon_eye_margin() as f32;
+
         let cam_uniform = CameraUniform {
-            view_proj: snapshot
-                .camera
-                .view_projection(aspect)
-                .as_mat4()
-                .to_cols_array_2d(),
+            view_proj: vp.as_mat4().to_cols_array_2d(),
             grid_step_deg: snapshot.grid_step_deg as f32,
             grid_width_px: snapshot.grid_width_px,
             polar_r_cap: POLAR_R_CAP as f32,
             _pad0: 0.0,
+            horizon_towards: horizon_towards.as_vec3().to_array(),
+            horizon_eye_margin,
         };
         queue.write_buffer(
             self.viewport.camera_buffer(),
@@ -183,29 +170,13 @@ impl GlobeRenderer {
             bytemuck::bytes_of(&cam_uniform),
         );
 
-        let tile_count = snapshot.tiles.len();
-        if tile_count == 0 {
-            return;
-        }
-        self.viewport.ensure_tile_uniform_capacity(
-            device,
-            &self.pipelines.tile_uniform_layout,
-            self.pipelines.tile_uniform_stride,
-            tile_count,
-        );
+        let arena = self.viewport.uniform_arena_mut();
+        arena.reset();
+        self.tile_uniform_offsets.clear();
 
-        let stride = self.pipelines.tile_uniform_stride as usize;
-        let total_bytes = tile_count * stride;
-        self.uniform_staging.clear();
-        self.uniform_staging.resize(total_bytes, 0);
-
-        let eye = snapshot.camera.eye_ecef();
         let step_deg = snapshot.grid_step_deg.max(1e-6);
-
-        for (i, draw) in snapshot.tiles.iter().enumerate() {
+        for draw in &snapshot.tiles {
             let offset_eye = (draw.visible.origin_ecef_m - eye).as_vec3().to_array();
-            // `tile_kind` and `grid_anchor` are only consumed by `fs_grid`; skip
-            // per-tile anchor math when graticule is off.
             let (tile_kind, grid_anchor) = if snapshot.show_graticule {
                 let cached_anchor = self.meshes.peek(&draw.visible.id).map(|m| m.grid_anchor);
                 tile_graticule_uniform(draw.visible.id, cached_anchor, step_deg)
@@ -219,15 +190,17 @@ impl GlobeRenderer {
                 uv_rect: draw.uv_rect,
                 grid_anchor,
             };
-            let bytes = bytemuck::bytes_of(&u);
-            let dst_start = i * stride;
-            self.uniform_staging[dst_start..dst_start + bytes.len()].copy_from_slice(bytes);
+            self.tile_uniform_offsets.push(arena.push(&u));
         }
 
-        queue.write_buffer(
-            self.viewport.tile_uniform_buffer(),
-            0,
-            &self.uniform_staging[..total_bytes],
+        self.overlay
+            .push_uniforms(arena, snapshot, eye, &mut self.overlay_uniform_offsets);
+
+        arena.flush(
+            device,
+            queue,
+            &self.pipelines.tile_uniform_layout,
+            &self.pipelines.overlay_uniform_layout,
         );
     }
 
@@ -235,19 +208,20 @@ impl GlobeRenderer {
         let mut last_textured: Option<bool> = None;
         let mut last_tex_id: Option<u64> = None;
         let full_indices = self.meshes.full_indices();
+        let arena = self.viewport.uniform_arena();
+
         for (i, draw) in snapshot.tiles.iter().enumerate() {
             let Some(mesh) = self.meshes.peek(&draw.visible.id) else {
                 continue;
             };
-            let dyn_offset = (i as u32) * self.pipelines.tile_uniform_stride;
+            let dyn_offset = self.tile_uniform_offsets[i];
             pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-            pass.set_bind_group(1, self.viewport.tile_uniform_bind_group(), &[dyn_offset]);
+            pass.set_bind_group(1, arena.tile_bind_group(), &[dyn_offset]);
 
             if let Some(gpu_tile) = &draw.texture
-                && gpu_tile.format == PixelFormat::Rgba8UnormSrgb
-                && let Some((weak, tex_bg)) = self.tile_bind_groups.get(&gpu_tile.tile_id)
-                && weak.strong_count() > 0
-                && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
+                && let Some(tex_bg) = self
+                    .tile_bind_groups
+                    .get(gpu_tile, PixelFormat::Rgba8UnormSrgb)
             {
                 if last_textured != Some(true) {
                     pass.set_pipeline(&self.pipelines.body_textured_pipeline);
@@ -272,62 +246,96 @@ impl GlobeRenderer {
         snapshot: &DrawSnapshot,
     ) {
         pass.set_pipeline(&self.pipelines.grid_pipeline);
-        let surface_indices = self.meshes.surface_indices();
-        for (i, draw) in snapshot.tiles.iter().enumerate() {
-            let Some(mesh) = self.meshes.peek(&draw.visible.id) else {
-                continue;
-            };
-            let dyn_offset = (i as u32) * self.pipelines.tile_uniform_stride;
-            pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-            pass.set_bind_group(1, self.viewport.tile_uniform_bind_group(), &[dyn_offset]);
-            pass.draw_indexed(surface_indices.clone(), 0, 0..1);
-        }
-    }
-
-    fn record_offscreen_pass(&self, encoder: &mut wgpu::CommandEncoder, snapshot: &DrawSnapshot) {
-        let Some(target) = self.viewport.offscreen() else {
-            return;
-        };
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("globe offscreen pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.color_srgb_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(CLEAR_COLOR_LINEAR),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &target.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    // Reverse-Z: infinity clears to 0.0, near plane maps to 1.0.
-                    load: wgpu::LoadOp::Clear(0.0),
-                    store: wgpu::StoreOp::Discard,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-
         pass.set_index_buffer(
             self.meshes.index_buffer().slice(..),
             wgpu::IndexFormat::Uint32,
         );
-        pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
+        let surface_indices = self.meshes.surface_indices();
+        let arena = self.viewport.uniform_arena();
 
-        // Pass 1: Opaque WGS84 quadtree surface + downward skirts (Reverse-Z).
-        self.record_body_pass(&mut pass, snapshot);
+        for (i, draw) in snapshot.tiles.iter().enumerate() {
+            let Some(mesh) = self.meshes.peek(&draw.visible.id) else {
+                continue;
+            };
+            let dyn_offset = self.tile_uniform_offsets[i];
+            pass.set_vertex_buffer(0, mesh.buffer.slice(..));
+            pass.set_bind_group(1, arena.tile_bind_group(), &[dyn_offset]);
+            pass.draw_indexed(surface_indices.clone(), 0, 0..1);
+        }
+    }
 
-        // Pass 2: Post-overlay transparent procedural `fwidth()` graticule
-        // reusing the exact same quadtree vertex/index buffers (`surface` only,
-        // skipping skirts) so draped raster overlays never bury it.
-        if snapshot.show_graticule {
-            self.record_graticule_pass(&mut pass, snapshot);
+    fn record_offscreen_passes(&self, encoder: &mut wgpu::CommandEncoder, snapshot: &DrawSnapshot) {
+        let Some(target) = self.viewport.offscreen() else {
+            return;
+        };
+
+        // Pass 1: Opaque WGS84 quadtree surface + downward skirts (Reverse-Z,
+        // memoryless `TRANSIENT_ATTACHMENT` + `StoreOp::Discard`).
+        {
+            let mut body_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("globe opaque body pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_srgb_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR_LINEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        // Reverse-Z: infinity clears to 0.0, near plane maps to 1.0.
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            body_pass.set_index_buffer(
+                self.meshes.index_buffer().slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            body_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
+            self.record_body_pass(&mut body_pass, snapshot);
+        }
+
+        // Pass 2: Depth-less (`depth_stencil_attachment: None`, `LoadOp::Load`)
+        // post-body raster overlays + procedural `fwidth()` graticule.
+        if !snapshot.overlays.is_empty() || snapshot.show_graticule {
+            let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("globe post-body overlay & graticule pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_srgb_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
+            self.overlay.record_pass(
+                &mut post_pass,
+                self.viewport.uniform_arena(),
+                &self.tile_bind_groups,
+                snapshot,
+                &self.overlay_uniform_offsets,
+            );
+            if snapshot.show_graticule {
+                self.record_graticule_pass(&mut post_pass, snapshot);
+            }
         }
     }
 }

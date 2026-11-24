@@ -8,13 +8,18 @@
 
 mod globe;
 mod mesh;
+mod overlay;
 mod pipelines;
 mod snapshot;
 mod uniforms;
 mod viewport;
 
 pub use globe::GlobeRenderer;
-pub use snapshot::{DrawSnapshot, DrawTile, SnapshotBuildParams, TileCarrierPolicy};
+pub use overlay::OverlayMeshKey;
+pub use snapshot::{
+    DrawOverlayLayer, DrawOverlayPatch, DrawSnapshot, DrawTile, SnapshotBuildParams,
+    TileCarrierPolicy,
+};
 pub use viewport::RenderParams;
 
 /// Native desktop primary `wgpu` backends (Vulkan, DX12, Metal), explicitly
@@ -64,6 +69,8 @@ fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
 
 /// Embedded WGSL source for the quadtree globe body and procedural graticule.
 pub const GLOBE_WGSL: &str = include_str!("../shaders/globe.wgsl");
+/// Embedded WGSL source for depth-less post-body raster overlay warp meshes.
+pub const OVERLAY_WGSL: &str = include_str!("../shaders/overlay.wgsl");
 /// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.
 pub const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
 

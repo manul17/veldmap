@@ -1,5 +1,6 @@
-//! Top workstation toolbar (Go-To navigation, basemap selector, graticule
-//! toggle, GPU adapter badge) and bottom GIS status bar extracted from `app.rs`.
+//! Top workstation toolbar (File Open, Layers toggle, Go-To navigation,
+//! basemap selector, graticule toggle, GPU adapter badge) and bottom GIS status
+//! bar extracted from `app.rs`.
 //!
 //! Strictly action-only: emits [`ToolbarAction`] values back to `VeldmapApp`
 //! without mutating `Camera`, storage, or scene state directly from UI layout
@@ -10,6 +11,7 @@ use veldmap_core::geo::camera::Camera;
 use veldmap_core::geo::coords::{ParsedLocation, parse_location};
 
 use crate::basemap::BasemapStatusSnapshot;
+use crate::layers::CursorReadout;
 use crate::settings::AppSettings;
 
 use super::ERROR_TEXT_COLOR;
@@ -20,6 +22,8 @@ use super::hud;
 /// `VeldmapApp`.
 #[derive(Clone, Debug)]
 pub(crate) enum ToolbarAction {
+    OpenFileTrigger,
+    ToggleLayersPanel,
     FocusLocation(ParsedLocation),
     Basemap(BasemapUiAction),
     SetGraticule(bool),
@@ -31,6 +35,8 @@ pub(crate) struct ToolbarInputs<'a> {
     pub(crate) settings: &'a AppSettings,
     pub(crate) basemap_status: &'a BasemapStatusSnapshot,
     pub(crate) adapter_label: &'a str,
+    pub(crate) layer_count: usize,
+    pub(crate) layers_open: bool,
 }
 
 /// Transient UI state for the Go-To coordinate input field in the top toolbar.
@@ -66,6 +72,28 @@ pub(crate) fn show_top_toolbar(
     egui::Panel::top("top_toolbar").show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.strong(veldmap_core::APP_NAME);
+            ui.separator();
+
+            if ui
+                .button("Open…")
+                .on_hover_text("Open local GeoTIFF / BigTIFF / COG")
+                .clicked()
+            {
+                actions.push(ToolbarAction::OpenFileTrigger);
+            }
+            let layers_label = if inputs.layer_count > 0 {
+                format!("Layers ({})", inputs.layer_count)
+            } else {
+                "Layers".to_owned()
+            };
+            if ui
+                .selectable_label(inputs.layers_open, layers_label)
+                .on_hover_text("Toggle Layer List panel")
+                .clicked()
+            {
+                actions.push(ToolbarAction::ToggleLayersPanel);
+            }
+
             ui.separator();
 
             ui.label("Go to:");
@@ -114,10 +142,14 @@ pub(crate) fn show_top_toolbar(
     actions
 }
 
-/// Render the bottom GIS status bar (cursor position, camera center, altitude, GSD).
+/// Render the bottom GIS status bar (cursor position, zoom-invariant RGB
+/// readout, camera center, altitude, viewport GSD, and native source pixel
+/// size).
 pub(crate) fn show_status_bar(
     ui: &mut egui::Ui,
     cursor_geo: Option<(f64, f64)>,
+    cursor_readout: Option<&CursorReadout>,
+    topmost_source_px: Option<(f64, f64)>,
     camera: &Camera,
     viewport_height_px: f64,
 ) {
@@ -128,8 +160,33 @@ pub(crate) fn show_status_bar(
                 None => "Cursor: Off globe".to_owned(),
             };
             ui.monospace(cursor_text);
-            ui.separator();
 
+            if let Some(readout) = cursor_readout {
+                ui.separator();
+                let val_text = if let Some([r, g, b, a]) = readout.rgba {
+                    if a == 255 {
+                        format!(
+                            "RGB({r},{g},{b}) @ ({},{})",
+                            readout.pixel.0, readout.pixel.1
+                        )
+                    } else {
+                        format!(
+                            "RGBA({r},{g},{b},{a}) @ ({},{})",
+                            readout.pixel.0, readout.pixel.1
+                        )
+                    }
+                } else if readout.pending {
+                    format!("RGB(…) @ ({},{})", readout.pixel.0, readout.pixel.1)
+                } else {
+                    format!("nodata @ ({},{})", readout.pixel.0, readout.pixel.1)
+                };
+                ui.monospace(val_text).on_hover_text(format!(
+                    "Native base-resolution readout: {}",
+                    readout.layer_name
+                ));
+            }
+
+            ui.separator();
             let (clat, clon) = camera.center();
             ui.monospace(format!("Center: {}", hud::format_lat_lon(clat, clon)));
             ui.separator();
@@ -141,7 +198,24 @@ pub(crate) fn show_status_bar(
             ui.separator();
 
             let mpp = camera.metres_per_pixel(viewport_height_px);
-            ui.monospace(format!("GSD: {}", hud::format_resolution(mpp)));
+            ui.monospace(format!("Viewport GSD: {}", hud::format_resolution(mpp)));
+
+            let source_px = cursor_readout
+                .and_then(|r| r.source_pixel_size_m)
+                .or(topmost_source_px);
+            if let Some((mx, my)) = source_px {
+                ui.separator();
+                let label = if (mx - my).abs() / mx.max(1e-9) <= 0.02 {
+                    format!("Source px: {}", hud::format_resolution(mx))
+                } else {
+                    format!(
+                        "Source px: {} × {}",
+                        hud::format_resolution(mx),
+                        hud::format_resolution(my)
+                    )
+                };
+                ui.monospace(label);
+            }
         });
     });
 }

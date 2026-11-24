@@ -489,8 +489,7 @@ fn orientation(at: DVec3, up: DVec3) -> DQuat {
 
 /// Project an `f64` ECEF world point into clip space given a rotation-only
 /// view-projection matrix and the camera eye position in `f64`.
-#[cfg(test)]
-fn project(view_proj: &DMat4, point: DVec3, eye: DVec3) -> DVec4 {
+pub fn project(view_proj: &DMat4, point: DVec3, eye: DVec3) -> DVec4 {
     *view_proj * (point - eye).extend(1.0)
 }
 

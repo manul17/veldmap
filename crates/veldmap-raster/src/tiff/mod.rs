@@ -455,6 +455,108 @@ impl TiffSource {
             emit,
         )
     }
+
+    /// Zoom-invariant display RGBA8 pixel readout at native base pixel
+    /// `(px, py)` (reads IFD `0` via `SharedChunkCache`).
+    pub fn sample_display_rgba(
+        &self,
+        px: u32,
+        py: u32,
+        ctx: &DecodeContext<'_>,
+    ) -> Result<Option<[u8; 4]>, RasterError> {
+        use crate::pipeline::driver::Chunked as _;
+
+        if px >= self.description.width || py >= self.description.height {
+            return Ok(None);
+        }
+        let (cw, ch) = self.grid.chunk;
+        let across = self.description.width.div_ceil(cw.max(1));
+        let cx = px / cw.max(1);
+        let cy = py / ch.max(1);
+        let chunk_index = cy.saturating_mul(across).saturating_add(cx);
+        let lx = px % cw.max(1);
+        let ly = py % ch.max(1);
+
+        let mapping = self.display_mapping(ctx)?;
+        let mut reader = TiffChunkReader::new(
+            &self.decoder_pool,
+            self.source_id,
+            self.format,
+            mapping,
+            ChunkReadMode::Pointwise {
+                chunk_cache: ctx.chunk_cache,
+                budget_tracker: ctx.budget_tracker,
+            },
+        );
+        let chunk = reader.chunk(0, chunk_index, ctx.cancel)?;
+        if lx >= chunk.width || ly >= chunk.height {
+            return Ok(None);
+        }
+        let idx = (ly as usize)
+            .saturating_mul(chunk.width as usize)
+            .saturating_add(lx as usize)
+            .saturating_mul(4);
+        let Some(px_bytes) = chunk.data.get(idx..idx + 4) else {
+            return Ok(None);
+        };
+        let rgba = [px_bytes[0], px_bytes[1], px_bytes[2], px_bytes[3]];
+        Ok((rgba[3] > 0).then_some(rgba))
+    }
+}
+
+impl crate::pipeline::RasterSource for TiffSource {
+    fn fingerprint(&self) -> SourceFingerprint {
+        self.fingerprint()
+    }
+
+    fn source_id(&self) -> SourceId {
+        self.source_id()
+    }
+
+    fn description(&self) -> &RasterDescription {
+        self.description()
+    }
+
+    fn pyramid_meta(&self) -> PyramidMeta {
+        self.pyramid_meta()
+    }
+
+    fn pass_peak_bytes(&self) -> u64 {
+        self.pass_peak_bytes()
+    }
+
+    fn produce_direct(
+        &self,
+        level: u8,
+        wants: &[(u32, u32)],
+        ctx: &DecodeContext<'_>,
+        emit: TileEmit<'_>,
+    ) -> Result<(), RasterError> {
+        self.produce_direct(level, wants, ctx, emit)
+    }
+
+    fn produce_pass(&self, ctx: &DecodeContext<'_>, emit: TileEmit<'_>) -> Result<(), RasterError> {
+        self.produce_pass(ctx, emit)
+    }
+
+    fn decode_pointwise_tile(
+        &self,
+        level: u8,
+        tx: u32,
+        ty: u32,
+        ctx: &DecodeContext<'_>,
+    ) -> Result<DecodedTile, RasterError> {
+        self.decode_pointwise_tile(level, tx, ty, ctx)
+    }
+
+    fn sample_display_rgba(
+        &self,
+        px: u32,
+        py: u32,
+        ctx: &DecodeContext<'_>,
+    ) -> Result<Option<[u8; 4]>, RasterError> {
+        self.sample_display_rgba(px, py, ctx)
+    }
 }
 
 #[cfg(test)]

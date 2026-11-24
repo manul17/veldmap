@@ -314,6 +314,121 @@ impl TileDiskCache {
         self.get_encoded_filtered(key, None)
     }
 
+    /// Look up and decode a QOI-compressed 8-bit `Rgba8UnormSrgb` tile
+    /// (`TileBlobEncoding::Qoi`) for `key`.
+    ///
+    /// Returns `Ok(None)` on miss or encoding mismatch. Corrupt QOI blobs are
+    /// automatically purged from the cache and treated as a clean miss.
+    pub fn get_qoi_rgba8(
+        &self,
+        key: &DiskTileKey,
+    ) -> Result<Option<(u32, u32, Vec<u8>)>, StorageError> {
+        if key.format != veldmap_core::tile::PixelFormat::Rgba8UnormSrgb {
+            return Ok(None);
+        }
+        let Some((_, payload)) = self.get_encoded_filtered(key, Some(TileBlobEncoding::Qoi))?
+        else {
+            return Ok(None);
+        };
+        let header = match qoi::decode_header(&payload) {
+            Ok(h) => h,
+            Err(err) => {
+                tracing::warn!(
+                    source_key = %key.source_key,
+                    level = key.level,
+                    x = key.x,
+                    y = key.y,
+                    error = %err,
+                    "Purging corrupt QOI disk tile header"
+                );
+                let _ = self.delete(key);
+                return Ok(None);
+            }
+        };
+        let expected_bytes = (header.width as usize)
+            .checked_mul(header.height as usize)
+            .and_then(|px| px.checked_mul(4));
+        if header.width == 0
+            || header.height == 0
+            || header.channels != qoi::Channels::Rgba
+            || expected_bytes.is_none_or(|b| b > MAX_CACHED_TILE_BYTES)
+        {
+            tracing::warn!(
+                source_key = %key.source_key,
+                level = key.level,
+                x = key.x,
+                y = key.y,
+                width = header.width,
+                height = header.height,
+                "Purging QOI disk tile with invalid or oversized header"
+            );
+            let _ = self.delete(key);
+            return Ok(None);
+        }
+        match qoi::decode_to_vec(&payload) {
+            Ok((decoded_header, rgba)) => {
+                if decoded_header.width == header.width
+                    && decoded_header.height == header.height
+                    && decoded_header.channels == qoi::Channels::Rgba
+                    && expected_bytes == Some(rgba.len())
+                {
+                    Ok(Some((decoded_header.width, decoded_header.height, rgba)))
+                } else {
+                    tracing::warn!(
+                        source_key = %key.source_key,
+                        level = key.level,
+                        x = key.x,
+                        y = key.y,
+                        "Purging QOI disk tile with mismatched decoded byte length"
+                    );
+                    let _ = self.delete(key);
+                    Ok(None)
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    source_key = %key.source_key,
+                    level = key.level,
+                    x = key.x,
+                    y = key.y,
+                    error = %err,
+                    "Purging corrupt QOI disk tile"
+                );
+                let _ = self.delete(key);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Encode an 8-bit RGBA8 display tile as lossless QOI
+    /// (`TileBlobEncoding::Qoi`) and store it under `key`.
+    pub fn put_qoi_rgba8(
+        &self,
+        key: &DiskTileKey,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<EvictionReport, StorageError> {
+        if key.format != veldmap_core::tile::PixelFormat::Rgba8UnormSrgb {
+            return Err(StorageError::Codec(format!(
+                "QOI disk cache only supports Rgba8UnormSrgb, got {:?}",
+                key.format
+            )));
+        }
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(4));
+        if width == 0 || height == 0 || expected != Some(rgba.len()) {
+            return Err(StorageError::Codec(format!(
+                "QOI RGBA8 buffer length {} does not match {width}x{height}x4",
+                rgba.len()
+            )));
+        }
+        let encoded = qoi::encode_to_vec(rgba, width, height)
+            .map_err(|e| StorageError::Codec(e.to_string()))?;
+        self.put_encoded(key, TileBlobEncoding::Qoi, &encoded)
+    }
+
     /// Insert or replace encoded image tile bytes (`TileBlobEncoding::EncodedImage`)
     /// for `key`, enforcing `payload_bytes <= max_bytes` via O(log N) per-tile
     /// LRU eviction and `PRAGMA incremental_vacuum`.

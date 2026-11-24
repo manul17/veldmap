@@ -64,13 +64,13 @@ jobs:
       - name: Install and run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
 
-      - name: Check English-only hygiene (no Cyrillic outside old/)
+      - name: Check English-only hygiene (no Cyrillic)
         run: |
           python3 - <<'EOF'
           import os, pathlib, re, sys
 
           pattern = re.compile(r"[\u0400-\u04FF]")
-          skip_dirs = {".git", "target", "old"}
+          skip_dirs = {".git", "target"}
           offenders = []
 
           for dirpath, dirnames, filenames in os.walk("."):
@@ -86,32 +86,11 @@ jobs:
                           offenders.append(f"{path}:{lineno}: {line.strip()}")
 
           if offenders:
-              print("Cyrillic characters found outside old/:", file=sys.stderr)
+              print("Cyrillic characters found:", file=sys.stderr)
               for item in offenders[:50]:
                   print(f"  {item}", file=sys.stderr)
               sys.exit(1)
           print("English-only hygiene check passed.")
-          EOF
-
-      - name: Forbid links from docs/ into old/
-        run: |
-          python3 - <<'EOF'
-          import pathlib, re, sys
-
-          inline_pattern = re.compile(r"\]\((?:[^)]*/)?old(?:/|\))")
-          ref_pattern = re.compile(r"^\s*\[[^\]]+\]:\s*(?:\S*/)?old(?:/|$)")
-          offenders = []
-          for path in sorted(pathlib.Path("docs").rglob("*.md")):
-              for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                  if inline_pattern.search(line) or ref_pattern.search(line):
-                      offenders.append(f"{path}:{lineno}: {line.strip()}")
-
-          if offenders:
-              print("Forbidden links from docs/ into old/:", file=sys.stderr)
-              for item in offenders:
-                  print(f"  {item}", file=sys.stderr)
-              sys.exit(1)
-          print("No docs/ -> old/ links found.")
           EOF
 
       - name: Check offline markdown links in docs/ and root markdown
