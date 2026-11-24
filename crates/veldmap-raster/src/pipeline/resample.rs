@@ -10,7 +10,7 @@ use crate::color::{
 /// (`w x h` -> `ceil(w/2) x ceil(h/2)`).
 ///
 /// Keeps fully transparent blocks deterministic `[0, 0, 0, 0]`.
-pub fn halve_rgba8(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+pub(crate) fn halve_rgba8(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
@@ -49,16 +49,16 @@ pub fn halve_rgba8(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
 /// Fractional sub-rectangle inside a decoded source region in pixel coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Window {
-    pub x0: f64,
-    pub y0: f64,
-    pub x1: f64,
-    pub y1: f64,
+pub(crate) struct Window {
+    pub(crate) x0: f64,
+    pub(crate) y0: f64,
+    pub(crate) x1: f64,
+    pub(crate) y1: f64,
 }
 
 /// Area-weighted resampling of fractional `window` inside `src` (`sw x sh`) to
 /// `dw x dh` RGBA8 output, preserving exact seam alignment across adjacent tiles.
-pub fn resample_rgba8_window(
+pub(crate) fn resample_rgba8_window(
     src: &[u8],
     sw: u32,
     sh: u32,
@@ -148,7 +148,7 @@ fn overlap(s: u32, a: f64, b: f64) -> f64 {
 
 /// Spread valid RGB colors 2 rings outward into fully transparent (`alpha == 0`)
 /// nodata neighbors while keeping alpha at `0`, eliminating dark bilinear edges.
-pub fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
+pub(crate) fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
     const BLEED_STEPS: u32 = 2;
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || rgba.len() < w * h * 4 {

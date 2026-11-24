@@ -4,14 +4,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use veldmap_core::sync::{CancelToken, lock_unpoisoned};
+use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{QuadTileId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
-use crate::http::{FetchFailure, FetchOutcome, download_capped};
-use crate::{DecodeCompletion, DecodeFailure, DecodeRequest, TileBlobStore};
+use crate::http::{FetchFailure, FetchOutcome, TransientFetchError, download_capped};
+use crate::{DecodeCompletion, DecodeFailure, DecodeRequest};
 
 use super::PipelineContext;
+use super::disk::{DiskCacheGate, DiskReadOutcome};
 use super::dispatch::HttpFetchInput;
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
 
@@ -19,22 +20,23 @@ use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
 /// was rejected or evicted under CPU decode-pool backpressure.
 const DECODE_BACKPRESSURE_BACKOFF: Duration = Duration::from_millis(50);
 
-fn schedule_decode_backpressure(
-    ctx: &PipelineContext,
-    key: TileKey,
-    guard: &mut InFlightGuard,
-    retry_disk: bool,
-) {
-    if lock_unpoisoned(&ctx.state).schedule_decode_backpressure(
-        key,
-        guard.generation,
-        DECODE_BACKPRESSURE_BACKOFF,
-        retry_disk,
-        Instant::now(),
-    ) {
-        guard.disarm();
-        ctx.notify.notify_one();
-    }
+/// Non-aborted decode outcome returned by [`submit_and_await_decode`].
+enum DecodeOutcome {
+    Ok,
+    InvalidPayload(String),
+}
+
+fn schedule_decode_backpressure(guard: InFlightGuard, retry_disk: bool) {
+    let now = Instant::now();
+    guard.finish(|st, key, generation| {
+        st.schedule_decode_backpressure(
+            key,
+            generation,
+            DECODE_BACKPRESSURE_BACKOFF,
+            retry_disk,
+            now,
+        )
+    });
 }
 
 /// Submit encoded tile bytes to the injected [`crate::TileDecodeExecutor`] and
@@ -47,9 +49,9 @@ async fn submit_and_await_decode(
     key: TileKey,
     bytes: Arc<[u8]>,
     cancel: &CancelToken,
-    mut guard: InFlightGuard,
+    guard: InFlightGuard,
     retry_disk: bool,
-) -> Option<(InFlightGuard, Result<(), DecodeFailure>)> {
+) -> Option<(InFlightGuard, DecodeOutcome)> {
     let (on_decoded, rx) = DecodeCompletion::channel();
     let req = DecodeRequest {
         key,
@@ -59,8 +61,8 @@ async fn submit_and_await_decode(
     };
 
     if !ctx.decoder.submit(req) {
-        if !cancel.is_cancelled() && !ctx.shutdown.is_cancelled() {
-            schedule_decode_backpressure(ctx, key, &mut guard, retry_disk);
+        if !cancel.is_cancelled() && !ctx.shared.shutdown.is_cancelled() {
+            schedule_decode_backpressure(guard, retry_disk);
         }
         return None;
     }
@@ -70,70 +72,32 @@ async fn submit_and_await_decode(
         res = rx.recv() => res,
     };
 
-    if matches!(outcome, Err(DecodeFailure::Aborted)) {
-        if !cancel.is_cancelled() && !ctx.shutdown.is_cancelled() {
-            schedule_decode_backpressure(ctx, key, &mut guard, retry_disk);
+    match outcome {
+        Ok(()) => Some((guard, DecodeOutcome::Ok)),
+        Err(DecodeFailure::InvalidPayload(msg)) => {
+            Some((guard, DecodeOutcome::InvalidPayload(msg)))
         }
-        return None;
+        Err(DecodeFailure::Aborted) => {
+            if !cancel.is_cancelled() && !ctx.shared.shutdown.is_cancelled() {
+                schedule_decode_backpressure(guard, retry_disk);
+            }
+            None
+        }
     }
-
-    Some((guard, outcome))
 }
 
-async fn delete_corrupt_cached_tile(
-    ctx: &PipelineContext,
-    cache: Arc<dyn TileBlobStore>,
-    spec: Arc<LiveBasemapSpec>,
-    key: TileKey,
-    id: QuadTileId,
-    cancel: &CancelToken,
-) {
-    if cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
-        return;
-    }
-    let Ok(_queue_permit) = Arc::clone(&ctx.disk_put_queue_sem).try_acquire_owned() else {
-        tracing::debug!(
-            ?key,
-            "Skipping corrupt disk tile deletion under write-queue backpressure"
-        );
-        return;
-    };
-    let permit = tokio::select! {
-        _ = cancel.cancelled() => return,
-        _ = ctx.shutdown.cancelled() => return,
-        res = Arc::clone(&ctx.disk_put_sem).acquire_owned() => match res {
-            Ok(p) => p,
-            Err(_) => return,
-        },
-    };
-    let cancel_for_delete = cancel.clone();
-    let shutdown = ctx.shutdown.clone();
-    let del_res = tokio::select! {
-        _ = cancel.cancelled() => return,
-        res = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            if cancel_for_delete.is_cancelled() || shutdown.is_cancelled() {
-                return Ok(());
-            }
-            cache.delete(spec.cache_key(), id)
-        }) => res,
-    };
-    if let Ok(Err(del_err)) = del_res {
-        tracing::debug!(
-            ?key,
-            error = %del_err,
-            "Failed to delete corrupt cached tile entry"
-        );
-    }
+fn promote_to_http(ctx: &PipelineContext, cancel: &CancelToken, guard: InFlightGuard) {
+    let can_requeue = !cancel.is_cancelled() && !ctx.shared.shutdown.is_cancelled();
+    guard.finish(|st, key, generation| st.promote_disk_miss_to_http(key, generation, can_requeue));
 }
 
 pub(super) async fn run_disk_lookup(
     ctx: Arc<PipelineContext>,
-    cache: Arc<dyn TileBlobStore>,
+    gate: DiskCacheGate,
     key: TileKey,
     spec: Arc<LiveBasemapSpec>,
     cancel: CancelToken,
-    mut guard: InFlightGuard,
+    guard: InFlightGuard,
     disk_slot: DiskSlotGuard,
 ) {
     if cancel.is_cancelled() {
@@ -142,130 +106,125 @@ pub(super) async fn run_disk_lookup(
     let Some(id) = key.quad_id() else {
         return;
     };
-    let spec_for_read = Arc::clone(&spec);
-    let cache_for_read = Arc::clone(&cache);
-    let disk_res = tokio::select! {
-        _ = cancel.cancelled() => return,
-        res = tokio::task::spawn_blocking(move || cache_for_read.get(spec_for_read.cache_key(), id)) => res,
-    };
+
+    let read_outcome = gate.get(&spec, id, &cancel).await;
     // Release the disk-lookup concurrency slot immediately before decode/HTTP.
     drop(disk_slot);
 
-    if cancel.is_cancelled() {
-        return;
-    }
-
-    match disk_res {
-        Ok(Ok(Some(bytes))) => {
-            let Some((mut guard, outcome)) =
+    match read_outcome {
+        DiskReadOutcome::Cancelled => {}
+        DiskReadOutcome::Hit(bytes) => {
+            let Some((guard, outcome)) =
                 submit_and_await_decode(&ctx, key, Arc::from(bytes), &cancel, guard, true).await
             else {
                 return;
             };
             match outcome {
-                Ok(()) => {
-                    let transitioned =
-                        lock_unpoisoned(&ctx.state).mark_completed(key, guard.generation, true);
-                    guard.disarm();
-                    if transitioned {
-                        ctx.notify.notify_one();
-                    }
+                DecodeOutcome::Ok => {
+                    guard.finish(|st, key, generation| st.mark_completed(key, generation, true));
                 }
-                Err(DecodeFailure::InvalidPayload(err)) => {
+                DecodeOutcome::InvalidPayload(err) => {
                     tracing::debug!(
                         ?key,
                         error = %err,
                         "Cached disk tile failed decode; deleting corrupt entry and falling back to HTTP"
                     );
-                    delete_corrupt_cached_tile(&ctx, cache, spec, key, id, &cancel).await;
-                    promote_to_http(&ctx, key, &cancel, &mut guard);
+                    gate.delete_corrupt(spec, key, id, &cancel, &ctx.shared.shutdown)
+                        .await;
+                    promote_to_http(&ctx, &cancel, guard);
                 }
-                Err(DecodeFailure::Aborted) => {}
             }
         }
-        Ok(Ok(None)) => promote_to_http(&ctx, key, &cancel, &mut guard),
-        Ok(Err(err)) => {
+        DiskReadOutcome::Miss => promote_to_http(&ctx, &cancel, guard),
+        DiskReadOutcome::Error(err) => {
             tracing::debug!(?key, error = %err, "Disk cache lookup failed; falling back to HTTP");
-            promote_to_http(&ctx, key, &cancel, &mut guard);
-        }
-        Err(join_err) => {
-            tracing::warn!(
-                ?key,
-                error = %join_err,
-                "Disk cache lookup blocking task failed; falling back to HTTP"
-            );
-            promote_to_http(&ctx, key, &cancel, &mut guard);
+            promote_to_http(&ctx, &cancel, guard);
         }
     }
 }
 
-fn promote_to_http(
-    ctx: &PipelineContext,
-    key: TileKey,
-    cancel: &CancelToken,
-    guard: &mut InFlightGuard,
-) {
-    let can_requeue = !cancel.is_cancelled() && !ctx.shutdown.is_cancelled();
-    let promoted =
-        lock_unpoisoned(&ctx.state).promote_disk_miss_to_http(key, guard.generation, can_requeue);
-    if promoted {
-        guard.disarm();
-        ctx.notify.notify_one();
-    }
-}
-
-fn persist_validated_tile_async(
+async fn handle_http_payload(
     ctx: &PipelineContext,
     spec: &Arc<LiveBasemapSpec>,
     key: TileKey,
     id: QuadTileId,
-    bytes_for_cache: Arc<[u8]>,
+    bytes: Vec<u8>,
+    cancel: &CancelToken,
+    guard: InFlightGuard,
 ) {
-    let Some(cache) = ctx.disk_cache.clone() else {
+    let shared_bytes: Arc<[u8]> = Arc::from(bytes);
+    let bytes_for_cache = Arc::clone(&shared_bytes);
+    let Some((guard, outcome)) =
+        submit_and_await_decode(ctx, key, shared_bytes, cancel, guard, false).await
+    else {
         return;
     };
-    if ctx.shutdown.is_cancelled() {
-        return;
-    }
-    let Ok(queue_permit) = Arc::clone(&ctx.disk_put_queue_sem).try_acquire_owned() else {
-        tracing::debug!(
-            ?key,
-            "Skipping best-effort tile disk write under write-queue backpressure"
-        );
-        return;
-    };
-    let spec_for_put = Arc::clone(spec);
-    let put_sem = Arc::clone(&ctx.disk_put_sem);
-    let shutdown = ctx.shutdown.clone();
-    tokio::spawn(async move {
-        let _queue_permit = queue_permit;
-        let permit = tokio::select! {
-            _ = shutdown.cancelled() => return,
-            res = put_sem.acquire_owned() => match res {
-                Ok(p) => p,
-                Err(_) => return,
-            },
-        };
-        let _ = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            if shutdown.is_cancelled() {
-                return;
-            }
-            if let Err(err) = cache.put(spec_for_put.cache_key(), id, &bytes_for_cache) {
-                tracing::debug!(
-                    error = %err,
-                    "Failed to persist validated live tile to disk cache"
+    match outcome {
+        DecodeOutcome::Ok => {
+            let transition =
+                guard.finish(|st, key, generation| st.mark_completed(key, generation, false));
+            if transition.notify
+                && let Some(gate) = &ctx.disk_cache
+            {
+                gate.persist_async(
+                    Arc::clone(spec),
+                    key,
+                    id,
+                    bytes_for_cache,
+                    ctx.shared.shutdown.clone(),
                 );
             }
-        })
-        .await;
+        }
+        DecodeOutcome::InvalidPayload(err) => {
+            let safe_msg = spec.redact_secrets(&err);
+            record_terminal_failure(ctx, cancel, guard, Some(safe_msg));
+        }
+    }
+}
+
+fn handle_http_transient_failure(
+    ctx: &PipelineContext,
+    spec: &LiveBasemapSpec,
+    host: &str,
+    key: TileKey,
+    cancel: &CancelToken,
+    guard: InFlightGuard,
+    err: TransientFetchError,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
+    let safe_msg = spec.redact_secrets(&err.msg);
+    let delay = err.retry_after.unwrap_or(ctx.transient_retry_backoff);
+    let until = Instant::now() + delay;
+    let rate_limited = err.rate_limited || err.retry_after.is_some();
+    tracing::debug!(
+        ?key,
+        offline = err.offline,
+        delay_s = delay.as_secs(),
+        error = %safe_msg,
+        "Transient HTTP tile failure"
+    );
+    let transition = guard.finish(|st, key, generation| {
+        let tr = st.mark_transient_backoff(key, generation, until, err.offline, Some(safe_msg));
+        // Record host cooldown atomically under `state -> host_limiters` lock
+        // order and only if this task still belongs to the active source &
+        // generation, preventing a cancelled/stale task from poisoning a newly
+        // switched basemap that shares the same host.
+        if tr.wakeup && rate_limited {
+            ctx.shared.host_limiters.record_cooldown(host, until);
+        }
+        tr
     });
+    if transition.wakeup {
+        (ctx.wakeup)();
+    }
 }
 
 pub(super) async fn run_http_fetch(
     ctx: Arc<PipelineContext>,
     input: HttpFetchInput,
-    mut guard: InFlightGuard,
+    guard: InFlightGuard,
     permit_guard: PermitGuard,
 ) {
     let HttpFetchInput {
@@ -278,7 +237,6 @@ pub(super) async fn run_http_fetch(
     if cancel.is_cancelled() {
         return;
     }
-
     let Some(id) = key.quad_id() else {
         return;
     };
@@ -289,7 +247,7 @@ pub(super) async fn run_http_fetch(
         Err(err) => {
             drop(permit_guard);
             let safe_msg = spec.redact_secrets(&err.to_string());
-            record_terminal_failure(&ctx, &cancel, key, &mut guard, Some(safe_msg));
+            record_terminal_failure(&ctx, &cancel, guard, Some(safe_msg));
             return;
         }
     };
@@ -308,80 +266,22 @@ pub(super) async fn run_http_fetch(
 
     match fetch_res {
         Ok(FetchOutcome::Payload(bytes)) => {
-            let shared_bytes: Arc<[u8]> = Arc::from(bytes);
-            let bytes_for_cache = Arc::clone(&shared_bytes);
-            let Some((mut guard, outcome)) =
-                submit_and_await_decode(&ctx, key, shared_bytes, &cancel, guard, false).await
-            else {
-                return;
-            };
-            match outcome {
-                Ok(()) => {
-                    let transitioned =
-                        lock_unpoisoned(&ctx.state).mark_completed(key, guard.generation, false);
-                    guard.disarm();
-                    if transitioned {
-                        ctx.notify.notify_one();
-                        persist_validated_tile_async(&ctx, &spec, key, id, bytes_for_cache);
-                    }
-                }
-                Err(DecodeFailure::InvalidPayload(err)) => {
-                    let safe_msg = spec.redact_secrets(&err);
-                    record_terminal_failure(&ctx, &cancel, key, &mut guard, Some(safe_msg));
-                }
-                Err(DecodeFailure::Aborted) => {}
-            }
+            handle_http_payload(&ctx, &spec, key, id, bytes, &cancel, guard).await;
         }
         Ok(FetchOutcome::Empty204) => {
             // Valid empty/nodata tile: suppress infinite refetch without
             // bumping `failed_count` or displaying an error badge.
             if !cancel.is_cancelled() {
-                let transitioned =
-                    lock_unpoisoned(&ctx.state).mark_empty_204(key, guard.generation);
-                guard.disarm();
-                if transitioned {
-                    ctx.notify.notify_one();
-                }
+                guard.finish(|st, key, generation| st.mark_empty_204(key, generation));
             }
         }
         Err(FetchFailure::Terminal(msg)) => {
             let safe_msg = spec.redact_secrets(&msg);
             tracing::debug!(?key, error = %safe_msg, "Terminal HTTP tile failure");
-            record_terminal_failure(&ctx, &cancel, key, &mut guard, Some(safe_msg));
+            record_terminal_failure(&ctx, &cancel, guard, Some(safe_msg));
         }
-        Err(FetchFailure::Transient {
-            msg,
-            offline,
-            rate_limited,
-            retry_after,
-        }) => {
-            let safe_msg = spec.redact_secrets(&msg);
-            let delay = retry_after.unwrap_or(ctx.transient_retry_backoff);
-            let until = Instant::now() + delay;
-            if rate_limited || retry_after.is_some() {
-                ctx.host_limiters.record_cooldown(&host, until);
-            }
-            tracing::debug!(
-                ?key,
-                offline,
-                delay_s = delay.as_secs(),
-                error = %safe_msg,
-                "Transient HTTP tile failure"
-            );
-            if !cancel.is_cancelled() {
-                let should_wake = lock_unpoisoned(&ctx.state).mark_transient_backoff(
-                    key,
-                    guard.generation,
-                    until,
-                    offline,
-                    Some(safe_msg),
-                );
-                guard.disarm();
-                if should_wake {
-                    ctx.notify.notify_one();
-                    (ctx.wakeup)();
-                }
-            }
+        Err(FetchFailure::Transient(err)) => {
+            handle_http_transient_failure(&ctx, &spec, &host, key, &cancel, guard, err);
         }
     }
 }
@@ -389,18 +289,15 @@ pub(super) async fn run_http_fetch(
 fn record_terminal_failure(
     ctx: &PipelineContext,
     cancel: &CancelToken,
-    key: TileKey,
-    guard: &mut InFlightGuard,
+    guard: InFlightGuard,
     error_msg: Option<String>,
 ) {
     if cancel.is_cancelled() {
         return;
     }
-    let should_wake =
-        lock_unpoisoned(&ctx.state).mark_terminal_failure(key, guard.generation, error_msg);
-    guard.disarm();
-    if should_wake {
-        ctx.notify.notify_one();
+    let transition =
+        guard.finish(|st, key, generation| st.mark_terminal_failure(key, generation, error_msg));
+    if transition.wakeup {
         (ctx.wakeup)();
     }
 }

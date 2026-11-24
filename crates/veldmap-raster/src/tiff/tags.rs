@@ -26,21 +26,13 @@ pub(super) fn map_tiff_error(err: tiff::TiffError, cancel: &CancelToken) -> Rast
     if cancel.is_cancelled() {
         return RasterError::Cancelled;
     }
-    match &err {
-        tiff::TiffError::IoError(io_err)
-            if io_err
-                .get_ref()
-                .and_then(|e| e.downcast_ref::<IoError>())
-                .is_some_and(IoError::is_cancelled) =>
-        {
-            RasterError::Cancelled
-        }
-        tiff::TiffError::IoError(io_err) => RasterError::from(IoError::Io(std::io::Error::new(
-            io_err.kind(),
-            io_err.to_string(),
-        ))),
+    match err {
+        tiff::TiffError::IoError(io_err) => match io_err.downcast::<IoError>() {
+            Ok(core_err) => RasterError::from(core_err),
+            Err(io_err) => RasterError::from(IoError::Io(io_err)),
+        },
         tiff::TiffError::LimitsExceeded => RasterError::DecoderLimitsExceeded(err.to_string()),
-        _ => RasterError::Tiff(err.to_string()),
+        other => RasterError::Tiff(other.to_string()),
     }
 }
 
@@ -49,6 +41,21 @@ pub(super) fn is_missing_tag(err: &tiff::TiffError) -> bool {
         err,
         tiff::TiffError::FormatError(tiff::TiffFormatError::RequiredTagNotFound(_))
     )
+}
+
+/// Convert an optional TIFF tag read into `Option<T>`, propagating cancellation
+/// and I/O errors while treating missing or non-matching tags as `Ok(None)`.
+pub(super) fn opt_tag<T>(
+    res: Result<T, tiff::TiffError>,
+    cancel: &CancelToken,
+) -> Result<Option<T>, RasterError> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(err) if is_missing_tag(&err) => Ok(None),
+        Err(_) if cancel.is_cancelled() => Err(RasterError::Cancelled),
+        Err(err @ tiff::TiffError::IoError(_)) => Err(map_tiff_error(err, cancel)),
+        Err(_) => Ok(None),
+    }
 }
 
 pub(super) fn is_overview(subfile_type: u32) -> bool {
@@ -163,11 +170,6 @@ pub(super) fn ensure_readable(
 ) -> Result<(PixelLayout, u8, SampleType), RasterError> {
     let color = decoder.colortype().map_err(|e| map_tiff_error(e, cancel))?;
     let (layout, bits, mut stype) = model(decoder, color, cancel)?;
-    if bits < 8 {
-        return Err(RasterError::Tiff(format!(
-            "{bits} bits per sample cannot unpack directly into pixels"
-        )));
-    }
     ensure_decodable(decoder, cancel)?;
     let sample_format = ensure_sampled(decoder, bits, cancel)?;
     if sample_format == 2 && bits == 16 {
@@ -251,12 +253,7 @@ pub(super) fn read_tag_u16_vec_opt(
     tag: Tag,
     cancel: &CancelToken,
 ) -> Result<Vec<u16>, RasterError> {
-    match decoder.get_tag_u16_vec(tag) {
-        Ok(v) => Ok(v),
-        Err(_) if cancel.is_cancelled() => Err(RasterError::Cancelled),
-        Err(err) if matches!(err, tiff::TiffError::IoError(_)) => Err(map_tiff_error(err, cancel)),
-        Err(_) => Ok(Vec::new()),
-    }
+    Ok(opt_tag(decoder.get_tag_u16_vec(tag), cancel)?.unwrap_or_default())
 }
 
 pub(super) fn read_tag_f64_vec_opt(
@@ -264,12 +261,7 @@ pub(super) fn read_tag_f64_vec_opt(
     tag: Tag,
     cancel: &CancelToken,
 ) -> Result<Vec<f64>, RasterError> {
-    match decoder.get_tag_f64_vec(tag) {
-        Ok(v) => Ok(v),
-        Err(_) if cancel.is_cancelled() => Err(RasterError::Cancelled),
-        Err(err) if matches!(err, tiff::TiffError::IoError(_)) => Err(map_tiff_error(err, cancel)),
-        Err(_) => Ok(Vec::new()),
-    }
+    Ok(opt_tag(decoder.get_tag_f64_vec(tag), cancel)?.unwrap_or_default())
 }
 
 pub(super) fn read_tag_ascii_opt(
@@ -277,10 +269,5 @@ pub(super) fn read_tag_ascii_opt(
     tag: Tag,
     cancel: &CancelToken,
 ) -> Result<String, RasterError> {
-    match decoder.get_tag_ascii_string(tag) {
-        Ok(v) => Ok(v),
-        Err(_) if cancel.is_cancelled() => Err(RasterError::Cancelled),
-        Err(err) if matches!(err, tiff::TiffError::IoError(_)) => Err(map_tiff_error(err, cancel)),
-        Err(_) => Ok(String::new()),
-    }
+    Ok(opt_tag(decoder.get_tag_ascii_string(tag), cancel)?.unwrap_or_default())
 }

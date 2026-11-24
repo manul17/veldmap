@@ -40,7 +40,7 @@ impl CascadeBand {
 }
 
 /// Exact working memory in bytes required by [`Cascade`] for `(base_w, base_h)`.
-pub fn bytes(base_w: u32, base_h: u32) -> u64 {
+pub(crate) fn bytes(base_w: u32, base_h: u32) -> u64 {
     bands_bytes(base_w, base_h).saturating_add(flush_bytes(base_w, base_h))
 }
 
@@ -84,13 +84,13 @@ fn levels(base_w: u32, base_h: u32) -> impl Iterator<Item = (u32, u32, bool)> {
 }
 
 /// Top-to-bottom streaming RGBA8 pyramid builder.
-pub struct Cascade {
+pub(crate) struct Cascade {
     bands: Vec<CascadeBand>,
 }
 
 impl Cascade {
     /// Allocate cascade bands from `base_level` up to the single-tile apex.
-    pub fn new(base_level: u8, base_w: u32, base_h: u32) -> Self {
+    pub(crate) fn new(base_level: u8, base_w: u32, base_h: u32) -> Self {
         let bands = levels(base_w, base_h)
             .enumerate()
             .map(|(idx, (w, h, _))| CascadeBand::new(base_level.saturating_add(idx as u8), w, h))
@@ -99,7 +99,7 @@ impl Cascade {
     }
 
     /// Feed `nrows` contiguous RGBA8 rows at `base_level`.
-    pub fn push_rows(
+    pub(crate) fn push_rows(
         &mut self,
         rows: &[u8],
         nrows: u32,
@@ -112,7 +112,7 @@ impl Cascade {
     }
 
     /// Flush all incomplete bottom-edge bands top-down.
-    pub fn finish(mut self, emit: TileEmit<'_>) -> Result<(), RasterError> {
+    pub(crate) fn finish(mut self, emit: TileEmit<'_>) -> Result<(), RasterError> {
         for i in 0..self.bands.len() {
             self.flush(i, emit)?;
         }

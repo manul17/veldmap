@@ -1,6 +1,6 @@
-//! Format-agnostic analytical raster pyramid pipeline: band metadata, chunk
-//! grid & singleflight cache, cascade emission, resampling, radiometry,
-//! level-table planning, and `TileScheduler`.
+//! Format-agnostic analytical raster pyramid pipeline: band metadata, static
+//! pyramid plans, chunk grid & execution driver, singleflight chunk cache,
+//! cascade emission, resampling, radiometry, and `TileScheduler`.
 
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::CancelToken;
@@ -8,13 +8,15 @@ use veldmap_core::sync::CancelToken;
 pub(crate) mod band;
 pub(crate) mod cascade;
 pub(crate) mod chunk_cache;
+pub(crate) mod driver;
 pub(crate) mod grid;
 pub(crate) mod peak;
+pub(crate) mod plan;
 pub(crate) mod pyramid;
 pub(crate) mod radiometry;
 pub(crate) mod resample;
 pub(crate) mod scheduler;
-pub(crate) mod table;
+pub(crate) mod singleflight;
 
 /// Shared runtime context passed into analytical raster decoding calls.
 pub struct DecodeContext<'a> {

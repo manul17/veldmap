@@ -82,18 +82,12 @@ fn request_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     Some((device, queue))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "concise test builder for DrawSnapshot fixtures"
-)]
 pub(crate) fn build_snapshot(
     camera: Camera,
     width_px: u32,
     height_px: u32,
     show_graticule: bool,
-    textured: bool,
     active_source: SourceId,
-    generation: u64,
     config: &QuadtreeConfig,
     cache: Option<&mut GpuTileCache>,
 ) -> Arc<DrawSnapshot> {
@@ -105,9 +99,7 @@ pub(crate) fn build_snapshot(
             height_px,
             pixels_per_point: 1.0,
             show_graticule,
-            textured,
             carrier_policy: &policy,
-            generation,
             config,
         },
         cache,

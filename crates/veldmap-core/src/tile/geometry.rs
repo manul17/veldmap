@@ -4,7 +4,8 @@
 
 use crate::geo::projection::{WEB_MERCATOR_LIMIT_DEG, web_mercator_lat_deg};
 
-use super::key::{PlanetaryScheme, QuadTileId};
+use super::key::QuadTileId;
+use super::scheme::PlanetaryScheme;
 
 /// Stereographic disk radius corresponding to `|lat| = WEB_MERCATOR_LIMIT_DEG`
 /// (`tan((90° - 85.05112878°) / 2)`).

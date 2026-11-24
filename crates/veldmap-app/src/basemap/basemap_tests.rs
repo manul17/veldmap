@@ -1,8 +1,8 @@
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::camera::Camera;
-use veldmap_core::tile::{DecodedTile, TileScheme, traverse};
+use veldmap_core::tile::{DecodedTile, GlobeScheme, TileScheme, traverse};
 use veldmap_net::{DecodeCompletion, DecodeFailure, DecodeRequest};
-use veldmap_raster::{DecodePool, DecodePoolConfig};
+use veldmap_raster::{DecodePool, DecodePoolConfig, TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::StoragePaths;
 
 use super::adapters::RasterDecodeExecutor;
@@ -25,12 +25,18 @@ fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
     let mut storage = AppStorage::open(Arc::clone(&wakeup), Some(paths));
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
+    let decode_shutdown = CancelToken::new();
+    let decode_pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
+        decode_shutdown.clone(),
+    );
     let mut manager = BasemapManager::new(
         storage.settings(),
         storage.disk_cache(),
         tx,
         wakeup,
-        &MemoryBudget::default(),
+        decode_pool.handle().fast().clone(),
+        decode_shutdown.clone(),
     );
 
     assert!(!manager.is_textured());
@@ -67,9 +73,70 @@ fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
 
     manager.begin_shutdown();
     storage.begin_shutdown();
+    decode_shutdown.cancel();
     pending.close();
+    decode_pool.shutdown();
     manager.finish_shutdown();
     storage.finish_shutdown();
+}
+
+#[test]
+fn unavailable_live_pipeline_degrades_cleanly_to_full_bundled_basemap() {
+    let decode_shutdown = CancelToken::new();
+    let decode_pool = DecodePool::spawn(
+        DecodePoolConfig {
+            worker_count: 1,
+            ..DecodePoolConfig::default()
+        },
+        decode_shutdown.clone(),
+    );
+    let mut pending = PendingUploads::new();
+    let tx = pending.sender().expect("sender");
+    let bundled_provider = BundledBasemapProvider::new(
+        decode_pool.handle(),
+        tx,
+        Arc::new(|| {}),
+        decode_shutdown.clone(),
+    );
+    let mut manager = BasemapManager {
+        active_basemap: BasemapSelection::EoxSentinel2Cloudless,
+        bundled_provider,
+        live_pipeline: None,
+        live_pipeline_error: Some("simulated TLS init failure".to_owned()),
+        active_live_spec: None,
+        config_error: None,
+        observed_live_tile_bytes: 0,
+        wanted_bundled: HashSet::new(),
+        wanted_live: HashSet::new(),
+    };
+
+    let settings = AppSettings {
+        active_basemap: BasemapSelection::EoxSentinel2Cloudless,
+        ..AppSettings::default()
+    };
+    manager.sync_active_spec(&settings);
+
+    assert_eq!(manager.active_source(), SourceId::BUNDLED_BASEMAP);
+    assert_eq!(manager.attribution(), Some(BUNDLED_ATTRIBUTION));
+    let qcfg = manager.quadtree_config();
+    assert_eq!(qcfg.scheme, GlobeScheme::Geodetic);
+    assert_eq!(qcfg.max_tex_level, BUNDLED_MAX_LEVEL);
+    assert!(manager.status_snapshot().live_pipeline_error.is_some());
+
+    let gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
+    let visible = traverse(&Camera::at(0.0, 0.0, 1_500_000.0), 800, 600, &qcfg);
+    manager.schedule_for_tiles(visible.iter().map(|v| v.tex_id), &gpu_cache, &pending, 1);
+    assert!(manager.wanted_live.is_empty());
+    assert!(
+        manager.wanted_bundled.iter().any(|k| k.level >= 2),
+        "unavailable live pipeline must allow full z=0..3 bundled fallback instead of z<=1 cap"
+    );
+
+    manager.begin_shutdown();
+    decode_shutdown.cancel();
+    pending.close();
+    decode_pool.shutdown();
+    manager.finish_shutdown();
 }
 
 #[test]
@@ -81,12 +148,18 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_evict
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
     let gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
+    let decode_shutdown = CancelToken::new();
+    let decode_pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
+        decode_shutdown.clone(),
+    );
     let mut manager = BasemapManager::new(
         storage.settings(),
         storage.disk_cache(),
         tx.clone(),
         wakeup,
-        &MemoryBudget::default(),
+        decode_pool.handle().fast().clone(),
+        decode_shutdown.clone(),
     );
 
     storage.mutate_settings(|s| s.active_basemap = BasemapSelection::NasaGibsBlueMarble);
@@ -132,7 +205,7 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_evict
     .expect("send stale");
     manager.record_upload_report(&UploadBatchReport {
         uploaded: 1,
-        max_active_tile_bytes: 2 * 1024 * 1024,
+        max_tile_bytes_by_source: vec![(gibs_source, 2 * 1024 * 1024)],
         ..UploadBatchReport::default()
     });
     assert_eq!(manager.observed_live_tile_bytes, 2 * 1024 * 1024);
@@ -149,7 +222,9 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_evict
 
     manager.begin_shutdown();
     storage.begin_shutdown();
+    decode_shutdown.cancel();
     pending.close();
+    decode_pool.shutdown();
     manager.finish_shutdown();
     storage.finish_shutdown();
 }
@@ -197,4 +272,70 @@ fn rejected_or_cancelled_decode_request_signals_aborted() {
     );
     shutdown.cancel();
     pool.shutdown();
+}
+
+#[test]
+fn in_place_custom_xyz_spec_edit_marks_changed_without_evicting_source() {
+    let mut settings = AppSettings {
+        active_basemap: BasemapSelection::CustomXyz,
+        custom_xyz: crate::settings::CustomXyzSettings {
+            name: "Custom Test".to_string(),
+            url_template: "https://tiles.example.test/{z}/{x}/{y}.png?key={key}".to_string(),
+            max_level: 10,
+            api_key: "old-secret".to_string(),
+            attribution: "Example v1".to_string(),
+            tms_flip_y: false,
+        },
+        ..AppSettings::default()
+    };
+
+    let wakeup: Wakeup = Arc::new(|| {});
+    let mut pending = PendingUploads::new();
+    let tx = pending.sender().expect("sender");
+    let decode_shutdown = CancelToken::new();
+    let decode_pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
+        decode_shutdown.clone(),
+    );
+    let mut manager = BasemapManager::new(
+        &settings,
+        None,
+        tx,
+        wakeup,
+        decode_pool.handle().fast().clone(),
+        decode_shutdown.clone(),
+    );
+
+    let initial_source = manager.active_source();
+    assert_ne!(initial_source, SourceId::BUNDLED_BASEMAP);
+
+    // Editing max_level / api_key / attribution preserves `SourceId` (derived
+    // from template + tms_flip_y) while mutating `LiveBasemapSpec`. Sync must
+    // report `changed = true` so `SceneState` invalidates its cached snapshot
+    // and re-schedules tiles, without evicting cached tiles for the same source.
+    settings.custom_xyz.max_level = 14;
+    settings.custom_xyz.api_key = "new-secret".to_string();
+    settings.custom_xyz.attribution = "Example v2".to_string();
+    let outcome = manager.sync_settings(&settings);
+    assert_eq!(manager.active_source(), initial_source);
+    assert!(
+        outcome.changed,
+        "in-place CustomXyz spec edit must mark scene dirty"
+    );
+    assert_eq!(
+        outcome.evict_source, None,
+        "same SourceId must not evict cached tiles"
+    );
+    assert_eq!(manager.quadtree_config().max_tex_level, 14);
+
+    // Repeating sync with identical settings must be a no-op.
+    let noop = manager.sync_settings(&settings);
+    assert!(!noop.changed);
+    assert_eq!(noop.evict_source, None);
+
+    manager.begin_shutdown();
+    decode_shutdown.cancel();
+    pending.close();
+    decode_pool.shutdown();
+    manager.finish_shutdown();
 }

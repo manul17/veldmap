@@ -3,7 +3,9 @@
 //! queues, end-to-end `CancelToken` abort through an injected
 //! [`TileDecodeExecutor`], and deterministic shutdown.
 
+mod disk;
 mod dispatch;
+mod failures;
 mod guards;
 mod queue;
 mod state;
@@ -13,32 +15,27 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::TileKey;
 
 use crate::basemap::LiveBasemapSpec;
-use crate::http::{
-    DEFAULT_MAX_CONCURRENT_PER_HOST, DEFAULT_MAX_TILE_RESPONSE_BYTES, HostLimiters,
-    HttpClientConfig, build_http_client, default_user_agent,
-};
+use crate::http::{HostLimiters, HttpClientConfig, build_http_client, default_user_agent};
 use crate::{NetError, TileBlobStore, TileDecodeExecutor};
 
+use self::disk::DiskCacheGate;
 use self::dispatch::dispatcher_loop;
 use self::state::PipelineState;
+
+/// Default maximum concurrent HTTP requests per remote host.
+const DEFAULT_MAX_CONCURRENT_PER_HOST: usize = 6;
+
+/// Default maximum encoded response body accepted for one live tile (`16 MiB`).
+const DEFAULT_MAX_TILE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default backoff duration after transient HTTP / network errors before
 /// retrying a tile.
 const DEFAULT_TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_secs(15);
-
-/// Maximum concurrent blocking disk-cache write/delete tasks (`cache.put()` /
-/// `cache.delete()`) so burst completions serialize cleanly without piling up
-/// contending Tokio blocking threads on a single-writer backend.
-const MAX_CONCURRENT_DISK_WRITES: usize = 1;
-
-/// Maximum total pending + active post-decode disk-cache write/delete tasks so
-/// slow disk writes never accumulate unbounded queued tasks and payloads.
-const MAX_QUEUED_DISK_WRITES: usize = 32;
 
 /// Configuration for [`LiveTilePipeline`].
 #[derive(Clone, Debug)]
@@ -76,16 +73,27 @@ pub struct NetworkStatus {
     pub last_error: Option<String>,
 }
 
+/// Shared control-plane handles held by both [`LiveTilePipeline`] and
+/// [`PipelineContext`].
+///
+/// Kept distinct from [`PipelineContext`] so the frontend handle never extends
+/// the lifetimes of `reqwest::Client`, `DiskCacheGate`, `TileDecodeExecutor`,
+/// or `Wakeup` past `dispatcher_loop` exit.
+///
+/// Lock ordering: always acquire `state` BEFORE `host_limiters` (never
+/// reverse; `HostLimiters` is a leaf lock).
+struct PipelineShared {
+    shutdown: CancelToken,
+    state: Mutex<PipelineState>,
+    host_limiters: HostLimiters,
+    notify: Notify,
+}
+
 /// Shared immutable context passed across the dispatcher and per-tile tasks.
 struct PipelineContext {
-    state: Arc<Mutex<PipelineState>>,
-    notify: Arc<Notify>,
-    shutdown: CancelToken,
+    shared: Arc<PipelineShared>,
     client: reqwest::Client,
-    host_limiters: Arc<HostLimiters>,
-    disk_cache: Option<Arc<dyn TileBlobStore>>,
-    disk_put_queue_sem: Arc<Semaphore>,
-    disk_put_sem: Arc<Semaphore>,
+    disk_cache: Option<DiskCacheGate>,
     decoder: Arc<dyn TileDecodeExecutor>,
     wakeup: Wakeup,
     max_tile_bytes: usize,
@@ -93,17 +101,14 @@ struct PipelineContext {
 }
 
 /// Complete live HTTP tile streaming pipeline owning:
-/// 1. `CancelToken` (`shutdown`)
+/// 1. Shared control state (`CancelToken`, queue/in-flight state, host limiters)
 /// 2. Dedicated `tokio::runtime::Runtime` running HTTP fetches
 ///
 /// Decodes encoded tile payloads via the caller-injected [`TileDecodeExecutor`],
 /// keeping `veldmap-net` free of `veldmap-raster` and image codecs.
 /// Shuts down deterministically via [`Self::signal_shutdown`] / [`Self::shutdown`].
 pub struct LiveTilePipeline {
-    shutdown: CancelToken,
-    state: Arc<Mutex<PipelineState>>,
-    host_limiters: Arc<HostLimiters>,
-    notify: Arc<Notify>,
+    shared: Arc<PipelineShared>,
     runtime: Option<tokio::runtime::Runtime>,
 }
 
@@ -130,19 +135,17 @@ impl LiveTilePipeline {
             .enable_all()
             .build()?;
 
-        let state = Arc::new(Mutex::new(PipelineState::default()));
-        let notify = Arc::new(Notify::new());
-        let host_limiters = Arc::new(HostLimiters::new(config.max_concurrent_per_host));
+        let shared = Arc::new(PipelineShared {
+            shutdown,
+            state: Mutex::new(PipelineState::default()),
+            host_limiters: HostLimiters::new(config.max_concurrent_per_host),
+            notify: Notify::new(),
+        });
 
         let ctx = Arc::new(PipelineContext {
-            state: Arc::clone(&state),
-            notify: Arc::clone(&notify),
-            shutdown: shutdown.clone(),
+            shared: Arc::clone(&shared),
             client,
-            host_limiters: Arc::clone(&host_limiters),
-            disk_cache,
-            disk_put_queue_sem: Arc::new(Semaphore::new(MAX_QUEUED_DISK_WRITES)),
-            disk_put_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_DISK_WRITES)),
+            disk_cache: disk_cache.map(DiskCacheGate::new),
             decoder,
             wakeup,
             max_tile_bytes: config.max_tile_bytes,
@@ -154,10 +157,7 @@ impl LiveTilePipeline {
         });
 
         Ok(Self {
-            shutdown,
-            state,
-            host_limiters,
-            notify,
+            shared,
             runtime: Some(runtime),
         })
     }
@@ -167,18 +167,18 @@ impl LiveTilePipeline {
     /// and queued CPU decode jobs from any previous source.
     pub fn set_active_spec(&self, spec: Option<LiveBasemapSpec>) {
         let to_cancel = {
-            let mut st = lock_unpoisoned(&self.state);
+            let mut st = lock_unpoisoned(&self.shared.state);
             let Some(tokens) = st.set_active_spec(spec) else {
                 return;
             };
-            self.host_limiters.clear_cooldowns();
+            self.shared.host_limiters.clear_cooldowns();
             tokens
         };
 
         for tok in to_cancel {
             tok.cancel();
         }
-        self.notify.notify_one();
+        self.shared.notify.notify_one();
     }
 
     /// Replace the visible-first fetch queue with `wanted`, immediately
@@ -194,7 +194,7 @@ impl LiveTilePipeline {
     {
         let now = Instant::now();
         let to_cancel = {
-            let mut st = lock_unpoisoned(&self.state);
+            let mut st = lock_unpoisoned(&self.shared.state);
             let Some(tokens) = st.reconcile_wanted(wanted, &is_ready, now) else {
                 return;
             };
@@ -204,35 +204,35 @@ impl LiveTilePipeline {
         for tok in to_cancel {
             tok.cancel();
         }
-        self.notify.notify_one();
+        self.shared.notify.notify_one();
     }
 
     /// Clear failure / offline markers and per-host cooldowns, immediately
     /// re-queueing any previously failed keys still in `last_wanted`.
     pub fn retry_failed(&self) {
         {
-            let mut st = lock_unpoisoned(&self.state);
-            self.host_limiters.clear_cooldowns();
+            let mut st = lock_unpoisoned(&self.shared.state);
+            self.shared.host_limiters.clear_cooldowns();
             st.retry_failed();
         }
-        self.notify.notify_one();
+        self.shared.notify.notify_one();
     }
 
     /// Snapshot observable status counters for the GIS UI.
     pub fn status(&self) -> NetworkStatus {
-        lock_unpoisoned(&self.state).status()
+        lock_unpoisoned(&self.shared.state).status()
     }
 
     /// Trigger global and per-tile `CancelToken`s immediately (Phase 1 of
     /// deterministic shutdown, called BEFORE closing the upload channel or
     /// joining the caller-owned decode pool).
     pub fn signal_shutdown(&self) {
-        self.shutdown.cancel();
-        let active_tokens = lock_unpoisoned(&self.state).signal_shutdown();
+        self.shared.shutdown.cancel();
+        let active_tokens = lock_unpoisoned(&self.shared.state).signal_shutdown();
         for tok in active_tokens {
             tok.cancel();
         }
-        self.notify.notify_waiters();
+        self.shared.notify.notify_waiters();
     }
 
     /// Deterministically shut down the async runtime after signalling

@@ -17,6 +17,7 @@ veldmap-core = { path = "../veldmap-core" }
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }
+veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
 
 [lints]
 workspace = true

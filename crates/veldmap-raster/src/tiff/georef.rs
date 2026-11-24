@@ -11,9 +11,7 @@ use crate::pipeline::band::{
     GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie, is_valid_lat_lon,
 };
 
-use super::tags::{
-    is_missing_tag, map_tiff_error, read_tag_ascii_opt, read_tag_f64_vec_opt, read_tag_u16_vec_opt,
-};
+use super::tags::{opt_tag, read_tag_ascii_opt, read_tag_f64_vec_opt, read_tag_u16_vec_opt};
 
 /// Parse raw `GeoKeyDirectoryTag` (`34735`), `GeoDoubleParamsTag` (`34736`),
 /// and `GeoAsciiParamsTag` (`34737`) payloads.
@@ -86,14 +84,8 @@ pub(super) fn parse_gdal_nodata(
     decoder: &mut Decoder<BufferedByteReader>,
     cancel: &CancelToken,
 ) -> Result<Option<f64>, RasterError> {
-    let raw = match decoder.get_tag_ascii_string(Tag::GdalNodata) {
-        Ok(s) => s,
-        Err(err) if is_missing_tag(&err) => return Ok(None),
-        Err(_) if cancel.is_cancelled() => return Err(RasterError::Cancelled),
-        Err(err) if matches!(err, tiff::TiffError::IoError(_)) => {
-            return Err(map_tiff_error(err, cancel));
-        }
-        Err(_) => return Ok(None),
+    let Some(raw) = opt_tag(decoder.get_tag_ascii_string(Tag::GdalNodata), cancel)? else {
+        return Ok(None);
     };
     let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
     if trimmed.eq_ignore_ascii_case("nan") {
@@ -191,6 +183,23 @@ pub(super) fn affine_from_matrix(matrix: &[f64], half: f64) -> Option<[f64; 6]> 
     ])
 }
 
+fn affine_from_tags(points: &[f64], scale: &[f64], matrix: &[f64], half: f64) -> Option<[f64; 6]> {
+    if let (Some(tie), true) = (points.get(..6), usable_step(scale)) {
+        let affine = [
+            scale[0],
+            0.0,
+            tie[3] - (tie[0] + half) * scale[0],
+            0.0,
+            -scale[1],
+            tie[4] + (tie[1] + half) * scale[1],
+        ];
+        if affine.iter().all(|v| v.is_finite()) {
+            return Some(affine);
+        }
+    }
+    affine_from_matrix(matrix, half)
+}
+
 pub(super) fn geo_placement(
     geo_params: &GeoKeyParams,
     points: &[f64],
@@ -208,17 +217,7 @@ pub(super) fn geo_placement(
     };
 
     let half = geo_params.raster_type.half_pixel_shift();
-    let affine = match (points.get(..6), usable_step(scale)) {
-        (Some(tie), true) => [
-            scale[0],
-            0.0,
-            tie[3] - (tie[0] + half) * scale[0],
-            0.0,
-            -scale[1],
-            tie[4] + (tie[1] + half) * scale[1],
-        ],
-        _ => affine_from_matrix(matrix, half)?,
-    };
+    let affine = affine_from_tags(points, scale, matrix, half)?;
 
     let (right, bottom) = (f64::from(width), f64::from(height));
     let corner = [
@@ -268,39 +267,7 @@ pub(super) fn geo_ties(
         return finite_ties(ties);
     }
 
-    if let (Some(tie), true) = (points.get(..6), usable_step(scale)) {
-        let x0 = tie[3] - (tie[0] + half) * scale[0];
-        let y0 = tie[4] + (tie[1] + half) * scale[1];
-        let (right, bottom) = (f64::from(width), f64::from(height));
-        return finite_ties(vec![
-            GeoTie {
-                px: 0.0,
-                py: 0.0,
-                lon: x0,
-                lat: y0,
-            },
-            GeoTie {
-                px: right,
-                py: 0.0,
-                lon: x0 + right * scale[0],
-                lat: y0,
-            },
-            GeoTie {
-                px: 0.0,
-                py: bottom,
-                lon: x0,
-                lat: y0 - bottom * scale[1],
-            },
-            GeoTie {
-                px: right,
-                py: bottom,
-                lon: x0 + right * scale[0],
-                lat: y0 - bottom * scale[1],
-            },
-        ]);
-    }
-
-    if let Some(a) = affine_from_matrix(matrix, half) {
+    if let Some(a) = affine_from_tags(points, scale, matrix, half) {
         let (right, bottom) = (f64::from(width), f64::from(height));
         let place = |px: f64, py: f64| GeoTie {
             px,

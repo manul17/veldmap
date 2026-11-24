@@ -239,7 +239,7 @@ impl BundledBasemap {
         }
 
         let out_of_range = || RasterError::TileOutOfRange {
-            scheme: id.scheme,
+            scheme: id.scheme.into_tile_scheme(),
             level: id.level,
             x: id.x,
             y: id.y,

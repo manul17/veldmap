@@ -1,14 +1,18 @@
 //! Unified tile addressing (`TileKey`, `TileScheme`, `PlanetaryScheme`,
 //! `GlobeScheme`, `BandKey`, `PixelFormat`, `SourceFingerprint`,
-//! `TileStreamSpec`, `StreamKey`), pure O(1) LRU `TileCache<K, V>`, planetary
-//! tile projection/sampling, and scheme-matched WGS84 planetary quadtree with
-//! adaptive Polar Stereographic caps.
+//! `TileStreamSpec`, `StreamKey`), raster pyramid arithmetic (`pyramid`), pure
+//! O(1) LRU `TileCache<K, V>`, planetary tile projection/sampling, and
+//! scheme-matched WGS84 planetary quadtree with adaptive Polar Stereographic
+//! caps.
 
 pub mod cache;
 pub mod decoded;
 pub mod geometry;
+pub mod identity;
 pub mod key;
+pub mod pyramid;
 pub mod quadtree;
+pub mod scheme;
 
 pub use cache::TileCache;
 pub use decoded::{
@@ -18,11 +22,15 @@ pub use geometry::{
     LatLonTileBounds, POLAR_R_CAP, TileSurfaceSample, polar_cap_point, sample_tile_surface,
     web_mercator_y_bounds,
 };
-pub use key::{
-    BandKey, GlobeScheme, PixelFormat, PlanetaryScheme, QuadTileId, SourceFingerprint, SourceId,
-    StreamKey, TileKey, TileScheme, TileStreamSpec, compose_uv_rect, fnv1a_64,
+pub use identity::{
+    BandKey, PixelFormat, SourceFingerprint, SourceId, StreamKey, TileStreamSpec, fnv1a_64,
+};
+pub use key::{QuadTileId, TileKey, compose_uv_rect};
+pub use pyramid::{
+    RASTER_TILE_SIZE, cell_image_rect, cell_uv, grid_dim, level_count, level_size, tile_extent,
 };
 pub use quadtree::{
     DEFAULT_GRID_CELLS, DEFAULT_POLAR_MAX_TEX_LEVEL, DEFAULT_TILE_PX, QuadtreeConfig, VisibleTile,
     describe_tile, traverse,
 };
+pub use scheme::{GlobeScheme, PlanetaryScheme, TileScheme};

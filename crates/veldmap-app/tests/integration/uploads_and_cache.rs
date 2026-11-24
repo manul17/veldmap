@@ -76,8 +76,6 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         queue,
         &mut cache,
         UploadPassParams {
-            pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
-            observed_source: Some(SourceId::BUNDLED_BASEMAP),
             wanted: &[],
             protected: None,
             byte_budget: 1,
@@ -98,9 +96,7 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
             65,
             65,
             false,
-            true,
             SourceId::BUNDLED_BASEMAP,
-            1,
             &cfg,
             Some(&mut cache),
         );
@@ -114,8 +110,6 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         queue,
         &mut cache,
         UploadPassParams {
-            pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
-            observed_source: Some(SourceId::BUNDLED_BASEMAP),
             wanted: &[],
             protected: None,
             byte_budget: 1024 * 1024,
@@ -143,8 +137,6 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
         queue,
         &mut cache,
         UploadPassParams {
-            pinned_root_sources: &[SourceId::BUNDLED_BASEMAP],
-            observed_source: Some(SourceId::BUNDLED_BASEMAP),
             wanted: &[],
             protected: None,
             byte_budget: 1024 * 1024,
@@ -234,9 +226,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         w,
         h,
         false,
-        true,
         live_source,
-        1,
         &merc_cfg,
         Some(&mut cache),
     );
@@ -260,9 +250,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         w,
         h,
         false,
-        true,
         live_source,
-        2,
         &merc_cfg,
         Some(&mut cache),
     );
@@ -295,13 +283,12 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     let tx = pending.sender().expect("sender");
     tx.send((live_root, live_tile.clone())).expect("send live");
     let pinned_live = [live_source, SourceId::BUNDLED_BASEMAP];
+    pending.set_pinned_root_sources(&pinned_live);
     let rep = pending.drain_and_upload(
         device,
         queue,
         &mut cache,
         UploadPassParams {
-            pinned_root_sources: &pinned_live,
-            observed_source: Some(live_source),
             wanted: &[&HashSet::from([live_root])],
             protected: Some(&fallback_snap.carrier_keys),
             byte_budget: 1024 * 1024,
@@ -331,8 +318,6 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         queue,
         &mut cache,
         UploadPassParams {
-            pinned_root_sources: &pinned_live,
-            observed_source: Some(live_source),
             wanted: &[&HashSet::from([south_polar_root])],
             protected: Some(&all_protected),
             byte_budget: 1024 * 1024,
@@ -352,9 +337,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         w,
         h,
         false,
-        true,
         live_source,
-        3,
         &merc_cfg,
         Some(&mut cache),
     );
@@ -376,8 +359,6 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         queue,
         &mut cache,
         UploadPassParams {
-            pinned_root_sources: &pinned_live,
-            observed_source: Some(live_source),
             wanted: &[&HashSet::from([south_polar_root])],
             protected: Some(&live_snap.carrier_keys),
             byte_budget: 1024 * 1024,

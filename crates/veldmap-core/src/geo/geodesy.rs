@@ -80,14 +80,20 @@ impl Ellipsoid {
     /// Evaluate a separable `N x N` grid of surface (`height_m = 0.0`) ECEF
     /// points and outward unit normals, factoring trigonometry into `N` lat and
     /// `N` lon evaluations instead of `N^2`.
-    pub fn fill_separable_surface_grid<const N: usize>(
+    pub(crate) fn fill_separable_surface_grid<const N: usize>(
         &self,
         lats_deg: [f64; N],
         lons_deg: [f64; N],
         samples: &mut [DVec3],
         normals: &mut [DVec3],
     ) {
-        debug_assert!(samples.len() >= N * N && normals.len() >= N * N);
+        let len = N * N;
+        assert!(
+            samples.len() >= len && normals.len() >= len,
+            "separable surface grid buffers must hold at least {len} entries"
+        );
+        let samples = &mut samples[..len];
+        let normals = &mut normals[..len];
         let e2 = self.eccentricity_sq();
         let one_minus_e2 = 1.0 - e2;
         let mut lat_cache = [(0.0_f64, 0.0_f64, 0.0_f64); N];

@@ -52,7 +52,13 @@ impl BasemapSettingsDraft {
 
     pub(crate) fn apply_into(&self, target: &mut AppSettings) {
         target.active_basemap = self.active_basemap;
-        target.gibs_date = self.gibs_date.clone();
+        // Never overwrite a valid persisted GIBS date with a half-typed invalid
+        // string when saving unrelated settings (e.g. disk cache cap or Custom XYZ).
+        if validate_gibs_date(&self.gibs_date)
+            || self.active_basemap == BasemapSelection::NasaGibsViirs
+        {
+            target.gibs_date = self.gibs_date.clone();
+        }
         target.custom_xyz = self.custom_xyz.clone();
         target.disk_cache_max_mb = self.disk_cache_max_mb;
     }
@@ -150,7 +156,7 @@ fn show_live_status_badge(
     if !current.is_live() {
         return;
     }
-    let net = &status.network;
+    let net = &status.stream;
     if let Some(init_err) = status.live_pipeline_error.as_deref() {
         ui.label(
             egui::RichText::new("Live unavailable")
@@ -434,7 +440,8 @@ pub(crate) fn show_settings_window(
             );
 
             ui.separator();
-            let can_apply = date_valid
+            let can_apply = (ui_state.draft.active_basemap != BasemapSelection::NasaGibsViirs
+                || date_valid)
                 && (ui_state.draft.active_basemap != BasemapSelection::CustomXyz || custom_valid);
             ui.horizontal(|ui| {
                 if ui
@@ -444,10 +451,7 @@ pub(crate) fn show_settings_window(
                     actions.push(BasemapUiAction::ApplyDraft(ui_state.draft.clone()));
                 }
                 if ui
-                    .add_enabled(
-                        date_valid && custom_valid,
-                        egui::Button::new("Use Custom XYZ"),
-                    )
+                    .add_enabled(custom_valid, egui::Button::new("Use Custom XYZ"))
                     .clicked()
                 {
                     let mut next = ui_state.draft.clone();
@@ -483,6 +487,15 @@ mod tests {
             BasemapSelection::EoxSentinel2Cloudless
         );
         assert_eq!(settings.disk_cache_max_mb, 1024);
+
+        // Applying draft with an invalid GIBS date while GIBS VIIRS is inactive
+        // preserves the existing valid GIBS date instead of persisting a typo.
+        let prev_date = settings.gibs_date.clone();
+        ui_state.draft.gibs_date = "not-a-date".to_owned();
+        ui_state.draft.disk_cache_max_mb = 2048;
+        ui_state.draft.apply_into(&mut settings);
+        assert_eq!(settings.gibs_date, prev_date);
+        assert_eq!(settings.disk_cache_max_mb, 2048);
 
         // Cached custom validation fails on empty URL, then updates when edited.
         assert!(ui_state.custom_validation().is_err());

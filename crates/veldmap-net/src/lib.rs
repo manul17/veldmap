@@ -33,12 +33,6 @@ pub enum BlobStoreError {
     Backend(String),
 }
 
-impl From<String> for BlobStoreError {
-    fn from(msg: String) -> Self {
-        Self::Backend(msg)
-    }
-}
-
 /// Minimal encoded-tile persistence boundary injected into
 /// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from concrete disk-cache
 /// backends (implementations may enforce source-key formatting rules and

@@ -1,0 +1,251 @@
+//! Scene/upload/decode-pool orchestration (`SceneState`) extracted from `app.rs`.
+//!
+//! Owns the GPU tile cache, bounded upload queue, shared two-lane CPU decode
+//! pool (`TwoLaneDecodePool`), basemap coordinator, cached immutable
+//! `DrawSnapshot`, and monotonic `scene_generation`.
+
+use std::sync::Arc;
+
+use veldmap_core::budget::MemoryBudget;
+use veldmap_core::geo::camera::Camera;
+use veldmap_core::sync::{CancelToken, Wakeup};
+use veldmap_core::tile::SourceId;
+use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
+use veldmap_storage::TileDiskCache;
+
+use crate::app::AppError;
+use crate::basemap::{BasemapManager, BasemapStatusSnapshot};
+use crate::gpu_tiles::{
+    DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
+    UploadBatchReport, UploadPassParams,
+};
+use crate::render::{DrawSnapshot, SnapshotBuildParams};
+use crate::settings::AppSettings;
+use crate::viewport_bridge::SnapshotKey;
+
+/// Coordinates tile caches, bounded GPU uploads, shared two-lane CPU decode
+/// threads, active basemap scheduling, and cached frame snapshots.
+pub(crate) struct SceneState {
+    gpu_tile_cache: GpuTileCache,
+    pending_uploads: PendingUploads,
+    decode_shutdown: CancelToken,
+    decode_pool: Option<TwoLaneDecodePool>,
+    basemap: BasemapManager,
+    cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
+    scene_generation: u64,
+}
+
+impl SceneState {
+    /// Initialize GPU/upload caches, the shared two-lane CPU decode pool, and
+    /// basemap streaming from startup `budget` and persisted `settings`.
+    pub(crate) fn new(
+        settings: &AppSettings,
+        disk_cache: Option<Arc<TileDiskCache>>,
+        wakeup: Wakeup,
+        budget: &MemoryBudget,
+    ) -> Result<Self, AppError> {
+        let pending_uploads = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
+        let done_tx = pending_uploads
+            .sender()
+            .ok_or(AppError::UploadChannelClosed)?;
+
+        let decode_shutdown = CancelToken::new();
+        let mut decode_cfg = TwoLaneDecodePoolConfig::from_budget(budget);
+        decode_cfg.fast.worker_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(2, 4);
+        let decode_pool = TwoLaneDecodePool::spawn(decode_cfg, decode_shutdown.clone());
+
+        let basemap = BasemapManager::new(
+            settings,
+            disk_cache,
+            done_tx,
+            wakeup,
+            decode_pool.handle().fast().clone(),
+            decode_shutdown.clone(),
+        );
+
+        let scene = Self {
+            gpu_tile_cache: GpuTileCache::new(budget.gpu_tile_cache_bytes),
+            pending_uploads,
+            decode_shutdown,
+            decode_pool: Some(decode_pool),
+            basemap,
+            cached_snapshot: None,
+            scene_generation: 1,
+        };
+        scene.sync_pinned_root_sources();
+        Ok(scene)
+    }
+
+    fn pinned_root_sources(&self) -> [SourceId; 2] {
+        [self.basemap.active_source(), SourceId::BUNDLED_BASEMAP]
+    }
+
+    fn sync_pinned_root_sources(&self) {
+        let sources = self.pinned_root_sources();
+        self.pending_uploads.set_pinned_root_sources(&sources);
+    }
+
+    /// Bump `scene_generation` after any external scene-visible toggle (such as
+    /// toggling the graticule).
+    pub(crate) fn mark_dirty(&mut self) {
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+    }
+
+    /// Release cached `Arc<DrawSnapshot>` references when the viewport is
+    /// collapsed/minimized so evicted `GpuTile` textures are not pinned.
+    pub(crate) fn clear_cached_snapshot(&mut self) {
+        self.cached_snapshot = None;
+    }
+
+    /// Visible basemap attribution pill text (`None` for `EllipsoidOnly`).
+    pub(crate) fn attribution(&self) -> Option<&str> {
+        self.basemap.attribution()
+    }
+
+    /// Snapshot toolbar-visible live streaming / config error status.
+    pub(crate) fn basemap_status(&self) -> BasemapStatusSnapshot {
+        self.basemap.status_snapshot()
+    }
+
+    /// Synchronize basemap providers with updated [`AppSettings`], purging any
+    /// superseded live source from VRAM / pending uploads and updating pinned
+    /// roots. Returns `true` if visible scene state changed.
+    pub(crate) fn sync_basemap_settings(&mut self, settings: &AppSettings) -> bool {
+        let outcome = self.basemap.sync_settings(settings);
+        if let Some(evict) = outcome.evict_source {
+            self.gpu_tile_cache.remove_source(evict);
+            self.pending_uploads.clear_source(evict);
+        }
+        if outcome.changed {
+            self.sync_pinned_root_sources();
+            self.mark_dirty();
+        }
+        outcome.changed
+    }
+
+    /// Retry failed/offline live tile requests and reconcile providers.
+    pub(crate) fn retry_live_and_reconcile(&mut self) {
+        self.basemap.retry_live();
+        self.reconcile_providers();
+    }
+
+    /// Reconcile background tile providers against current GPU + pending state.
+    pub(crate) fn reconcile_providers(&mut self) {
+        self.basemap
+            .reconcile_providers(&self.gpu_tile_cache, &self.pending_uploads);
+    }
+
+    /// Drain background tile completions and upload coarsest-first within the
+    /// per-frame VRAM/time budget while protecting active-frame carriers.
+    pub(crate) fn drain_tile_uploads(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> UploadBatchReport {
+        let wanted = self.basemap.wanted_tile_sets();
+        let protected = self
+            .cached_snapshot
+            .as_ref()
+            .map(|(_, snap)| &snap.carrier_keys);
+        let report = self.pending_uploads.drain_and_upload(
+            device,
+            queue,
+            &mut self.gpu_tile_cache,
+            UploadPassParams {
+                wanted: &wanted,
+                protected,
+                byte_budget: DEFAULT_UPLOAD_BYTE_BUDGET,
+                time_budget: DEFAULT_UPLOAD_TIME_BUDGET,
+            },
+        );
+        self.basemap.record_upload_report(&report);
+        if report.uploaded > 0 {
+            self.mark_dirty();
+        }
+        report
+    }
+
+    /// Return the cached immutable `Arc<DrawSnapshot>` when `(camera, viewport,
+    /// scene_generation)` is unchanged (avoiding quadtree traversal on 120 Hz
+    /// mouse hover), or rebuild and schedule missing tiles.
+    /// Returns `(snapshot, reconciled_providers)`.
+    pub(crate) fn snapshot_for_frame(
+        &mut self,
+        camera: Camera,
+        width_px: u32,
+        height_px: u32,
+        pixels_per_point: f32,
+        show_graticule: bool,
+    ) -> (Arc<DrawSnapshot>, bool) {
+        let key = SnapshotKey::new(
+            &camera,
+            [width_px, height_px],
+            pixels_per_point,
+            self.scene_generation,
+        );
+        if let Some((cached_key, snapshot)) = &self.cached_snapshot
+            && *cached_key == key
+        {
+            return (Arc::clone(snapshot), false);
+        }
+
+        let textured = self.basemap.is_textured();
+        let quadtree_config = self.basemap.quadtree_config();
+        let policy = self.basemap.carrier_policy();
+        let snapshot = Arc::new(DrawSnapshot::build(
+            SnapshotBuildParams {
+                camera,
+                width_px,
+                height_px,
+                pixels_per_point,
+                show_graticule,
+                carrier_policy: &policy,
+                config: &quadtree_config,
+            },
+            textured.then_some(&mut self.gpu_tile_cache),
+        ));
+
+        self.basemap.schedule_for_tiles(
+            snapshot.visible_tex_ids(),
+            &self.gpu_tile_cache,
+            &self.pending_uploads,
+            1,
+        );
+
+        self.cached_snapshot = Some((key, Arc::clone(&snapshot)));
+        (snapshot, true)
+    }
+
+    /// Phase 1 of deterministic shutdown: cancel all worker tokens and signal
+    /// live/bundled pipelines BEFORE closing `PendingUploads`.
+    pub(crate) fn begin_shutdown(&mut self) {
+        self.basemap.begin_shutdown();
+        self.decode_shutdown.cancel();
+    }
+
+    /// Phase 2 of deterministic shutdown: close bounded upload queue so
+    /// producers exit promptly on send.
+    pub(crate) fn close_uploads(&mut self) {
+        self.pending_uploads.close();
+    }
+
+    /// Phase 3 of deterministic shutdown: join the shared CPU decode pool
+    /// BEFORE shutting down `LiveTilePipeline`'s `tokio::Runtime`.
+    pub(crate) fn finish_shutdown(&mut self) {
+        if let Some(pool) = self.decode_pool.take() {
+            pool.shutdown();
+        }
+        self.basemap.finish_shutdown();
+    }
+}
+
+impl Drop for SceneState {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+        self.close_uploads();
+        self.finish_shutdown();
+    }
+}

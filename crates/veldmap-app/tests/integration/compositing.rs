@@ -24,9 +24,7 @@ fn srgb_and_unorm_compositing_parity_and_zero_idle_rerender() {
         w,
         h,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        1,
         &cfg,
         None,
     );
@@ -113,9 +111,7 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
         w,
         h,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        1,
         &cfg,
         None,
     );
@@ -124,9 +120,7 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
         w,
         h,
         false,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        1,
         &cfg,
         None,
     );
@@ -141,28 +135,8 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
     // At (37.5 N, 52.5 E, 14,000 km), front 15-degree graticule lines lie far
     // from viewport center; central 9x9 patch must stay free of back-side bleed.
     let cam = Camera::at(37.5, 52.5, 14_000_000.0);
-    let s_on = build_snapshot(
-        cam,
-        w,
-        h,
-        true,
-        false,
-        SourceId::BUNDLED_BASEMAP,
-        2,
-        &cfg,
-        None,
-    );
-    let s_off = build_snapshot(
-        cam,
-        w,
-        h,
-        false,
-        false,
-        SourceId::BUNDLED_BASEMAP,
-        2,
-        &cfg,
-        None,
-    );
+    let s_on = build_snapshot(cam, w, h, true, SourceId::BUNDLED_BASEMAP, &cfg, None);
+    let s_off = build_snapshot(cam, w, h, false, SourceId::BUNDLED_BASEMAP, &cfg, None);
     let with_grid = render_srgb(&mut renderer, device, queue, w, h, &s_on);
     let without_grid = render_srgb(&mut renderer, device, queue, w, h, &s_off);
     let mid = w / 2;
@@ -187,9 +161,7 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
         129,
         129,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        3,
         &cfg,
         None,
     );
@@ -198,9 +170,7 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
         129,
         129,
         false,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        3,
         &cfg,
         None,
     );
@@ -223,17 +193,7 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
     let cfg = QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL);
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
     let cam = Camera::at(37.5, 52.5, 14_000_000.0);
-    let empty_snap = build_snapshot(
-        cam,
-        0,
-        0,
-        true,
-        false,
-        SourceId::BUNDLED_BASEMAP,
-        1,
-        &cfg,
-        None,
-    );
+    let empty_snap = build_snapshot(cam, 0, 0, true, SourceId::BUNDLED_BASEMAP, &cfg, None);
 
     let mut zero_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     assert!(!renderer.render_if_dirty(
@@ -247,17 +207,7 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
         },
     ));
 
-    let snap = build_snapshot(
-        cam,
-        65,
-        65,
-        true,
-        false,
-        SourceId::BUNDLED_BASEMAP,
-        1,
-        &cfg,
-        None,
-    );
+    let snap = build_snapshot(cam, 65, 65, true, SourceId::BUNDLED_BASEMAP, &cfg, None);
     let params = RenderParams {
         width: 65,
         height: 65,

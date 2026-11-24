@@ -4,7 +4,7 @@
 use rusqlite::{Connection, Transaction};
 
 use super::EvictionReport;
-use super::schema::{delete_meta_ids, select_evict_batch, set_cache_meta_totals};
+use super::queries::{delete_meta_ids, select_evict_batch, set_cache_meta_totals};
 
 /// Eviction headroom divisor (`10` => evict down to `90%` of budget so
 /// subsequent inserts do not trigger eviction on every single tile).
@@ -16,12 +16,10 @@ const INCREMENTAL_VACUUM_PAGES: i64 = 128;
 /// Maximum batch size pulled per SQLite LRU eviction iteration.
 pub(super) const EVICT_BATCH_ROWS: i64 = 128;
 
-pub(super) fn reclaim_space(conn: &Connection, is_file_backed: bool, full_vacuum: bool) {
+pub(super) fn reclaim_space(conn: &Connection, full_vacuum: bool) {
     if full_vacuum {
         let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
-        if is_file_backed {
-            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        }
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     } else {
         let _ = conn.execute_batch(&format!(
             "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES});"

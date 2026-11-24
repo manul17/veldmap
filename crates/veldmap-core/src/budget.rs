@@ -249,10 +249,7 @@ impl DecodeBudgetTracker {
                     bytes,
                 });
             }
-            state = match self.inner.cvar.wait(state) {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            state = crate::sync::wait_unpoisoned(&self.inner.cvar, state);
         }
     }
 }

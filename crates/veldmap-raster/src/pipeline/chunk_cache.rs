@@ -3,12 +3,14 @@
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::{SourceId, TileCache, TileStreamSpec};
 
 use crate::RasterError;
+
+use super::singleflight::SingleflightSlot;
 
 /// Composite key identifying one decoded source chunk (TIFF tile/strip)
 /// partitioned by `(source, spec, image, chunk_index)` so incompatible bands,
@@ -36,44 +38,12 @@ impl DecodedChunk {
     }
 }
 
-enum SlotState {
-    Pending,
-    Ready(Arc<DecodedChunk>),
-    Failed(RasterError),
-}
-
-struct SingleflightSlot {
-    state: Mutex<SlotState>,
-    cvar: Condvar,
-}
-
-impl SingleflightSlot {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(SlotState::Pending),
-            cvar: Condvar::new(),
-        }
-    }
-
-    fn complete_ok(&self, chunk: Arc<DecodedChunk>) {
-        let mut guard = lock_unpoisoned(&self.state);
-        *guard = SlotState::Ready(chunk);
-        self.cvar.notify_all();
-    }
-
-    fn complete_err(&self, err: RasterError) {
-        let mut guard = lock_unpoisoned(&self.state);
-        if matches!(*guard, SlotState::Pending) {
-            *guard = SlotState::Failed(err);
-            self.cvar.notify_all();
-        }
-    }
-}
+type ChunkSlot = SingleflightSlot<Result<Arc<DecodedChunk>, RasterError>>;
 
 struct LeaderGuard<'a> {
     state: &'a Mutex<CacheState>,
     key: ChunkKey,
-    slot: Arc<SingleflightSlot>,
+    slot: Arc<ChunkSlot>,
     completed: bool,
 }
 
@@ -92,15 +62,15 @@ impl Drop for LeaderGuard<'_> {
                 guard.in_flight.remove(&self.key);
             }
         }
-        self.slot.complete_err(RasterError::InvalidFormat(
+        self.slot.resolve(Err(RasterError::DecoderPanicked(
             "chunk decode leader panicked or exited prematurely".to_string(),
-        ));
+        )));
     }
 }
 
 struct CacheState {
     lru: TileCache<ChunkKey, Arc<DecodedChunk>>,
-    in_flight: HashMap<ChunkKey, Arc<SingleflightSlot>>,
+    in_flight: HashMap<ChunkKey, Arc<ChunkSlot>>,
     hits: u64,
     misses: u64,
     dedup_waits: u64,
@@ -165,8 +135,8 @@ impl SharedChunkCache {
 
         enum Role {
             Hit(Arc<DecodedChunk>),
-            Leader(Arc<SingleflightSlot>),
-            Follower(Arc<SingleflightSlot>),
+            Leader(Arc<ChunkSlot>),
+            Follower(Arc<ChunkSlot>),
         }
 
         let role = {
@@ -187,7 +157,11 @@ impl SharedChunkCache {
 
         match role {
             Role::Hit(chunk) => Ok(chunk),
-            Role::Follower(slot) => wait_for_slot(&slot, cancel),
+            Role::Follower(slot) => match slot.wait(cancel)? {
+                Ok(chunk) => Ok(chunk),
+                Err(_) if cancel.is_cancelled() => Err(RasterError::Cancelled),
+                Err(err) => Err(err),
+            },
             Role::Leader(slot) => {
                 let mut guard = LeaderGuard {
                     state: &self.state,
@@ -211,7 +185,7 @@ impl SharedChunkCache {
                             st.lru.insert(key, Arc::clone(&arc), byte_size).ok()
                         };
                         drop(evicted);
-                        slot.complete_ok(Arc::clone(&arc));
+                        slot.resolve(Ok(Arc::clone(&arc)));
                         guard.completed = true;
                         Ok(arc)
                     }
@@ -224,54 +198,18 @@ impl SharedChunkCache {
                                 st.in_flight.remove(&key);
                             }
                         }
-                        slot.complete_err(err.clone());
+                        slot.resolve(Err(err.clone()));
                         guard.completed = true;
                         Err(err)
                     }
                     Err(_) => {
                         // Drop `guard` cleanly: removes `in_flight` and notifies waiters.
                         drop(guard);
-                        Err(RasterError::InvalidFormat(
+                        Err(RasterError::DecoderPanicked(
                             "chunk decoder panicked".to_string(),
                         ))
                     }
                 }
-            }
-        }
-    }
-}
-
-fn wait_for_slot(
-    slot: &Arc<SingleflightSlot>,
-    cancel: &CancelToken,
-) -> Result<Arc<DecodedChunk>, RasterError> {
-    if cancel.is_cancelled() {
-        return Err(RasterError::Cancelled);
-    }
-    let wake_slot = Arc::clone(slot);
-    let _cancel_guard = cancel.on_cancel_guarded(move || {
-        let _lock = lock_unpoisoned(&wake_slot.state);
-        wake_slot.cvar.notify_all();
-    });
-
-    let mut state = lock_unpoisoned(&slot.state);
-    loop {
-        match &*state {
-            SlotState::Ready(chunk) => return Ok(Arc::clone(chunk)),
-            SlotState::Failed(err) => {
-                if cancel.is_cancelled() {
-                    return Err(RasterError::Cancelled);
-                }
-                return Err(err.clone());
-            }
-            SlotState::Pending => {
-                if cancel.is_cancelled() {
-                    return Err(RasterError::Cancelled);
-                }
-                state = match slot.cvar.wait(state) {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
             }
         }
     }

@@ -1,24 +1,40 @@
 //! Generic bounded `std::thread` CPU decode pool with panic isolation,
 //! configurable job-count + byte queue capping, coarsest-first priority
-//! scheduling, deduplication by [`DecodeJobKey`] (`TileKey` or `PassKey`),
+//! scheduling, deduplication by [`DecodeJobKey`] (`TileKey` or `StreamKey`),
 //! immediate cancellation checks, outside-mutex drop hygiene, and deterministic
 //! shutdown joining.
+
+mod queue;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::sync::{CancelGuard, CancelToken, lock_unpoisoned};
-use veldmap_core::tile::TileKey;
+use veldmap_core::sync::{CancelGuard, CancelToken, lock_unpoisoned, wait_unpoisoned};
 
-use crate::pipeline::scheduler::PassKey;
+use queue::DecodeQueue;
+pub use queue::{DecodeJob, DecodeJobKey};
 
 /// Default maximum queued decode jobs awaiting a CPU worker.
 pub const DEFAULT_MAX_PENDING_DECODE_JOBS: usize = 128;
 
 /// Default maximum cumulative queued bytes awaiting a CPU worker (`64 MiB`).
 pub const DEFAULT_MAX_PENDING_DECODE_BYTES: usize = 64 * 1024 * 1024;
+
+type SharedQueue = Arc<(Mutex<DecodeQueue>, Condvar)>;
+
+fn close_queue_shared(shared: &SharedQueue) {
+    let drained = {
+        let (lock, cvar) = &**shared;
+        let mut queue = lock_unpoisoned(lock);
+        queue.closed = true;
+        let drained = queue.drain_all();
+        cvar.notify_all();
+        drained
+    };
+    drop(drained);
+}
 
 /// Configuration for [`DecodePool::spawn`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,200 +57,10 @@ impl Default for DecodePoolConfig {
     }
 }
 
-/// Deduplication and scheduling identity for a [`DecodeJob`], cleanly
-/// distinguishing single-tile fast jobs from `PassKey`-scoped bulk cascade jobs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DecodeJobKey {
-    Tile(TileKey),
-    Pass(PassKey),
-}
-
-impl From<TileKey> for DecodeJobKey {
-    fn from(key: TileKey) -> Self {
-        Self::Tile(key)
-    }
-}
-
-impl From<PassKey> for DecodeJobKey {
-    fn from(key: PassKey) -> Self {
-        Self::Pass(key)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct DecodeJobPriority(DecodeJobKey);
-
-impl Ord for DecodeJobPriority {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self.0, other.0) {
-            (DecodeJobKey::Tile(a), DecodeJobKey::Tile(b)) => {
-                a.coarsest_first_key().cmp(&b.coarsest_first_key())
-            }
-            (DecodeJobKey::Pass(a), DecodeJobKey::Pass(b)) => a.cmp(&b),
-            (DecodeJobKey::Tile(_), DecodeJobKey::Pass(_)) => std::cmp::Ordering::Less,
-            (DecodeJobKey::Pass(_), DecodeJobKey::Tile(_)) => std::cmp::Ordering::Greater,
-        }
-    }
-}
-
-impl PartialOrd for DecodeJobPriority {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl DecodeJobKey {
-    /// Coarseness rank (smaller = higher priority). Pass jobs run at equal
-    /// rank `0` and never evict one another.
-    const fn coarseness_rank(self) -> u8 {
-        match self {
-            Self::Tile(key) => key.scheme.coarseness_rank(key.level),
-            Self::Pass(_) => 0,
-        }
-    }
-
-    /// Total deterministic priority key (smaller = dispatched first).
-    const fn priority_key(self) -> DecodeJobPriority {
-        DecodeJobPriority(self)
-    }
-}
-
-/// Single prioritized, byte-accounted CPU decode job submitted to
-/// [`DecodePoolHandle`].
-pub struct DecodeJob {
-    pub key: DecodeJobKey,
-    /// Accounted payload/working bytes charged against `max_pending_bytes`.
-    pub queued_bytes: usize,
-    pub cancel: CancelToken,
-    /// Decode closure executed on a worker thread inside `catch_unwind`.
-    pub work: Box<dyn FnOnce() + Send + 'static>,
-}
-
-struct DecodeQueue {
-    jobs: Vec<DecodeJob>,
-    queued_bytes: usize,
-    max_pending_jobs: usize,
-    max_pending_bytes: usize,
-    closed: bool,
-}
-
-impl DecodeQueue {
-    fn new(max_pending_jobs: usize, max_pending_bytes: usize) -> Self {
-        Self {
-            jobs: Vec::new(),
-            queued_bytes: 0,
-            max_pending_jobs: max_pending_jobs.max(1),
-            max_pending_bytes,
-            closed: false,
-        }
-    }
-
-    fn push_job(&mut self, job: DecodeJob) {
-        self.queued_bytes = self.queued_bytes.saturating_add(job.queued_bytes);
-        self.jobs.push(job);
-    }
-
-    fn swap_remove_job(&mut self, idx: usize) -> DecodeJob {
-        let job = self.jobs.swap_remove(idx);
-        self.queued_bytes = self.queued_bytes.saturating_sub(job.queued_bytes);
-        job
-    }
-
-    fn drain_all(&mut self) -> Vec<DecodeJob> {
-        self.queued_bytes = 0;
-        std::mem::take(&mut self.jobs)
-    }
-
-    fn prune_cancelled(&mut self, to_drop: &mut Vec<DecodeJob>) {
-        let mut i = 0;
-        while i < self.jobs.len() {
-            if self.jobs[i].cancel.is_cancelled() {
-                let removed = self.swap_remove_job(i);
-                to_drop.push(removed);
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    /// Plan eviction victims transactionally before mutating the queue so
-    /// rejecting an incoming job never destroys valid finer queued jobs
-    /// (always permitting a single job into an empty queue).
-    fn plan_evictions(&self, key: DecodeJobKey, incoming_bytes: usize) -> Option<Vec<usize>> {
-        let needs_eviction = !self.jobs.is_empty()
-            && (self.jobs.len() >= self.max_pending_jobs
-                || self.queued_bytes.saturating_add(incoming_bytes) > self.max_pending_bytes);
-        if !needs_eviction {
-            return Some(Vec::new());
-        }
-
-        let incoming_coarse = key.coarseness_rank();
-        let mut candidates: Vec<(usize, _, usize)> = self
-            .jobs
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, j)| {
-                let victim_coarse = j.key.coarseness_rank();
-                (incoming_coarse < victim_coarse).then_some((
-                    idx,
-                    j.key.priority_key(),
-                    j.queued_bytes,
-                ))
-            })
-            .collect();
-        // Finest-first victim order (highest priority tuple first).
-        candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
-
-        let mut remaining_jobs = self.jobs.len();
-        let mut remaining_bytes = self.queued_bytes;
-        let mut victims = Vec::new();
-        for (idx, _, bytes) in candidates {
-            if remaining_jobs == 0
-                || (remaining_jobs < self.max_pending_jobs
-                    && remaining_bytes.saturating_add(incoming_bytes) <= self.max_pending_bytes)
-            {
-                break;
-            }
-            remaining_jobs -= 1;
-            remaining_bytes = remaining_bytes.saturating_sub(bytes);
-            victims.push(idx);
-        }
-
-        let fits = remaining_jobs == 0
-            || (remaining_jobs < self.max_pending_jobs
-                && remaining_bytes.saturating_add(incoming_bytes) <= self.max_pending_bytes);
-        fits.then_some(victims)
-    }
-
-    fn admit_job(&mut self, job: DecodeJob, to_drop: &mut Vec<DecodeJob>) -> bool {
-        if self.closed {
-            to_drop.push(job);
-            return false;
-        }
-        self.prune_cancelled(to_drop);
-        if self.jobs.iter().any(|j| j.key == job.key) {
-            to_drop.push(job);
-            return false;
-        }
-        let Some(mut victims) = self.plan_evictions(job.key, job.queued_bytes) else {
-            to_drop.push(job);
-            return false;
-        };
-        // Remove in descending index order so `swap_remove` never invalidates
-        // earlier planned indices.
-        victims.sort_unstable_by_key(|&idx| std::cmp::Reverse(idx));
-        for idx in victims {
-            to_drop.push(self.swap_remove_job(idx));
-        }
-        self.push_job(job);
-        true
-    }
-}
-
 /// Cloneable producer handle for submitting work to a [`DecodePool`].
 #[derive(Clone)]
 pub struct DecodePoolHandle {
-    shared: Arc<(Mutex<DecodeQueue>, Condvar)>,
+    shared: SharedQueue,
 }
 
 impl DecodePoolHandle {
@@ -265,7 +91,7 @@ impl DecodePoolHandle {
 
 /// Owned bounded `std::thread` CPU decode pool.
 pub struct DecodePool {
-    shared: Arc<(Mutex<DecodeQueue>, Condvar)>,
+    shared: SharedQueue,
     _shutdown_guard: CancelGuard,
     workers: Vec<JoinHandle<()>>,
 }
@@ -296,15 +122,7 @@ impl DecodePool {
         // dropping cleared jobs strictly outside `DecodeQueue`'s lock.
         let wake_shared = Arc::clone(&shared);
         let shutdown_guard = shutdown.on_cancel_guarded(move || {
-            let drained = {
-                let (lock, cvar) = &*wake_shared;
-                let mut queue = lock_unpoisoned(lock);
-                queue.closed = true;
-                let drained = queue.drain_all();
-                cvar.notify_all();
-                drained
-            };
-            drop(drained);
+            close_queue_shared(&wake_shared);
         });
 
         let mut workers = Vec::with_capacity(count);
@@ -319,27 +137,13 @@ impl DecodePool {
                         let (job, cancelled_batch) = {
                             let (lock, cvar) = &*worker_shared;
                             let mut queue = lock_unpoisoned(lock);
-                            while queue.jobs.is_empty() && !queue.closed && !stop.is_cancelled() {
-                                queue = match cvar.wait(queue) {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
+                            while queue.is_empty() && !queue.closed && !stop.is_cancelled() {
+                                queue = wait_unpoisoned(cvar, queue);
                             }
                             if queue.closed || stop.is_cancelled() {
                                 break;
                             }
-                            // Pop coarsest uncancelled job first so roots land first.
-                            let best_idx = queue
-                                .jobs
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, j)| !j.cancel.is_cancelled())
-                                .min_by_key(|(_, j)| j.key.priority_key())
-                                .map(|(i, _)| i);
-                            match best_idx {
-                                Some(i) => (Some(queue.swap_remove_job(i)), Vec::new()),
-                                None => (None, queue.drain_all()),
-                            }
+                            queue.pop_coarsest_or_drain_cancelled()
                         };
                         drop(cancelled_batch);
 
@@ -392,15 +196,7 @@ impl DecodePool {
     }
 
     fn close_queue(&self) {
-        let drained = {
-            let (lock, cvar) = &*self.shared;
-            let mut queue = lock_unpoisoned(lock);
-            queue.closed = true;
-            let drained = queue.drain_all();
-            cvar.notify_all();
-            drained
-        };
-        drop(drained);
+        close_queue_shared(&self.shared);
     }
 
     fn shutdown_inner(&mut self) {

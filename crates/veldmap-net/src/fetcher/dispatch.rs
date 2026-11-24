@@ -9,13 +9,14 @@ use tokio::sync::OwnedSemaphorePermit;
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::TileKey;
 
-use crate::TileBlobStore;
 use crate::basemap::LiveBasemapSpec;
 use crate::http::PermitDenied;
 
 use super::PipelineContext;
+use super::disk::DiskCacheGate;
+use super::failures::FailureMarker;
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
-use super::state::{FailureMarker, PipelineState};
+use super::state::PipelineState;
 use super::workers::{run_disk_lookup, run_http_fetch};
 
 /// Maximum concurrent blocking disk-cache lookup tasks so cached tiles stay
@@ -67,9 +68,11 @@ fn plan_disk_tasks(
     }
 
     let mut tasks = Vec::new();
-    while let Some((key, generation, cancel)) =
-        st.pop_next_disk(active_source, MAX_CONCURRENT_DISK_LOOKUPS, &ctx.shutdown)
-    {
+    while let Some((key, generation, cancel)) = st.pop_next_disk(
+        active_source,
+        MAX_CONCURRENT_DISK_LOOKUPS,
+        &ctx.shared.shutdown,
+    ) {
         tasks.push(DiskTask {
             key,
             generation,
@@ -106,9 +109,9 @@ fn plan_http_tasks(
             deferred_http.push(key);
             continue;
         }
-        match ctx.host_limiters.try_acquire_permit(host, now) {
+        match ctx.shared.host_limiters.try_acquire_permit(host, now) {
             Ok(permit) => {
-                let (generation, cancel) = st.register_http_in_flight(key, &ctx.shutdown);
+                let (generation, cancel) = st.register_http_in_flight(key, &ctx.shared.shutdown);
                 tasks.push(HttpTask {
                     input: HttpFetchInput {
                         key,
@@ -138,13 +141,13 @@ fn plan_http_tasks(
         }
     }
 
-    st.restore_deferred_http(deferred_http);
+    st.push_deferred_http(deferred_http);
     tasks
 }
 
 fn plan_dispatch_batch(ctx: &PipelineContext, now: Instant) -> DispatchBatch {
-    let mut st = lock_unpoisoned(&ctx.state);
-    st.prune_expired_backoffs(now);
+    let mut st = lock_unpoisoned(&ctx.shared.state);
+    let _ = st.prune_expired_backoffs(now);
 
     let mut earliest_wakeup: Option<Instant> = None;
     let (disk_tasks, http_tasks) = if let Some(spec) = st.active_spec() {
@@ -171,35 +174,30 @@ async fn wait_for_dispatch_event(ctx: &PipelineContext, wake_at: Option<Instant>
     if let Some(wake_at) = wake_at {
         let deadline = tokio::time::Instant::from_std(wake_at);
         tokio::select! {
-            _ = ctx.shutdown.cancelled() => false,
-            _ = ctx.notify.notified() => true,
+            _ = ctx.shared.shutdown.cancelled() => false,
+            _ = ctx.shared.notify.notified() => true,
             _ = tokio::time::sleep_until(deadline) => true,
         }
     } else {
         tokio::select! {
-            _ = ctx.shutdown.cancelled() => false,
-            _ = ctx.notify.notified() => true,
+            _ = ctx.shared.shutdown.cancelled() => false,
+            _ = ctx.shared.notify.notified() => true,
         }
     }
 }
 
-fn spawn_disk_task(ctx: &Arc<PipelineContext>, cache: &Arc<dyn TileBlobStore>, task: DiskTask) {
+fn spawn_disk_task(ctx: &Arc<PipelineContext>, gate: &DiskCacheGate, task: DiskTask) {
+    // Construct RAII guards synchronously BEFORE `tokio::spawn` (after
+    // `PipelineState`'s mutex has been dropped) so even a task dropped prior to
+    // its first poll cleanly releases its slot and `in_flight` registration.
+    let guard = InFlightGuard::new(Arc::clone(&ctx.shared), task.key, task.generation);
+    let disk_slot = DiskSlotGuard::new(Arc::clone(&ctx.shared));
     let task_ctx = Arc::clone(ctx);
-    let task_cache = Arc::clone(cache);
+    let task_gate = gate.clone();
     tokio::spawn(async move {
-        let guard = InFlightGuard::new(
-            Arc::clone(&task_ctx.state),
-            task.key,
-            task.generation,
-            Arc::clone(&task_ctx.notify),
-        );
-        let disk_slot = DiskSlotGuard {
-            state: Arc::clone(&task_ctx.state),
-            notify: Arc::clone(&task_ctx.notify),
-        };
         run_disk_lookup(
             task_ctx,
-            task_cache,
+            task_gate,
             task.key,
             task.spec,
             task.cancel,
@@ -211,25 +209,16 @@ fn spawn_disk_task(ctx: &Arc<PipelineContext>, cache: &Arc<dyn TileBlobStore>, t
 }
 
 fn spawn_http_task(ctx: &Arc<PipelineContext>, task: HttpTask) {
+    let guard = InFlightGuard::new(Arc::clone(&ctx.shared), task.input.key, task.generation);
+    let permit_guard = PermitGuard::new(task.permit, Arc::clone(&ctx.shared));
     let task_ctx = Arc::clone(ctx);
     tokio::spawn(async move {
-        let guard = InFlightGuard::new(
-            Arc::clone(&task_ctx.state),
-            task.input.key,
-            task.generation,
-            Arc::clone(&task_ctx.notify),
-        );
-        // Release HTTP concurrency immediately after download completes.
-        let permit_guard = PermitGuard {
-            permit: Some(task.permit),
-            notify: Arc::clone(&task_ctx.notify),
-        };
         run_http_fetch(task_ctx, task.input, guard, permit_guard).await;
     });
 }
 
 pub(super) async fn dispatcher_loop(ctx: Arc<PipelineContext>) {
-    while !ctx.shutdown.is_cancelled() {
+    while !ctx.shared.shutdown.is_cancelled() {
         let batch = plan_dispatch_batch(&ctx, Instant::now());
 
         if batch.disk_tasks.is_empty() && batch.http_tasks.is_empty() {
@@ -239,9 +228,9 @@ pub(super) async fn dispatcher_loop(ctx: Arc<PipelineContext>) {
             continue;
         }
 
-        if let Some(cache) = &ctx.disk_cache {
+        if let Some(gate) = &ctx.disk_cache {
             for task in batch.disk_tasks {
-                spawn_disk_task(&ctx, cache, task);
+                spawn_disk_task(&ctx, gate, task);
             }
         }
 

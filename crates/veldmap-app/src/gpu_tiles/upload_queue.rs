@@ -37,15 +37,12 @@ impl fmt::Display for UploadChannelClosed {
 impl std::error::Error for UploadChannelClosed {}
 
 /// Parameters governing one frame's [`PendingUploads::drain_and_upload`] pass.
+///
+/// Pinned root sources are configured once via
+/// [`PendingUploads::set_pinned_root_sources`] so enqueue-time overflow
+/// shedding and drain-time pruning always share a single source of truth.
 #[derive(Clone, Copy, Debug)]
 pub struct UploadPassParams<'a> {
-    /// Sources whose coarsest root tiles (`key.is_root_of(src)`) are pinned
-    /// against `wanted` pruning and queue-cap eviction.
-    pub pinned_root_sources: &'a [SourceId],
-    /// Optional source whose largest uploaded tile byte size is reported in
-    /// [`UploadBatchReport::max_active_tile_bytes`] (used for live basemap
-    /// `@2x`/512 px appetite sizing).
-    pub observed_source: Option<SourceId>,
     /// Currently desired tile key sets across all active layers (an empty
     /// slice skips `wanted` pruning; otherwise a non-pinned tile is kept if it
     /// appears in any set).
@@ -57,7 +54,7 @@ pub struct UploadPassParams<'a> {
 }
 
 /// Summary of one frame's [`PendingUploads::drain_and_upload`] pass.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct UploadBatchReport {
     pub uploaded: usize,
     pub evicted: usize,
@@ -69,9 +66,31 @@ pub struct UploadBatchReport {
     /// Tiles kept queued because active-frame protection blocked eviction (must
     /// NOT trigger an infinite idle repaint loop on its own).
     pub deferred_protected: usize,
-    /// Largest single tile byte size uploaded for `observed_source` in this
-    /// pass.
-    pub max_active_tile_bytes: usize,
+    /// Largest single uploaded tile byte size observed per source in this pass.
+    pub max_tile_bytes_by_source: Vec<(SourceId, usize)>,
+}
+
+impl UploadBatchReport {
+    /// Return the largest single tile byte size uploaded for `source` during
+    /// this pass (`0` if no tile of `source` was uploaded).
+    pub fn max_tile_bytes_for(&self, source: SourceId) -> usize {
+        self.max_tile_bytes_by_source
+            .iter()
+            .find_map(|&(src, bytes)| (src == source).then_some(bytes))
+            .unwrap_or(0)
+    }
+
+    fn record_source_tile_bytes(&mut self, source: SourceId, byte_size: usize) {
+        if let Some((_, max_bytes)) = self
+            .max_tile_bytes_by_source
+            .iter_mut()
+            .find(|(src, _)| *src == source)
+        {
+            *max_bytes = (*max_bytes).max(byte_size);
+        } else {
+            self.max_tile_bytes_by_source.push((source, byte_size));
+        }
+    }
 }
 
 fn is_pinned_root(key: &TileKey, pinned_root_sources: &[SourceId]) -> bool {
@@ -306,11 +325,11 @@ impl PendingUploads {
         drop(to_drop);
     }
 
-    /// Prune cached/unwanted tiles (retaining roots of
-    /// `params.pinned_root_sources`), enforce `max_queued_bytes`, and upload
-    /// coarsest-first within `(byte_budget, time_budget)` while protecting
-    /// active-frame carriers and guaranteeing `>= 1` tile per frame whenever
-    /// an admissible tile is queued.
+    /// Prune cached/unwanted tiles (retaining roots configured via
+    /// [`Self::set_pinned_root_sources`]), enforce `max_queued_bytes`, and
+    /// upload coarsest-first within `(byte_budget, time_budget)` while
+    /// protecting active-frame carriers and guaranteeing `>= 1` tile per frame
+    /// whenever an admissible tile is queued.
     pub fn drain_and_upload(
         &mut self,
         device: &wgpu::Device,
@@ -324,11 +343,8 @@ impl PendingUploads {
             if state.closed {
                 return UploadBatchReport::default();
             }
-            state.pinned_root_sources.clear();
-            state
-                .pinned_root_sources
-                .extend_from_slice(params.pinned_root_sources);
 
+            let pinned = state.pinned_root_sources.clone();
             state.retain_keys(
                 |key| {
                     if cache.contains(key) {
@@ -337,8 +353,7 @@ impl PendingUploads {
                     if params.wanted.is_empty() {
                         true
                     } else {
-                        is_in_any_wanted(key, params.wanted)
-                            || is_pinned_root(key, params.pinned_root_sources)
+                        is_in_any_wanted(key, params.wanted) || is_pinned_root(key, &pinned)
                     }
                 },
                 &mut to_drop,
@@ -367,15 +382,12 @@ impl PendingUploads {
         order: Vec<TileKey>,
     ) -> UploadBatchReport {
         let start = Instant::now();
-        let mut uploaded = 0usize;
-        let mut evicted = 0usize;
+        let mut report = UploadBatchReport::default();
         let mut bytes_uploaded = 0usize;
-        let mut deferred_protected = 0usize;
-        let mut max_active_tile_bytes = 0usize;
 
         for key in order {
             // Anti-starvation: always upload at least 1 admissible tile per frame.
-            if uploaded >= 1
+            if report.uploaded >= 1
                 && (bytes_uploaded >= params.byte_budget || start.elapsed() >= params.time_budget)
             {
                 break;
@@ -398,11 +410,9 @@ impl PendingUploads {
                     evicted: ev_count,
                 } => {
                     bytes_uploaded = bytes_uploaded.saturating_add(tile.byte_size);
-                    evicted = evicted.saturating_add(ev_count);
-                    uploaded += 1;
-                    if params.observed_source == Some(key.source) {
-                        max_active_tile_bytes = max_active_tile_bytes.max(tile.byte_size);
-                    }
+                    report.evicted = report.evicted.saturating_add(ev_count);
+                    report.uploaded += 1;
+                    report.record_source_tile_bytes(key.source, tile.byte_size);
                 }
                 UploadInsertOutcome::RefusedByProtection => {
                     let mut to_drop = Vec::new();
@@ -418,23 +428,16 @@ impl PendingUploads {
                     };
                     drop(to_drop);
                     if retained {
-                        deferred_protected += 1;
+                        report.deferred_protected += 1;
                     }
                 }
                 UploadInsertOutcome::Rejected => {}
             }
         }
 
-        let remaining = lock_unpoisoned(&self.shared).queued.len();
-        let remaining_ready = remaining.saturating_sub(deferred_protected);
-        UploadBatchReport {
-            uploaded,
-            evicted,
-            remaining,
-            remaining_ready,
-            deferred_protected,
-            max_active_tile_bytes,
-        }
+        report.remaining = lock_unpoisoned(&self.shared).queued.len();
+        report.remaining_ready = report.remaining.saturating_sub(report.deferred_protected);
+        report
     }
 }
 

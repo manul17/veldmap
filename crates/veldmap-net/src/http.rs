@@ -19,12 +19,6 @@ pub(crate) struct HttpClientConfig<'a> {
     pub max_concurrent_per_host: usize,
 }
 
-/// Default maximum concurrent HTTP requests per remote host.
-pub(crate) const DEFAULT_MAX_CONCURRENT_PER_HOST: usize = 6;
-
-/// Default maximum encoded response body accepted for one live tile (`16 MiB`).
-pub(crate) const DEFAULT_MAX_TILE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-
 /// Cap initial buffer pre-allocation from untrusted `Content-Length` headers so
 /// a malicious or misconfigured server cannot force 16 MiB upfront allocations
 /// before sending any payload bytes.
@@ -78,8 +72,9 @@ pub(crate) enum PermitDenied {
 /// Per-host concurrency semaphores and rate-limit cooldown tracking (`429` /
 /// `503` `Retry-After`).
 ///
-/// Lock ordering: always acquire `PipelineState` BEFORE `HostLimiters` (never
-/// reverse; `HostLimiters` never locks `PipelineState` or calls `Notify`).
+/// Lock ordering: `HostLimiters` is a strict leaf lock — it never acquires
+/// external mutexes or signals notifiers while locked, so callers may safely
+/// invoke it while holding higher-level scheduler locks.
 pub(crate) struct HostLimiters {
     max_per_host: usize,
     map: Mutex<HashMap<String, HostEntry>>,
@@ -118,25 +113,34 @@ impl HostLimiters {
             .map_err(|_| PermitDenied::Saturated)
     }
 
-    /// Record or extend a per-host cooldown window (e.g. on HTTP `429`/`503`).
+    /// Record or extend a per-host cooldown window (e.g. on HTTP `429`/`503`),
+    /// avoiding string allocation when `host` is already tracked.
     pub(crate) fn record_cooldown(&self, host: &str, until: Instant) {
         let mut map = lock_unpoisoned(&self.map);
-        let entry = map.entry(host.to_owned()).or_insert_with(|| HostEntry {
-            semaphore: Arc::new(Semaphore::new(self.max_per_host)),
-            cooldown_until: None,
-        });
+        let entry = if let Some(existing) = map.get_mut(host) {
+            existing
+        } else {
+            map.entry(host.to_owned()).or_insert_with(|| HostEntry {
+                semaphore: Arc::new(Semaphore::new(self.max_per_host)),
+                cooldown_until: None,
+            })
+        };
         entry.cooldown_until = Some(match entry.cooldown_until {
             Some(existing) if existing > until => existing,
             _ => until,
         });
     }
 
-    /// Clear all host cooldowns (e.g. on explicit user Retry or basemap switch).
+    /// Clear all host cooldowns (e.g. on explicit user Retry or basemap switch)
+    /// and prune idle host entries with no outstanding permits.
     pub(crate) fn clear_cooldowns(&self) {
         let mut map = lock_unpoisoned(&self.map);
-        for entry in map.values_mut() {
+        let max_per_host = self.max_per_host;
+        map.retain(|_, entry| {
             entry.cooldown_until = None;
-        }
+            Arc::strong_count(&entry.semaphore) > 1
+                || entry.semaphore.available_permits() < max_per_host
+        });
     }
 }
 
@@ -152,14 +156,16 @@ pub(crate) enum FetchOutcome {
     Empty204,
 }
 
+pub(crate) struct TransientFetchError {
+    pub msg: String,
+    pub offline: bool,
+    pub rate_limited: bool,
+    pub retry_after: Option<Duration>,
+}
+
 pub(crate) enum FetchFailure {
     Terminal(String),
-    Transient {
-        msg: String,
-        offline: bool,
-        rate_limited: bool,
-        retry_after: Option<Duration>,
-    },
+    Transient(TransientFetchError),
 }
 
 pub(crate) async fn download_capped(
@@ -169,12 +175,12 @@ pub(crate) async fn download_capped(
 ) -> Result<FetchOutcome, FetchFailure> {
     let mut resp = client.get(url).send().await.map_err(|err| {
         let offline = err.is_connect() || err.is_timeout();
-        FetchFailure::Transient {
+        FetchFailure::Transient(TransientFetchError {
             msg: err.to_string(),
             offline,
             rate_limited: false,
             retry_after: None,
-        }
+        })
     })?;
 
     let status = resp.status();
@@ -197,12 +203,12 @@ pub(crate) async fn download_capped(
         } else {
             None
         };
-        return Err(FetchFailure::Transient {
+        return Err(FetchFailure::Transient(TransientFetchError {
             msg,
             offline: false,
             rate_limited,
             retry_after,
-        });
+        }));
     }
 
     if let Some(len) = resp.content_length()
@@ -217,11 +223,13 @@ pub(crate) async fn download_capped(
         (n as usize).min(max_bytes).min(MAX_INITIAL_CAPACITY_BYTES)
     });
     let mut buf = Vec::with_capacity(initial_cap);
-    while let Some(chunk) = resp.chunk().await.map_err(|err| FetchFailure::Transient {
-        msg: err.to_string(),
-        offline: err.is_connect() || err.is_timeout(),
-        rate_limited: false,
-        retry_after: None,
+    while let Some(chunk) = resp.chunk().await.map_err(|err| {
+        FetchFailure::Transient(TransientFetchError {
+            msg: err.to_string(),
+            offline: err.is_connect() || err.is_timeout(),
+            rate_limited: false,
+            retry_after: None,
+        })
     })? {
         if buf.len().saturating_add(chunk.len()) > max_bytes {
             return Err(FetchFailure::Terminal(format!(

@@ -37,6 +37,32 @@ const EOX_S2_MAX_LEVEL: u8 = 14;
 /// Standard `{s}` subdomain pool for custom XYZ/TMS templates.
 const SUBDOMAINS: [&str; 3] = ["a", "b", "c"];
 
+#[inline]
+fn subdomain_index(id: QuadTileId, count: usize) -> usize {
+    ((u64::from(id.x) + u64::from(id.y)) % (count as u64)) as usize
+}
+
+/// Pre-encoded API secret variants computed once at [`LiveBasemapSpec`]
+/// construction so per-tile URL expansion and error redaction do zero redundant
+/// percent-encoding work.
+#[derive(Clone, PartialEq, Eq)]
+struct EncodedSecret {
+    raw: String,
+    encoded_upper: String,
+    encoded_lower: String,
+}
+
+impl EncodedSecret {
+    fn new(raw: String) -> Self {
+        let (encoded_upper, encoded_lower) = percent_encode_variants(&raw);
+        Self {
+            raw,
+            encoded_upper,
+            encoded_lower,
+        }
+    }
+}
+
 /// Validate an explicit calendar-valid `YYYY-MM-DD` UTC date string within the
 /// NASA GIBS epoch (`2000..=2100`, enforcing exact month lengths and leap-year
 /// February).
@@ -124,7 +150,7 @@ pub struct LiveBasemapSpec {
     /// URL expansion and string allocations under `PipelineState`'s mutex.
     hosts: Vec<String>,
     tms_flip_y: bool,
-    api_key: Option<String>,
+    api_key: Option<EncodedSecret>,
 }
 
 impl fmt::Debug for LiveBasemapSpec {
@@ -141,7 +167,7 @@ impl fmt::Debug for LiveBasemapSpec {
             .field("tms_flip_y", &self.tms_flip_y)
             .field(
                 "api_key",
-                &redact_secret_label(self.api_key.as_deref(), "<none>"),
+                &redact_secret_label(self.api_key.as_ref().map(|k| k.raw.as_str()), "<none>"),
             )
             .finish()
     }
@@ -237,9 +263,7 @@ impl LiveBasemapSpec {
         if self.hosts.len() == 1 {
             &self.hosts[0]
         } else {
-            let sub_idx =
-                ((u64::from(id.x) + u64::from(id.y)) % (self.hosts.len() as u64)) as usize;
-            &self.hosts[sub_idx]
+            &self.hosts[subdomain_index(id, self.hosts.len())]
         }
     }
 
@@ -333,7 +357,8 @@ impl LiveBasemapSpec {
         } else {
             cfg.attribution.trim().to_owned()
         };
-        let api_key = (!cfg.api_key.trim().is_empty()).then(|| cfg.api_key.trim().to_owned());
+        let api_key = (!cfg.api_key.trim().is_empty())
+            .then(|| EncodedSecret::new(cfg.api_key.trim().to_owned()));
         let url_template = template.to_owned();
         let hosts = precompute_hosts(&url_template);
 
@@ -357,7 +382,7 @@ impl LiveBasemapSpec {
 
     /// Validate that `id` is eligible for live fetching (never `PolarCap`,
     /// matches `self.scheme`, `level <= self.max_level`, valid `(x, y)`).
-    pub fn validate_tile(&self, id: QuadTileId) -> Result<(u32, u32), NetError> {
+    pub(crate) fn validate_tile(&self, id: QuadTileId) -> Result<(u32, u32), NetError> {
         if matches!(id.scheme, PlanetaryScheme::PolarCap { .. }) {
             return Err(NetError::PolarCapForbidden);
         }
@@ -389,7 +414,7 @@ impl LiveBasemapSpec {
         let (_cols, rows) = self.validate_tile(id)?;
         let tms_y = rows - 1 - id.y;
         let effective_y = if self.tms_flip_y { tms_y } else { id.y };
-        let sub_idx = ((u64::from(id.x) + u64::from(id.y)) % (SUBDOMAINS.len() as u64)) as usize;
+        let sub_idx = subdomain_index(id, SUBDOMAINS.len());
 
         let mut url = self
             .url_template
@@ -399,11 +424,10 @@ impl LiveBasemapSpec {
             .replace("{-y}", &tms_y.to_string())
             .replace("{y}", &effective_y.to_string());
 
-        if let Some(key) = self.api_key.as_deref() {
-            let (encoded_key, _) = percent_encode_variants(key);
+        if let Some(secret) = &self.api_key {
             url = url
-                .replace("{api_key}", &encoded_key)
-                .replace("{key}", &encoded_key);
+                .replace("{api_key}", &secret.encoded_upper)
+                .replace("{key}", &secret.encoded_upper);
         } else {
             url = url.replace("{api_key}", "").replace("{key}", "");
         }
@@ -415,14 +439,13 @@ impl LiveBasemapSpec {
     /// `text` before logging or displaying error messages in the UI.
     pub fn redact_secrets(&self, text: &str) -> String {
         let mut out = sanitize_urls_in_text(text);
-        if let Some(secret) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
-            out = out.replace(secret, "<redacted>");
-            let (enc_upper, enc_lower) = percent_encode_variants(secret);
-            if enc_upper != secret {
-                out = out.replace(&enc_upper, "<redacted>");
+        if let Some(secret) = &self.api_key {
+            out = out.replace(&secret.raw, "<redacted>");
+            if secret.encoded_upper != secret.raw {
+                out = out.replace(&secret.encoded_upper, "<redacted>");
             }
-            if enc_lower != secret && enc_lower != enc_upper {
-                out = out.replace(&enc_lower, "<redacted>");
+            if secret.encoded_lower != secret.raw && secret.encoded_lower != secret.encoded_upper {
+                out = out.replace(&secret.encoded_lower, "<redacted>");
             }
         }
         out

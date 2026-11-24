@@ -3,7 +3,8 @@
 //! followers) from terminal sampling errors (propagated to current-round
 //! followers without serial retry storms).
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex};
 
 use veldmap_core::budget::DecodeBudgetTracker;
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
@@ -11,48 +12,29 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use crate::RasterError;
 use crate::pipeline::grid;
 use crate::pipeline::radiometry::{self, DisplayMapping, PixelLayout, percentile_stretch};
+use crate::pipeline::singleflight::SingleflightSlot;
 
 use super::chunk_reader::DecoderPool;
 use super::tags::{map_tiff_error, typed_samples};
 
-enum RoundState {
-    InFlight,
+#[derive(Clone)]
+enum RoundOutcome {
     Ready(DisplayMapping),
-    Cancelled,
+    LeaderCancelled,
     Failed(RasterError),
 }
 
-struct StretchRound {
-    state: Mutex<RoundState>,
-    cvar: Condvar,
-}
-
-impl StretchRound {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(RoundState::InFlight),
-            cvar: Condvar::new(),
-        }
-    }
-
-    fn resolve(&self, next: RoundState) {
-        let mut state = lock_unpoisoned(&self.state);
-        if matches!(*state, RoundState::InFlight) {
-            *state = next;
-            self.cvar.notify_all();
-        }
-    }
-}
+type StretchSlot = SingleflightSlot<RoundOutcome>;
 
 enum CacheState {
     Uncomputed,
-    InFlight(Arc<StretchRound>),
+    InFlight(Arc<StretchSlot>),
     Ready(DisplayMapping),
 }
 
 struct RoundGuard<'a> {
     cache: &'a Mutex<CacheState>,
-    round: Arc<StretchRound>,
+    slot: Arc<StretchSlot>,
     completed: bool,
 }
 
@@ -64,13 +46,13 @@ impl Drop for RoundGuard<'_> {
         {
             let mut guard = lock_unpoisoned(self.cache);
             if let CacheState::InFlight(cur) = &*guard
-                && Arc::ptr_eq(cur, &self.round)
+                && Arc::ptr_eq(cur, &self.slot)
             {
                 *guard = CacheState::Uncomputed;
             }
         }
-        self.round
-            .resolve(RoundState::Failed(RasterError::InvalidFormat(
+        self.slot
+            .resolve(RoundOutcome::Failed(RasterError::DecoderPanicked(
                 "display-mapping sampling leader panicked".to_string(),
             )));
     }
@@ -98,104 +80,87 @@ impl StretchCache {
         loop {
             enum Role {
                 Ready(DisplayMapping),
-                Leader(Arc<StretchRound>),
-                Follower(Arc<StretchRound>),
+                Leader(Arc<StretchSlot>),
+                Follower(Arc<StretchSlot>),
             }
 
             let role = {
                 let mut guard = lock_unpoisoned(&self.state);
                 match &*guard {
                     CacheState::Ready(ready) => Role::Ready(*ready),
-                    CacheState::InFlight(round) => Role::Follower(Arc::clone(round)),
+                    CacheState::InFlight(slot) => Role::Follower(Arc::clone(slot)),
                     CacheState::Uncomputed => {
                         if req.cancel.is_cancelled() {
                             return Err(RasterError::Cancelled);
                         }
-                        let round = Arc::new(StretchRound::new());
-                        *guard = CacheState::InFlight(Arc::clone(&round));
-                        Role::Leader(round)
+                        let slot = Arc::new(SingleflightSlot::new());
+                        *guard = CacheState::InFlight(Arc::clone(&slot));
+                        Role::Leader(slot)
                     }
                 }
             };
 
             match role {
                 Role::Ready(ready) => return Ok(ready),
-                Role::Leader(round) => {
+                Role::Leader(slot) => {
                     let mut guard = RoundGuard {
                         cache: &self.state,
-                        round: Arc::clone(&round),
+                        slot: Arc::clone(&slot),
                         completed: false,
                     };
-                    match compute_mapping(req) {
-                        Ok(computed) => {
+                    match catch_unwind(AssertUnwindSafe(|| compute_mapping(req))) {
+                        Ok(Ok(computed)) => {
                             {
                                 let mut cache = lock_unpoisoned(&self.state);
                                 *cache = CacheState::Ready(computed);
                             }
-                            round.resolve(RoundState::Ready(computed));
+                            slot.resolve(RoundOutcome::Ready(computed));
                             guard.completed = true;
                             return Ok(computed);
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             {
                                 let mut cache = lock_unpoisoned(&self.state);
                                 if let CacheState::InFlight(cur) = &*cache
-                                    && Arc::ptr_eq(cur, &round)
+                                    && Arc::ptr_eq(cur, &slot)
                                 {
                                     *cache = CacheState::Uncomputed;
                                 }
                             }
                             if err.is_cancelled() {
-                                round.resolve(RoundState::Cancelled);
+                                slot.resolve(RoundOutcome::LeaderCancelled);
                             } else {
                                 // Current-round followers receive this error
                                 // directly instead of triggering serial retries.
-                                round.resolve(RoundState::Failed(err.clone()));
+                                slot.resolve(RoundOutcome::Failed(err.clone()));
                             }
                             guard.completed = true;
                             return Err(err);
                         }
-                    }
-                }
-                Role::Follower(round) => {
-                    if req.cancel.is_cancelled() {
-                        return Err(RasterError::Cancelled);
-                    }
-                    let wake_round = Arc::clone(&round);
-                    let _cancel_guard = req.cancel.on_cancel_guarded(move || {
-                        let _lock = lock_unpoisoned(&wake_round.state);
-                        wake_round.cvar.notify_all();
-                    });
-                    let mut state = lock_unpoisoned(&round.state);
-                    loop {
-                        match &*state {
-                            RoundState::Ready(ready) => return Ok(*ready),
-                            RoundState::Failed(err) => {
-                                if req.cancel.is_cancelled() {
-                                    return Err(RasterError::Cancelled);
-                                }
-                                return Err(err.clone());
-                            }
-                            RoundState::Cancelled => {
-                                // Leader was cancelled; loop so an uncancelled
-                                // follower can elect itself as the new leader.
-                                if req.cancel.is_cancelled() {
-                                    return Err(RasterError::Cancelled);
-                                }
-                                break;
-                            }
-                            RoundState::InFlight => {
-                                if req.cancel.is_cancelled() {
-                                    return Err(RasterError::Cancelled);
-                                }
-                                state = match round.cvar.wait(state) {
-                                    Ok(g) => g,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                            }
+                        Err(_) => {
+                            drop(guard);
+                            return Err(RasterError::DecoderPanicked(
+                                "display-mapping sampling leader panicked".to_string(),
+                            ));
                         }
                     }
                 }
+                Role::Follower(slot) => match slot.wait(req.cancel)? {
+                    RoundOutcome::Ready(ready) => return Ok(ready),
+                    RoundOutcome::Failed(err) => {
+                        if req.cancel.is_cancelled() {
+                            return Err(RasterError::Cancelled);
+                        }
+                        return Err(err);
+                    }
+                    RoundOutcome::LeaderCancelled => {
+                        // Leader was cancelled; loop so an uncancelled
+                        // follower can elect itself as the new leader.
+                        if req.cancel.is_cancelled() {
+                            return Err(RasterError::Cancelled);
+                        }
+                    }
+                },
             }
         }
     }

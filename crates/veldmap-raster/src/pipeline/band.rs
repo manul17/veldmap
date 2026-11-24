@@ -6,7 +6,7 @@
 
 use veldmap_core::tile::{BandKey, PixelFormat};
 
-use super::scheduler::LevelPlan;
+use super::plan::LevelPlan;
 
 /// Raw numeric sample storage type of a decoded raster band.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -4,17 +4,16 @@ use std::time::Duration;
 
 use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme};
 
-use super::evict::EVICT_BATCH_ROWS;
-use super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE, init_connection};
+use super::super::evict::EVICT_BATCH_ROWS;
+use super::super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE};
 use super::*;
 use crate::test_support::TestTempDir;
 
-fn open_in_memory_cache(max_bytes: u64) -> Result<TileDiskCache, StorageError> {
-    let conn = Connection::open_in_memory()?;
-    let max_ts = init_connection(&conn, false, true)?;
-    Ok(TileDiskCache::from_connection(
-        conn, None, max_bytes, max_ts,
-    ))
+fn open_temp_cache(label: &str, max_bytes: u64) -> (TestTempDir, TileDiskCache) {
+    let dir = TestTempDir::new(label);
+    let db_path = dir.path().join("tiles.sqlite3");
+    let cache = TileDiskCache::open(&db_path, max_bytes).expect("open temp WAL cache");
+    (dir, cache)
 }
 
 fn key(source: &str, level: u8, x: u32, y: u32) -> DiskTileKey {
@@ -39,7 +38,7 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
     assert!(!valid_source_key("a/b"));
 
     // Budget = 100 B, 10% headroom target = 90 B.
-    let cache = open_in_memory_cache(100).expect("open mem cache");
+    let (_dir, cache) = open_temp_cache("lru-headroom", 100);
     let k_a = key("eox", 12, 0, 0);
     let k_b = key("eox", 12, 1, 0);
     let k_c = key("eox", 12, 2, 0);
@@ -78,7 +77,7 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
 
 #[test]
 fn pragmas_schema_version_and_covering_lru_index_are_configured() {
-    let cache = open_in_memory_cache(4096).expect("open mem");
+    let (_dir, cache) = open_temp_cache("pragmas-index", 4096);
     let conn = lock_unpoisoned(&cache.writer);
 
     let page_size: i64 = conn
@@ -93,10 +92,18 @@ fn pragmas_schema_version_and_covering_lru_index_are_configured() {
     let busy_timeout: i64 = conn
         .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
         .expect("busy_timeout");
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
+        .expect("journal_mode");
+    let auto_vacuum: i64 = conn
+        .query_row("PRAGMA auto_vacuum;", [], |r| r.get(0))
+        .expect("auto_vacuum");
     assert_eq!(page_size, SQLITE_PAGE_SIZE);
     assert_eq!(foreign_keys, 1);
     assert_eq!(user_version, SCHEMA_VERSION);
     assert_eq!(busy_timeout, SQLITE_BUSY_TIMEOUT_MS);
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(auto_vacuum, 2);
 
     let mut stmt = conn
         .prepare(
@@ -258,7 +265,7 @@ fn file_backed_open_waits_for_brief_external_lock_and_serves_concurrent_wal_read
 
 #[test]
 fn multi_band_format_gutter_and_encoding_never_alias() {
-    let cache = open_in_memory_cache(16 * 1024).expect("open mem");
+    let (_dir, cache) = open_temp_cache("multi-band", 16 * 1024);
     let source = "sentinel2-s36uvb";
     let base = TileKey {
         source: veldmap_core::tile::SourceId::from_stable_key(source),
@@ -328,7 +335,7 @@ fn multi_band_format_gutter_and_encoding_never_alias() {
 
 #[test]
 fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
-    let cache = open_in_memory_cache(10_000).expect("open mem");
+    let (_dir, cache) = open_temp_cache("overwrite-batch", 10_000);
     let k = key("eox", 5, 1, 1);
 
     // Overwrite with larger then smaller payloads; byte & tile_count stay exact.
@@ -369,7 +376,7 @@ fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
 
 #[test]
 fn clear_source_removes_only_matching_source_without_orphan_blobs() {
-    let cache = open_in_memory_cache(4096).expect("open mem");
+    let (_dir, cache) = open_temp_cache("clear-source", 4096);
     let k1 = key("gibs", 1, 0, 0);
     let k2 = key("eox", 1, 0, 0);
     cache.put(&k1, &[1u8; 100]).expect("put k1");
@@ -394,7 +401,7 @@ fn clear_source_removes_only_matching_source_without_orphan_blobs() {
 
 #[test]
 fn large_tile_near_budget_never_self_evicts_and_delete_updates_total() {
-    let cache = open_in_memory_cache(100).expect("open mem");
+    let (_dir, cache) = open_temp_cache("large-tile", 100);
     let old = key("eox", 1, 0, 0);
     let big = key("eox", 1, 1, 0);
 
@@ -416,7 +423,8 @@ fn large_tile_near_budget_never_self_evicts_and_delete_updates_total() {
 
 #[test]
 fn concurrent_reads_and_writes_keep_budget_and_accounting_consistent() {
-    let cache = Arc::new(open_in_memory_cache(4096).expect("open mem"));
+    let (_dir, cache) = open_temp_cache("concurrent-wal", 4096);
+    let cache = Arc::new(cache);
     let mut threads = Vec::new();
     for tid in 0..4u32 {
         let c = Arc::clone(&cache);

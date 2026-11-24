@@ -20,13 +20,13 @@ use veldmap_storage::{
 };
 
 /// Default disk cache cap in mebibytes (`512 MiB`).
-pub(crate) const DEFAULT_DISK_CACHE_MAX_MB: u64 = 512;
+const DEFAULT_DISK_CACHE_MAX_MB: u64 = 512;
 
 /// Minimum configurable disk cache cap in mebibytes (`16 MiB`).
-pub(crate) const MIN_DISK_CACHE_MAX_MB: u64 = 16;
+const MIN_DISK_CACHE_MAX_MB: u64 = 16;
 
 /// Maximum configurable disk cache cap in mebibytes (`16 GiB`).
-pub(crate) const MAX_DISK_CACHE_MAX_MB: u64 = 16 * 1024;
+const MAX_DISK_CACHE_MAX_MB: u64 = 16 * 1024;
 
 /// Allowed slider range for Custom XYZ / TMS maximum zoom levels.
 pub(crate) const CUSTOM_MAX_LEVEL_RANGE: RangeInclusive<u8> =
@@ -50,11 +50,11 @@ pub(crate) fn validate_custom_url_template(template: &str) -> Result<(), String>
 }
 
 /// Current JSON schema version for [`AppSettings`].
-pub(crate) const SETTINGS_SCHEMA_VERSION: u32 = 1;
+const SETTINGS_SCHEMA_VERSION: u32 = 1;
 
 /// Default explicit UTC date (`YYYY-MM-DD`) for NASA GIBS daily reflectance
 /// layers.
-pub(crate) const DEFAULT_GIBS_DATE: &str = "2024-07-01";
+const DEFAULT_GIBS_DATE: &str = "2024-07-01";
 
 /// Active planetary basemap selection persisted across sessions.
 ///

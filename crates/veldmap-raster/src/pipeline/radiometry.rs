@@ -3,15 +3,15 @@
 //! and exact raw-value nodata transparency keying.
 
 /// Maximum samples retained for deterministic per-file percentile stretch.
-pub const STRETCH_SAMPLES: usize = 1 << 20;
+pub(crate) const STRETCH_SAMPLES: usize = 1 << 20;
 
 /// Return whether `value` is finite and distinct from any declared `nodata`.
-pub fn is_data(value: f32, nodata: Option<f32>) -> bool {
+pub(crate) fn is_data(value: f32, nodata: Option<f32>) -> bool {
     value.is_finite() && Some(value) != nodata
 }
 
 /// Typed slice of decoded raw raster samples.
-pub enum Samples<'a> {
+pub(crate) enum Samples<'a> {
     U8(&'a [u8]),
     U16(&'a [u16]),
     I16(&'a [i16]),
@@ -20,7 +20,7 @@ pub enum Samples<'a> {
 
 impl Samples<'_> {
     /// Total scalar sample count across all channels.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::U8(v) => v.len(),
             Self::U16(v) => v.len(),
@@ -30,7 +30,7 @@ impl Samples<'_> {
     }
 
     /// Read scalar sample `i` as `f32`.
-    pub fn get(&self, i: usize) -> f32 {
+    pub(crate) fn get(&self, i: usize) -> f32 {
         match self {
             Self::U8(v) => f32::from(v[i]),
             Self::U16(v) => f32::from(v[i]),
@@ -42,15 +42,15 @@ impl Samples<'_> {
 
 /// Pixel channel interpretation for display mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PixelLayout {
-    pub channels: usize,
+pub(crate) struct PixelLayout {
+    pub(crate) channels: usize,
     colors: usize,
     alpha: bool,
 }
 
 impl PixelLayout {
     /// Named color model: 1 = Gray, 2 = GrayA, 3 = RGB, 4+ = RGBA.
-    pub fn named(channels: usize) -> Self {
+    pub(crate) fn named(channels: usize) -> Self {
         Self {
             channels: channels.max(1),
             colors: match channels {
@@ -63,7 +63,7 @@ impl PixelLayout {
 
     /// Arbitrary multi-band stack without color interpretation (displays band
     /// 0 as grayscale without guessing an alpha channel).
-    pub fn stack(channels: usize) -> Self {
+    pub(crate) fn stack(channels: usize) -> Self {
         Self {
             channels: channels.max(1),
             colors: 1,
@@ -72,19 +72,19 @@ impl PixelLayout {
     }
 
     /// Number of color channels mapped to RGB (`1` or `3`).
-    pub const fn colors(&self) -> usize {
+    pub(crate) const fn colors(&self) -> usize {
         self.colors
     }
 
     /// Whether the final channel carries opacity.
-    pub const fn has_alpha(&self) -> bool {
+    pub(crate) const fn has_alpha(&self) -> bool {
         self.alpha
     }
 }
 
 /// Expand raw 8-bit samples directly to RGBA8 without stretching or nodata
 /// keying.
-pub fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
+fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(pixels * 4);
     for px in samples.chunks_exact(pixel.channels).take(pixels) {
         let (rgb, alpha) = match (pixel.colors(), pixel.has_alpha()) {
@@ -101,14 +101,14 @@ pub fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
 
 /// File-wide display mapping (`[lo, hi] -> [0, 255]` + optional raw `nodata`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DisplayMapping {
+pub(crate) struct DisplayMapping {
     stretch: Option<(f64, f64)>,
     nodata: Option<f32>,
 }
 
 impl DisplayMapping {
     /// Identity 8-bit display mapping with optional raw `nodata` transparency.
-    pub fn identity(nodata: Option<f32>) -> Self {
+    pub(crate) fn identity(nodata: Option<f32>) -> Self {
         Self {
             stretch: None,
             nodata,
@@ -116,7 +116,7 @@ impl DisplayMapping {
     }
 
     /// Linear `[lo, hi] -> [0, 255]` display stretch with optional raw `nodata`.
-    pub fn stretched(lo: f64, hi: f64, nodata: Option<f32>) -> Self {
+    pub(crate) fn stretched(lo: f64, hi: f64, nodata: Option<f32>) -> Self {
         Self {
             stretch: Some((lo, hi)),
             nodata,
@@ -124,7 +124,7 @@ impl DisplayMapping {
     }
 
     /// Convert up to `pixels` raw samples into tightly packed RGBA8 bytes.
-    pub fn rgba(&self, samples: &Samples<'_>, pixel: PixelLayout, pixels: usize) -> Vec<u8> {
+    pub(crate) fn rgba(&self, samples: &Samples<'_>, pixel: PixelLayout, pixels: usize) -> Vec<u8> {
         if let (Samples::U8(v), None, None) = (samples, self.stretch, self.nodata) {
             return to_rgba8(v, pixel, pixels);
         }
@@ -199,7 +199,7 @@ impl DisplayMapping {
 /// Compute `[2%, 98%]` percentile display bounds in `f64` from `values`
 /// (`None` if empty). Expands flat constant fields symmetrically around the
 /// constant value so flat valid data renders mid-gray rather than black.
-pub fn percentile_stretch(values: &mut [f32]) -> Option<(f64, f64)> {
+pub(crate) fn percentile_stretch(values: &mut [f32]) -> Option<(f64, f64)> {
     if values.is_empty() {
         return None;
     }

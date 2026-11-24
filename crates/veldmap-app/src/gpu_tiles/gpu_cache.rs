@@ -38,7 +38,7 @@ impl std::fmt::Debug for GpuTile {
 }
 
 /// Convert domain [`PixelFormat`] to the corresponding `wgpu::TextureFormat`.
-pub(crate) fn wgpu_format(format: PixelFormat) -> wgpu::TextureFormat {
+fn wgpu_format(format: PixelFormat) -> wgpu::TextureFormat {
     match format {
         PixelFormat::Rgba8UnormSrgb => wgpu::TextureFormat::Rgba8UnormSrgb,
         PixelFormat::R32Float => wgpu::TextureFormat::R32Float,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::tile::key::{BandKey, PixelFormat, SourceId, TileScheme};
+use crate::tile::{BandKey, PixelFormat, SourceId, TileScheme};
 
 fn make_key(scheme: TileScheme, level: u8, x: u32, y: u32) -> TileKey {
     TileKey {

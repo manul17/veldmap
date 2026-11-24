@@ -1,5 +1,5 @@
 //! Pure-`std` worker coordination primitives (`CancelToken`, `CancelGuard`,
-//! `CancelledFuture`, `Wakeup`, and [`lock_unpoisoned`]).
+//! `CancelledFuture`, `Wakeup`, [`lock_unpoisoned`], and [`wait_unpoisoned`]).
 //!
 //! Keeps `veldmap-core` permanently free of async runtime (`tokio`) or HTTP
 //! (`reqwest`) dependencies while allowing synchronous decoders, local storage
@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 
 type CancelCallback = Box<dyn FnOnce() + Send + 'static>;
@@ -35,9 +35,16 @@ pub type Wakeup = Arc<dyn Fn() + Send + Sync>;
 
 /// Acquire `mutex`, recovering the inner guard if a previous holder panicked.
 #[inline]
-pub fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wait on `cvar`, recovering the inner guard if a previous holder panicked.
+#[inline]
+pub fn wait_unpoisoned<'a, T>(cvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    cvar.wait(guard)
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 

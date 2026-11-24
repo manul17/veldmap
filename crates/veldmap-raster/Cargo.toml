@@ -13,6 +13,7 @@ tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 
 [dev-dependencies]
+veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
 zstd.workspace = true
 
 [lints]

@@ -67,9 +67,7 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
         w,
         h,
         false,
-        true,
         SourceId::BUNDLED_BASEMAP,
-        10,
         &cfg,
         Some(&mut cache),
     );
@@ -90,9 +88,7 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
         w,
         h,
         false,
-        true,
         SourceId::BUNDLED_BASEMAP,
-        11,
         &cfg,
         Some(&mut cache),
     );
@@ -113,9 +109,7 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
         w,
         h,
         false,
-        true,
         SourceId::BUNDLED_BASEMAP,
-        12,
         &cfg,
         Some(&mut cache),
     );
@@ -148,9 +142,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         w,
         h,
         false,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        1,
         &cfg,
         None,
     );
@@ -184,9 +176,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         w,
         h,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        2,
         &cfg,
         None,
     );
@@ -195,9 +185,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         w,
         h,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        3,
         &cfg,
         None,
     );
@@ -243,9 +231,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         w,
         h,
         false,
-        true,
         SourceId::BUNDLED_BASEMAP,
-        4,
         &cfg,
         Some(&mut overzoom_cache),
     );
@@ -270,9 +256,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         w,
         h,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        6,
         &cfg,
         None,
     );
@@ -281,9 +265,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         w,
         h,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        7,
         &cfg,
         None,
     );
@@ -292,9 +274,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
         w,
         h,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        8,
         &cfg,
         None,
     );
@@ -328,9 +308,7 @@ fn multi_lod_polar_seam_and_web_mercator_continuity() {
         mw,
         mh,
         true,
-        false,
         SourceId::BUNDLED_BASEMAP,
-        1,
         &cfg,
         None,
     );
@@ -391,17 +369,8 @@ fn multi_lod_polar_seam_and_web_mercator_continuity() {
             &cfg,
         ),
     ] {
-        let seam_snap = build_snapshot(
-            cam,
-            w,
-            h,
-            true,
-            false,
-            SourceId::BUNDLED_BASEMAP,
-            5,
-            active_cfg,
-            None,
-        );
+        let seam_snap =
+            build_snapshot(cam, w, h, true, SourceId::BUNDLED_BASEMAP, active_cfg, None);
         assert!(
             !seam_snap.tiles.is_empty(),
             "{label}: quadtree produced 0 tiles"

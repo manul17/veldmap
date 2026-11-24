@@ -8,6 +8,8 @@ use veldmap_core::tile::{BandKey, PixelFormat, PlanetaryScheme, QuadTileId, Sour
 
 use crate::decode_map_tile_with_mipmaps;
 
+use veldmap_core::tile::TileKey;
+
 use super::*;
 
 fn make_png(color: [u8; 4]) -> Vec<u8> {

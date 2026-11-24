@@ -7,6 +7,7 @@ mod app;
 pub(crate) mod basemap;
 pub mod gpu_tiles;
 pub mod render;
+mod scene;
 pub(crate) mod settings;
 pub(crate) mod storage;
 mod ui;

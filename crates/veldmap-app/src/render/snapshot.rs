@@ -30,9 +30,7 @@ pub struct SnapshotBuildParams<'a> {
     pub height_px: u32,
     pub pixels_per_point: f32,
     pub show_graticule: bool,
-    pub textured: bool,
     pub carrier_policy: &'a dyn TileCarrierPolicy,
-    pub generation: u64,
     pub config: &'a QuadtreeConfig,
 }
 
@@ -47,7 +45,7 @@ pub struct DrawTile {
     pub uv_rect: [f32; 4],
 }
 
-/// Immutable per-frame draw snapshot built on `VeldmapApp` (cached by
+/// Immutable per-frame draw snapshot built on the app thread (cached by
 /// `(camera_key, scene_generation)` so 120 Hz mouse hover never rebuilds tile
 /// lists) and handed to `GlobePaintCallback`.
 #[derive(Clone, Debug)]
@@ -61,7 +59,6 @@ pub struct DrawSnapshot {
     pub show_graticule: bool,
     pub grid_step_deg: f64,
     pub grid_width_px: f32,
-    pub generation: u64,
 }
 
 impl DrawSnapshot {
@@ -71,7 +68,8 @@ impl DrawSnapshot {
     }
 
     /// Build a draw snapshot from grouped viewport, camera, graticule, and
-    /// carrier-policy parameters plus an optional [`GpuTileCache`].
+    /// carrier-policy parameters plus an optional [`GpuTileCache`] (`Some` for
+    /// textured rendering, `None` for untextured ellipsoid rendering).
     pub fn build(params: SnapshotBuildParams<'_>, cache: Option<&mut GpuTileCache>) -> Self {
         let visible = traverse(
             &params.camera,
@@ -87,36 +85,33 @@ impl DrawSnapshot {
 
         let mut tiles = Vec::with_capacity(visible.len());
         let mut carrier_keys = HashSet::new();
-        match (params.textured, cache) {
-            (true, Some(gpu_cache)) => {
-                for vis in visible {
-                    if let Some((carrier_key, uv_rect, gpu_tile)) = params
-                        .carrier_policy
-                        .resolve_carrier(vis.tex_id, vis.uv_rect, gpu_cache)
-                    {
-                        carrier_keys.insert(carrier_key);
-                        tiles.push(DrawTile {
-                            visible: vis,
-                            texture: Some(gpu_tile),
-                            uv_rect,
-                        });
-                    } else {
-                        tiles.push(DrawTile {
-                            visible: vis,
-                            texture: None,
-                            uv_rect: vis.uv_rect,
-                        });
-                    }
-                }
-            }
-            _ => {
-                for vis in visible {
+        if let Some(gpu_cache) = cache {
+            for vis in visible {
+                if let Some((carrier_key, uv_rect, gpu_tile)) = params
+                    .carrier_policy
+                    .resolve_carrier(vis.tex_id, vis.uv_rect, gpu_cache)
+                {
+                    carrier_keys.insert(carrier_key);
+                    tiles.push(DrawTile {
+                        visible: vis,
+                        texture: Some(gpu_tile),
+                        uv_rect,
+                    });
+                } else {
                     tiles.push(DrawTile {
                         visible: vis,
                         texture: None,
                         uv_rect: vis.uv_rect,
                     });
                 }
+            }
+        } else {
+            for vis in visible {
+                tiles.push(DrawTile {
+                    visible: vis,
+                    texture: None,
+                    uv_rect: vis.uv_rect,
+                });
             }
         }
 
@@ -128,7 +123,6 @@ impl DrawSnapshot {
             show_graticule: params.show_graticule,
             grid_step_deg,
             grid_width_px,
-            generation: params.generation,
         }
     }
 }

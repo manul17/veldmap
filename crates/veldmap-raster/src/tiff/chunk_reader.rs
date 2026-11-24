@@ -7,14 +7,15 @@ use tiff::decoder::{Decoder, Limits};
 use veldmap_core::budget::DecodeBudgetTracker;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileStreamSpec};
+use veldmap_core::tile::SourceId;
 
 use crate::RasterError;
 use crate::pipeline::chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
-use crate::pipeline::grid::{self, Chunked};
+use crate::pipeline::driver::Chunked;
+use crate::pipeline::grid;
 use crate::pipeline::radiometry::{DisplayMapping, PixelLayout};
 
-use super::TIFF_DECODE_REV;
+use super::DISPLAY_STREAM_SPEC;
 use super::tags::{chunk_rgba, map_tiff_error};
 
 /// Maximum idle `tiff::decoder::Decoder` handles retained per [`super::TiffSource`].
@@ -85,6 +86,9 @@ impl DecoderPool {
 
 /// RAII checkout guard returning a clean `Decoder` to [`DecoderPool`] on drop
 /// with its `CancelToken` reset so cancelled requests never poison reuse.
+///
+/// Any mutating operation (`decoder_mut`, `seek_to_image`) automatically marks
+/// the checkout dirty until the caller confirms success via [`Self::mark_clean`].
 pub(super) struct PooledDecoder<'a> {
     pool: &'a DecoderPool,
     entry: Option<DecoderEntry>,
@@ -97,6 +101,7 @@ impl PooledDecoder<'_> {
     }
 
     pub(super) fn decoder_mut(&mut self) -> &mut Decoder<BufferedByteReader> {
+        self.clean = false;
         #[expect(
             clippy::expect_used,
             reason = "INVARIANT: entry is only taken inside Drop"
@@ -109,6 +114,7 @@ impl PooledDecoder<'_> {
         image: usize,
         cancel: &CancelToken,
     ) -> Result<(), RasterError> {
+        self.clean = false;
         #[expect(
             clippy::expect_used,
             reason = "INVARIANT: entry is only taken inside Drop"
@@ -192,14 +198,10 @@ impl<'a> TiffChunkReader<'a> {
         budget_tracker: Option<&DecodeBudgetTracker>,
         cancel: &CancelToken,
     ) -> Result<DecodedChunk, RasterError> {
-        if self.pooled.is_none() {
-            self.pooled = Some(self.decoder_pool.checkout(cancel)?);
-        }
-        let pooled = self
-            .pooled
-            .as_mut()
-            .ok_or_else(|| RasterError::InvalidFormat("missing TIFF decoder".to_string()))?;
-        pooled.clean = false;
+        let pooled = match self.pooled.as_mut() {
+            Some(pooled) => pooled,
+            None => self.pooled.insert(self.decoder_pool.checkout(cancel)?),
+        };
         pooled.seek_to_image(image, cancel)?;
         let (dw, dh) = pooled.decoder_mut().chunk_data_dimensions(index);
         if dw == 0 || dh == 0 {
@@ -244,12 +246,7 @@ impl Chunked for TiffChunkReader<'_> {
             } => {
                 let key = ChunkKey {
                     source: self.source_id,
-                    spec: TileStreamSpec::new(
-                        BandKey::Display,
-                        PixelFormat::Rgba8UnormSrgb,
-                        0,
-                        TIFF_DECODE_REV,
-                    ),
+                    spec: DISPLAY_STREAM_SPEC,
                     image,
                     chunk_index: index,
                 };

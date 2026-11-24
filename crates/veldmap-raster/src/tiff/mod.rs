@@ -22,18 +22,18 @@ use veldmap_core::tile::{
 
 use crate::RasterError;
 use crate::pipeline::DecodeContext;
-use crate::pipeline::band::{BandInfo, RasterDescription};
+use crate::pipeline::band::{BandInfo, RasterDescription, SampleType};
 use crate::pipeline::cascade::TileEmit;
-use crate::pipeline::grid::{self, Grid, Overview};
+use crate::pipeline::driver::{self, DirectRead};
+use crate::pipeline::grid::{Grid, Overview};
+use crate::pipeline::plan::{LevelPlan, PyramidMeta, build_chunked_level_table};
 use crate::pipeline::pyramid::RASTER_TILE_SIZE;
 use crate::pipeline::radiometry::{DisplayMapping, PixelLayout};
-use crate::pipeline::scheduler::{LevelPlan, PyramidMeta};
-use crate::pipeline::table::build_chunked_level_table;
 
 use chunk_reader::{ChunkReadMode, DecoderPool, TiffChunkReader};
 use georef::{ParsedGeoref, georef, parse_gdal_nodata};
 use stretch::{StretchCache, StretchRequest};
-use tags::{chunk_grid, depth_of_layout, ensure_readable, is_overview, map_tiff_error};
+use tags::{chunk_grid, depth_of_layout, ensure_readable, is_overview, map_tiff_error, opt_tag};
 
 /// BigTIFF file header signatures (`version = 43`).
 const BIG_MAGIC: [&[u8]; 2] = [b"II\x2b\x00", b"MM\x00\x2b"];
@@ -54,6 +54,15 @@ pub const MAX_SOURCE_SIDE: u32 = 65_536;
 /// Current display decode revision encoded into `TileKey` and `ChunkKey`.
 pub const TIFF_DECODE_REV: u32 = 1;
 
+/// Canonical display stream spec shared across [`TiffSource::pyramid_meta`] and
+/// [`TiffChunkReader`].
+pub(super) const DISPLAY_STREAM_SPEC: TileStreamSpec = TileStreamSpec::new(
+    BandKey::Display,
+    PixelFormat::Rgba8UnormSrgb,
+    0,
+    TIFF_DECODE_REV,
+);
+
 /// Return whether `head` begins with a classic TIFF or BigTIFF signature.
 pub fn has_tiff_magic(head: &[u8]) -> bool {
     CLASSIC_MAGIC.iter().any(|m| head.starts_with(m))
@@ -67,6 +76,85 @@ fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
         .decode_working_bytes
         .clamp(4 * 1024 * 1024, 128 * 1024 * 1024) as usize;
     limits
+}
+
+struct BaseFormat {
+    pixel_layout: PixelLayout,
+    sample_bits: u8,
+    sample_type: SampleType,
+    depth: u32,
+}
+
+fn scan_overviews(
+    decoder: &mut Decoder<BufferedByteReader>,
+    base: &BaseFormat,
+    budget: &MemoryBudget,
+    cancel: &CancelToken,
+) -> Result<(Vec<Overview>, usize, bool), RasterError> {
+    let mut overviews = Vec::new();
+    let mut ifd_index = 0usize;
+    let mut decoder_clean = true;
+    while ifd_index + 1 < MAX_IFDS && decoder.more_images() {
+        if cancel.is_cancelled() {
+            return Err(RasterError::Cancelled);
+        }
+        if let Err(err) = decoder.next_image() {
+            if cancel.is_cancelled() {
+                return Err(RasterError::Cancelled);
+            }
+            tracing::debug!(error = %err, "Stopped scanning TIFF overviews");
+            decoder_clean = false;
+            break;
+        }
+        ifd_index += 1;
+        let subfile = match opt_tag(decoder.get_tag_unsigned::<u32>(Tag::NewSubfileType), cancel) {
+            Ok(v) => v.unwrap_or(0),
+            Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
+            Err(_) => continue,
+        };
+        if !is_overview(subfile) {
+            continue;
+        }
+        match ensure_readable(decoder, cancel) {
+            Ok((o_layout, o_bits, o_type)) => {
+                if o_layout != base.pixel_layout
+                    || o_bits != base.sample_bits
+                    || o_type != base.sample_type
+                {
+                    continue;
+                }
+            }
+            Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
+            Err(_) => {
+                if cancel.is_cancelled() {
+                    return Err(RasterError::Cancelled);
+                }
+                continue;
+            }
+        }
+        let Ok((ow, oh)) = decoder.dimensions() else {
+            if cancel.is_cancelled() {
+                return Err(RasterError::Cancelled);
+            }
+            continue;
+        };
+        if ow == 0 || oh == 0 {
+            continue;
+        }
+        // `chunk_grid` checks `ensure_chunky` once per overview.
+        let ochunk = match chunk_grid(decoder, budget, base.depth, cancel) {
+            Ok(c) => c,
+            Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
+            Err(_) => continue,
+        };
+        overviews.push(Overview {
+            image: ifd_index,
+            width: ow,
+            height: oh,
+            chunk: ochunk,
+        });
+    }
+    Ok((overviews, ifd_index, decoder_clean))
 }
 
 /// Thread-safe opened GeoTIFF/BigTIFF/COG source backed by a positioned
@@ -142,64 +230,14 @@ impl TiffSource {
             trouble: binding_trouble,
         } = georef(&mut decoder, width, height, cancel)?;
 
-        let mut overviews = Vec::new();
-        let mut ifd_index = 0usize;
-        let mut decoder_clean = true;
-        while ifd_index + 1 < MAX_IFDS && decoder.more_images() {
-            if cancel.is_cancelled() {
-                return Err(RasterError::Cancelled);
-            }
-            if let Err(err) = decoder.next_image() {
-                if cancel.is_cancelled() {
-                    return Err(RasterError::Cancelled);
-                }
-                tracing::debug!(error = %err, "Stopped scanning TIFF overviews");
-                decoder_clean = false;
-                break;
-            }
-            ifd_index += 1;
-            let subfile = decoder
-                .get_tag_unsigned::<u32>(Tag::NewSubfileType)
-                .unwrap_or(0);
-            if !is_overview(subfile) {
-                continue;
-            }
-            match ensure_readable(&mut decoder, cancel) {
-                Ok((o_layout, o_bits, o_type)) => {
-                    if o_layout != pixel_layout || o_bits != sample_bits || o_type != sample_type {
-                        continue;
-                    }
-                }
-                Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
-                Err(_) => {
-                    if cancel.is_cancelled() {
-                        return Err(RasterError::Cancelled);
-                    }
-                    continue;
-                }
-            }
-            let Ok((ow, oh)) = decoder.dimensions() else {
-                if cancel.is_cancelled() {
-                    return Err(RasterError::Cancelled);
-                }
-                continue;
-            };
-            if ow == 0 || oh == 0 {
-                continue;
-            }
-            // `chunk_grid` checks `ensure_chunky` once per overview.
-            let ochunk = match chunk_grid(&mut decoder, budget, depth, cancel) {
-                Ok(c) => c,
-                Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
-                Err(_) => continue,
-            };
-            overviews.push(Overview {
-                image: ifd_index,
-                width: ow,
-                height: oh,
-                chunk: ochunk,
-            });
-        }
+        let base_fmt = BaseFormat {
+            pixel_layout,
+            sample_bits,
+            sample_type,
+            depth,
+        };
+        let (overviews, ifd_index, decoder_clean) =
+            scan_overviews(&mut decoder, &base_fmt, budget, cancel)?;
 
         let grid = Grid {
             tiled,
@@ -294,12 +332,7 @@ impl TiffSource {
     pub fn pyramid_meta(&self) -> PyramidMeta {
         PyramidMeta {
             source: self.source_id,
-            spec: TileStreamSpec::new(
-                BandKey::Display,
-                PixelFormat::Rgba8UnormSrgb,
-                0,
-                TIFF_DECODE_REV,
-            ),
+            spec: DISPLAY_STREAM_SPEC,
             width: self.description.width,
             height: self.description.height,
             tile_size: RASTER_TILE_SIZE,
@@ -346,8 +379,11 @@ impl TiffSource {
                 Ok(())
             },
         )?;
-        produced.ok_or_else(|| {
-            RasterError::InvalidFormat(format!("tile ({tx}, {ty}) at level {level} out of bounds"))
+        produced.ok_or_else(|| RasterError::TileOutOfRange {
+            scheme: self.pyramid_meta().scheme(),
+            level,
+            x: tx,
+            y: ty,
         })
     }
 
@@ -373,7 +409,7 @@ impl TiffSource {
                 budget_tracker: ctx.budget_tracker,
             },
         );
-        let req = grid::DirectRead {
+        let req = DirectRead {
             grid: &self.grid,
             base: (self.description.width, self.description.height),
             level,
@@ -382,7 +418,7 @@ impl TiffSource {
             budget_tracker: ctx.budget_tracker,
             cancel: ctx.cancel,
         };
-        grid::direct(&mut reader, &req, emit)
+        driver::direct(&mut reader, &req, emit)
     }
 
     /// Run a sequential top-to-bottom pass over the base IFD, emitting every
@@ -412,7 +448,7 @@ impl TiffSource {
             mapping,
             ChunkReadMode::SequentialPass,
         );
-        grid::pass(
+        driver::pass(
             &mut reader,
             &self.grid,
             (self.description.width, self.description.height),

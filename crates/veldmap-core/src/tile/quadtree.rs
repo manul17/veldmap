@@ -15,7 +15,8 @@ use crate::geo::sag;
 use super::geometry::{
     lat_lon_bounds, lerp_f64, sample_tile_surface, tile_lon_bounds, web_mercator_y_bounds,
 };
-use super::key::{GlobeScheme, PlanetaryScheme, QuadTileId};
+use super::key::QuadTileId;
+use super::scheme::{GlobeScheme, PlanetaryScheme};
 
 /// Default mesh grid cells per quadtree tile side (`16 x 16` quads = 289
 /// surface vertices + 68 skirt vertices).

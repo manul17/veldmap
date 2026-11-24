@@ -11,12 +11,143 @@ use std::ops::Range;
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::geodesy;
 use veldmap_core::tile::{
-    PlanetaryScheme, QuadTileId, TileSurfaceSample, VisibleTile, sample_tile_surface,
+    DEFAULT_GRID_CELLS, PlanetaryScheme, QuadTileId, TileCache, TileSurfaceSample, VisibleTile,
+    sample_tile_surface,
 };
+use wgpu::util::DeviceExt;
 
+use super::snapshot::DrawTile;
 use super::uniforms::{
     TILE_KIND_GEO, TILE_KIND_POLAR_CLEAR_SCALE, TILE_KIND_POLAR_NORTH, TILE_KIND_POLAR_SOUTH,
 };
+
+/// Default VRAM budget for cached per-tile geometry vertex buffers (`16 MiB`,
+/// ~1,000 cached `16 x 16` tiles).
+const DEFAULT_MESH_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+pub(super) struct CachedTileMesh {
+    pub(super) buffer: wgpu::Buffer,
+    pub(super) grid_anchor: TileGridAnchor,
+}
+
+/// Bounded LRU cache of per-tile CPU `f64` RTC vertex buffers paired with the
+/// shared static quadtree index buffer.
+pub(super) struct TileMeshCache {
+    grid_cells: u32,
+    surface_indices: Range<u32>,
+    full_indices: Range<u32>,
+    index_buffer: wgpu::Buffer,
+    meshes: TileCache<QuadTileId, CachedTileMesh>,
+}
+
+impl TileMeshCache {
+    pub(super) fn new(device: &wgpu::Device) -> Self {
+        let grid_cells = DEFAULT_GRID_CELLS;
+        let shared = SharedTileIndices::build(grid_cells);
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quadtree shared index buffer"),
+            contents: bytemuck::cast_slice(&shared.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        Self {
+            grid_cells,
+            surface_indices: shared.surface,
+            full_indices: shared.full,
+            index_buffer,
+            meshes: TileCache::new(DEFAULT_MESH_CACHE_BYTES),
+        }
+    }
+
+    pub(super) fn index_buffer(&self) -> &wgpu::Buffer {
+        &self.index_buffer
+    }
+
+    pub(super) fn surface_indices(&self) -> Range<u32> {
+        self.surface_indices.clone()
+    }
+
+    pub(super) fn full_indices(&self) -> Range<u32> {
+        self.full_indices.clone()
+    }
+
+    pub(super) fn peek(&self, id: &QuadTileId) -> Option<&CachedTileMesh> {
+        self.meshes.peek(id)
+    }
+
+    fn ensure_grid_cells(&mut self, device: &wgpu::Device, grid_cells: u32) {
+        let cells = grid_cells.max(1);
+        if cells == self.grid_cells {
+            return;
+        }
+        let shared = SharedTileIndices::build(cells);
+        self.grid_cells = cells;
+        self.surface_indices = shared.surface;
+        self.full_indices = shared.full;
+        self.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quadtree shared index buffer"),
+            contents: bytemuck::cast_slice(&shared.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let _ = self.meshes.clear();
+    }
+
+    /// Ensure every tile in `tiles` has an uploaded vertex buffer without
+    /// evicting earlier tiles of the current frame, while relaxing the cache
+    /// ceiling back toward [`DEFAULT_MESH_CACHE_BYTES`] once demand subsides.
+    pub(super) fn prepare_for_tiles(
+        &mut self,
+        device: &wgpu::Device,
+        grid_cells: u32,
+        tiles: &[DrawTile],
+    ) {
+        self.ensure_grid_cells(device, grid_cells);
+        let stride = (self.grid_cells + 1) as usize;
+        let single_tile_bytes = (stride * stride + 4 * stride) * std::mem::size_of::<TileVertex>();
+        let needed_bytes = tiles.len().saturating_mul(single_tile_bytes);
+
+        // Temporarily ensure the cap can hold every tile in the active frame so
+        // earlier draws in this snapshot are never evicted by later inserts.
+        let active_floor = needed_bytes.max(DEFAULT_MESH_CACHE_BYTES);
+        if active_floor > self.meshes.max_bytes() {
+            let _ = self.meshes.set_max_bytes(active_floor);
+        }
+
+        // Touch all already-cached current-frame meshes first so subsequent
+        // LRU evictions target strictly stale off-frame tiles.
+        for draw in tiles {
+            self.meshes.touch(&draw.visible.id);
+        }
+
+        for draw in tiles {
+            let id = draw.visible.id;
+            if self.meshes.peek(&id).is_some() {
+                continue;
+            }
+            let (verts, grid_anchor) = build_tile_mesh_data(&draw.visible, self.grid_cells);
+            let byte_size = std::mem::size_of_val(verts.as_slice());
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("quadtree tile RTC vertex buffer"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let _ = self.meshes.insert(
+                id,
+                CachedTileMesh {
+                    buffer,
+                    grid_anchor,
+                },
+                byte_size,
+            );
+        }
+
+        // Shrink back toward `DEFAULT_MESH_CACHE_BYTES` when frame demand
+        // subsides, while never dipping below `needed_bytes` for the active frame.
+        let target_cap = needed_bytes.max(DEFAULT_MESH_CACHE_BYTES);
+        if target_cap < self.meshes.max_bytes() {
+            let _ = self.meshes.set_max_bytes(target_cap);
+        }
+    }
+}
 
 /// Cached tile-center `f64` graticule anchor sampled once during mesh build.
 #[derive(Clone, Copy, Debug, Default)]

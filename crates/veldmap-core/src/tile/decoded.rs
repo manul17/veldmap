@@ -1,12 +1,12 @@
 //! CPU-decoded tile pixel storage (`DecodedTile`) with construction-time
 //! invariant enforcement and optional precomputed mipmap levels shared across
-//! `veldmap-raster`, `veldmap-net`, and `veldmap-app`.
+//! `veldmap-raster` and `veldmap-app`.
 
 use std::fmt;
 
 use thiserror::Error;
 
-use super::key::PixelFormat;
+use super::identity::PixelFormat;
 
 /// Maximum number of mip levels (including base level 0) for a 2D texture of
 /// dimensions `(width, height)`.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::tile::SourceFingerprint;
 
 fn make_key(scheme: TileScheme, level: u8, x: u32, y: u32) -> TileKey {
     TileKey {

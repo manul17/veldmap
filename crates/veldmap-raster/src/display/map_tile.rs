@@ -53,7 +53,7 @@ fn map_image_err(
             estimated_bytes,
             limit_bytes,
         },
-        other => RasterError::Decode(std::sync::Arc::new(other)),
+        other => RasterError::Decode(other.to_string()),
     }
 }
 

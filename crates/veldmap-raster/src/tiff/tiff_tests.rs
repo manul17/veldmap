@@ -20,8 +20,7 @@ use crate::pipeline::DecodeContext;
 use crate::pipeline::band::{GeoKeyParams, GeoRasterType, SampleType};
 use crate::pipeline::chunk_cache::SharedChunkCache;
 use crate::pipeline::grid::Grid;
-use crate::pipeline::scheduler::ServeMode;
-use crate::pipeline::table;
+use crate::pipeline::plan::{self, ServeMode};
 
 fn tiny_u16_tiff_bytes() -> Vec<u8> {
     let mut file = Cursor::new(Vec::new());
@@ -339,7 +338,7 @@ fn georef_tag_limits_and_table_helpers_work_consistently() {
         overviews: Vec::new(),
         depth: 3,
     };
-    let tbl = table::build_chunked_level_table(&grid, 8192, 8192, &tiny_budget);
+    let tbl = plan::build_chunked_level_table(&grid, 8192, 8192, &tiny_budget);
     assert!(!tbl.is_empty());
     assert!(matches!(tbl[0].serve, ServeMode::Pass { from: 0 }));
 }

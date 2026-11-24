@@ -1,8 +1,9 @@
 //! Coarsest-first deduplicated `TileKey` priority queue backed by a `BTreeSet`
-//! for O(log N) insertion, deduplication, lookup, and coarsest-first pop.
+//! for O(log N) insertion, deduplication, lookup, in-place retain, and
+//! coarsest-first pop.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use veldmap_core::tile::TileKey;
 
@@ -82,32 +83,10 @@ impl CoarsestTileQueue {
         added
     }
 
-    pub(super) fn replace_sorted(&mut self, keys: impl IntoIterator<Item = TileKey>) {
-        self.items.clear();
-        for key in keys {
-            self.items.insert(OrderedTileKey(key));
-        }
-    }
-
-    pub(super) fn retain_and_collect(
-        &mut self,
-        mut keep: impl FnMut(&TileKey) -> bool,
-    ) -> HashSet<TileKey> {
-        let mut retained = HashSet::new();
-        self.items.retain(|entry| {
-            let ok = keep(&entry.0);
-            if ok {
-                retained.insert(entry.0);
-            }
-            ok
-        });
-        retained
-    }
-
-    pub(super) fn restore_deferred(&mut self, deferred: Vec<TileKey>) {
-        for key in deferred {
-            self.items.insert(OrderedTileKey(key));
-        }
+    /// Retain only entries matching `keep` in place with zero auxiliary
+    /// allocations.
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&TileKey) -> bool) {
+        self.items.retain(|entry| keep(&entry.0));
     }
 
     pub(super) fn drain(&mut self) -> Vec<TileKey> {
@@ -135,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_unique_maintains_coarsest_first_order() {
+    fn insert_unique_and_retain_maintain_coarsest_first_order() {
         let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
         let mut queue = CoarsestTileQueue::default();
         let k0 = wm_key(&spec, 0, 0, 0);
@@ -147,8 +126,10 @@ mod tests {
         assert!(queue.insert_unique(k2));
         assert!(!queue.insert_unique(k1));
         assert!(queue.contains(&k2));
+
+        queue.retain(|k| *k != k2);
+        assert!(!queue.contains(&k2));
         assert_eq!(queue.pop(), Some(k0));
-        assert_eq!(queue.pop(), Some(k2));
         assert_eq!(queue.pop(), Some(k1));
         assert_eq!(queue.pop(), None);
     }

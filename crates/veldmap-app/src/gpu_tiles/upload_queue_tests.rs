@@ -1,29 +1,26 @@
 use veldmap_core::tile::{BandKey, PixelFormat, PlanetaryScheme, QuadTileId, TileScheme};
 
-use crate::basemap_policy::{bundled_tile_key, source_tile_key};
-
 use super::*;
+
+fn wm_key(source: SourceId, level: u8, x: u32, y: u32) -> TileKey {
+    TileKey::display_quad(
+        source,
+        QuadTileId {
+            scheme: PlanetaryScheme::WebMercator,
+            level,
+            x,
+            y,
+        },
+    )
+}
 
 #[test]
 fn pending_uploads_enforces_byte_cap_on_enqueue_and_preserves_roots() {
     let mut pending = PendingUploads::with_max_queued_bytes(10);
     let tx = pending.sender().expect("sender");
     let live_a = SourceId::from_stable_key("live-a");
-    let k_live = source_tile_key(
-        live_a,
-        QuadTileId {
-            scheme: PlanetaryScheme::WebMercator,
-            level: 1,
-            x: 0,
-            y: 0,
-        },
-    );
-    let k_bundled = bundled_tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 0,
-        x: 0,
-        y: 0,
-    });
+    let k_live = wm_key(live_a, 1, 0, 0);
+    let k_bundled = wm_key(SourceId::BUNDLED_BASEMAP, 0, 0, 0);
     let tile_4b =
         DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]).expect("tile");
     tx.send((k_live, tile_4b.clone())).expect("send live");
@@ -39,24 +36,8 @@ fn pending_uploads_enforces_byte_cap_on_enqueue_and_preserves_roots() {
     // Send finer z=3 first (8 B total <= 10 B), then coarser z=1 (would be 12 B > 10 B):
     // enqueue-time backpressure MUST immediately evict finest non-pinned z=3 without
     // requiring any UI drain, preserving pinned root z=0 and coarser z=1.
-    let k_z3 = source_tile_key(
-        live_a,
-        QuadTileId {
-            scheme: PlanetaryScheme::WebMercator,
-            level: 3,
-            x: 0,
-            y: 0,
-        },
-    );
-    let k_z1 = source_tile_key(
-        live_a,
-        QuadTileId {
-            scheme: PlanetaryScheme::WebMercator,
-            level: 1,
-            x: 0,
-            y: 0,
-        },
-    );
+    let k_z3 = wm_key(live_a, 3, 0, 0);
+    let k_z1 = wm_key(live_a, 1, 0, 0);
     tx.send((k_z3, tile_4b.clone())).expect("send z3");
     assert_eq!(pending.queued_bytes(), 8);
     assert!(pending.contains(&k_z3));
@@ -73,15 +54,7 @@ fn pending_uploads_enforces_byte_cap_on_enqueue_and_preserves_roots() {
 
     // Burst of 100 fine tiles with NO UI drain must stay strictly bounded <= 10 B.
     for x in 0..100u32 {
-        let fine = source_tile_key(
-            live_a,
-            QuadTileId {
-                scheme: PlanetaryScheme::WebMercator,
-                level: 8,
-                x,
-                y: 0,
-            },
-        );
+        let fine = wm_key(live_a, 8, x, 0);
         tx.send((fine, tile_4b.clone())).expect("send burst");
         assert!(pending.queued_bytes() <= 10);
     }
@@ -98,24 +71,8 @@ fn pending_uploads_enforces_byte_cap_on_enqueue_and_preserves_roots() {
 #[test]
 fn pinned_root_check_handles_planetary_and_raster_pyramid() {
     let live = SourceId::from_stable_key("eox");
-    let wm_root = source_tile_key(
-        live,
-        QuadTileId {
-            scheme: PlanetaryScheme::WebMercator,
-            level: 0,
-            x: 0,
-            y: 0,
-        },
-    );
-    let wm_child = source_tile_key(
-        live,
-        QuadTileId {
-            scheme: PlanetaryScheme::WebMercator,
-            level: 1,
-            x: 0,
-            y: 0,
-        },
-    );
+    let wm_root = wm_key(live, 0, 0, 0);
+    let wm_child = wm_key(live, 1, 0, 0);
     assert!(is_pinned_root(&wm_root, &[live]));
     assert!(!is_pinned_root(&wm_root, &[SourceId::BUNDLED_BASEMAP]));
     assert!(!is_pinned_root(&wm_child, &[live]));
@@ -150,18 +107,8 @@ fn clear_where_and_proportional_budget_cover_pre_3a_hooks() {
     let tx = pending.sender().expect("sender");
     let tile_4b =
         DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]).expect("tile");
-    let k0 = bundled_tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 0,
-        x: 0,
-        y: 0,
-    });
-    let k2 = bundled_tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 2,
-        x: 1,
-        y: 1,
-    });
+    let k0 = wm_key(SourceId::BUNDLED_BASEMAP, 0, 0, 0);
+    let k2 = wm_key(SourceId::BUNDLED_BASEMAP, 2, 1, 1);
     tx.send((k0, tile_4b.clone())).expect("send k0");
     tx.send((k2, tile_4b)).expect("send k2");
 

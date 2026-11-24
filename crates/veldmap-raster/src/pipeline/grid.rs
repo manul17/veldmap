@@ -1,23 +1,17 @@
-//! Chunk grid driver (`Grid`, `Overview`, `Chunked`, `direct`, `pass`):
-//! drives both pointwise random chunk access and single-pass sequential
-//! cascade emission while honoring `MemoryBudget` and `CancelToken`.
+//! Pure chunk-grid geometry, overview selection, fractional source-window
+//! mapping, and working-memory peak estimation (`Grid`, `Overview`,
+//! `Footprint`, `Region`, `region_of`).
 
-use std::sync::Arc;
-
-use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
-use veldmap_core::sync::CancelToken;
+use veldmap_core::budget::MemoryBudget;
 use veldmap_core::tile::PixelFormat;
 
-use crate::RasterError;
-
-use super::cascade::{self, Cascade, TileEmit};
-use super::chunk_cache::DecodedChunk;
+use super::cascade;
 use super::peak::DecodePeak;
 use super::pyramid::{self, RASTER_TILE_SIZE};
-use super::resample::{Window, bleed_alpha, resample_rgba8_window};
+use super::resample::Window;
 
 /// Minimum chunk pixel area eligible for pointwise random access.
-pub const MIN_CHUNK_PIXELS: u64 = 32 * 32;
+const MIN_CHUNK_PIXELS: u64 = 32 * 32;
 
 /// Working memory in bytes for decoding a `dw x dh` chunk with `depth` raw
 /// bytes/pixel, optionally adding 4 bytes/pixel for RGBA8 display expansion.
@@ -35,34 +29,34 @@ pub(crate) fn chunk_working_bytes(
 
 /// Cost of reading one tile at a pointwise level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Footprint {
-    pub image: usize,
-    pub region_pixels: u64,
-    pub held_pixels: u64,
+pub(crate) struct Footprint {
+    pub(crate) image: usize,
+    pub(crate) region_pixels: u64,
+    pub(crate) held_pixels: u64,
 }
 
 /// Reduced overview IFD inside a multi-resolution source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Overview {
-    pub image: usize,
-    pub width: u32,
-    pub height: u32,
-    pub chunk: (u32, u32),
+pub(crate) struct Overview {
+    pub(crate) image: usize,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) chunk: (u32, u32),
 }
 
 /// Chunk layout of a raster source (base image + overviews).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Grid {
-    pub tiled: bool,
-    pub chunk: (u32, u32),
-    pub overviews: Vec<Overview>,
+pub(crate) struct Grid {
+    pub(crate) tiled: bool,
+    pub(crate) chunk: (u32, u32),
+    pub(crate) overviews: Vec<Overview>,
     /// Bytes per pixel in raw encoded samples (`channels * sample_bytes`).
-    pub depth: u32,
+    pub(crate) depth: u32,
 }
 
 impl Grid {
     /// Return the chunk grid `(cw, ch)` for `image` (`0` = base IFD).
-    pub fn chunk_of(&self, image: usize) -> (u32, u32) {
+    pub(crate) fn chunk_of(&self, image: usize) -> (u32, u32) {
         self.overviews
             .iter()
             .find(|o| o.image == image)
@@ -72,7 +66,7 @@ impl Grid {
     /// Choose the smallest overview covering `(level_width, level_height)`
     /// within the 1-pixel rounding tolerance between `ceil(side / 2^k)` and
     /// GDAL's `floor(side / 2)`.
-    pub fn source_for(
+    pub(crate) fn source_for(
         &self,
         base: (u32, u32),
         level_width: u32,
@@ -96,7 +90,7 @@ impl Grid {
 
     /// Compute the pointwise reading footprint for `level`, or `None` when the
     /// level must be served via sequential pass.
-    pub fn footprint(
+    pub(crate) fn footprint(
         &self,
         base: (u32, u32),
         level: u8,
@@ -144,31 +138,36 @@ impl Grid {
     }
 
     /// Peak memory of decoding one fresh chunk `(cw, ch)` before expansion.
-    pub fn chunk_bytes(&self, chunk: (u32, u32)) -> u64 {
+    pub(crate) fn chunk_bytes(&self, chunk: (u32, u32)) -> u64 {
         chunk_working_bytes(chunk.0, chunk.1, self.depth, true)
     }
 
+    /// Estimated per-operation working memory peak for an already-computed
+    /// pointwise [`Footprint`] (`region + fresh chunk + output tile`; excludes
+    /// the independent fixed-cap global [`super::chunk_cache::SharedChunkCache`]).
+    pub(crate) fn direct_peak_for_footprint(&self, fp: &Footprint) -> DecodePeak {
+        let tile = u64::from(RASTER_TILE_SIZE) * u64::from(RASTER_TILE_SIZE) * 4;
+        DecodePeak::new()
+            .with("region", fp.region_pixels.saturating_mul(4))
+            .with("fresh chunk", self.chunk_bytes(self.chunk_of(fp.image)))
+            .with("tile", tile)
+    }
+
     /// Estimated per-operation working memory peak for pointwise reading at
-    /// `level` (`region + fresh chunk + output tile`; excludes the independent
-    /// fixed-cap global [`SharedChunkCache`]).
-    pub fn direct_peak(
+    /// `level`.
+    #[cfg(test)]
+    pub(crate) fn direct_peak(
         &self,
         base: (u32, u32),
         level: u8,
         budget: &MemoryBudget,
     ) -> Option<DecodePeak> {
         let fp = self.footprint(base, level, budget)?;
-        let tile = u64::from(RASTER_TILE_SIZE) * u64::from(RASTER_TILE_SIZE) * 4;
-        Some(
-            DecodePeak::new()
-                .with("region", fp.region_pixels.saturating_mul(4))
-                .with("fresh chunk", self.chunk_bytes(self.chunk_of(fp.image)))
-                .with("tile", tile),
-        )
+        Some(self.direct_peak_for_footprint(&fp))
     }
 
     /// Estimated working memory peak for a full sequential pass over `base`.
-    pub fn pass_peak(&self, base: (u32, u32)) -> DecodePeak {
+    pub(crate) fn pass_peak(&self, base: (u32, u32)) -> DecodePeak {
         let (width, height) = base;
         DecodePeak::new()
             .with(
@@ -231,11 +230,11 @@ pub(crate) fn source_scale(
 }
 
 pub(crate) struct Region {
-    pub sx0: u64,
-    pub sx1: u64,
-    pub sy0: u64,
-    pub sy1: u64,
-    pub window: Window,
+    pub(crate) sx0: u64,
+    pub(crate) sx1: u64,
+    pub(crate) sy0: u64,
+    pub(crate) sy1: u64,
+    pub(crate) window: Window,
 }
 
 pub(crate) fn region_of(
@@ -299,197 +298,6 @@ pub(crate) fn region_of(
             y1: y1_win,
         },
     }
-}
-
-/// Chunked raster backend driving [`direct`] and [`pass`].
-pub trait Chunked {
-    /// Decode chunk `index` of IFD/image `image` as tightly packed RGBA8.
-    fn chunk(
-        &mut self,
-        image: usize,
-        index: u32,
-        cancel: &CancelToken,
-    ) -> Result<Arc<DecodedChunk>, RasterError>;
-}
-
-/// Parameters governing a [`direct`] pointwise tile read.
-pub(crate) struct DirectRead<'a> {
-    pub grid: &'a Grid,
-    pub base: (u32, u32),
-    pub level: u8,
-    pub wants: &'a [(u32, u32)],
-    pub budget: &'a MemoryBudget,
-    pub budget_tracker: &'a DecodeBudgetTracker,
-    pub cancel: &'a CancelToken,
-}
-
-/// Pointwise reading: decode only the chunks intersecting `req.wants` at
-/// `req.level`, reserving `region + tile` working memory against
-/// `req.budget_tracker` without nesting leases across chunk singleflight.
-pub(crate) fn direct<S: Chunked>(
-    source: &mut S,
-    req: &DirectRead<'_>,
-    emit: TileEmit<'_>,
-) -> Result<(), RasterError> {
-    if req.base.0 == 0 || req.base.1 == 0 {
-        return Err(RasterError::InvalidDimensions {
-            width: req.base.0,
-            height: req.base.1,
-        });
-    }
-    let lw = pyramid::level_size(req.base.0, u32::from(req.level));
-    let lh = pyramid::level_size(req.base.1, u32::from(req.level));
-    let (image, sw, sh) = req.grid.source_for(req.base, lw, lh);
-    let (cw, ch) = req.grid.chunk_of(image);
-    if cw == 0 || ch == 0 {
-        return Err(RasterError::InvalidDimensions {
-            width: cw,
-            height: ch,
-        });
-    }
-    let across = sw.div_ceil(cw);
-    let region_cap_pixels = req
-        .budget
-        .region_cap_pixels_for(PixelFormat::Rgba8UnormSrgb);
-
-    for &(tx, ty) in req.wants {
-        if req.cancel.is_cancelled() {
-            return Err(RasterError::Cancelled);
-        }
-        let tw = pyramid::tile_extent(tx, lw);
-        let th = pyramid::tile_extent(ty, lh);
-        if tw == 0 || th == 0 {
-            continue;
-        }
-
-        let Region {
-            sx0,
-            sx1,
-            sy0,
-            sy1,
-            window,
-        } = region_of((tx, ty), (tw, th), req.base, (sw, sh), req.level);
-        let (rw, rh) = ((sx1 - sx0) as u32, (sy1 - sy0) as u32);
-        if rw == 0 || rh == 0 {
-            return Err(RasterError::InvalidFormat(format!(
-                "tile ({tx}, {ty}) at level {} produced empty source region",
-                req.level
-            )));
-        }
-        if u64::from(rw) * u64::from(rh) > region_cap_pixels {
-            return Err(RasterError::LimitExceeded {
-                width: rw,
-                height: rh,
-                estimated_bytes: u64::from(rw) * u64::from(rh) * 4,
-                limit_bytes: req.budget.region_cap_bytes,
-            });
-        }
-        let (sx0, sy0) = (sx0 as u32, sy0 as u32);
-
-        // Fetch intersecting chunks BEFORE acquiring the region+tile working
-        // lease so chunk singleflight and per-chunk reservations never nest
-        // leases or risk AB-BA deadlock under tight decode budgets.
-        let mut chunks = Vec::new();
-        for cy in sy0 / ch..=(sy0 + rh - 1) / ch {
-            for cx in sx0 / cw..=(sx0 + rw - 1) / cw {
-                if req.cancel.is_cancelled() {
-                    return Err(RasterError::Cancelled);
-                }
-                let chunk = source.chunk(image, cy * across + cx, req.cancel)?;
-                chunks.push((cx * cw, cy * ch, chunk));
-            }
-        }
-
-        let region_bytes = u64::from(rw)
-            .saturating_mul(u64::from(rh))
-            .saturating_mul(4);
-        let tile_bytes = u64::from(tw)
-            .saturating_mul(u64::from(th))
-            .saturating_mul(4);
-        let _work_lease = req
-            .budget_tracker
-            .reserve_blocking(region_bytes.saturating_add(tile_bytes), req.cancel)?;
-
-        let mut region = vec![0u8; (rw as usize) * (rh as usize) * 4];
-        for (chunk_x, chunk_y, chunk) in chunks {
-            let ix0 = sx0.max(chunk_x);
-            let iy0 = sy0.max(chunk_y);
-            let ix1 = (sx0 + rw).min(chunk_x + chunk.width);
-            let iy1 = (sy0 + rh).min(chunk_y + chunk.height);
-            if ix0 >= ix1 || iy0 >= iy1 {
-                continue;
-            }
-            let run = ((ix1 - ix0) as usize) * 4;
-            for y in iy0..iy1 {
-                let src_off = (((y - chunk_y) as usize) * (chunk.width as usize)
-                    + ((ix0 - chunk_x) as usize))
-                    * 4;
-                let dst_off = (((y - sy0) as usize) * (rw as usize) + ((ix0 - sx0) as usize)) * 4;
-                region[dst_off..dst_off + run].copy_from_slice(&chunk.data[src_off..src_off + run]);
-            }
-        }
-
-        let mut tile = resample_rgba8_window(&region, rw, rh, window, tw, th);
-        drop(region);
-        bleed_alpha(&mut tile, tw, th);
-        emit(req.level, tx, ty, tw, th, tile)?;
-    }
-
-    Ok(())
-}
-
-/// Sequential top-to-bottom pass over the base IFD feeding `Cascade`.
-///
-/// Callers must admit/reserve `grid.pass_peak(base)` before invoking `pass`.
-pub(crate) fn pass<S: Chunked>(
-    source: &mut S,
-    grid: &Grid,
-    base: (u32, u32),
-    cancel: &CancelToken,
-    emit: TileEmit<'_>,
-) -> Result<(), RasterError> {
-    let (width, height) = base;
-    let (cw, ch) = grid.chunk;
-    if width == 0 || height == 0 || cw == 0 || ch == 0 {
-        return Err(RasterError::InvalidDimensions { width, height });
-    }
-    let across = width.div_ceil(cw);
-    let down = height.div_ceil(ch);
-
-    let mut cascade = Cascade::new(0, width, height);
-    let mut bled_emit = |lvl: u8,
-                         tx: u32,
-                         ty: u32,
-                         tw: u32,
-                         th: u32,
-                         mut rgba: Vec<u8>|
-     -> Result<(), RasterError> {
-        bleed_alpha(&mut rgba, tw, th);
-        emit(lvl, tx, ty, tw, th, rgba)
-    };
-
-    for cy in 0..down {
-        if cancel.is_cancelled() {
-            return Err(RasterError::Cancelled);
-        }
-        let rows = ch.min(height - cy * ch);
-        let mut band = vec![0u8; (width as usize) * (rows as usize) * 4];
-        for cx in 0..across {
-            if cancel.is_cancelled() {
-                return Err(RasterError::Cancelled);
-            }
-            let chunk = source.chunk(0, cy * across + cx, cancel)?;
-            let copy_w = chunk.width.min(width - cx * cw) as usize;
-            let run = copy_w * 4;
-            for y in 0..chunk.height.min(rows) as usize {
-                let src_row = y * (chunk.width as usize) * 4;
-                let dst_row = (y * (width as usize) + (cx * cw) as usize) * 4;
-                band[dst_row..dst_row + run].copy_from_slice(&chunk.data[src_row..src_row + run]);
-            }
-        }
-        cascade.push_rows(&band, rows, &mut bled_emit)?;
-    }
-    cascade.finish(&mut bled_emit)
 }
 
 #[cfg(test)]
