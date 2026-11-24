@@ -1,4 +1,4 @@
-//! GPU bind-group layouts, `PixelFormat`-partitioned texture bind-group cache,
+//! GPU bind-group layouts, `Weak<GpuTile>`-guarded texture bind-group cache,
 //! samplers, and render pipelines for [`super::GlobeRenderer`] and
 //! [`super::overlay::OverlayRenderer`].
 

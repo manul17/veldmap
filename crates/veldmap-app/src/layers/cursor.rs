@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
-use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileKey};
+use veldmap_core::tile::SourceId;
 use veldmap_raster::{DecodeContext, DecodeJob, DecodeJobKey};
 
 use super::runtime::OverlayRuntime;
@@ -207,17 +207,11 @@ impl CursorProber {
                 probe_key,
                 Arc::clone(&runtime.wakeup),
             );
-            let job_key = DecodeJobKey::Tile(TileKey {
+            let job_key = DecodeJobKey::Probe {
                 source: layer.source_id(),
-                band: BandKey::Display,
-                scheme: layer.meta.scheme(),
-                format: PixelFormat::Rgba8UnormSrgb,
-                gutter: 0,
-                decode_rev: u32::MAX,
-                level: layer.meta.max_level(),
                 x: px,
                 y: py,
-            });
+            };
             let job = DecodeJob {
                 key: job_key,
                 queued_bytes: 4096,

@@ -45,7 +45,7 @@ fn reconcile_cancels_and_clears_satisfied_and_terminal_failures() {
         },
         shutdown.clone(),
     );
-    let uploads = PendingUploads::new();
+    let mut uploads = PendingUploads::new();
     let tx = uploads.sender().expect("sender");
     let provider =
         BundledBasemapProvider::new(pool.handle(), tx, Arc::new(|| {}), shutdown.clone());
@@ -73,6 +73,7 @@ fn reconcile_cancels_and_clears_satisfied_and_terminal_failures() {
     assert_eq!(provider.in_flight_count(), 1);
 
     shutdown.cancel();
+    uploads.close();
     pool.shutdown();
 }
 
@@ -87,12 +88,23 @@ fn evicted_bundled_job_clears_in_flight_via_captured_guard() {
         },
         shutdown.clone(),
     );
-    let uploads = PendingUploads::new();
+    let mut uploads = PendingUploads::new();
     let tx = uploads.sender().expect("sender");
     let provider =
         BundledBasemapProvider::new(pool.handle(), tx, Arc::new(|| {}), shutdown.clone());
 
     // Block the single worker thread so the next queued job sits in `DecodeQueue`.
+    // Guard the release barrier with `Drop` so an assertion failure never hangs
+    // `DecodePool::drop` while joining the blocked worker.
+    struct BarrierReleaseGuard(Option<Arc<Barrier>>);
+    impl Drop for BarrierReleaseGuard {
+        fn drop(&mut self) {
+            if let Some(barrier) = self.0.take() {
+                barrier.wait();
+            }
+        }
+    }
+
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let entered_w = Arc::clone(&entered);
@@ -116,6 +128,7 @@ fn evicted_bundled_job_clears_in_flight_via_captured_guard() {
         }),
     }));
     entered.wait();
+    let release_guard = BarrierReleaseGuard(Some(release));
 
     // Submit a finer non-root bundled job (`level = 3`), then evict it with a
     // coarser job (`level = 0`) filling the 1-slot queue.
@@ -151,8 +164,9 @@ fn evicted_bundled_job_clears_in_flight_via_captured_guard() {
         "evicted bundled job must clean up in_flight on closure drop"
     );
 
-    release.wait();
+    drop(release_guard);
     shutdown.cancel();
+    uploads.close();
     pool.shutdown();
 }
 

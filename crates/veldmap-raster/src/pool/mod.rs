@@ -1,6 +1,6 @@
 //! Generic bounded `std::thread` CPU decode pool with panic isolation,
 //! configurable job-count + byte queue capping, coarsest-first priority
-//! scheduling, deduplication by [`DecodeJobKey`] (`TileKey` or `StreamKey`),
+//! scheduling, deduplication by [`DecodeJobKey`] (`Probe`, `TileKey`, or `StreamKey`),
 //! immediate cancellation checks, outside-mutex drop hygiene, and deterministic
 //! shutdown joining.
 

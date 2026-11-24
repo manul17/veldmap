@@ -1,7 +1,7 @@
 //! Shared overlay runtime handles, RAII flight guards, and the dedicated
 //! off-UI-thread [`OverlayIoWorker`] for non-blocking local file open/reload.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -10,18 +10,17 @@ use std::time::{Duration, Instant};
 
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::geo::Frame;
-use veldmap_core::io::ByteSource;
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{SourceId, TileKey};
 use veldmap_raster::{
-    DecodePoolHandle, PassKey, RasterSource, SharedChunkCache, TiffSource, TileFailureOutcome,
-    TileScheduler, frame_from_description,
+    DecodePoolHandle, PassKey, RasterSource, SharedChunkCache, TileFailureOutcome, TileScheduler,
 };
-use veldmap_storage::{LocalFileSource, LocalFingerprintCache, TileDiskCache};
+use veldmap_storage::{LocalFingerprintCache, TileDiskCache};
 
 use crate::gpu_tiles::UploadSender;
 
 use super::LayerId;
+use super::opener::open_local_raster;
 
 /// Backoff window applied when a decode lane queue is saturated (`SubmitError::Full`)
 /// so the UI retries cleanly without spinning at 100% CPU.
@@ -297,7 +296,13 @@ impl OverlayIoWorker {
                             if cancel.is_cancelled() {
                                 continue;
                             }
-                            let outcome = open_source_and_frame(&runtime, &path, false, &cancel);
+                            let outcome = open_local_raster(
+                                &path,
+                                &runtime.fingerprint_cache,
+                                &runtime.budget,
+                                false,
+                                &cancel,
+                            );
                             if cancel.is_cancelled() {
                                 continue;
                             }
@@ -319,7 +324,13 @@ impl OverlayIoWorker {
                                 continue;
                             }
                             runtime.fingerprint_cache.invalidate(&path);
-                            let outcome = open_source_and_frame(&runtime, &path, true, &cancel);
+                            let outcome = open_local_raster(
+                                &path,
+                                &runtime.fingerprint_cache,
+                                &runtime.budget,
+                                true,
+                                &cancel,
+                            );
                             if cancel.is_cancelled() {
                                 continue;
                             }
@@ -384,25 +395,4 @@ impl Drop for OverlayIoWorker {
     fn drop(&mut self) {
         self.join();
     }
-}
-
-pub(super) fn open_source_and_frame(
-    runtime: &OverlayRuntime,
-    path: &Path,
-    bypass_cache: bool,
-    cancel: &CancelToken,
-) -> Result<(Arc<dyn RasterSource>, Frame), String> {
-    let fingerprint = runtime
-        .fingerprint_cache
-        .get_or_compute_with_bypass(path, bypass_cache, cancel)
-        .map_err(|e| format!("failed to fingerprint '{}': {e}", path.display()))?;
-    let file_source: Arc<dyn ByteSource> = Arc::new(
-        LocalFileSource::open(path)
-            .map_err(|e| format!("failed to open '{}': {e}", path.display()))?,
-    );
-    let tiff = TiffSource::open(file_source, fingerprint, &runtime.budget, cancel)
-        .map_err(|e| format!("failed to read GeoTIFF '{}': {e}", path.display()))?;
-    let frame = frame_from_description(tiff.description())
-        .map_err(|e| format!("'{}': {e}", path.display()))?;
-    Ok((Arc::new(tiff), frame))
 }

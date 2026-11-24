@@ -26,7 +26,7 @@ pub struct GlobeRenderer {
     meshes: TileMeshCache,
     /// Extracted post-body warp-mesh overlay renderer.
     overlay: OverlayRenderer,
-    /// `PixelFormat`-partitioned `BindGroup` caches guarded by `Weak<GpuTile>`.
+    /// `Weak<GpuTile>`-guarded texture `BindGroup` cache (`Rgba8UnormSrgb`).
     tile_bind_groups: TileBindGroupCache,
     /// Per-frame dynamic uniform byte offsets for `snapshot.tiles`.
     tile_uniform_offsets: Vec<u32>,
@@ -67,8 +67,7 @@ impl GlobeRenderer {
         self.tile_bind_groups.sweep_stale();
     }
 
-    /// Number of currently cached tile texture bind groups across all
-    /// `PixelFormat` partitions.
+    /// Number of currently cached tile texture bind groups.
     pub fn cached_tile_bind_group_count(&self) -> usize {
         self.tile_bind_groups.len()
     }

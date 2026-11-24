@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use super::footprint::{self, FootprintBounds};
 use super::geodesy;
-use super::projection::Projection;
+use super::projection::{self, Projection};
 
 /// Tolerance for clustering tie-point raster fractions onto shared grid lines.
 const SAME_LINE: f64 = 1e-6;
@@ -69,7 +69,11 @@ impl TieGrid {
     pub fn new(ties: &[Tie]) -> Option<Self> {
         if ties.len() < 4
             || ties.iter().any(|t| {
-                !(t.fx.is_finite() && t.fy.is_finite() && t.lat.is_finite() && t.lon.is_finite())
+                !(t.fx.is_finite()
+                    && t.fy.is_finite()
+                    && t.lat.is_finite()
+                    && t.lon.is_finite()
+                    && (-90.0..=90.0).contains(&t.lat))
             })
         {
             return None;
@@ -175,8 +179,10 @@ impl TieGrid {
 
     fn compute_widest_row(&self) -> f64 {
         let across = self.xs.len();
+        let rows = self.ys.len();
         let width = (self.xs[across - 1] - self.xs[0]).max(f64::EPSILON);
-        self.nodes
+        let mut widest = self
+            .nodes
             .chunks_exact(across)
             .map(|row| {
                 row.windows(2)
@@ -184,7 +190,24 @@ impl TieGrid {
                     .sum::<f64>()
                     / width
             })
-            .fold(0.0, f64::max)
+            .fold(0.0, f64::max);
+
+        // Also sample midpoints between consecutive tie rows so 2-row
+        // pole-to-pole grids (`lat = ±90°`) measure their interior width
+        // instead of degenerate `cos(±90°)` polar rows.
+        for row in 1..rows {
+            let prev = &self.nodes[(row - 1) * across..row * across];
+            let curr = &self.nodes[row * across..(row + 1) * across];
+            let mut mid_span = 0.0;
+            for col in 0..across - 1 {
+                let left = lerp_pair(prev[col], curr[col], 0.5);
+                let right = lerp_pair(prev[col + 1], curr[col + 1], 0.5);
+                mid_span += unwound_span_m(left, right);
+            }
+            widest = widest.max(mid_span / width);
+        }
+
+        widest
     }
 
     fn compute_widest_column(&self) -> f64 {
@@ -223,6 +246,10 @@ impl TieGrid {
 
     /// Interpolate geodetic `(lat_deg, lon_deg)` for normalized raster fraction
     /// `(fx, fy)`.
+    ///
+    /// Output latitude is clamped to `[-90°, +90°]` so outer half-pixel
+    /// extrapolation on pole-touching `PixelIsPoint` lattices cannot fold over
+    /// the poles while leaving every interior sample untouched.
     pub fn geodetic(&self, fx: f64, fy: f64) -> (f64, f64) {
         let (col, tx) = axis_cell(&self.xs, fx);
         let (row, ty) = axis_cell(&self.ys, fy);
@@ -230,7 +257,8 @@ impl TieGrid {
         let node = |r: usize, c: usize| self.nodes[r * across + c];
         let top = lerp_pair(node(row, col), node(row, col + 1), tx);
         let bottom = lerp_pair(node(row + 1, col), node(row + 1, col + 1), tx);
-        lerp_pair(top, bottom, ty)
+        let (lat, lon) = lerp_pair(top, bottom, ty);
+        (lat.clamp(-90.0, 90.0), lon)
     }
 
     /// Invert geodetic `(lat_deg, lon_deg)` back into normalized raster
@@ -560,7 +588,12 @@ impl Frame {
         }
         match &self.kind {
             FrameKind::Projected { system, affine } => {
-                let (x_base, y) = system.from_geodetic(lat_deg, lon_deg);
+                let (x_base, y) = match system {
+                    Projection::WebMercator => {
+                        projection::web_mercator_from_geodetic_strict(lat_deg, lon_deg)?
+                    }
+                    Projection::Transverse(tm) => tm.from_geodetic(lat_deg, lon_deg),
+                };
                 if !(x_base.is_finite() && y.is_finite()) {
                     return None;
                 }

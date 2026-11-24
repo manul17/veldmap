@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "veldmap"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 bytemuck.workspace = true

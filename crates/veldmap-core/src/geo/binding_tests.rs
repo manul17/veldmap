@@ -162,4 +162,109 @@ fn invalid_epsg_and_degenerate_frames_return_typed_errors() {
         Frame::quad([(10.0, 0.0), (10.0, 5.0), (10.0, 5.0), (10.0, 0.0)]).is_none(),
         "zero-height quad must be rejected"
     );
+    assert!(
+        TieGrid::new(&[
+            Tie {
+                fx: 0.0,
+                fy: 0.0,
+                lat: 95.0,
+                lon: 0.0,
+            },
+            Tie {
+                fx: 1.0,
+                fy: 0.0,
+                lat: 95.0,
+                lon: 10.0,
+            },
+            Tie {
+                fx: 0.0,
+                fy: 1.0,
+                lat: 85.0,
+                lon: 0.0,
+            },
+            Tie {
+                fx: 1.0,
+                fy: 1.0,
+                lat: 85.0,
+                lon: 10.0,
+            },
+        ])
+        .is_none(),
+        "out-of-range latitude ties must be rejected"
+    );
+}
+
+#[test]
+fn web_mercator_fraction_at_rejects_polar_caps() {
+    let (x0, y1) = Projection::WebMercator.from_geodetic(85.05112878, -180.0);
+    let (x1, y0) = Projection::WebMercator.from_geodetic(-85.05112878, 180.0);
+    let global_wm =
+        Frame::projected_bounds(Projection::WebMercator, x0, y0, x1, y1).expect("global 3857");
+
+    // Interior points stay valid.
+    assert!(global_wm.fraction_at(0.0, 0.0).is_some());
+    assert!(global_wm.fraction_at(85.0, 10.0).is_some());
+    assert!(global_wm.fraction_at(-85.0, -10.0).is_some());
+
+    // Polar caps beyond the Web Mercator extent must never produce phantom hits.
+    for lat in [85.1, 88.0, 89.9, 90.0, -85.1, -88.0, -90.0] {
+        assert!(
+            global_wm.fraction_at(lat, 0.0).is_none(),
+            "expected no WebMercator hit at lat={lat}"
+        );
+    }
+}
+
+#[test]
+fn pole_touching_pixel_is_point_tie_grid_is_measurable_and_clamps_outer_half_pixel() {
+    // 3601x1801 global PixelIsPoint lattice with pixel centers at ±90 deg and ±180 deg.
+    let (w, h) = (3601.0_f64, 1801.0_f64);
+    let (fx0, fx1) = (0.5 / w, (w - 0.5) / w);
+    let (fy0, fy1) = (0.5 / h, (h - 0.5) / h);
+    let ties = [
+        Tie {
+            fx: fx0,
+            fy: fy0,
+            lat: 90.0,
+            lon: -180.0,
+        },
+        Tie {
+            fx: fx1,
+            fy: fy0,
+            lat: 90.0,
+            lon: 180.0,
+        },
+        Tie {
+            fx: fx0,
+            fy: fy1,
+            lat: -90.0,
+            lon: -180.0,
+        },
+        Tie {
+            fx: fx1,
+            fy: fy1,
+            lat: -90.0,
+            lon: 180.0,
+        },
+    ];
+    let grid = TieGrid::new(&ties).expect("pole-touching PixelIsPoint grid");
+    assert!(
+        grid.widest_spans_m().0 > 39_000_000.0,
+        "midpoint row check should measure equatorial width, got {}",
+        grid.widest_spans_m().0
+    );
+    let frame = Frame::from_grid(grid);
+    assert!(frame.measurable());
+
+    // Outer extrapolated corners clamp cleanly to ±90 deg instead of folding over the pole.
+    assert_eq!(frame.geodetic(0.0, 0.0).0, 90.0);
+    assert_eq!(frame.geodetic(1.0, 1.0).0, -90.0);
+
+    // Every pixel center retains exact 0.0 deg placement error.
+    let (lat_top, lon_left) = frame.geodetic(0.5 / w, 0.5 / h);
+    assert!((lat_top - 90.0).abs() < 1e-12);
+    assert!((lon_left - -180.0).abs() < 1e-12);
+    let (lat_mid, lon_mid) = frame.geodetic(1800.5 / w, 900.5 / h);
+    assert!(lat_mid.abs() < 1e-12);
+    assert!(lon_mid.abs() < 1e-12);
 }

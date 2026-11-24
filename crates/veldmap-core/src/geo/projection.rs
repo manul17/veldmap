@@ -202,6 +202,22 @@ impl Projection {
     }
 }
 
+/// Unclamped EPSG:3857 forward projection for exact raster inverse hits.
+///
+/// Unlike [`Projection::from_geodetic`], this never clamps polar latitudes onto
+/// `±WEB_MERCATOR_LIMIT_DEG`, preventing phantom cursor hits over polar caps
+/// while remaining an exact inverse of [`Projection::to_geodetic`] across
+/// `(-90°, +90°)`.
+pub(crate) fn web_mercator_from_geodetic_strict(lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
+    if !(lat_deg.is_finite() && lon_deg.is_finite()) || lat_deg.abs() >= 90.0 {
+        return None;
+    }
+    let phi = lat_deg.to_radians();
+    let x = WEB_MERCATOR_RADIUS_M * lon_deg.to_radians();
+    let y = WEB_MERCATOR_RADIUS_M * (std::f64::consts::FRAC_PI_4 + phi / 2.0).tan().ln();
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
 /// Transverse cylindrical projection parameters.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct System {

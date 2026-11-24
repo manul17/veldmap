@@ -19,8 +19,9 @@ use crate::RasterError;
 use crate::pipeline::DecodeContext;
 use crate::pipeline::chunk_cache::SharedChunkCache;
 use crate::pipeline::grid::Grid;
-use crate::pipeline::metadata::{GeoKeyParams, GeoRasterType, SampleType};
+use crate::pipeline::metadata::{GeoKeyParams, GeoRasterType, RasterDescription, SampleType};
 use crate::pipeline::plan::{self, ServeMode};
+use crate::pipeline::source::frame_from_description;
 
 fn tiny_u16_tiff_bytes() -> Vec<u8> {
     let mut file = Cursor::new(Vec::new());
@@ -343,4 +344,102 @@ fn georef_tag_limits_and_table_helpers_work_consistently() {
     let tbl = plan::build_chunked_level_table(&grid, 8192, 8192, &tiny_budget);
     assert!(!tbl.is_empty());
     assert!(matches!(tbl[0].serve, ServeMode::Pass { from: 0 }));
+}
+
+#[test]
+fn wide_and_global_pixel_is_point_geographic_geotiffs_bind_without_wrapping_or_rejection() {
+    let make_desc = |width: u32, height: u32, ties: Vec<_>| RasterDescription {
+        width,
+        height,
+        bands: Vec::new(),
+        placement: None,
+        ties,
+        foreign_datum_epsg: None,
+        binding_trouble: None,
+        levels: Vec::new(),
+    };
+
+    // 1. Wide 240-deg affine geographic raster `[-120, +120]` must not wrap backwards.
+    let area_geo = GeoKeyParams {
+        model_type: Some(2),
+        raster_type: GeoRasterType::PixelIsArea,
+        ..Default::default()
+    };
+    let wide_ties = geo_ties(
+        &area_geo,
+        &[0.0, 0.0, 0.0, -120.0, 60.0, 0.0],
+        &[1.0, 1.0, 0.0],
+        &[],
+        240,
+        120,
+    );
+    assert!(wide_ties.len() > 4, "wide span should subdivide longitude");
+    let wide_frame = frame_from_description(&make_desc(240, 120, wide_ties))
+        .expect("wide geographic frame should bind");
+    assert!(wide_frame.axial());
+    let (lat_c, lon_c) = wide_frame.geodetic(0.5, 0.5);
+    assert!(
+        lat_c.abs() < 1e-9 && lon_c.abs() < 1e-9,
+        "got ({lat_c}, {lon_c})"
+    );
+    let (fx, fy) = wide_frame.fraction_at(0.0, 0.0).expect("center hit");
+    assert!((fx - 0.5).abs() < 1e-9 && (fy - 0.5).abs() < 1e-9);
+    assert!(
+        wide_frame.fraction_at(0.0, 170.0).is_none(),
+        "Pacific gap outside [-120, +120] must not hit"
+    );
+
+    // 2. Rotated wide raster where longitude spans 240 deg along image Y.
+    let rot_matrix = [
+        0.0, 1.0, 0.0, -120.0, // lon = py - 120
+        -1.0, 0.0, 0.0, 60.0, // lat = 60 - px
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    let rot_ties = geo_ties(&area_geo, &[], &[], &rot_matrix, 120, 240);
+    let rot_frame = frame_from_description(&make_desc(120, 240, rot_ties))
+        .expect("rotated wide geographic frame should bind");
+    let (rlat, rlon) = rot_frame.geodetic(0.5, 0.5);
+    assert!(
+        rlat.abs() < 1e-9 && rlon.abs() < 1e-9,
+        "got ({rlat}, {rlon})"
+    );
+
+    // 3. Global 3601x1801 PixelIsPoint rasters in both [-180, 180] and [0, 360].
+    let point_geo = GeoKeyParams {
+        model_type: Some(2),
+        raster_type: GeoRasterType::PixelIsPoint,
+        ..Default::default()
+    };
+    for (lon0, expected_center_lon) in [(-180.0_f64, 0.0_f64), (0.0_f64, 180.0_f64)] {
+        let ties = geo_ties(
+            &point_geo,
+            &[0.0, 0.0, 0.0, lon0, 90.0, 0.0],
+            &[0.1, 0.1, 0.0],
+            &[],
+            3601,
+            1801,
+        );
+        assert!(
+            !ties.is_empty(),
+            "global PixelIsPoint ties must be accepted"
+        );
+        let frame = frame_from_description(&make_desc(3601, 1801, ties))
+            .expect("global PixelIsPoint frame should bind");
+        assert!(frame.measurable());
+
+        // Exact pixel centers: (0, 0) -> (90, lon0), (3600, 1800) -> (-90, lon0 + 360).
+        let (lat0, lon_start) = frame.geodetic(0.5 / 3601.0, 0.5 / 1801.0);
+        assert!((lat0 - 90.0).abs() < 1e-12);
+        assert!((lon_start - lon0).abs() < 1e-12);
+        let (lat1, lon_end) = frame.geodetic(3600.5 / 3601.0, 1800.5 / 1801.0);
+        assert!((lat1 - -90.0).abs() < 1e-12);
+        assert!((lon_end - (lon0 + 360.0)).abs() < 1e-12);
+        let (mid_lat, mid_lon) = frame.geodetic(1800.5 / 3601.0, 900.5 / 1801.0);
+        assert!(mid_lat.abs() < 1e-12);
+        assert!((mid_lon - expected_center_lon).abs() < 1e-12);
+
+        // Outer half-pixel edges clamp to ±90 deg.
+        assert_eq!(frame.geodetic(0.0, 0.0).0, 90.0);
+        assert_eq!(frame.geodetic(1.0, 1.0).0, -90.0);
+    }
 }

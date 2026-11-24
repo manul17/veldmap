@@ -303,18 +303,74 @@ pub(super) fn geo_ties(
 
     if let Some(a) = affine_from_tags(points, scale, matrix, half) {
         let (right, bottom) = (f64::from(width), f64::from(height));
-        let place = |px: f64, py: f64| GeoTie {
-            px,
-            py,
-            lon: a[0] * px + a[1] * py + a[2],
-            lat: a[3] * px + a[4] * py + a[5],
+        // For `PixelIsPoint`, sample ties at the outer pixel centers (matching
+        // the explicit multi-tiepoint branch) so pole-touching global rasters
+        // (`lat = ±90°`) and `[0°, 360°]` rasters stay within valid geodetic
+        // bounds while `TieGrid` linearly extrapolates outer half-pixel edges.
+        let (px0, px1) = if half > 0.0 && width > 1 {
+            (half, right - half)
+        } else {
+            (0.0, right)
         };
-        return finite_ties(vec![
-            place(0.0, 0.0),
-            place(right, 0.0),
-            place(0.0, bottom),
-            place(right, bottom),
-        ]);
+        let (py0, py1) = if half > 0.0 && height > 1 {
+            (half, bottom - half)
+        } else {
+            (0.0, bottom)
+        };
+
+        let dlon_x = (a[0] * (px1 - px0)).abs();
+        let dlon_y = (a[1] * (py1 - py0)).abs();
+        // Guard against corrupt TIFFs before subdividing; valid longitudes are
+        // within `[-360°, +360°]` (`span <= 720°`).
+        if !dlon_x.is_finite() || !dlon_y.is_finite() || dlon_x > 720.0 || dlon_y > 720.0 {
+            return Vec::new();
+        }
+        // Subdivide any axis whose longitude span exceeds `170°` so adjacent
+        // lattice samples stay `< 180°` apart and `TieGrid::unwind` never wraps
+        // wide (`180° < Δlon < 359°`) geographic rasters backwards.
+        let x_steps = if dlon_x > 170.0 {
+            (dlon_x / 90.0).ceil().max(2.0) as usize
+        } else {
+            1
+        };
+        let y_steps = if dlon_y > 170.0 {
+            (dlon_y / 90.0).ceil().max(2.0) as usize
+        } else {
+            1
+        };
+
+        // Snap tiny IEEE-754 rounding noise near ±90° / ±360° without masking
+        // genuine out-of-range coordinates (e.g. UTM metres mis-tagged as geo).
+        let snap_bound = |v: f64, limit: f64| {
+            const EPS_DEG: f64 = 1e-6;
+            if v > limit && v <= limit + EPS_DEG {
+                limit
+            } else if v < -limit && v >= -limit - EPS_DEG {
+                -limit
+            } else {
+                v
+            }
+        };
+
+        let mut ties = Vec::with_capacity((x_steps + 1) * (y_steps + 1));
+        for iy in 0..=y_steps {
+            let py = if iy == y_steps {
+                py1
+            } else {
+                py0 + (py1 - py0) * (iy as f64 / y_steps as f64)
+            };
+            for ix in 0..=x_steps {
+                let px = if ix == x_steps {
+                    px1
+                } else {
+                    px0 + (px1 - px0) * (ix as f64 / x_steps as f64)
+                };
+                let lon = snap_bound(a[0] * px + a[1] * py + a[2], 360.0);
+                let lat = snap_bound(a[3] * px + a[4] * py + a[5], 90.0);
+                ties.push(GeoTie { px, py, lon, lat });
+            }
+        }
+        return finite_ties(ties);
     }
 
     Vec::new()

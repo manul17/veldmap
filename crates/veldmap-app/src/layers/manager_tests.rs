@@ -14,18 +14,7 @@ use veldmap_storage::TileDiskCache;
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 use crate::layers::{CursorReadoutValue, OverlayIoEvent, OverlayManager};
-
-fn temp_test_dir(label: &str) -> std::path::PathBuf {
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "veldmap-app-layers-{label}-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
+use crate::test_support::TempTestRoot;
 
 /// Write a real multi-level tiled GeoTIFF COG (`width x height`, 512x512 tiles,
 /// `EPSG:32637`) to `path` filled with `rgb`.
@@ -111,12 +100,12 @@ fn wait_for_io_event(mgr: &mut OverlayManager) -> OverlayIoEvent {
 #[test]
 fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_async_open_reload_and_cursor()
  {
-    let dir = temp_test_dir("cog-lifecycle");
-    let tif_path = dir.join("scene_2048.tif");
+    let dir = TempTestRoot::new("cog-lifecycle");
+    let tif_path = dir.path().join("scene_2048.tif");
     write_tiled_geotiff_cog(&tif_path, 2048, 2048, [42, 128, 210]);
 
     let disk_cache = Arc::new(
-        TileDiskCache::open(dir.join("tiles.sqlite"), 32 * 1024 * 1024).expect("disk cache"),
+        TileDiskCache::open(dir.path().join("tiles.sqlite"), 32 * 1024 * 1024).expect("disk cache"),
     );
     let budget = MemoryBudget::default();
     let shutdown = CancelToken::new();
@@ -153,9 +142,9 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     };
     assert_eq!(mgr.layer_summaries().len(), 1);
 
-    // 2. Regression for P0 #1: zoomed into target_level=0 on a max_level=2 COG,
-    //    `layer.wanted` MUST contain intermediate rung 1 (not just 2 and 0) so
-    //    `PendingUploads` never prunes intermediate progressive refinement tiles.
+    // 2. Zoomed into target_level=0 on a max_level=2 COG, `layer.wanted` MUST
+    //    contain intermediate rung 1 (not just 2 and 0) so `PendingUploads`
+    //    never prunes intermediate progressive refinement tiles.
     let mut gpu_cache = GpuTileCache::new(budget.gpu_tile_cache_bytes);
     let cam = Camera::at(bounds.lat, bounds.lon, 3_000.0);
     let mut carriers = std::collections::HashSet::new();
@@ -270,6 +259,4 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     pending.close();
     pool.shutdown();
     mgr.finish_shutdown();
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -5,6 +5,7 @@
 mod cursor;
 mod jobs;
 mod manager;
+mod opener;
 mod runtime;
 mod stack;
 

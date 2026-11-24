@@ -397,3 +397,97 @@ fn decodes_valid_tiles_isolates_panics_and_drops_cancelled_outside_lock() {
 
     pool.shutdown();
 }
+
+#[test]
+fn probe_job_key_deduplicates_prioritizes_ahead_of_tiles_and_respects_root_rank() {
+    let mut queue = DecodeQueue::new(2, 1024);
+    let mut to_drop = Vec::new();
+    let cancel = CancelToken::new();
+    let probe_a = DecodeJobKey::Probe {
+        source: SourceId::new(7),
+        x: 10,
+        y: 20,
+    };
+    let probe_b = DecodeJobKey::Probe {
+        source: SourceId::new(7),
+        x: 11,
+        y: 20,
+    };
+
+    // Enqueue a fine tile (rank 4) and a root tile (rank 0).
+    let root = tile_key(0, 0, 0);
+    let fine = tile_key(4, 1, 1);
+    queue
+        .admit_job(
+            DecodeJob {
+                key: root,
+                queued_bytes: 16,
+                cancel: cancel.clone(),
+                work: Box::new(|| {}),
+            },
+            &mut to_drop,
+        )
+        .expect("admit root");
+    queue
+        .admit_job(
+            DecodeJob {
+                key: fine,
+                queued_bytes: 16,
+                cancel: cancel.clone(),
+                work: Box::new(|| {}),
+            },
+            &mut to_drop,
+        )
+        .expect("admit fine");
+    assert!(to_drop.is_empty());
+
+    // Probe (rank 0) evicts the fine tile, keeping the root tile.
+    queue
+        .admit_job(
+            DecodeJob {
+                key: probe_a,
+                queued_bytes: 16,
+                cancel: cancel.clone(),
+                work: Box::new(|| {}),
+            },
+            &mut to_drop,
+        )
+        .expect("probe should evict fine tile");
+    assert_eq!(to_drop.len(), 1);
+    assert_eq!(to_drop[0].key, fine);
+    to_drop.clear();
+
+    // Duplicate probe is rejected cleanly.
+    assert!(matches!(
+        queue.admit_job(
+            DecodeJob {
+                key: probe_a,
+                queued_bytes: 16,
+                cancel: cancel.clone(),
+                work: Box::new(|| {}),
+            },
+            &mut to_drop,
+        ),
+        Err(SubmitError::Duplicate(_))
+    ));
+
+    // A second probe cannot evict either the existing probe or the root tile (both rank 0).
+    assert!(matches!(
+        queue.admit_job(
+            DecodeJob {
+                key: probe_b,
+                queued_bytes: 16,
+                cancel: cancel.clone(),
+                work: Box::new(|| {}),
+            },
+            &mut to_drop,
+        ),
+        Err(SubmitError::Full(_))
+    ));
+
+    // Probe pops ahead of Tile in priority order.
+    let (first, _) = queue.pop_coarsest_or_drain_cancelled();
+    assert_eq!(first.expect("pop first").key, probe_a);
+    let (second, _) = queue.pop_coarsest_or_drain_cancelled();
+    assert_eq!(second.expect("pop second").key, root);
+}

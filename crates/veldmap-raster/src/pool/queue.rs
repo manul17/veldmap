@@ -2,12 +2,14 @@
 //! [`super::DecodePool`].
 
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{StreamKey, TileKey};
+use veldmap_core::tile::{SourceId, StreamKey, TileKey};
 
 /// Deduplication and scheduling identity for a [`DecodeJob`], cleanly
-/// distinguishing single-tile fast jobs from `StreamKey`-scoped bulk cascade jobs.
+/// distinguishing interactive cursor probes, single-tile fast jobs, and
+/// `StreamKey`-scoped bulk cascade jobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodeJobKey {
+    Probe { source: SourceId, x: u32, y: u32 },
     Tile(TileKey),
     Pass(StreamKey),
 }
@@ -29,13 +31,32 @@ pub(super) struct DecodeJobPriority(DecodeJobKey);
 
 impl Ord for DecodeJobPriority {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
         match (self.0, other.0) {
+            (
+                DecodeJobKey::Probe {
+                    source: s1,
+                    x: x1,
+                    y: y1,
+                },
+                DecodeJobKey::Probe {
+                    source: s2,
+                    x: x2,
+                    y: y2,
+                },
+            ) => (s1, x1, y1).cmp(&(s2, x2, y2)),
+            (DecodeJobKey::Probe { .. }, DecodeJobKey::Tile(_) | DecodeJobKey::Pass(_)) => {
+                Ordering::Less
+            }
+            (DecodeJobKey::Tile(_) | DecodeJobKey::Pass(_), DecodeJobKey::Probe { .. }) => {
+                Ordering::Greater
+            }
             (DecodeJobKey::Tile(a), DecodeJobKey::Tile(b)) => {
                 a.coarsest_first_key().cmp(&b.coarsest_first_key())
             }
             (DecodeJobKey::Pass(a), DecodeJobKey::Pass(b)) => a.cmp(&b),
-            (DecodeJobKey::Tile(_), DecodeJobKey::Pass(_)) => std::cmp::Ordering::Less,
-            (DecodeJobKey::Pass(_), DecodeJobKey::Tile(_)) => std::cmp::Ordering::Greater,
+            (DecodeJobKey::Tile(_), DecodeJobKey::Pass(_)) => Ordering::Less,
+            (DecodeJobKey::Pass(_), DecodeJobKey::Tile(_)) => Ordering::Greater,
         }
     }
 }
@@ -47,12 +68,12 @@ impl PartialOrd for DecodeJobPriority {
 }
 
 impl DecodeJobKey {
-    /// Coarseness rank (smaller = higher priority). Pass jobs run at equal
-    /// rank `0` and never evict one another.
+    /// Coarseness rank (smaller = higher priority). Pass and Probe jobs run at
+    /// equal rank `0` and never evict one another or root tiles.
     pub(super) const fn coarseness_rank(self) -> u8 {
         match self {
             Self::Tile(key) => key.scheme.coarseness_rank(key.level),
-            Self::Pass(_) => 0,
+            Self::Pass(_) | Self::Probe { .. } => 0,
         }
     }
 
