@@ -1,8 +1,8 @@
 //! Chord and quad sagitta helpers for curved WGS84 surface meshes.
 //!
 //! Used for geodesic footprint densification, planetary quadtree subdivision,
-//! and upcoming warp-mesh subdivision to bound how far flat chords dip below
-//! the curved ellipsoid.
+//! and overlay warp-mesh culling/subdivision to bound how far flat chords dip
+//! below the curved ellipsoid.
 
 use super::geodesy::SEMI_MAJOR_M;
 

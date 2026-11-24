@@ -14,7 +14,7 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::sync::{CancelGuard, CancelToken, lock_unpoisoned, wait_unpoisoned};
 
 use queue::DecodeQueue;
-pub use queue::{DecodeJob, DecodeJobKey};
+pub use queue::{DecodeJob, DecodeJobKey, SubmitError};
 
 /// Default maximum queued decode jobs awaiting a CPU worker.
 const DEFAULT_MAX_PENDING_DECODE_JOBS: usize = 128;
@@ -64,28 +64,35 @@ pub struct DecodePoolHandle {
 }
 
 impl DecodePoolHandle {
-    /// Enqueue a CPU decode job. Prunes cancelled jobs, deduplicates by
-    /// [`DecodeJobKey`], and enforces both `max_pending_jobs` and
-    /// `max_pending_bytes` caps while always dropping evicted or rejected
-    /// `DecodeJob`s OUTSIDE `DecodeQueue`'s mutex to avoid lock-order deadlocks
-    /// with caller drop guards.
-    pub fn submit(&self, job: DecodeJob) -> bool {
+    /// Enqueue a CPU decode job, returning `Err(SubmitError)` with ownership of
+    /// the rejected job so callers can clean up scheduler/flight state before
+    /// dropping it.
+    ///
+    /// Always drops evicted/cancelled queued jobs OUTSIDE `DecodeQueue`'s mutex
+    /// to avoid lock-order deadlocks with caller drop guards.
+    pub fn try_submit(&self, job: DecodeJob) -> Result<(), SubmitError> {
         if job.cancel.is_cancelled() {
-            return false;
+            return Err(SubmitError::Cancelled(job));
         }
         let mut to_drop = Vec::new();
-        let accepted = {
+        let result = {
             let (lock, cvar) = &*self.shared;
             let mut queue = lock_unpoisoned(lock);
-            let admitted = queue.admit_job(job, &mut to_drop);
-            if admitted {
+            let res = queue.admit_job(job, &mut to_drop);
+            if res.is_ok() {
                 cvar.notify_one();
             }
-            admitted
+            res
         };
-        // Drop evicted/cancelled/rejected jobs AFTER releasing `DecodeQueue`'s lock.
+        // Drop evicted/cancelled jobs AFTER releasing `DecodeQueue`'s lock.
         drop(to_drop);
-        accepted
+        result
+    }
+
+    /// Enqueue a CPU decode job. Convenience wrapper over [`Self::try_submit`]
+    /// returning `true` if admitted and dropping rejected jobs outside the lock.
+    pub fn submit(&self, job: DecodeJob) -> bool {
+        self.try_submit(job).is_ok()
     }
 }
 

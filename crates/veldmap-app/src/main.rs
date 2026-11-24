@@ -36,10 +36,26 @@ fn main() -> eframe::Result<()> {
         );
     }
 
-    let startup_files: Vec<std::path::PathBuf> = std::env::args_os()
-        .skip(1)
-        .map(std::path::PathBuf::from)
-        .collect();
+    let mut startup_files = Vec::new();
+    let mut positional_only = false;
+    for arg in std::env::args_os().skip(1) {
+        if !positional_only && let Some(flag) = arg.to_str() {
+            if flag == "--" {
+                positional_only = true;
+                continue;
+            }
+            if flag == "-h" || flag == "--help" {
+                println!("Usage: veldmap [OPTIONS] [GEOTIFF_OR_COG_PATH...]");
+                return Ok(());
+            }
+            // Skip unknown flags and macOS Finder launch arguments (`-psn_*`).
+            if flag.starts_with('-') {
+                tracing::warn!(flag, "Ignoring unrecognized CLI flag");
+                continue;
+            }
+        }
+        startup_files.push(std::path::PathBuf::from(arg));
+    }
 
     eframe::run_native(
         veldmap_core::APP_NAME,

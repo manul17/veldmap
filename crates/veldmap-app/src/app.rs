@@ -8,10 +8,12 @@ use eframe::egui;
 use eframe::egui_wgpu;
 use thiserror::Error;
 use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
+use veldmap_core::geo::footprint::FootprintBounds;
 use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
 use crate::gpu_tiles::UploadChannelClosed;
+use crate::layers::OverlayIoEvent;
 use crate::render::GlobeRenderer;
 use crate::scene::SceneState;
 use crate::storage::AppStorage;
@@ -150,30 +152,59 @@ impl VeldmapApp {
         };
 
         for path in startup_files {
-            app.open_overlay_path(&path, true);
+            app.queue_open_overlay_path(&path, true);
         }
 
         Ok(app)
     }
 
-    fn open_overlay_path(&mut self, path: &Path, fly_to: bool) -> bool {
-        match self.scene.open_overlay_file(path) {
-            Ok((_id, bounds)) => {
-                self.layers_ui.open = true;
-                self.layers_ui.clear_error();
-                self.layers_ui.path_input.clear();
-                self.layers_ui.open_prompt_visible = false;
-                if fly_to && let Some(b) = bounds {
-                    self.camera.focus(b.lat, b.lon, b.radius_deg.max(0.000_2));
+    fn focus_footprint(&mut self, bounds: FootprintBounds) {
+        self.camera
+            .focus(bounds.lat, bounds.lon, bounds.radius_deg.max(0.000_2));
+    }
+
+    fn queue_open_overlay_path(&mut self, path: &Path, fly_to: bool) -> bool {
+        if let Err(err) = self.scene.begin_open_overlay_file(path, fly_to) {
+            tracing::warn!(path = %path.display(), error = %err, "Failed to queue overlay open");
+            self.layers_ui.push_error(err);
+        }
+        true
+    }
+
+    fn drain_overlay_io_events(&mut self) -> bool {
+        let events = self.scene.poll_overlay_io_events();
+        if events.is_empty() {
+            return false;
+        }
+        let mut had_error = false;
+        let mut had_open = false;
+        for event in events {
+            match event {
+                OverlayIoEvent::Opened { id, bounds, fly_to } => {
+                    tracing::info!(?id, "Opened local overlay layer");
+                    self.layers_ui.open = true;
+                    self.layers_ui.path_input.clear();
+                    self.layers_ui.open_prompt_visible = false;
+                    had_open = true;
+                    if fly_to && let Some(b) = bounds {
+                        self.focus_footprint(b);
+                    }
                 }
-                true
-            }
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "Failed to open overlay file");
-                self.layers_ui.set_error(err);
-                true
+                OverlayIoEvent::Reloaded { id } => {
+                    tracing::info!(?id, "Reloaded local overlay layer");
+                    self.layers_ui.clear_error();
+                }
+                OverlayIoEvent::Failed { path, error } => {
+                    tracing::warn!(path = %path.display(), error = %error, "Overlay I/O failed");
+                    self.layers_ui.push_error(error);
+                    had_error = true;
+                }
             }
         }
+        if had_open && !had_error {
+            self.layers_ui.clear_error();
+        }
+        true
     }
 
     fn apply_layer_actions(&mut self, actions: Vec<LayerUiAction>) -> bool {
@@ -181,7 +212,8 @@ impl VeldmapApp {
         for action in actions {
             match action {
                 LayerUiAction::OpenPath(path) => {
-                    needs_repaint |= self.open_overlay_path(&path, true);
+                    self.layers_ui.clear_error();
+                    needs_repaint |= self.queue_open_overlay_path(&path, true);
                 }
                 LayerUiAction::ToggleVisibility(id, visible) => {
                     needs_repaint |= self.scene.set_overlay_visible(id, visible);
@@ -190,19 +222,13 @@ impl VeldmapApp {
                     needs_repaint |= self.scene.set_overlay_opacity(id, opacity);
                 }
                 LayerUiAction::ZoomToExtent(bounds) => {
-                    self.camera
-                        .focus(bounds.lat, bounds.lon, bounds.radius_deg.max(0.000_2));
+                    self.focus_footprint(bounds);
                     needs_repaint = true;
                 }
                 LayerUiAction::ReloadBypassCache(id) => {
-                    match self.scene.reload_overlay_bypass_cache(id) {
-                        Ok(_) => {
-                            self.layers_ui.clear_error();
-                        }
-                        Err(err) => {
-                            tracing::warn!(?id, error = %err, "Failed to reload overlay");
-                            self.layers_ui.set_error(err);
-                        }
+                    if let Err(err) = self.scene.begin_reload_overlay_bypass_cache(id) {
+                        tracing::warn!(?id, error = %err, "Failed to queue overlay reload");
+                        self.layers_ui.push_error(err);
                     }
                     needs_repaint = true;
                 }
@@ -382,9 +408,9 @@ impl VeldmapApp {
 impl eframe::App for VeldmapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let mut needs_repaint = self.drain_overlay_io_events();
         let upload_report = self.scene.drain_tile_uploads(&self.device, &self.queue);
 
-        let mut needs_repaint = false;
         let mut reconciled_this_frame = false;
         if self.storage.poll_clear_completed() {
             self.scene.retry_live_and_reconcile();
@@ -414,8 +440,11 @@ impl eframe::App for VeldmapApp {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
-        for path in dropped_paths {
-            needs_repaint |= self.open_overlay_path(&path, true);
+        if !dropped_paths.is_empty() {
+            self.layers_ui.clear_error();
+            for path in dropped_paths {
+                needs_repaint |= self.queue_open_overlay_path(&path, true);
+            }
         }
 
         // Top toolbar and Settings window.
@@ -536,6 +565,8 @@ impl eframe::App for VeldmapApp {
             || (upload_report.uploaded > 0 && upload_report.deferred_protected > 0)
         {
             ctx.request_repaint();
+        } else if let Some(delay) = self.scene.overlay_retry_delay() {
+            ctx.request_repaint_after(delay);
         }
     }
 }

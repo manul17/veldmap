@@ -119,13 +119,15 @@ impl Ellipsoid {
     }
 
     /// Evaluate a dynamically sized separable grid of surface (`height_m = 0.0`)
-    /// ECEF points in row-major order (`lats_deg.len() * lons_deg.len()`),
-    /// computing trigonometry once per row and once per column.
-    pub fn fill_separable_surface_points(
+    /// ECEF points and outward unit normals in row-major order
+    /// (`lats_deg.len() * lons_deg.len()`), computing trigonometry once per row
+    /// and once per column.
+    pub fn fill_separable_surface_points_and_normals(
         &self,
         lats_deg: &[f64],
         lons_deg: &[f64],
-        out: &mut Vec<DVec3>,
+        out_points: &mut Vec<DVec3>,
+        out_normals: &mut Vec<DVec3>,
     ) {
         let e2 = self.eccentricity_sq();
         let one_minus_e2 = 1.0 - e2;
@@ -133,15 +135,19 @@ impl Ellipsoid {
             .iter()
             .map(|&lon_deg| lon_deg.to_radians().sin_cos())
             .collect();
-        out.clear();
-        out.reserve(lats_deg.len().saturating_mul(lons_deg.len()));
+        let total = lats_deg.len().saturating_mul(lons_deg.len());
+        out_points.clear();
+        out_points.reserve(total);
+        out_normals.clear();
+        out_normals.reserve(total);
         for &lat_deg in lats_deg {
             let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
             let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
             let eq = curvature * cos_lat;
             let z = curvature * one_minus_e2 * sin_lat;
             for &(sin_lon, cos_lon) in &lon_cache {
-                out.push(DVec3::new(eq * cos_lon, eq * sin_lon, z));
+                out_points.push(DVec3::new(eq * cos_lon, eq * sin_lon, z));
+                out_normals.push(DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat));
             }
         }
     }

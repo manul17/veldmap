@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 image.workspace = true
+qoi.workspace = true
 thiserror.workspace = true
 tiff.workspace = true
 tracing.workspace = true

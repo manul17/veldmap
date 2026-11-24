@@ -73,6 +73,27 @@ pub struct DecodeJob {
     pub work: Box<dyn FnOnce() + Send + 'static>,
 }
 
+/// Reason a [`DecodeJob`] was not admitted by [`super::DecodePoolHandle::try_submit`],
+/// returning ownership of the rejected job so callers can clean up flight state
+/// before dropping it.
+pub enum SubmitError {
+    Closed(DecodeJob),
+    Cancelled(DecodeJob),
+    Duplicate(DecodeJob),
+    Full(DecodeJob),
+}
+
+impl std::fmt::Debug for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed(j) => f.debug_tuple("Closed").field(&j.key).finish(),
+            Self::Cancelled(j) => f.debug_tuple("Cancelled").field(&j.key).finish(),
+            Self::Duplicate(j) => f.debug_tuple("Duplicate").field(&j.key).finish(),
+            Self::Full(j) => f.debug_tuple("Full").field(&j.key).finish(),
+        }
+    }
+}
+
 pub(super) struct DecodeQueue {
     pub(super) jobs: Vec<DecodeJob>,
     pub(super) queued_bytes: usize,
@@ -176,19 +197,20 @@ impl DecodeQueue {
             .then_some(victims)
     }
 
-    pub(super) fn admit_job(&mut self, job: DecodeJob, to_drop: &mut Vec<DecodeJob>) -> bool {
+    pub(super) fn admit_job(
+        &mut self,
+        job: DecodeJob,
+        to_drop: &mut Vec<DecodeJob>,
+    ) -> Result<(), SubmitError> {
         if self.closed {
-            to_drop.push(job);
-            return false;
+            return Err(SubmitError::Closed(job));
         }
         self.prune_cancelled(to_drop);
         if self.jobs.iter().any(|j| j.key == job.key) {
-            to_drop.push(job);
-            return false;
+            return Err(SubmitError::Duplicate(job));
         }
         let Some(mut victims) = self.plan_evictions(job.key, job.queued_bytes) else {
-            to_drop.push(job);
-            return false;
+            return Err(SubmitError::Full(job));
         };
         // Remove in descending index order so `swap_remove` never invalidates
         // earlier planned indices.
@@ -197,7 +219,7 @@ impl DecodeQueue {
             to_drop.push(self.swap_remove_job(idx));
         }
         self.push_job(job);
-        true
+        Ok(())
     }
 
     /// Pop the highest-priority (coarsest) uncancelled job, or drain all

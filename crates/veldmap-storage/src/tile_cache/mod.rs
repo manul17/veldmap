@@ -18,4 +18,6 @@ mod schema;
 mod store;
 
 pub use self::key::{DiskTileKey, TileBlobEncoding, valid_source_key};
-pub use self::store::{DiskCacheStats, EvictionReport, MAX_CACHED_TILE_BYTES, TileDiskCache};
+pub use self::store::{
+    DiskCacheStats, DiskTileEntry, EvictionReport, MAX_CACHED_TILE_BYTES, TileDiskCache,
+};

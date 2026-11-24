@@ -279,8 +279,9 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
 
         match plan.serve {
             ServeMode::Pointwise => {
-                let admitted = sched.admit_pointwise(&meta, lvl, &[k0], |_| false);
-                assert_eq!(admitted, vec![k0]);
+                let admitted = sched.admit_pointwise(&meta, lvl, &[k0], |_| false, &cancel);
+                assert_eq!(admitted.len(), 1);
+                assert_eq!(admitted[0].key, k0);
                 let tile = src
                     .decode_pointwise_tile(k0.level, k0.x, k0.y, &ctx)
                     .expect("pointwise decode");
@@ -288,7 +289,7 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
                     (tile.width(), tile.height()),
                     (RASTER_TILE_SIZE, RASTER_TILE_SIZE)
                 );
-                sched.on_tile_arrived(&k0);
+                assert!(sched.on_pointwise_arrived(&k0, admitted[0].job_id));
             }
             ServeMode::Pass { from } => {
                 let pending = sched.check_pass_candidates(&meta, lvl, &[k0], |_| false);
@@ -299,11 +300,11 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
                     .begin_pass(pass_key, lvl, Some(from), pass_cancel, vec![k0])
                     .expect("begin pass");
                 src.produce_pass(&ctx, &mut |plvl, px, py, _, _, _| {
-                    sched.on_tile_arrived(&meta.tile_key(plvl, px, py));
+                    sched.on_pass_tile_arrived(pass_key, pass_id, &meta.tile_key(plvl, px, py));
                     Ok(())
                 })
                 .expect("produce_pass");
-                sched.finish_pass(pass_key, pass_id, true);
+                assert!(sched.finish_pass(pass_key, pass_id, true));
             }
         }
         assert!(!sched.is_in_flight(&k0));
@@ -387,54 +388,17 @@ fn concurrent_pass_and_pointwise_under_tight_budget_never_deadlock() {
 
 #[test]
 fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_lane() {
-    use ::tiff::encoder::TiffEncoder;
-    use ::tiff::tags::Tag;
-    use std::io::Cursor;
-    use veldmap_raster::ServeMode;
-
-    use crate::common::{build_tiled_cog, fake_fingerprint, rgb_pattern};
+    use crate::common::{build_stripped_tiff, build_tiled_cog, fake_fingerprint};
 
     // 1. Build a real untiled stripped GeoTIFF (1024 x 1024, 16 rows/strip)
-    //    whose coarse level 1 uses `ServeMode::Pass`.
-    let mut strip_buf = Cursor::new(Vec::new());
-    {
-        let mut enc = TiffEncoder::new(&mut strip_buf).expect("strip encoder");
-        let mut dir = enc.image_directory().expect("strip dir");
-        let (w, h, rps) = (1024u32, 1024u32, 16u32);
-        let rgb = rgb_pattern(w, h);
-        dir.write_tag(Tag::ImageWidth, w).expect("tag");
-        dir.write_tag(Tag::ImageLength, h).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-            .expect("tag");
-        dir.write_tag(Tag::Compression, 1u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-        dir.write_tag(Tag::RowsPerStrip, rps).expect("tag");
-        let mut offsets = Vec::new();
-        let mut counts = Vec::new();
-        for strip in 0..(h / rps) {
-            let start = (strip * rps * w * 3) as usize;
-            let end = start + (rps * w * 3) as usize;
-            let at = dir.write_data(&rgb[start..end]).expect("write strip");
-            offsets.push(at as u32);
-            counts.push((end - start) as u32);
-        }
-        dir.write_tag(Tag::StripOffsets, &offsets[..]).expect("tag");
-        dir.write_tag(Tag::StripByteCounts, &counts[..])
-            .expect("tag");
-        dir.finish().expect("finish");
-    }
-    let strip_bytes = strip_buf.into_inner();
-
+    //    whose coarse level 1 uses `ServeMode::Pass`, reusing the shared builder.
+    let strip_bytes = build_stripped_tiff(1024, 1024, 16);
     // 2. Build a real tiled COG (1024 x 1024 with overview) using `ServeMode::Pointwise`.
     let (cog_bytes, _, _) = build_tiled_cog(1024, 1024, 1);
 
     // Cap pointwise region working set to 2 MiB so the untiled stripped 1024x1024
-    // TIFF's coarse level 1 (which spans 4 MiB of base strips) selects
-    // `ServeMode::Pass` on the bulk lane, while the tiled COG's 512x512 tiles
-    // (`1 MiB`) stay `ServeMode::Pointwise` on the fast lane.
+    // TIFF's coarse level 1 selects `ServeMode::Pass` on the bulk lane, while
+    // the tiled COG's 512x512 tiles stay `ServeMode::Pointwise` on the fast lane.
     let budget = MemoryBudget {
         region_cap_bytes: 2 * 1024 * 1024,
         ..MemoryBudget::default()
@@ -489,8 +453,8 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
     );
     let handle = pool.handle();
 
-    let bulk_paused = Arc::new(AtomicUsize::new(0));
-    let release_bulk = CancelToken::new();
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
     let mut scheduler = TileScheduler::default();
 
     let pass_key = strip_meta.pass_key();
@@ -504,8 +468,6 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
         let src = Arc::clone(&strip_src);
         let cache = Arc::clone(&chunk_cache);
         let tr = Arc::clone(&tracker);
-        let paused = Arc::clone(&bulk_paused);
-        let rel = release_bulk.clone();
         assert!(handle.bulk().submit(DecodeJob {
             key: DecodeJobKey::Pass(pass_key),
             queued_bytes: 1024,
@@ -521,10 +483,8 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
                 let _ = src.produce_pass(&ctx, &mut |_, _, _, _, _, _| {
                     if !signaled {
                         signaled = true;
-                        paused.store(1, Ordering::Release);
-                        while !rel.is_cancelled() {
-                            thread::sleep(Duration::from_millis(2));
-                        }
+                        let _ = paused_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(5));
                     }
                     Ok(())
                 });
@@ -532,24 +492,20 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
         }));
     }
 
-    let wait = Instant::now();
-    while bulk_paused.load(Ordering::Acquire) == 0 && wait.elapsed() < Duration::from_secs(2) {
-        thread::sleep(Duration::from_millis(2));
-    }
-    assert_eq!(bulk_paused.load(Ordering::Acquire), 1);
+    paused_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("bulk pass paused");
 
-    // While the untiled stripped TIFF pass occupies the bulk lane, the tiled
-    // COG's pointwise tile on the fast lane must complete immediately.
     let cog_tile_key = cog_meta.tile_key(0, 1, 1);
-    let admitted = scheduler.admit_pointwise(&cog_meta, 0, &[cog_tile_key], |_| false);
-    assert_eq!(admitted, vec![cog_tile_key]);
+    let admitted = scheduler.admit_pointwise(&cog_meta, 0, &[cog_tile_key], |_| false, &shutdown);
+    assert_eq!(admitted.len(), 1);
 
     let (tx, rx) = mpsc::channel();
     {
         let src = Arc::clone(&cog_src);
         let cache = Arc::clone(&chunk_cache);
         let tr = Arc::clone(&tracker);
-        let fast_cancel = shutdown.child_token();
+        let fast_cancel = admitted[0].cancel.clone();
         assert!(handle.fast().submit(DecodeJob {
             key: DecodeJobKey::Tile(cog_tile_key),
             queued_bytes: 256,
@@ -573,11 +529,11 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
         .recv_timeout(Duration::from_secs(2))
         .expect("tiled COG fast tile must not HoL stall behind stripped bulk pass");
     assert_eq!(dims, (RASTER_TILE_SIZE, RASTER_TILE_SIZE));
-    scheduler.on_tile_arrived(&cog_tile_key);
+    assert!(scheduler.on_pointwise_arrived(&cog_tile_key, admitted[0].job_id));
 
-    release_bulk.cancel();
+    let _ = release_tx.send(());
     pool.shutdown();
-    scheduler.finish_pass(pass_key, pass_id, true);
+    assert!(scheduler.finish_pass(pass_key, pass_id, true));
     assert!(tracker.peak_bytes() <= budget.decode_working_bytes);
     assert_eq!(tracker.active_bytes(), 0);
 }

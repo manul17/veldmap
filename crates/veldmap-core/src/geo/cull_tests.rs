@@ -192,3 +192,28 @@ fn degenerate_zero_eye_produces_no_nan_in_horizon_plane() {
     assert!(frame.towards.is_finite());
     assert!(!frame.horizon_margin(at(0.0, 0.0, 0.0)).is_nan());
 }
+
+#[test]
+fn oblate_horizon_plane_separates_near_limb_points_at_mid_latitude() {
+    for height_m in [2.0, 500.0, 2_000_000.0] {
+        let cam = crate::geo::camera::Camera::at(45.0, 39.7, height_m);
+        let frustum = cam.frustum(16.0 / 9.0);
+        let nadir = at(45.0, 39.7, 0.0);
+        assert!(frustum.horizon_margin(nadir) > 0.0);
+
+        // Compute exact east-west equatorial horizon arc at 45 deg lat via binary search
+        // and verify +/-0.05 deg separation on either side of the oblate tangent plane.
+        let mut lo = 0.0_f64;
+        let mut hi = 90.0_f64;
+        for _ in 0..48 {
+            let mid = 0.5 * (lo + hi);
+            if frustum.horizon_margin(at(45.0, 39.7 + mid, 0.0)) >= 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        assert!(frustum.horizon_margin(at(45.0, 39.7 + (lo - 0.05).max(0.0), 0.0)) > 0.0);
+        assert!(frustum.horizon_margin(at(45.0, 39.7 + hi + 0.05, 0.0)) < 0.0);
+    }
+}

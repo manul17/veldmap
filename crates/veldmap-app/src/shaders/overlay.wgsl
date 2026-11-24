@@ -1,8 +1,9 @@
 // Depth-less post-body WGS84 raster overlay warp-mesh shader:
 // - Per-cell CPU f64 RTC vertex transforms (`offset_eye + rel_pos`)
-// - Exact CPU f64 ellipsoidal tangent horizon-plane clip
-//   (`dot(in.world, camera.horizon_towards) >= camera.horizon_eye_margin`)
-//   so coarse limb chords never leak back-hemisphere fragments
+// - Sag-safe ellipsoidal horizon facing clip (`dot(in.normal, -in.world) <= 0.0`)
+//   matching `globe.wgsl::fs_grid`, guaranteeing zero holes beneath the nadir
+//   camera at 2 m altitude even on coarse/global cells while clipping back-hemisphere
+//   limb fragments
 // - Uniform-flow `textureSample` strictly before any fragment `discard`
 // - Alpha-blended sRGB display overlays over the opaque globe body.
 
@@ -12,8 +13,6 @@ struct CameraUniform {
     grid_width_px: f32,
     polar_r_cap: f32,
     _pad0: f32,
-    horizon_towards: vec3<f32>,
-    horizon_eye_margin: f32,
 };
 
 struct OverlayPatchUniform {
@@ -34,19 +33,23 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     /// Eye-relative ECEF position (`P - E`, metres).
     @location(0) world: vec3<f32>,
+    /// Outward WGS84 geodetic surface normal.
+    @location(1) normal: vec3<f32>,
     /// Cell-local texture coordinates in `[0, 1]^2`.
-    @location(1) uv: vec2<f32>,
+    @location(2) uv: vec2<f32>,
 };
 
 @vertex
 fn vs_main(
     @location(0) rel_pos: vec3<f32>,
-    @location(1) uv: vec2<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
 ) -> VsOut {
     var out: VsOut;
     let rel = overlay.offset_eye + rel_pos;
     out.clip = camera.view_proj * vec4<f32>(rel, 1.0);
     out.world = rel;
+    out.normal = normal;
     out.uv = uv;
     return out;
 }
@@ -58,7 +61,7 @@ fn fs_overlay(in: VsOut) -> @location(0) vec4<f32> {
     let sample_uv = overlay.uv_rect.xy + in.uv * overlay.uv_rect.zw;
     let color = textureSample(tile_tex, tile_sampler, sample_uv);
 
-    if dot(in.world, camera.horizon_towards) < camera.horizon_eye_margin {
+    if dot(in.normal, -in.world) <= 0.0 {
         discard;
     }
 

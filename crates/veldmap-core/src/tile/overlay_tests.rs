@@ -1,14 +1,21 @@
 use super::*;
 use crate::geo::camera::Camera;
-use crate::geo::projection::System;
-use crate::tile::{cell_image_rect, level_count};
+use crate::geo::geodesy::Geodetic;
+use crate::geo::projection::Projection;
+use crate::tile::level_count;
 
 /// Measure the worst horizontal surface placement drift (in metres) across a
 /// dense sample grid inside `cell_rect` between the CPU `f64` RTC warp patch
 /// (including `f32` vertex quantization and triangle interpolation) and the
 /// exact georeference binding.
-fn max_surface_drift_m(frame: &Frame, width: u32, height: u32, cell_rect: [f64; 4]) -> f64 {
-    let patch = build_warp_patch(frame, width, height, cell_rect);
+fn max_surface_drift_m(
+    frame: &Frame,
+    width: u32,
+    height: u32,
+    cell_rect: [f64; 4],
+    segments: u32,
+) -> f64 {
+    let patch = build_warp_patch(frame, width, height, cell_rect, segments);
     let w = f64::from(width);
     let h = f64::from(height);
     let samples = 25usize;
@@ -23,9 +30,7 @@ fn max_surface_drift_m(frame: &Frame, width: u32, height: u32, cell_rect: [f64; 
             let (exact_lat, exact_lon) = frame.geodetic(px / w, py / h);
             let exact_ecef = WGS84.to_ecef(Geodetic::surface(exact_lat, exact_lon));
 
-            let drawn_ecef = evaluate_warp_patch_ecef(&patch, tx, ty);
-            // Project drawn point onto WGS84 ellipsoid surface to measure
-            // surface placement drift (separating radial chord sag).
+            let drawn_ecef = patch.evaluate_ecef(tx, ty).expect("valid patch eval");
             let drawn_geo = WGS84.from_ecef(drawn_ecef);
             let drawn_surface =
                 WGS84.to_ecef(Geodetic::surface(drawn_geo.lat_deg, drawn_geo.lon_deg));
@@ -47,12 +52,11 @@ fn a_raster_lands_where_its_binding_puts_it() {
         frame: Frame,
         width: u32,
         height: u32,
-        level: u32,
+        level: u8,
         cell_x: u32,
         cell_y: u32,
     }
 
-    // 30-degree rotated 8000x5000 orthophoto at 2 cm/px in UTM 37N.
     let angle = 30.0_f64.to_radians();
     let gsd = 0.02;
     let (sin_a, cos_a) = angle.sin_cos();
@@ -67,11 +71,18 @@ fn a_raster_lands_where_its_binding_puts_it() {
     let rotated_frame =
         Frame::from_pixel_affine(utm37, rotated_affine, 8_000, 5_000).expect("rotated frame");
 
+    // WebMercator axial benchmark (~10 m/px around 45N).
+    let (wm_x0, wm_y0) = Projection::WebMercator.from_geodetic(45.0, 39.0);
+    let (wm_x1, wm_y1) = Projection::WebMercator.from_geodetic(45.25, 39.35);
+    let wm_frame =
+        Frame::projected_bounds(Projection::WebMercator, wm_x0, wm_y0, wm_x1, wm_y1).expect("WM");
+
     let cases = [
         // 1. Drone orthophoto at 2 cm/px (UTM 37N)
         Case {
             name: "utm37_drone_2cm",
-            frame: Frame::utm(utm37, 550_000.0, 5_230_000.0, 550_200.0, 5_230_200.0),
+            frame: Frame::projected_bounds(utm37, 550_000.0, 5_230_000.0, 550_200.0, 5_230_200.0)
+                .expect("drone"),
             width: 10_000,
             height: 10_000,
             level: 0,
@@ -81,7 +92,8 @@ fn a_raster_lands_where_its_binding_puts_it() {
         // 2. Sentinel-2 granule at 10 m/px (UTM 37N near zone edge)
         Case {
             name: "utm37_sentinel2_10m",
-            frame: Frame::utm(utm37, 600_000.0, 5_200_000.0, 709_800.0, 5_309_800.0),
+            frame: Frame::projected_bounds(utm37, 600_000.0, 5_200_000.0, 709_800.0, 5_309_800.0)
+                .expect("s2"),
             width: 10_980,
             height: 10_980,
             level: 0,
@@ -91,7 +103,8 @@ fn a_raster_lands_where_its_binding_puts_it() {
         // 3. Landsat scene at 30 m/px (UTM 37N)
         Case {
             name: "utm37_landsat_30m",
-            frame: Frame::utm(utm37, 450_000.0, 5_100_000.0, 681_000.0, 5_331_000.0),
+            frame: Frame::projected_bounds(utm37, 450_000.0, 5_100_000.0, 681_000.0, 5_331_000.0)
+                .expect("landsat"),
             width: 7_700,
             height: 7_700,
             level: 0,
@@ -101,7 +114,8 @@ fn a_raster_lands_where_its_binding_puts_it() {
         // 4. Sentinel-2 granule at pyramid level 4 (coarse UTM zone edge)
         Case {
             name: "utm37_sentinel2_level4_edge",
-            frame: Frame::utm(utm37, 600_000.0, 5_200_000.0, 709_800.0, 5_309_800.0),
+            frame: Frame::projected_bounds(utm37, 600_000.0, 5_200_000.0, 709_800.0, 5_309_800.0)
+                .expect("s2 l4"),
             width: 10_980,
             height: 10_980,
             level: 4,
@@ -121,7 +135,8 @@ fn a_raster_lands_where_its_binding_puts_it() {
         // 6. Second CRS fixture: Gauss-Kruger Pulkovo 1942 zone 7 (EPSG:28407)
         Case {
             name: "gk_pulkovo1942_zone7_10m",
-            frame: Frame::utm(gk7, 7_450_000.0, 5_200_000.0, 7_559_800.0, 5_309_800.0),
+            frame: Frame::projected_bounds(gk7, 7_450_000.0, 5_200_000.0, 7_559_800.0, 5_309_800.0)
+                .expect("gk7"),
             width: 10_980,
             height: 10_980,
             level: 4,
@@ -131,12 +146,23 @@ fn a_raster_lands_where_its_binding_puts_it() {
         // 7. Southern Hemisphere UTM 37S (EPSG:32737)
         Case {
             name: "utm37s_southern_hemisphere_native",
-            frame: Frame::utm(utm37s, 500_000.0, 6_000_000.0, 500_200.0, 6_000_200.0),
+            frame: Frame::projected_bounds(utm37s, 500_000.0, 6_000_000.0, 500_200.0, 6_000_200.0)
+                .expect("utm37s"),
             width: 10_000,
             height: 10_000,
             level: 0,
             cell_x: 4,
             cell_y: 4,
+        },
+        // 8. Axial WebMercator separable trig warp-mesh path
+        Case {
+            name: "web_mercator_axial_native",
+            frame: wm_frame,
+            width: 4_096,
+            height: 4_096,
+            level: 0,
+            cell_x: 3,
+            cell_y: 2,
         },
     ];
 
@@ -144,11 +170,12 @@ fn a_raster_lands_where_its_binding_puts_it() {
         let cell = cell_image_rect(
             case.cell_x,
             case.cell_y,
-            case.level,
+            u32::from(case.level),
             case.width,
             case.height,
         );
-        let drift_m = max_surface_drift_m(&case.frame, case.width, case.height, cell);
+        let segs = level_segments(&case.frame, case.width, case.height, case.level);
+        let drift_m = max_surface_drift_m(&case.frame, case.width, case.height, cell, segs);
         let base_px_m = case
             .frame
             .ground_m_per_px(case.width)
@@ -177,11 +204,10 @@ fn a_raster_lands_where_its_binding_puts_it() {
 }
 
 #[test]
-fn negative_determinant_and_south_up_affines_wind_outward() {
+fn negative_determinant_and_south_up_affines_wind_outward_and_emit_outward_normals() {
     let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
     let cell = [0.0, 0.0, 512.0, 512.0];
 
-    // Standard north-up: x_per_i > 0, y_per_j < 0 -> normal CCW winding.
     let north_up = Frame::from_pixel_affine(
         utm37,
         [10.0, 0.0, 500_000.0, 0.0, -10.0, 5_250_000.0],
@@ -189,10 +215,9 @@ fn negative_determinant_and_south_up_affines_wind_outward() {
         512,
     )
     .expect("north-up");
-    let patch_normal = build_warp_patch(&north_up, 512, 512, cell);
+    let patch_normal = build_warp_patch(&north_up, 512, 512, cell, MIN_WARP_SEGMENTS);
     assert!(!patch_normal.flip_winding);
 
-    // South-up: x_per_i > 0, y_per_j > 0 -> flipped winding to face outward.
     let south_up = Frame::from_pixel_affine(
         utm37,
         [10.0, 0.0, 500_000.0, 0.0, 10.0, 5_240_000.0],
@@ -200,10 +225,9 @@ fn negative_determinant_and_south_up_affines_wind_outward() {
         512,
     )
     .expect("south-up");
-    let patch_south = build_warp_patch(&south_up, 512, 512, cell);
+    let patch_south = build_warp_patch(&south_up, 512, 512, cell, MIN_WARP_SEGMENTS);
     assert!(patch_south.flip_winding);
 
-    // Horizontally mirrored: x_per_i < 0, y_per_j < 0 -> flipped winding.
     let mirrored = Frame::from_pixel_affine(
         utm37,
         [-10.0, 0.0, 505_120.0, 0.0, -10.0, 5_250_000.0],
@@ -211,12 +235,13 @@ fn negative_determinant_and_south_up_affines_wind_outward() {
         512,
     )
     .expect("mirrored");
-    let patch_mirrored = build_warp_patch(&mirrored, 512, 512, cell);
+    let patch_mirrored = build_warp_patch(&mirrored, 512, 512, cell, MIN_WARP_SEGMENTS);
     assert!(patch_mirrored.flip_winding);
 
-    // Verify the final emitted triangle winding always has outward normals.
     for patch in [&patch_normal, &patch_south, &patch_mirrored] {
         let side = (patch.segments + 1) as usize;
+        assert_eq!(patch.rel_positions.len(), side * side);
+        assert_eq!(patch.normals.len(), side * side);
         let v = |r: usize, c: usize| {
             let p = patch.rel_positions[r * side + c];
             patch.origin_ecef_m + DVec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))
@@ -229,74 +254,33 @@ fn negative_determinant_and_south_up_affines_wind_outward() {
         } else {
             (p1 - p0).cross(p2 - p0)
         };
-        assert!(
-            tri_n.dot(p0) > 0.0,
-            "triangle winding must face outward from WGS84 ellipsoid"
-        );
+        assert!(tri_n.dot(p0) > 0.0);
+        for (&rel, &n) in patch.rel_positions.iter().zip(&patch.normals) {
+            let n_vec = DVec3::new(f64::from(n[0]), f64::from(n[1]), f64::from(n[2]));
+            let p_vec = patch.origin_ecef_m
+                + DVec3::new(f64::from(rel[0]), f64::from(rel[1]), f64::from(rel[2]));
+            assert!((n_vec.length() - 1.0).abs() < 1e-5);
+            assert!(n_vec.dot(p_vec) > 0.0);
+        }
     }
 }
 
 #[test]
-fn horizon_plane_uniform_matches_exact_ellipsoidal_horizon() {
-    for height_m in [2.0, 500.0, 2_000_000.0] {
-        let cam = Camera::at(47.2, 39.7, height_m);
-        let eye = cam.eye_ecef();
-        let frustum = cam.frustum(16.0 / 9.0);
-        let (towards, _horizon) = frustum.horizon_plane();
-        let margin = frustum.horizon_eye_margin();
-
-        // Point directly beneath camera is strictly front-facing.
-        let nadir = WGS84.to_ecef(Geodetic::surface(47.2, 39.7));
-        let world_nadir = (nadir - eye).as_vec3().as_dvec3();
-        assert!(world_nadir.dot(towards) > margin);
-
-        // Antipodal point is strictly behind the horizon plane.
-        let antipode = WGS84.to_ecef(Geodetic::surface(-47.2, 39.7 - 180.0));
-        let world_anti = (antipode - eye).as_vec3().as_dvec3();
-        assert!(world_anti.dot(towards) < margin);
-
-        // Point 5 degrees of great-circle arc past the horizon (at the equator
-        // so longitude delta equals true angular separation) must be rejected.
-        let cam_eq = Camera::at(0.0, 39.7, height_m);
-        let eye_eq = cam_eq.eye_ecef();
-        let frustum_eq = cam_eq.frustum(16.0 / 9.0);
-        let (towards_eq, _) = frustum_eq.horizon_plane();
-        let margin_eq = frustum_eq.horizon_eye_margin();
-        let horizon_arc_deg = (geodesy::SEMI_MAJOR_M / (geodesy::SEMI_MAJOR_M + height_m))
-            .acos()
-            .to_degrees();
-        let past_limb = WGS84.to_ecef(Geodetic::surface(
-            0.0,
-            39.7 + (horizon_arc_deg + 5.0).min(179.0),
-        ));
-        let world_past = (past_limb - eye_eq).as_vec3().as_dvec3();
-        assert!(
-            world_past.dot(towards_eq) < margin_eq,
-            "height={height_m}: point past horizon must fail horizon plane test"
-        );
-    }
-}
-
-#[test]
-fn lazy_cull_tree_prunes_offscreen_subtrees_and_preserves_limb_visibility() {
+fn lazy_cull_tree_matches_brute_force_prunes_offscreen_and_keeps_limb_cells() {
     let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
-    let frame = Frame::utm(utm37, 500_000.0, 5_200_000.0, 600_000.0, 5_300_000.0);
+    let frame = Frame::projected_bounds(utm37, 500_000.0, 5_200_000.0, 600_000.0, 5_300_000.0)
+        .expect("utm37");
     let width = 16_384;
     let height = 16_384;
     let max_level = (level_count(width, height) - 1) as u8;
     let mut tree = OverlayCullTree::new(width, height, max_level);
 
-    // Zoom into the center of the raster: only a handful of level-0 tiles are
-    // visible out of 32 x 32 = 1024, so lazy descent should materialize far
-    // fewer balls than eager level-0 construction.
+    // 1. Center zoom: lazy pruning materializes far fewer balls than 32x32=1024
+    //    and matches brute-force level-0 culling with zero false negatives.
     let (center_lat, center_lon) = frame.geodetic(0.5, 0.5);
     let cam = Camera::at(center_lat, center_lon, 5_000.0);
-    let aspect = 16.0 / 9.0;
-    let vp = cam.view_projection(aspect);
-    let eye = cam.eye_ecef();
-    let frustum = cam.frustum(aspect);
-
-    let visible = tree.visible_cells(&frame, 0, &frustum, &vp, eye);
+    let frustum = cam.frustum(16.0 / 9.0);
+    let visible = tree.visible_cells(&frame, 0, &frustum);
     assert!(!visible.is_empty());
     assert!(
         tree.cached_ball_count() < 200,
@@ -304,60 +288,67 @@ fn lazy_cull_tree_prunes_offscreen_subtrees_and_preserves_limb_visibility() {
         tree.cached_ball_count()
     );
 
-    // Every cell on the opposite side of the Earth must be rejected.
-    let cam_far = Camera::at(-center_lat, center_lon - 180.0, 5_000_000.0);
-    let vp_far = cam_far.view_projection(aspect);
-    let eye_far = cam_far.eye_ecef();
-    let frustum_far = cam_far.frustum(aspect);
+    let cols = grid_dim(width);
+    let rows = grid_dim(height);
+    let mut brute = Vec::new();
+    for y in 0..rows {
+        for x in 0..cols {
+            let ball = compute_cell_ball(&frame, width, height, 0, x, y);
+            if frustum.admits(&ball) {
+                brute.push((x, y));
+            }
+        }
+    }
+    let mut visible_sorted = visible;
+    visible_sorted.sort_unstable();
+    brute.sort_unstable();
+    assert_eq!(visible_sorted, brute);
+
+    // 2. Limb visibility: place camera so the raster sits right on the visible
+    //    eastern limb and verify visible cells are NOT culled.
+    let limb_cam = Camera::at(center_lat, center_lon - 50.0, 4_000_000.0);
+    let limb_frustum = limb_cam.frustum(16.0 / 9.0);
+    let limb_visible = tree.visible_cells(&frame, 0, &limb_frustum);
     assert!(
-        tree.visible_cells(&frame, 0, &frustum_far, &vp_far, eye_far)
-            .is_empty()
+        !limb_visible.is_empty(),
+        "cells on the visible limb must remain admitted"
     );
+
+    // 3. Opposite hemisphere: every cell must be rejected.
+    let far_cam = Camera::at(-center_lat, center_lon - 180.0, 5_000_000.0);
+    let far_frustum = far_cam.frustum(16.0 / 9.0);
+    assert!(tree.visible_cells(&frame, 0, &far_frustum).is_empty());
 }
 
 #[test]
-fn frame_fraction_inverse_round_trips_for_projected_and_tie_grid() {
-    let utm37 = Projection::Transverse(System::utm(37, true));
-    let frame = Frame::utm(utm37, 500_000.0, 5_200_000.0, 510_000.0, 5_210_000.0);
-    let (lat, lon) = frame.geodetic(0.37, 0.64);
-    let (fx, fy) = frame.fraction_at(lat, lon).expect("inside projected frame");
-    assert!((fx - 0.37).abs() < 1e-7);
-    assert!((fy - 0.64).abs() < 1e-7);
-    assert!(frame.fraction_at(0.0, 0.0).is_none());
+fn uniform_level_segments_eliminates_t_junctions_and_handles_antimeridian() {
+    // 700x700 regional raster (2x2 tiles with clipped right/bottom edges).
+    let regional =
+        Frame::quad([(10.0, 0.0), (10.0, 14.0), (-4.0, 14.0), (-4.0, 0.0)]).expect("regional");
+    let segs = level_segments(&regional, 700, 700, 0);
+    assert!(segs >= MIN_WARP_SEGMENTS);
+    let c00 = build_warp_patch(
+        &regional,
+        700,
+        700,
+        cell_image_rect(0, 0, 0, 700, 700),
+        segs,
+    );
+    let c10 = build_warp_patch(
+        &regional,
+        700,
+        700,
+        cell_image_rect(1, 0, 0, 700, 700),
+        segs,
+    );
+    assert_eq!(c00.segments, c10.segments);
 
-    // Axial geographic TieGrid
-    let ties = [
-        Tie {
-            fx: 0.0,
-            fy: 0.0,
-            lat: 48.0,
-            lon: 39.0,
-        },
-        Tie {
-            fx: 1.0,
-            fy: 0.0,
-            lat: 48.0,
-            lon: 41.0,
-        },
-        Tie {
-            fx: 0.0,
-            fy: 1.0,
-            lat: 46.0,
-            lon: 39.0,
-        },
-        Tie {
-            fx: 1.0,
-            fy: 1.0,
-            lat: 46.0,
-            lon: 41.0,
-        },
-    ];
-    let grid = TieGrid::new(&ties).expect("valid axial grid");
-    assert!(grid.is_axial());
-    let gframe = Frame::Grid(grid);
-    let (glat, glon) = gframe.geodetic(0.25, 0.75);
-    let (gfx, gfy) = gframe.fraction_at(glat, glon).expect("inside tie grid");
-    assert!((gfx - 0.25).abs() < 1e-9);
-    assert!((gfy - 0.75).abs() < 1e-9);
-    assert!(gframe.fraction_at(50.0, 40.0).is_none());
+    // Antimeridian 2-deg cell must stay at MIN_WARP_SEGMENTS (not blow up to 64
+    // from a 358-deg raw longitude wrap).
+    let antimeridian = Frame::quad([(5.0, 179.0), (5.0, -179.0), (3.0, -179.0), (3.0, 179.0)])
+        .expect("antimeridian");
+    assert_eq!(
+        level_segments(&antimeridian, 512, 512, 0),
+        MIN_WARP_SEGMENTS
+    );
 }

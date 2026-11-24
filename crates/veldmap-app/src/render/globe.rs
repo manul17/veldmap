@@ -151,9 +151,6 @@ impl GlobeRenderer {
         let aspect = f64::from(width) / f64::from(height.max(1));
         let vp = snapshot.camera.view_projection(aspect);
         let eye = snapshot.camera.eye_ecef();
-        let frustum = veldmap_core::geo::CullFrustum::new(&vp, eye);
-        let (horizon_towards, _) = frustum.horizon_plane();
-        let horizon_eye_margin = frustum.horizon_eye_margin() as f32;
 
         let cam_uniform = CameraUniform {
             view_proj: vp.as_mat4().to_cols_array_2d(),
@@ -161,8 +158,6 @@ impl GlobeRenderer {
             grid_width_px: snapshot.grid_width_px,
             polar_r_cap: POLAR_R_CAP as f32,
             _pad0: 0.0,
-            horizon_towards: horizon_towards.as_vec3().to_array(),
-            horizon_eye_margin,
         };
         queue.write_buffer(
             self.viewport.camera_buffer(),

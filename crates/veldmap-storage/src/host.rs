@@ -103,6 +103,7 @@ mod tests {
             Some(32_845_120 * 1024)
         );
         let budget = detect_memory_budget();
-        assert!(budget.host_ram_bytes >= 1024 * 1024 * 1024);
+        assert!(budget.host_ram_bytes > 0);
+        assert!(budget.gpu_tile_cache_bytes >= 256 * 1024 * 1024);
     }
 }

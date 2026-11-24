@@ -4,8 +4,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use veldmap_core::geo::Frame;
 use veldmap_core::geo::camera::Camera;
-use veldmap_core::glam::DVec3;
 use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, traverse};
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
@@ -49,15 +49,15 @@ pub struct DrawTile {
 }
 
 /// Single draped raster overlay warp-mesh cell inside [`DrawOverlayLayer`].
+///
+/// Vertex geometry is built lazily on GPU mesh-cache miss inside
+/// `OverlayRenderer::prepare_resources` from the parent layer's [`Frame`] and
+/// uniform per-level `segments`.
 #[derive(Clone, Debug)]
 pub struct DrawOverlayPatch {
     pub mesh_key: OverlayMeshKey,
-    pub origin_ecef_m: DVec3,
-    pub segments: u32,
-    pub flip_winding: bool,
-    /// Shared CPU RTC relative vertex positions (`(segments + 1)^2` entries)
-    /// uploaded lazily on cache miss in the overlay renderer.
-    pub rel_positions: Arc<[[f32; 3]]>,
+    /// Pixel rectangle `[x0, y0, x1, y1]` in base-image coordinates.
+    pub cell_rect: [f64; 4],
     /// Carrier UV sub-rectangle `(u_offset, v_offset, u_scale, v_scale)`.
     pub uv_rect: [f32; 4],
     pub texture: Arc<GpuTile>,
@@ -67,6 +67,12 @@ pub struct DrawOverlayPatch {
 #[derive(Clone, Debug)]
 pub struct DrawOverlayLayer {
     pub opacity: f32,
+    pub frame: Arc<Frame>,
+    pub image_width: u32,
+    pub image_height: u32,
+    /// Uniform warp-mesh subdivisions per cell side for this layer's active
+    /// pyramid level (shared by every patch in `patches` to prevent T-junctions).
+    pub segments: u32,
     pub patches: Vec<DrawOverlayPatch>,
 }
 

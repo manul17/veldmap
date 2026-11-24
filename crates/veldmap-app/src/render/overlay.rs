@@ -1,4 +1,4 @@
-//! Depth-less post-body warp-mesh overlay renderer extracted from `globe.rs`.
+//! Depth-less post-body warp-mesh overlay renderer.
 //!
 //! Renders per-cell CPU `f64` RTC raster overlay patches in painter's order
 //! inside Pass 2 (`depth_stencil_attachment: None`, `LoadOp::Load`) using the
@@ -8,10 +8,11 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::DVec3;
-use veldmap_core::tile::{PixelFormat, SourceId, TileCache};
+use veldmap_core::tile::{MAX_WARP_SEGMENTS, PixelFormat, SourceId, TileCache, build_warp_patch};
 use wgpu::util::DeviceExt;
 
 use super::OVERLAY_WGSL;
+use super::mesh::push_grid_quad_indices;
 use super::pipelines::{GlobePipelines, TileBindGroupCache};
 use super::snapshot::DrawSnapshot;
 use super::uniforms::{DynamicUniformArena, OverlayPatchUniform};
@@ -34,11 +35,12 @@ pub struct OverlayMeshKey {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct OverlayVertex {
     rel_pos: [f32; 3],
+    normal: [f32; 3],
     uv: [f32; 2],
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<OverlayVertex>() == 20);
+    assert!(std::mem::size_of::<OverlayVertex>() == 32);
 };
 
 impl OverlayVertex {
@@ -47,19 +49,21 @@ impl OverlayVertex {
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &wgpu::vertex_attr_array![
             0 => Float32x3,
-            1 => Float32x2,
+            1 => Float32x3,
+            2 => Float32x2,
         ],
     };
 }
 
 struct CachedOverlayMesh {
     buffer: wgpu::Buffer,
+    origin_ecef_m: DVec3,
     segments: u32,
     flip_winding: bool,
 }
 
 /// Manages the depth-less overlay pipeline, shared per-density index buffers,
-/// and bounded LRU cache of uploaded per-cell RTC warp-mesh vertex buffers.
+/// and bounded LRU cache of lazily built per-cell RTC warp-mesh vertex buffers.
 pub(super) struct OverlayRenderer {
     pipeline: wgpu::RenderPipeline,
     index_buffers: HashMap<(u32, bool), (wgpu::Buffer, u32)>,
@@ -120,25 +124,12 @@ impl OverlayRenderer {
     }
 
     fn ensure_index_buffer(&mut self, device: &wgpu::Device, segments: u32, flip_winding: bool) {
-        let segs = segments.max(1);
+        let segs = segments.clamp(1, MAX_WARP_SEGMENTS);
         if self.index_buffers.contains_key(&(segs, flip_winding)) {
             return;
         }
-        let stride = segs + 1;
         let mut indices = Vec::with_capacity((segs * segs * 6) as usize);
-        for row in 0..segs {
-            for col in 0..segs {
-                let top = row * stride + col;
-                let bottom = top + stride;
-                if flip_winding {
-                    indices.extend_from_slice(&[top, top + 1, bottom]);
-                    indices.extend_from_slice(&[top + 1, bottom + 1, bottom]);
-                } else {
-                    indices.extend_from_slice(&[top, bottom, top + 1]);
-                    indices.extend_from_slice(&[top + 1, bottom, bottom + 1]);
-                }
-            }
-        }
+        push_grid_quad_indices(&mut indices, segs, flip_winding);
         let count = indices.len() as u32;
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("overlay warp-mesh shared index buffer"),
@@ -149,8 +140,10 @@ impl OverlayRenderer {
             .insert((segs, flip_winding), (buffer, count));
     }
 
-    /// Ensure vertex buffers, shared density index buffers, and texture bind
-    /// groups exist for every overlay patch in `snapshot`.
+    /// Ensure vertex buffers (built lazily on cache miss), shared density index
+    /// buffers, and texture bind groups exist for every overlay patch in
+    /// `snapshot`. Releases cached overlay vertex buffers when no overlays are
+    /// present so closed layers never linger in VRAM.
     pub(super) fn prepare_resources(
         &mut self,
         device: &wgpu::Device,
@@ -159,6 +152,7 @@ impl OverlayRenderer {
         snapshot: &DrawSnapshot,
     ) {
         if snapshot.overlays.is_empty() {
+            let _ = self.meshes.clear();
             if self.meshes.max_bytes() > DEFAULT_OVERLAY_MESH_CACHE_BYTES {
                 let _ = self.meshes.set_max_bytes(DEFAULT_OVERLAY_MESH_CACHE_BYTES);
             }
@@ -168,10 +162,12 @@ impl OverlayRenderer {
         let needed_bytes: usize = snapshot
             .overlays
             .iter()
-            .flat_map(|layer| &layer.patches)
-            .map(|patch| {
-                let side = (patch.segments.max(1) + 1) as usize;
-                side * side * std::mem::size_of::<OverlayVertex>()
+            .map(|layer| {
+                let side = (layer.segments.clamp(1, MAX_WARP_SEGMENTS) + 1) as usize;
+                layer
+                    .patches
+                    .len()
+                    .saturating_mul(side * side * std::mem::size_of::<OverlayVertex>())
             })
             .sum();
         let active_floor = needed_bytes.max(DEFAULT_OVERLAY_MESH_CACHE_BYTES);
@@ -186,20 +182,31 @@ impl OverlayRenderer {
         }
 
         for layer in &snapshot.overlays {
+            let segs = layer.segments.clamp(1, MAX_WARP_SEGMENTS);
             for patch in &layer.patches {
                 bind_groups.ensure(device, pipelines, &patch.texture);
-                let segs = patch.segments.max(1);
-                self.ensure_index_buffer(device, segs, patch.flip_winding);
 
-                let already_valid = self
-                    .meshes
-                    .peek(&patch.mesh_key)
-                    .is_some_and(|m| m.segments == segs && m.flip_winding == patch.flip_winding);
-                if already_valid {
+                if let Some(existing) = self.meshes.peek(&patch.mesh_key)
+                    && existing.segments == segs
+                {
+                    let flip = existing.flip_winding;
+                    self.ensure_index_buffer(device, segs, flip);
                     continue;
                 }
 
-                let vertices = build_overlay_vertices(segs, &patch.rel_positions);
+                let warp = build_warp_patch(
+                    &layer.frame,
+                    layer.image_width,
+                    layer.image_height,
+                    patch.cell_rect,
+                    segs,
+                );
+                self.ensure_index_buffer(device, warp.segments, warp.flip_winding);
+                let Some(vertices) =
+                    build_overlay_vertices(warp.segments, &warp.rel_positions, &warp.normals)
+                else {
+                    continue;
+                };
                 let byte_size = std::mem::size_of_val(vertices.as_slice());
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("overlay warp-mesh RTC vertex buffer"),
@@ -210,8 +217,9 @@ impl OverlayRenderer {
                     patch.mesh_key,
                     CachedOverlayMesh {
                         buffer,
-                        segments: segs,
-                        flip_winding: patch.flip_winding,
+                        origin_ecef_m: warp.origin_ecef_m,
+                        segments: warp.segments,
+                        flip_winding: warp.flip_winding,
                     },
                     byte_size,
                 );
@@ -237,7 +245,11 @@ impl OverlayRenderer {
         for layer in &snapshot.overlays {
             let opacity = layer.opacity.clamp(0.0, 1.0);
             for patch in &layer.patches {
-                let offset_eye = (patch.origin_ecef_m - eye).as_vec3().to_array();
+                let origin = self
+                    .meshes
+                    .peek(&patch.mesh_key)
+                    .map_or(DVec3::ZERO, |m| m.origin_ecef_m);
+                let offset_eye = (origin - eye).as_vec3().to_array();
                 let u = OverlayPatchUniform {
                     offset_eye,
                     opacity,
@@ -298,9 +310,16 @@ impl OverlayRenderer {
     }
 }
 
-fn build_overlay_vertices(segments: u32, rel_positions: &[[f32; 3]]) -> Vec<OverlayVertex> {
+fn build_overlay_vertices(
+    segments: u32,
+    rel_positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+) -> Option<Vec<OverlayVertex>> {
     let side = (segments + 1) as usize;
-    let total = side * side;
+    let total = side.checked_mul(side)?;
+    if rel_positions.len() < total || normals.len() < total {
+        return None;
+    }
     let mut vertices = Vec::with_capacity(total);
     let inv = 1.0 / (segments as f32);
     for row in 0..side {
@@ -308,12 +327,12 @@ fn build_overlay_vertices(segments: u32, rel_positions: &[[f32; 3]]) -> Vec<Over
         for col in 0..side {
             let u = (col as f32) * inv;
             let idx = row * side + col;
-            let rel_pos = rel_positions.get(idx).copied().unwrap_or([0.0; 3]);
             vertices.push(OverlayVertex {
-                rel_pos,
+                rel_pos: rel_positions[idx],
+                normal: normals[idx],
                 uv: [u, v],
             });
         }
     }
-    vertices
+    Some(vertices)
 }

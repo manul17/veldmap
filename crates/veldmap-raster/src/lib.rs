@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use veldmap_core::budget::BudgetError;
+use veldmap_core::geo::BindingError;
 use veldmap_core::io::IoError;
 use veldmap_core::tile::TileScheme;
 
@@ -19,18 +20,18 @@ mod pool;
 mod tiff;
 
 pub use display::{
-    BundledBasemap, BundledBasemapConfig, decode_map_tile, decode_map_tile_with_mipmaps,
-    generate_linear_mipmaps,
+    BundledBasemap, BundledBasemapConfig, MAX_QOI_DECODED_BYTES, decode_map_tile,
+    decode_map_tile_with_mipmaps, decode_qoi_rgba8, encode_qoi_rgba8, generate_linear_mipmaps,
 };
 pub use pipeline::{
-    BandInfo, DecodeContext, GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie,
-    LevelPlan, PassBusy, PassKey, PyramidMeta, RasterDescription, RasterSource, SampleType,
+    AdmittedTile, BandInfo, DecodeContext, GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType,
+    GeoTie, LevelPlan, PassBusy, PassKey, PyramidMeta, RasterDescription, RasterSource, SampleType,
     ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
     frame_from_description,
 };
 pub use pool::{
     DecodeJob, DecodeJobKey, DecodeLane, DecodePool, DecodePoolConfig, DecodePoolHandle,
-    TwoLaneDecodePool, TwoLaneDecodePoolConfig, TwoLaneDecodePoolHandle,
+    SubmitError, TwoLaneDecodePool, TwoLaneDecodePoolConfig, TwoLaneDecodePoolHandle,
 };
 pub use tiff::{MAX_IFDS, MAX_SOURCE_SIDE, TiffSource, has_tiff_magic};
 
@@ -71,6 +72,8 @@ pub enum RasterError {
         x: u32,
         y: u32,
     },
+    #[error("georeference binding error: {0}")]
+    Binding(String),
 }
 
 impl RasterError {
@@ -96,5 +99,11 @@ impl From<BudgetError> for RasterError {
             BudgetError::Cancelled => Self::Cancelled,
             other => Self::Budget(other),
         }
+    }
+}
+
+impl From<BindingError> for RasterError {
+    fn from(err: BindingError) -> Self {
+        Self::Binding(err.to_string())
     }
 }

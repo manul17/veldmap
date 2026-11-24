@@ -25,8 +25,8 @@ pub use fingerprint::{FINGERPRINT_SAMPLE_BYTES, LocalFingerprintCache, fingerpri
 pub use host::{detect_host_ram_bytes, detect_memory_budget};
 pub use paths::StoragePaths;
 pub use tile_cache::{
-    DiskCacheStats, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES, TileBlobEncoding,
-    TileDiskCache, valid_source_key,
+    DiskCacheStats, DiskTileEntry, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES,
+    TileBlobEncoding, TileDiskCache, valid_source_key,
 };
 
 #[cfg(test)]
@@ -81,8 +81,6 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("SQLite cache error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("tile blob codec error: {0}")]
-    Codec(String),
 }
 
 impl StorageError {

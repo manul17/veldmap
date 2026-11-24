@@ -446,86 +446,112 @@ fn concurrent_reads_and_writes_keep_budget_and_accounting_consistent() {
 }
 
 #[test]
-fn qoi_rgba8_round_trips_and_purges_corrupt_entries() {
-    let (_dir, cache) = open_temp_cache("qoi-rgba8", 2 * 1024 * 1024);
+fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
+    let (_dir, cache) = open_temp_cache("entry-batch", 1_000);
     let source = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let k = DiskTileKey::from_tile_key(
-        source,
-        &TileKey {
-            source: veldmap_core::tile::SourceId::from_stable_key(source),
-            band: BandKey::Display,
-            scheme: TileScheme::RasterPyramid { max_level: 3 },
-            format: PixelFormat::Rgba8UnormSrgb,
-            gutter: 0,
-            decode_rev: 1,
-            level: 0,
-            x: 2,
-            y: 1,
-        },
-    );
-
-    let (w, h) = (32u32, 24u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            rgba.extend_from_slice(&[
-                (x * 7) as u8,
-                (y * 11) as u8,
-                ((x ^ y) * 5) as u8,
-                if (x + y) % 5 == 0 { 0 } else { 255 },
-            ]);
-        }
-    }
-
-    cache.put_qoi_rgba8(&k, w, h, &rgba).expect("put qoi");
-    // `get()` only returns `EncodedImage`, so `Qoi` must not alias raw HTTP tiles.
-    assert!(cache.get(&k).expect("get encoded image").is_none());
-    assert_eq!(
-        cache.get_qoi_rgba8(&k).expect("get qoi"),
-        Some((w, h, rgba))
-    );
-
-    // Corrupt QOI bytes must self-heal by deleting the bad entry and returning None.
-    cache
-        .put_encoded(&k, TileBlobEncoding::Qoi, b"not-a-valid-qoi-stream")
-        .expect("put corrupt qoi");
-    assert!(cache.get_qoi_rgba8(&k).expect("corrupt qoi miss").is_none());
-    assert_eq!(cache.stats().expect("stats after purge").tile_count, 0);
-
-    // Oversized QOI header (e.g. bit-flip claiming 10000x10000 RGBA = 400 MiB)
-    // must be rejected BEFORE allocating pixels and purged cleanly.
-    let mut bad_header = Vec::with_capacity(22);
-    bad_header.extend_from_slice(b"qoif");
-    bad_header.extend_from_slice(&10_000u32.to_be_bytes());
-    bad_header.extend_from_slice(&10_000u32.to_be_bytes());
-    bad_header.push(4); // RGBA
-    bad_header.push(0); // sRGB
-    bad_header.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
-    cache
-        .put_encoded(&k, TileBlobEncoding::Qoi, &bad_header)
-        .expect("put oversized qoi header");
-    assert!(
-        cache
-            .get_qoi_rgba8(&k)
-            .expect("oversized qoi header rejected")
-            .is_none()
-    );
-    assert_eq!(
-        cache
-            .stats()
-            .expect("stats after oversized purge")
-            .tile_count,
-        0
-    );
-
-    // Non-Rgba8 format is rejected.
-    let float_key = DiskTileKey {
-        format: PixelFormat::R32Float,
-        ..k
+    let make_key = |x: u32| {
+        DiskTileKey::from_tile_key(
+            source,
+            &TileKey {
+                source: veldmap_core::tile::SourceId::from_stable_key(source),
+                band: BandKey::Display,
+                scheme: TileScheme::RasterPyramid { max_level: 3 },
+                format: PixelFormat::Rgba8UnormSrgb,
+                gutter: 0,
+                decode_rev: 1,
+                level: 0,
+                x,
+                y: 0,
+            },
+        )
     };
+
+    // 1. ABA safety on delete_entry: stale reader seeing corrupt bytes must NOT
+    //    delete a newer valid overwrite of the same key (same SQLite tile_id).
+    let k0 = make_key(0);
+    cache
+        .put_encoded(&k0, TileBlobEncoding::Qoi, b"corrupt")
+        .expect("put corrupt");
+    let (stale_entry, enc, payload) = cache
+        .get_encoded_entry(&k0, Some(TileBlobEncoding::Qoi))
+        .expect("get entry")
+        .expect("present");
+    assert_eq!(enc, TileBlobEncoding::Qoi);
+    assert_eq!(payload, b"corrupt");
+    // `get()` only returns `EncodedImage`, so `Qoi` must not alias raw HTTP tiles.
+    assert!(cache.get(&k0).expect("get encoded image").is_none());
+
+    // Concurrent writer replaces `k0` with valid bytes.
+    cache
+        .put_encoded(&k0, TileBlobEncoding::Qoi, b"valid-replacement")
+        .expect("overwrite valid");
+    // Stale reader tries to purge `stale_entry` -> must be a no-op!
     assert!(
-        cache
-            .put_qoi_rgba8(&float_key, 1, 1, &[0, 0, 0, 255])
-            .is_err()
+        !cache.delete_entry(stale_entry).expect("stale delete"),
+        "stale entry must not delete newer overwrite"
     );
+    let (fresh_entry, _, fresh_payload) = cache
+        .get_encoded_entry(&k0, Some(TileBlobEncoding::Qoi))
+        .expect("get fresh")
+        .expect("still present");
+    assert_eq!(fresh_payload, b"valid-replacement");
+    assert!(cache.delete_entry(fresh_entry).expect("delete fresh"));
+    assert_eq!(cache.stats().expect("stats").tile_count, 0);
+
+    // 2. Cancelled puts are ignored cleanly.
+    let cancel = veldmap_core::sync::CancelToken::new();
+    cancel.cancel();
+    cache
+        .put_encoded_if_uncancelled(&k0, TileBlobEncoding::Qoi, b"ignored", &cancel)
+        .expect("cancelled put");
+    assert_eq!(cache.stats().expect("stats").tile_count, 0);
+
+    // 3. Batch put: pre-batch tile evicts to headroom, batch items between 90%
+    //    and 100% of cap are NOT self-evicted, and batch > cap evicts down to
+    //    `max_bytes` while keeping the newest item.
+    let live = veldmap_core::sync::CancelToken::new();
+    let k_old = make_key(99);
+    cache
+        .put_encoded(&k_old, TileBlobEncoding::Qoi, &[1u8; 300])
+        .expect("put old");
+
+    let k1 = make_key(1);
+    let k2 = make_key(2);
+    let k3 = make_key(3);
+    let b320 = vec![2u8; 320];
+    let report = cache
+        .put_encoded_batch_if_uncancelled(
+            &[
+                (&k1, TileBlobEncoding::Qoi, &b320),
+                (&k2, TileBlobEncoding::Qoi, &b320),
+                (&k3, TileBlobEncoding::Qoi, &b320),
+            ],
+            &live,
+        )
+        .expect("batch put");
+    // Total of k1..k3 = 960 <= 1000 (above 900 headroom): k_old evicted, all 3 kept!
+    assert_eq!(report.evicted_tiles, 1);
+    assert_eq!(report.total_bytes_after, 960);
+    assert!(cache.get_encoded(&k_old).expect("old evicted").is_none());
+    assert!(cache.get_encoded(&k1).expect("k1 kept").is_some());
+    assert!(cache.get_encoded(&k2).expect("k2 kept").is_some());
+    assert!(cache.get_encoded(&k3).expect("k3 kept").is_some());
+
+    // Batch exceeding `max_bytes` enforces the hard cap (<= 1000) and keeps newest.
+    let k4 = make_key(4);
+    let k5 = make_key(5);
+    let k6 = make_key(6);
+    let b400 = vec![3u8; 400];
+    let overflow = cache
+        .put_encoded_batch_if_uncancelled(
+            &[
+                (&k4, TileBlobEncoding::Qoi, &b400),
+                (&k5, TileBlobEncoding::Qoi, &b400),
+                (&k6, TileBlobEncoding::Qoi, &b400),
+            ],
+            &live,
+        )
+        .expect("overflow batch");
+    assert!(overflow.total_bytes_after <= 1_000);
+    assert!(cache.get_encoded(&k6).expect("newest kept").is_some());
 }

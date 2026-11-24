@@ -2,7 +2,7 @@
 //! decoders (such as [`crate::TiffSource`], future PNG/JPEG world-file
 //! adapters, and v1.1 mission codecs).
 
-use veldmap_core::geo::overlay::{Frame, Tie, TieGrid};
+use veldmap_core::geo::{Frame, Tie, TieGrid};
 use veldmap_core::tile::{DecodedTile, PixelFormat, SourceFingerprint, SourceId};
 
 use crate::RasterError;
@@ -12,14 +12,20 @@ use super::cascade::TileEmit;
 use super::metadata::RasterDescription;
 use super::plan::PyramidMeta;
 
-/// Derive a [`veldmap_core::geo::overlay::Frame`] georeference binding from a
-/// parsed [`RasterDescription`].
+/// Derive a [`veldmap_core::geo::Frame`] georeference binding from a parsed
+/// [`RasterDescription`].
 ///
 /// Prefers a dense tie-point lattice (`> 4` ties), then a projected CRS affine
 /// placement (`GeoPlacement`), then a 4-corner geographic tie-point grid.
-pub fn frame_from_description(desc: &RasterDescription) -> Result<Frame, String> {
-    let w = f64::from(desc.width.max(1));
-    let h = f64::from(desc.height.max(1));
+pub fn frame_from_description(desc: &RasterDescription) -> Result<Frame, RasterError> {
+    if desc.width == 0 || desc.height == 0 {
+        return Err(RasterError::InvalidDimensions {
+            width: desc.width,
+            height: desc.height,
+        });
+    }
+    let w = f64::from(desc.width);
+    let h = f64::from(desc.height);
 
     let ties: Vec<Tie> = desc
         .ties
@@ -33,10 +39,20 @@ pub fn frame_from_description(desc: &RasterDescription) -> Result<Frame, String>
         .collect();
     let grid = TieGrid::new(&ties);
 
+    let warn_foreign_geographic_datum = |epsg: Option<u16>| {
+        if let Some(code) = epsg {
+            tracing::warn!(
+                foreign_datum_epsg = code,
+                "Geographic raster uses foreign datum EPSG:{code}; binding on WGS84 without datum shift until Slice 3A-2"
+            );
+        }
+    };
+
     if let Some(ref g) = grid
         && g.is_dense()
     {
-        return Ok(Frame::Grid(g.clone()));
+        warn_foreign_geographic_datum(desc.foreign_datum_epsg);
+        return Ok(Frame::from_grid(g.clone()));
     }
 
     if let Some(ref placement) = desc.placement
@@ -46,21 +62,24 @@ pub fn frame_from_description(desc: &RasterDescription) -> Result<Frame, String>
             Ok(frame) => return Ok(frame),
             Err(err) => {
                 if let Some(g) = grid {
-                    return Ok(Frame::Grid(g));
+                    warn_foreign_geographic_datum(desc.foreign_datum_epsg);
+                    return Ok(Frame::from_grid(g));
                 }
-                return Err(err);
+                return Err(err.into());
             }
         }
     }
 
     if let Some(g) = grid {
-        return Ok(Frame::Grid(g));
+        warn_foreign_geographic_datum(desc.foreign_datum_epsg);
+        return Ok(Frame::from_grid(g));
     }
 
-    Err(desc
-        .binding_trouble
-        .clone()
-        .unwrap_or_else(|| "raster carries no supported georeference binding".to_owned()))
+    Err(RasterError::Binding(
+        desc.binding_trouble
+            .clone()
+            .unwrap_or_else(|| "raster carries no supported georeference binding".to_owned()),
+    ))
 }
 
 /// Format-agnostic opened analytical raster source capable of describing its

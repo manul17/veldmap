@@ -80,18 +80,14 @@ pub(super) struct CameraUniform {
     pub(super) grid_width_px: f32,
     pub(super) polar_r_cap: f32,
     pub(super) _pad0: f32,
-    pub(super) horizon_towards: [f32; 3],
-    pub(super) horizon_eye_margin: f32,
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<CameraUniform>() == 96);
+    assert!(std::mem::size_of::<CameraUniform>() == 80);
     assert!(std::mem::offset_of!(CameraUniform, view_proj) == 0);
     assert!(std::mem::offset_of!(CameraUniform, grid_step_deg) == 64);
     assert!(std::mem::offset_of!(CameraUniform, grid_width_px) == 68);
     assert!(std::mem::offset_of!(CameraUniform, polar_r_cap) == 72);
-    assert!(std::mem::offset_of!(CameraUniform, horizon_towards) == 80);
-    assert!(std::mem::offset_of!(CameraUniform, horizon_eye_margin) == 92);
 };
 
 #[repr(C)]
@@ -127,7 +123,7 @@ const _: () = {
 };
 
 /// Frame-wide dynamic uniform arena shared across globe body, post-body
-/// overlays, graticule, and future multi-pass analytical targets.
+/// overlays, and graticule passes.
 ///
 /// Accumulates all aligned per-draw uniforms in a single CPU staging buffer and
 /// flushes them with one `queue.write_buffer` call per dirty frame, preventing
@@ -135,6 +131,7 @@ const _: () = {
 pub(super) struct DynamicUniformArena {
     alignment: u32,
     staging: Vec<u8>,
+    last_offset: usize,
     buffer: wgpu::Buffer,
     capacity_bytes: usize,
     tile_bind_group: wgpu::BindGroup,
@@ -155,6 +152,7 @@ impl DynamicUniformArena {
         Self {
             alignment,
             staging: Vec::with_capacity(initial_bytes),
+            last_offset: 0,
             buffer,
             capacity_bytes: initial_bytes,
             tile_bind_group,
@@ -203,6 +201,7 @@ impl DynamicUniformArena {
 
     pub(super) fn reset(&mut self) {
         self.staging.clear();
+        self.last_offset = 0;
     }
 
     /// Append `value` at the next hardware-aligned dynamic offset and return
@@ -215,11 +214,13 @@ impl DynamicUniformArena {
         }
         let bytes = bytemuck::bytes_of(value);
         self.staging.extend_from_slice(bytes);
+        self.last_offset = offset;
         offset as u32
     }
 
-    /// Ensure the GPU arena buffer fits all pushed uniforms plus trailing
-    /// binding range, then upload the frame's staging bytes in a single write.
+    /// Ensure the GPU arena buffer fits all pushed uniforms plus the final
+    /// entry's declared binding range, then upload the frame's staging bytes
+    /// in a single write.
     pub(super) fn flush(
         &mut self,
         device: &wgpu::Device,
@@ -230,17 +231,10 @@ impl DynamicUniformArena {
         if self.staging.is_empty() {
             return;
         }
-        // Pad to 4-byte copy alignment and guarantee the final entry's full
-        // declared `min_binding_size` lies within the GPU buffer.
         let max_binding =
             std::mem::size_of::<TileUniform>().max(std::mem::size_of::<OverlayPatchUniform>());
-        let align = self.alignment as usize;
-        let required_bytes = self
-            .staging
-            .len()
-            .div_ceil(align)
-            .saturating_mul(align)
-            .max(self.staging.len().saturating_add(max_binding));
+        let copy_len = self.staging.len().div_ceil(4) * 4;
+        let required_bytes = copy_len.max(self.last_offset.saturating_add(max_binding));
         if required_bytes > self.capacity_bytes {
             let next_cap = required_bytes.next_power_of_two().max(4096);
             let (buf, tile_bg, overlay_bg) =
@@ -250,7 +244,6 @@ impl DynamicUniformArena {
             self.overlay_bind_group = overlay_bg;
             self.capacity_bytes = next_cap;
         }
-        let copy_len = self.staging.len().div_ceil(4) * 4;
         if copy_len > self.staging.len() {
             self.staging.resize(copy_len, 0);
         }

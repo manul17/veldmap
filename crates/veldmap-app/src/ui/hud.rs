@@ -45,6 +45,17 @@ pub(super) fn format_resolution(m_per_px: f64) -> String {
     }
 }
 
+/// Format an `(x, y)` native source pixel size, collapsing nearly isotropic
+/// pixels (`<= 2%` difference) to a single value and formatting anisotropic
+/// pixels as `mx × my`.
+pub(super) fn format_source_pixel_size(mx: f64, my: f64) -> String {
+    if (mx - my).abs() / mx.max(1e-9) <= 0.02 {
+        format_resolution(mx)
+    } else {
+        format!("{} × {}", format_resolution(mx), format_resolution(my))
+    }
+}
+
 /// Choose a clean `1–2–5` metric scale-bar distance and its exact screen width
 /// in logical points for `m_per_pt` ground metres per logical point.
 ///

@@ -11,7 +11,7 @@ use veldmap_core::geo::camera::Camera;
 use veldmap_core::geo::coords::{ParsedLocation, parse_location};
 
 use crate::basemap::BasemapStatusSnapshot;
-use crate::layers::CursorReadout;
+use crate::layers::{CursorReadout, CursorReadoutValue};
 use crate::settings::AppSettings;
 
 use super::ERROR_TEXT_COLOR;
@@ -163,22 +163,29 @@ pub(crate) fn show_status_bar(
 
             if let Some(readout) = cursor_readout {
                 ui.separator();
-                let val_text = if let Some([r, g, b, a]) = readout.rgba {
-                    if a == 255 {
-                        format!(
-                            "RGB({r},{g},{b}) @ ({},{})",
-                            readout.pixel.0, readout.pixel.1
-                        )
-                    } else {
-                        format!(
-                            "RGBA({r},{g},{b},{a}) @ ({},{})",
-                            readout.pixel.0, readout.pixel.1
-                        )
+                let val_text = match readout.value {
+                    CursorReadoutValue::Rgba([r, g, b, a]) => {
+                        if a == 255 {
+                            format!(
+                                "RGB({r},{g},{b}) @ ({},{})",
+                                readout.pixel.0, readout.pixel.1
+                            )
+                        } else {
+                            format!(
+                                "RGBA({r},{g},{b},{a}) @ ({},{})",
+                                readout.pixel.0, readout.pixel.1
+                            )
+                        }
                     }
-                } else if readout.pending {
-                    format!("RGB(…) @ ({},{})", readout.pixel.0, readout.pixel.1)
-                } else {
-                    format!("nodata @ ({},{})", readout.pixel.0, readout.pixel.1)
+                    CursorReadoutValue::Pending => {
+                        format!("RGB(…) @ ({},{})", readout.pixel.0, readout.pixel.1)
+                    }
+                    CursorReadoutValue::Nodata => {
+                        format!("nodata @ ({},{})", readout.pixel.0, readout.pixel.1)
+                    }
+                    CursorReadoutValue::Unavailable => {
+                        format!("RGB(n/a) @ ({},{})", readout.pixel.0, readout.pixel.1)
+                    }
                 };
                 ui.monospace(val_text).on_hover_text(format!(
                     "Native base-resolution readout: {}",
@@ -205,16 +212,10 @@ pub(crate) fn show_status_bar(
                 .or(topmost_source_px);
             if let Some((mx, my)) = source_px {
                 ui.separator();
-                let label = if (mx - my).abs() / mx.max(1e-9) <= 0.02 {
-                    format!("Source px: {}", hud::format_resolution(mx))
-                } else {
-                    format!(
-                        "Source px: {} × {}",
-                        hud::format_resolution(mx),
-                        hud::format_resolution(my)
-                    )
-                };
-                ui.monospace(label);
+                ui.monospace(format!(
+                    "Source px: {}",
+                    hud::format_source_pixel_size(mx, my)
+                ));
             }
         });
     });

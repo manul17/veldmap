@@ -38,6 +38,7 @@ pub(super) fn evict_in_tx(
     mut tile_count: u64,
     max_bytes: u64,
     protect_id: Option<i64>,
+    batch_start_ts: Option<i64>,
 ) -> Result<EvictionOutcome, rusqlite::Error> {
     if total_bytes <= max_bytes {
         return Ok(EvictionOutcome {
@@ -62,8 +63,18 @@ pub(super) fn evict_in_tx(
         }
 
         let mut to_delete = Vec::with_capacity(batch.len());
-        for (tile_id, sz) in batch {
-            if total_bytes <= target {
+        let mut stopped_at_batch_boundary = false;
+        for (tile_id, sz, last_used_ms) in batch {
+            // Pre-batch entries evict down to `target` (90% headroom); entries
+            // inserted by the current batch only evict while `total_bytes > max_bytes`
+            // so a batch never self-evicts into headroom while still honoring the
+            // hard `max_bytes` cap.
+            let is_current_batch = batch_start_ts.is_some_and(|start| last_used_ms >= start);
+            let limit = if is_current_batch { max_bytes } else { target };
+            if total_bytes <= limit {
+                if is_current_batch {
+                    stopped_at_batch_boundary = true;
+                }
                 break;
             }
             to_delete.push(tile_id);
@@ -72,6 +83,12 @@ pub(super) fn evict_in_tx(
             tile_count = tile_count.saturating_sub(1);
             evicted_bytes = evicted_bytes.saturating_add(sz);
             evicted_tiles += 1;
+        }
+        if to_delete.is_empty() || stopped_at_batch_boundary {
+            if !to_delete.is_empty() {
+                delete_meta_ids(tx, &to_delete)?;
+            }
+            break;
         }
         delete_meta_ids(tx, &to_delete)?;
     }

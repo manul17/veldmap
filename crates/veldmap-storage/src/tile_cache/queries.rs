@@ -10,7 +10,7 @@ use super::key::{EncodedKey, TileBlobEncoding};
 const CLEAR_BLOBS_SQL: &str = "DELETE FROM tile_blobs";
 const CLEAR_META_SQL: &str = "DELETE FROM tile_meta";
 
-const SELECT_TILE_BLOB_SQL: &str = "SELECT m.tile_id, m.encoding, b.payload
+const SELECT_TILE_BLOB_SQL: &str = "SELECT m.tile_id, m.encoding, m.last_used_ms, b.payload
      FROM tile_meta m
      JOIN tile_blobs b ON b.tile_id = m.tile_id
      WHERE m.source_key = ?1
@@ -59,14 +59,18 @@ const TOUCH_META_SQL: &str =
 
 const DELETE_META_BY_ID_SQL: &str = "DELETE FROM tile_meta WHERE tile_id = ?1";
 
+const DELETE_META_BY_ID_AND_TS_SQL: &str =
+    "DELETE FROM tile_meta WHERE tile_id = ?1 AND last_used_ms = ?2 RETURNING byte_size";
+
 const DELETE_SOURCE_META_SQL: &str =
     "DELETE FROM tile_meta WHERE source_key = ?1 RETURNING tile_id, byte_size";
 
-const SELECT_EVICT_BATCH_SQL: &str = "SELECT tile_id, byte_size FROM tile_meta
+const SELECT_EVICT_BATCH_SQL: &str = "SELECT tile_id, byte_size, last_used_ms FROM tile_meta
      ORDER BY last_used_ms ASC
      LIMIT ?1";
 
-const SELECT_EVICT_BATCH_PROTECTED_SQL: &str = "SELECT tile_id, byte_size FROM tile_meta
+const SELECT_EVICT_BATCH_PROTECTED_SQL: &str =
+    "SELECT tile_id, byte_size, last_used_ms FROM tile_meta
      WHERE tile_id != ?1
      ORDER BY last_used_ms ASC
      LIMIT ?2";
@@ -84,13 +88,27 @@ const DECREMENT_CACHE_META_SQL: &str = "UPDATE cache_meta
 const RESET_CACHE_META_SQL: &str =
     "UPDATE cache_meta SET total_bytes = 0, tile_count = 0 WHERE id = 1";
 
+pub(super) struct SelectedTileBlob {
+    pub(super) tile_id: i64,
+    pub(super) encoding_raw: i64,
+    pub(super) last_used_ms: i64,
+    pub(super) payload: Vec<u8>,
+}
+
 pub(super) fn select_tile_blob(
     conn: &Connection,
     enc: &EncodedKey<'_>,
-) -> Result<Option<(i64, i64, Vec<u8>)>, rusqlite::Error> {
+) -> Result<Option<SelectedTileBlob>, rusqlite::Error> {
     let mut stmt = conn.prepare(SELECT_TILE_BLOB_SQL)?;
-    stmt.query_row(enc.key_params(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .optional()
+    stmt.query_row(enc.key_params(), |r| {
+        Ok(SelectedTileBlob {
+            tile_id: r.get(0)?,
+            encoding_raw: r.get(1)?,
+            last_used_ms: r.get(2)?,
+            payload: r.get(3)?,
+        })
+    })
+    .optional()
 }
 
 fn select_meta_id_bytes(
@@ -125,7 +143,7 @@ fn upsert_tile_blob(
     Ok(())
 }
 
-pub(super) fn upsert_tile_in_tx(
+pub(super) fn upsert_tile_raw_in_tx(
     tx: &Transaction<'_>,
     enc: &EncodedKey<'_>,
     encoding: TileBlobEncoding,
@@ -140,6 +158,18 @@ pub(super) fn upsert_tile_in_tx(
 
     let old = prev_bytes.unwrap_or(0).max(0) as u64;
     let count_delta = u64::from(prev_bytes.is_none());
+    Ok((inserted_id, old, count_delta))
+}
+
+pub(super) fn upsert_tile_in_tx(
+    tx: &Transaction<'_>,
+    enc: &EncodedKey<'_>,
+    encoding: TileBlobEncoding,
+    payload: &[u8],
+    ts_ms: i64,
+) -> Result<(i64, u64, u64), rusqlite::Error> {
+    let new_bytes = payload.len() as u64;
+    let (inserted_id, old, count_delta) = upsert_tile_raw_in_tx(tx, enc, encoding, payload, ts_ms)?;
     let (current_total, current_count) = read_cache_meta_totals(tx)?;
     let updated_total = current_total.saturating_sub(old).saturating_add(new_bytes);
     let updated_count = current_count.saturating_add(count_delta);
@@ -180,6 +210,22 @@ pub(super) fn delete_tile_in_tx(
     delete_meta_by_id(tx, tile_id)?;
     decrement_cache_meta(tx, sz, 1)?;
     Ok(Some(tile_id))
+}
+
+pub(super) fn delete_entry_in_tx(
+    tx: &Transaction<'_>,
+    tile_id: i64,
+    expected_last_used_ms: i64,
+) -> Result<bool, rusqlite::Error> {
+    let mut stmt = tx.prepare(DELETE_META_BY_ID_AND_TS_SQL)?;
+    let deleted_sz: Option<i64> = stmt
+        .query_row(params![tile_id, expected_last_used_ms], |r| r.get(0))
+        .optional()?;
+    let Some(sz) = deleted_sz else {
+        return Ok(false);
+    };
+    decrement_cache_meta(tx, sz.max(0), 1)?;
+    Ok(true)
 }
 
 pub(super) fn delete_meta_ids(
@@ -238,12 +284,13 @@ fn collect_evict_rows(
     stmt: &mut Statement<'_>,
     params: impl Params,
     capacity: usize,
-) -> Result<Vec<(i64, u64)>, rusqlite::Error> {
+) -> Result<Vec<(i64, u64, i64)>, rusqlite::Error> {
     let mut batch = Vec::with_capacity(capacity);
     let rows = stmt.query_map(params, |r| {
         let tile_id: i64 = r.get(0)?;
         let sz: i64 = r.get(1)?;
-        Ok((tile_id, sz.max(0) as u64))
+        let last_used_ms: i64 = r.get(2)?;
+        Ok((tile_id, sz.max(0) as u64, last_used_ms))
     })?;
     for row in rows {
         batch.push(row?);
@@ -255,7 +302,7 @@ pub(super) fn select_evict_batch(
     tx: &Transaction<'_>,
     limit: i64,
     protect_id: Option<i64>,
-) -> Result<Vec<(i64, u64)>, rusqlite::Error> {
+) -> Result<Vec<(i64, u64, i64)>, rusqlite::Error> {
     // `ORDER BY last_used_ms ASC` (without `, tile_id ASC`) lets SQLite satisfy
     // the query directly from covering index `idx_tile_meta_lru (last_used_ms,
     // byte_size)` with zero temp B-tree sorting and zero table lookups.

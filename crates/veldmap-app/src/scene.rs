@@ -1,4 +1,4 @@
-//! Scene/upload/decode-pool orchestration (`SceneState`) extracted from `app.rs`.
+//! Scene, tile-upload, and two-lane decode-pool orchestration (`SceneState`).
 //!
 //! Owns the GPU tile cache, bounded upload queue, shared two-lane CPU decode
 //! pool (`TwoLaneDecodePool`), basemap coordinator, ordered raster overlay
@@ -7,10 +7,10 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::camera::Camera;
-use veldmap_core::geo::footprint::FootprintBounds;
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::SourceId;
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
@@ -21,7 +21,9 @@ use crate::gpu_tiles::{
     DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
-use crate::layers::{CursorReadout, LayerId, LayerSummary, OverlayManager};
+use crate::layers::{
+    CursorReadout, LayerId, LayerSummary, OverlayIoEvent, OverlayManager, OverlayMutation,
+};
 use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
 use crate::settings::AppSettings;
 
@@ -165,44 +167,48 @@ impl SceneState {
         self.overlays.layer_summaries()
     }
 
-    /// Open a local GeoTIFF/BigTIFF/COG overlay layer and return its ID and
-    /// geographic footprint bounds.
-    pub(crate) fn open_overlay_file(
-        &mut self,
-        path: &Path,
-    ) -> Result<(LayerId, Option<FootprintBounds>), String> {
-        let result = self.overlays.open_local_file(path, false)?;
-        self.sync_pinned_root_sources();
-        self.mark_dirty();
-        Ok(result)
+    fn apply_overlay_mutation(&mut self, mutation: OverlayMutation) -> bool {
+        for src in mutation.purge_sources {
+            self.gpu_tile_cache.remove_source(src);
+            self.pending_uploads.clear_source(src);
+        }
+        if mutation.changed {
+            self.sync_pinned_root_sources();
+            self.mark_dirty();
+        }
+        mutation.changed
     }
 
-    /// Reload an existing overlay layer from disk, bypassing both the stat
-    /// fingerprint cache and any cached QOI disk tiles.
-    pub(crate) fn reload_overlay_bypass_cache(
-        &mut self,
-        id: LayerId,
-    ) -> Result<Option<FootprintBounds>, String> {
-        let bounds = self.overlays.reload_layer_bypass_cache(
-            id,
-            &mut self.gpu_tile_cache,
-            &mut self.pending_uploads,
-        )?;
-        self.sync_pinned_root_sources();
-        self.mark_dirty();
-        Ok(bounds)
+    /// Queue a non-blocking local GeoTIFF/BigTIFF/COG overlay open onto the
+    /// background overlay I/O worker.
+    pub(crate) fn begin_open_overlay_file(&self, path: &Path, fly_to: bool) -> Result<(), String> {
+        self.overlays.begin_open_file(path, fly_to)
+    }
+
+    /// Queue a non-blocking reload of an existing overlay layer from disk,
+    /// bypassing both the stat fingerprint cache and any cached QOI disk tiles.
+    pub(crate) fn begin_reload_overlay_bypass_cache(&mut self, id: LayerId) -> Result<(), String> {
+        let mutation = self.overlays.begin_reload_bypass_cache(id)?;
+        let _ = self.apply_overlay_mutation(mutation);
+        Ok(())
+    }
+
+    /// Drain completed background overlay open/reload events.
+    pub(crate) fn poll_overlay_io_events(&mut self) -> Vec<OverlayIoEvent> {
+        let (events, mutation) = self.overlays.poll_io_events();
+        let _ = self.apply_overlay_mutation(mutation);
+        events
     }
 
     /// Remove an overlay layer and reclaim its VRAM/pending/chunk state.
     pub(crate) fn remove_overlay(&mut self, id: LayerId) -> bool {
-        let removed =
-            self.overlays
-                .remove_layer(id, &mut self.gpu_tile_cache, &mut self.pending_uploads);
-        if removed {
-            self.sync_pinned_root_sources();
-            self.mark_dirty();
-        }
-        removed
+        let mutation = self.overlays.remove_layer(id);
+        self.apply_overlay_mutation(mutation)
+    }
+
+    /// Optional backoff delay if an overlay decode lane was recently saturated.
+    pub(crate) fn overlay_retry_delay(&self) -> Option<Duration> {
+        self.overlays.retry_delay()
     }
 
     /// Toggle visibility of an overlay layer.
@@ -277,6 +283,8 @@ impl SceneState {
     pub(crate) fn reconcile_providers(&mut self) {
         self.basemap
             .reconcile_providers(&self.gpu_tile_cache, &self.pending_uploads);
+        self.overlays
+            .reconcile(&self.gpu_tile_cache, &self.pending_uploads);
     }
 
     /// Drain background tile completions and upload coarsest-first within the
@@ -305,7 +313,7 @@ impl SceneState {
         );
         self.basemap.record_upload_report(&report);
         self.overlays.record_upload_report(&report);
-        if report.uploaded > 0 {
+        if report.uploaded > 0 || self.overlays.take_reschedule_needed() {
             self.mark_dirty();
         }
         report
@@ -403,11 +411,13 @@ impl SceneState {
     }
 
     /// Phase 3 of deterministic shutdown: join the shared CPU decode pool
-    /// BEFORE shutting down `LiveTilePipeline`'s `tokio::Runtime`.
+    /// and overlay I/O worker BEFORE shutting down `LiveTilePipeline`'s
+    /// `tokio::Runtime`.
     pub(crate) fn finish_shutdown(&mut self) {
         if let Some(pool) = self.decode_pool.take() {
             pool.shutdown();
         }
+        self.overlays.finish_shutdown();
         self.basemap.finish_shutdown();
     }
 }

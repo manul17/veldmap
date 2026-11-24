@@ -1,21 +1,60 @@
-//! CPU-only `naga` WGSL validation and SPIR-V / HLSL / MSL codegen tests
-//! (pinned to `wgpu` 30's `naga` 30 major version).
+//! CPU-only `naga` WGSL validation, uniform struct layout parity checks, and
+//! SPIR-V / HLSL / MSL codegen tests (pinned to `wgpu` 30's `naga` 30).
 
 use naga::back::{hlsl, msl, spv};
+use naga::proc::Layouter;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use veldmap_app::render::{COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_WGSL};
 
-fn validate_and_compile_all_backends(name: &str, wgsl_source: &str) {
+fn parse_and_validate(name: &str, wgsl_source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
     let module = naga::front::wgsl::parse_str(wgsl_source).unwrap_or_else(|err| {
         panic!(
             "{name}: WGSL parse failed:\n{}",
             err.emit_to_string(wgsl_source)
         )
     });
-
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
         .validate(&module)
         .unwrap_or_else(|err| panic!("{name}: naga validation failed:\n{err:?}"));
+    (module, info)
+}
+
+fn assert_struct_layout(
+    module: &naga::Module,
+    struct_name: &str,
+    expected_size: u32,
+    expected_members: &[(&str, u32)],
+) {
+    let mut layouter = Layouter::default();
+    layouter
+        .update(module.to_ctx())
+        .expect("naga layouter update");
+    let (handle, ty) = module
+        .types
+        .iter()
+        .find(|(_, t)| t.name.as_deref() == Some(struct_name))
+        .unwrap_or_else(|| panic!("WGSL struct `{struct_name}` not found"));
+    assert_eq!(
+        layouter[handle].size, expected_size,
+        "WGSL struct `{struct_name}` size mismatch"
+    );
+    let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+        panic!("`{struct_name}` is not a WGSL struct");
+    };
+    for &(field, expected_offset) in expected_members {
+        let member = members
+            .iter()
+            .find(|m| m.name.as_deref() == Some(field))
+            .unwrap_or_else(|| panic!("field `{struct_name}.{field}` not found"));
+        assert_eq!(
+            member.offset, expected_offset,
+            "field `{struct_name}.{field}` offset mismatch"
+        );
+    }
+}
+
+fn validate_and_compile_all_backends(name: &str, wgsl_source: &str) -> naga::Module {
+    let (module, info) = parse_and_validate(name, wgsl_source);
 
     // 1. SPIR-V (Vulkan)
     let spv_opts = spv::Options {
@@ -61,11 +100,38 @@ fn validate_and_compile_all_backends(name: &str, wgsl_source: &str) {
         !msl_out.is_empty(),
         "{name}: MSL codegen produced empty output"
     );
+    module
 }
 
 #[test]
-fn globe_and_composite_shaders_compile_to_spv_hlsl_msl() {
-    validate_and_compile_all_backends("globe.wgsl", GLOBE_WGSL);
-    validate_and_compile_all_backends("overlay.wgsl", OVERLAY_WGSL);
-    validate_and_compile_all_backends("composite.wgsl", COMPOSITE_WGSL);
+fn globe_overlay_and_composite_shaders_compile_and_match_rust_uniform_layouts() {
+    let globe = validate_and_compile_all_backends("globe.wgsl", GLOBE_WGSL);
+    let overlay = validate_and_compile_all_backends("overlay.wgsl", OVERLAY_WGSL);
+    let _composite = validate_and_compile_all_backends("composite.wgsl", COMPOSITE_WGSL);
+
+    let camera_members = &[
+        ("view_proj", 0),
+        ("grid_step_deg", 64),
+        ("grid_width_px", 68),
+        ("polar_r_cap", 72),
+    ];
+    assert_struct_layout(&globe, "CameraUniform", 80, camera_members);
+    assert_struct_layout(&overlay, "CameraUniform", 80, camera_members);
+    assert_struct_layout(
+        &globe,
+        "TileUniform",
+        48,
+        &[
+            ("offset_eye", 0),
+            ("tile_kind", 12),
+            ("uv_rect", 16),
+            ("grid_anchor", 32),
+        ],
+    );
+    assert_struct_layout(
+        &overlay,
+        "OverlayPatchUniform",
+        32,
+        &[("offset_eye", 0), ("opacity", 12), ("uv_rect", 16)],
+    );
 }

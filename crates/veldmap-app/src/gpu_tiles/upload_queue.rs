@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use veldmap_core::sync::lock_unpoisoned;
+use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::{DecodedTile, SourceId, TileKey};
 
 use super::gpu_cache::{GpuTileCache, UploadInsertOutcome};
@@ -193,6 +193,39 @@ pub struct UploadSender {
 }
 
 impl UploadSender {
+    /// Submit a decoded tile for GPU upload only if `cancel` has not been
+    /// triggered (checked both before and under the queue lock so concurrent
+    /// `cancel + clear_source` reloads cannot be raced by stale workers).
+    ///
+    /// Returns `Ok(true)` if admitted, `Ok(false)` if cancelled, or
+    /// `Err(UploadChannelClosed)` once [`PendingUploads::close`] has run.
+    pub fn send_if_uncancelled(
+        &self,
+        item: (TileKey, DecodedTile),
+        cancel: &CancelToken,
+    ) -> Result<bool, UploadChannelClosed> {
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
+        let (key, decoded) = item;
+        let mut to_drop = Vec::new();
+        let outcome = {
+            let mut state = lock_unpoisoned(&self.shared);
+            if state.closed {
+                to_drop.push(decoded);
+                Err(UploadChannelClosed)
+            } else if cancel.is_cancelled() {
+                to_drop.push(decoded);
+                Ok(false)
+            } else {
+                state.insert_and_bound(key, decoded, &mut to_drop);
+                Ok(true)
+            }
+        };
+        drop(to_drop);
+        outcome
+    }
+
     /// Submit a decoded tile for GPU upload.
     ///
     /// Returns `Err(UploadChannelClosed)` once [`PendingUploads::close`] has

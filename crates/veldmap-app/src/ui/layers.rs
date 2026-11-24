@@ -1,4 +1,4 @@
-//! Action-only Layer List panel and minimal File Open trigger for local
+//! Collapsible Layer List side panel and minimal File Open trigger for local
 //! GeoTIFF/BigTIFF/COG overlays.
 
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ pub(crate) enum LayerUiAction {
 pub(crate) struct LayersPanelState {
     pub(crate) open: bool,
     pub(crate) open_prompt_visible: bool,
+    focus_path_input: bool,
     pub(crate) path_input: String,
     pub(crate) error: Option<String>,
 }
@@ -35,12 +36,19 @@ impl LayersPanelState {
     pub(crate) fn show_open_prompt(&mut self) {
         self.open = true;
         self.open_prompt_visible = true;
+        self.focus_path_input = true;
         self.error = None;
     }
 
-    pub(crate) fn set_error(&mut self, msg: String) {
+    pub(crate) fn push_error(&mut self, msg: String) {
         self.open = true;
-        self.error = Some(msg);
+        match &mut self.error {
+            Some(existing) if !existing.is_empty() => {
+                existing.push('\n');
+                existing.push_str(&msg);
+            }
+            slot => *slot = Some(msg),
+        }
     }
 
     pub(crate) fn clear_error(&mut self) {
@@ -77,6 +85,9 @@ pub(crate) fn show_layers_panel(
                         .clicked()
                     {
                         state.open_prompt_visible = !state.open_prompt_visible;
+                        if state.open_prompt_visible {
+                            state.focus_path_input = true;
+                        }
                     }
                 });
             });
@@ -87,15 +98,19 @@ pub(crate) fn show_layers_panel(
                 ui.horizontal(|ui| {
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut state.path_input)
-                            .desired_width(ui.available_width() - 56.0)
+                            .desired_width((ui.available_width() - 56.0).max(120.0))
                             .hint_text("/path/to/orthophoto.tif"),
                     );
+                    if state.focus_path_input {
+                        resp.request_focus();
+                        state.focus_path_input = false;
+                    }
                     if resp.changed() {
                         state.error = None;
                     }
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Load").clicked() || enter {
-                        let trimmed = state.path_input.trim().trim_matches('"');
+                        let trimmed = state.path_input.trim().trim_matches(['"', '\'']);
                         if !trimmed.is_empty() {
                             actions.push(LayerUiAction::OpenPath(PathBuf::from(trimmed)));
                         }
@@ -120,74 +135,90 @@ pub(crate) fn show_layers_panel(
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                // Display top-to-bottom (reverse of painter's order).
+                // Display top-to-bottom (reverse of painter's order), keyed
+                // strictly by `LayerId` so removals never shift widget state.
                 for layer in layers.iter().rev() {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            let mut visible = layer.visible;
-                            if ui.checkbox(&mut visible, "").changed() {
-                                actions.push(LayerUiAction::ToggleVisibility(layer.id, visible));
-                            }
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&layer.name).strong())
-                                    .truncate(),
-                            )
-                            .on_hover_text(layer.path.display().to_string());
-                        });
+                    ui.push_id(layer.id, |ui| {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                let mut visible = layer.visible;
+                                if ui.checkbox(&mut visible, "").changed() {
+                                    actions
+                                        .push(LayerUiAction::ToggleVisibility(layer.id, visible));
+                                }
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(&layer.name).strong())
+                                        .truncate(),
+                                )
+                                .on_hover_text(layer.path.display().to_string());
+                            });
 
-                        let px_label = match layer.source_pixel_size_m {
-                            Some((mx, _)) => format!(
-                                "{}×{} · {}",
-                                layer.width,
-                                layer.height,
-                                hud::format_resolution(mx)
-                            ),
-                            None => format!("{}×{}", layer.width, layer.height),
-                        };
-                        ui.horizontal(|ui| {
-                            ui.weak(egui::RichText::new(px_label).small());
-                            if layer.pass_active || layer.in_flight > 0 {
-                                ui.weak(egui::RichText::new("· loading…").small());
-                            }
-                        });
+                            let px_label = match layer.source_pixel_size_m {
+                                Some((mx, my)) => format!(
+                                    "{}×{} · {}",
+                                    layer.width,
+                                    layer.height,
+                                    hud::format_source_pixel_size(mx, my)
+                                ),
+                                None => format!("{}×{}", layer.width, layer.height),
+                            };
+                            ui.horizontal(|ui| {
+                                ui.weak(egui::RichText::new(px_label).small());
+                                if layer.reloading {
+                                    ui.weak(egui::RichText::new("· reloading…").small());
+                                } else if layer.visible
+                                    && (layer.pass_active || layer.in_flight > 0)
+                                {
+                                    ui.weak(egui::RichText::new("· loading…").small());
+                                }
+                            });
 
-                        let mut opacity = layer.opacity;
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Opacity").small());
-                            if ui
-                                .add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false))
-                                .changed()
-                            {
-                                actions.push(LayerUiAction::SetOpacity(layer.id, opacity));
-                            }
-                            ui.monospace(
-                                egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small(),
-                            );
-                        });
+                            let mut opacity = layer.opacity;
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Opacity").small());
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut opacity, 0.0..=1.0)
+                                            .show_value(false),
+                                    )
+                                    .changed()
+                                {
+                                    actions.push(LayerUiAction::SetOpacity(layer.id, opacity));
+                                }
+                                ui.monospace(
+                                    egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small(),
+                                );
+                            });
 
-                        ui.horizontal(|ui| {
-                            if let Some(bounds) = layer.footprint
-                                && ui
-                                    .small_button("Zoom")
-                                    .on_hover_text("Fly camera to layer extent")
+                            ui.horizontal(|ui| {
+                                if let Some(bounds) = layer.footprint
+                                    && ui
+                                        .small_button("Zoom")
+                                        .on_hover_text("Fly camera to layer extent")
+                                        .clicked()
+                                {
+                                    actions.push(LayerUiAction::ZoomToExtent(bounds));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !layer.reloading,
+                                        egui::Button::new("Reload").small(),
+                                    )
+                                    .on_hover_text(
+                                        "Reload from disk (bypass fingerprint & tile cache)",
+                                    )
                                     .clicked()
-                            {
-                                actions.push(LayerUiAction::ZoomToExtent(bounds));
-                            }
-                            if ui
-                                .small_button("Reload")
-                                .on_hover_text("Reload from disk (bypass fingerprint & tile cache)")
-                                .clicked()
-                            {
-                                actions.push(LayerUiAction::ReloadBypassCache(layer.id));
-                            }
-                            if ui
-                                .small_button("Remove")
-                                .on_hover_text("Remove layer and free VRAM")
-                                .clicked()
-                            {
-                                actions.push(LayerUiAction::Remove(layer.id));
-                            }
+                                {
+                                    actions.push(LayerUiAction::ReloadBypassCache(layer.id));
+                                }
+                                if ui
+                                    .small_button("Remove")
+                                    .on_hover_text("Remove layer and free VRAM")
+                                    .clicked()
+                                {
+                                    actions.push(LayerUiAction::Remove(layer.id));
+                                }
+                            });
                         });
                     });
                     ui.add_space(4.0);

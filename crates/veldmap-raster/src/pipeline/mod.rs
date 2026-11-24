@@ -25,7 +25,7 @@ pub use metadata::{
     SampleType,
 };
 pub use plan::{LevelPlan, PassKey, PyramidMeta, ServeMode};
-pub use scheduler::{PassBusy, TileFailureOutcome, TileScheduler};
+pub use scheduler::{AdmittedTile, PassBusy, TileFailureOutcome, TileScheduler};
 pub use source::{RasterSource, frame_from_description};
 
 /// Shared runtime context passed into analytical raster decoding calls.

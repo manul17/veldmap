@@ -17,7 +17,7 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{
-    BandKey, DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, SourceId, TileScheme,
+    BandKey, DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, SourceId,
     TileStreamSpec,
 };
 
@@ -25,7 +25,7 @@ use crate::RasterError;
 use crate::pipeline::DecodeContext;
 use crate::pipeline::cascade::TileEmit;
 use crate::pipeline::driver::{self, DirectRead};
-use crate::pipeline::grid::{Grid, Overview};
+use crate::pipeline::grid::{Grid, Overview, chunk_working_bytes};
 use crate::pipeline::metadata::{BandInfo, RasterDescription, SampleType};
 use crate::pipeline::plan::{LevelPlan, PyramidMeta, build_chunked_level_table};
 use crate::pipeline::radiometry::{DisplayMapping, PixelLayout};
@@ -40,6 +40,12 @@ const BIG_MAGIC: [&[u8]; 2] = [b"II\x2b\x00", b"MM\x00\x2b"];
 
 /// Classic TIFF file header signatures (`version = 42`).
 const CLASSIC_MAGIC: [&[u8]; 2] = [b"II\x2a\x00", b"MM\x00\x2a"];
+
+/// Maximum decoded RGBA8 bytes allowed for a single base-IFD chunk during
+/// interactive cursor readouts (`16 MiB`, allowing up to `2048 x 2048` COG
+/// chunks and normal strips while refusing giant single-strip TIFFs on
+/// `fast_pool`).
+const MAX_CURSOR_CHUNK_RGBA_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Maximum number of IFD directories scanned during `open` to guard against
 /// malformed or pathological multi-IFD files.
@@ -210,10 +216,10 @@ impl TiffSource {
 
         let nodata_f64 = parse_gdal_nodata(&mut decoder, cancel)?;
         let nodata = nodata_f64.and_then(|v| {
-            if v.is_nan() {
+            if !v.is_finite() || v < f64::from(f32::MIN) || v > f64::from(f32::MAX) {
                 None
             } else {
-                Some(v.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32)
+                Some(v as f32)
             }
         });
 
@@ -339,16 +345,6 @@ impl TiffSource {
         &self.description.levels
     }
 
-    fn scheme(&self) -> TileScheme {
-        let max_level = self
-            .description
-            .levels
-            .len()
-            .saturating_sub(1)
-            .min(u8::MAX as usize) as u8;
-        TileScheme::RasterPyramid { max_level }
-    }
-
     fn display_mapping(&self, ctx: &DecodeContext<'_>) -> Result<DisplayMapping, RasterError> {
         self.stretch.get_or_compute(&StretchRequest {
             decoder_pool: &self.decoder_pool,
@@ -368,24 +364,7 @@ impl TiffSource {
         ty: u32,
         ctx: &DecodeContext<'_>,
     ) -> Result<DecodedTile, RasterError> {
-        let mut produced: Option<DecodedTile> = None;
-        self.produce_direct(
-            level,
-            &[(tx, ty)],
-            ctx,
-            &mut |_lvl, _x, _y, tw, th, rgba| {
-                let tile = DecodedTile::try_new(tw, th, PixelFormat::Rgba8UnormSrgb, rgba)
-                    .map_err(|e| RasterError::Decode(e.to_string()))?;
-                produced = Some(tile);
-                Ok(())
-            },
-        )?;
-        produced.ok_or_else(|| RasterError::TileOutOfRange {
-            scheme: self.scheme(),
-            level,
-            x: tx,
-            y: ty,
-        })
+        <Self as crate::pipeline::RasterSource>::decode_pointwise_tile(self, level, tx, ty, ctx)
     }
 
     /// Produce pointwise tiles `wants` at `level`, deduplicating source chunk
@@ -458,6 +437,10 @@ impl TiffSource {
 
     /// Zoom-invariant display RGBA8 pixel readout at native base pixel
     /// `(px, py)` (reads IFD `0` via `SharedChunkCache`).
+    ///
+    /// Returns [`RasterError::LimitExceeded`] without decoding if the base
+    /// chunk exceeds interactive chunk limits (preventing giant single-strip
+    /// TIFFs from stalling `fast_pool` on mouse hover).
     pub fn sample_display_rgba(
         &self,
         px: u32,
@@ -469,13 +452,42 @@ impl TiffSource {
         if px >= self.description.width || py >= self.description.height {
             return Ok(None);
         }
-        let (cw, ch) = self.grid.chunk;
-        let across = self.description.width.div_ceil(cw.max(1));
-        let cx = px / cw.max(1);
-        let cy = py / ch.max(1);
-        let chunk_index = cy.saturating_mul(across).saturating_add(cx);
-        let lx = px % cw.max(1);
-        let ly = py % ch.max(1);
+        let (cw, ch) = (self.grid.chunk.0.max(1), self.grid.chunk.1.max(1));
+        let across = self.description.width.div_ceil(cw);
+        let cx = px / cw;
+        let cy = py / ch;
+        let Some(chunk_index) = cy.checked_mul(across).and_then(|base| base.checked_add(cx)) else {
+            return Err(RasterError::Decode("chunk index overflow".to_owned()));
+        };
+        let lx = px % cw;
+        let ly = py % ch;
+
+        // Guard against giant untiled single-strip TIFFs BEFORE computing
+        // stretch stats or reading IFD 0 on `fast_pool`.
+        let dw = cw.min(self.description.width - cx * cw);
+        let dh = ch.min(self.description.height - cy * ch);
+        let rgba_bytes = u64::from(dw)
+            .saturating_mul(u64::from(dh))
+            .saturating_mul(4);
+        let rgba_cap =
+            (ctx.budget.decoded_chunk_cache_bytes as u64).min(MAX_CURSOR_CHUNK_RGBA_BYTES);
+        if rgba_bytes > rgba_cap {
+            return Err(RasterError::LimitExceeded {
+                width: dw,
+                height: dh,
+                estimated_bytes: rgba_bytes,
+                limit_bytes: rgba_cap,
+            });
+        }
+        let working_bytes = chunk_working_bytes(dw, dh, self.format.depth, true);
+        if working_bytes > ctx.budget.decode_working_bytes {
+            return Err(RasterError::LimitExceeded {
+                width: dw,
+                height: dh,
+                estimated_bytes: working_bytes,
+                limit_bytes: ctx.budget.decode_working_bytes,
+            });
+        }
 
         let mapping = self.display_mapping(ctx)?;
         let mut reader = TiffChunkReader::new(
@@ -537,16 +549,6 @@ impl crate::pipeline::RasterSource for TiffSource {
 
     fn produce_pass(&self, ctx: &DecodeContext<'_>, emit: TileEmit<'_>) -> Result<(), RasterError> {
         self.produce_pass(ctx, emit)
-    }
-
-    fn decode_pointwise_tile(
-        &self,
-        level: u8,
-        tx: u32,
-        ty: u32,
-        ctx: &DecodeContext<'_>,
-    ) -> Result<DecodedTile, RasterError> {
-        self.decode_pointwise_tile(level, tx, ty, ctx)
     }
 
     fn sample_display_rgba(

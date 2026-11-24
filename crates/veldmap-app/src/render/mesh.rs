@@ -229,6 +229,26 @@ impl TileVertex {
 /// Shared static triangle-list index buffer for every `grid_cells x grid_cells`
 /// quadtree tile (both main planetary tiles and adaptive Polar Stereographic
 /// cap tiles).
+/// Append triangle indices for an `n x n` row-major vertex grid
+/// (`(n + 1) x (n + 1)` vertices), flipping triangle winding when
+/// `flip_winding` is `true` so negative-determinant bindings still face outward.
+pub(super) fn push_grid_quad_indices(out: &mut Vec<u32>, n: u32, flip_winding: bool) {
+    let stride = n + 1;
+    for row in 0..n {
+        for col in 0..n {
+            let top = row * stride + col;
+            let bottom = top + stride;
+            if flip_winding {
+                out.extend_from_slice(&[top, top + 1, bottom]);
+                out.extend_from_slice(&[top + 1, bottom + 1, bottom]);
+            } else {
+                out.extend_from_slice(&[top, bottom, top + 1]);
+                out.extend_from_slice(&[top + 1, bottom, bottom + 1]);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct SharedTileIndices {
     pub(super) indices: Vec<u32>,
@@ -254,14 +274,7 @@ impl SharedTileIndices {
         let mut indices = Vec::with_capacity(surface_idx_count + skirt_idx_count);
 
         // 1. Surface quads (CCW outward when viewed from outside the ellipsoid).
-        for row in 0..n {
-            for col in 0..n {
-                let top = row * stride + col;
-                let bottom = top + stride;
-                indices.extend_from_slice(&[top, bottom, top + 1]);
-                indices.extend_from_slice(&[top + 1, bottom, bottom + 1]);
-            }
-        }
+        push_grid_quad_indices(&mut indices, n, false);
         let surface_end = indices.len() as u32;
 
         // Skirt vertex ring offsets immediately follow the surface vertices:

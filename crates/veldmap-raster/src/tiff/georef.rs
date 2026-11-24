@@ -193,6 +193,9 @@ fn usable_step(scale: &[f64]) -> bool {
 }
 
 pub(super) fn affine_from_matrix(matrix: &[f64], half: f64) -> Option<[f64; 6]> {
+    if matrix.len() != 16 {
+        return None;
+    }
     let a = matrix.get(..8)?;
     if !a.iter().all(|v| v.is_finite()) || a[0] * a[5] - a[1] * a[4] == 0.0 {
         return None;
@@ -208,6 +211,13 @@ pub(super) fn affine_from_matrix(matrix: &[f64], half: f64) -> Option<[f64; 6]> 
 }
 
 fn affine_from_tags(points: &[f64], scale: &[f64], matrix: &[f64], half: f64) -> Option<[f64; 6]> {
+    // Prefer `ModelTransformationTag` when it carries non-zero rotation/shear
+    // (which `ModelTiepointTag + ModelPixelScaleTag` cannot represent).
+    if let Some(mat_affine) = affine_from_matrix(matrix, half)
+        && (mat_affine[1] != 0.0 || mat_affine[3] != 0.0)
+    {
+        return Some(mat_affine);
+    }
     if let (Some(tie), true) = (points.get(..6), usable_step(scale)) {
         let affine = [
             scale[0],

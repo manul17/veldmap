@@ -806,8 +806,8 @@ fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
 #[test]
 fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() {
     use veldmap_core::geo::geodesy::{Geodetic, WGS84};
-    use veldmap_core::geo::overlay::{build_warp_patch, evaluate_warp_patch_ecef};
     use veldmap_core::geo::projection::Projection;
+    use veldmap_core::tile::{MIN_WARP_SEGMENTS, build_warp_patch};
     use veldmap_raster::{RasterSource, frame_from_description};
 
     let build_geotiff = |raster_type_key: u16| -> Vec<u8> {
@@ -900,12 +900,24 @@ fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() 
     let frame_area = frame_from_description(src_area.description()).expect("area frame");
     let frame_point = frame_from_description(src_point.description()).expect("point frame");
 
-    let patch_area = build_warp_patch(&frame_area, 64, 64, [0.0, 0.0, 64.0, 64.0]);
-    let patch_point = build_warp_patch(&frame_point, 64, 64, [0.0, 0.0, 64.0, 64.0]);
+    let patch_area = build_warp_patch(
+        &frame_area,
+        64,
+        64,
+        [0.0, 0.0, 64.0, 64.0],
+        MIN_WARP_SEGMENTS,
+    );
+    let patch_point = build_warp_patch(
+        &frame_point,
+        64,
+        64,
+        [0.0, 0.0, 64.0, 64.0],
+        MIN_WARP_SEGMENTS,
+    );
 
     let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
-    let geo_area = WGS84.from_ecef(evaluate_warp_patch_ecef(&patch_area, 0.0, 0.0));
-    let geo_point = WGS84.from_ecef(evaluate_warp_patch_ecef(&patch_point, 0.0, 0.0));
+    let geo_area = WGS84.from_ecef(patch_area.evaluate_ecef(0.0, 0.0).expect("area ul"));
+    let geo_point = WGS84.from_ecef(patch_point.evaluate_ecef(0.0, 0.0).expect("point ul"));
     let (ea, na) = utm37.from_geodetic(geo_area.lat_deg, geo_area.lon_deg);
     let (ep, np) = utm37.from_geodetic(geo_point.lat_deg, geo_point.lon_deg);
 
@@ -915,11 +927,9 @@ fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() 
     // PixelIsPoint shifts UL corner by exact (-0.5 px, +0.5 px) = (-5.0 m, +5.0 m).
     assert!((ep - 549_995.0).abs() < 0.002, "point easting={ep}");
     assert!((np - 5_250_005.0).abs() < 0.002, "point northing={np}");
-    let exact_pt_ul = WGS84.to_ecef(Geodetic::surface(
-        utm37.to_geodetic(549_995.0, 5_250_005.0).0,
-        utm37.to_geodetic(549_995.0, 5_250_005.0).1,
-    ));
-    let drawn_pt_ul = evaluate_warp_patch_ecef(&patch_point, 0.0, 0.0);
+    let (pt_lat, pt_lon) = utm37.to_geodetic(549_995.0, 5_250_005.0);
+    let exact_pt_ul = WGS84.to_ecef(Geodetic::surface(pt_lat, pt_lon));
+    let drawn_pt_ul = patch_point.evaluate_ecef(0.0, 0.0).expect("point ul");
     assert!(exact_pt_ul.distance(drawn_pt_ul) < 0.002);
 
     // Zoom-invariant native base-IFD display readout matches synthetic RGB pattern.
@@ -948,4 +958,44 @@ fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() 
             .expect("out of bounds"),
         None
     );
+
+    // Multi-chunk tiled COG readout: sample pixels in non-zero (cx, cy) tiles
+    // and verify the large-chunk guard rejects oversized single-chunk readouts.
+    let (cog_bytes, _, _) = build_tiled_cog(700, 600, 1);
+    let cog_src = TiffSource::open(
+        Arc::new(MemoryByteSource::new(Arc::from(cog_bytes.as_slice()))),
+        fake_fingerprint(&cog_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open multi-chunk cog");
+    let (cpx, cpy) = (610u32, 540u32);
+    let cog_expected = [
+        (cpx * 7 + cpy * 3) as u8,
+        (cpx ^ cpy) as u8,
+        ((cpx * cpy) / 97) as u8,
+        255,
+    ];
+    assert_eq!(
+        cog_src
+            .sample_display_rgba(cpx, cpy, &ctx)
+            .expect("sample multi-chunk cog"),
+        Some(cog_expected)
+    );
+
+    // Tight chunk cache budget triggers LimitExceeded before decoding on fast_pool.
+    let tiny_budget = MemoryBudget {
+        decoded_chunk_cache_bytes: 16 * 1024,
+        ..budget
+    };
+    let tiny_ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &tiny_budget,
+        cancel: &cancel,
+    };
+    assert!(matches!(
+        cog_src.sample_display_rgba(cpx, cpy, &tiny_ctx),
+        Err(RasterError::LimitExceeded { .. })
+    ));
 }

@@ -3417,6 +3417,7 @@ dependencies = [
  "pollster",
  "serde",
  "thiserror 2.0.21",
+ "tiff",
  "tracing",
  "tracing-subscriber",
  "veldmap-core",
@@ -3451,6 +3452,7 @@ name = "veldmap-raster"
 version = "0.1.0"
 dependencies = [
  "image",
+ "qoi",
  "thiserror 2.0.21",
  "tiff",
  "tracing",
@@ -3464,7 +3466,6 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "directories",
- "qoi",
  "rusqlite",
  "serde",
  "serde_json",

@@ -58,90 +58,52 @@ fn create_globe_pipeline(
     })
 }
 
-/// `PixelFormat`-partitioned cache of `Weak<GpuTile>`-guarded `wgpu::BindGroup`
-/// entries so filterable sRGB display tiles (`Rgba8UnormSrgb`), non-filterable
-/// scientific float tiles (`R32Float`), and unsigned integer categorical tiles
-/// (`R8Uint`/`R16Uint`) never share incompatible bind-group layouts.
+/// `Weak<GpuTile>`-guarded cache of `wgpu::BindGroup` entries for display
+/// textures, keyed by process-unique `GpuTile::tile_id` and guarded on
+/// `PixelFormat` so incompatible texture formats can never bind to the
+/// filterable sRGB layout.
 #[derive(Default)]
 pub(super) struct TileBindGroupCache {
-    rgba8_srgb: HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)>,
-    r32_float: HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)>,
-    r8_uint: HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)>,
-    r16_uint: HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)>,
+    entries: HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)>,
 }
 
 impl TileBindGroupCache {
-    fn map_for(&self, format: PixelFormat) -> &HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)> {
-        match format {
-            PixelFormat::Rgba8UnormSrgb => &self.rgba8_srgb,
-            PixelFormat::R32Float => &self.r32_float,
-            PixelFormat::R8Uint => &self.r8_uint,
-            PixelFormat::R16Uint => &self.r16_uint,
-        }
-    }
-
-    fn map_for_mut(
-        &mut self,
-        format: PixelFormat,
-    ) -> &mut HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)> {
-        match format {
-            PixelFormat::Rgba8UnormSrgb => &mut self.rgba8_srgb,
-            PixelFormat::R32Float => &mut self.r32_float,
-            PixelFormat::R8Uint => &mut self.r8_uint,
-            PixelFormat::R16Uint => &mut self.r16_uint,
-        }
-    }
-
-    /// Ensure a bind group matching `gpu_tile.format` exists for `gpu_tile`.
+    /// Ensure a bind group exists for `gpu_tile` when its format is
+    /// [`PixelFormat::Rgba8UnormSrgb`].
     pub(super) fn ensure(
         &mut self,
         device: &wgpu::Device,
         pipelines: &GlobePipelines,
         gpu_tile: &Arc<GpuTile>,
     ) {
-        let format = gpu_tile.format;
-        let map = self.map_for_mut(format);
-        let reuse = map.get(&gpu_tile.tile_id).is_some_and(|(weak, _)| {
-            weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
-        });
+        if gpu_tile.format != PixelFormat::Rgba8UnormSrgb {
+            return;
+        }
+        let reuse = self
+            .entries
+            .get(&gpu_tile.tile_id)
+            .is_some_and(|(weak, _)| {
+                weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
+            });
         if reuse {
             return;
         }
-        let bg = match format {
-            PixelFormat::Rgba8UnormSrgb => device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tile Rgba8UnormSrgb bind group"),
-                layout: &pipelines.tile_texture_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&gpu_tile.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&pipelines.tile_sampler),
-                    },
-                ],
-            }),
-            PixelFormat::R32Float => device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tile R32Float bind group"),
-                layout: &pipelines.float_texture_layout,
-                entries: &[wgpu::BindGroupEntry {
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tile Rgba8UnormSrgb bind group"),
+            layout: &pipelines.tile_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(&gpu_tile.view),
-                }],
-            }),
-            PixelFormat::R8Uint | PixelFormat::R16Uint => {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("tile Uint bind group"),
-                    layout: &pipelines.uint_texture_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&gpu_tile.view),
-                    }],
-                })
-            }
-        };
-        map.insert(gpu_tile.tile_id, (Arc::downgrade(gpu_tile), bg));
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&pipelines.tile_sampler),
+                },
+            ],
+        });
+        self.entries
+            .insert(gpu_tile.tile_id, (Arc::downgrade(gpu_tile), bg));
     }
 
     /// Look up the cached bind group for `gpu_tile` only if it matches the
@@ -151,30 +113,23 @@ impl TileBindGroupCache {
         gpu_tile: &Arc<GpuTile>,
         expected_format: PixelFormat,
     ) -> Option<&wgpu::BindGroup> {
-        if gpu_tile.format != expected_format {
+        if gpu_tile.format != expected_format || expected_format != PixelFormat::Rgba8UnormSrgb {
             return None;
         }
-        self.map_for(expected_format)
-            .get(&gpu_tile.tile_id)
-            .and_then(|(weak, bg)| {
-                (weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile)))
-                    .then_some(bg)
-            })
+        self.entries.get(&gpu_tile.tile_id).and_then(|(weak, bg)| {
+            (weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile)))
+                .then_some(bg)
+        })
     }
 
     /// Drop entries whose backing `GpuTile` has been evicted and released.
     pub(super) fn sweep_stale(&mut self) {
-        self.rgba8_srgb
-            .retain(|_, (weak, _)| weak.strong_count() > 0);
-        self.r32_float
-            .retain(|_, (weak, _)| weak.strong_count() > 0);
-        self.r8_uint.retain(|_, (weak, _)| weak.strong_count() > 0);
-        self.r16_uint.retain(|_, (weak, _)| weak.strong_count() > 0);
+        self.entries.retain(|_, (weak, _)| weak.strong_count() > 0);
     }
 
-    /// Total cached bind groups across all `PixelFormat` partitions.
+    /// Total cached bind groups.
     pub(super) fn len(&self) -> usize {
-        self.rgba8_srgb.len() + self.r32_float.len() + self.r8_uint.len() + self.r16_uint.len()
+        self.entries.len()
     }
 }
 
@@ -183,8 +138,6 @@ pub(super) struct GlobePipelines {
     pub(super) tile_uniform_layout: wgpu::BindGroupLayout,
     pub(super) overlay_uniform_layout: wgpu::BindGroupLayout,
     pub(super) tile_texture_layout: wgpu::BindGroupLayout,
-    pub(super) float_texture_layout: wgpu::BindGroupLayout,
-    pub(super) uint_texture_layout: wgpu::BindGroupLayout,
     pub(super) tile_sampler: wgpu::Sampler,
     pub(super) body_ellipsoid_pipeline: wgpu::RenderPipeline,
     pub(super) body_textured_pipeline: wgpu::RenderPipeline,
@@ -199,8 +152,6 @@ struct SharedLayouts {
     tile_uniform_layout: wgpu::BindGroupLayout,
     overlay_uniform_layout: wgpu::BindGroupLayout,
     tile_texture_layout: wgpu::BindGroupLayout,
-    float_texture_layout: wgpu::BindGroupLayout,
-    uint_texture_layout: wgpu::BindGroupLayout,
 }
 
 fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
@@ -274,41 +225,11 @@ fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
         ],
     });
 
-    let float_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("tile R32Float non-filterable texture layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        }],
-    });
-
-    let uint_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("tile Uint categorical texture layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Uint,
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        }],
-    });
-
     SharedLayouts {
         camera_layout,
         tile_uniform_layout,
         overlay_uniform_layout,
         tile_texture_layout,
-        float_texture_layout,
-        uint_texture_layout,
     }
 }
 
@@ -463,8 +384,7 @@ impl GlobePipelines {
         );
 
         // Post-body graticule runs inside the depth-less (`depth_stencil_attachment: None`)
-        // color pass so draped overlays and future interleaved analytical passes
-        // share the exact same color-only pass contract.
+        // color pass directly above draped raster overlays.
         let grid_pipeline = create_globe_pipeline(
             device,
             &globe_shader,
@@ -485,8 +405,6 @@ impl GlobePipelines {
             tile_uniform_layout: layouts.tile_uniform_layout,
             overlay_uniform_layout: layouts.overlay_uniform_layout,
             tile_texture_layout: layouts.tile_texture_layout,
-            float_texture_layout: layouts.float_texture_layout,
-            uint_texture_layout: layouts.uint_texture_layout,
             tile_sampler,
             body_ellipsoid_pipeline,
             body_textured_pipeline,

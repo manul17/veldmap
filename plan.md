@@ -54,26 +54,21 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 
 ##### Slice 3A-1b — GPU Warp-Mesh Draping, Accuracy Regression, QOI Cache & `old/` Retirement `[x]`
 - [x] **Multi-layer `LayerStack` & `DrawSnapshot` generalization (`veldmap-app`):**
-  - Added ordered `LayerStack` + `OverlayManager` inside `SceneState` and extended `DrawSnapshot` with ordered `DrawOverlayLayer` / `DrawOverlayPatch` entries.
-  - Aggregated `wanted_tiles`, `pinned_root_sources`, and proportional VRAM appetite weights across basemap + active visible overlays.
+  - Added modular `layers/` (`LayerStack`, `OverlayManager`, `OverlayRuntime`, `OverlayIoWorker`, `CursorProber`), extended `DrawSnapshot` with ordered `DrawOverlayLayer` / `DrawOverlayPatch` entries, and aggregated `wanted_tiles`, pinned roots, and proportional VRAM appetite weights across basemap + active overlays.
 - [x] **Renderer modularization, post-body depth-less pass & warp-mesh draping (`veldmap-app`, `veldmap-core`):**
-  - Extracted `render/overlay.rs` + `shaders/overlay.wgsl` out of `render/globe.rs` alongside a frame-wide `DynamicUniformArena` and `PixelFormat`-partitioned `TileBindGroupCache` / layouts (ready for `3B` non-filterable `R32Float` / `Uint`).
-  - Closed Pass 1 (`Depth32Float`, `StoreOp::Discard` + `TRANSIENT_ATTACHMENT`) after the opaque globe body and moved post-body overlays + procedural graticule into a **`depth_stencil_attachment: None` color pass (`LoadOp::Load`)**.
-  - Implemented top-down lazy `DVec3` culling balls (`OverlayCullTree`, preserving per-rung limb-culling margins) in `veldmap-core` and per-tile CPU `f64` RTC warp meshes (`MIN_WARP_SEGMENTS = 16` for `< 2 cm` at coarse UTM zone edges; automatic outward WGS84 normal winding flip for negative-determinant/south-up affines; exact CPU `f64` horizon-plane uniform `dot(in.world, horizon_towards) >= horizon_eye_margin`).
-- [x] **Thin `RasterSource` seam, minimal opener/layer list, HUD & accuracy regression:**
-  - Introduced format-agnostic `RasterSource` trait + `frame_from_description` + zoom-invariant `sample_display_rgba` in `veldmap-raster` over `TiffSource`.
-  - Wired CLI file arguments, OS drag-and-drop, minimal File Open trigger, Layer List panel (visibility, opacity, zoom-to-extent, reload/bypass cache, remove), `PassKey`-scoped `TileScheduler` on `TwoLaneDecodePool` (`fast()`/`bulk()`), proportional `< 50%` VRAM appetite sharing, and native Windows `GlobalMemoryStatusEx` RAM detection in `veldmap-storage/src/host.rs`.
-  - Labeled HUD **Viewport GSD** separately from **Source px** and added non-blocking zoom-invariant CPU RGB cursor readouts.
-  - Rebuilt `a_raster_lands_where_its_binding_puts_it` (all 5 UTM 37 benchmarks + Gauss-Krüger `EPSG:28407` + Southern Hemisphere `EPSG:32737` at `< 10⁻³ px`, `< 2 mm` native, `< 2 cm` pyramid) plus end-to-end `PixelIsArea` vs. `PixelIsPoint` (`GTRasterTypeGeoKey`) half-pixel placement tests.
+  - Added `render/overlay.rs` + `shaders/overlay.wgsl` with a frame-wide `DynamicUniformArena` and `depth_stencil_attachment: None` Pass 2 (`LoadOp::Load`) for overlays + procedural graticule.
+  - Kept `veldmap-core::geo::binding` (`Frame`, `TieGrid`, `BindingError`) acyclic beneath `veldmap-core::tile::overlay` (`5×5`-probe lazy `OverlayCullTree`, uniform per-level `level_segments`, per-cell CPU `f64` RTC warp meshes with outward winding flip and outward vertex normals for sag-safe `dot(in.normal, -in.world) <= 0.0` horizon clipping).
+- [x] **Display `RasterSource` seam, non-blocking opener/layer list, HUD & accuracy regression:**
+  - Introduced the 3A display `RasterSource` trait (to be generalized for typed multi-band tracks in Slice 3B) + `frame_from_description` + chunk-guarded `sample_display_rgba` over `TiffSource`.
+  - Wired non-blocking CLI/drag-and-drop/Open, Layer List (visibility, opacity, zoom-to-extent, reload/bypass cache, remove), versioned `PassKey`-scoped `TileScheduler` on `TwoLaneDecodePool`, linear-light overlay mipmaps, native Windows `GlobalMemoryStatusEx`, distinct `Viewport GSD` vs. `Source px` HUD labels, and non-blocking CPU RGB cursor readouts.
+  - Verified `a_raster_lands_where_its_binding_puts_it` (5 UTM 37 benchmarks + Gauss-Krüger `EPSG:28407` + UTM `EPSG:32737` + WebMercator) plus end-to-end `PixelIsArea` vs. `PixelIsPoint` half-pixel placement.
 - [x] **8-bit QOI disk cache & two-lane budget validation:**
-  - Added lossless QOI disk caching (`TileBlobEncoding::Qoi`, pure-Rust `qoi` crate, self-healing corrupt-entry purge) via `TileDiskCache::{put_qoi_rgba8, get_qoi_rgba8}`.
-  - Validated two-lane decode budgeting end-to-end (untiled stripped GeoTIFF `ServeMode::Pass` on `bulk()` never HoL-blocks tiled COG `ServeMode::Pointwise` on `fast()`).
+  - Added pure-Rust QOI display tile codec helpers (`veldmap-raster`) backed by ABA-safe, cancellation-checked batched SQLite caching (`veldmap-storage`), and validated two-lane `bulk`/`fast` isolation end-to-end.
 - [x] **Docs & complete `old/` retirement:**
-  - Updated `docs/decisions.md` (§8) and `docs/limitations.md`.
-  - Migrated remaining `3A-2` PNG/JPEG and v1.1 (`3C-1`, `4B`, `6`) legacy porting hazard checklists into `plan.md`, deleted `old/` completely, and removed all `old/` references and CI carve-outs.
+  - Updated `docs/decisions.md` (§8) and `docs/limitations.md`, migrated remaining `3A-2` / v1.1 hazard checklists into `plan.md`, deleted `old/`, and removed all `old/` references and CI carve-outs.
 - **Exit criteria:**
-  - *Automated CI:* `a_raster_lands_where_its_binding_puts_it` (all 5 UTM 37 benchmarks + 2nd CRS + `PixelIsArea`/`PixelIsPoint`), negative-determinant affine winding, exact horizon-plane limb test, COG `CountingByteSource` tests, memory-budget/singleflight/`TileScheduler` concurrency stress tests, `0` idle GPU re-render checks, and full 3-OS CI with `old/` removed pass.
-  - *Manual QA:* Local GeoTIFF/BigTIFF/COG and cm-scale drone orthophotos open via CLI/drag-and-drop/Open trigger, toggle/reorder/remove cleanly in the Layer List, and drape accurately with responsive zooming and bounded RAM/VRAM/disk.
+  - *Automated CI:* Accuracy benchmark + `PixelIsArea`/`PixelIsPoint`, south-up winding, `2 m` coarse-sag horizon facing & silhouette containment, multi-layer opacity/nodata/ancestor compositing, multi-level COG `OverlayManager` lifecycle/reload tests, `naga` uniform layout parity, and full 3-OS CI with `old/` removed pass.
+  - *Manual QA:* Local GeoTIFF/BigTIFF/COG and cm-scale drone orthophotos open cleanly via CLI/drag-and-drop/Open, toggle/reload/remove in the Layer List, and drape accurately with responsive zooming and bounded RAM/VRAM/disk.
 
 #### Slice 3A-2 — Local Workstation UX, Drone RGB Codecs, Expanded Pure-Rust CRS & GeoJSON Overlay `[ ]`
 - [ ] **Workstation UI/tools, navigation & minimal session persistence (`veldmap-app`):**
@@ -220,5 +215,5 @@ Audited safety, correctness, and architecture hazards preserved from retired `ol
 
 ## Next Step
 
-- **Current state:** Phases 0–0.5, Slices 1, 2A, 2B, and **Slice 3A-1 (`3A-1a` + `3A-1b`)** are complete on `main` (`ByteSource`/`LocalFileSource`, sampled BLAKE3 `SourceFingerprint` + `LocalFingerprintCache`, cross-OS `detect_memory_budget` including Windows `GlobalMemoryStatusEx`, `RasterSource` + `TiffSource`, `SharedChunkCache`, `TwoLaneDecodePool`, `PassKey`-scoped `TileScheduler`, `LayerStack`/`OverlayManager`, depth-less Pass 2 post-body warp-mesh draping with `DynamicUniformArena` + `PixelFormat`-partitioned bind-group caches + exact CPU `f64` horizon-plane uniform + lazy `DVec3` culling balls, CLI/drag-and-drop/Open/Layer List/HUD RGB cursor readout, QOI disk cache, full accuracy regression, and complete `old/` retirement; see [Design Decisions](docs/decisions.md)).
+- **Current state:** Phases 0–0.5 and Slices 1, 2A, 2B, and **3A-1 (`3A-1a` + `3A-1b`)** are complete on `main` (see [Design Decisions](docs/decisions.md) for settled invariants).
 - **Immediate task:** Start **Slice 3A-2 — Local Workstation UX, Drone RGB Codecs, Expanded Pure-Rust CRS & GeoJSON Overlay** (`rfd` pure-Rust `xdg-portal` native picker, Layer Manager reorder/inspector/banners, manual heading rotation & keyboard pan/zoom, minimal local session persistence, `YCbCr`/`WebP` GeoTIFF + PNG/JPEG world-file/`.prj` adapters, expanded pure-Rust CRS & explicit Helmert sign conventions, Karney geodesic measurement + RFC 7946 GeoJSON export, and read-only GeoJSON overlay).

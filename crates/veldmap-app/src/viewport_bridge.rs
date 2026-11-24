@@ -1,5 +1,5 @@
 //! `egui_wgpu` viewport bridge ([`GlobePaintCallback`] and logical-to-physical
-//! viewport pixel mapping) extracted from `app.rs`.
+//! viewport pixel mapping).
 
 use std::sync::Arc;
 

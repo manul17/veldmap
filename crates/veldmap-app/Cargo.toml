@@ -30,6 +30,7 @@ wgpu.workspace = true
 glam.workspace = true
 naga.workspace = true
 pollster.workspace = true
+tiff.workspace = true
 
 [lints]
 workspace = true
