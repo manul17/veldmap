@@ -442,5 +442,5 @@ fn collect_geometry_points(geom: &GeoJsonGeometry, out: &mut Vec<GeoPoint>) {
 }
 
 #[cfg(test)]
-#[path = "../geojson_tests.rs"]
+#[path = "geojson_tests.rs"]
 mod tests;

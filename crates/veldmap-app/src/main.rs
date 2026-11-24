@@ -18,6 +18,40 @@ fn init_tracing() {
 fn main() -> eframe::Result<()> {
     init_tracing();
 
+    let mut startup_files = Vec::new();
+    let mut positional_only = false;
+    for arg in std::env::args_os().skip(1) {
+        if !positional_only && let Some(flag) = arg.to_str() {
+            if flag == "--" {
+                positional_only = true;
+                continue;
+            }
+            if flag == "-h" || flag == "--help" {
+                println!(
+                    "Usage: veldmap [OPTIONS] [RASTER_OR_GEOJSON_PATH...]\n\
+                     \n\
+                     Supported files: GeoTIFF/BigTIFF/COG, PNG/JPEG (with world-file/.prj sidecars), GeoJSON.\n\
+                     \n\
+                     Options:\n\
+                       -h, --help     Print this help message\n\
+                       -V, --version  Print version information\n\
+                       --             Treat remaining arguments as file paths"
+                );
+                return Ok(());
+            }
+            if flag == "-V" || flag == "--version" {
+                println!("{} {}", veldmap_core::APP_NAME, env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            // Skip unknown flags and macOS Finder launch arguments (`-psn_*`).
+            if flag.starts_with('-') {
+                tracing::warn!(flag, "Ignoring unrecognized CLI flag");
+                continue;
+            }
+        }
+        startup_files.push(std::path::PathBuf::from(arg));
+    }
+
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -34,27 +68,6 @@ fn main() -> eframe::Result<()> {
             power_preference = ?setup.power_preference,
             "Starting VeldMap"
         );
-    }
-
-    let mut startup_files = Vec::new();
-    let mut positional_only = false;
-    for arg in std::env::args_os().skip(1) {
-        if !positional_only && let Some(flag) = arg.to_str() {
-            if flag == "--" {
-                positional_only = true;
-                continue;
-            }
-            if flag == "-h" || flag == "--help" {
-                println!("Usage: veldmap [OPTIONS] [GEOTIFF_OR_COG_PATH...]");
-                return Ok(());
-            }
-            // Skip unknown flags and macOS Finder launch arguments (`-psn_*`).
-            if flag.starts_with('-') {
-                tracing::warn!(flag, "Ignoring unrecognized CLI flag");
-                continue;
-            }
-        }
-        startup_files.push(std::path::PathBuf::from(arg));
     }
 
     eframe::run_native(

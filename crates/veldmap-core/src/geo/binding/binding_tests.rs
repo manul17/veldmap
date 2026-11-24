@@ -322,3 +322,52 @@ fn foreign_datum_geographic_frame_shifts_to_wgs84_and_inverts_cleanly() {
     assert!((fx - 0.5).abs() < 1e-6);
     assert!((fy - 0.5).abs() < 1e-6);
 }
+
+#[test]
+fn crs_pixel_affine_geographic_handles_pole_touching_pixel_is_point_and_360_domain() {
+    use super::super::crs::CrsSpec;
+
+    let wgs84 = CrsSpec::from_epsg(4326).expect("EPSG:4326");
+
+    // 3601x1801 PixelIsPoint [-180, 180] x [-90, 90] (0.1 deg spacing):
+    // top-left pixel edge sits at (-180.05, +90.05) so pixel (0, 0) center is (-180, +90).
+    let affine_pm180 = [0.1, 0.0, -180.05, 0.0, -0.1, 90.05];
+    let frame_pm180 = Frame::from_crs_pixel_affine(&wgs84, affine_pm180, 3601, 1801)
+        .expect("pole-touching [-180, 180] PixelIsPoint frame");
+    assert!(frame_pm180.axial());
+    assert!(frame_pm180.measurable());
+    let (lat_c0, lon_c0) = frame_pm180.geodetic(0.5 / 3601.0, 0.5 / 1801.0);
+    assert!(
+        (lat_c0 - 90.0).abs() < 1e-12,
+        "top pixel center lat={lat_c0}"
+    );
+    assert!(
+        (lon_c0 - -180.0).abs() < 1e-12,
+        "left pixel center lon={lon_c0}"
+    );
+    // Interior row (row 10 -> lat = +89.0) must not be compressed by pole clamping.
+    let (lat_r10, _) = frame_pm180.geodetic(1800.5 / 3601.0, 10.5 / 1801.0);
+    assert!((lat_r10 - 89.0).abs() < 1e-12, "row 10 lat={lat_r10}");
+    assert_eq!(frame_pm180.geodetic(0.0, 0.0).0, 90.0);
+    assert_eq!(frame_pm180.geodetic(1.0, 1.0).0, -90.0);
+
+    // 3601x1801 PixelIsPoint [0, 360] x [-90, 90] (top-left edge lon = -0.05, right edge = 360.05).
+    let affine_360 = [0.1, 0.0, -0.05, 0.0, -0.1, 90.05];
+    let frame_360 = Frame::from_crs_pixel_affine(&wgs84, affine_360, 3601, 1801)
+        .expect("pole-touching [0, 360] PixelIsPoint frame");
+    let (lat_r, lon_r) = frame_360.geodetic(3600.5 / 3601.0, 900.5 / 1801.0);
+    assert!(lat_r.abs() < 1e-12);
+    assert!(
+        (lon_r - 360.0).abs() < 1e-12,
+        "right pixel center lon={lon_r}"
+    );
+
+    // Standard 3600x1800 PixelIsArea [-180, 180] x [-90, 90] retains exact corners.
+    let affine_area = [0.1, 0.0, -180.0, 0.0, -0.1, 90.0];
+    let frame_area = Frame::from_crs_pixel_affine(&wgs84, affine_area, 3600, 1800)
+        .expect("global PixelIsArea frame");
+    let (lat_tl, lon_tl) = frame_area.geodetic(0.0, 0.0);
+    let (lat_br, lon_br) = frame_area.geodetic(1.0, 1.0);
+    assert!((lat_tl - 90.0).abs() < 1e-12 && (lon_tl - -180.0).abs() < 1e-12);
+    assert!((lat_br - -90.0).abs() < 1e-12 && (lon_br - 180.0).abs() < 1e-12);
+}
