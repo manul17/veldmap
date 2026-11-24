@@ -7,6 +7,7 @@ mod disk;
 mod dispatch;
 mod failures;
 mod guards;
+mod in_flight;
 mod queue;
 mod state;
 mod workers;

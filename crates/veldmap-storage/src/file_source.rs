@@ -4,7 +4,9 @@
 
 use std::fs::{File, Metadata};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 #[cfg(not(unix))]
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
@@ -15,6 +17,18 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::sync::lock_unpoisoned;
 
 use crate::StorageError;
+
+/// Verify that `meta` describes a regular file, rejecting directories, FIFOs,
+/// and device nodes with a consistent [`StorageError::InvalidPath`].
+pub(crate) fn ensure_regular_file(meta: &Metadata, path: &Path) -> Result<(), StorageError> {
+    if !meta.is_file() {
+        return Err(StorageError::InvalidPath(format!(
+            "'{}' is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Maximum idle read-only `File` handles cached per [`LocalFileSource`] on
 /// platforms where positioned reads mutate the kernel file pointer.
@@ -28,6 +42,7 @@ const MAX_POOLED_HANDLES: usize = 8;
 /// path-reopen inode skew. On Windows/other platforms, pools read-only `File`
 /// handles without holding the pool lock across disk I/O.
 pub struct LocalFileSource {
+    #[cfg(not(unix))]
     path: PathBuf,
     len: u64,
     mtime_ns: Option<i128>,
@@ -44,23 +59,14 @@ impl LocalFileSource {
         // Check regular-file status before `File::open` so Windows directories
         // report `InvalidPath` (not `PermissionDenied`) and Unix FIFOs do not block.
         let path_meta = std::fs::metadata(path_ref)?;
-        if !path_meta.is_file() {
-            return Err(StorageError::InvalidPath(format!(
-                "'{}' is not a regular file",
-                path_ref.display()
-            )));
-        }
+        ensure_regular_file(&path_meta, path_ref)?;
         let file = File::open(path_ref)?;
         let meta = file.metadata()?;
-        if !meta.is_file() {
-            return Err(StorageError::InvalidPath(format!(
-                "'{}' is not a regular file",
-                path_ref.display()
-            )));
-        }
+        ensure_regular_file(&meta, path_ref)?;
         let len = meta.len();
         let mtime_ns = metadata_mtime_ns(&meta);
         Ok(Self {
+            #[cfg(not(unix))]
             path: path_ref.to_path_buf(),
             len,
             mtime_ns,
@@ -71,14 +77,9 @@ impl LocalFileSource {
         })
     }
 
-    /// Underlying file path.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Last-modified timestamp in nanoseconds relative to `UNIX_EPOCH`, if
     /// available on this platform/filesystem.
-    pub const fn mtime_ns(&self) -> Option<i128> {
+    pub(crate) const fn mtime_ns(&self) -> Option<i128> {
         self.mtime_ns
     }
 

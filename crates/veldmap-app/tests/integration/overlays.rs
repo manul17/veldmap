@@ -6,14 +6,12 @@
 
 use std::sync::Arc;
 
-use veldmap_app::gpu_tiles::GpuTileCache;
+use veldmap_app::gpu_tiles::{GpuTile, GpuTileCache};
 use veldmap_app::render::{
     DrawOverlayLayer, DrawOverlayPatch, DrawSnapshot, GlobeRenderer, OverlayMeshKey, RenderParams,
     SnapshotBuildParams,
 };
-use veldmap_core::geo::Frame;
-use veldmap_core::geo::camera::Camera;
-use veldmap_core::geo::projection::Projection;
+use veldmap_core::geo::{Camera, Frame, Projection};
 use veldmap_core::tile::{
     BandKey, DecodedTile, MIN_WARP_SEGMENTS, PixelFormat, QuadtreeConfig, SourceId, TileKey,
     TileScheme, build_warp_patch, level_segments,
@@ -23,6 +21,55 @@ use crate::common::{
     is_clear_background, pixel_at, render_srgb, render_with, shared_headless_device,
 };
 
+fn build_empty_snapshot(
+    camera: Camera,
+    width_px: u32,
+    height_px: u32,
+    config: &QuadtreeConfig,
+) -> DrawSnapshot {
+    DrawSnapshot::build(
+        SnapshotBuildParams {
+            camera,
+            width_px,
+            height_px,
+            pixels_per_point: 1.0,
+            show_graticule: false,
+            config,
+        },
+        None,
+    )
+}
+
+fn single_patch_layer(
+    frame: &Arc<Frame>,
+    source: SourceId,
+    relaid: u64,
+    segments: u32,
+    opacity: f32,
+    uv_rect: [f32; 4],
+    texture: Arc<GpuTile>,
+) -> DrawOverlayLayer {
+    DrawOverlayLayer {
+        opacity,
+        frame: Arc::clone(frame),
+        image_width: 512,
+        image_height: 512,
+        segments,
+        patches: vec![DrawOverlayPatch {
+            mesh_key: OverlayMeshKey {
+                source,
+                relaid,
+                level: 0,
+                x: 0,
+                y: 0,
+            },
+            cell_rect: [0.0, 0.0, 512.0, 512.0],
+            uv_rect,
+            texture,
+        }],
+    }
+}
+
 fn upload_overlay_tile(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -31,7 +78,7 @@ fn upload_overlay_tile(
     w: u32,
     h: u32,
     mut pixel_fn: impl FnMut(u32, u32) -> [u8; 4],
-) -> (TileKey, Arc<veldmap_app::gpu_tiles::GpuTile>) {
+) -> (TileKey, Arc<GpuTile>) {
     let key = TileKey {
         source,
         band: BandKey::Display,
@@ -104,37 +151,17 @@ fn overlay_warp_mesh_drapes_with_south_up_winding_graticule_on_top_and_zero_idle
         let warp = build_warp_patch(frame, 512, 512, [0.0, 0.0, 512.0, 512.0], segs);
         assert_eq!(warp.flip_winding, expected_flip);
 
-        let mut snap = DrawSnapshot::build(
-            SnapshotBuildParams {
-                camera: cam,
-                width_px: width,
-                height_px: height,
-                pixels_per_point: 1.0,
-                show_graticule: false,
-                config: &config,
-            },
-            None,
-        );
+        let mut snap = build_empty_snapshot(cam, width, height, &config);
         snap.carrier_keys.insert(tile_key);
-        snap.overlays.push(DrawOverlayLayer {
-            opacity: 1.0,
-            frame: Arc::clone(frame),
-            image_width: 512,
-            image_height: 512,
-            segments: segs,
-            patches: vec![DrawOverlayPatch {
-                mesh_key: OverlayMeshKey {
-                    source: src,
-                    relaid: 1,
-                    level: 0,
-                    x: 0,
-                    y: 0,
-                },
-                cell_rect: [0.0, 0.0, 512.0, 512.0],
-                uv_rect: [0.0, 0.0, 1.0, 1.0],
-                texture: Arc::clone(&gpu_tile),
-            }],
-        });
+        snap.overlays.push(single_patch_layer(
+            frame,
+            src,
+            1,
+            segs,
+            1.0,
+            [0.0, 0.0, 1.0, 1.0],
+            Arc::clone(&gpu_tile),
+        ));
         let snap = Arc::new(snap);
 
         let pixels = render_srgb(&mut renderer, device, queue, width, height, &snap);
@@ -210,37 +237,17 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
     // where radial chord sag is maximized (~121 m >> 2 m altitude).
     let half_step = 10.0 / f64::from(segs_coarse) * 0.5;
     let cam_2m = Camera::at(half_step, half_step, 2.0);
-    let mut snap_2m = DrawSnapshot::build(
-        SnapshotBuildParams {
-            camera: cam_2m,
-            width_px: width,
-            height_px: height,
-            pixels_per_point: 1.0,
-            show_graticule: false,
-            config: &config,
-        },
-        None,
-    );
+    let mut snap_2m = build_empty_snapshot(cam_2m, width, height, &config);
     snap_2m.carrier_keys.insert(k_coarse);
-    snap_2m.overlays.push(DrawOverlayLayer {
-        opacity: 1.0,
-        frame: Arc::clone(&coarse_frame),
-        image_width: 512,
-        image_height: 512,
-        segments: segs_coarse,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_coarse,
-                relaid: 1,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture: tex_coarse,
-        }],
-    });
+    snap_2m.overlays.push(single_patch_layer(
+        &coarse_frame,
+        src_coarse,
+        1,
+        segs_coarse,
+        1.0,
+        [0.0, 0.0, 1.0, 1.0],
+        tex_coarse,
+    ));
     let pixels_2m = render_srgb(
         &mut renderer,
         device,
@@ -262,17 +269,7 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
     //    globe-only baseline render so ANY leak outside the globe silhouette
     //    (not just the 4 corners) fails immediately.
     let cam_orbit = Camera::at(0.0, 0.0, 12_000_000.0);
-    let base_snap = Arc::new(DrawSnapshot::build(
-        SnapshotBuildParams {
-            camera: cam_orbit,
-            width_px: width,
-            height_px: height,
-            pixels_per_point: 1.0,
-            show_graticule: false,
-            config: &config,
-        },
-        None,
-    ));
+    let base_snap = Arc::new(build_empty_snapshot(cam_orbit, width, height, &config));
     let baseline = render_srgb(&mut renderer, device, queue, width, height, &base_snap);
 
     let limb_frame = Arc::new(
@@ -287,25 +284,15 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
     let segs_limb = level_segments(&limb_frame, 512, 512, 0);
     let mut limb_snap = (*base_snap).clone();
     limb_snap.carrier_keys.insert(k_limb);
-    limb_snap.overlays.push(DrawOverlayLayer {
-        opacity: 1.0,
-        frame: limb_frame,
-        image_width: 512,
-        image_height: 512,
-        segments: segs_limb,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_limb,
-                relaid: 2,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture: tex_limb,
-        }],
-    });
+    limb_snap.overlays.push(single_patch_layer(
+        &limb_frame,
+        src_limb,
+        2,
+        segs_limb,
+        1.0,
+        [0.0, 0.0, 1.0, 1.0],
+        tex_limb,
+    ));
     let limb_pixels = render_srgb(
         &mut renderer,
         device,
@@ -384,57 +371,27 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
             }
         });
 
-    let mut snap = DrawSnapshot::build(
-        SnapshotBuildParams {
-            camera: cam,
-            width_px: width,
-            height_px: height,
-            pixels_per_point: 1.0,
-            show_graticule: false,
-            config: &config,
-        },
-        None,
-    );
+    let mut snap = build_empty_snapshot(cam, width, height, &config);
     snap.carrier_keys.insert(k_bot);
     snap.carrier_keys.insert(k_top);
-    snap.overlays.push(DrawOverlayLayer {
-        opacity: 1.0,
-        frame: Arc::clone(&frame),
-        image_width: 512,
-        image_height: 512,
-        segments: MIN_WARP_SEGMENTS,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_bot,
-                relaid: 1,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.5, 0.0, 0.5, 1.0],
-            texture: tex_bot,
-        }],
-    });
-    snap.overlays.push(DrawOverlayLayer {
-        opacity: 0.5,
-        frame: Arc::clone(&frame),
-        image_width: 512,
-        image_height: 512,
-        segments: MIN_WARP_SEGMENTS,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_top,
-                relaid: 2,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture: tex_top,
-        }],
-    });
+    snap.overlays.push(single_patch_layer(
+        &frame,
+        src_bot,
+        1,
+        MIN_WARP_SEGMENTS,
+        1.0,
+        [0.5, 0.0, 0.5, 1.0],
+        tex_bot,
+    ));
+    snap.overlays.push(single_patch_layer(
+        &frame,
+        src_top,
+        2,
+        MIN_WARP_SEGMENTS,
+        0.5,
+        [0.0, 0.0, 1.0, 1.0],
+        tex_top,
+    ));
 
     let pixels = render_srgb(&mut renderer, device, queue, width, height, &Arc::new(snap));
 

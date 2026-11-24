@@ -2,15 +2,15 @@
 //! nadir globe camera, frustum culling, chord sagitta helpers, and footprint
 //! hit-testing.
 
-pub mod binding;
+mod binding;
 pub mod camera;
-pub mod coords;
-pub mod cull;
+mod coords;
+mod cull;
 pub mod footprint;
 pub mod geodesy;
 pub mod mgrs;
 pub mod projection;
-pub mod sag;
+pub(crate) mod sag;
 
 pub use binding::{BindingError, Frame, Tie, TieGrid};
 pub use camera::Camera;

@@ -4,8 +4,6 @@
 //! ring edges so hit testing stays consistent across the antimeridian, around
 //! the poles, and for global parallel bands.
 
-use glam::DVec3;
-
 use super::{geodesy, sag};
 
 /// A latitude/longitude coordinate pair in WGS84 degrees.
@@ -39,7 +37,7 @@ pub struct FootprintBounds {
 /// Compute the spherical framing circle enclosing `rings`, or `None` if empty.
 pub fn frame(rings: &[Ring]) -> Option<FootprintBounds> {
     let first = rings.iter().flat_map(|ring| &ring.points).next()?;
-    let (lat, lon) = middle(points(rings)).unwrap_or((first.lat, first.lon));
+    let (lat, lon) = geodesy::spherical_centroid(points(rings)).unwrap_or((first.lat, first.lon));
     let radius_deg = points(rings)
         .map(|point| geodesy::separation((lat, lon), point))
         .fold(0.0, f64::max);
@@ -89,7 +87,8 @@ fn inside(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
     let traced = traced(&ring);
     let turned = turn(&traced, lat, lon);
     if turned.abs() > 180.0 {
-        let Some((centre_lat, centre_lon)) = middle(ring.iter().copied()) else {
+        let Some((centre_lat, centre_lon)) = geodesy::spherical_centroid(ring.iter().copied())
+        else {
             return true;
         };
         let centre_turn = turn(&traced, centre_lat, centre_lon);
@@ -111,12 +110,6 @@ fn inside(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
     }
 }
 
-/// Minimum longitude span treated as a full circle around the globe.
-///
-/// Pixel-centered global grids may fall half a pixel short of 360 degrees
-/// (for example `-179.9875 -> 179.9875`).
-pub(crate) const FULL_CIRCLE_DEG: f64 = 359.0;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Along {
     Parallel,
@@ -135,7 +128,7 @@ fn along(from: (f64, f64), to: (f64, f64)) -> Along {
 /// Signed longitude sweep along an edge, preserving full-circle bands while
 /// taking the shorter antimeridian branch for all other edges.
 fn sweep(from: (f64, f64), to: (f64, f64)) -> f64 {
-    if (to.1 - from.1).abs() >= FULL_CIRCLE_DEG {
+    if (to.1 - from.1).abs() >= geodesy::FULL_CIRCLE_DEG {
         to.1 - from.1
     } else {
         geodesy::unwind(from.1, to.1) - from.1
@@ -229,11 +222,11 @@ fn band_seam_cuts(places: &[(f64, f64)]) -> Vec<usize> {
         };
         let (opens, closes) = (places[first], places[(last + 1) % places.len()]);
         let lon_gap = geodesy::unwind(opens.1, closes.1) - opens.1;
-        if opens.0 != closes.0 || lon_gap.abs() > (geodesy::TURN_DEG - FULL_CIRCLE_DEG) {
+        if opens.0 != closes.0 || lon_gap.abs() > (geodesy::TURN_DEG - geodesy::FULL_CIRCLE_DEG) {
             return Vec::new();
         }
         let span: f64 = run.iter().map(|index| sweeps[*index]).sum();
-        if span.abs() >= FULL_CIRCLE_DEG {
+        if span.abs() >= geodesy::FULL_CIRCLE_DEG {
             carried = true;
         } else if span == 0.0 {
             continue;
@@ -251,11 +244,6 @@ fn turn(ring: &[(f64, f64)], lat: f64, lon: f64) -> f64 {
         turned += wrap(bearing(lat, lon, to.0, to.1) - bearing(lat, lon, from.0, from.1));
     }
     turned
-}
-
-fn middle(points: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
-    let sum: DVec3 = points.map(|(lat, lon)| geodesy::unit(lat, lon)).sum();
-    (sum.length() > 1e-9).then(|| geodesy::angles(sum.normalize()))
 }
 
 fn bearing(from_lat: f64, from_lon: f64, to_lat: f64, to_lon: f64) -> f64 {

@@ -5,7 +5,7 @@ use veldmap_core::budget::{DEFAULT_FALLBACK_HOST_RAM_BYTES, MemoryBudget};
 
 /// Probe physical host RAM in bytes using OS-specific facilities, returning
 /// `None` if unavailable on this platform.
-pub fn detect_host_ram_bytes() -> Option<u64> {
+fn detect_host_ram_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let contents = std::fs::read_to_string("/proc/meminfo").ok()?;

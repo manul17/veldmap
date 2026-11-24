@@ -1,8 +1,8 @@
+use glam::DVec3;
+
 use super::*;
-use crate::geo::camera::Camera;
-use crate::geo::geodesy::Geodetic;
-use crate::geo::projection::Projection;
-use crate::tile::level_count;
+use crate::geo::{Camera, Frame, Geodetic, Projection, WGS84};
+use crate::tile::{cell_image_rect, grid_dim, level_count};
 
 /// Measure the worst horizontal surface placement drift (in metres) across a
 /// dense sample grid inside `cell_rect` between the CPU `f64` RTC warp patch

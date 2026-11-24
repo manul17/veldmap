@@ -161,22 +161,6 @@ pub(super) fn upsert_tile_raw_in_tx(
     Ok((inserted_id, old, count_delta))
 }
 
-pub(super) fn upsert_tile_in_tx(
-    tx: &Transaction<'_>,
-    enc: &EncodedKey<'_>,
-    encoding: TileBlobEncoding,
-    payload: &[u8],
-    ts_ms: i64,
-) -> Result<(i64, u64, u64), rusqlite::Error> {
-    let new_bytes = payload.len() as u64;
-    let (inserted_id, old, count_delta) = upsert_tile_raw_in_tx(tx, enc, encoding, payload, ts_ms)?;
-    let (current_total, current_count) = read_cache_meta_totals(tx)?;
-    let updated_total = current_total.saturating_sub(old).saturating_add(new_bytes);
-    let updated_count = current_count.saturating_add(count_delta);
-    set_cache_meta_totals(tx, updated_total, updated_count)?;
-    Ok((inserted_id, updated_total, updated_count))
-}
-
 pub(super) fn flush_touches_in_tx(
     tx: &Transaction<'_>,
     touches: &HashMap<i64, i64>,
@@ -194,12 +178,6 @@ pub(super) fn flush_touches_in_tx(
     Ok(())
 }
 
-fn delete_meta_by_id(tx: &Transaction<'_>, tile_id: i64) -> Result<(), rusqlite::Error> {
-    let mut stmt = tx.prepare(DELETE_META_BY_ID_SQL)?;
-    stmt.execute(params![tile_id])?;
-    Ok(())
-}
-
 pub(super) fn delete_tile_in_tx(
     tx: &Transaction<'_>,
     enc: &EncodedKey<'_>,
@@ -207,7 +185,7 @@ pub(super) fn delete_tile_in_tx(
     let Some((tile_id, sz)) = select_meta_id_bytes(tx, enc)? else {
         return Ok(None);
     };
-    delete_meta_by_id(tx, tile_id)?;
+    delete_meta_ids(tx, &[tile_id])?;
     decrement_cache_meta(tx, sz, 1)?;
     Ok(Some(tile_id))
 }

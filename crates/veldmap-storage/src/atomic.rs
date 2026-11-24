@@ -84,7 +84,8 @@ fn rename_replace(tmp: &Path, target: &Path) -> std::io::Result<()> {
 /// data and metadata via `sync_all()`, **closes the `File` handle synchronously
 /// before renaming** (required on Windows), atomically renames over `path`,
 /// and best-effort fsyncs the parent directory on Unix.
-pub fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+#[cfg(test)]
+fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     write_atomic_impl(path, bytes, false)
 }
 
@@ -166,7 +167,8 @@ fn write_json_impl<T: Serialize>(
 }
 
 /// Serialize `value` as pretty JSON and persist it via [`write_atomic_durable`].
-pub fn write_json_durable<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
+#[cfg(test)]
+fn write_json_durable<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
     write_json_impl(path, value, false)
 }
 
@@ -180,7 +182,7 @@ pub fn write_json_durable_private<T: Serialize>(
 }
 
 /// Read JSON from `path`, returning `T::default()` if the file does not exist.
-pub fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, StorageError> {
+fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, StorageError> {
     match fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),

@@ -11,16 +11,13 @@ use std::ops::Range;
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::geodesy;
 use veldmap_core::tile::{
-    DEFAULT_GRID_CELLS, PlanetaryScheme, QuadTileId, TileCache, TileSurfaceSample, VisibleTile,
+    DEFAULT_GRID_CELLS, PlanetaryScheme, QuadTileId, TileSurfaceSample, VisibleTile,
     sample_tile_surface,
 };
 use wgpu::util::DeviceExt;
 
+use super::mesh_cache::{DEFAULT_MESH_CACHE_BYTES, ElasticMeshCache, push_grid_quad_indices};
 use super::snapshot::DrawTile;
-
-/// Default VRAM budget for cached per-tile geometry vertex buffers (`16 MiB`,
-/// ~1,000 cached `16 x 16` tiles).
-const DEFAULT_MESH_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) struct CachedTileMesh {
     pub(super) buffer: wgpu::Buffer,
@@ -34,7 +31,7 @@ pub(super) struct TileMeshCache {
     surface_indices: Range<u32>,
     full_indices: Range<u32>,
     index_buffer: wgpu::Buffer,
-    meshes: TileCache<QuadTileId, CachedTileMesh>,
+    meshes: ElasticMeshCache<QuadTileId, CachedTileMesh>,
 }
 
 impl TileMeshCache {
@@ -51,7 +48,7 @@ impl TileMeshCache {
             surface_indices: shared.surface,
             full_indices: shared.full,
             index_buffer,
-            meshes: TileCache::new(DEFAULT_MESH_CACHE_BYTES),
+            meshes: ElasticMeshCache::new(DEFAULT_MESH_CACHE_BYTES),
         }
     }
 
@@ -85,7 +82,7 @@ impl TileMeshCache {
             contents: bytemuck::cast_slice(&shared.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let _ = self.meshes.clear();
+        self.meshes.clear_and_reset_cap();
     }
 
     /// Ensure every tile in `tiles` has an uploaded vertex buffer without
@@ -102,18 +99,8 @@ impl TileMeshCache {
         let single_tile_bytes = (stride * stride + 4 * stride) * std::mem::size_of::<TileVertex>();
         let needed_bytes = tiles.len().saturating_mul(single_tile_bytes);
 
-        // Temporarily ensure the cap can hold every tile in the active frame so
-        // earlier draws in this snapshot are never evicted by later inserts.
-        let active_floor = needed_bytes.max(DEFAULT_MESH_CACHE_BYTES);
-        if active_floor > self.meshes.max_bytes() {
-            let _ = self.meshes.set_max_bytes(active_floor);
-        }
-
-        // Touch all already-cached current-frame meshes first so subsequent
-        // LRU evictions target strictly stale off-frame tiles.
-        for draw in tiles {
-            self.meshes.touch(&draw.visible.id);
-        }
+        self.meshes
+            .begin_frame(needed_bytes, tiles.iter().map(|draw| &draw.visible.id));
 
         for draw in tiles {
             let id = draw.visible.id;
@@ -127,7 +114,7 @@ impl TileMeshCache {
                 contents: bytemuck::cast_slice(&verts),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-            let _ = self.meshes.insert(
+            self.meshes.insert(
                 id,
                 CachedTileMesh {
                     buffer,
@@ -137,14 +124,20 @@ impl TileMeshCache {
             );
         }
 
-        // Shrink back toward `DEFAULT_MESH_CACHE_BYTES` when frame demand
-        // subsides, while never dipping below `needed_bytes` for the active frame.
-        let target_cap = needed_bytes.max(DEFAULT_MESH_CACHE_BYTES);
-        if target_cap < self.meshes.max_bytes() {
-            let _ = self.meshes.set_max_bytes(target_cap);
-        }
+        self.meshes.end_frame(needed_bytes);
     }
 }
+
+/// `TileUniform::tile_kind` tag for `Geodetic` / `WebMercator` tiles.
+pub(super) const TILE_KIND_GEO: f32 = 0.0;
+/// `TileUniform::tile_kind` tag for North PolarCap tiles near the pole.
+const TILE_KIND_POLAR_NORTH: f32 = 1.0;
+/// `TileUniform::tile_kind` tag for South PolarCap tiles near the pole.
+const TILE_KIND_POLAR_SOUTH: f32 = -1.0;
+/// Scale multiplier applied to `TILE_KIND_POLAR_*` (`±2.0`) when a PolarCap
+/// tile is strictly clear of the pole and uses cancellation-free relative
+/// longitude deltas in `shaders/globe.wgsl` (`abs(tile.tile_kind) > 1.5`).
+const TILE_KIND_POLAR_CLEAR_SCALE: f32 = 2.0;
 
 /// Cached tile-center `f64` graticule anchor sampled once during mesh build.
 #[derive(Clone, Copy, Debug, Default)]
@@ -189,6 +182,60 @@ impl TileGridAnchor {
     }
 }
 
+/// Compute per-tile `(tile_kind, grid_anchor)` uniform values from a cached
+/// [`TileGridAnchor`] so `GlobeRenderer` never re-samples `sample_tile_surface`
+/// on every dirty frame.
+pub(super) fn tile_graticule_uniform(
+    id: QuadTileId,
+    cached_anchor: Option<TileGridAnchor>,
+    step_deg: f64,
+) -> (f32, [f32; 4]) {
+    let anchor = cached_anchor.unwrap_or_else(|| TileGridAnchor::for_tile(id));
+    match id.scheme {
+        PlanetaryScheme::PolarCap { north } => {
+            let colat_phase = (90.0 - anchor.lat0.abs()).rem_euclid(step_deg);
+            let lon_phase = anchor.lon0.rem_euclid(step_deg);
+
+            // Use cancellation-free relative longitude deltas when the tile's
+            // disk center is strictly clear of the pole (`rho0 > 4 * tile_half_diag`).
+            let rho0 = anchor.dx0.hypot(anchor.dy0);
+            let n = f64::from(1u32 << id.level.min(30));
+            let tile_half_diag = std::f64::consts::SQRT_2 / n;
+            let clear_of_pole = id.level >= 2 && rho0 > 4.0 * tile_half_diag;
+            let sign = if north {
+                TILE_KIND_POLAR_NORTH
+            } else {
+                TILE_KIND_POLAR_SOUTH
+            };
+            let kind = if clear_of_pole {
+                sign * TILE_KIND_POLAR_CLEAR_SCALE
+            } else {
+                sign
+            };
+            (
+                kind,
+                [
+                    anchor.dx0 as f32,
+                    anchor.dy0 as f32,
+                    colat_phase as f32,
+                    lon_phase as f32,
+                ],
+            )
+        }
+        PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => {
+            // Wrap tile anchor phase modulo `grid_step_deg` in f64 on CPU so
+            // `f32` fragment arithmetic preserves sub-millimetre accuracy even
+            // at `2 m` altitude.
+            let lon_phase = anchor.lon0.rem_euclid(step_deg);
+            let lat_phase = anchor.lat0.rem_euclid(step_deg);
+            (
+                TILE_KIND_GEO,
+                [lon_phase as f32, lat_phase as f32, 0.0, 0.0],
+            )
+        }
+    }
+}
+
 /// Vertex layout shared by textured/untextured quadtree tiles and the
 /// post-overlay procedural graticule.
 #[repr(C)]
@@ -229,26 +276,6 @@ impl TileVertex {
 /// Shared static triangle-list index buffer for every `grid_cells x grid_cells`
 /// quadtree tile (both main planetary tiles and adaptive Polar Stereographic
 /// cap tiles).
-/// Append triangle indices for an `n x n` row-major vertex grid
-/// (`(n + 1) x (n + 1)` vertices), flipping triangle winding when
-/// `flip_winding` is `true` so negative-determinant bindings still face outward.
-pub(super) fn push_grid_quad_indices(out: &mut Vec<u32>, n: u32, flip_winding: bool) {
-    let stride = n + 1;
-    for row in 0..n {
-        for col in 0..n {
-            let top = row * stride + col;
-            let bottom = top + stride;
-            if flip_winding {
-                out.extend_from_slice(&[top, top + 1, bottom]);
-                out.extend_from_slice(&[top + 1, bottom + 1, bottom]);
-            } else {
-                out.extend_from_slice(&[top, bottom, top + 1]);
-                out.extend_from_slice(&[top + 1, bottom, bottom + 1]);
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(super) struct SharedTileIndices {
     pub(super) indices: Vec<u32>,

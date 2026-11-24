@@ -4,6 +4,10 @@ fn at(lat_deg: f64, lon_deg: f64, height_m: f64) -> Camera {
     Camera::at(lat_deg, lon_deg, height_m)
 }
 
+fn project(view_proj: &DMat4, point: DVec3, eye: DVec3) -> DVec4 {
+    *view_proj * (point - eye).extend(1.0)
+}
+
 #[test]
 fn the_frame_shape_reaches_the_matrix_unchanged() {
     let camera = at(45.0, 60.0, 10_000.0);

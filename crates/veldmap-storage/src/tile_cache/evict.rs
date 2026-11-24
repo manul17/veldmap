@@ -42,11 +42,7 @@ pub(super) fn evict_in_tx(
 ) -> Result<EvictionOutcome, rusqlite::Error> {
     if total_bytes <= max_bytes {
         return Ok(EvictionOutcome {
-            report: EvictionReport {
-                evicted_tiles: 0,
-                evicted_bytes: 0,
-                total_bytes_after: total_bytes,
-            },
+            report: EvictionReport::unchanged(total_bytes),
             evicted_ids: Vec::new(),
         });
     }

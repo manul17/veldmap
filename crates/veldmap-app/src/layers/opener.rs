@@ -1,7 +1,7 @@
 //! Format-dispatching local raster opener seam (`open_local_raster`).
 //!
 //! Isolates file fingerprinting, `ByteSource` construction, codec selection, and
-//! georeference `Frame` binding from [`super::runtime::OverlayIoWorker`] so
+//! georeference `Frame` binding from [`super::io_worker::OverlayIoWorker`] so
 //! additional local formats (e.g. PNG/JPEG + world-file/`.prj` sidecars) plug
 //! in cleanly without coupling I/O worker lifecycle to individual decoders.
 

@@ -19,7 +19,7 @@ use crate::render::TileCarrierPolicy;
 ///   ancestors while streaming or offline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BasemapCarrierPolicy {
-    pub active_source: SourceId,
+    active_source: SourceId,
 }
 
 impl BasemapCarrierPolicy {
@@ -28,7 +28,7 @@ impl BasemapCarrierPolicy {
     }
 
     /// Primary [`TileKey`] serving `tex_id` under this basemap policy.
-    pub const fn primary_key(self, tex_id: QuadTileId) -> TileKey {
+    pub(crate) const fn primary_key(self, tex_id: QuadTileId) -> TileKey {
         if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. }) {
             bundled_tile_key(tex_id)
         } else {
@@ -38,7 +38,7 @@ impl BasemapCarrierPolicy {
 
     /// Optional offline bundled fallback [`TileKey`] when `primary_key(tex_id)`
     /// has no cached carrier in VRAM yet.
-    pub const fn fallback_key(self, tex_id: QuadTileId) -> Option<TileKey> {
+    pub(crate) const fn fallback_key(self, tex_id: QuadTileId) -> Option<TileKey> {
         if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. })
             || self.active_source.0 == SourceId::BUNDLED_BASEMAP.0
         {

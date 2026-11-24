@@ -6,15 +6,17 @@ use std::time::{Duration, Instant};
 use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::geo::camera::Camera;
+use veldmap_core::geo::Camera;
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{RASTER_TILE_SIZE, level_count};
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
+use veldmap_storage::test_support::TestTempDir;
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
-use crate::layers::{CursorReadoutValue, OverlayIoEvent, OverlayManager};
-use crate::test_support::TempTestRoot;
+use crate::layers::{
+    CursorReadout, CursorReadoutValue, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
+};
 
 /// Write a real multi-level tiled GeoTIFF COG (`width x height`, 512x512 tiles,
 /// `EPSG:32637`) to `path` filled with `rgb`.
@@ -97,10 +99,24 @@ fn wait_for_io_event(mgr: &mut OverlayManager) -> OverlayIoEvent {
     panic!("timed out waiting for overlay I/O event");
 }
 
+fn wait_for_cursor_readout(mgr: &OverlayManager, lat_deg: f64, lon_deg: f64) -> CursorReadout {
+    let _ = mgr.query_cursor_readout(lat_deg, lon_deg);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Some(readout) = mgr.query_cursor_readout(lat_deg, lon_deg)
+            && readout.value != CursorReadoutValue::Pending
+        {
+            return readout;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("timed out waiting for cursor readout");
+}
+
 #[test]
 fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_async_open_reload_and_cursor()
  {
-    let dir = TempTestRoot::new("cog-lifecycle");
+    let dir = TestTempDir::new("cog-lifecycle");
     let tif_path = dir.path().join("scene_2048.tif");
     write_tiled_geotiff_cog(&tif_path, 2048, 2048, [42, 128, 210]);
 
@@ -124,8 +140,8 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     let mut mgr = OverlayManager::new(
         &budget,
         Some(Arc::clone(&disk_cache)),
-        pool.handle().fast().clone(),
-        pool.handle().bulk().clone(),
+        pool.fast_handle(),
+        pool.bulk_handle(),
         done_tx,
         wakeup,
         shutdown.clone(),
@@ -148,17 +164,17 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     let mut gpu_cache = GpuTileCache::new(budget.gpu_tile_cache_bytes);
     let cam = Camera::at(bounds.lat, bounds.lon, 3_000.0);
     let mut carriers = std::collections::HashSet::new();
-    let total_weight = mgr.stack().total_appetite_weight_bytes().max(1);
-    let _ = mgr.build_and_schedule(
-        &cam,
-        1024,
-        1024,
-        &mut gpu_cache,
-        &pending,
-        total_weight,
-        &mut carriers,
-    );
-    let layer = &mgr.stack().layers()[0];
+    let total_weight = mgr.total_appetite_weight_bytes().max(1);
+    let _ = mgr.build_and_schedule(&mut OverlayFrameCtx {
+        camera: &cam,
+        width_px: 1024,
+        height_px: 1024,
+        gpu_cache: &mut gpu_cache,
+        pending: &pending,
+        total_appetite_weight: total_weight,
+        carrier_keys: &mut carriers,
+    });
+    let layer = &mgr.stack.layers()[0];
     assert_eq!(layer.meta.max_level(), 2);
     let has_lvl2 = layer.wanted.iter().any(|k| k.level == 2);
     let has_lvl1 = layer.wanted.iter().any(|k| k.level == 1);
@@ -188,20 +204,9 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     );
 
     // 3. Zoom-invariant CPU cursor readout resolves exact RGB [42, 128, 210, 255].
-    let _ = mgr.query_cursor_readout(bounds.lat, bounds.lon);
-    let cursor_deadline = Instant::now() + Duration::from_secs(5);
-    let mut resolved = None;
-    while Instant::now() < cursor_deadline {
-        if let Some(readout) = mgr.query_cursor_readout(bounds.lat, bounds.lon)
-            && readout.value != CursorReadoutValue::Pending
-        {
-            resolved = Some(readout);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let readout = resolved.expect("cursor readout resolved");
+    let readout = wait_for_cursor_readout(&mgr, bounds.lat, bounds.lon);
     assert_eq!(readout.value, CursorReadoutValue::Rgba([42, 128, 210, 255]));
+    assert!(mgr.topmost_visible_source_pixel_size_m().is_some());
 
     // 4. Reload bypass cache after modifying the TIFF on disk: clears old QOI
     //    cache off-UI-thread, switches to new RGB [200, 50, 10], and preserves visibility.
@@ -211,12 +216,17 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         .expect("queue reload");
     assert!(reload_mut.changed);
     assert!(mgr.layer_summaries()[0].reloading);
+    assert!(
+        mgr.topmost_visible_source_pixel_size_m().is_none(),
+        "reloading layer must not leak old source pixel size into HUD"
+    );
 
     match wait_for_io_event(&mut mgr) {
         OverlayIoEvent::Reloaded { id } => assert_eq!(id, layer_id),
         other => panic!("expected Reloaded event, got {other:?}"),
     }
     assert!(!mgr.layer_summaries()[0].reloading);
+    assert!(mgr.topmost_visible_source_pixel_size_m().is_some());
     assert_eq!(
         disk_cache.stats().expect("stats after reload").tile_count,
         0,
@@ -224,22 +234,8 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     );
 
     // Cursor readout after reload sees the updated pixel value [200, 50, 10, 255].
-    let _ = mgr.query_cursor_readout(bounds.lat, bounds.lon);
-    let cursor_deadline2 = Instant::now() + Duration::from_secs(5);
-    let mut resolved2 = None;
-    while Instant::now() < cursor_deadline2 {
-        if let Some(readout) = mgr.query_cursor_readout(bounds.lat, bounds.lon)
-            && readout.value != CursorReadoutValue::Pending
-        {
-            resolved2 = Some(readout);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(
-        resolved2.expect("post-reload cursor").value,
-        CursorReadoutValue::Rgba([200, 50, 10, 255])
-    );
+    let readout2 = wait_for_cursor_readout(&mgr, bounds.lat, bounds.lon);
+    assert_eq!(readout2.value, CursorReadoutValue::Rgba([200, 50, 10, 255]));
 
     // 5. Failed reload (after deleting file) leaves the existing layer intact.
     std::fs::remove_file(&tif_path).expect("remove tif");

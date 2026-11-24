@@ -6,6 +6,8 @@
 //! decoupled from `veldmap-storage` via [`TileBlobStore`], and stays decoupled
 //! from `veldmap-raster` codecs via [`TileDecodeExecutor`].
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use thiserror::Error;

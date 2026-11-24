@@ -3,8 +3,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use tiff::decoder::{Decoder, Limits};
-use veldmap_core::budget::DecodeBudgetTracker;
+use tiff::decoder::{Decoder, DecodingResult, Limits};
+use veldmap_core::budget::{BudgetLease, DecodeBudgetTracker};
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::SourceId;
@@ -37,6 +37,7 @@ pub(super) fn open_decoder(
 struct DecoderEntry {
     decoder: Decoder<BufferedByteReader>,
     aimed_image: Option<usize>,
+    aimed_chunk_count: Option<u64>,
 }
 
 /// Bounded pool of initialized `Decoder<BufferedByteReader>` instances so
@@ -60,6 +61,7 @@ impl DecoderPool {
             entries.push(DecoderEntry {
                 decoder,
                 aimed_image: Some(aimed_image),
+                aimed_chunk_count: None,
             });
         }
         Self {
@@ -84,6 +86,7 @@ impl DecoderPool {
             DecoderEntry {
                 decoder,
                 aimed_image: Some(0),
+                aimed_chunk_count: None,
             }
         };
         Ok(PooledDecoder {
@@ -94,11 +97,21 @@ impl DecoderPool {
     }
 }
 
+/// Decoded raw TIFF chunk held together with its active memory-budget lease so
+/// callers keep working-memory reservation alive until post-processing finishes.
+pub(super) struct BudgetedChunk {
+    pub(super) raw: DecodingResult,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    _lease: Option<BudgetLease>,
+}
+
 /// RAII checkout guard returning a clean `Decoder` to [`DecoderPool`] on drop
 /// with its `CancelToken` reset so cancelled requests never poison reuse.
 ///
-/// Any mutating operation (`decoder_mut`, `seek_to_image`) automatically marks
-/// the checkout dirty until the caller confirms success via [`Self::mark_clean`].
+/// Any mutating operation (`decoder_mut`, `seek_to_image`,
+/// `read_budgeted_chunk`) automatically marks the checkout dirty until the
+/// caller confirms success via [`Self::mark_clean`].
 pub(super) struct PooledDecoder<'a> {
     pool: &'a DecoderPool,
     entry: Option<DecoderEntry>,
@@ -110,13 +123,17 @@ impl PooledDecoder<'_> {
         self.clean = true;
     }
 
-    pub(super) fn decoder_mut(&mut self) -> &mut Decoder<BufferedByteReader> {
-        self.clean = false;
+    fn entry_mut(&mut self) -> &mut DecoderEntry {
         #[expect(
             clippy::expect_used,
             reason = "INVARIANT: entry is only taken inside Drop"
         )]
-        &mut self.entry.as_mut().expect("pooled decoder present").decoder
+        self.entry.as_mut().expect("pooled decoder present")
+    }
+
+    fn decoder_mut(&mut self) -> &mut Decoder<BufferedByteReader> {
+        self.clean = false;
+        &mut self.entry_mut().decoder
     }
 
     pub(super) fn seek_to_image(
@@ -125,15 +142,12 @@ impl PooledDecoder<'_> {
         cancel: &CancelToken,
     ) -> Result<(), RasterError> {
         self.clean = false;
-        #[expect(
-            clippy::expect_used,
-            reason = "INVARIANT: entry is only taken inside Drop"
-        )]
-        let entry = self.entry.as_mut().expect("pooled decoder present");
+        let entry = self.entry_mut();
         if entry.aimed_image == Some(image) {
             return Ok(());
         }
         entry.aimed_image = None;
+        entry.aimed_chunk_count = None;
         entry
             .decoder
             .seek_to_image(image)
@@ -142,10 +156,14 @@ impl PooledDecoder<'_> {
         Ok(())
     }
 
-    /// Compute the total chunk count of the currently aimed IFD, returning
+    /// Compute the total chunk count of the currently aimed IFD, caching it on
+    /// the active entry until the aimed IFD changes, and returning
     /// [`RasterError::InvalidDimensions`] when either image or chunk
     /// dimensions are zero.
     pub(super) fn ifd_chunk_layout(&mut self, cancel: &CancelToken) -> Result<u64, RasterError> {
+        if let Some(count) = self.entry_mut().aimed_chunk_count {
+            return Ok(count);
+        }
         let (img_w, img_h) = self
             .decoder_mut()
             .dimensions()
@@ -163,7 +181,47 @@ impl PooledDecoder<'_> {
                 height: ch,
             });
         }
-        Ok(u64::from(img_w.div_ceil(cw)) * u64::from(img_h.div_ceil(ch)))
+        let count = u64::from(img_w.div_ceil(cw)) * u64::from(img_h.div_ceil(ch));
+        self.entry_mut().aimed_chunk_count = Some(count);
+        Ok(count)
+    }
+
+    /// Read raw chunk `index` from the currently aimed IFD under optional
+    /// working-memory budget tracking.
+    ///
+    /// Returns [`RasterError::InvalidDimensions`] when the chunk reports zero
+    /// width or height so callers can either propagate the error (tile decode)
+    /// or skip empty edge chunks (stretch sampling).
+    pub(super) fn read_budgeted_chunk(
+        &mut self,
+        index: u32,
+        depth: u32,
+        includes_rgba8: bool,
+        budget_tracker: Option<&DecodeBudgetTracker>,
+        cancel: &CancelToken,
+    ) -> Result<BudgetedChunk, RasterError> {
+        let (dw, dh) = self.decoder_mut().chunk_data_dimensions(index);
+        if dw == 0 || dh == 0 {
+            return Err(RasterError::InvalidDimensions {
+                width: dw,
+                height: dh,
+            });
+        }
+        let est_bytes = grid::chunk_working_bytes(dw, dh, depth, includes_rgba8);
+        let lease = match budget_tracker {
+            Some(tracker) => Some(tracker.reserve_blocking(est_bytes, cancel)?),
+            None => None,
+        };
+        let raw = self
+            .decoder_mut()
+            .read_chunk(index)
+            .map_err(|e| map_tiff_error(e, cancel))?;
+        Ok(BudgetedChunk {
+            raw,
+            width: dw,
+            height: dh,
+            _lease: lease,
+        })
     }
 }
 
@@ -240,28 +298,20 @@ impl<'a> TiffChunkReader<'a> {
                 "chunk index {index} out of range for IFD {image} ({total_chunks} chunks)"
             )));
         }
-        let (dw, dh) = pooled.decoder_mut().chunk_data_dimensions(index);
-        if dw == 0 || dh == 0 {
-            return Err(RasterError::InvalidDimensions {
-                width: dw,
-                height: dh,
-            });
-        }
-        let est_bytes = grid::chunk_working_bytes(dw, dh, self.format.depth, true);
-        let _lease = match budget_tracker {
-            Some(tracker) => Some(tracker.reserve_blocking(est_bytes, cancel)?),
-            None => None,
-        };
-        let raw = pooled
-            .decoder_mut()
-            .read_chunk(index)
-            .map_err(|e| map_tiff_error(e, cancel))?;
+        let chunk =
+            pooled.read_budgeted_chunk(index, self.format.depth, true, budget_tracker, cancel)?;
         pooled.mark_clean();
-        let rgba = chunk_rgba(&self.mapping, &raw, self.format.pixel_layout, dw, dh)?;
+        let rgba = chunk_rgba(
+            &self.mapping,
+            &chunk.raw,
+            self.format.pixel_layout,
+            chunk.width,
+            chunk.height,
+        )?;
         Ok(DecodedChunk {
             data: rgba,
-            width: dw,
-            height: dh,
+            width: chunk.width,
+            height: chunk.height,
         })
     }
 }

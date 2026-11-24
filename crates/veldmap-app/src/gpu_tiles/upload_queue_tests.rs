@@ -14,6 +14,10 @@ fn wm_key(source: SourceId, level: u8, x: u32, y: u32) -> TileKey {
     )
 }
 
+fn tile_1x1() -> DecodedTile {
+    DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]).expect("tile")
+}
+
 #[test]
 fn pending_uploads_enforces_byte_cap_on_enqueue_and_preserves_roots() {
     let mut pending = PendingUploads::with_max_queued_bytes(10);
@@ -21,8 +25,7 @@ fn pending_uploads_enforces_byte_cap_on_enqueue_and_preserves_roots() {
     let live_a = SourceId::from_stable_key("live-a");
     let k_live = wm_key(live_a, 1, 0, 0);
     let k_bundled = wm_key(SourceId::BUNDLED_BASEMAP, 0, 0, 0);
-    let tile_4b =
-        DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]).expect("tile");
+    let tile_4b = tile_1x1();
     tx.send((k_live, tile_4b.clone())).expect("send live");
     tx.send((k_bundled, tile_4b.clone())).expect("send bundled");
 
@@ -105,8 +108,7 @@ fn pinned_root_check_handles_planetary_and_raster_pyramid() {
 fn clear_where_and_proportional_budget_cover_pre_3a_hooks() {
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
-    let tile_4b =
-        DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]).expect("tile");
+    let tile_4b = tile_1x1();
     let k0 = wm_key(SourceId::BUNDLED_BASEMAP, 0, 0, 0);
     let k2 = wm_key(SourceId::BUNDLED_BASEMAP, 2, 1, 1);
     tx.send((k0, tile_4b.clone())).expect("send k0");
@@ -125,8 +127,7 @@ fn clear_where_and_proportional_budget_cover_pre_3a_hooks() {
 fn dropping_pending_uploads_closes_channel_without_explicit_close() {
     let pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
-    let tile =
-        DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]).expect("tile");
+    let tile = tile_1x1();
     let key = wm_key(SourceId::BUNDLED_BASEMAP, 0, 0, 0);
     tx.send((key, tile.clone())).expect("send while open");
 

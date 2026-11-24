@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::geo::camera::Camera;
+use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::SourceId;
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
@@ -22,7 +22,8 @@ use crate::gpu_tiles::{
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::layers::{
-    CursorReadout, LayerId, LayerSummary, OverlayIoEvent, OverlayManager, OverlayMutation,
+    CursorReadout, LayerId, LayerSummary, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
+    OverlayMutation,
 };
 use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
 use crate::settings::AppSettings;
@@ -60,6 +61,26 @@ impl SnapshotKey {
     }
 }
 
+/// Repaint scheduling hint returned by [`SceneState::end_frame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SceneRepaintHint {
+    /// No scene-driven repaint needed.
+    None,
+    /// Schedule a delayed retry after an overlay decode lane saturation backoff.
+    After(Duration),
+    /// Request an immediate follow-up frame (budget-deferred uploads remain or
+    /// partial upload progress may have unprotected a deferred tile).
+    Immediate,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameState {
+    reconciled: bool,
+    uploaded: usize,
+    remaining_ready: usize,
+    deferred_protected: usize,
+}
+
 /// Coordinates tile caches, bounded GPU uploads, shared two-lane CPU decode
 /// threads, active basemap + raster overlay scheduling, and cached frame
 /// snapshots.
@@ -72,6 +93,7 @@ pub(crate) struct SceneState {
     overlays: OverlayManager,
     cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
     scene_generation: u64,
+    active_frame: Option<FrameState>,
 }
 
 impl SceneState {
@@ -100,14 +122,14 @@ impl SceneState {
             disk_cache.clone(),
             done_tx.clone(),
             Arc::clone(&wakeup),
-            decode_pool.handle().fast().clone(),
+            decode_pool.fast_handle(),
             decode_shutdown.clone(),
         );
         let overlays = OverlayManager::new(
             budget,
             disk_cache,
-            decode_pool.handle().fast().clone(),
-            decode_pool.handle().bulk().clone(),
+            decode_pool.fast_handle(),
+            decode_pool.bulk_handle(),
             done_tx,
             wakeup,
             decode_shutdown.clone(),
@@ -122,6 +144,7 @@ impl SceneState {
             overlays,
             cached_snapshot: None,
             scene_generation: 1,
+            active_frame: None,
         };
         scene.sync_pinned_root_sources();
         Ok(scene)
@@ -129,9 +152,7 @@ impl SceneState {
 
     fn pinned_root_sources(&self) -> Vec<SourceId> {
         let mut sources = vec![self.basemap.active_source(), SourceId::BUNDLED_BASEMAP];
-        self.overlays
-            .stack()
-            .extend_pinned_root_sources(&mut sources);
+        self.overlays.extend_pinned_root_sources(&mut sources);
         sources
     }
 
@@ -144,6 +165,19 @@ impl SceneState {
     /// changes.
     fn mark_dirty(&mut self) {
         self.scene_generation = self.scene_generation.wrapping_add(1);
+    }
+
+    /// Purge a superseded/removed source from both GPU VRAM and pending uploads.
+    fn purge_source_caches(&mut self, src: SourceId) {
+        self.gpu_tile_cache.remove_source(src);
+        self.pending_uploads.clear_source(src);
+    }
+
+    /// Re-sync pinned root sources and bump `scene_generation` after basemap or
+    /// overlay topology changes.
+    fn mark_topology_changed(&mut self) {
+        self.sync_pinned_root_sources();
+        self.mark_dirty();
     }
 
     /// Release cached `Arc<DrawSnapshot>` references when the viewport is
@@ -169,12 +203,10 @@ impl SceneState {
 
     fn apply_overlay_mutation(&mut self, mutation: OverlayMutation) -> bool {
         for src in mutation.purge_sources {
-            self.gpu_tile_cache.remove_source(src);
-            self.pending_uploads.clear_source(src);
+            self.purge_source_caches(src);
         }
         if mutation.changed {
-            self.sync_pinned_root_sources();
-            self.mark_dirty();
+            self.mark_topology_changed();
         }
         mutation.changed
     }
@@ -206,17 +238,11 @@ impl SceneState {
         self.apply_overlay_mutation(mutation)
     }
 
-    /// Optional backoff delay if an overlay decode lane was recently saturated.
-    pub(crate) fn overlay_retry_delay(&self) -> Option<Duration> {
-        self.overlays.retry_delay()
-    }
-
     /// Toggle visibility of an overlay layer.
     pub(crate) fn set_overlay_visible(&mut self, id: LayerId, visible: bool) -> bool {
         let changed = self.overlays.set_visible(id, visible);
         if changed {
-            self.sync_pinned_root_sources();
-            self.mark_dirty();
+            self.mark_topology_changed();
         }
         changed
     }
@@ -246,15 +272,10 @@ impl SceneState {
     }
 
     /// Return the native source pixel size `(m_x, m_y)` of the topmost visible
-    /// overlay (used in the HUD when the cursor is not over a specific overlay).
+    /// non-reloading overlay (used in the HUD when the cursor is not over a
+    /// specific overlay).
     pub(crate) fn topmost_visible_source_pixel_size_m(&self) -> Option<(f64, f64)> {
-        self.overlays
-            .stack()
-            .layers()
-            .iter()
-            .rev()
-            .find(|l| l.visible)
-            .and_then(|l| l.source_pixel_size_m)
+        self.overlays.topmost_visible_source_pixel_size_m()
     }
 
     /// Synchronize basemap providers with updated [`AppSettings`], purging any
@@ -263,12 +284,10 @@ impl SceneState {
     pub(crate) fn sync_basemap_settings(&mut self, settings: &AppSettings) -> bool {
         let outcome = self.basemap.sync_settings(settings);
         if let Some(evict) = outcome.evict_source {
-            self.gpu_tile_cache.remove_source(evict);
-            self.pending_uploads.clear_source(evict);
+            self.purge_source_caches(evict);
         }
         if outcome.changed {
-            self.sync_pinned_root_sources();
-            self.mark_dirty();
+            self.mark_topology_changed();
         }
         outcome.changed
     }
@@ -280,22 +299,39 @@ impl SceneState {
     }
 
     /// Reconcile background tile providers against current GPU + pending state.
-    pub(crate) fn reconcile_providers(&mut self) {
+    fn reconcile_providers(&mut self) {
         self.basemap
             .reconcile_providers(&self.gpu_tile_cache, &self.pending_uploads);
         self.overlays
             .reconcile(&self.gpu_tile_cache, &self.pending_uploads);
+        if let Some(frame) = &mut self.active_frame {
+            frame.reconciled = true;
+        }
+    }
+
+    /// Begin a UI frame by draining background tile completions into VRAM
+    /// within the per-frame byte/time budget while protecting active-frame
+    /// carriers. Call [`Self::end_frame`] once the frame's UI/viewport pass
+    /// completes.
+    pub(crate) fn begin_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let report = self.drain_tile_uploads(device, queue);
+        self.active_frame = Some(FrameState {
+            reconciled: false,
+            uploaded: report.uploaded,
+            remaining_ready: report.remaining_ready,
+            deferred_protected: report.deferred_protected,
+        });
     }
 
     /// Drain background tile completions and upload coarsest-first within the
     /// per-frame VRAM/time budget while protecting active-frame carriers.
-    pub(crate) fn drain_tile_uploads(
+    fn drain_tile_uploads(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> UploadBatchReport {
         let mut wanted = self.basemap.wanted_tile_sets().to_vec();
-        self.overlays.stack().extend_wanted_tile_sets(&mut wanted);
+        self.overlays.extend_wanted_tile_sets(&mut wanted);
         let protected = self
             .cached_snapshot
             .as_ref()
@@ -322,7 +358,6 @@ impl SceneState {
     /// Return the cached immutable `Arc<DrawSnapshot>` when `(camera, viewport,
     /// show_graticule, scene_generation)` is unchanged (avoiding quadtree
     /// traversal on 120 Hz mouse hover), or rebuild and schedule missing tiles.
-    /// Returns `(snapshot, reconciled_providers)`.
     pub(crate) fn snapshot_for_frame(
         &mut self,
         camera: Camera,
@@ -330,7 +365,7 @@ impl SceneState {
         height_px: u32,
         pixels_per_point: f32,
         show_graticule: bool,
-    ) -> (Arc<DrawSnapshot>, bool) {
+    ) -> Arc<DrawSnapshot> {
         let key = SnapshotKey::new(
             &camera,
             [width_px, height_px],
@@ -341,7 +376,7 @@ impl SceneState {
         if let Some((cached_key, snapshot)) = &self.cached_snapshot
             && *cached_key == key
         {
-            return (Arc::clone(snapshot), false);
+            return Arc::clone(snapshot);
         }
 
         let textured = self.basemap.is_textured();
@@ -366,18 +401,18 @@ impl SceneState {
         } else {
             0
         };
-        let overlay_weight = self.overlays.stack().total_appetite_weight_bytes();
+        let overlay_weight = self.overlays.total_appetite_weight_bytes();
         let total_weight = basemap_weight.saturating_add(overlay_weight).max(1);
 
-        let overlay_layers = self.overlays.build_and_schedule(
-            &camera,
+        let overlay_layers = self.overlays.build_and_schedule(&mut OverlayFrameCtx {
+            camera: &camera,
             width_px,
             height_px,
-            &mut self.gpu_tile_cache,
-            &self.pending_uploads,
-            total_weight,
-            &mut snapshot_inner.carrier_keys,
-        );
+            gpu_cache: &mut self.gpu_tile_cache,
+            pending: &self.pending_uploads,
+            total_appetite_weight: total_weight,
+            carrier_keys: &mut snapshot_inner.carrier_keys,
+        });
         snapshot_inner.overlays = overlay_layers;
 
         let snapshot = Arc::new(snapshot_inner);
@@ -393,7 +428,30 @@ impl SceneState {
         );
 
         self.cached_snapshot = Some((key, Arc::clone(&snapshot)));
-        (snapshot, true)
+        if let Some(frame) = &mut self.active_frame {
+            frame.reconciled = true;
+        }
+        snapshot
+    }
+
+    /// Finalize the active UI frame: reconcile background providers if uploads
+    /// progressed or remained deferred without a snapshot rebuild (e.g. a
+    /// collapsed window), and return the scene-driven [`SceneRepaintHint`].
+    pub(crate) fn end_frame(&mut self) -> SceneRepaintHint {
+        let frame = self.active_frame.take().unwrap_or_default();
+        if !frame.reconciled
+            && (frame.uploaded > 0 || frame.remaining_ready > 0 || frame.deferred_protected > 0)
+        {
+            self.reconcile_providers();
+        }
+
+        if frame.remaining_ready > 0 || (frame.uploaded > 0 && frame.deferred_protected > 0) {
+            SceneRepaintHint::Immediate
+        } else if let Some(delay) = self.overlays.retry_delay() {
+            SceneRepaintHint::After(delay)
+        } else {
+            SceneRepaintHint::None
+        }
     }
 
     /// Phase 1 of deterministic shutdown: cancel all worker tokens and signal

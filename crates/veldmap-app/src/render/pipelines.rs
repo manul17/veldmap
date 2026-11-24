@@ -1,20 +1,14 @@
-//! GPU bind-group layouts, `Weak<GpuTile>`-guarded texture bind-group cache,
-//! samplers, and render pipelines for [`super::GlobeRenderer`] and
-//! [`super::overlay::OverlayRenderer`].
-
-use std::collections::HashMap;
-use std::sync::{Arc, Weak};
-
-use veldmap_core::tile::PixelFormat;
-
-use crate::gpu_tiles::GpuTile;
+//! GPU bind-group layouts, samplers, and render pipelines for
+//! [`super::GlobeRenderer`] and [`super::overlay::OverlayRenderer`].
 
 use super::mesh::TileVertex;
+use super::overlay::OverlayVertex;
 use super::uniforms::{CameraUniform, OverlayPatchUniform, TileUniform};
-use super::{COMPOSITE_WGSL, GLOBE_WGSL};
+use super::{COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_WGSL};
 
 struct GlobePipelineSpec<'a> {
     label: &'a str,
+    vertex_layout: wgpu::VertexBufferLayout<'static>,
     fragment_entry: &'a str,
     blend: wgpu::BlendState,
     depth_stencil: Option<wgpu::DepthStencilState>,
@@ -32,7 +26,7 @@ fn create_globe_pipeline(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
-            buffers: &[Some(TileVertex::LAYOUT)],
+            buffers: &[Some(spec.vertex_layout)],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -58,81 +52,6 @@ fn create_globe_pipeline(
     })
 }
 
-/// `Weak<GpuTile>`-guarded cache of `wgpu::BindGroup` entries for display
-/// textures, keyed by process-unique `GpuTile::tile_id` and guarded on
-/// `PixelFormat` so incompatible texture formats can never bind to the
-/// filterable sRGB layout.
-#[derive(Default)]
-pub(super) struct TileBindGroupCache {
-    entries: HashMap<u64, (Weak<GpuTile>, wgpu::BindGroup)>,
-}
-
-impl TileBindGroupCache {
-    /// Ensure a bind group exists for `gpu_tile` when its format is
-    /// [`PixelFormat::Rgba8UnormSrgb`].
-    pub(super) fn ensure(
-        &mut self,
-        device: &wgpu::Device,
-        pipelines: &GlobePipelines,
-        gpu_tile: &Arc<GpuTile>,
-    ) {
-        if gpu_tile.format != PixelFormat::Rgba8UnormSrgb {
-            return;
-        }
-        let reuse = self
-            .entries
-            .get(&gpu_tile.tile_id)
-            .is_some_and(|(weak, _)| {
-                weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
-            });
-        if reuse {
-            return;
-        }
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tile Rgba8UnormSrgb bind group"),
-            layout: &pipelines.tile_texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&gpu_tile.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&pipelines.tile_sampler),
-                },
-            ],
-        });
-        self.entries
-            .insert(gpu_tile.tile_id, (Arc::downgrade(gpu_tile), bg));
-    }
-
-    /// Look up the cached bind group for `gpu_tile` only if it matches the
-    /// live `Arc<GpuTile>` pointer and `expected_format`.
-    pub(super) fn get(
-        &self,
-        gpu_tile: &Arc<GpuTile>,
-        expected_format: PixelFormat,
-    ) -> Option<&wgpu::BindGroup> {
-        if gpu_tile.format != expected_format || expected_format != PixelFormat::Rgba8UnormSrgb {
-            return None;
-        }
-        self.entries.get(&gpu_tile.tile_id).and_then(|(weak, bg)| {
-            (weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile)))
-                .then_some(bg)
-        })
-    }
-
-    /// Drop entries whose backing `GpuTile` has been evicted and released.
-    pub(super) fn sweep_stale(&mut self) {
-        self.entries.retain(|_, (weak, _)| weak.strong_count() > 0);
-    }
-
-    /// Total cached bind groups.
-    pub(super) fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
 pub(super) struct GlobePipelines {
     pub(super) camera_layout: wgpu::BindGroupLayout,
     pub(super) tile_uniform_layout: wgpu::BindGroupLayout,
@@ -141,6 +60,7 @@ pub(super) struct GlobePipelines {
     pub(super) tile_sampler: wgpu::Sampler,
     pub(super) body_ellipsoid_pipeline: wgpu::RenderPipeline,
     pub(super) body_textured_pipeline: wgpu::RenderPipeline,
+    pub(super) overlay_pipeline: wgpu::RenderPipeline,
     pub(super) grid_pipeline: wgpu::RenderPipeline,
     pub(super) composite_layout: wgpu::BindGroupLayout,
     pub(super) composite_sampler: wgpu::Sampler,
@@ -154,54 +74,36 @@ struct SharedLayouts {
     tile_texture_layout: wgpu::BindGroupLayout,
 }
 
-fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
-    let camera_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("globe camera bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<CameraUniform>() as u64
-                    ),
-                },
-                count: None,
-            }],
-        });
-
-    let tile_uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("globe per-tile dynamic uniform layout"),
+fn uniform_buffer_layout<T>(
+    device: &wgpu::Device,
+    label: &str,
+    dynamic: bool,
+) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<TileUniform>() as u64),
+                has_dynamic_offset: dynamic,
+                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<T>() as u64),
             },
             count: None,
         }],
-    });
+    })
+}
 
-    let overlay_uniform_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("overlay patch dynamic uniform layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<OverlayPatchUniform>() as u64,
-                    ),
-                },
-                count: None,
-            }],
-        });
+fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
+    let camera_layout =
+        uniform_buffer_layout::<CameraUniform>(device, "globe camera bind group layout", false);
+    let tile_uniform_layout =
+        uniform_buffer_layout::<TileUniform>(device, "globe per-tile dynamic uniform layout", true);
+    let overlay_uniform_layout = uniform_buffer_layout::<OverlayPatchUniform>(
+        device,
+        "overlay patch dynamic uniform layout",
+        true,
+    );
 
     let tile_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("tile Rgba8UnormSrgb texture layout"),
@@ -349,6 +251,22 @@ impl GlobePipelines {
                 immediate_size: 0,
             });
 
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay warp-mesh wgsl"),
+            source: wgpu::ShaderSource::Wgsl(OVERLAY_WGSL.into()),
+        });
+
+        let overlay_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("overlay warp-mesh pipeline layout"),
+                bind_group_layouts: &[
+                    Some(&layouts.camera_layout),
+                    Some(&layouts.overlay_uniform_layout),
+                    Some(&layouts.tile_texture_layout),
+                ],
+                immediate_size: 0,
+            });
+
         let body_depth = || {
             Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
@@ -365,6 +283,7 @@ impl GlobePipelines {
             &untextured_pipeline_layout,
             GlobePipelineSpec {
                 label: "globe body ellipsoid pipeline (Reverse-Z)",
+                vertex_layout: TileVertex::LAYOUT,
                 fragment_entry: "fs_body_ellipsoid",
                 blend: wgpu::BlendState::REPLACE,
                 depth_stencil: body_depth(),
@@ -377,9 +296,23 @@ impl GlobePipelines {
             &textured_pipeline_layout,
             GlobePipelineSpec {
                 label: "globe body textured pipeline (Reverse-Z)",
+                vertex_layout: TileVertex::LAYOUT,
                 fragment_entry: "fs_body_textured",
                 blend: wgpu::BlendState::REPLACE,
                 depth_stencil: body_depth(),
+            },
+        );
+
+        let overlay_pipeline = create_globe_pipeline(
+            device,
+            &overlay_shader,
+            &overlay_pipeline_layout,
+            GlobePipelineSpec {
+                label: "overlay warp-mesh pipeline (depth-less)",
+                vertex_layout: OverlayVertex::LAYOUT,
+                fragment_entry: "fs_overlay",
+                blend: wgpu::BlendState::ALPHA_BLENDING,
+                depth_stencil: None,
             },
         );
 
@@ -391,6 +324,7 @@ impl GlobePipelines {
             &untextured_pipeline_layout,
             GlobePipelineSpec {
                 label: "globe post-overlay procedural graticule pipeline (depth-less)",
+                vertex_layout: TileVertex::LAYOUT,
                 fragment_entry: "fs_grid",
                 blend: wgpu::BlendState::ALPHA_BLENDING,
                 depth_stencil: None,
@@ -408,6 +342,7 @@ impl GlobePipelines {
             tile_sampler,
             body_ellipsoid_pipeline,
             body_textured_pipeline,
+            overlay_pipeline,
             grid_pipeline,
             composite_layout,
             composite_sampler,

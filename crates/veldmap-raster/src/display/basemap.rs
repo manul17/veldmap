@@ -14,7 +14,8 @@ use std::fmt;
 
 use veldmap_core::geo::projection::web_mercator_lat_deg;
 use veldmap_core::tile::{
-    DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, polar_cap_point, web_mercator_y_bounds,
+    DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, geodetic_lat_bounds, polar_cap_point,
+    polar_cap_uv_bounds, tile_lon_bounds, web_mercator_y_bounds,
 };
 
 use crate::RasterError;
@@ -196,11 +197,6 @@ impl BundledBasemap {
         (base.width, base.height)
     }
 
-    /// Configured tiling parameters for this basemap.
-    pub fn config(&self) -> BundledBasemapConfig {
-        self.config
-    }
-
     fn select_mip(&self, src_px_per_dst_px: f64) -> &RgbLevel {
         let max_idx = self.levels.len().saturating_sub(1);
         let idx = if src_px_per_dst_px <= 1.0 {
@@ -326,15 +322,14 @@ impl BundledBasemap {
         let scale_x = f64::from(base_w) / (cols_f * tile_f);
         let scale_y = f64::from(base_h) / (rows_f * tile_f);
         let mip = self.select_mip(scale_x.max(scale_y));
+        let (lon_west, lon_east) = tile_lon_bounds(ctx.id.x, ctx.cols);
+        let (lat_north, lat_south) = geodetic_lat_bounds(ctx.id.y, ctx.rows);
 
         Self::render_pixel_grid(
             ctx,
             data,
-            |t| (mip, 90.0 - 180.0 * (f64::from(ctx.id.y) + t) / rows_f),
-            |&lat, s| {
-                let lon = -180.0 + 360.0 * (f64::from(ctx.id.x) + s) / cols_f;
-                (lat, lon)
-            },
+            |t| (mip, lat_north + (lat_south - lat_north) * t),
+            |&lat, s| (lat, lon_west + (lon_east - lon_west) * s),
         );
     }
 
@@ -342,6 +337,7 @@ impl BundledBasemap {
         let (base_w, base_h) = self.dimensions();
         let tile_f = f64::from(ctx.tile_px);
         let cols_f = f64::from(ctx.cols);
+        let (lon_west, lon_east) = tile_lon_bounds(ctx.id.x, ctx.cols);
         let (merc_n, merc_s) = web_mercator_y_bounds(ctx.id.y, ctx.rows);
         let d_merc_per_px = (merc_n - merc_s) / tile_f;
         let scale_x = f64::from(base_w) / (cols_f * tile_f);
@@ -358,24 +354,20 @@ impl BundledBasemap {
                 let scale_y = (f64::from(base_h) / 180.0) * dlat_per_px;
                 (self.select_mip(scale_x.max(scale_y)), lat)
             },
-            |&lat, s| {
-                let lon = -180.0 + 360.0 * (f64::from(ctx.id.x) + s) / cols_f;
-                (lat, lon)
-            },
+            |&lat, s| (lat, lon_west + (lon_east - lon_west) * s),
         );
     }
 
     fn render_polar_cap_tile(&self, ctx: &TileRenderContext<'_>, north: bool, data: &mut [u8]) {
-        let cols_f = f64::from(ctx.cols);
-        let rows_f = f64::from(ctx.rows);
+        let (u0, u1, v0, v1) = polar_cap_uv_bounds(ctx.id.x, ctx.id.y, ctx.cols);
         let mip = &self.levels[0];
 
         Self::render_pixel_grid(
             ctx,
             data,
-            |t| (mip, -1.0 + 2.0 * (f64::from(ctx.id.y) + t) / rows_f),
+            |t| (mip, v0 + (v1 - v0) * t),
             |&v, s| {
-                let u = -1.0 + 2.0 * (f64::from(ctx.id.x) + s) / cols_f;
+                let u = u0 + (u1 - u0) * s;
                 let (lat, lon, _, _) = polar_cap_point(north, u, v);
                 (lat, lon)
             },

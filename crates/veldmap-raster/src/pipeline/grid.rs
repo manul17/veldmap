@@ -197,7 +197,7 @@ fn spanned(side: u64, chunk: u32, source: u32, aligned: bool) -> u64 {
 }
 
 /// Exact rational `(num, den)` source pixels per level-`level` texel along `(x, y)`
-/// matching `veldmap_core::tile::cell_uv`'s `2^level` base-pixel stride across
+/// matching `veldmap_core::tile::cell_uv_rect`'s `2^level` base-pixel stride across
 /// exact, `ceil`, and GDAL `floor` overviews.
 fn source_scale(base: (u32, u32), source: (u32, u32), level: u8) -> ((u128, u128), (u128, u128)) {
     let (bw, bh) = base;

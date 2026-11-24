@@ -193,18 +193,12 @@ pub struct UploadSender {
 }
 
 impl UploadSender {
-    /// Submit a decoded tile for GPU upload only if `cancel` has not been
-    /// triggered (checked both before and under the queue lock so concurrent
-    /// `cancel + clear_source` reloads cannot be raced by stale workers).
-    ///
-    /// Returns `Ok(true)` if admitted, `Ok(false)` if cancelled, or
-    /// `Err(UploadChannelClosed)` once [`PendingUploads::close`] has run.
-    pub fn send_if_uncancelled(
+    fn send_inner(
         &self,
         item: (TileKey, DecodedTile),
-        cancel: &CancelToken,
+        cancel: Option<&CancelToken>,
     ) -> Result<bool, UploadChannelClosed> {
-        if cancel.is_cancelled() {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
             return Ok(false);
         }
         let (key, decoded) = item;
@@ -214,7 +208,7 @@ impl UploadSender {
             if state.closed {
                 to_drop.push(decoded);
                 Err(UploadChannelClosed)
-            } else if cancel.is_cancelled() {
+            } else if cancel.is_some_and(CancelToken::is_cancelled) {
                 to_drop.push(decoded);
                 Ok(false)
             } else {
@@ -226,30 +220,27 @@ impl UploadSender {
         outcome
     }
 
+    /// Submit a decoded tile for GPU upload only if `cancel` has not been
+    /// triggered (checked both before and under the queue lock so concurrent
+    /// `cancel + clear_source` reloads cannot be raced by stale workers).
+    ///
+    /// Returns `Ok(true)` if admitted, `Ok(false)` if cancelled, or
+    /// `Err(UploadChannelClosed)` once [`PendingUploads::close`] has run.
+    pub fn send_if_uncancelled(
+        &self,
+        item: (TileKey, DecodedTile),
+        cancel: &CancelToken,
+    ) -> Result<bool, UploadChannelClosed> {
+        self.send_inner(item, Some(cancel))
+    }
+
     /// Submit a decoded tile for GPU upload.
     ///
     /// Returns `Err(UploadChannelClosed)` once [`PendingUploads::close`] has
     /// been called; otherwise admits the tile under `max_queued_bytes`
     /// (evicting finest non-pinned tiles outside the lock if needed).
     pub fn send(&self, item: (TileKey, DecodedTile)) -> Result<(), UploadChannelClosed> {
-        let (key, decoded) = item;
-        let mut to_drop = Vec::new();
-        let closed = {
-            let mut state = lock_unpoisoned(&self.shared);
-            if state.closed {
-                to_drop.push(decoded);
-                true
-            } else {
-                state.insert_and_bound(key, decoded, &mut to_drop);
-                false
-            }
-        };
-        drop(to_drop);
-        if closed {
-            Err(UploadChannelClosed)
-        } else {
-            Ok(())
-        }
+        self.send_inner(item, None).map(|_| ())
     }
 }
 

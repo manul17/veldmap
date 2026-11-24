@@ -7,8 +7,7 @@
 //! code.
 
 use eframe::egui;
-use veldmap_core::geo::camera::Camera;
-use veldmap_core::geo::coords::{ParsedLocation, parse_location};
+use veldmap_core::geo::{Camera, ParsedLocation, parse_location};
 
 use crate::basemap::BasemapStatusSnapshot;
 use crate::layers::{CursorReadout, CursorReadoutValue};

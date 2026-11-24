@@ -487,11 +487,6 @@ fn orientation(at: DVec3, up: DVec3) -> DQuat {
     DQuat::from_mat3(&DMat3::from_cols(up.cross(at), up, at))
 }
 
-#[cfg(test)]
-fn project(view_proj: &DMat4, point: DVec3, eye: DVec3) -> DVec4 {
-    *view_proj * (point - eye).extend(1.0)
-}
-
 /// Ellipsoidal altitude in metres from which a circle of `radius_deg` fits
 /// vertically inside the viewport.
 pub fn height_for(radius_deg: f64) -> f64 {

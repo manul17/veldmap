@@ -170,22 +170,7 @@ fn square_origin(
     // and UTM zone longitude span (rejects out-of-band rows like `37MAA` and
     // out-of-zone high-latitude columns like `37XAA`).
     let system = System::utm(zone, south);
-    let mut min_lat = f64::INFINITY;
-    let mut max_lat = f64::NEG_INFINITY;
-    let mut min_lon = f64::INFINITY;
-    let mut max_lon = f64::NEG_INFINITY;
-    for (x, y) in [
-        (easting, northing),
-        (easting + SQUARE_M, northing),
-        (easting, northing + SQUARE_M),
-        (easting + SQUARE_M, northing + SQUARE_M),
-    ] {
-        let (lat, lon) = system.to_geodetic(x, y);
-        min_lat = min_lat.min(lat);
-        max_lat = max_lat.max(lat);
-        min_lon = min_lon.min(lon);
-        max_lon = max_lon.max(lon);
-    }
+    let (min_lat, max_lat, min_lon, max_lon) = square_geo_bounds(&system, easting, northing);
     if max_lat <= south_edge || min_lat >= north_edge {
         return Err(MgrsError::InvalidRow(row_char as char));
     }
@@ -210,6 +195,28 @@ fn square_origin(
         min_lon,
         max_lon,
     })
+}
+
+/// Geodetic bounding box `(min_lat, max_lat, min_lon, max_lon)` of the 4
+/// corners of a 100 km MGRS square rooted at `(easting, northing)`.
+fn square_geo_bounds(system: &System, easting: f64, northing: f64) -> (f64, f64, f64, f64) {
+    let mut min_lat = f64::INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    let mut min_lon = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    for (x, y) in [
+        (easting, northing),
+        (easting + SQUARE_M, northing),
+        (easting, northing + SQUARE_M),
+        (easting + SQUARE_M, northing + SQUARE_M),
+    ] {
+        let (lat, lon) = system.to_geodetic(x, y);
+        min_lat = min_lat.min(lat);
+        max_lat = max_lat.max(lat);
+        min_lon = min_lon.min(lon);
+        max_lon = max_lon.max(lon);
+    }
+    (min_lat, max_lat, min_lon, max_lon)
 }
 
 /// Compute the Sentinel-2 109.8 km granule frame in UTM metres for a
@@ -288,42 +295,8 @@ pub fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> {
             SQUARE_M,
         )
     } else {
-        let raw_digits = &trimmed[orig_positions[digits_start]..];
-        let digit_parts: Vec<&str> = raw_digits.split_whitespace().collect();
-        let (e_str, n_str) = match digit_parts.as_slice() {
-            [combined] => {
-                if !combined.bytes().all(|b| b.is_ascii_digit())
-                    || !combined.len().is_multiple_of(2)
-                    || combined.len() > 10
-                {
-                    return Err(MgrsError::InvalidDigits(raw_digits.to_owned()));
-                }
-                combined.split_at(combined.len() / 2)
-            }
-            [e_part, n_part] => {
-                if e_part.len() != n_part.len()
-                    || !(1..=5).contains(&e_part.len())
-                    || !e_part.bytes().all(|b| b.is_ascii_digit())
-                    || !n_part.bytes().all(|b| b.is_ascii_digit())
-                {
-                    return Err(MgrsError::InvalidDigits(raw_digits.to_owned()));
-                }
-                (*e_part, *n_part)
-            }
-            _ => return Err(MgrsError::InvalidDigits(raw_digits.to_owned())),
-        };
-        let step_m = 10_f64.powi(5 - e_str.len() as i32);
-        let e_val: f64 = e_str
-            .parse()
-            .map_err(|_| MgrsError::InvalidDigits(raw_digits.to_owned()))?;
-        let n_val: f64 = n_str
-            .parse()
-            .map_err(|_| MgrsError::InvalidDigits(raw_digits.to_owned()))?;
-        (
-            origin.easting + (e_val + 0.5) * step_m,
-            origin.northing + (n_val + 0.5) * step_m,
-            step_m,
-        )
+        let (de, dn, step_m) = parse_grid_digits(&trimmed[orig_positions[digits_start]..])?;
+        (origin.easting + de, origin.northing + dn, step_m)
     };
 
     let system = System::utm(origin.zone, origin.south);
@@ -356,6 +329,42 @@ pub fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> {
     let lon_deg = unwind(0.0, lon_deg);
     let radius_deg = (cell_side_m / 111_320.0).clamp(0.002, 1.0);
     Ok((lat_deg, lon_deg, radius_deg))
+}
+
+/// Parse MGRS easting/northing numeric digits into `(delta_easting_m,
+/// delta_northing_m, cell_side_m)` centered on the addressed sub-cell.
+fn parse_grid_digits(raw_digits: &str) -> Result<(f64, f64, f64), MgrsError> {
+    let digit_parts: Vec<&str> = raw_digits.split_whitespace().collect();
+    let (e_str, n_str) = match digit_parts.as_slice() {
+        [combined] => {
+            if !combined.bytes().all(|b| b.is_ascii_digit())
+                || !combined.len().is_multiple_of(2)
+                || combined.len() > 10
+            {
+                return Err(MgrsError::InvalidDigits(raw_digits.to_owned()));
+            }
+            combined.split_at(combined.len() / 2)
+        }
+        [e_part, n_part] => {
+            if e_part.len() != n_part.len()
+                || !(1..=5).contains(&e_part.len())
+                || !e_part.bytes().all(|b| b.is_ascii_digit())
+                || !n_part.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(MgrsError::InvalidDigits(raw_digits.to_owned()));
+            }
+            (*e_part, *n_part)
+        }
+        _ => return Err(MgrsError::InvalidDigits(raw_digits.to_owned())),
+    };
+    let step_m = 10_f64.powi(5 - e_str.len() as i32);
+    let e_val: f64 = e_str
+        .parse()
+        .map_err(|_| MgrsError::InvalidDigits(raw_digits.to_owned()))?;
+    let n_val: f64 = n_str
+        .parse()
+        .map_err(|_| MgrsError::InvalidDigits(raw_digits.to_owned()))?;
+    Ok(((e_val + 0.5) * step_m, (n_val + 0.5) * step_m, step_m))
 }
 
 #[cfg(test)]

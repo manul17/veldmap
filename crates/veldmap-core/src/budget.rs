@@ -145,11 +145,6 @@ impl DecodeBudgetTracker {
         }
     }
 
-    /// Configured cap in bytes.
-    pub fn cap_bytes(&self) -> u64 {
-        self.inner.cap_bytes
-    }
-
     /// Currently reserved active working bytes.
     pub fn active_bytes(&self) -> u64 {
         lock_unpoisoned(&self.inner.state).active_bytes
@@ -173,9 +168,9 @@ impl DecodeBudgetTracker {
 
     /// Attempt to reserve `bytes` immediately without blocking.
     ///
-    /// Returns `Err(BudgetError::ExceedsCap)` when `bytes > cap_bytes()`,
-    /// `Ok(None)` when sufficient budget is occupied or queued ahead,
-    /// or `Ok(Some(lease))` on success.
+    /// Returns `Err(BudgetError::ExceedsCap)` when `bytes` exceeds the
+    /// configured cap, `Ok(None)` when sufficient budget is occupied or queued
+    /// ahead, or `Ok(Some(lease))` on success.
     pub fn try_reserve(&self, bytes: u64) -> Result<Option<BudgetLease>, BudgetError> {
         self.check_cap(bytes)?;
         let mut state = lock_unpoisoned(&self.inner.state);
@@ -192,9 +187,9 @@ impl DecodeBudgetTracker {
         }))
     }
 
-    /// Block in FIFO waiter order until `bytes` can be reserved within
-    /// `cap_bytes()` or `cancel` triggers. Returns `Err(BudgetError::ExceedsCap)`
-    /// immediately if `bytes > cap_bytes()`.
+    /// Block in FIFO waiter order until `bytes` can be reserved within the
+    /// configured cap or `cancel` triggers. Returns
+    /// `Err(BudgetError::ExceedsCap)` immediately if `bytes` exceeds the cap.
     pub fn reserve_blocking(
         &self,
         bytes: u64,

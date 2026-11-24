@@ -17,42 +17,48 @@ mod paths;
 mod tile_cache;
 
 pub use atomic::{
-    read_json_or_default, read_json_or_default_with_backup, write_atomic_durable,
-    write_atomic_durable_private, write_json_durable, write_json_durable_private,
+    read_json_or_default_with_backup, write_atomic_durable_private, write_json_durable_private,
 };
 pub use file_source::LocalFileSource;
-pub use fingerprint::{FINGERPRINT_SAMPLE_BYTES, LocalFingerprintCache, fingerprint_byte_source};
-pub use host::{detect_host_ram_bytes, detect_memory_budget};
+pub use fingerprint::{LocalFingerprintCache, fingerprint_byte_source};
+pub use host::detect_memory_budget;
 pub use paths::StoragePaths;
 pub use tile_cache::{
     DiskCacheStats, DiskTileEntry, DiskTileKey, EvictionReport, MAX_CACHED_TILE_BYTES,
-    TileBlobEncoding, TileDiskCache, valid_source_key,
+    TileBlobEncoding, TileDiskCache,
 };
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    //! RAII temporary directory helper shared by unit and integration tests.
+
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    pub(crate) struct TestTempDir(pub(crate) PathBuf);
+    /// Temporary directory automatically removed when dropped.
+    pub struct TestTempDir(PathBuf);
 
     impl TestTempDir {
-        pub(crate) fn new(label: &str) -> Self {
+        /// Create a fresh process- and timestamp-unique temporary directory.
+        pub fn new(label: &str) -> Self {
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos());
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "veldmap-storage-{label}-{}-{nanos}-{seq}",
+                "veldmap-test-{label}-{}-{nanos}-{seq}",
                 std::process::id()
             ));
-            std::fs::create_dir_all(&dir).expect("create temp test dir");
+            if let Err(err) = std::fs::create_dir_all(&dir) {
+                panic!("create temp test dir {}: {err}", dir.display());
+            }
             Self(dir)
         }
 
-        pub(crate) fn path(&self) -> &Path {
+        /// Path to the created temporary directory.
+        pub fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -78,15 +84,27 @@ pub enum StorageError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON serialization error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(String),
     #[error("SQLite cache error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(String),
 }
 
 impl StorageError {
     /// Return whether this error represents task cancellation.
     pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
+    }
+}
+
+impl From<serde_json::Error> for StorageError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Json(err.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Sqlite(err.to_string())
     }
 }
 

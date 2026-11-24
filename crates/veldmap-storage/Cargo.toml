@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 blake3.workspace = true
 directories.workspace = true
@@ -18,6 +21,7 @@ veldmap-core = { path = "../veldmap-core" }
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }
 veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
+veldmap-storage = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

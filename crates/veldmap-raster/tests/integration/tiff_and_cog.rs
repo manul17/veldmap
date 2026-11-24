@@ -9,8 +9,8 @@ use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{RASTER_TILE_SIZE, tile_extent};
 use veldmap_raster::{
-    DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError, SharedChunkCache, TiffSource,
-    has_tiff_magic,
+    DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError, RasterSource, SharedChunkCache,
+    TiffSource, has_tiff_magic,
 };
 
 use crate::common::{build_stripped_tiff, build_tiled_cog, fake_fingerprint, rgb_pattern};

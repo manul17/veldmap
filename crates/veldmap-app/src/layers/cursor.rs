@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::SourceId;
-use veldmap_raster::{DecodeContext, DecodeJob, DecodeJobKey};
+use veldmap_raster::{DecodeJob, DecodeJobKey, RasterSource};
 
 use super::runtime::OverlayRuntime;
-use super::stack::LayerStack;
+use super::stack::{LayerStack, OverlayLayer};
 use super::{CursorReadout, CursorReadoutValue};
 
 /// RAII guard ensuring an evicted, cancelled, or panicked cursor readout job
@@ -100,6 +100,54 @@ impl Default for CursorProbeCache {
     }
 }
 
+fn find_topmost_pixel(
+    stack: &LayerStack,
+    lat_deg: f64,
+    lon_deg: f64,
+) -> Option<(&OverlayLayer, (u32, u32))> {
+    stack.layers().iter().rev().find_map(|layer| {
+        if !layer.is_active() {
+            return None;
+        }
+        let (fx, fy) = layer.frame.fraction_at(lat_deg, lon_deg)?;
+        let desc = layer.source.description();
+        let px = ((fx * f64::from(desc.width)).floor() as i64)
+            .clamp(0, i64::from(desc.width.saturating_sub(1))) as u32;
+        let py = ((fy * f64::from(desc.height)).floor() as i64)
+            .clamp(0, i64::from(desc.height.saturating_sub(1))) as u32;
+        Some((layer, (px, py)))
+    })
+}
+
+fn build_readout(
+    layer: &OverlayLayer,
+    pixel: (u32, u32),
+    value: CursorReadoutValue,
+) -> CursorReadout {
+    CursorReadout {
+        layer_name: layer.name.clone(),
+        pixel,
+        source_pixel_size_m: layer.source_pixel_size_m,
+        value,
+    }
+}
+
+fn sample_cursor_pixel(
+    rt: &OverlayRuntime,
+    source: &dyn RasterSource,
+    pixel: (u32, u32),
+    cancel: &CancelToken,
+    probe_guard: CursorProbeGuard,
+) {
+    let ctx = rt.decode_context(cancel);
+    match source.sample_display_rgba(pixel.0, pixel.1, &ctx) {
+        Ok(Some(rgba)) => probe_guard.resolve(CursorReadoutValue::Rgba(rgba)),
+        Ok(None) => probe_guard.resolve(CursorReadoutValue::Nodata),
+        Err(err) if err.is_cancelled() => probe_guard.clear_transient(),
+        Err(_) => probe_guard.resolve(CursorReadoutValue::Unavailable),
+    }
+}
+
 /// Manages single-flight cancelled-on-move base-resolution CPU pixel probes on
 /// `fast_pool` without ever blocking the UI thread or spinning on queue saturation.
 pub(super) struct CursorProber {
@@ -147,6 +195,50 @@ impl CursorProber {
         }
     }
 
+    fn submit_probe(
+        &self,
+        layer: &OverlayLayer,
+        pixel: (u32, u32),
+        cancel: CancelToken,
+        runtime: &Arc<OverlayRuntime>,
+    ) -> bool {
+        let probe_key = (layer.source_id(), pixel.0, pixel.1);
+        let source = Arc::clone(&layer.source);
+        let rt = Arc::clone(runtime);
+        let probe_guard = CursorProbeGuard::new(
+            Arc::clone(&self.cache),
+            probe_key,
+            Arc::clone(&runtime.wakeup),
+        );
+        let job = DecodeJob {
+            key: DecodeJobKey::Probe {
+                source: layer.source_id(),
+                x: pixel.0,
+                y: pixel.1,
+            },
+            queued_bytes: 4096,
+            cancel: cancel.clone(),
+            work: Box::new(move || {
+                sample_cursor_pixel(&rt, source.as_ref(), pixel, &cancel, probe_guard);
+            }),
+        };
+
+        if let Err(err) = runtime.fast_pool.try_submit(job) {
+            // Clear `active_key` BEFORE dropping `job` so `CursorProbeGuard::drop`
+            // does not trigger a 100% CPU repaint spin loop when `fast_pool` is full.
+            {
+                let mut state = lock_unpoisoned(&self.cache);
+                if state.active_key == Some(probe_key) {
+                    state.active_key = None;
+                    state.active_cancel = None;
+                }
+            }
+            drop(err);
+            return false;
+        }
+        true
+    }
+
     /// Query the zoom-invariant native CPU display RGBA readout under
     /// `(lat_deg, lon_deg)` on the topmost visible non-reloading overlay.
     pub(super) fn query(
@@ -156,34 +248,16 @@ impl CursorProber {
         lat_deg: f64,
         lon_deg: f64,
     ) -> Option<CursorReadout> {
-        let topmost = stack.layers().iter().rev().find_map(|layer| {
-            if !layer.visible || layer.reloading {
-                return None;
-            }
-            let (fx, fy) = layer.frame.fraction_at(lat_deg, lon_deg)?;
-            let desc = layer.source.description();
-            let px = ((fx * f64::from(desc.width)).floor() as i64)
-                .clamp(0, i64::from(desc.width.saturating_sub(1))) as u32;
-            let py = ((fy * f64::from(desc.height)).floor() as i64)
-                .clamp(0, i64::from(desc.height.saturating_sub(1))) as u32;
-            Some((layer, px, py))
-        });
-
-        let Some((layer, px, py)) = topmost else {
+        let Some((layer, pixel)) = find_topmost_pixel(stack, lat_deg, lon_deg) else {
             self.cancel();
             return None;
         };
 
-        let probe_key = (layer.source_id(), px, py);
+        let probe_key = (layer.source_id(), pixel.0, pixel.1);
         let (submit_cancel, prev_cancel) = {
             let mut state = lock_unpoisoned(&self.cache);
             if state.resolved_key == Some(probe_key) {
-                return Some(CursorReadout {
-                    layer_name: layer.name.clone(),
-                    pixel: (px, py),
-                    source_pixel_size_m: layer.source_pixel_size_m,
-                    value: state.resolved_value,
-                });
+                return Some(build_readout(layer, pixel, state.resolved_value));
             }
             if state.active_key != Some(probe_key) {
                 let prev = state.active_cancel.take();
@@ -199,64 +273,12 @@ impl CursorProber {
             prev.cancel();
         }
 
-        if let Some(cancel) = submit_cancel {
-            let source = Arc::clone(&layer.source);
-            let rt = Arc::clone(runtime);
-            let probe_guard = CursorProbeGuard::new(
-                Arc::clone(&self.cache),
-                probe_key,
-                Arc::clone(&runtime.wakeup),
-            );
-            let job_key = DecodeJobKey::Probe {
-                source: layer.source_id(),
-                x: px,
-                y: py,
-            };
-            let job = DecodeJob {
-                key: job_key,
-                queued_bytes: 4096,
-                cancel: cancel.clone(),
-                work: Box::new(move || {
-                    let ctx = DecodeContext {
-                        chunk_cache: &rt.chunk_cache,
-                        budget_tracker: &rt.budget_tracker,
-                        budget: &rt.budget,
-                        cancel: &cancel,
-                    };
-                    match source.sample_display_rgba(px, py, &ctx) {
-                        Ok(Some(rgba)) => probe_guard.resolve(CursorReadoutValue::Rgba(rgba)),
-                        Ok(None) => probe_guard.resolve(CursorReadoutValue::Nodata),
-                        Err(err) if err.is_cancelled() => probe_guard.clear_transient(),
-                        Err(_) => probe_guard.resolve(CursorReadoutValue::Unavailable),
-                    }
-                }),
-            };
-
-            if let Err(err) = runtime.fast_pool.try_submit(job) {
-                // Clear `active_key` BEFORE dropping `job` so `CursorProbeGuard::drop`
-                // does not trigger a 100% CPU repaint spin loop when `fast_pool` is full.
-                {
-                    let mut state = lock_unpoisoned(&self.cache);
-                    if state.active_key == Some(probe_key) {
-                        state.active_key = None;
-                        state.active_cancel = None;
-                    }
-                }
-                drop(err);
-                return Some(CursorReadout {
-                    layer_name: layer.name.clone(),
-                    pixel: (px, py),
-                    source_pixel_size_m: layer.source_pixel_size_m,
-                    value: CursorReadoutValue::Unavailable,
-                });
-            }
+        if let Some(cancel) = submit_cancel
+            && !self.submit_probe(layer, pixel, cancel, runtime)
+        {
+            return Some(build_readout(layer, pixel, CursorReadoutValue::Unavailable));
         }
 
-        Some(CursorReadout {
-            layer_name: layer.name.clone(),
-            pixel: (px, py),
-            source_pixel_size_m: layer.source_pixel_size_m,
-            value: CursorReadoutValue::Pending,
-        })
+        Some(build_readout(layer, pixel, CursorReadoutValue::Pending))
     }
 }

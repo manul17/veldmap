@@ -3412,7 +3412,6 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "eframe",
- "glam",
  "naga",
  "pollster",
  "serde",
@@ -3472,6 +3471,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "veldmap-core",
+ "veldmap-storage",
 ]
 
 [[package]]

@@ -19,7 +19,7 @@ const MAX_MAP_TILE_ALLOC_BYTES: u64 = 36 * 1024 * 1024;
 
 /// Decode raw PNG or JPEG map-tile bytes into tightly packed `Rgba8UnormSrgb`
 /// pixels under explicit dimension and peak-allocation limits.
-pub fn decode_map_tile(bytes: &[u8]) -> Result<DecodedTile, RasterError> {
+fn decode_map_tile(bytes: &[u8]) -> Result<DecodedTile, RasterError> {
     decode_rgba8_limited(bytes, MAX_MAP_TILE_DIM, MAX_MAP_TILE_ALLOC_BYTES)
 }
 

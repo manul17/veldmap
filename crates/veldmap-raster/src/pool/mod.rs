@@ -111,11 +111,7 @@ impl DecodePool {
 
     /// Spawn a bounded CPU decode pool with explicit worker thread name prefix
     /// (`"{thread_prefix}-{idx}"`).
-    pub fn spawn_named(
-        thread_prefix: &str,
-        config: DecodePoolConfig,
-        shutdown: CancelToken,
-    ) -> Self {
+    fn spawn_named(thread_prefix: &str, config: DecodePoolConfig, shutdown: CancelToken) -> Self {
         let count = config.worker_count.clamp(1, 8);
         let shared = Arc::new((
             Mutex::new(DecodeQueue::new(
@@ -236,7 +232,7 @@ pub enum DecodeLane {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TwoLaneDecodePoolConfig {
     /// Fast pointwise tile lane (worker count clamped to `1..=8` by
-    /// [`DecodePool::spawn_named`]).
+    /// [`DecodePool::spawn`]).
     pub fast: DecodePoolConfig,
     /// Bulk sequential-pass lane (worker count clamped to `1..=4` by
     /// [`TwoLaneDecodePool::spawn`] so long-running passes do not saturate
@@ -328,6 +324,16 @@ impl TwoLaneDecodePool {
             fast: self.fast.handle(),
             bulk: self.bulk.handle(),
         }
+    }
+
+    /// Return a cloneable handle targeting the fast/pointwise decode lane.
+    pub fn fast_handle(&self) -> DecodePoolHandle {
+        self.fast.handle()
+    }
+
+    /// Return a cloneable handle targeting the bulk/sequential-pass decode lane.
+    pub fn bulk_handle(&self) -> DecodePoolHandle {
+        self.bulk.handle()
     }
 
     /// Close both queues before deterministically joining all worker threads.

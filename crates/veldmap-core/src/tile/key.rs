@@ -182,10 +182,15 @@ impl TileKey {
         }
     }
 
-    /// Extract the [`StreamKey`] identifying this tile's band/format/gutter
-    /// stream independent of `decode_rev`.
+    /// Extract the [`StreamKey`] identifying this tile's source/band/format/gutter
+    /// stream.
     pub const fn stream_key(&self) -> StreamKey {
-        StreamKey::from_tile_key(self)
+        StreamKey {
+            source: self.source,
+            band: self.band,
+            format: self.format,
+            gutter: self.gutter,
+        }
     }
 
     /// Extract the planetary geometric `(scheme, level, x, y)` identifier,
@@ -221,8 +226,13 @@ impl TileKey {
     ///
     /// Orders by `(coarseness_rank, scheme, y, x)` first so multi-band tiles
     /// (`B04`, `B08`, `SCL`) interleave at each spatial cell, then breaks ties
-    /// deterministically by `(source, stream_spec)`.
-    pub const fn coarsest_first_key(&self) -> (u8, TileScheme, u32, u32, SourceId, TileStreamSpec) {
+    /// deterministically by `(source, stream_spec, level)`. Including `level`
+    /// ensures strict injectivity with [`Eq`] even for out-of-range
+    /// `RasterPyramid` levels (`level > max_level`) whose `coarseness_rank`
+    /// saturates to `0`.
+    pub const fn coarsest_first_key(
+        &self,
+    ) -> (u8, TileScheme, u32, u32, SourceId, TileStreamSpec, u8) {
         (
             self.scheme.coarseness_rank(self.level),
             self.scheme,
@@ -230,6 +240,7 @@ impl TileKey {
             self.x,
             self.source,
             self.stream_spec(),
+            self.level,
         )
     }
 
@@ -254,7 +265,7 @@ impl TileKey {
     /// `None` if `ancestor` is not a valid ancestor of `self`, differs in
     /// source/scheme/stream_spec, or if `gutter != 0` (guttered tiles and
     /// clipped `RasterPyramid` edge tiles should resolve carriers via
-    /// `TileCache::find_carrier` and compute UVs via [`super::cell_uv`]).
+    /// `TileCache::find_carrier` and compute UVs via [`super::cell_uv_rect`]).
     pub fn sub_rect_in_ancestor(&self, ancestor: &Self) -> Option<[f32; 4]> {
         if self.source != ancestor.source
             || self.scheme != ancestor.scheme
@@ -274,18 +285,6 @@ impl TileKey {
             return None;
         }
         Some(sub_rect_for_shift(self.x, self.y, dz))
-    }
-}
-
-impl StreamKey {
-    /// Extract the [`StreamKey`] identifying `key`'s band/format/gutter stream.
-    pub const fn from_tile_key(key: &TileKey) -> Self {
-        Self {
-            source: key.source,
-            band: key.band,
-            format: key.format,
-            gutter: key.gutter,
-        }
     }
 }
 

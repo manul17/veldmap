@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{QuadTileId, TileKey};
 
@@ -82,6 +82,50 @@ impl DiskCacheGate {
         }
     }
 
+    async fn run_bounded_write(
+        store: Arc<dyn TileBlobStore>,
+        put_sem: Arc<Semaphore>,
+        queue_permit: OwnedSemaphorePermit,
+        cancel: CancelToken,
+        key: TileKey,
+        op_label: &'static str,
+        op: impl FnOnce(&dyn TileBlobStore) -> Result<(), BlobStoreError> + Send + 'static,
+    ) {
+        let put_permit = tokio::select! {
+            _ = cancel.cancelled() => return,
+            res = put_sem.acquire_owned() => match res {
+                Ok(p) => p,
+                Err(_) => return,
+            },
+        };
+        let cancel_for_write = cancel.clone();
+        let res = tokio::select! {
+            _ = cancel.cancelled() => return,
+            res = tokio::task::spawn_blocking(move || {
+                let _queue_permit = queue_permit;
+                let _put_permit = put_permit;
+                if cancel_for_write.is_cancelled() {
+                    return Ok(());
+                }
+                op(store.as_ref())
+            }) => res,
+        };
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::debug!(?key, error = %err, op = op_label, "Disk cache write failed");
+            }
+            Err(join_err) => {
+                tracing::debug!(
+                    ?key,
+                    error = %join_err,
+                    op = op_label,
+                    "Disk cache write blocking task failed"
+                );
+            }
+        }
+    }
+
     /// Best-effort bounded deletion of a corrupt cached tile entry.
     ///
     /// Both `queue_permit` and `put_permit` are moved into `spawn_blocking` so
@@ -93,9 +137,8 @@ impl DiskCacheGate {
         key: TileKey,
         id: QuadTileId,
         cancel: &CancelToken,
-        shutdown: &CancelToken,
     ) {
-        if cancel.is_cancelled() || shutdown.is_cancelled() {
+        if cancel.is_cancelled() {
             return;
         }
         let Ok(queue_permit) = Arc::clone(&self.put_queue_sem).try_acquire_owned() else {
@@ -105,46 +148,16 @@ impl DiskCacheGate {
             );
             return;
         };
-        let put_permit = tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = shutdown.cancelled() => return,
-            res = Arc::clone(&self.put_sem).acquire_owned() => match res {
-                Ok(p) => p,
-                Err(_) => return,
-            },
-        };
-        let store = Arc::clone(&self.store);
-        let cancel_for_delete = cancel.clone();
-        let shutdown_for_delete = shutdown.clone();
-        let del_res = tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = shutdown.cancelled() => return,
-            res = tokio::task::spawn_blocking(move || {
-                let _queue_permit = queue_permit;
-                let _put_permit = put_permit;
-                if cancel_for_delete.is_cancelled() || shutdown_for_delete.is_cancelled() {
-                    return Ok(());
-                }
-                store.delete(spec.cache_key(), id)
-            }) => res,
-        };
-        match del_res {
-            Ok(Ok(())) => {}
-            Ok(Err(del_err)) => {
-                tracing::debug!(
-                    ?key,
-                    error = %del_err,
-                    "Failed to delete corrupt cached tile entry"
-                );
-            }
-            Err(join_err) => {
-                tracing::debug!(
-                    ?key,
-                    error = %join_err,
-                    "Corrupt cached tile deletion blocking task failed"
-                );
-            }
-        }
+        Self::run_bounded_write(
+            Arc::clone(&self.store),
+            Arc::clone(&self.put_sem),
+            queue_permit,
+            cancel.clone(),
+            key,
+            "delete_corrupt",
+            move |store| store.delete(spec.cache_key(), id),
+        )
+        .await;
     }
 
     /// Spawn a bounded best-effort background write persisting decode-validated
@@ -169,28 +182,14 @@ impl DiskCacheGate {
         };
         let store = Arc::clone(&self.store);
         let put_sem = Arc::clone(&self.put_sem);
-        tokio::spawn(async move {
-            let put_permit = tokio::select! {
-                _ = shutdown.cancelled() => return,
-                res = put_sem.acquire_owned() => match res {
-                    Ok(p) => p,
-                    Err(_) => return,
-                },
-            };
-            let _ = tokio::task::spawn_blocking(move || {
-                let _queue_permit = queue_permit;
-                let _put_permit = put_permit;
-                if shutdown.is_cancelled() {
-                    return;
-                }
-                if let Err(err) = store.put(spec.cache_key(), id, &bytes) {
-                    tracing::debug!(
-                        error = %err,
-                        "Failed to persist validated live tile to disk cache"
-                    );
-                }
-            })
-            .await;
-        });
+        tokio::spawn(Self::run_bounded_write(
+            store,
+            put_sem,
+            queue_permit,
+            shutdown,
+            key,
+            "persist_tile",
+            move |store| store.put(spec.cache_key(), id, &bytes),
+        ));
     }
 }

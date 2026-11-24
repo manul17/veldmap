@@ -7,7 +7,7 @@ use crate::StorageError;
 
 /// Validate a disk cache source key: non-empty, `<= 128` bytes, not `.` or `..`,
 /// closed safe ASCII alphabet (`a-z`, `A-Z`, `0-9`, `-`, `_`, `.`).
-pub fn valid_source_key(key: &str) -> bool {
+pub(crate) fn valid_source_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 128
         && key != "."
@@ -95,7 +95,7 @@ impl DiskTileKey {
     }
 
     /// Construct a disk cache key from a [`TileStreamSpec`] and tile coordinates.
-    pub fn from_stream(
+    fn from_stream(
         source_key: impl Into<String>,
         spec: TileStreamSpec,
         scheme: TileScheme,

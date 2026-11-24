@@ -28,10 +28,10 @@ veldmap-storage = { path = "../veldmap-storage" }
 wgpu.workspace = true
 
 [dev-dependencies]
-glam.workspace = true
 naga.workspace = true
 pollster.workspace = true
 tiff.workspace = true
+veldmap-storage = { path = "../veldmap-storage", features = ["test-support"] }
 
 [lints]
 workspace = true

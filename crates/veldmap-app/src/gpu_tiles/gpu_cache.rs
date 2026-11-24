@@ -99,7 +99,7 @@ impl GpuTileCache {
     /// Remove every cached GPU tile belonging to `source`, returning how many
     /// tiles were removed.
     pub fn remove_source(&mut self, source: SourceId) -> usize {
-        self.cache.remove_where(|k| k.source == source).len()
+        self.remove_where(|k| k.source == source)
     }
 
     /// Remove every cached GPU tile matching `predicate`, returning how many
@@ -109,12 +109,6 @@ impl GpuTileCache {
         F: FnMut(&TileKey) -> bool,
     {
         self.cache.remove_where(predicate).len()
-    }
-
-    /// Maximum byte appetite allowed for one active pyramid (`< 50%` of VRAM
-    /// budget divided across `active_pyramids`).
-    pub fn pyramid_byte_cap(&self, active_pyramids: usize) -> usize {
-        self.cache.pyramid_byte_cap(active_pyramids)
     }
 
     /// Proportional byte appetite cap for one weighted pyramid (`< 50%`

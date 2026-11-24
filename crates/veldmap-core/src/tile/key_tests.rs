@@ -187,6 +187,13 @@ fn grid_dims_sub_rect_and_coarsest_first_tie_breaking_are_deterministic() {
         ..base
     };
     assert!(pyr_root.coarsest_first_key() < pyr_fine.coarsest_first_key());
+    // Out-of-range RasterPyramid levels (`level > max_level`) both saturate
+    // `coarseness_rank` to `0`, yet must remain strictly distinct under `Ord`
+    // to preserve `Ord`/`Eq` consistency.
+    assert_ne!(
+        pyr_root.coarsest_first_key(),
+        pyr_invalid.coarsest_first_key()
+    );
 
     let b04_cell0 = TileKey {
         band: BandKey::Index(4),

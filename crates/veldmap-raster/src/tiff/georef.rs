@@ -1,5 +1,4 @@
-//! GeoTIFF / GDAL georeference, `GeoKeyDirectoryTag` (`34735`–`34737`), and
-//! nodata tag parsing.
+//! GeoTIFF georeference and `GeoKeyDirectoryTag` (`34735`–`34737`) parsing.
 
 use tiff::decoder::Decoder;
 use tiff::tags::Tag;
@@ -11,7 +10,7 @@ use crate::pipeline::metadata::{
     GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie, is_valid_lat_lon,
 };
 
-use super::tags::{opt_tag, read_tag_ascii_opt, read_tag_f64_vec_opt, read_tag_u16_vec_opt};
+use super::tags::{read_tag_ascii_opt, read_tag_f64_vec_opt, read_tag_u16_vec_opt};
 
 const GEOKEY_LOCATION_SHORT: u16 = 0;
 const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
@@ -106,20 +105,6 @@ fn parse_geokeys(raw_keys: &[u16], double_params: &[f64], ascii_params: &str) ->
     out
 }
 
-pub(super) fn parse_gdal_nodata(
-    decoder: &mut Decoder<BufferedByteReader>,
-    cancel: &CancelToken,
-) -> Result<Option<f64>, RasterError> {
-    let Some(raw) = opt_tag(decoder.get_tag_ascii_string(Tag::GdalNodata), cancel)? else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-    if trimmed.eq_ignore_ascii_case("nan") {
-        return Ok(Some(f64::NAN));
-    }
-    Ok(trimmed.parse::<f64>().ok().filter(|v| v.is_finite()))
-}
-
 pub(super) struct ParsedGeoref {
     pub(super) ties: Vec<GeoTie>,
     pub(super) placement: Option<GeoPlacement>,
@@ -166,7 +151,7 @@ pub(super) fn georef(
     })
 }
 
-pub(super) fn foreign_datum(geo_params: &GeoKeyParams) -> Option<u16> {
+fn foreign_datum(geo_params: &GeoKeyParams) -> Option<u16> {
     if let Some(code) = geo_params.geographic_crs.filter(|code| {
         !WGS84_GEOGRAPHIC_CODES.contains(code) && !UNSAID_GEOKEY_CODES.contains(code)
     }) {
@@ -192,7 +177,7 @@ fn usable_step(scale: &[f64]) -> bool {
     matches!(scale.get(..2), Some([x, y]) if x.is_finite() && y.is_finite() && *x != 0.0 && *y != 0.0)
 }
 
-pub(super) fn affine_from_matrix(matrix: &[f64], half: f64) -> Option<[f64; 6]> {
+fn affine_from_matrix(matrix: &[f64], half: f64) -> Option<[f64; 6]> {
     if matrix.len() != 16 {
         return None;
     }
@@ -234,7 +219,7 @@ fn affine_from_tags(points: &[f64], scale: &[f64], matrix: &[f64], half: f64) ->
     affine_from_matrix(matrix, half)
 }
 
-pub(super) fn geo_placement(
+fn geo_placement(
     geo_params: &GeoKeyParams,
     points: &[f64],
     scale: &[f64],
@@ -269,7 +254,79 @@ pub(super) fn geo_placement(
     })
 }
 
-pub(super) fn geo_ties(
+fn snap_deg_bound(v: f64, limit: f64) -> f64 {
+    const EPS_DEG: f64 = 1e-6;
+    if v > limit && v <= limit + EPS_DEG {
+        limit
+    } else if v < -limit && v >= -limit - EPS_DEG {
+        -limit
+    } else {
+        v
+    }
+}
+
+fn synthesize_affine_ties(a: [f64; 6], width: u32, height: u32, half: f64) -> Vec<GeoTie> {
+    let (right, bottom) = (f64::from(width), f64::from(height));
+    // For `PixelIsPoint`, sample ties at the outer pixel centers (matching
+    // the explicit multi-tiepoint branch) so pole-touching global rasters
+    // (`lat = ±90°`) and `[0°, 360°]` rasters stay within valid geodetic
+    // bounds while `TieGrid` linearly extrapolates outer half-pixel edges.
+    let (px0, px1) = if half > 0.0 && width > 1 {
+        (half, right - half)
+    } else {
+        (0.0, right)
+    };
+    let (py0, py1) = if half > 0.0 && height > 1 {
+        (half, bottom - half)
+    } else {
+        (0.0, bottom)
+    };
+
+    let dlon_x = (a[0] * (px1 - px0)).abs();
+    let dlon_y = (a[1] * (py1 - py0)).abs();
+    // Guard against corrupt TIFFs before subdividing; valid longitudes are
+    // within `[-360°, +360°]` (`span <= 720°`).
+    if !dlon_x.is_finite() || !dlon_y.is_finite() || dlon_x > 720.0 || dlon_y > 720.0 {
+        return Vec::new();
+    }
+    // Subdivide any axis whose longitude span exceeds `170°` so adjacent
+    // lattice samples stay `< 180°` apart and `TieGrid::unwind` never wraps
+    // wide (`180° < Δlon < 359°`) geographic rasters backwards.
+    let x_steps = if dlon_x > 170.0 {
+        (dlon_x / 90.0).ceil().max(2.0) as usize
+    } else {
+        1
+    };
+    let y_steps = if dlon_y > 170.0 {
+        (dlon_y / 90.0).ceil().max(2.0) as usize
+    } else {
+        1
+    };
+
+    let mut ties = Vec::with_capacity((x_steps + 1) * (y_steps + 1));
+    for iy in 0..=y_steps {
+        let py = if iy == y_steps {
+            py1
+        } else {
+            py0 + (py1 - py0) * (iy as f64 / y_steps as f64)
+        };
+        for ix in 0..=x_steps {
+            let px = if ix == x_steps {
+                px1
+            } else {
+                px0 + (px1 - px0) * (ix as f64 / x_steps as f64)
+            };
+            // Snap tiny IEEE-754 rounding noise near ±90° / ±360° without masking
+            // genuine out-of-range coordinates (e.g. UTM metres mis-tagged as geo).
+            let lon = snap_deg_bound(a[0] * px + a[1] * py + a[2], 360.0);
+            let lat = snap_deg_bound(a[3] * px + a[4] * py + a[5], 90.0);
+            ties.push(GeoTie { px, py, lon, lat });
+        }
+    }
+    ties
+}
+
+fn geo_ties(
     geo_params: &GeoKeyParams,
     points: &[f64],
     scale: &[f64],
@@ -302,99 +359,12 @@ pub(super) fn geo_ties(
     }
 
     if let Some(a) = affine_from_tags(points, scale, matrix, half) {
-        let (right, bottom) = (f64::from(width), f64::from(height));
-        // For `PixelIsPoint`, sample ties at the outer pixel centers (matching
-        // the explicit multi-tiepoint branch) so pole-touching global rasters
-        // (`lat = ±90°`) and `[0°, 360°]` rasters stay within valid geodetic
-        // bounds while `TieGrid` linearly extrapolates outer half-pixel edges.
-        let (px0, px1) = if half > 0.0 && width > 1 {
-            (half, right - half)
-        } else {
-            (0.0, right)
-        };
-        let (py0, py1) = if half > 0.0 && height > 1 {
-            (half, bottom - half)
-        } else {
-            (0.0, bottom)
-        };
-
-        let dlon_x = (a[0] * (px1 - px0)).abs();
-        let dlon_y = (a[1] * (py1 - py0)).abs();
-        // Guard against corrupt TIFFs before subdividing; valid longitudes are
-        // within `[-360°, +360°]` (`span <= 720°`).
-        if !dlon_x.is_finite() || !dlon_y.is_finite() || dlon_x > 720.0 || dlon_y > 720.0 {
-            return Vec::new();
-        }
-        // Subdivide any axis whose longitude span exceeds `170°` so adjacent
-        // lattice samples stay `< 180°` apart and `TieGrid::unwind` never wraps
-        // wide (`180° < Δlon < 359°`) geographic rasters backwards.
-        let x_steps = if dlon_x > 170.0 {
-            (dlon_x / 90.0).ceil().max(2.0) as usize
-        } else {
-            1
-        };
-        let y_steps = if dlon_y > 170.0 {
-            (dlon_y / 90.0).ceil().max(2.0) as usize
-        } else {
-            1
-        };
-
-        // Snap tiny IEEE-754 rounding noise near ±90° / ±360° without masking
-        // genuine out-of-range coordinates (e.g. UTM metres mis-tagged as geo).
-        let snap_bound = |v: f64, limit: f64| {
-            const EPS_DEG: f64 = 1e-6;
-            if v > limit && v <= limit + EPS_DEG {
-                limit
-            } else if v < -limit && v >= -limit - EPS_DEG {
-                -limit
-            } else {
-                v
-            }
-        };
-
-        let mut ties = Vec::with_capacity((x_steps + 1) * (y_steps + 1));
-        for iy in 0..=y_steps {
-            let py = if iy == y_steps {
-                py1
-            } else {
-                py0 + (py1 - py0) * (iy as f64 / y_steps as f64)
-            };
-            for ix in 0..=x_steps {
-                let px = if ix == x_steps {
-                    px1
-                } else {
-                    px0 + (px1 - px0) * (ix as f64 / x_steps as f64)
-                };
-                let lon = snap_bound(a[0] * px + a[1] * py + a[2], 360.0);
-                let lat = snap_bound(a[3] * px + a[4] * py + a[5], 90.0);
-                ties.push(GeoTie { px, py, lon, lat });
-            }
-        }
-        return finite_ties(ties);
+        return finite_ties(synthesize_affine_ties(a, width, height, half));
     }
 
     Vec::new()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn geokey_parse_respects_count_and_nul_stripped_ascii_tail() {
-        let raw_keys = [
-            1, 1, 0, 3, // header
-            1024, 0, 1, 1, // ModelType = Projected
-            3073, 34737, 8, 4, // PCSCitation starting at 4, count 8 (stripped NUL)
-            3080, 34736, 1, 0, // ProjFalseOriginLong
-            0, 0, 0, 0, // trailing padding ignored
-        ];
-        let doubles = [39.0_f64, f64::NAN];
-        let ascii = "Foo|Zone 37";
-        let parsed = parse_geokeys(&raw_keys, &doubles, ascii);
-        assert_eq!(parsed.model_type, Some(1));
-        assert_eq!(parsed.get_ascii(3073), Some("Zone 37"));
-        assert_eq!(parsed.get_f64(3080), Some(39.0));
-        assert_eq!(parsed.keys.len(), 3);
-    }
-}
+#[path = "georef_tests.rs"]
+mod tests;

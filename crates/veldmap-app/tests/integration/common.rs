@@ -10,7 +10,7 @@ use veldmap_app::render::{
     clamp_to_primary_backends,
 };
 use veldmap_app::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG};
-use veldmap_core::geo::camera::Camera;
+use veldmap_core::geo::Camera;
 use veldmap_core::tile::{QuadtreeConfig, SourceId};
 use veldmap_raster::BundledBasemap;
 

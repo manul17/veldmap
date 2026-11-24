@@ -9,13 +9,12 @@ use veldmap_core::budget::DecodeBudgetTracker;
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
 use crate::RasterError;
-use crate::pipeline::grid;
 use crate::pipeline::radiometry::{self, DisplayMapping, percentile_stretch};
 use crate::pipeline::singleflight::{SingleflightRole, SingleflightSlot, run_singleflight};
 
 use super::TiffFormat;
 use super::chunk_reader::DecoderPool;
-use super::tags::{map_tiff_error, typed_samples};
+use super::tags::typed_samples;
 
 type StretchSlot = SingleflightSlot<DisplayMapping>;
 
@@ -129,17 +128,18 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
         if req.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
-        let (dw, dh) = pooled.decoder_mut().chunk_data_dimensions(index);
-        if dw == 0 || dh == 0 {
-            continue;
-        }
-        let est_bytes = grid::chunk_working_bytes(dw, dh, req.format.depth, false);
-        let _lease = req.budget_tracker.reserve_blocking(est_bytes, req.cancel)?;
-        let raw = pooled
-            .decoder_mut()
-            .read_chunk(index)
-            .map_err(|e| map_tiff_error(e, req.cancel))?;
-        let samples = typed_samples(&raw)?;
+        let chunk = match pooled.read_budgeted_chunk(
+            index,
+            req.format.depth,
+            false,
+            Some(req.budget_tracker),
+            req.cancel,
+        ) {
+            Ok(chunk) => chunk,
+            Err(RasterError::InvalidDimensions { .. }) => continue,
+            Err(err) => return Err(err),
+        };
+        let samples = typed_samples(&chunk.raw)?;
         let pixels = samples.len() / pixel.channels.max(1);
         let step = (pixels * pixel.colors().max(1))
             .div_ceil(target_per_chunk)

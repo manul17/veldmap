@@ -1,8 +1,8 @@
 //! Cross-module integration tests exercising the public `veldmap-core::geo` API.
 
 use glam::DVec3;
+use veldmap_core::geo::Ball;
 use veldmap_core::geo::camera::{Camera, MIN_HEIGHT_M};
-use veldmap_core::geo::cull::Ball;
 use veldmap_core::geo::footprint::{self, GeoPoint, Ring};
 use veldmap_core::geo::geodesy::{self, Geodetic, SEMI_MAJOR_M};
 

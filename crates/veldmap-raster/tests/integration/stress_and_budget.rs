@@ -12,7 +12,7 @@ use veldmap_core::tile::{
     SourceId, StreamKey, TileKey,
 };
 use veldmap_raster::{
-    DecodeContext, DecodeJob, DecodeJobKey, DecodeLane, DecodePoolConfig, ServeMode,
+    DecodeContext, DecodeJob, DecodeJobKey, DecodeLane, DecodePoolConfig, RasterSource, ServeMode,
     SharedChunkCache, TiffSource, TileScheduler, TwoLaneDecodePool, TwoLaneDecodePoolConfig,
 };
 
@@ -291,20 +291,21 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
                 );
                 assert!(sched.on_pointwise_arrived(&k0, admitted[0].job_id));
             }
-            ServeMode::Pass { from } => {
-                let pending = sched.check_pass_candidates(&meta, lvl, &[k0], |_| false);
-                assert_eq!(pending, vec![k0]);
-                let pass_key = meta.pass_key();
-                let pass_cancel = CancelToken::new();
-                let pass_id = sched
-                    .begin_pass(pass_key, lvl, Some(from), pass_cancel, vec![k0])
-                    .expect("begin pass");
+            ServeMode::Pass { .. } => {
+                let admitted = sched
+                    .admit_pass(&meta, lvl, &[k0], |_| false, &cancel)
+                    .expect("admit pass");
+                assert_eq!(admitted.tiles, vec![k0]);
                 src.produce_pass(&ctx, &mut |plvl, px, py, _, _, _| {
-                    sched.on_pass_tile_arrived(pass_key, pass_id, &meta.tile_key(plvl, px, py));
+                    sched.on_pass_tile_arrived(
+                        admitted.key,
+                        admitted.pass_id,
+                        &meta.tile_key(plvl, px, py),
+                    );
                     Ok(())
                 })
                 .expect("produce_pass");
-                assert!(sched.finish_pass(pass_key, pass_id, true));
+                assert!(sched.finish_pass(admitted.key, admitted.pass_id, true));
             }
         }
         assert!(!sched.is_in_flight(&k0));
@@ -457,12 +458,13 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
     let (release_tx, release_rx) = mpsc::channel();
     let mut scheduler = TileScheduler::default();
 
-    let pass_key = strip_meta.pass_key();
     let strip_want = vec![strip_meta.tile_key(1, 0, 0)];
-    let pass_cancel = shutdown.child_token();
-    let pass_id = scheduler
-        .begin_pass(pass_key, 1, Some(0), pass_cancel.clone(), strip_want)
-        .expect("begin stripped pass");
+    let admitted_pass = scheduler
+        .admit_pass(&strip_meta, 1, &strip_want, |_| false, &shutdown)
+        .expect("admit stripped pass");
+    let pass_key = admitted_pass.key;
+    let pass_id = admitted_pass.pass_id;
+    let pass_cancel = admitted_pass.cancel;
 
     {
         let src = Arc::clone(&strip_src);

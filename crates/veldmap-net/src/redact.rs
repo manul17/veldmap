@@ -78,7 +78,7 @@ pub(crate) fn extract_host(url: &str) -> String {
 
 /// Percent-encode a secret string into both uppercase and lowercase hex forms
 /// for URL substitution and redaction matching.
-pub(crate) fn percent_encode_variants(secret: &str) -> (String, String) {
+fn percent_encode_variants(secret: &str) -> (String, String) {
     let mut upper = String::with_capacity(secret.len());
     let mut lower = String::with_capacity(secret.len());
     for &b in secret.as_bytes() {
@@ -91,6 +91,61 @@ pub(crate) fn percent_encode_variants(secret: &str) -> (String, String) {
         }
     }
     (upper, lower)
+}
+
+/// Pre-encoded API secret variants computed once at configuration construction
+/// so per-tile URL expansion and error redaction do zero redundant
+/// percent-encoding work.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct EncodedSecret {
+    raw: String,
+    encoded_upper: String,
+    encoded_lower: String,
+}
+
+impl EncodedSecret {
+    pub(crate) fn new(raw: String) -> Self {
+        let (encoded_upper, encoded_lower) = percent_encode_variants(&raw);
+        Self {
+            raw,
+            encoded_upper,
+            encoded_lower,
+        }
+    }
+
+    pub(crate) fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub(crate) fn encoded_upper(&self) -> &str {
+        &self.encoded_upper
+    }
+
+    /// Redact raw and percent-encoded (upper/lower hex) forms of this secret
+    /// from `text`.
+    fn redact_in(&self, mut text: String) -> String {
+        if self.raw.is_empty() {
+            return text;
+        }
+        text = text.replace(&self.raw, "<redacted>");
+        if self.encoded_upper != self.raw {
+            text = text.replace(&self.encoded_upper, "<redacted>");
+        }
+        if self.encoded_lower != self.raw && self.encoded_lower != self.encoded_upper {
+            text = text.replace(&self.encoded_lower, "<redacted>");
+        }
+        text
+    }
+}
+
+/// Redact inline URL `user:pass@` authority credentials, `?query` tokens, and
+/// any configured [`EncodedSecret`] (raw or percent-encoded) from `text`.
+pub(crate) fn redact_text(text: &str, secret: Option<&EncodedSecret>) -> String {
+    let out = sanitize_urls_in_text(text);
+    match secret {
+        Some(secret) => secret.redact_in(out),
+        None => out,
+    }
 }
 
 fn is_valid_url_scheme(scheme: &str) -> bool {
@@ -143,7 +198,7 @@ pub fn sanitize_url_for_display(url: &str) -> String {
 /// Redact `user:pass@` credentials and `?query` tokens inside any URLs
 /// embedded within an arbitrary error or diagnostic string (e.g.
 /// `reqwest::Error::to_string()`).
-pub(crate) fn sanitize_urls_in_text(text: &str) -> String {
+fn sanitize_urls_in_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = find_url_scheme_start(rest) {

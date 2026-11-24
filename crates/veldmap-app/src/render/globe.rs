@@ -11,11 +11,12 @@
 use veldmap_core::tile::{POLAR_R_CAP, PixelFormat};
 
 use super::CLEAR_COLOR_LINEAR;
-use super::mesh::TileMeshCache;
+use super::bind_groups::TileBindGroupCache;
+use super::mesh::{TILE_KIND_GEO, TileMeshCache, tile_graticule_uniform};
 use super::overlay::OverlayRenderer;
-use super::pipelines::{GlobePipelines, TileBindGroupCache};
+use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
-use super::uniforms::{CameraUniform, TILE_KIND_GEO, TileUniform, tile_graticule_uniform};
+use super::uniforms::{CameraUniform, TileUniform};
 use super::viewport::{RenderParams, ViewportState};
 
 /// Standalone offscreen `wgpu` WGS84 quadtree globe renderer.
@@ -30,8 +31,6 @@ pub struct GlobeRenderer {
     tile_bind_groups: TileBindGroupCache,
     /// Per-frame dynamic uniform byte offsets for `snapshot.tiles`.
     tile_uniform_offsets: Vec<u32>,
-    /// Per-frame dynamic uniform byte offsets for `snapshot.overlays`.
-    overlay_uniform_offsets: Vec<u32>,
     viewport: ViewportState,
 }
 
@@ -41,14 +40,8 @@ impl GlobeRenderer {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let pipelines = GlobePipelines::new(device, target_format);
         let meshes = TileMeshCache::new(device);
-        let overlay = OverlayRenderer::new(device, &pipelines);
-        let viewport = ViewportState::new(
-            device,
-            target_format,
-            &pipelines.camera_layout,
-            &pipelines.tile_uniform_layout,
-            &pipelines.overlay_uniform_layout,
-        );
+        let overlay = OverlayRenderer::new();
+        let viewport = ViewportState::new(device, target_format, &pipelines);
 
         Self {
             pipelines,
@@ -56,7 +49,6 @@ impl GlobeRenderer {
             overlay,
             tile_bind_groups: TileBindGroupCache::default(),
             tile_uniform_offsets: Vec::new(),
-            overlay_uniform_offsets: Vec::new(),
             viewport,
         }
     }
@@ -94,13 +86,8 @@ impl GlobeRenderer {
             return false;
         }
 
-        self.viewport.ensure_offscreen(
-            device,
-            &self.pipelines.composite_layout,
-            &self.pipelines.composite_sampler,
-            width,
-            height,
-        );
+        self.viewport
+            .ensure_offscreen(device, &self.pipelines, width, height);
         self.prepare_tile_resources(device, params.snapshot);
         self.upload_uniforms(device, queue, width, height, params.snapshot);
         self.record_offscreen_passes(encoder, params.snapshot);
@@ -187,15 +174,9 @@ impl GlobeRenderer {
             self.tile_uniform_offsets.push(arena.push(&u));
         }
 
-        self.overlay
-            .push_uniforms(arena, snapshot, eye, &mut self.overlay_uniform_offsets);
+        self.overlay.push_uniforms(arena, snapshot, eye);
 
-        arena.flush(
-            device,
-            queue,
-            &self.pipelines.tile_uniform_layout,
-            &self.pipelines.overlay_uniform_layout,
-        );
+        arena.flush(device, queue);
     }
 
     fn record_body_pass<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, snapshot: &DrawSnapshot) {
@@ -322,10 +303,10 @@ impl GlobeRenderer {
             post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
             self.overlay.record_pass(
                 &mut post_pass,
+                &self.pipelines.overlay_pipeline,
                 self.viewport.uniform_arena(),
                 &self.tile_bind_groups,
                 snapshot,
-                &self.overlay_uniform_offsets,
             );
             if snapshot.show_graticule {
                 self.record_graticule_pass(&mut post_pass, snapshot);

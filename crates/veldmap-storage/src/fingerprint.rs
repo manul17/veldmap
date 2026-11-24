@@ -11,10 +11,10 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::SourceFingerprint;
 
 use crate::StorageError;
-use crate::file_source::{LocalFileSource, metadata_mtime_ns};
+use crate::file_source::{LocalFileSource, ensure_regular_file, metadata_mtime_ns};
 
 /// Edge/midpoint sample window size (`64 KiB`).
-pub const FINGERPRINT_SAMPLE_BYTES: u64 = 64 * 1024;
+const FINGERPRINT_SAMPLE_BYTES: u64 = 64 * 1024;
 
 /// Maximum stat entries retained in [`LocalFingerprintCache`] so long-running
 /// sessions cannot grow the in-memory cache without bound.
@@ -22,7 +22,7 @@ const MAX_FINGERPRINT_CACHE_ENTRIES: usize = 1024;
 
 /// Compute non-overlapping `(offset, len)` sample windows covering
 /// `head_64k || mid_64k || tail_64k` for a stream of `total_len` bytes.
-pub(crate) fn sample_ranges(total_len: u64) -> Vec<(u64, usize)> {
+fn sample_ranges(total_len: u64) -> Vec<(u64, usize)> {
     let s = FINGERPRINT_SAMPLE_BYTES;
     if total_len == 0 {
         return Vec::new();
@@ -123,12 +123,7 @@ impl LocalFingerprintCache {
 
         if !bypass_cache {
             let meta = std::fs::metadata(&key)?;
-            if !meta.is_file() {
-                return Err(StorageError::InvalidPath(format!(
-                    "'{}' is not a regular file",
-                    path.display()
-                )));
-            }
+            ensure_regular_file(&meta, path)?;
             let len = meta.len();
             let mtime_ns = metadata_mtime_ns(&meta);
             let guard = lock_unpoisoned(&self.entries);
@@ -190,11 +185,6 @@ impl LocalFingerprintCache {
         }
         guard.remove(path);
     }
-
-    /// Clear all cached stat entries.
-    pub fn clear(&self) {
-        lock_unpoisoned(&self.entries).clear();
-    }
 }
 
 #[cfg(test)]
@@ -207,7 +197,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::TestTempDir;
-    use crate::valid_source_key;
+    use crate::tile_cache::valid_source_key;
 
     #[test]
     fn sample_ranges_are_non_overlapping_and_cover_small_and_large_files() {
@@ -286,6 +276,5 @@ mod tests {
         std::fs::remove_file(&path).expect("remove");
         cache.invalidate(&path);
         assert!(lock_unpoisoned(&cache.entries).is_empty());
-        cache.clear();
     }
 }

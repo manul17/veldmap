@@ -67,16 +67,6 @@ impl SharedChunkCache {
         }
     }
 
-    /// Configured maximum byte budget.
-    pub fn max_bytes(&self) -> usize {
-        lock_unpoisoned(&self.state).lru.max_bytes()
-    }
-
-    /// Currently cached bytes across all stored chunks.
-    pub fn total_bytes(&self) -> usize {
-        lock_unpoisoned(&self.state).lru.total_bytes()
-    }
-
     /// Cache statistics `(hits, misses, dedup_waits)`.
     pub fn stats(&self) -> (u64, u64, u64) {
         let guard = lock_unpoisoned(&self.state);

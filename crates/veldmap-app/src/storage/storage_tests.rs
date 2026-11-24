@@ -1,16 +1,17 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use veldmap_core::tile::TileScheme;
 use veldmap_storage::DiskTileKey;
+use veldmap_storage::test_support::TestTempDir;
 
 use super::*;
 use crate::settings::BasemapSelection;
-use crate::test_support::TempTestRoot;
 
 #[test]
 fn update_settings_skips_noop_writes_and_flushes_async_saves_on_shutdown() {
-    let dir = TempTestRoot::new("storage-noop");
+    let dir = TestTempDir::new("storage-noop");
     let paths = StoragePaths::with_root(dir.path());
     let settings_path = paths.settings_path();
     let wakeup: Wakeup = Arc::new(|| {});
@@ -46,7 +47,7 @@ fn update_settings_skips_noop_writes_and_flushes_async_saves_on_shutdown() {
 
 #[test]
 fn disk_cache_worker_handles_refresh_cap_clear_and_disconnected_recovery() {
-    let dir = TempTestRoot::new("storage-worker");
+    let dir = TestTempDir::new("storage-worker");
     let paths = StoragePaths::with_root(dir.path());
     let wakes = Arc::new(AtomicUsize::new(0));
     let wakes_c = Arc::clone(&wakes);

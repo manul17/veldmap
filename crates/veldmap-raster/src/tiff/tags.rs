@@ -135,7 +135,7 @@ fn model(
     }
 }
 
-pub(super) fn resolve_sample_type(sample_format: u16, bits: u8) -> Result<SampleType, RasterError> {
+fn resolve_sample_type(sample_format: u16, bits: u8) -> Result<SampleType, RasterError> {
     match (sample_format, bits) {
         (1, 8) => Ok(SampleType::U8),
         (1, 16) => Ok(SampleType::U16),
@@ -273,4 +273,36 @@ pub(super) fn read_tag_ascii_opt(
     cancel: &CancelToken,
 ) -> Result<String, RasterError> {
     Ok(opt_tag(decoder.get_tag_ascii_string(tag), cancel)?.unwrap_or_default())
+}
+
+pub(super) fn parse_gdal_nodata(
+    decoder: &mut Decoder<BufferedByteReader>,
+    cancel: &CancelToken,
+) -> Result<Option<f64>, RasterError> {
+    let Some(raw) = opt_tag(decoder.get_tag_ascii_string(Tag::GdalNodata), cancel)? else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if trimmed.eq_ignore_ascii_case("nan") {
+        return Ok(Some(f64::NAN));
+    }
+    Ok(trimmed.parse::<f64>().ok().filter(|v| v.is_finite()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overview_bit_and_sample_type_resolution_reject_invalid_formats() {
+        assert!(!is_overview(0));
+        assert!(is_overview(1));
+        assert!(!is_overview(5)); // mask bit set
+        assert_eq!(resolve_sample_type(1, 8).unwrap(), SampleType::U8);
+        assert_eq!(resolve_sample_type(1, 16).unwrap(), SampleType::U16);
+        assert_eq!(resolve_sample_type(2, 16).unwrap(), SampleType::I16);
+        assert_eq!(resolve_sample_type(3, 32).unwrap(), SampleType::F32);
+        assert!(resolve_sample_type(1, 12).is_err());
+        assert!(resolve_sample_type(1, 32).is_err());
+    }
 }

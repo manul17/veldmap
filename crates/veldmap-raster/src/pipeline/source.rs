@@ -125,7 +125,6 @@ pub trait RasterSource: Send + Sync {
         ty: u32,
         ctx: &DecodeContext<'_>,
     ) -> Result<DecodedTile, RasterError> {
-        let meta = self.pyramid_meta();
         let mut produced: Option<DecodedTile> = None;
         self.produce_direct(
             level,
@@ -139,7 +138,7 @@ pub trait RasterSource: Send + Sync {
             },
         )?;
         produced.ok_or_else(|| RasterError::TileOutOfRange {
-            scheme: meta.scheme(),
+            scheme: self.pyramid_meta().scheme(),
             level,
             x: tx,
             y: ty,

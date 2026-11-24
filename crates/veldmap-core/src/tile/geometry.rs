@@ -40,11 +40,33 @@ pub struct TileSurfaceSample {
 
 /// Compute geographic `(lon_west_deg, lon_east_deg)` bounds for column `x` of `cols`.
 #[inline]
-pub(crate) fn tile_lon_bounds(x: u32, cols: u32) -> (f64, f64) {
+pub fn tile_lon_bounds(x: u32, cols: u32) -> (f64, f64) {
     let cols_f = f64::from(cols);
     let west = -180.0 + 360.0 * f64::from(x) / cols_f;
     let east = -180.0 + 360.0 * (f64::from(x) + 1.0) / cols_f;
     (west, east)
+}
+
+/// Compute unclamped geodetic `(lat_north_deg, lat_south_deg)` bounds in
+/// `[-90, 90]` for tile row `y` out of `rows` rows.
+#[inline]
+pub fn geodetic_lat_bounds(y: u32, rows: u32) -> (f64, f64) {
+    let rows_f = f64::from(rows);
+    let north = 90.0 - 180.0 * f64::from(y) / rows_f;
+    let south = 90.0 - 180.0 * (f64::from(y) + 1.0) / rows_f;
+    (north, south)
+}
+
+/// Compute normalized cap square `(u_west, u_east, v_north, v_south)` bounds
+/// in `[-1, 1]` for polar cap tile `(x, y)` inside an `n x n` grid.
+#[inline]
+pub fn polar_cap_uv_bounds(x: u32, y: u32, n: u32) -> (f64, f64, f64, f64) {
+    let n_f = f64::from(n);
+    let u0 = -1.0 + 2.0 * f64::from(x) / n_f;
+    let u1 = -1.0 + 2.0 * (f64::from(x) + 1.0) / n_f;
+    let v0 = -1.0 + 2.0 * f64::from(y) / n_f;
+    let v1 = -1.0 + 2.0 * (f64::from(y) + 1.0) / n_f;
+    (u0, u1, v0, v1)
 }
 
 /// Linearly interpolate along a 1D interval `[start, end]` at fraction `t`.
@@ -68,13 +90,11 @@ pub fn web_mercator_y_bounds(y: u32, rows: u32) -> (f64, f64) {
 /// the `|lat| >= WEB_MERCATOR_LIMIT_DEG` polar caps.
 pub(crate) fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
     let (cols, rows) = id.checked_grid_dims()?;
-    let rows_f = f64::from(rows);
     let (lon_west_deg, lon_east_deg) = tile_lon_bounds(id.x, cols);
 
     match id.scheme {
         PlanetaryScheme::Geodetic => {
-            let raw_lat_north_deg = 90.0 - 180.0 * f64::from(id.y) / rows_f;
-            let raw_lat_south_deg = 90.0 - 180.0 * f64::from(id.y + 1) / rows_f;
+            let (raw_lat_north_deg, raw_lat_south_deg) = geodetic_lat_bounds(id.y, rows);
             if raw_lat_south_deg >= WEB_MERCATOR_LIMIT_DEG
                 || raw_lat_north_deg <= -WEB_MERCATOR_LIMIT_DEG
             {
@@ -176,9 +196,9 @@ pub fn sample_tile_surface(id: QuadTileId, s: f64, t: f64) -> Option<TileSurface
         }
         PlanetaryScheme::PolarCap { north } => {
             let (n, _) = id.checked_grid_dims()?;
-            let n_f = f64::from(n);
-            let u = -1.0 + 2.0 * (f64::from(id.x) + s) / n_f;
-            let v = -1.0 + 2.0 * (f64::from(id.y) + t) / n_f;
+            let (u0, u1, v0, v1) = polar_cap_uv_bounds(id.x, id.y, n);
+            let u = lerp_f64(u0, u1, s);
+            let v = lerp_f64(v0, v1, t);
             let (lat_deg, lon_deg, polar_dx, polar_dy) = polar_cap_point(north, u, v);
             Some(TileSurfaceSample {
                 lat_deg,

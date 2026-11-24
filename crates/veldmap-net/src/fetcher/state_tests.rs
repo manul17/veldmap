@@ -48,10 +48,10 @@ fn expired_backoffs_route_directly_to_http_or_disk_queues() {
     );
 
     st.prune_expired_backoffs(now);
-    assert!(st.pending_http.contains(&http_key));
-    assert!(!st.pending_disk.contains(&http_key));
-    assert!(st.pending_disk.contains(&disk_key));
-    assert!(!st.pending_http.contains(&disk_key));
+    assert!(st.pending.http.contains(&http_key));
+    assert!(!st.pending.disk.contains(&http_key));
+    assert!(st.pending.disk.contains(&disk_key));
+    assert!(!st.pending.http.contains(&disk_key));
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn retry_failed_preserves_204_empty_and_ignores_stale_generations() {
         Some(FailureMarker::Empty)
     );
     assert!(!st.failures.has_failure(&terminal_key));
-    assert!(st.pending_disk.contains(&terminal_key));
+    assert!(st.pending.disk.contains(&terminal_key));
 }
 
 #[test]
@@ -107,13 +107,13 @@ fn active_root_stays_pinned_across_reconcile_and_backoff_expiry() {
     let mut initial_wanted = HashSet::new();
     initial_wanted.insert(root_key);
     st.reconcile_wanted(&initial_wanted, &|_| false, now);
-    assert!(st.pending_disk.contains(&root_key));
+    assert!(st.pending.disk.contains(&root_key));
 
     let empty_wanted = HashSet::new();
     st.reconcile_wanted(&empty_wanted, &|_| false, now);
     assert!(
-        st.pending_disk.contains(&root_key),
-        "active root must remain pinned in pending_disk until ready"
+        st.pending.disk.contains(&root_key),
+        "active root must remain pinned in pending.disk until ready"
     );
 
     st.failures.insert_backoff(
@@ -127,10 +127,10 @@ fn active_root_stays_pinned_across_reconcile_and_backoff_expiry() {
         st.earliest_wanted_backoff(now),
         Some(now + Duration::from_secs(5))
     );
-    st.pending_disk.clear();
+    st.pending.disk.clear();
     st.reconcile_wanted(&empty_wanted, &|_| false, now + Duration::from_secs(6));
     assert!(
-        st.pending_disk.contains(&root_key),
+        st.pending.disk.contains(&root_key),
         "expired retry_disk backoff for pinned active root must re-queue"
     );
 }
@@ -171,7 +171,7 @@ fn mark_empty_204_wakes_ui_and_clears_offline_status() {
     let key = wm_key(&spec, 3, 1, 2);
     let shutdown = CancelToken::new();
 
-    st.offline = true;
+    st.counters.offline = true;
     st.last_wanted.insert(key);
     let (gen_id, _) = st.register_http_in_flight(key, &shutdown);
 
@@ -179,14 +179,14 @@ fn mark_empty_204_wakes_ui_and_clears_offline_status() {
     assert_eq!(stale, Transition::Stale);
     assert!(!stale.is_applied());
     assert!(!stale.should_wakeup());
-    assert!(st.offline);
+    assert!(st.counters.offline);
     assert_eq!(st.status().in_flight, 1);
 
     let applied = st.mark_empty_204(key, gen_id);
     assert_eq!(applied, Transition::Applied { wakeup: true });
     assert!(applied.is_applied());
     assert!(applied.should_wakeup());
-    assert!(!st.offline);
+    assert!(!st.counters.offline);
     assert_eq!(st.status().in_flight, 0);
     assert_eq!(st.failures.failure_marker(&key), Some(FailureMarker::Empty));
 }
@@ -226,12 +226,12 @@ fn reconcile_wanted_routes_expired_backoffs_and_skips_ready_roots() {
     let wanted = HashSet::from([http_retry_key, disk_retry_key]);
     st.reconcile_wanted(&wanted, &|k| *k == root_key, now);
 
-    assert!(!st.pending_disk.contains(&root_key));
-    assert!(!st.pending_http.contains(&root_key));
-    assert!(st.pending_http.contains(&http_retry_key));
-    assert!(!st.pending_disk.contains(&http_retry_key));
-    assert!(st.pending_disk.contains(&disk_retry_key));
-    assert!(!st.pending_http.contains(&disk_retry_key));
+    assert!(!st.pending.disk.contains(&root_key));
+    assert!(!st.pending.http.contains(&root_key));
+    assert!(st.pending.http.contains(&http_retry_key));
+    assert!(!st.pending.disk.contains(&http_retry_key));
+    assert!(st.pending.disk.contains(&disk_retry_key));
+    assert!(!st.pending.http.contains(&disk_retry_key));
 }
 
 #[test]
@@ -245,12 +245,60 @@ fn drain_disk_to_http_streams_only_eligible_keys() {
     let wrong_source_key = wm_key(&other_spec, 2, 0, 0);
 
     st.insert_failure(suppressed_key, FailureMarker::Terminal);
-    st.pending_disk
+    st.pending
+        .disk
         .push_unique([eligible_key, suppressed_key, wrong_source_key]);
 
     st.drain_disk_to_http(spec.source_id());
-    assert!(st.pending_disk.is_empty());
-    assert!(st.pending_http.contains(&eligible_key));
-    assert!(!st.pending_http.contains(&suppressed_key));
-    assert!(!st.pending_http.contains(&wrong_source_key));
+    assert!(st.pending.disk.is_empty());
+    assert!(st.pending.http.contains(&eligible_key));
+    assert!(!st.pending.http.contains(&suppressed_key));
+    assert!(!st.pending.http.contains(&wrong_source_key));
+}
+
+#[test]
+fn plan_dispatch_carries_quad_id_and_defers_cooled_down_hosts() {
+    let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
+    let mut st = active_state(&spec);
+    let now = Instant::now();
+    let shutdown = CancelToken::new();
+    let limiters = HostLimiters::new(2);
+
+    let id0 = QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 1,
+        x: 0,
+        y: 0,
+    };
+    let id1 = QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 1,
+        x: 1,
+        y: 0,
+    };
+    let k0 = spec.tile_key(id0);
+    let k1 = spec.tile_key(id1);
+    st.pending.disk.push_unique([k0, k1]);
+
+    // With disk cache enabled, disk tasks are planned with unpacked QuadTileId.
+    let disk_batch = st.plan_dispatch(true, 1, &limiters, &shutdown, now);
+    assert_eq!(disk_batch.disk_tasks.len(), 1);
+    assert_eq!(disk_batch.disk_tasks[0].key, k0);
+    assert_eq!(disk_batch.disk_tasks[0].id, id0);
+    assert!(disk_batch.http_tasks.is_empty());
+
+    // Without disk cache, remaining pending.disk drains to HTTP and respects host cooldown.
+    let cooldown_until = now + Duration::from_secs(10);
+    limiters.record_cooldown(spec.host_for(id1), cooldown_until);
+    let deferred = st.plan_dispatch(false, 4, &limiters, &shutdown, now);
+    assert!(deferred.disk_tasks.is_empty());
+    assert!(deferred.http_tasks.is_empty());
+    assert_eq!(deferred.earliest_wakeup, Some(cooldown_until));
+    assert!(st.pending.http.contains(&k1));
+
+    // After cooldown expires, HTTP task is planned with exact QuadTileId.
+    let http_batch = st.plan_dispatch(false, 4, &limiters, &shutdown, cooldown_until);
+    assert_eq!(http_batch.http_tasks.len(), 1);
+    assert_eq!(http_batch.http_tasks[0].key, k1);
+    assert_eq!(http_batch.http_tasks[0].id, id1);
 }

@@ -1,53 +1,126 @@
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::geo::camera::Camera;
-use veldmap_core::tile::{DecodedTile, GlobeScheme, TileScheme, traverse};
+use veldmap_core::geo::Camera;
+use veldmap_core::tile::{DecodedTile, GlobeScheme, PixelFormat, TileScheme, traverse};
 use veldmap_net::{DecodeCompletion, DecodeFailure, DecodeRequest};
 use veldmap_raster::{DecodePool, DecodePoolConfig, TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::StoragePaths;
+use veldmap_storage::test_support::TestTempDir;
 
 use super::super::adapters::RasterDecodeExecutor;
 use super::super::policy::{bundled_tile_key, source_tile_key};
 use super::*;
 use crate::storage::AppStorage;
-use crate::test_support::TempTestRoot;
+
+struct BasemapTestHarness {
+    _root: Option<TestTempDir>,
+    storage: Option<AppStorage>,
+    pending: PendingUploads,
+    tx: UploadSender,
+    decode_shutdown: CancelToken,
+    decode_pool: Option<TwoLaneDecodePool>,
+    manager: BasemapManager,
+}
+
+impl BasemapTestHarness {
+    fn with_storage(label: &str, initial: Option<&AppSettings>) -> Self {
+        let root = TestTempDir::new(label);
+        let paths = StoragePaths::with_root(root.path());
+        if let Some(settings) = initial {
+            settings.save(&paths).expect("save initial settings");
+        }
+        let wakeup: Wakeup = Arc::new(|| {});
+        let storage = AppStorage::open(Arc::clone(&wakeup), Some(paths));
+        let pending = PendingUploads::new();
+        let tx = pending.sender().expect("sender");
+        let decode_shutdown = CancelToken::new();
+        let decode_pool = TwoLaneDecodePool::spawn(
+            TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
+            decode_shutdown.clone(),
+        );
+        let manager = BasemapManager::new(
+            storage.settings(),
+            storage.disk_cache(),
+            tx.clone(),
+            wakeup,
+            decode_pool.fast_handle(),
+            decode_shutdown.clone(),
+        );
+        Self {
+            _root: Some(root),
+            storage: Some(storage),
+            pending,
+            tx,
+            decode_shutdown,
+            decode_pool: Some(decode_pool),
+            manager,
+        }
+    }
+
+    fn without_storage(settings: &AppSettings) -> Self {
+        let wakeup: Wakeup = Arc::new(|| {});
+        let pending = PendingUploads::new();
+        let tx = pending.sender().expect("sender");
+        let decode_shutdown = CancelToken::new();
+        let decode_pool = TwoLaneDecodePool::spawn(
+            TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
+            decode_shutdown.clone(),
+        );
+        let manager = BasemapManager::new(
+            settings,
+            None,
+            tx.clone(),
+            wakeup,
+            decode_pool.fast_handle(),
+            decode_shutdown.clone(),
+        );
+        Self {
+            _root: None,
+            storage: None,
+            pending,
+            tx,
+            decode_shutdown,
+            decode_pool: Some(decode_pool),
+            manager,
+        }
+    }
+}
+
+impl Drop for BasemapTestHarness {
+    fn drop(&mut self) {
+        self.manager.begin_shutdown();
+        if let Some(storage) = &mut self.storage {
+            storage.begin_shutdown();
+        }
+        self.decode_shutdown.cancel();
+        self.pending.close();
+        if let Some(pool) = self.decode_pool.take() {
+            pool.shutdown();
+        }
+        self.manager.finish_shutdown();
+        if let Some(storage) = &mut self.storage {
+            storage.finish_shutdown();
+        }
+    }
+}
 
 #[test]
 fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
-    let root = TempTestRoot::new("ellipsoid-and-errors");
-    let paths = StoragePaths::with_root(root.path());
     let initial = AppSettings {
         active_basemap: BasemapSelection::EllipsoidOnly,
         ..AppSettings::default()
     };
-    initial.save(&paths).expect("save ellipsoid settings");
+    let mut h = BasemapTestHarness::with_storage("ellipsoid-and-errors", Some(&initial));
+    let storage = h.storage.as_mut().expect("storage");
 
-    let wakeup: Wakeup = Arc::new(|| {});
-    let mut storage = AppStorage::open(Arc::clone(&wakeup), Some(paths));
-    let mut pending = PendingUploads::new();
-    let tx = pending.sender().expect("sender");
-    let decode_shutdown = CancelToken::new();
-    let decode_pool = TwoLaneDecodePool::spawn(
-        TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
-        decode_shutdown.clone(),
-    );
-    let mut manager = BasemapManager::new(
-        storage.settings(),
-        storage.disk_cache(),
-        tx,
-        wakeup,
-        decode_pool.handle().fast().clone(),
-        decode_shutdown.clone(),
-    );
-
-    assert!(!manager.is_textured());
-    assert_eq!(manager.attribution(), None);
+    assert!(!h.manager.is_textured());
+    assert_eq!(h.manager.attribution(), None);
     assert_eq!(
-        manager.bundled_provider.in_flight_count(),
+        h.manager.bundled_provider.in_flight_count(),
         0,
         "EllipsoidOnly must not seed bundled roots"
     );
     assert!(
-        !manager.bundled_provider.is_basemap_decoded(),
+        !h.manager.bundled_provider.is_basemap_decoded(),
         "EllipsoidOnly must not eagerly decode bundled JPEG"
     );
 
@@ -55,29 +128,21 @@ fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
     bad_date.active_basemap = BasemapSelection::NasaGibsViirs;
     bad_date.gibs_date = "2024-02-30".to_owned();
     storage.update_settings(bad_date);
-    let outcome = manager.sync_settings(storage.settings());
+    let outcome = h.manager.sync_settings(storage.settings());
     assert!(outcome.changed);
     assert_eq!(outcome.evict_source, None);
-    assert!(manager.status_snapshot().config_error.is_some());
-    assert_eq!(manager.active_source(), SourceId::BUNDLED_BASEMAP);
-    assert_eq!(manager.attribution(), Some(BUNDLED_ATTRIBUTION));
+    assert!(h.manager.status_snapshot().config_error.is_some());
+    assert_eq!(h.manager.active_source(), SourceId::BUNDLED_BASEMAP);
+    assert_eq!(h.manager.attribution(), Some(BUNDLED_ATTRIBUTION));
 
     let mut bad_custom = initial;
     bad_custom.active_basemap = BasemapSelection::CustomXyz;
     bad_custom.custom_xyz.url_template = "ftp://bad/{z}/{x}/{y}".to_owned();
     storage.update_settings(bad_custom);
-    let outcome = manager.sync_settings(storage.settings());
+    let outcome = h.manager.sync_settings(storage.settings());
     assert!(outcome.changed);
-    assert!(manager.status_snapshot().config_error.is_some());
-    assert_eq!(manager.active_source(), SourceId::BUNDLED_BASEMAP);
-
-    manager.begin_shutdown();
-    storage.begin_shutdown();
-    decode_shutdown.cancel();
-    pending.close();
-    decode_pool.shutdown();
-    manager.finish_shutdown();
-    storage.finish_shutdown();
+    assert!(h.manager.status_snapshot().config_error.is_some());
+    assert_eq!(h.manager.active_source(), SourceId::BUNDLED_BASEMAP);
 }
 
 #[test]
@@ -148,54 +213,37 @@ fn unavailable_live_pipeline_degrades_cleanly_to_full_bundled_basemap() {
 
 #[test]
 fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_eviction_intent() {
-    let root = TempTestRoot::new("schedule");
-    let paths = StoragePaths::with_root(root.path());
-    let wakeup: Wakeup = Arc::new(|| {});
-    let mut storage = AppStorage::open(Arc::clone(&wakeup), Some(paths));
-    let mut pending = PendingUploads::new();
-    let tx = pending.sender().expect("sender");
+    let mut h = BasemapTestHarness::with_storage("schedule", None);
     let gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
-    let decode_shutdown = CancelToken::new();
-    let decode_pool = TwoLaneDecodePool::spawn(
-        TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
-        decode_shutdown.clone(),
-    );
-    let mut manager = BasemapManager::new(
-        storage.settings(),
-        storage.disk_cache(),
-        tx.clone(),
-        wakeup,
-        decode_pool.handle().fast().clone(),
-        decode_shutdown.clone(),
-    );
 
+    let storage = h.storage.as_mut().expect("storage");
     storage.mutate_settings(|s| s.active_basemap = BasemapSelection::NasaGibsBlueMarble);
-    let first_switch = manager.sync_settings(storage.settings());
+    let first_switch = h.manager.sync_settings(storage.settings());
     assert!(first_switch.changed);
     assert_eq!(first_switch.evict_source, None);
-    let gibs_source = manager.active_source();
+    let gibs_source = h.manager.active_source();
     assert_ne!(gibs_source, SourceId::BUNDLED_BASEMAP);
 
-    let qcfg = manager.quadtree_config();
+    let qcfg = h.manager.quadtree_config();
     let visible = traverse(&Camera::at(-86.0, 0.0, 3_000_000.0), 800, 600, &qcfg);
-    let weight = manager.appetite_weight_bytes();
+    let weight = h.manager.appetite_weight_bytes();
     let appetite = gpu_cache.proportional_pyramid_byte_cap(weight, weight);
-    manager.schedule_for_tiles(
+    h.manager.schedule_for_tiles(
         visible.iter().map(|v| v.tex_id),
         &gpu_cache,
-        &pending,
+        &h.pending,
         appetite,
     );
 
     assert!(
-        manager
+        h.manager
             .wanted_live
             .iter()
             .all(|k| !matches!(k.scheme, TileScheme::PolarCap { .. }) && k.level <= 8),
         "wanted_live must never include PolarCap or levels above max_level"
     );
     assert!(
-        manager
+        h.manager
             .wanted_bundled
             .iter()
             .any(|k| matches!(k.scheme, TileScheme::PolarCap { north: false })),
@@ -211,36 +259,28 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_evict
             y: 0,
         },
     );
-    tx.send((
+    h.tx.send((
         stale_key,
         DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![0, 0, 0, 255])
             .expect("valid tile"),
     ))
     .expect("send stale");
-    manager.record_upload_report(&UploadBatchReport {
+    h.manager.record_upload_report(&UploadBatchReport {
         uploaded: 1,
         max_tile_bytes_by_source: vec![(gibs_source, 2 * 1024 * 1024)],
         ..UploadBatchReport::default()
     });
-    assert_eq!(manager.observed_live_tile_bytes, 2 * 1024 * 1024);
+    assert_eq!(h.manager.observed_live_tile_bytes, 2 * 1024 * 1024);
 
     storage.mutate_settings(|s| s.active_basemap = BasemapSelection::EoxSentinel2Cloudless);
-    let second_switch = manager.sync_settings(storage.settings());
+    let second_switch = h.manager.sync_settings(storage.settings());
     assert!(second_switch.changed);
     assert_eq!(second_switch.evict_source, Some(gibs_source));
     if let Some(evict) = second_switch.evict_source {
-        pending.clear_source(evict);
+        h.pending.clear_source(evict);
     }
-    assert!(!pending.contains(&stale_key));
-    assert_eq!(manager.observed_live_tile_bytes, 0);
-
-    manager.begin_shutdown();
-    storage.begin_shutdown();
-    decode_shutdown.cancel();
-    pending.close();
-    decode_pool.shutdown();
-    manager.finish_shutdown();
-    storage.finish_shutdown();
+    assert!(!h.pending.contains(&stale_key));
+    assert_eq!(h.manager.observed_live_tile_bytes, 0);
 }
 
 #[test]
@@ -303,24 +343,8 @@ fn in_place_custom_xyz_spec_edit_marks_changed_without_evicting_source() {
         ..AppSettings::default()
     };
 
-    let wakeup: Wakeup = Arc::new(|| {});
-    let mut pending = PendingUploads::new();
-    let tx = pending.sender().expect("sender");
-    let decode_shutdown = CancelToken::new();
-    let decode_pool = TwoLaneDecodePool::spawn(
-        TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
-        decode_shutdown.clone(),
-    );
-    let mut manager = BasemapManager::new(
-        &settings,
-        None,
-        tx,
-        wakeup,
-        decode_pool.handle().fast().clone(),
-        decode_shutdown.clone(),
-    );
-
-    let initial_source = manager.active_source();
+    let mut h = BasemapTestHarness::without_storage(&settings);
+    let initial_source = h.manager.active_source();
     assert_ne!(initial_source, SourceId::BUNDLED_BASEMAP);
 
     // Editing max_level / api_key / attribution preserves `SourceId` (derived
@@ -330,8 +354,8 @@ fn in_place_custom_xyz_spec_edit_marks_changed_without_evicting_source() {
     settings.custom_xyz.max_level = 14;
     settings.custom_xyz.api_key = "new-secret".to_string();
     settings.custom_xyz.attribution = "Example v2".to_string();
-    let outcome = manager.sync_settings(&settings);
-    assert_eq!(manager.active_source(), initial_source);
+    let outcome = h.manager.sync_settings(&settings);
+    assert_eq!(h.manager.active_source(), initial_source);
     assert!(
         outcome.changed,
         "in-place CustomXyz spec edit must mark scene dirty"
@@ -340,16 +364,10 @@ fn in_place_custom_xyz_spec_edit_marks_changed_without_evicting_source() {
         outcome.evict_source, None,
         "same SourceId must not evict cached tiles"
     );
-    assert_eq!(manager.quadtree_config().max_tex_level, 14);
+    assert_eq!(h.manager.quadtree_config().max_tex_level, 14);
 
     // Repeating sync with identical settings must be a no-op.
-    let noop = manager.sync_settings(&settings);
+    let noop = h.manager.sync_settings(&settings);
     assert!(!noop.changed);
     assert_eq!(noop.evict_source, None);
-
-    manager.begin_shutdown();
-    decode_shutdown.cancel();
-    pending.close();
-    decode_pool.shutdown();
-    manager.finish_shutdown();
 }

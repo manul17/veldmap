@@ -150,16 +150,6 @@ impl BufferedByteReader {
         self.cancel = cancel;
     }
 
-    /// Return the current logical stream position.
-    pub const fn position(&self) -> u64 {
-        self.pos
-    }
-
-    /// Return the underlying [`ByteSource`].
-    pub fn source(&self) -> &Arc<dyn ByteSource> {
-        &self.source
-    }
-
     fn buffered_end(&self) -> u64 {
         self.buf_offset.saturating_add(self.buf_len as u64)
     }

@@ -371,17 +371,6 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
 }
 
 impl<V> TileCache<TileKey, V> {
-    /// Maximum byte appetite allowed for one active pyramid (`< 50%` of
-    /// `max_bytes` divided evenly among `active_pyramids`).
-    ///
-    /// Keeping each visible set + in-flight request strictly below half the
-    /// cache budget prevents newly arriving tiles from evicting the currently
-    /// displayed frame before a step finishes.
-    pub fn pyramid_byte_cap(&self, active_pyramids: usize) -> usize {
-        let half_strict = (self.max_bytes / 2).saturating_sub(1);
-        half_strict / active_pyramids.max(1)
-    }
-
     /// Maximum byte appetite allowed for one active pyramid weighted
     /// proportionally by its per-tile byte cost (`pyramid_weight / total_weight`)
     /// within the strict `< 50%` combined appetite ceiling.

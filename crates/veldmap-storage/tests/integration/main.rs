@@ -2,52 +2,16 @@
 //! `LocalFileSource` + BLAKE3 `LocalFingerprintCache`, durable atomic JSON
 //! persistence, and multi-format `TileDiskCache` persistence across reopen.
 
-#![expect(
-    clippy::expect_used,
-    reason = "INVARIANT: integration test harness helpers panic on setup failure"
-)]
-
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
 use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileKey, TileScheme};
+use veldmap_storage::test_support::TestTempDir;
 use veldmap_storage::{
     DiskTileKey, LocalFileSource, LocalFingerprintCache, StoragePaths, TileBlobEncoding,
     TileDiskCache, fingerprint_byte_source, read_json_or_default_with_backup,
     write_json_durable_private,
 };
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "veldmap-storage-integ-{label}-{}-{nanos}-{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        Self(dir)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct TestDoc {
@@ -57,7 +21,7 @@ struct TestDoc {
 
 #[test]
 fn local_file_source_fingerprinting_and_bypass_cache_work_end_to_end() {
-    let dir = TempDir::new("fp");
+    let dir = TestTempDir::new("storage-integ-fp");
     let path = dir.path().join("sample.bin");
     let mut bytes = vec![0xAAu8; 256 * 1024];
     std::fs::write(&path, &bytes).expect("write initial");
@@ -85,7 +49,7 @@ fn local_file_source_fingerprinting_and_bypass_cache_work_end_to_end() {
 
 #[test]
 fn durable_json_and_sqlite_disk_cache_persist_across_reopen() {
-    let dir = TempDir::new("persist");
+    let dir = TestTempDir::new("storage-integ-persist");
     let paths = StoragePaths::with_root(dir.path());
     let doc_path = paths.config_dir.join("session.json");
     std::fs::create_dir_all(&paths.config_dir).expect("create config dir");

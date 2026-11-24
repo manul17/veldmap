@@ -8,13 +8,16 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{QuadTileId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
-use crate::http::{FetchFailure, FetchOutcome, TransientFetchError, download_capped};
+use crate::http::{
+    FetchFailure, FetchOutcome, TransientFetchError, TransientKind, download_capped,
+};
 use crate::{DecodeCompletion, DecodeFailure, DecodeRequest};
 
 use super::PipelineContext;
 use super::disk::{DiskCacheGate, DiskReadOutcome};
-use super::dispatch::HttpFetchInput;
-use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
+use super::dispatch::{DiskTask, HttpFetchInput};
+use super::guards::{InFlightGuard, PermitGuard};
+use super::state::{PipelineState, Transition};
 
 /// Short silent cooldown before re-attempting a tile whose decode submission
 /// was rejected or evicted under CPU decode-pool backpressure.
@@ -24,6 +27,16 @@ const DECODE_BACKPRESSURE_BACKOFF: Duration = Duration::from_millis(50);
 enum DecodeOutcome {
     Ok,
     InvalidPayload(String),
+}
+
+fn finish_with_wakeup(
+    ctx: &PipelineContext,
+    guard: InFlightGuard,
+    f: impl FnOnce(&mut PipelineState, TileKey, u64) -> Transition,
+) {
+    if guard.finish(f).should_wakeup() {
+        (ctx.wakeup)();
+    }
 }
 
 fn schedule_decode_backpressure(guard: InFlightGuard, retry_disk: bool) {
@@ -61,7 +74,7 @@ async fn submit_and_await_decode(
     };
 
     if !ctx.decoder.submit(req) {
-        if !cancel.is_cancelled() && !ctx.shared.shutdown.is_cancelled() {
+        if !cancel.is_cancelled() {
             schedule_decode_backpressure(guard, retry_disk);
         }
         return None;
@@ -78,7 +91,7 @@ async fn submit_and_await_decode(
             Some((guard, DecodeOutcome::InvalidPayload(msg)))
         }
         Err(DecodeFailure::Aborted) => {
-            if !cancel.is_cancelled() && !ctx.shared.shutdown.is_cancelled() {
+            if !cancel.is_cancelled() {
                 schedule_decode_backpressure(guard, retry_disk);
             }
             None
@@ -86,26 +99,27 @@ async fn submit_and_await_decode(
     }
 }
 
-fn promote_to_http(ctx: &PipelineContext, cancel: &CancelToken, guard: InFlightGuard) {
-    let can_requeue = !cancel.is_cancelled() && !ctx.shared.shutdown.is_cancelled();
+fn promote_to_http(cancel: &CancelToken, guard: InFlightGuard) {
+    let can_requeue = !cancel.is_cancelled();
     guard.finish(|st, key, generation| st.promote_disk_miss_to_http(key, generation, can_requeue));
 }
 
 pub(super) async fn run_disk_lookup(
     ctx: Arc<PipelineContext>,
     gate: DiskCacheGate,
-    key: TileKey,
-    spec: Arc<LiveBasemapSpec>,
-    cancel: CancelToken,
-    guard: InFlightGuard,
-    disk_slot: DiskSlotGuard,
+    task: DiskTask,
 ) {
+    let DiskTask {
+        key,
+        id,
+        spec,
+        cancel,
+        guard,
+        disk_slot,
+    } = task;
     if cancel.is_cancelled() {
         return;
     }
-    let Some(id) = key.quad_id() else {
-        return;
-    };
 
     let read_outcome = gate.get(&spec, id, &cancel).await;
     // Release the disk-lookup concurrency slot immediately before decode/HTTP.
@@ -129,16 +143,15 @@ pub(super) async fn run_disk_lookup(
                         error = %err,
                         "Cached disk tile failed decode; deleting corrupt entry and falling back to HTTP"
                     );
-                    gate.delete_corrupt(spec, key, id, &cancel, &ctx.shared.shutdown)
-                        .await;
-                    promote_to_http(&ctx, &cancel, guard);
+                    gate.delete_corrupt(spec, key, id, &cancel).await;
+                    promote_to_http(&cancel, guard);
                 }
             }
         }
-        DiskReadOutcome::Miss => promote_to_http(&ctx, &cancel, guard),
+        DiskReadOutcome::Miss => promote_to_http(&cancel, guard),
         DiskReadOutcome::Error(err) => {
             tracing::debug!(?key, error = %err, "Disk cache lookup failed; falling back to HTTP");
-            promote_to_http(&ctx, &cancel, guard);
+            promote_to_http(&cancel, guard);
         }
     }
 }
@@ -195,18 +208,25 @@ fn handle_http_transient_failure(
         return;
     }
     let safe_msg = spec.redact_secrets(&err.msg);
-    let delay = err.retry_after.unwrap_or(ctx.transient_retry_backoff);
+    let (offline, rate_limited, delay) = match err.kind {
+        TransientKind::Network { offline } => (offline, false, ctx.transient_retry_backoff),
+        TransientKind::ServerError => (false, false, ctx.transient_retry_backoff),
+        TransientKind::RateLimited { retry_after } => (
+            false,
+            true,
+            retry_after.unwrap_or(ctx.transient_retry_backoff),
+        ),
+    };
     let until = Instant::now() + delay;
-    let rate_limited = err.rate_limited || err.retry_after.is_some();
     tracing::debug!(
         ?key,
-        offline = err.offline,
+        offline,
         delay_s = delay.as_secs(),
         error = %safe_msg,
         "Transient HTTP tile failure"
     );
-    let transition = guard.finish(|st, key, generation| {
-        let tr = st.mark_transient_backoff(key, generation, until, err.offline, Some(safe_msg));
+    finish_with_wakeup(ctx, guard, |st, key, generation| {
+        let tr = st.mark_transient_backoff(key, generation, until, offline, Some(safe_msg));
         // Record host cooldown atomically under `state -> host_limiters` lock
         // order and only if this task still belongs to the active source &
         // generation, preventing a cancelled/stale task from poisoning a newly
@@ -216,9 +236,6 @@ fn handle_http_transient_failure(
         }
         tr
     });
-    if transition.should_wakeup() {
-        (ctx.wakeup)();
-    }
 }
 
 pub(super) async fn run_http_fetch(
@@ -229,6 +246,7 @@ pub(super) async fn run_http_fetch(
 ) {
     let HttpFetchInput {
         key,
+        id,
         spec,
         host,
         cancel,
@@ -237,9 +255,6 @@ pub(super) async fn run_http_fetch(
     if cancel.is_cancelled() {
         return;
     }
-    let Some(id) = key.quad_id() else {
-        return;
-    };
 
     // Expand full tile URL outside `PipelineState`'s mutex.
     let url = match spec.resolve_url(id) {
@@ -271,10 +286,9 @@ pub(super) async fn run_http_fetch(
         Ok(FetchOutcome::Empty204) => {
             // Valid empty/nodata tile: suppress infinite refetch without
             // bumping `failed_count` or displaying an error badge.
-            let transition = guard.finish(|st, key, generation| st.mark_empty_204(key, generation));
-            if transition.should_wakeup() {
-                (ctx.wakeup)();
-            }
+            finish_with_wakeup(&ctx, guard, |st, key, generation| {
+                st.mark_empty_204(key, generation)
+            });
         }
         Err(FetchFailure::Terminal(msg)) => {
             let safe_msg = spec.redact_secrets(&msg);
@@ -296,9 +310,7 @@ fn record_terminal_failure(
     if cancel.is_cancelled() {
         return;
     }
-    let transition =
-        guard.finish(|st, key, generation| st.mark_terminal_failure(key, generation, error_msg));
-    if transition.should_wakeup() {
-        (ctx.wakeup)();
-    }
+    finish_with_wakeup(ctx, guard, |st, key, generation| {
+        st.mark_terminal_failure(key, generation, error_msg)
+    });
 }

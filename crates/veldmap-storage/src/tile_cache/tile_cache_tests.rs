@@ -174,13 +174,13 @@ fn recovers_from_corrupt_or_legacy_v1_sqlite_file_and_persists_across_reopen() {
 
     let k1 = key("gibs", 3, 2, 1);
     cache.put(&k1, b"png-bytes").expect("put k1");
-    let ts_before = cache.last_ts_ms.load(Ordering::Acquire);
+    let ts_before = cache.clock.current_ms();
     drop(cache);
 
     // 3. Reopen and verify persistence + monotonic timestamp seed + shrinking + clear.
     let reopened = TileDiskCache::open(&db_path, 4096).expect("reopen");
     assert!(
-        reopened.last_ts_ms.load(Ordering::Acquire) >= ts_before,
+        reopened.clock.current_ms() >= ts_before,
         "reopen must seed last_ts_ms from MAX(last_used_ms)"
     );
     assert_eq!(
@@ -212,6 +212,20 @@ fn recovers_from_corrupt_or_legacy_v1_sqlite_file_and_persists_across_reopen() {
         "clear() should reclaim space (before={before_clear}, after={})",
         after_clear.file_bytes
     );
+
+    // 4. Reopening an over-budget cache enforces `max_bytes` while keeping `write_generation == 0`.
+    reopened
+        .put(&key("gibs", 5, 0, 0), &[1u8; 64])
+        .expect("put 1");
+    reopened
+        .put(&key("gibs", 5, 1, 0), &[2u8; 64])
+        .expect("put 2");
+    drop(reopened);
+    let capped = TileDiskCache::open(&db_path, 80).expect("reopen capped");
+    assert_eq!(capped.write_generation(), 0);
+    let capped_stats = capped.stats().expect("capped stats");
+    assert!(capped_stats.payload_bytes <= 80);
+    assert_eq!(capped_stats.tile_count, 1);
 }
 
 #[test]
@@ -390,11 +404,11 @@ fn clear_source_removes_only_matching_source_without_orphan_blobs() {
     assert_eq!(stats.payload_bytes, 200);
     assert_eq!(stats.tile_count, 1);
     assert_eq!(count_rows(&cache, "tile_blobs"), 1);
-    assert_eq!(cache.pending_touches.lock().unwrap().len(), 1);
+    assert_eq!(cache.touches.len(), 1);
 
     assert_eq!(cache.clear_source("eox").expect("clear eox"), 1);
     assert!(
-        cache.pending_touches.lock().unwrap().is_empty(),
+        cache.touches.is_empty(),
         "clear_source must leave pending_touches empty for deleted tile_ids"
     );
 }
@@ -554,4 +568,19 @@ fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
         .expect("overflow batch");
     assert!(overflow.total_bytes_after <= 1_000);
     assert!(cache.get_encoded(&k6).expect("newest kept").is_some());
+
+    // Batch where every entry is outside size bounds reports honest current
+    // bytes and does not spuriously bump `write_generation`.
+    let gen_before = cache.write_generation();
+    let bytes_before = cache.stats().expect("stats").payload_bytes;
+    let oversized = vec![9u8; 2_000];
+    let skipped = cache
+        .put_encoded_batch_if_uncancelled(
+            &[(&make_key(7), TileBlobEncoding::Qoi, &oversized)],
+            &live,
+        )
+        .expect("oversized batch");
+    assert_eq!(skipped.evicted_tiles, 0);
+    assert_eq!(skipped.total_bytes_after, bytes_before);
+    assert_eq!(cache.write_generation(), gen_before);
 }

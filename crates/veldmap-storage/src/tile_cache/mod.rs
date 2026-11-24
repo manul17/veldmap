@@ -14,10 +14,14 @@
 mod evict;
 mod key;
 mod queries;
+mod readers;
 mod schema;
 mod store;
+mod touches;
 
-pub use self::key::{DiskTileKey, TileBlobEncoding, valid_source_key};
+#[cfg(test)]
+pub(crate) use self::key::valid_source_key;
+pub use self::key::{DiskTileKey, TileBlobEncoding};
 pub use self::store::{
     DiskCacheStats, DiskTileEntry, EvictionReport, MAX_CACHED_TILE_BYTES, TileDiskCache,
 };

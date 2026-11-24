@@ -1,5 +1,5 @@
 //! Native raster pyramid tile scheduler (`TileScheduler`, `AdmittedTile`,
-//! `PassBusy`, `TileFailureOutcome`).
+//! `AdmittedPass`, `TileFailureOutcome`).
 //!
 //! Coordinates progressive coarsest-to-target tile fetching across both
 //! concurrent pointwise reads and single-active sequential passes per
@@ -33,13 +33,17 @@ pub struct AdmittedTile {
     pub cancel: CancelToken,
 }
 
-/// Error returned when starting a sequential pass while one is already active
-/// for the same [`PassKey`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PassBusy {
+/// Sequential pass admitted atomically by [`TileScheduler::admit_pass`] with
+/// its versioned `pass_id`, shared cascade origin `pass_from`, per-pass child
+/// [`CancelToken`], and admitted missing `tiles`.
+#[derive(Clone, Debug)]
+pub struct AdmittedPass {
     pub key: PassKey,
-    pub active_pass_id: u64,
-    pub active_level: u8,
+    pub pass_id: u64,
+    pub level: u8,
+    pub pass_from: u8,
+    pub cancel: CancelToken,
+    pub tiles: Vec<TileKey>,
 }
 
 /// Classification of a failed tile request.
@@ -48,8 +52,8 @@ pub enum TileFailureOutcome {
     /// First transient failure: removed from in-flight and eligible for one retry.
     RetryEligible,
     /// Terminal rejection or second consecutive failure: suppressed permanently
-    /// until `forgive_single_pass_failures` (for single-pass forgiveness) or
-    /// `reset_source`.
+    /// until a subsequent healthy pass forgives single-pass failures or
+    /// `reset_source` clears state.
     TerminalFailed,
 }
 
@@ -60,6 +64,80 @@ enum FailureState {
     Permanent,
 }
 
+#[derive(Default)]
+struct TileFailureMap {
+    states: HashMap<TileKey, FailureState>,
+}
+
+impl TileFailureMap {
+    fn is_terminal_failed(&self, key: &TileKey) -> bool {
+        matches!(
+            self.states.get(key),
+            Some(FailureState::Permanent | FailureState::TransientPassSuppressed)
+        )
+    }
+
+    fn is_suppressed(&self, key: &TileKey, is_pointwise: bool) -> bool {
+        if is_pointwise {
+            self.is_terminal_failed(key)
+        } else {
+            matches!(self.states.get(key), Some(FailureState::Permanent))
+        }
+    }
+
+    fn record_pointwise_failure(&mut self, key: TileKey, terminal: bool) -> TileFailureOutcome {
+        if terminal {
+            self.states.insert(key, FailureState::Permanent);
+            return TileFailureOutcome::TerminalFailed;
+        }
+        match self.states.get(&key) {
+            None => {
+                self.states.insert(key, FailureState::RetriedOnce);
+                TileFailureOutcome::RetryEligible
+            }
+            Some(
+                FailureState::RetriedOnce
+                | FailureState::TransientPassSuppressed
+                | FailureState::Permanent,
+            ) => {
+                self.states.insert(key, FailureState::Permanent);
+                TileFailureOutcome::TerminalFailed
+            }
+        }
+    }
+
+    fn record_pass_failure(&mut self, key: TileKey) {
+        let next = match self.states.get(&key) {
+            None => FailureState::TransientPassSuppressed,
+            Some(
+                FailureState::RetriedOnce
+                | FailureState::TransientPassSuppressed
+                | FailureState::Permanent,
+            ) => FailureState::Permanent,
+        };
+        self.states.insert(key, next);
+    }
+
+    /// Forgive tiles of `pass_key` that only failed once in a prior broken pass
+    /// (demoting them to `RetriedOnce` so a subsequent healthy pass allows one
+    /// retry while a second failure becomes permanent).
+    fn forgive_single_pass(&mut self, pass_key: PassKey) {
+        for (key, state) in &mut self.states {
+            if key.stream_key() == pass_key && *state == FailureState::TransientPassSuppressed {
+                *state = FailureState::RetriedOnce;
+            }
+        }
+    }
+
+    fn clear_tile(&mut self, key: &TileKey) {
+        self.states.remove(key);
+    }
+
+    fn clear_source(&mut self, source: SourceId) {
+        self.states.retain(|k, _| k.source != source);
+    }
+}
+
 enum FlightEntry {
     Pointwise { job_id: u64, cancel: CancelToken },
     Pass { pass_id: u64 },
@@ -68,7 +146,7 @@ enum FlightEntry {
 struct ActivePass {
     pass_id: u64,
     level: u8,
-    pass_from: Option<u8>,
+    pass_from: u8,
     cancel: CancelToken,
     tiles: Vec<TileKey>,
 }
@@ -81,7 +159,7 @@ pub struct TileScheduler {
     next_pass_id: u64,
     active_passes: HashMap<PassKey, ActivePass>,
     in_flight: HashMap<TileKey, FlightEntry>,
-    failures: HashMap<TileKey, FailureState>,
+    failures: TileFailureMap,
 }
 
 impl Default for TileScheduler {
@@ -98,7 +176,7 @@ impl TileScheduler {
             next_pass_id: 1,
             active_passes: HashMap::new(),
             in_flight: HashMap::new(),
-            failures: HashMap::new(),
+            failures: TileFailureMap::default(),
         }
     }
 
@@ -109,13 +187,9 @@ impl TileScheduler {
 
     /// Return whether any band/format stream of `source` currently has an
     /// active `ServeMode::Pass`.
-    pub fn has_any_active_pass(&self, source: SourceId) -> bool {
+    #[cfg(test)]
+    fn has_any_active_pass(&self, source: SourceId) -> bool {
         self.active_passes.keys().any(|k| k.source == source)
-    }
-
-    /// Return the level of the active `ServeMode::Pass` for `key`, if any.
-    pub fn active_pass_level(&self, key: PassKey) -> Option<u8> {
-        self.active_passes.get(&key).map(|p| p.level)
     }
 
     /// Return whether `key` is currently marked in-flight.
@@ -131,10 +205,7 @@ impl TileScheduler {
     /// Return whether `key` is permanently or transiently suppressed from
     /// re-requesting.
     pub fn is_terminal_failed(&self, key: &TileKey) -> bool {
-        matches!(
-            self.failures.get(key),
-            Some(FailureState::Permanent | FailureState::TransientPassSuppressed)
-        )
+        self.failures.is_terminal_failed(key)
     }
 
     fn filter_candidates(
@@ -157,12 +228,10 @@ impl TileScheduler {
             {
                 continue;
             }
-            let suppressed = if is_pointwise {
-                self.is_terminal_failed(&key)
-            } else {
-                matches!(self.failures.get(&key), Some(FailureState::Permanent))
-            };
-            if is_cached(&key) || self.in_flight.contains_key(&key) || suppressed {
+            if is_cached(&key)
+                || self.in_flight.contains_key(&key)
+                || self.failures.is_suppressed(&key, is_pointwise)
+            {
                 continue;
             }
             eligible.push(key);
@@ -245,60 +314,39 @@ impl TileScheduler {
         cancelled
     }
 
-    /// Read-only check returning unique fitting `ServeMode::Pass` candidates at
-    /// `level` that warrant launching a sequential pass (callers then pass the
-    /// result into [`Self::begin_pass`]).
+    /// Atomically filter missing `ServeMode::Pass` candidates at `level` and
+    /// begin the single active sequential pass for `meta.pass_key()`,
+    /// deriving a child [`CancelToken`] from `parent_cancel`.
     ///
-    /// Returns empty if `level` does not fit, is not `ServeMode::Pass`, or a
-    /// pass is already active for `meta.pass_key()`. Permits first-time
-    /// pass-failed tiles to trigger a recovery pass so pass-only sources never
-    /// permanently starve.
-    pub fn check_pass_candidates(
-        &self,
+    /// Returns `None` if `level` does not exist, does not fit, is not
+    /// `ServeMode::Pass`, a pass is already active for `meta.pass_key()`, or
+    /// every candidate is already cached, in-flight, or permanently suppressed.
+    /// Permits first-time pass-failed tiles to trigger a recovery pass so
+    /// pass-only sources never permanently starve.
+    pub fn admit_pass(
+        &mut self,
         meta: &PyramidMeta,
         level: u8,
         candidates: &[TileKey],
         is_cached: impl Fn(&TileKey) -> bool,
-    ) -> Vec<TileKey> {
-        let Some(plan) = meta.level(level) else {
-            return Vec::new();
+        parent_cancel: &CancelToken,
+    ) -> Option<AdmittedPass> {
+        let plan = meta.level(level)?;
+        let ServeMode::Pass { from: pass_from } = plan.serve else {
+            return None;
         };
-        if !plan.fits
-            || !matches!(plan.serve, ServeMode::Pass { .. })
-            || self.has_active_pass(meta.pass_key())
-        {
-            return Vec::new();
+        let key = meta.pass_key();
+        if !plan.fits || self.has_active_pass(key) {
+            return None;
         }
-        self.filter_candidates(meta, level, candidates, &is_cached, false)
-    }
+        let tiles = self.filter_candidates(meta, level, candidates, &is_cached, false);
+        if tiles.is_empty() {
+            return None;
+        }
 
-    /// Begin the single active `ServeMode::Pass` for `key` at `level`
-    /// (with optional shared cascade root `pass_from`).
-    ///
-    /// Returns `Err(PassBusy)` if another sequential pass is already active
-    /// for `key`. `ServeMode::Pointwise` requests must NOT call this method
-    /// so pointwise tiles execute concurrently.
-    pub fn begin_pass(
-        &mut self,
-        key: PassKey,
-        level: u8,
-        pass_from: Option<u8>,
-        cancel: CancelToken,
-        tiles: Vec<TileKey>,
-    ) -> Result<u64, PassBusy> {
-        if let Some(existing) = self.active_passes.get(&key) {
-            return Err(PassBusy {
-                key,
-                active_pass_id: existing.pass_id,
-                active_level: existing.level,
-            });
-        }
-        debug_assert!(
-            tiles.iter().all(|t| PassKey::from_tile_key(t) == key),
-            "begin_pass tiles must match PassKey"
-        );
         let pass_id = self.next_pass_id;
         self.next_pass_id = self.next_pass_id.wrapping_add(1).max(1);
+        let cancel = parent_cancel.child_token();
         for &tile in &tiles {
             self.in_flight.insert(tile, FlightEntry::Pass { pass_id });
         }
@@ -308,11 +356,18 @@ impl TileScheduler {
                 pass_id,
                 level,
                 pass_from,
-                cancel,
-                tiles,
+                cancel: cancel.clone(),
+                tiles: tiles.clone(),
             },
         );
-        Ok(pass_id)
+        Some(AdmittedPass {
+            key,
+            pass_id,
+            level,
+            pass_from,
+            cancel,
+            tiles,
+        })
     }
 
     fn take_active_pass(&mut self, key: PassKey, pass_id: u64) -> Option<ActivePass> {
@@ -337,6 +392,13 @@ impl TileScheduler {
         matches
     }
 
+    fn teardown_pass(&mut self, pass: ActivePass) -> CancelToken {
+        for tile in &pass.tiles {
+            self.remove_pass_in_flight(tile, pass.pass_id);
+        }
+        pass.cancel
+    }
+
     /// Update the desired target level (and its `pass_from`, if served via
     /// `ServeMode::Pass`) for `key`.
     ///
@@ -352,17 +414,13 @@ impl TileScheduler {
         target_pass_from: Option<u8>,
     ) -> Option<CancelToken> {
         let should_cancel = self.active_passes.get(&key).is_some_and(|pass| {
-            pass.level < target_level
-                && !(target_pass_from.is_some() && pass.pass_from == target_pass_from)
+            pass.level < target_level && target_pass_from != Some(pass.pass_from)
         });
         if !should_cancel {
             return None;
         }
         let pass = self.active_passes.remove(&key)?;
-        for tile in &pass.tiles {
-            self.remove_pass_in_flight(tile, pass.pass_id);
-        }
-        Some(pass.cancel)
+        Some(self.teardown_pass(pass))
     }
 
     /// Mark an active pass `pass_id` for `key` as completed.
@@ -377,19 +435,11 @@ impl TileScheduler {
         };
         for tile in pass.tiles {
             if self.remove_pass_in_flight(&tile, pass.pass_id) && !succeeded {
-                let next = match self.failures.get(&tile) {
-                    None => FailureState::TransientPassSuppressed,
-                    Some(
-                        FailureState::RetriedOnce
-                        | FailureState::TransientPassSuppressed
-                        | FailureState::Permanent,
-                    ) => FailureState::Permanent,
-                };
-                self.failures.insert(tile, next);
+                self.failures.record_pass_failure(tile);
             }
         }
         if succeeded {
-            self.forgive_single_pass_failures(key);
+            self.failures.forgive_single_pass(key);
         }
         true
     }
@@ -418,24 +468,18 @@ impl TileScheduler {
     /// pass so the caller can invoke `cancel()` outside any scheduler lock.
     pub fn abort_pass(&mut self, key: PassKey, pass_id: u64) -> Option<CancelToken> {
         let pass = self.take_active_pass(key, pass_id)?;
-        for tile in &pass.tiles {
-            self.remove_pass_in_flight(tile, pass.pass_id);
-        }
-        Some(pass.cancel)
+        Some(self.teardown_pass(pass))
     }
 
     /// Record successful arrival of pointwise `(key, job_id)`, clearing its
     /// in-flight and failure flags. Returns `true` if `(key, job_id)` matched.
     pub fn on_pointwise_arrived(&mut self, key: &TileKey, job_id: u64) -> bool {
-        let matches = matches!(
-            self.in_flight.get(key),
-            Some(FlightEntry::Pointwise { job_id: id, .. }) if *id == job_id
-        );
-        if matches {
-            self.in_flight.remove(key);
-            self.failures.remove(key);
+        if self.cancel_in_flight(key, job_id) {
+            self.failures.clear_tile(key);
+            true
+        } else {
+            false
         }
-        matches
     }
 
     /// Record successful arrival of `key` emitted by active pass
@@ -450,7 +494,7 @@ impl TileScheduler {
             return false;
         }
         self.remove_pass_in_flight(key, pass_id);
-        self.failures.remove(key);
+        self.failures.clear_tile(key);
         true
     }
 
@@ -470,38 +514,7 @@ impl TileScheduler {
         if !self.cancel_in_flight(key, job_id) {
             return None;
         }
-        if terminal {
-            self.failures.insert(*key, FailureState::Permanent);
-            return Some(TileFailureOutcome::TerminalFailed);
-        }
-        let outcome = match self.failures.get(key) {
-            None => {
-                self.failures.insert(*key, FailureState::RetriedOnce);
-                TileFailureOutcome::RetryEligible
-            }
-            Some(
-                FailureState::RetriedOnce
-                | FailureState::TransientPassSuppressed
-                | FailureState::Permanent,
-            ) => {
-                self.failures.insert(*key, FailureState::Permanent);
-                TileFailureOutcome::TerminalFailed
-            }
-        };
-        Some(outcome)
-    }
-
-    /// Forgive tiles of `pass_key` that only failed once in a prior broken pass
-    /// (demoting them to `RetriedOnce` so a subsequent healthy pass allows one
-    /// retry while a second failure becomes permanent).
-    pub fn forgive_single_pass_failures(&mut self, pass_key: PassKey) {
-        for (key, state) in &mut self.failures {
-            if PassKey::from_tile_key(key) == pass_key
-                && *state == FailureState::TransientPassSuppressed
-            {
-                *state = FailureState::RetriedOnce;
-            }
-        }
+        Some(self.failures.record_pointwise_failure(*key, terminal))
     }
 
     /// Drop all active passes, pointwise in-flight entries, and failure state
@@ -527,7 +540,7 @@ impl TileScheduler {
                 true
             }
         });
-        self.failures.retain(|k, _| k.source != source);
+        self.failures.clear_source(source);
         tokens
     }
 }

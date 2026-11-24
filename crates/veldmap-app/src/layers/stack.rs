@@ -4,8 +4,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use veldmap_core::geo::Frame;
-use veldmap_core::geo::footprint::FootprintBounds;
+use veldmap_core::geo::{FootprintBounds, Frame};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::{OverlayCullTree, SourceId, TileKey};
 use veldmap_raster::{PyramidMeta, RasterSource};
@@ -13,34 +12,34 @@ use veldmap_raster::{PyramidMeta, RasterSource};
 use super::{LayerId, default_display_tile_bytes};
 
 /// Single georeferenced raster overlay inside [`LayerStack`].
-pub(crate) struct OverlayLayer {
-    pub(crate) id: LayerId,
-    pub(crate) name: String,
-    pub(crate) path: PathBuf,
-    pub(crate) source: Arc<dyn RasterSource>,
-    pub(crate) meta: PyramidMeta,
-    pub(crate) fingerprint_hex: String,
-    pub(crate) frame: Arc<Frame>,
-    pub(crate) relaid: u64,
-    pub(crate) cull: OverlayCullTree,
-    pub(crate) visible: bool,
-    pub(crate) opacity: f32,
-    pub(crate) source_pixel_size_m: Option<(f64, f64)>,
-    pub(crate) footprint: Option<FootprintBounds>,
+pub(super) struct OverlayLayer {
+    pub(super) id: LayerId,
+    pub(super) name: String,
+    pub(super) path: PathBuf,
+    pub(super) source: Arc<dyn RasterSource>,
+    pub(super) meta: PyramidMeta,
+    pub(super) fingerprint_hex: String,
+    pub(super) frame: Arc<Frame>,
+    pub(super) relaid: u64,
+    pub(super) cull: OverlayCullTree,
+    pub(super) visible: bool,
+    pub(super) opacity: f32,
+    pub(super) source_pixel_size_m: Option<(f64, f64)>,
+    pub(super) footprint: Option<FootprintBounds>,
     /// Current wanted tile set (shared with active `ServeMode::Pass` jobs so
     /// mid-pass zooms deliver tiles matching the live viewport).
-    pub(crate) wanted_shared: Arc<Mutex<HashSet<TileKey>>>,
+    pub(super) wanted_shared: Arc<Mutex<HashSet<TileKey>>>,
     /// Snapshot of `wanted_shared` retained on the UI thread for
     /// `PendingUploads` retention without acquiring a lock inside upload drain.
-    pub(crate) wanted: HashSet<TileKey>,
-    pub(crate) observed_tile_bytes: usize,
-    pub(crate) reloading: bool,
-    pub(crate) reload_seq: u64,
-    pub(crate) reload_cancel: Option<CancelToken>,
+    pub(super) wanted: HashSet<TileKey>,
+    pub(super) observed_tile_bytes: usize,
+    reloading: bool,
+    reload_seq: u64,
+    reload_cancel: Option<CancelToken>,
 }
 
 impl OverlayLayer {
-    pub(crate) fn from_source(
+    pub(super) fn from_source(
         id: LayerId,
         path: PathBuf,
         source: Arc<dyn RasterSource>,
@@ -82,24 +81,88 @@ impl OverlayLayer {
         }
     }
 
-    pub(crate) fn source_id(&self) -> SourceId {
+    pub(super) fn source_id(&self) -> SourceId {
         self.meta.source
     }
 
-    pub(crate) fn appetite_weight_bytes(&self) -> u64 {
-        if self.visible && !self.reloading {
+    pub(super) fn is_active(&self) -> bool {
+        self.visible && !self.reloading
+    }
+
+    pub(super) fn is_reloading(&self) -> bool {
+        self.reloading
+    }
+
+    pub(super) fn begin_reload(&mut self, cancel: CancelToken) -> (u64, Option<CancelToken>) {
+        let prev = self.reload_cancel.replace(cancel);
+        self.reload_seq = self.reload_seq.saturating_add(1);
+        self.reloading = true;
+        self.clear_wanted();
+        (self.reload_seq, prev)
+    }
+
+    pub(super) fn abort_reload(&mut self) {
+        self.reloading = false;
+        self.reload_cancel = None;
+    }
+
+    pub(super) fn matches_reload_seq(&self, seq: u64) -> bool {
+        self.reload_seq == seq
+    }
+
+    pub(super) fn finish_reload_err(&mut self, seq: u64) -> bool {
+        if self.reload_seq != seq {
+            return false;
+        }
+        self.reloading = false;
+        self.reload_cancel = None;
+        true
+    }
+
+    pub(super) fn replace_reloaded(
+        &mut self,
+        seq: u64,
+        path: PathBuf,
+        source: Arc<dyn RasterSource>,
+        frame: Frame,
+        relaid: u64,
+    ) -> Option<SourceId> {
+        if self.reload_seq != seq {
+            return None;
+        }
+        let old_src = self.source_id();
+        let mut replacement = Self::from_source(
+            self.id,
+            path,
+            source,
+            frame,
+            self.visible,
+            self.opacity,
+            relaid,
+        );
+        replacement.reload_seq = seq;
+        *self = replacement;
+        Some(old_src)
+    }
+
+    pub(super) fn take_reload_cancel(&mut self) -> Option<CancelToken> {
+        self.reload_cancel.take()
+    }
+
+    pub(super) fn appetite_weight_bytes(&self) -> u64 {
+        if self.is_active() {
             (self.observed_tile_bytes as u64).max(1024)
         } else {
             0
         }
     }
 
-    pub(crate) fn sync_wanted_shared(&self) {
+    pub(super) fn sync_wanted_shared(&self) {
         let mut shared = lock_unpoisoned(&self.wanted_shared);
         shared.clone_from(&self.wanted);
     }
 
-    pub(crate) fn clear_wanted(&mut self) {
+    pub(super) fn clear_wanted(&mut self) {
         self.wanted.clear();
         lock_unpoisoned(&self.wanted_shared).clear();
     }
@@ -109,54 +172,66 @@ impl OverlayLayer {
 /// (index `0` drawn right above the basemap, last index drawn on top beneath
 /// the procedural graticule).
 #[derive(Default)]
-pub(crate) struct LayerStack {
+pub(super) struct LayerStack {
     layers: Vec<OverlayLayer>,
 }
 
 impl LayerStack {
-    pub(crate) fn push(&mut self, layer: OverlayLayer) {
+    pub(super) fn push(&mut self, layer: OverlayLayer) {
         self.layers.push(layer);
     }
 
-    pub(crate) fn remove(&mut self, id: LayerId) -> Option<OverlayLayer> {
+    pub(super) fn remove(&mut self, id: LayerId) -> Option<OverlayLayer> {
         let idx = self.layers.iter().position(|l| l.id == id)?;
         Some(self.layers.remove(idx))
     }
 
-    pub(crate) fn get_mut(&mut self, id: LayerId) -> Option<&mut OverlayLayer> {
+    pub(super) fn get(&self, id: LayerId) -> Option<&OverlayLayer> {
+        self.layers.iter().find(|l| l.id == id)
+    }
+
+    pub(super) fn get_mut(&mut self, id: LayerId) -> Option<&mut OverlayLayer> {
         self.layers.iter_mut().find(|l| l.id == id)
     }
 
-    pub(crate) fn layers(&self) -> &[OverlayLayer] {
+    pub(super) fn layers(&self) -> &[OverlayLayer] {
         &self.layers
     }
 
-    pub(crate) fn layers_mut(&mut self) -> &mut [OverlayLayer] {
+    pub(super) fn layers_mut(&mut self) -> &mut [OverlayLayer] {
         &mut self.layers
     }
 
-    pub(crate) fn count_sharing_source(&self, source_id: SourceId) -> usize {
+    pub(super) fn count_sharing_source(&self, source_id: SourceId) -> usize {
         self.layers
             .iter()
             .filter(|l| l.source_id() == source_id)
             .count()
     }
 
-    pub(crate) fn has_visible_source(&self, source_id: SourceId) -> bool {
+    pub(super) fn has_visible_source(&self, source_id: SourceId) -> bool {
         self.layers
             .iter()
-            .any(|l| l.visible && !l.reloading && l.source_id() == source_id)
+            .any(|l| l.is_active() && l.source_id() == source_id)
     }
 
-    pub(crate) fn total_appetite_weight_bytes(&self) -> u64 {
+    pub(super) fn total_appetite_weight_bytes(&self) -> u64 {
         self.layers
             .iter()
             .fold(0u64, |acc, l| acc.saturating_add(l.appetite_weight_bytes()))
     }
 
-    pub(crate) fn extend_pinned_root_sources(&self, out: &mut Vec<SourceId>) {
+    pub(super) fn topmost_visible_source_pixel_size_m(&self) -> Option<(f64, f64)> {
+        self.layers
+            .iter()
+            .rev()
+            .find(|l| l.is_active())
+            .and_then(|l| l.source_pixel_size_m)
+    }
+
+    pub(super) fn extend_pinned_root_sources(&self, out: &mut Vec<SourceId>) {
         for layer in &self.layers {
-            if layer.visible && !layer.reloading {
+            if layer.is_active() {
                 let src = layer.source_id();
                 if !out.contains(&src) {
                     out.push(src);
@@ -165,9 +240,9 @@ impl LayerStack {
         }
     }
 
-    pub(crate) fn extend_wanted_tile_sets<'a>(&'a self, out: &mut Vec<&'a HashSet<TileKey>>) {
+    pub(super) fn extend_wanted_tile_sets<'a>(&'a self, out: &mut Vec<&'a HashSet<TileKey>>) {
         for layer in &self.layers {
-            if layer.visible && !layer.reloading && !layer.wanted.is_empty() {
+            if layer.is_active() && !layer.wanted.is_empty() {
                 out.push(&layer.wanted);
             }
         }

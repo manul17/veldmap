@@ -148,16 +148,8 @@ fn ancestor_touch_protects_root_for_both_xyz_and_raster_pyramid() {
 }
 
 #[test]
-fn appetite_cap_and_proportional_budget_stay_strictly_below_half() {
+fn proportional_budget_stays_strictly_below_half() {
     let cache: TileCache<TileKey, u8> = TileCache::new(256 * 1024 * 1024);
-    let cap1 = cache.pyramid_byte_cap(1);
-    let cap2 = cache.pyramid_byte_cap(2);
-    let cap4 = cache.pyramid_byte_cap(4);
-
-    assert!(cap1 * 2 < cache.max_bytes());
-    assert!(cap2 * 4 < cache.max_bytes());
-    assert!(cap4 * 8 < cache.max_bytes());
-    assert!(cache.pyramid_byte_cap(1) / (256 * 256 * 4) < 512);
 
     // Heterogeneous multi-band weights: basemap (349 KiB) + 3x R32Float (1 MiB each) + SCL (256 KiB).
     let w_base = 350_000u64;
@@ -176,7 +168,7 @@ fn appetite_cap_and_proportional_budget_stay_strictly_below_half() {
     assert_eq!(cache.proportional_pyramid_byte_cap(0, total_w), 0);
 
     let small: TileCache<TileKey, u8> = TileCache::new(1000);
-    let per_pyr_bytes = small.pyramid_byte_cap(4);
+    let per_pyr_bytes = small.proportional_pyramid_byte_cap(1, 4);
     assert!(per_pyr_bytes * 4 * 2 < small.max_bytes());
 
     // Shrinking `max_bytes` via `set_max_bytes` evicts LRU entries cleanly.

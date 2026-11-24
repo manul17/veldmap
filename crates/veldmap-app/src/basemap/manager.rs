@@ -5,10 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::{
-    PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey, max_mip_levels,
-    mip_chain_byte_size,
-};
+use veldmap_core::tile::{PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey};
 use veldmap_net::{
     FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError, TileBlobStore, TileDecodeExecutor,
 };
@@ -21,7 +18,9 @@ use super::bundled::{
 };
 use super::policy::BasemapCarrierPolicy;
 use super::{BasemapStatusSnapshot, BasemapSyncOutcome, LiveStreamStatus};
-use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSender};
+use crate::gpu_tiles::{
+    GpuTileCache, PendingUploads, UploadBatchReport, UploadSender, display_tile_mip_bytes,
+};
 use crate::settings::{AppSettings, BasemapSelection};
 
 /// Attribution string displayed for the bundled public-domain Blue Marble
@@ -343,14 +342,7 @@ impl BasemapManager {
     }
 
     fn bundled_tile_byte_size() -> usize {
-        let mips = max_mip_levels(BUNDLED_TILE_PX, BUNDLED_TILE_PX);
-        mip_chain_byte_size(
-            BUNDLED_TILE_PX,
-            BUNDLED_TILE_PX,
-            PixelFormat::Rgba8UnormSrgb,
-            mips,
-        )
-        .max(1)
+        display_tile_mip_bytes(BUNDLED_TILE_PX)
     }
 
     fn collect_tile_candidates(

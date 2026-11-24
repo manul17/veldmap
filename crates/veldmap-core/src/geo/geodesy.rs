@@ -77,77 +77,81 @@ impl Ellipsoid {
         (ecef, normal)
     }
 
-    /// Evaluate a separable `N x N` grid of surface (`height_m = 0.0`) ECEF
-    /// points and outward unit normals, factoring trigonometry into `N` lat and
-    /// `N` lon evaluations instead of `N^2`.
-    pub(crate) fn fill_separable_surface_grid<const N: usize>(
-        &self,
-        lats_deg: [f64; N],
-        lons_deg: [f64; N],
-        samples: &mut [DVec3],
-        normals: &mut [DVec3],
-    ) {
-        let len = N * N;
-        assert!(
-            samples.len() >= len && normals.len() >= len,
-            "separable surface grid buffers must hold at least {len} entries"
-        );
-        let samples = &mut samples[..len];
-        let normals = &mut normals[..len];
-        let e2 = self.eccentricity_sq();
-        let one_minus_e2 = 1.0 - e2;
-        let mut lat_cache = [(0.0_f64, 0.0_f64, 0.0_f64); N];
-        for (slot, lat_deg) in lat_cache.iter_mut().zip(lats_deg) {
-            let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
-            let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-            *slot = (sin_lat, cos_lat, curvature);
-        }
-        let mut lon_cache = [(0.0_f64, 0.0_f64); N];
-        for (slot, lon_deg) in lon_cache.iter_mut().zip(lons_deg) {
-            *slot = lon_deg.to_radians().sin_cos();
-        }
-        let mut idx = 0usize;
-        for &(sin_lat, cos_lat, curvature) in &lat_cache {
-            let eq = curvature * cos_lat;
-            let z = curvature * one_minus_e2 * sin_lat;
-            for &(sin_lon, cos_lon) in &lon_cache {
-                normals[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
-                samples[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
-                idx += 1;
-            }
-        }
-    }
-
-    /// Evaluate a dynamically sized separable grid of surface (`height_m = 0.0`)
-    /// ECEF points and outward unit normals in row-major order
-    /// (`lats_deg.len() * lons_deg.len()`), computing trigonometry once per row
-    /// and once per column.
-    pub fn fill_separable_surface_points_and_normals(
+    /// Evaluate a separable `lats_deg.len() x lons_deg.len()` row-major grid of
+    /// surface (`height_m = 0.0`) ECEF points (and optional outward unit
+    /// normals), computing trigonometry once per row and once per column.
+    ///
+    /// Uses a 65-column stack cache (covering both `5 x 5` culling probes and
+    /// `MAX_WARP_SEGMENTS + 1 = 65` warp patches) so hot per-frame callers
+    /// incur zero heap allocations.
+    pub(crate) fn fill_separable_surface_grid(
         &self,
         lats_deg: &[f64],
         lons_deg: &[f64],
-        out_points: &mut Vec<DVec3>,
-        out_normals: &mut Vec<DVec3>,
+        out_points: &mut [DVec3],
+        out_normals: Option<&mut [DVec3]>,
     ) {
+        const STACK_LON_CAP: usize = 65;
+
+        let len = lats_deg.len().saturating_mul(lons_deg.len());
+        assert!(
+            out_points.len() >= len,
+            "separable surface grid point buffer must hold at least {len} entries"
+        );
+        if let Some(normals) = out_normals.as_deref() {
+            assert!(
+                normals.len() >= len,
+                "separable surface grid normal buffer must hold at least {len} entries"
+            );
+        }
+
+        let mut stack_lons = [(0.0_f64, 0.0_f64); STACK_LON_CAP];
+        let mut heap_lons = Vec::new();
+        let lon_cache: &[(f64, f64)] = if lons_deg.len() <= STACK_LON_CAP {
+            for (slot, &lon_deg) in stack_lons.iter_mut().zip(lons_deg) {
+                *slot = lon_deg.to_radians().sin_cos();
+            }
+            &stack_lons[..lons_deg.len()]
+        } else {
+            heap_lons.extend(
+                lons_deg
+                    .iter()
+                    .map(|&lon_deg| lon_deg.to_radians().sin_cos()),
+            );
+            &heap_lons
+        };
+
         let e2 = self.eccentricity_sq();
         let one_minus_e2 = 1.0 - e2;
-        let lon_cache: Vec<(f64, f64)> = lons_deg
-            .iter()
-            .map(|&lon_deg| lon_deg.to_radians().sin_cos())
-            .collect();
-        let total = lats_deg.len().saturating_mul(lons_deg.len());
-        out_points.clear();
-        out_points.reserve(total);
-        out_normals.clear();
-        out_normals.reserve(total);
-        for &lat_deg in lats_deg {
-            let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
-            let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-            let eq = curvature * cos_lat;
-            let z = curvature * one_minus_e2 * sin_lat;
-            for &(sin_lon, cos_lon) in &lon_cache {
-                out_points.push(DVec3::new(eq * cos_lon, eq * sin_lon, z));
-                out_normals.push(DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat));
+        let out_points = &mut out_points[..len];
+        let out_normals = out_normals.map(|n| &mut n[..len]);
+
+        let mut idx = 0usize;
+        match out_normals {
+            Some(normals) => {
+                for &lat_deg in lats_deg {
+                    let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
+                    let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+                    let eq = curvature * cos_lat;
+                    let z = curvature * one_minus_e2 * sin_lat;
+                    for &(sin_lon, cos_lon) in lon_cache {
+                        normals[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+                        out_points[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
+                        idx += 1;
+                    }
+                }
+            }
+            None => {
+                for &lat_deg in lats_deg {
+                    let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
+                    let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+                    let eq = curvature * cos_lat;
+                    let z = curvature * one_minus_e2 * sin_lat;
+                    for &(sin_lon, cos_lon) in lon_cache {
+                        out_points[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
+                        idx += 1;
+                    }
+                }
             }
         }
     }
@@ -331,6 +335,20 @@ pub fn between(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
 
 /// One full turn of longitude in degrees.
 pub(crate) const TURN_DEG: f64 = 360.0;
+
+/// Minimum longitude span treated as a full circle around the globe.
+///
+/// Pixel-centered global grids may fall half a pixel short of 360 degrees
+/// (for example `-179.9875 -> 179.9875`).
+pub(crate) const FULL_CIRCLE_DEG: f64 = 359.0;
+
+/// Spherical centroid `(lat_deg, lon_deg)` of a set of `(lat_deg, lon_deg)`
+/// points via normalized unit-vector sum, returning `None` if empty or
+/// antipodally balanced.
+pub(crate) fn spherical_centroid(points: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
+    let sum: DVec3 = points.map(|(lat, lon)| unit(lat, lon)).sum();
+    (sum.length() > 1e-9).then(|| angles(sum.normalize()))
+}
 
 /// Shift `lon_deg` by an integer multiple of 360 degrees so it lies within
 /// `[-180, +180]` of `base`.

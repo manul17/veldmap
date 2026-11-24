@@ -4,8 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use veldmap_core::geo::Frame;
-use veldmap_core::geo::camera::Camera;
+use veldmap_core::geo::{Camera, Frame};
 use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, traverse};
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
@@ -99,7 +98,7 @@ pub struct DrawSnapshot {
 
 impl DrawSnapshot {
     /// Iterator over the texture tile IDs needed by the basemap quadtree.
-    pub fn visible_tex_ids(&self) -> impl Iterator<Item = QuadTileId> + '_ {
+    pub(crate) fn visible_tex_ids(&self) -> impl Iterator<Item = QuadTileId> + '_ {
         self.tiles.iter().map(|t| t.visible.tex_id)
     }
 

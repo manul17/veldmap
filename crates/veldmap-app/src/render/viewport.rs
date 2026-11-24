@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use super::DrawSnapshot;
+use super::pipelines::GlobePipelines;
 use super::uniforms::{CameraUniform, DynamicUniformArena};
 
 /// Parameters for a single offscreen globe frame.
@@ -69,9 +70,7 @@ impl ViewportState {
     pub(super) fn new(
         device: &wgpu::Device,
         target_format: wgpu::TextureFormat,
-        camera_layout: &wgpu::BindGroupLayout,
-        tile_uniform_layout: &wgpu::BindGroupLayout,
-        overlay_uniform_layout: &wgpu::BindGroupLayout,
+        pipelines: &GlobePipelines,
     ) -> Self {
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globe camera uniform"),
@@ -81,15 +80,18 @@ impl ViewportState {
         });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globe camera bind group"),
-            layout: camera_layout,
+            layout: &pipelines.camera_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
 
-        let uniform_arena =
-            DynamicUniformArena::new(device, tile_uniform_layout, overlay_uniform_layout);
+        let uniform_arena = DynamicUniformArena::new(
+            device,
+            &pipelines.tile_uniform_layout,
+            &pipelines.overlay_uniform_layout,
+        );
 
         Self {
             target_format,
@@ -151,8 +153,7 @@ impl ViewportState {
     pub(super) fn ensure_offscreen(
         &mut self,
         device: &wgpu::Device,
-        composite_layout: &wgpu::BindGroupLayout,
-        composite_sampler: &wgpu::Sampler,
+        pipelines: &GlobePipelines,
         width: u32,
         height: u32,
     ) {
@@ -216,7 +217,7 @@ impl ViewportState {
 
         let composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globe composite bind group"),
-            layout: composite_layout,
+            layout: &pipelines.composite_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -224,7 +225,7 @@ impl ViewportState {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(composite_sampler),
+                    resource: wgpu::BindingResource::Sampler(&pipelines.composite_sampler),
                 },
             ],
         });

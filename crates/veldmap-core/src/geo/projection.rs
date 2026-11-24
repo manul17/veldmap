@@ -178,14 +178,10 @@ impl Projection {
     pub fn from_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         match self {
             Self::Transverse(system) => system.from_geodetic(lat_deg, lon_deg),
-            Self::WebMercator => {
-                let lat = lat_deg.clamp(-WEB_MERCATOR_LIMIT_DEG, WEB_MERCATOR_LIMIT_DEG);
-                let phi = lat.to_radians();
-                (
-                    WEB_MERCATOR_RADIUS_M * lon_deg.to_radians(),
-                    WEB_MERCATOR_RADIUS_M * (std::f64::consts::FRAC_PI_4 + phi / 2.0).tan().ln(),
-                )
-            }
+            Self::WebMercator => web_mercator_xy_unchecked(
+                lat_deg.clamp(-WEB_MERCATOR_LIMIT_DEG, WEB_MERCATOR_LIMIT_DEG),
+                lon_deg,
+            ),
         }
     }
 
@@ -202,6 +198,15 @@ impl Projection {
     }
 }
 
+#[inline]
+fn web_mercator_xy_unchecked(lat_deg: f64, lon_deg: f64) -> (f64, f64) {
+    let phi = lat_deg.to_radians();
+    (
+        WEB_MERCATOR_RADIUS_M * lon_deg.to_radians(),
+        WEB_MERCATOR_RADIUS_M * (std::f64::consts::FRAC_PI_4 + phi / 2.0).tan().ln(),
+    )
+}
+
 /// Unclamped EPSG:3857 forward projection for exact raster inverse hits.
 ///
 /// Unlike [`Projection::from_geodetic`], this never clamps polar latitudes onto
@@ -212,9 +217,7 @@ pub(crate) fn web_mercator_from_geodetic_strict(lat_deg: f64, lon_deg: f64) -> O
     if !(lat_deg.is_finite() && lon_deg.is_finite()) || lat_deg.abs() >= 90.0 {
         return None;
     }
-    let phi = lat_deg.to_radians();
-    let x = WEB_MERCATOR_RADIUS_M * lon_deg.to_radians();
-    let y = WEB_MERCATOR_RADIUS_M * (std::f64::consts::FRAC_PI_4 + phi / 2.0).tan().ln();
+    let (x, y) = web_mercator_xy_unchecked(lat_deg, lon_deg);
     (x.is_finite() && y.is_finite()).then_some((x, y))
 }
 

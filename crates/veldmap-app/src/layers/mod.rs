@@ -3,29 +3,28 @@
 //! CPU cursor readouts.
 
 mod cursor;
+mod frame;
+mod io_worker;
 mod jobs;
 mod manager;
 mod opener;
+mod qoi_cache;
 mod runtime;
 mod stack;
 
 use std::path::PathBuf;
 
-use veldmap_core::geo::footprint::FootprintBounds;
-use veldmap_core::tile::{PixelFormat, RASTER_TILE_SIZE, max_mip_levels, mip_chain_byte_size};
+use veldmap_core::geo::FootprintBounds;
+use veldmap_core::tile::RASTER_TILE_SIZE;
 
-pub(crate) use manager::{OverlayManager, OverlayMutation};
+use crate::gpu_tiles::display_tile_mip_bytes;
+
+pub(crate) use manager::{OverlayFrameCtx, OverlayManager, OverlayMutation};
 
 /// Default unpacked VRAM byte weight for an 8-bit `512 x 512` display tile
 /// with full linear-light mip chain (`~1.33 MiB`), matching `BasemapManager`.
-pub(crate) fn default_display_tile_bytes() -> usize {
-    let mips = max_mip_levels(RASTER_TILE_SIZE, RASTER_TILE_SIZE);
-    mip_chain_byte_size(
-        RASTER_TILE_SIZE,
-        RASTER_TILE_SIZE,
-        PixelFormat::Rgba8UnormSrgb,
-        mips,
-    )
+pub(super) fn default_display_tile_bytes() -> usize {
+    display_tile_mip_bytes(RASTER_TILE_SIZE)
 }
 
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].

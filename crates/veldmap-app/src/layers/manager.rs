@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::geo::camera::Camera;
+use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{SourceId, TileKey};
 use veldmap_raster::DecodePoolHandle;
@@ -21,10 +21,23 @@ use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSe
 use crate::render::DrawOverlayLayer;
 
 use super::cursor::CursorProber;
-use super::jobs::build_and_schedule_layer;
-use super::runtime::{OverlayIoCmd, OverlayIoResult, OverlayIoWorker, OverlayRuntime};
+use super::frame::{LayerFrameCtx, build_and_schedule_layer};
+use super::io_worker::{OverlayIoCmd, OverlayIoResult, OverlayIoWorker};
+use super::runtime::OverlayRuntime;
 use super::stack::{LayerStack, OverlayLayer};
 use super::{CursorReadout, LayerId, LayerSummary, OverlayIoEvent};
+
+/// Per-frame camera, viewport, cache, and appetite inputs for
+/// [`OverlayManager::build_and_schedule`].
+pub(crate) struct OverlayFrameCtx<'a> {
+    pub(crate) camera: &'a Camera,
+    pub(crate) width_px: u32,
+    pub(crate) height_px: u32,
+    pub(crate) gpu_cache: &'a mut GpuTileCache,
+    pub(crate) pending: &'a PendingUploads,
+    pub(crate) total_appetite_weight: u64,
+    pub(crate) carrier_keys: &'a mut HashSet<TileKey>,
+}
 
 /// Cache-purge side effects returned by [`OverlayManager`] mutations for
 /// `SceneState` to apply cleanly to `GpuTileCache` and `PendingUploads`.
@@ -70,14 +83,31 @@ impl OverlayManager {
         }
     }
 
-    pub(crate) fn stack(&self) -> &LayerStack {
-        &self.stack
+    pub(crate) fn extend_pinned_root_sources(&self, out: &mut Vec<SourceId>) {
+        self.stack.extend_pinned_root_sources(out);
+    }
+
+    pub(crate) fn extend_wanted_tile_sets<'a>(&'a self, out: &mut Vec<&'a HashSet<TileKey>>) {
+        self.stack.extend_wanted_tile_sets(out);
+    }
+
+    pub(crate) fn total_appetite_weight_bytes(&self) -> u64 {
+        self.stack.total_appetite_weight_bytes()
+    }
+
+    pub(crate) fn topmost_visible_source_pixel_size_m(&self) -> Option<(f64, f64)> {
+        self.stack.topmost_visible_source_pixel_size_m()
     }
 
     fn alloc_relaid(&mut self) -> u64 {
         let r = self.next_relaid;
         self.next_relaid = self.next_relaid.saturating_add(1);
         r
+    }
+
+    fn purge_source(&self, src: SourceId) {
+        self.runtime.purge_source_runtime(src);
+        self.cursor.invalidate_source(src);
     }
 
     /// Return immutable UI summaries of all loaded overlay layers.
@@ -101,7 +131,7 @@ impl OverlayManager {
                     footprint: layer.footprint,
                     in_flight: sched.in_flight_count_for_source(layer.source_id()),
                     pass_active: sched.has_active_pass(pass_key),
-                    reloading: layer.reloading,
+                    reloading: layer.is_reloading(),
                 }
             })
             .collect()
@@ -133,17 +163,13 @@ impl OverlayManager {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
             };
-            let prev = layer.reload_cancel.take();
             let cancel = self.runtime.shutdown.child_token();
-            layer.reload_seq = layer.reload_seq.saturating_add(1);
-            layer.reloading = true;
-            layer.reload_cancel = Some(cancel.clone());
-            layer.clear_wanted();
+            let (reload_seq, prev) = layer.begin_reload(cancel.clone());
             (
                 layer.path.clone(),
                 layer.source_id(),
                 layer.fingerprint_hex.clone(),
-                layer.reload_seq,
+                reload_seq,
                 cancel,
                 prev,
             )
@@ -154,8 +180,7 @@ impl OverlayManager {
 
         // Cancel in-flight jobs and clear runtime caches for `old_src` immediately
         // so no worker can write stale pixels while reload runs.
-        self.runtime.purge_source_runtime(old_src);
-        self.cursor.invalidate_source(old_src);
+        self.purge_source(old_src);
 
         if !self.io_worker.send(OverlayIoCmd::Reload {
             id,
@@ -165,9 +190,9 @@ impl OverlayManager {
             cancel: reload_cancel,
         }) {
             if let Some(layer) = self.stack.get_mut(id) {
-                layer.reloading = false;
-                layer.reload_cancel = None;
+                layer.abort_reload();
             }
+            self.runtime.request_reschedule();
             return Err("overlay I/O worker is unavailable".to_owned());
         }
 
@@ -211,49 +236,44 @@ impl OverlayManager {
                     path,
                     outcome,
                 } => {
-                    let Some(slot) = self.stack.get_mut(id) else {
-                        // Layer was removed while reload was in flight.
-                        continue;
-                    };
-                    if slot.reload_seq != reload_seq {
-                        // Superseded by a newer reload trigger.
+                    if !self
+                        .stack
+                        .get(id)
+                        .is_some_and(|slot| slot.matches_reload_seq(reload_seq))
+                    {
+                        // Layer was removed or superseded by a newer reload trigger.
                         continue;
                     }
-                    slot.reloading = false;
-                    slot.reload_cancel = None;
                     match outcome {
                         Ok((source, frame)) => {
-                            let visible = slot.visible;
-                            let opacity = slot.opacity;
-                            let seq = slot.reload_seq;
-                            let old_src = slot.source_id();
                             let new_src = source.source_id();
-                            let relaid = self.next_relaid;
-                            self.next_relaid = self.next_relaid.saturating_add(1);
-                            let mut replacement = OverlayLayer::from_source(
-                                id, path, source, frame, visible, opacity, relaid,
-                            );
-                            replacement.reload_seq = seq;
-                            *slot = replacement;
+                            let relaid = self.alloc_relaid();
+                            let Some(old_src) = self.stack.get_mut(id).and_then(|slot| {
+                                slot.replace_reloaded(reload_seq, path, source, frame, relaid)
+                            }) else {
+                                continue;
+                            };
 
                             // Purge runtime/GPU state for both `old_src` and `new_src`
                             // (in case a sibling layer decoded tiles during reload).
-                            self.runtime.purge_source_runtime(old_src);
-                            self.cursor.invalidate_source(old_src);
+                            self.purge_source(old_src);
                             mutation.purge_sources.push(old_src);
                             if new_src != old_src {
-                                self.runtime.purge_source_runtime(new_src);
-                                self.cursor.invalidate_source(new_src);
+                                self.purge_source(new_src);
                                 mutation.purge_sources.push(new_src);
                             }
                             mutation.changed = true;
                             events.push(OverlayIoEvent::Reloaded { id });
                         }
                         Err(error) => {
-                            // Reload failed: leave the existing layer intact and
-                            // resume normal rendering on the next frame.
-                            mutation.changed = true;
-                            events.push(OverlayIoEvent::Failed { path, error });
+                            if let Some(slot) = self.stack.get_mut(id)
+                                && slot.finish_reload_err(reload_seq)
+                            {
+                                // Reload failed: leave the existing layer intact and
+                                // resume normal rendering on the next frame.
+                                mutation.changed = true;
+                                events.push(OverlayIoEvent::Failed { path, error });
+                            }
                         }
                     }
                 }
@@ -270,7 +290,7 @@ impl OverlayManager {
         let Some(mut removed) = self.stack.remove(id) else {
             return OverlayMutation::default();
         };
-        if let Some(tok) = removed.reload_cancel.take() {
+        if let Some(tok) = removed.take_reload_cancel() {
             tok.cancel();
         }
         let src = removed.source_id();
@@ -279,12 +299,10 @@ impl OverlayManager {
             purge_sources: Vec::new(),
         };
         if self.stack.count_sharing_source(src) == 0 {
-            self.runtime.purge_source_runtime(src);
-            self.cursor.invalidate_source(src);
+            self.purge_source(src);
             mutation.purge_sources.push(src);
         } else if !self.stack.has_visible_source(src) {
-            self.runtime.purge_source_runtime(src);
-            self.cursor.invalidate_source(src);
+            self.purge_source(src);
         }
         mutation
     }
@@ -304,8 +322,7 @@ impl OverlayManager {
             layer.source_id()
         };
         if !visible && !self.stack.has_visible_source(src) {
-            self.runtime.purge_source_runtime(src);
-            self.cursor.invalidate_source(src);
+            self.purge_source(src);
         }
         true
     }
@@ -347,58 +364,33 @@ impl OverlayManager {
     /// cache state (called when `SceneState::reconcile_providers` runs outside a
     /// full snapshot rebuild).
     pub(crate) fn reconcile(&self, gpu_cache: &GpuTileCache, pending: &PendingUploads) {
-        let mut to_cancel = Vec::new();
-        {
-            let mut sched = lock_unpoisoned(&self.runtime.scheduler);
-            for layer in self.stack.layers() {
-                if !layer.visible || layer.reloading {
-                    continue;
-                }
-                to_cancel.extend(sched.reconcile_pointwise(
-                    layer.source_id(),
-                    &layer.wanted,
-                    |k| gpu_cache.contains(k) || pending.contains(k),
-                ));
-            }
-        }
-        for tok in to_cancel {
-            tok.cancel();
-        }
+        self.runtime
+            .reconcile_pointwise_layers(self.stack.layers(), gpu_cache, pending);
     }
 
     /// Build immutable [`DrawOverlayLayer`]s for the current frame, update
     /// per-layer wanted sets across all ladder rungs, and schedule missing
     /// tiles onto the two-lane decode pool.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "frame orchestration passes camera, viewport, caches, and appetite weights"
-    )]
     pub(crate) fn build_and_schedule(
         &mut self,
-        camera: &Camera,
-        width_px: u32,
-        height_px: u32,
-        gpu_cache: &mut GpuTileCache,
-        pending: &PendingUploads,
-        total_appetite_weight: u64,
-        carrier_keys: &mut HashSet<TileKey>,
+        ctx: &mut OverlayFrameCtx<'_>,
     ) -> Vec<DrawOverlayLayer> {
-        let aspect = f64::from(width_px.max(1)) / f64::from(height_px.max(1));
-        let frustum = camera.frustum(aspect);
-        let viewport_mpp = camera.metres_per_pixel(f64::from(height_px.max(1)));
+        let aspect = f64::from(ctx.width_px.max(1)) / f64::from(ctx.height_px.max(1));
+        let frustum = ctx.camera.frustum(aspect);
+        let viewport_mpp = ctx.camera.metres_per_pixel(f64::from(ctx.height_px.max(1)));
+        let mut layer_ctx = LayerFrameCtx {
+            runtime: &self.runtime,
+            frustum: &frustum,
+            viewport_mpp,
+            gpu_cache: ctx.gpu_cache,
+            pending: ctx.pending,
+            total_appetite_weight: ctx.total_appetite_weight,
+            carrier_keys: ctx.carrier_keys,
+        };
 
         let mut draw_layers = Vec::new();
         for layer in self.stack.layers_mut() {
-            if let Some(draw_layer) = build_and_schedule_layer(
-                layer,
-                &self.runtime,
-                &frustum,
-                viewport_mpp,
-                gpu_cache,
-                pending,
-                total_appetite_weight,
-                carrier_keys,
-            ) {
+            if let Some(draw_layer) = build_and_schedule_layer(layer, &mut layer_ctx) {
                 draw_layers.push(draw_layer);
             }
         }
@@ -417,20 +409,12 @@ impl OverlayManager {
     /// Phase 1 shutdown: cancel active overlay passes, pointwise jobs, reloads,
     /// cursor probes, and close the I/O worker channel.
     pub(crate) fn begin_shutdown(&mut self) {
-        let mut tokens = Vec::new();
-        {
-            let mut sched = lock_unpoisoned(&self.runtime.scheduler);
-            for layer in self.stack.layers() {
-                tokens.extend(sched.reset_source(layer.source_id()));
-            }
-        }
+        self.runtime
+            .cancel_sources(self.stack.layers().iter().map(OverlayLayer::source_id));
         for layer in self.stack.layers_mut() {
-            if let Some(tok) = layer.reload_cancel.take() {
-                tokens.push(tok);
+            if let Some(tok) = layer.take_reload_cancel() {
+                tok.cancel();
             }
-        }
-        for tok in tokens {
-            tok.cancel();
         }
         self.cursor.cancel();
         self.io_worker.close_channel();
@@ -439,6 +423,13 @@ impl OverlayManager {
     /// Phase 3 shutdown: deterministically join [`OverlayIoWorker`].
     pub(crate) fn finish_shutdown(&mut self) {
         self.io_worker.join();
+    }
+}
+
+impl Drop for OverlayManager {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+        self.finish_shutdown();
     }
 }
 

@@ -1,0 +1,404 @@
+//! Pure georeference bindings mapping normalized raster fractions `(fx, fy)` in
+//! `[0, 1]^2` onto the WGS84 ellipsoid (`Tie`, `TieGrid`, `Frame`).
+//!
+//! Kept strictly free of `crate::tile` dependencies so `veldmap-core::geo`
+//! remains a pure geodesy/projection layer beneath `veldmap-core::tile`.
+
+mod tie_grid;
+
+pub use tie_grid::{Tie, TieGrid};
+
+use thiserror::Error;
+
+use super::footprint::FootprintBounds;
+use super::geodesy;
+use super::projection::{self, Projection};
+
+/// Web Mercator equatorial circumference in metres (`2 * pi * a`).
+const WEB_MERCATOR_WORLD_M: f64 = 2.0 * std::f64::consts::PI * geodesy::SEMI_MAJOR_M;
+
+/// Errors returned when constructing a georeference [`Frame`].
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum BindingError {
+    #[error("unsupported projected CRS EPSG:{0}")]
+    UnsupportedEpsg(u32),
+    #[error("EPSG:{0} georeference transform has no valid ground extent")]
+    InvalidExtent(u32),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum FrameKind {
+    /// Exact map-projection binding:
+    /// `x = affine[0]*fx + affine[1]*fy + affine[2]`,
+    /// `y = affine[3]*fx + affine[4]*fy + affine[5]`,
+    /// evaluated through `system.to_geodetic(x, y)`.
+    Projected {
+        system: Projection,
+        affine: [f64; 6],
+    },
+    /// Rectangular tie-point lattice (for geographic, quad, or curvilinear swaths).
+    Grid(TieGrid),
+}
+
+/// Validated georeference binding mapping normalized raster fractions
+/// `(fx, fy)` in `[0, 1]^2` onto the WGS84 ellipsoid.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Frame {
+    kind: FrameKind,
+}
+
+impl Frame {
+    /// Construct a north-up projected frame from map-projection bounds
+    /// `[x0, x1] x [y0, y1]`, returning `None` if non-finite or degenerate.
+    #[cfg(test)]
+    pub(crate) fn projected_bounds(
+        system: impl Into<Projection>,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    ) -> Option<Self> {
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+            return None;
+        }
+        let frame = Self {
+            kind: FrameKind::Projected {
+                system: system.into(),
+                affine: [x1 - x0, 0.0, x0, 0.0, -(y1 - y0), y1],
+            },
+        };
+        frame.measurable().then_some(frame)
+    }
+
+    /// Construct a projected frame from a pixel-space affine transform
+    /// `x = a[0]*i + a[1]*j + a[2]`, `y = a[3]*i + a[4]*j + a[5]` and raster
+    /// dimensions `(width, height)`.
+    ///
+    /// Returns `None` if dimensions are zero, any coefficient is non-finite,
+    /// or the resulting frame has no valid finite ground extent.
+    pub fn from_pixel_affine(
+        system: Projection,
+        pixel_affine: [f64; 6],
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        if width == 0 || height == 0 || !pixel_affine.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let across = f64::from(width);
+        let down = f64::from(height);
+        let frame = Self {
+            kind: FrameKind::Projected {
+                system,
+                affine: [
+                    pixel_affine[0] * across,
+                    pixel_affine[1] * down,
+                    pixel_affine[2],
+                    pixel_affine[3] * across,
+                    pixel_affine[4] * down,
+                    pixel_affine[5],
+                ],
+            },
+        };
+        frame.measurable().then_some(frame)
+    }
+
+    /// Resolve `epsg` through [`Projection::from_epsg`] and build a projected
+    /// frame from a pixel-space affine transform.
+    pub fn from_epsg_pixel_affine(
+        epsg: u32,
+        pixel_affine: [f64; 6],
+        width: u32,
+        height: u32,
+    ) -> Result<Self, BindingError> {
+        let system = Projection::from_epsg(epsg).ok_or(BindingError::UnsupportedEpsg(epsg))?;
+        Self::from_pixel_affine(system, pixel_affine, width, height)
+            .ok_or(BindingError::InvalidExtent(epsg))
+    }
+
+    /// Wrap a validated [`TieGrid`] as a georeference [`Frame`].
+    pub fn from_grid(grid: TieGrid) -> Self {
+        Self {
+            kind: FrameKind::Grid(grid),
+        }
+    }
+
+    /// Construct a 2x2 geographic tie-grid frame from `(UL, UR, LR, LL)`
+    /// corners, preserving 360-degree global spans and matching forward/inverse
+    /// bilinear interpolation.
+    pub fn quad(points: [(f64, f64); 4]) -> Option<Self> {
+        let [ul, ur, lr, ll] = points;
+        let ties = [
+            Tie {
+                fx: 0.0,
+                fy: 0.0,
+                lat: ul.0,
+                lon: ul.1,
+            },
+            Tie {
+                fx: 1.0,
+                fy: 0.0,
+                lat: ur.0,
+                lon: ur.1,
+            },
+            Tie {
+                fx: 0.0,
+                fy: 1.0,
+                lat: ll.0,
+                lon: ll.1,
+            },
+            Tie {
+                fx: 1.0,
+                fy: 1.0,
+                lat: lr.0,
+                lon: lr.1,
+            },
+        ];
+        TieGrid::new(&ties).map(Self::from_grid)
+    }
+
+    /// Evaluate WGS84 `(lat_deg, lon_deg)` at normalized raster fractions
+    /// `(fx, fy)` (`0..1` left-to-right and top-to-bottom).
+    pub fn geodetic(&self, fx: f64, fy: f64) -> (f64, f64) {
+        match &self.kind {
+            FrameKind::Projected { system, affine } => {
+                let x = affine[0] * fx + affine[1] * fy + affine[2];
+                let y = affine[3] * fx + affine[4] * fy + affine[5];
+                system.to_geodetic(x, y)
+            }
+            FrameKind::Grid(grid) => grid.geodetic(fx, fy),
+        }
+    }
+
+    /// Invert WGS84 `(lat_deg, lon_deg)` into normalized raster fractions
+    /// `(fx, fy) in [0, 1]^2` for zoom-invariant CPU cursor readouts.
+    pub fn fraction_at(&self, lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
+        if !(lat_deg.is_finite() && lon_deg.is_finite()) {
+            return None;
+        }
+        match &self.kind {
+            FrameKind::Projected { system, affine } => {
+                let (x_base, y) = match system {
+                    Projection::WebMercator => {
+                        projection::web_mercator_from_geodetic_strict(lat_deg, lon_deg)?
+                    }
+                    Projection::Transverse(tm) => tm.from_geodetic(lat_deg, lon_deg),
+                };
+                if !(x_base.is_finite() && y.is_finite()) {
+                    return None;
+                }
+                let det = affine[0] * affine[4] - affine[1] * affine[3];
+                if !det.is_finite() || det.abs() < 1e-18 {
+                    return None;
+                }
+                let try_xy = |x: f64| {
+                    let dx = x - affine[2];
+                    let dy = y - affine[5];
+                    let fx = (dx * affine[4] - dy * affine[1]) / det;
+                    let fy = (affine[0] * dy - affine[3] * dx) / det;
+                    ((0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy)).then_some((fx, fy))
+                };
+                if let Some(hit) = try_xy(x_base) {
+                    return Some(hit);
+                }
+                if matches!(system, Projection::WebMercator) {
+                    for shift in [-WEB_MERCATOR_WORLD_M, WEB_MERCATOR_WORLD_M] {
+                        if let Some(hit) = try_xy(x_base + shift) {
+                            return Some(hit);
+                        }
+                    }
+                }
+                None
+            }
+            FrameKind::Grid(grid) => grid.fraction_at(lat_deg, lon_deg),
+        }
+    }
+
+    /// Ground metres per horizontal pixel at native resolution.
+    #[cfg(test)]
+    pub(crate) fn ground_m_per_px(&self, width: u32) -> Option<f64> {
+        let (span_x, _) = self.ground_spans_m();
+        (span_x.is_finite() && span_x > 0.0).then(|| span_x / f64::from(width.max(1)))
+    }
+
+    /// Ground pixel size `(m_per_px_x, m_per_px_y)` at native resolution for
+    /// HUD display (distinct from viewport GSD) and pyramid level selection.
+    pub fn pixel_size_m(&self, width: u32, height: u32) -> Option<(f64, f64)> {
+        let (span_x, span_y) = self.ground_spans_m();
+        if !(span_x.is_finite() && span_x > 0.0 && span_y.is_finite() && span_y > 0.0) {
+            return None;
+        }
+        Some((
+            span_x / f64::from(width.max(1)),
+            span_y / f64::from(height.max(1)),
+        ))
+    }
+
+    /// Widest grid row/column ground spans in metres for [`TieGrid`] bindings.
+    pub(crate) fn widest_grid_spans_m(&self) -> Option<(f64, f64)> {
+        match &self.kind {
+            FrameKind::Grid(grid) => Some(grid.widest_spans_m()),
+            FrameKind::Projected { .. } => None,
+        }
+    }
+
+    fn ground_spans_m(&self) -> (f64, f64) {
+        match &self.kind {
+            FrameKind::Projected {
+                system: Projection::WebMercator,
+                affine,
+            } => {
+                let (center_lat, _) = self.geodetic(0.5, 0.5);
+                let scale = center_lat.to_radians().cos().abs().max(1e-6);
+                (
+                    affine[0].hypot(affine[3]) * scale,
+                    affine[1].hypot(affine[4]) * scale,
+                )
+            }
+            FrameKind::Projected { affine, .. } => {
+                (affine[0].hypot(affine[3]), affine[1].hypot(affine[4]))
+            }
+            FrameKind::Grid(grid) => {
+                let (widest_x, widest_y) = grid.widest_spans_m();
+                let probed_x = self.probe_grid_span(|s, t| (s, t));
+                let probed_y = self.probe_grid_span(|s, t| (t, s));
+                (probed_x.max(widest_x), probed_y.max(widest_y))
+            }
+        }
+    }
+
+    fn probe_grid_span(&self, coords: impl Fn(f64, f64) -> (f64, f64)) -> f64 {
+        [0.0, 0.5, 1.0]
+            .into_iter()
+            .map(|fixed| {
+                let (ax, ay) = coords(0.0, fixed);
+                let (bx, by) = coords(0.5, fixed);
+                let (cx, cy) = coords(1.0, fixed);
+                let a = self.geodetic(ax, ay);
+                let b = self.geodetic(bx, by);
+                let c = self.geodetic(cx, cy);
+                geodesic_span_m(a, b) + geodesic_span_m(b, c)
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// Whether rows follow parallels and columns follow meridians (enabling
+    /// `O(N)` separable trig evaluation during culling and warp-mesh builds).
+    pub fn axial(&self) -> bool {
+        match &self.kind {
+            FrameKind::Projected {
+                system: Projection::WebMercator,
+                affine,
+            } => affine[1] == 0.0 && affine[3] == 0.0,
+            FrameKind::Projected { .. } => false,
+            FrameKind::Grid(grid) => grid.is_axial(),
+        }
+    }
+
+    /// Whether the binding has positive, finite ground extent on both axes and
+    /// maps corners and center to finite geodetic coordinates.
+    pub fn measurable(&self) -> bool {
+        if let FrameKind::Projected { affine, .. } = &self.kind {
+            let det = affine[0] * affine[4] - affine[1] * affine[3];
+            if !det.is_finite() || det.abs() == 0.0 {
+                return false;
+            }
+        }
+        let samples_finite = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)]
+            .into_iter()
+            .all(|(fx, fy)| {
+                let (lat, lon) = self.geodetic(fx, fy);
+                lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat)
+            });
+        samples_finite && self.pixel_size_m(1, 1).is_some()
+    }
+
+    /// Select the sharpest raster pyramid level whose finer pixel axis is no
+    /// coarser than `viewport_mpp` metres per pixel, clamped to `0..=max_level`.
+    pub fn sharpest_level(&self, width: u32, height: u32, viewport_mpp: f64, max_level: u8) -> u8 {
+        let Some((mpp_x, mpp_y)) = self.pixel_size_m(width, height) else {
+            return max_level;
+        };
+        let mpp_raster = mpp_x.min(mpp_y);
+        if !viewport_mpp.is_finite() || viewport_mpp <= mpp_raster {
+            return 0;
+        }
+        let raw = (viewport_mpp / mpp_raster).log2().floor();
+        if !raw.is_finite() || raw <= 0.0 {
+            0
+        } else {
+            (raw as u32).min(u32::from(max_level)) as u8
+        }
+    }
+
+    /// Spherical bounding circle around the raster for "Zoom to extent" camera
+    /// framing.
+    ///
+    /// Computes the spherical centroid over a symmetric `4 x 4` interior
+    /// midpoint grid (avoiding double-weighting `±180°` edges on global
+    /// rasters) and falls back to `geodetic(0.5, 0.5)` when full-globe vectors
+    /// cancel.
+    pub fn footprint_bounds(&self) -> Option<FootprintBounds> {
+        const INTERIOR_GRID: usize = 4;
+        const EDGE_STEPS: usize = 4;
+
+        let mut interior = Vec::with_capacity(INTERIOR_GRID * INTERIOR_GRID);
+        for iy in 0..INTERIOR_GRID {
+            let fy = (iy as f64 + 0.5) / INTERIOR_GRID as f64;
+            for ix in 0..INTERIOR_GRID {
+                let fx = (ix as f64 + 0.5) / INTERIOR_GRID as f64;
+                let (lat, lon) = self.geodetic(fx, fy);
+                if lat.is_finite() && lon.is_finite() {
+                    interior.push((lat, lon));
+                }
+            }
+        }
+        if interior.is_empty() {
+            return None;
+        }
+
+        let (center_lat, center_lon) = geodesy::spherical_centroid(interior.iter().copied())
+            .unwrap_or_else(|| {
+                let (lat, lon) = self.geodetic(0.5, 0.5);
+                if lat.is_finite() && lon.is_finite() {
+                    (lat, lon)
+                } else {
+                    interior[0]
+                }
+            });
+
+        let mut radius_deg = interior
+            .iter()
+            .map(|&p| geodesy::separation((center_lat, center_lon), p))
+            .fold(0.0_f64, f64::max);
+
+        let mut check_edge = |fx: f64, fy: f64| {
+            let (lat, lon) = self.geodetic(fx, fy);
+            if lat.is_finite() && lon.is_finite() {
+                radius_deg =
+                    radius_deg.max(geodesy::separation((center_lat, center_lon), (lat, lon)));
+            }
+        };
+        for i in 0..=EDGE_STEPS {
+            let t = i as f64 / EDGE_STEPS as f64;
+            check_edge(t, 0.0);
+            check_edge(1.0, t);
+            check_edge(t, 1.0);
+            check_edge(0.0, t);
+        }
+
+        Some(FootprintBounds {
+            lat: center_lat,
+            lon: geodesy::unwind(0.0, center_lon),
+            radius_deg,
+        })
+    }
+}
+
+fn geodesic_span_m(from: (f64, f64), to: (f64, f64)) -> f64 {
+    geodesy::separation(from, to).to_radians() * geodesy::SEMI_MAJOR_M
+}
+
+#[cfg(test)]
+#[path = "binding_tests.rs"]
+mod tests;

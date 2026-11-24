@@ -339,11 +339,6 @@ impl DecodedTile {
         &self.data
     }
 
-    /// Precomputed mipmap buffers (`1..N`).
-    pub fn mips(&self) -> &[Vec<u8>] {
-        &self.mips
-    }
-
     /// Total number of mip levels present (`1` for base only, up to
     /// [`max_mip_levels`]).
     pub fn mip_level_count(&self) -> u32 {

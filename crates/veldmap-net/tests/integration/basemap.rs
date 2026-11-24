@@ -173,6 +173,37 @@ fn custom_xyz_tms_handles_subdomains_flip_y_ipv6_encoding_and_redaction() {
         "https://tiles.example.org/2/1/3.png"
     );
 
+    // Single-pass scanner edge cases: nested braces `{{z}}`, unknown `{style}`,
+    // empty/non-empty `{api_key}`/`{key}`, and trailing unclosed `{`.
+    let edge_empty = LiveBasemapSpec::custom(CustomBasemapConfig {
+        url_template: "https://tiles.example.org/{{z}}/{style}/{z}{x}{y}.png?a={api_key}&b={key}&c={",
+        tms_flip_y: false,
+        api_key: "",
+        ..base_cfg.clone()
+    })
+    .expect("edge empty");
+    let tile = QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 3,
+        x: 4,
+        y: 5,
+    };
+    assert_eq!(
+        edge_empty.resolve_url(tile).expect("edge empty url"),
+        "https://tiles.example.org/{3}/{style}/345.png?a=&b=&c={"
+    );
+    let edge_key = LiveBasemapSpec::custom(CustomBasemapConfig {
+        url_template: "https://tiles.example.org/{{z}}/{z}/{x}/{y}.png?a={api_key}&b={key}",
+        tms_flip_y: false,
+        api_key: "k+1",
+        ..base_cfg.clone()
+    })
+    .expect("edge key");
+    assert_eq!(
+        edge_key.resolve_url(tile).expect("edge key url"),
+        "https://tiles.example.org/{3}/3/4/5.png?a=k%2B1&b=k%2B1"
+    );
+
     for bad in [
         "ftp://example.com/{z}/{x}/{y}.png",
         "https://{z}/{x}/{y}.png",

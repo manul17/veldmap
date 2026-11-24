@@ -3,14 +3,14 @@
 //! enforcing zero HTTP requests above `max_level` and zero HTTP requests for
 //! `PolarCap` keys.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey, fnv1a_64};
 
 use crate::NetError;
 use crate::redact::{
-    extract_host, parse_url_authority, percent_encode_variants, redact_secret_label,
-    sanitize_url_for_display, sanitize_urls_in_text, strip_http_scheme,
+    EncodedSecret, extract_host, parse_url_authority, redact_secret_label, redact_text,
+    sanitize_url_for_display, strip_http_scheme,
 };
 
 /// Minimum allowed custom XYZ/TMS maximum zoom level.
@@ -40,27 +40,6 @@ const SUBDOMAINS: [&str; 3] = ["a", "b", "c"];
 #[inline]
 fn subdomain_index(id: QuadTileId, count: usize) -> usize {
     ((u64::from(id.x) + u64::from(id.y)) % (count as u64)) as usize
-}
-
-/// Pre-encoded API secret variants computed once at [`LiveBasemapSpec`]
-/// construction so per-tile URL expansion and error redaction do zero redundant
-/// percent-encoding work.
-#[derive(Clone, PartialEq, Eq)]
-struct EncodedSecret {
-    raw: String,
-    encoded_upper: String,
-    encoded_lower: String,
-}
-
-impl EncodedSecret {
-    fn new(raw: String) -> Self {
-        let (encoded_upper, encoded_lower) = percent_encode_variants(&raw);
-        Self {
-            raw,
-            encoded_upper,
-            encoded_lower,
-        }
-    }
 }
 
 /// Validate an explicit calendar-valid `YYYY-MM-DD` UTC date string within the
@@ -167,7 +146,7 @@ impl fmt::Debug for LiveBasemapSpec {
             .field("tms_flip_y", &self.tms_flip_y)
             .field(
                 "api_key",
-                &redact_secret_label(self.api_key.as_ref().map(|k| k.raw.as_str()), "<none>"),
+                &redact_secret_label(self.api_key.as_ref().map(EncodedSecret::raw), "<none>"),
             )
             .finish()
     }
@@ -272,23 +251,30 @@ impl LiveBasemapSpec {
         self.hosts.len()
     }
 
-    /// NASA GIBS Blue Marble Shaded Relief + Bathymetry (`GoogleMapsCompatible_Level8`,
-    /// static, Public Domain).
-    pub fn nasa_gibs_blue_marble() -> Self {
-        let cache_key = "nasa-gibs-bluemarble-l8".to_owned();
-        let url_template = GIBS_BLUE_MARBLE_URL_TEMPLATE.to_owned();
+    fn preset(cache_key: String, attribution: String, max_level: u8, url_template: String) -> Self {
         let hosts = precompute_hosts(&url_template);
         Self {
             source_id: SourceId::from_stable_key(&cache_key),
             cache_key,
-            attribution: "Imagery: NASA GIBS / Blue Marble (Public Domain)".to_owned(),
+            attribution,
             scheme: GlobeScheme::WebMercator,
-            max_level: GIBS_BLUE_MARBLE_MAX_LEVEL,
+            max_level,
             url_template,
             hosts,
             tms_flip_y: false,
             api_key: None,
         }
+    }
+
+    /// NASA GIBS Blue Marble Shaded Relief + Bathymetry (`GoogleMapsCompatible_Level8`,
+    /// static, Public Domain).
+    pub fn nasa_gibs_blue_marble() -> Self {
+        Self::preset(
+            "nasa-gibs-bluemarble-l8".to_owned(),
+            "Imagery: NASA GIBS / Blue Marble (Public Domain)".to_owned(),
+            GIBS_BLUE_MARBLE_MAX_LEVEL,
+            GIBS_BLUE_MARBLE_URL_TEMPLATE.to_owned(),
+        )
     }
 
     /// NASA GIBS VIIRS SNPP Corrected Reflectance True Color
@@ -298,38 +284,22 @@ impl LiveBasemapSpec {
         if !is_valid_gibs_date(trimmed) {
             return Err(NetError::InvalidDate(trimmed.to_owned()));
         }
-        let cache_key = format!("nasa-gibs-viirs-l9-{trimmed}");
-        let url_template = GIBS_VIIRS_URL_TEMPLATE.replace("{time}", trimmed);
-        let hosts = precompute_hosts(&url_template);
-        Ok(Self {
-            source_id: SourceId::from_stable_key(&cache_key),
-            cache_key,
-            attribution: format!("Imagery: NASA GIBS / VIIRS SNPP {trimmed} (Public Domain)"),
-            scheme: GlobeScheme::WebMercator,
-            max_level: GIBS_VIIRS_MAX_LEVEL,
-            url_template,
-            hosts,
-            tms_flip_y: false,
-            api_key: None,
-        })
+        Ok(Self::preset(
+            format!("nasa-gibs-viirs-l9-{trimmed}"),
+            format!("Imagery: NASA GIBS / VIIRS SNPP {trimmed} (Public Domain)"),
+            GIBS_VIIRS_MAX_LEVEL,
+            GIBS_VIIRS_URL_TEMPLATE.replace("{time}", trimmed),
+        ))
     }
 
     /// EOX Sentinel-2 Cloudless 2023 (`WebMercator`, CC BY 4.0, `max_level = 14`).
     pub fn eox_sentinel2_cloudless() -> Self {
-        let cache_key = "eox-s2cloudless-2023-3857".to_owned();
-        let url_template = EOX_S2_URL_TEMPLATE.to_owned();
-        let hosts = precompute_hosts(&url_template);
-        Self {
-            source_id: SourceId::from_stable_key(&cache_key),
-            cache_key,
-            attribution: "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (CC BY 4.0, modified Copernicus Sentinel data)".to_owned(),
-            scheme: GlobeScheme::WebMercator,
-            max_level: EOX_S2_MAX_LEVEL,
-            url_template,
-            hosts,
-            tms_flip_y: false,
-            api_key: None,
-        }
+        Self::preset(
+            "eox-s2cloudless-2023-3857".to_owned(),
+            "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (CC BY 4.0, modified Copernicus Sentinel data)".to_owned(),
+            EOX_S2_MAX_LEVEL,
+            EOX_S2_URL_TEMPLATE.to_owned(),
+        )
     }
 
     /// Build a custom XYZ/TMS live source, validating URL scheme (`http://` or
@@ -414,23 +384,46 @@ impl LiveBasemapSpec {
         let (_cols, rows) = self.validate_tile(id)?;
         let tms_y = rows - 1 - id.y;
         let effective_y = if self.tms_flip_y { tms_y } else { id.y };
-        let sub_idx = subdomain_index(id, SUBDOMAINS.len());
+        let subdomain = SUBDOMAINS[subdomain_index(id, SUBDOMAINS.len())];
+        let api_key = self
+            .api_key
+            .as_ref()
+            .map_or("", EncodedSecret::encoded_upper);
 
-        let mut url = self
-            .url_template
-            .replace("{s}", SUBDOMAINS[sub_idx])
-            .replace("{z}", &id.level.to_string())
-            .replace("{x}", &id.x.to_string())
-            .replace("{-y}", &tms_y.to_string())
-            .replace("{y}", &effective_y.to_string());
+        let extra_cap = api_key.len().saturating_add(16);
+        let mut url = String::with_capacity(self.url_template.len().saturating_add(extra_cap));
+        let mut rest = self.url_template.as_str();
 
-        if let Some(secret) = &self.api_key {
-            url = url
-                .replace("{api_key}", &secret.encoded_upper)
-                .replace("{key}", &secret.encoded_upper);
-        } else {
-            url = url.replace("{api_key}", "").replace("{key}", "");
+        while let Some(brace) = rest.find('{') {
+            url.push_str(&rest[..brace]);
+            let tail = &rest[brace..];
+            if let Some(after) = tail.strip_prefix("{s}") {
+                url.push_str(subdomain);
+                rest = after;
+            } else if let Some(after) = tail.strip_prefix("{z}") {
+                let _ = write!(url, "{}", id.level);
+                rest = after;
+            } else if let Some(after) = tail.strip_prefix("{x}") {
+                let _ = write!(url, "{}", id.x);
+                rest = after;
+            } else if let Some(after) = tail.strip_prefix("{-y}") {
+                let _ = write!(url, "{tms_y}");
+                rest = after;
+            } else if let Some(after) = tail.strip_prefix("{y}") {
+                let _ = write!(url, "{effective_y}");
+                rest = after;
+            } else if let Some(after) = tail.strip_prefix("{api_key}") {
+                url.push_str(api_key);
+                rest = after;
+            } else if let Some(after) = tail.strip_prefix("{key}") {
+                url.push_str(api_key);
+                rest = after;
+            } else {
+                url.push('{');
+                rest = &tail[1..];
+            }
         }
+        url.push_str(rest);
         Ok(url)
     }
 
@@ -438,16 +431,6 @@ impl LiveBasemapSpec {
     /// inline URL `user:pass@` authority credentials and `?query` tokens from
     /// `text` before logging or displaying error messages in the UI.
     pub fn redact_secrets(&self, text: &str) -> String {
-        let mut out = sanitize_urls_in_text(text);
-        if let Some(secret) = &self.api_key {
-            out = out.replace(&secret.raw, "<redacted>");
-            if secret.encoded_upper != secret.raw {
-                out = out.replace(&secret.encoded_upper, "<redacted>");
-            }
-            if secret.encoded_lower != secret.raw && secret.encoded_lower != secret.encoded_upper {
-                out = out.replace(&secret.encoded_lower, "<redacted>");
-            }
-        }
-        out
+        redact_text(text, self.api_key.as_ref())
     }
 }

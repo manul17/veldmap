@@ -6,8 +6,10 @@
 //! Reverse-Z target, then composites 1:1 with `FilterMode::Nearest` onto
 //! `egui_wgpu`'s target format via `view_formats`.
 
+mod bind_groups;
 mod globe;
 mod mesh;
+mod mesh_cache;
 mod overlay;
 mod pipelines;
 mod snapshot;

@@ -5,9 +5,7 @@
 use std::collections::HashSet;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::tile::{
-    BandKey, PixelFormat, SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec, level_count,
-};
+use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec, level_count};
 
 use super::grid::Grid;
 
@@ -88,20 +86,6 @@ impl PyramidMeta {
         self.levels.get(level as usize).copied()
     }
 
-    /// Return whether `level` is served pointwise.
-    pub fn is_pointwise(&self, level: u8) -> bool {
-        self.level(level)
-            .is_some_and(|row| row.serve == ServeMode::Pointwise)
-    }
-
-    /// Return the pass start level if `level` is served by `ServeMode::Pass`.
-    pub fn pass_from(&self, level: u8) -> Option<u8> {
-        match self.level(level)?.serve {
-            ServeMode::Pass { from } => Some(from),
-            ServeMode::Pointwise => None,
-        }
-    }
-
     /// Progressive ladder of fitting levels from `max_level()` down to
     /// `target_level` (clamped to `[finest_fitting_level, max_level()]`),
     /// keeping at most one coarsest representative per distinct `ServeMode::Pass`
@@ -154,16 +138,6 @@ impl PyramidMeta {
     pub fn tile_key(&self, level: u8, x: u32, y: u32) -> TileKey {
         TileKey::from_stream(self.source, self.spec, self.scheme(), level, x, y)
     }
-
-    /// Band selector of this pyramid stream.
-    pub const fn band(&self) -> BandKey {
-        self.spec.band
-    }
-
-    /// Pixel format of this pyramid stream.
-    pub const fn format(&self) -> PixelFormat {
-        self.spec.format
-    }
 }
 
 /// Build the per-level serving plan (`0..level_count`) for a chunked raster.
@@ -202,4 +176,23 @@ pub(crate) fn build_chunked_level_table(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_table_assigns_pass_when_chunk_exceeds_decoded_chunk_cache_cap() {
+        let tiny_budget = MemoryBudget::for_host_ram(1024 * 1024 * 1024);
+        let grid = Grid {
+            tiled: false,
+            chunk: (8192, 4096), // 33.5M px * 4 B = 134 MB > 64 MiB chunk cache
+            overviews: Vec::new(),
+            depth: 3,
+        };
+        let tbl = build_chunked_level_table(&grid, 8192, 8192, &tiny_budget);
+        assert!(!tbl.is_empty());
+        assert!(matches!(tbl[0].serve, ServeMode::Pass { from: 0 }));
+    }
 }

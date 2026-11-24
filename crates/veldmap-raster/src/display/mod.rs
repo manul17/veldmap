@@ -8,6 +8,6 @@ mod mipmap;
 mod qoi;
 
 pub use basemap::{BundledBasemap, BundledBasemapConfig};
-pub use map_tile::{decode_map_tile, decode_map_tile_with_mipmaps};
+pub use map_tile::decode_map_tile_with_mipmaps;
 pub use mipmap::generate_linear_mipmaps;
 pub use qoi::{MAX_QOI_DECODED_BYTES, decode_qoi_rgba8, encode_qoi_rgba8};

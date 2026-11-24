@@ -1,5 +1,5 @@
-use glam::Vec3;
-use veldmap_core::geo::geodesy::Geodetic;
+use veldmap_core::geo::Geodetic;
+use veldmap_core::glam::Vec3;
 use veldmap_core::tile::{
     DEFAULT_GRID_CELLS, PlanetaryScheme, QuadTileId, QuadtreeConfig, describe_tile,
 };

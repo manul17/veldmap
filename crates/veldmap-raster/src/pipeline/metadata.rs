@@ -17,17 +17,6 @@ pub enum SampleType {
     F32,
 }
 
-impl SampleType {
-    /// Byte width of one raw scalar sample.
-    pub const fn byte_size(self) -> usize {
-        match self {
-            Self::U8 => 1,
-            Self::U16 | Self::I16 => 2,
-            Self::F32 => 4,
-        }
-    }
-}
-
 /// Metadata for one display composite or scientific/categorical band in a
 /// raster source.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,7 +36,7 @@ pub struct BandInfo {
 
 impl BandInfo {
     /// Construct a standard display-composite band entry (`BandKey::Display`).
-    pub fn display(
+    pub(crate) fn display(
         sample_type: SampleType,
         channels: usize,
         has_alpha: bool,
@@ -102,7 +91,7 @@ pub enum GeoRasterType {
 impl GeoRasterType {
     /// Half-pixel shift added when converting `(px, py)` into top-left cell
     /// corner coordinates (`0.0` for `PixelIsArea`, `0.5` for `PixelIsPoint`).
-    pub const fn half_pixel_shift(self) -> f64 {
+    pub(crate) const fn half_pixel_shift(self) -> f64 {
         match self {
             Self::PixelIsArea => 0.0,
             Self::PixelIsPoint => 0.5,

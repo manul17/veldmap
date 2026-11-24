@@ -267,11 +267,11 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempTestRoot;
+    use veldmap_storage::test_support::TestTempDir;
 
     #[test]
     fn settings_round_trip_and_redact_api_key_userinfo_and_query_in_debug() {
-        let dir = TempTestRoot::new("settings-rt");
+        let dir = TestTempDir::new("settings-rt");
         let paths = StoragePaths::with_root(dir.path());
 
         let mut settings = AppSettings {
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn corrupt_json_backs_up_file_and_unknown_basemap_variant_is_forward_compatible() {
-        let dir = TempTestRoot::new("settings-recovery");
+        let dir = TestTempDir::new("settings-recovery");
         let paths = StoragePaths::with_root(dir.path());
         let settings_path = paths.settings_path();
         std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");

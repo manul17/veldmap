@@ -26,12 +26,6 @@ impl GlobeScheme {
     pub const fn into_tile_scheme(self) -> TileScheme {
         self.into_planetary().into_tile_scheme()
     }
-
-    /// Return the grid dimensions `(cols, rows)` at `level`, or `None` for
-    /// out-of-range shift levels.
-    pub const fn grid_dims(self, level: u8) -> Option<(u32, u32)> {
-        self.into_planetary().grid_dims(level)
-    }
 }
 
 impl From<GlobeScheme> for PlanetaryScheme {

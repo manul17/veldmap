@@ -8,18 +8,14 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::DVec3;
-use veldmap_core::tile::{MAX_WARP_SEGMENTS, PixelFormat, SourceId, TileCache, build_warp_patch};
+use veldmap_core::tile::{MAX_WARP_SEGMENTS, PixelFormat, SourceId, build_warp_patch};
 use wgpu::util::DeviceExt;
 
-use super::OVERLAY_WGSL;
-use super::mesh::push_grid_quad_indices;
-use super::pipelines::{GlobePipelines, TileBindGroupCache};
+use super::bind_groups::TileBindGroupCache;
+use super::mesh_cache::{DEFAULT_MESH_CACHE_BYTES, ElasticMeshCache, push_grid_quad_indices};
+use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
 use super::uniforms::{DynamicUniformArena, OverlayPatchUniform};
-
-/// Default VRAM budget for cached per-cell overlay warp-mesh vertex buffers
-/// (`16 MiB`).
-const DEFAULT_OVERLAY_MESH_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Cache identity for an uploaded overlay cell warp-mesh vertex buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,7 +29,7 @@ pub struct OverlayMeshKey {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
-struct OverlayVertex {
+pub(super) struct OverlayVertex {
     rel_pos: [f32; 3],
     normal: [f32; 3],
     uv: [f32; 2],
@@ -44,7 +40,7 @@ const _: () = {
 };
 
 impl OverlayVertex {
-    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    pub(super) const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &wgpu::vertex_attr_array![
@@ -62,64 +58,27 @@ struct CachedOverlayMesh {
     flip_winding: bool,
 }
 
-/// Manages the depth-less overlay pipeline, shared per-density index buffers,
-/// and bounded LRU cache of lazily built per-cell RTC warp-mesh vertex buffers.
+/// Manages shared per-density index buffers, bounded LRU cache of lazily built
+/// per-cell RTC warp-mesh vertex buffers, and per-frame dynamic uniform
+/// offsets for draped raster overlays.
 pub(super) struct OverlayRenderer {
-    pipeline: wgpu::RenderPipeline,
     index_buffers: HashMap<(u32, bool), (wgpu::Buffer, u32)>,
-    meshes: TileCache<OverlayMeshKey, CachedOverlayMesh>,
+    meshes: ElasticMeshCache<OverlayMeshKey, CachedOverlayMesh>,
+    uniform_offsets: Vec<u32>,
+}
+
+impl Default for OverlayRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OverlayRenderer {
-    pub(super) fn new(device: &wgpu::Device, pipelines: &GlobePipelines) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("overlay warp-mesh wgsl"),
-            source: wgpu::ShaderSource::Wgsl(OVERLAY_WGSL.into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("overlay warp-mesh pipeline layout"),
-            bind_group_layouts: &[
-                Some(&pipelines.camera_layout),
-                Some(&pipelines.overlay_uniform_layout),
-                Some(&pipelines.tile_texture_layout),
-            ],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("overlay warp-mesh pipeline (depth-less)"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(OverlayVertex::LAYOUT)],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_overlay"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                front_face: wgpu::FrontFace::Ccw,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
+    pub(super) fn new() -> Self {
         Self {
-            pipeline,
             index_buffers: HashMap::new(),
-            meshes: TileCache::new(DEFAULT_OVERLAY_MESH_CACHE_BYTES),
+            meshes: ElasticMeshCache::new(DEFAULT_MESH_CACHE_BYTES),
+            uniform_offsets: Vec::new(),
         }
     }
 
@@ -152,10 +111,7 @@ impl OverlayRenderer {
         snapshot: &DrawSnapshot,
     ) {
         if snapshot.overlays.is_empty() {
-            let _ = self.meshes.clear();
-            if self.meshes.max_bytes() > DEFAULT_OVERLAY_MESH_CACHE_BYTES {
-                let _ = self.meshes.set_max_bytes(DEFAULT_OVERLAY_MESH_CACHE_BYTES);
-            }
+            self.meshes.clear_and_reset_cap();
             return;
         }
 
@@ -170,16 +126,13 @@ impl OverlayRenderer {
                     .saturating_mul(side * side * std::mem::size_of::<OverlayVertex>())
             })
             .sum();
-        let active_floor = needed_bytes.max(DEFAULT_OVERLAY_MESH_CACHE_BYTES);
-        if active_floor > self.meshes.max_bytes() {
-            let _ = self.meshes.set_max_bytes(active_floor);
-        }
-
-        for layer in &snapshot.overlays {
-            for patch in &layer.patches {
-                self.meshes.touch(&patch.mesh_key);
-            }
-        }
+        self.meshes.begin_frame(
+            needed_bytes,
+            snapshot
+                .overlays
+                .iter()
+                .flat_map(|layer| layer.patches.iter().map(|patch| &patch.mesh_key)),
+        );
 
         for layer in &snapshot.overlays {
             let segs = layer.segments.clamp(1, MAX_WARP_SEGMENTS);
@@ -213,7 +166,7 @@ impl OverlayRenderer {
                     contents: bytemuck::cast_slice(&vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                let _ = self.meshes.insert(
+                self.meshes.insert(
                     patch.mesh_key,
                     CachedOverlayMesh {
                         buffer,
@@ -226,22 +179,18 @@ impl OverlayRenderer {
             }
         }
 
-        let target_cap = needed_bytes.max(DEFAULT_OVERLAY_MESH_CACHE_BYTES);
-        if target_cap < self.meshes.max_bytes() {
-            let _ = self.meshes.set_max_bytes(target_cap);
-        }
+        self.meshes.end_frame(needed_bytes);
     }
 
     /// Push per-patch uniforms for every overlay patch into the frame-wide
-    /// `arena`, returning their aligned dynamic byte offsets in draw order.
+    /// `arena`, recording their aligned dynamic byte offsets in draw order.
     pub(super) fn push_uniforms(
-        &self,
+        &mut self,
         arena: &mut DynamicUniformArena,
         snapshot: &DrawSnapshot,
         eye: DVec3,
-        out_offsets: &mut Vec<u32>,
     ) {
-        out_offsets.clear();
+        self.uniform_offsets.clear();
         for layer in &snapshot.overlays {
             let opacity = layer.opacity.clamp(0.0, 1.0);
             for patch in &layer.patches {
@@ -255,7 +204,7 @@ impl OverlayRenderer {
                     opacity,
                     uv_rect: patch.uv_rect,
                 };
-                out_offsets.push(arena.push(&u));
+                self.uniform_offsets.push(arena.push(&u));
             }
         }
     }
@@ -265,22 +214,22 @@ impl OverlayRenderer {
     pub(super) fn record_pass<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
+        pipeline: &'a wgpu::RenderPipeline,
         arena: &'a DynamicUniformArena,
         bind_groups: &'a TileBindGroupCache,
         snapshot: &'a DrawSnapshot,
-        offsets: &[u32],
     ) {
         if snapshot.overlays.is_empty() {
             return;
         }
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(pipeline);
         let mut last_index_key: Option<(u32, bool)> = None;
         let mut last_tex_id: Option<u64> = None;
         let mut offset_idx = 0usize;
 
         for layer in &snapshot.overlays {
             for patch in &layer.patches {
-                let dyn_offset = offsets[offset_idx];
+                let dyn_offset = self.uniform_offsets[offset_idx];
                 offset_idx += 1;
 
                 let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {

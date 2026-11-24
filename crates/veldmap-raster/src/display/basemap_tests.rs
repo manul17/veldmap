@@ -163,7 +163,7 @@ fn renders_geodetic_web_mercator_and_polar_tiles_with_orientation_and_bounds_che
     );
 
     // 4. Out-of-range levels, OOB x/y, and invalid tile_px fail cleanly.
-    let cfg = basemap.config();
+    let cfg = basemap.config;
     for bad in [
         QuadTileId {
             scheme: PlanetaryScheme::Geodetic,

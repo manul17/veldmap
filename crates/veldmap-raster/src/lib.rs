@@ -5,6 +5,8 @@
 //! Keeps `veldmap-core` permanently free of image/codec dependencies and keeps
 //! `veldmap-net` decoupled from raster codecs via an injected decode executor.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -20,13 +22,13 @@ mod pool;
 mod tiff;
 
 pub use display::{
-    BundledBasemap, BundledBasemapConfig, MAX_QOI_DECODED_BYTES, decode_map_tile,
-    decode_map_tile_with_mipmaps, decode_qoi_rgba8, encode_qoi_rgba8, generate_linear_mipmaps,
+    BundledBasemap, BundledBasemapConfig, MAX_QOI_DECODED_BYTES, decode_map_tile_with_mipmaps,
+    decode_qoi_rgba8, encode_qoi_rgba8, generate_linear_mipmaps,
 };
 pub use pipeline::{
-    AdmittedTile, BandInfo, DecodeContext, GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType,
-    GeoTie, LevelPlan, PassBusy, PassKey, PyramidMeta, RasterDescription, RasterSource, SampleType,
-    ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
+    AdmittedPass, AdmittedTile, BandInfo, DecodeContext, GeoKeyParams, GeoKeyValue, GeoPlacement,
+    GeoRasterType, GeoTie, LevelPlan, PassKey, PyramidMeta, RasterDescription, RasterSource,
+    SampleType, ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
     frame_from_description,
 };
 pub use pool::{
@@ -79,7 +81,27 @@ pub enum RasterError {
 impl RasterError {
     /// Return whether this error represents task cancellation.
     pub const fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled)
+        matches!(self, Self::Cancelled | Self::Budget(BudgetError::Cancelled))
+    }
+
+    /// Return whether this error is deterministic and permanent for the
+    /// requested tile/source, so schedulers should suppress retries
+    /// immediately rather than allowing transient retry attempts.
+    pub const fn is_terminal(&self) -> bool {
+        match self {
+            Self::UnsupportedFormat
+            | Self::DecoderLimitsExceeded(_)
+            | Self::Budget(BudgetError::ExceedsCap { .. })
+            | Self::InvalidDimensions { .. }
+            | Self::LimitExceeded { .. }
+            | Self::TileOutOfRange { .. }
+            | Self::Binding(_) => true,
+            Self::Cancelled
+            | Self::Budget(BudgetError::Cancelled)
+            | Self::DecoderPanicked(_)
+            | Self::Io(_)
+            | Self::Decode(_) => false,
+        }
     }
 }
 
@@ -105,5 +127,69 @@ impl From<BudgetError> for RasterError {
 impl From<BindingError> for RasterError {
     fn from(err: BindingError) -> Self {
         Self::Binding(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raster_error_is_terminal_classifies_all_variants() {
+        let terminal = [
+            RasterError::UnsupportedFormat,
+            RasterError::DecoderLimitsExceeded("limit".to_owned()),
+            RasterError::Budget(BudgetError::ExceedsCap {
+                requested: 10,
+                cap: 5,
+                detail: "cap".to_owned(),
+            }),
+            RasterError::InvalidDimensions {
+                width: 0,
+                height: 0,
+            },
+            RasterError::LimitExceeded {
+                width: 1,
+                height: 1,
+                estimated_bytes: 10,
+                limit_bytes: 5,
+            },
+            RasterError::TileOutOfRange {
+                scheme: TileScheme::WebMercator,
+                level: 1,
+                x: 9,
+                y: 9,
+            },
+            RasterError::Binding("bad crs".to_owned()),
+        ];
+        for err in &terminal {
+            assert!(err.is_terminal(), "expected terminal for {err:?}");
+        }
+
+        let non_terminal = [
+            RasterError::Cancelled,
+            RasterError::Budget(BudgetError::Cancelled),
+            RasterError::DecoderPanicked("boom".to_owned()),
+            RasterError::Io(Arc::new(IoError::Io(std::io::Error::other("io")))),
+            RasterError::Decode("corrupt".to_owned()),
+        ];
+        for err in &non_terminal {
+            assert!(!err.is_terminal(), "expected non-terminal for {err:?}");
+        }
+    }
+
+    #[test]
+    fn raster_error_is_cancelled_covers_direct_and_budget_cancellation() {
+        assert!(RasterError::Cancelled.is_cancelled());
+        assert!(RasterError::Budget(BudgetError::Cancelled).is_cancelled());
+        assert!(
+            !RasterError::Budget(BudgetError::ExceedsCap {
+                requested: 10,
+                cap: 5,
+                detail: "cap".to_owned(),
+            })
+            .is_cancelled()
+        );
+        assert!(!RasterError::Decode("err".to_owned()).is_cancelled());
     }
 }

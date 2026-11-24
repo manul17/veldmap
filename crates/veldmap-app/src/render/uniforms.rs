@@ -3,74 +3,6 @@
 //! [`super::globe`].
 
 use bytemuck::{Pod, Zeroable};
-use veldmap_core::tile::{PlanetaryScheme, QuadTileId};
-
-use super::mesh::TileGridAnchor;
-
-/// `TileUniform::tile_kind` tag for `Geodetic` / `WebMercator` tiles.
-pub(super) const TILE_KIND_GEO: f32 = 0.0;
-/// `TileUniform::tile_kind` tag for North PolarCap tiles near the pole.
-const TILE_KIND_POLAR_NORTH: f32 = 1.0;
-/// `TileUniform::tile_kind` tag for South PolarCap tiles near the pole.
-const TILE_KIND_POLAR_SOUTH: f32 = -1.0;
-/// Scale multiplier applied to `TILE_KIND_POLAR_*` (`±2.0`) when a PolarCap
-/// tile is strictly clear of the pole and uses cancellation-free relative
-/// longitude deltas in `shaders/globe.wgsl` (`abs(tile.tile_kind) > 1.5`).
-const TILE_KIND_POLAR_CLEAR_SCALE: f32 = 2.0;
-
-/// Compute per-tile `(tile_kind, grid_anchor)` uniform values from a cached
-/// [`TileGridAnchor`] so `GlobeRenderer` never re-samples `sample_tile_surface`
-/// on every dirty frame.
-pub(super) fn tile_graticule_uniform(
-    id: QuadTileId,
-    cached_anchor: Option<TileGridAnchor>,
-    step_deg: f64,
-) -> (f32, [f32; 4]) {
-    let anchor = cached_anchor.unwrap_or_else(|| TileGridAnchor::for_tile(id));
-    match id.scheme {
-        PlanetaryScheme::PolarCap { north } => {
-            let colat_phase = (90.0 - anchor.lat0.abs()).rem_euclid(step_deg);
-            let lon_phase = anchor.lon0.rem_euclid(step_deg);
-
-            // Use cancellation-free relative longitude deltas when the tile's
-            // disk center is strictly clear of the pole (`rho0 > 4 * tile_half_diag`).
-            let rho0 = anchor.dx0.hypot(anchor.dy0);
-            let n = f64::from(1u32 << id.level.min(30));
-            let tile_half_diag = std::f64::consts::SQRT_2 / n;
-            let clear_of_pole = id.level >= 2 && rho0 > 4.0 * tile_half_diag;
-            let sign = if north {
-                TILE_KIND_POLAR_NORTH
-            } else {
-                TILE_KIND_POLAR_SOUTH
-            };
-            let kind = if clear_of_pole {
-                sign * TILE_KIND_POLAR_CLEAR_SCALE
-            } else {
-                sign
-            };
-            (
-                kind,
-                [
-                    anchor.dx0 as f32,
-                    anchor.dy0 as f32,
-                    colat_phase as f32,
-                    lon_phase as f32,
-                ],
-            )
-        }
-        PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => {
-            // Wrap tile anchor phase modulo `grid_step_deg` in f64 on CPU so
-            // `f32` fragment arithmetic preserves sub-millimetre accuracy even
-            // at `2 m` altitude.
-            let lon_phase = anchor.lon0.rem_euclid(step_deg);
-            let lat_phase = anchor.lat0.rem_euclid(step_deg);
-            (
-                TILE_KIND_GEO,
-                [lon_phase as f32, lat_phase as f32, 0.0, 0.0],
-            )
-        }
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -122,6 +54,26 @@ const _: () = {
     assert!(std::mem::offset_of!(OverlayPatchUniform, uv_rect) == 16);
 };
 
+fn dynamic_uniform_bind_group<T>(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::BindGroupLayout,
+    buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(std::mem::size_of::<T>() as u64),
+            }),
+        }],
+    })
+}
+
 /// Frame-wide dynamic uniform arena shared across globe body, post-body
 /// overlays, and graticule passes.
 ///
@@ -134,6 +86,8 @@ pub(super) struct DynamicUniformArena {
     last_offset: usize,
     buffer: wgpu::Buffer,
     capacity_bytes: usize,
+    tile_layout: wgpu::BindGroupLayout,
+    overlay_layout: wgpu::BindGroupLayout,
     tile_bind_group: wgpu::BindGroup,
     overlay_bind_group: wgpu::BindGroup,
 }
@@ -155,6 +109,8 @@ impl DynamicUniformArena {
             last_offset: 0,
             buffer,
             capacity_bytes: initial_bytes,
+            tile_layout: tile_layout.clone(),
+            overlay_layout: overlay_layout.clone(),
             tile_bind_group,
             overlay_bind_group,
         }
@@ -172,30 +128,18 @@ impl DynamicUniformArena {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let tile_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("arena tile dynamic uniform bind group"),
-            layout: tile_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(std::mem::size_of::<TileUniform>() as u64),
-                }),
-            }],
-        });
-        let overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("arena overlay dynamic uniform bind group"),
-            layout: overlay_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(std::mem::size_of::<OverlayPatchUniform>() as u64),
-                }),
-            }],
-        });
+        let tile_bind_group = dynamic_uniform_bind_group::<TileUniform>(
+            device,
+            "arena tile dynamic uniform bind group",
+            tile_layout,
+            &buffer,
+        );
+        let overlay_bind_group = dynamic_uniform_bind_group::<OverlayPatchUniform>(
+            device,
+            "arena overlay dynamic uniform bind group",
+            overlay_layout,
+            &buffer,
+        );
         (buffer, tile_bind_group, overlay_bind_group)
     }
 
@@ -221,13 +165,7 @@ impl DynamicUniformArena {
     /// Ensure the GPU arena buffer fits all pushed uniforms plus the final
     /// entry's declared binding range, then upload the frame's staging bytes
     /// in a single write.
-    pub(super) fn flush(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        tile_layout: &wgpu::BindGroupLayout,
-        overlay_layout: &wgpu::BindGroupLayout,
-    ) {
+    pub(super) fn flush(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.staging.is_empty() {
             return;
         }
@@ -238,7 +176,7 @@ impl DynamicUniformArena {
         if required_bytes > self.capacity_bytes {
             let next_cap = required_bytes.next_power_of_two().max(4096);
             let (buf, tile_bg, overlay_bg) =
-                Self::alloc(device, tile_layout, overlay_layout, next_cap);
+                Self::alloc(device, &self.tile_layout, &self.overlay_layout, next_cap);
             self.buffer = buf;
             self.tile_bind_group = tile_bg;
             self.overlay_bind_group = overlay_bg;

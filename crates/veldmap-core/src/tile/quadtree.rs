@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use glam::DVec3;
 
 use crate::geo::camera::Camera;
-use crate::geo::cull::{Ball, CullFrustum};
 use crate::geo::geodesy;
 use crate::geo::projection::web_mercator_lat_deg;
 use crate::geo::sag;
+use crate::geo::{Ball, CullFrustum};
 
 use super::geometry::{
     lat_lon_bounds, lerp_f64, sample_tile_surface, tile_lon_bounds, web_mercator_y_bounds,
@@ -30,11 +30,6 @@ const DEFAULT_POLAR_MAX_TEX_LEVEL: u8 = 0;
 
 /// Default `Geodetic` maximum texture level used by [`QuadtreeConfig::default`].
 const DEFAULT_GEODETIC_MAX_TEX_LEVEL: u8 = 3;
-
-/// Maximum WGS84 radius-of-curvature ratio relative to `SEMI_MAJOR_M`
-/// (`a / (1 - f) / a`), used to keep spherical chord-sag bounds strictly
-/// conservative at polar latitudes.
-const POLAR_CURVATURE_SCALE: f64 = 1.0 / (1.0 - geodesy::FLATTENING);
 
 /// Configuration for planetary quadtree traversal.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -179,7 +174,7 @@ fn sample_geodetic_grid(
         .map(|row| lerp_f64(b.lat_north_deg, b.lat_south_deg, f64::from(row) * 0.25));
     let lons = [0u32, 1, 2, 3, 4]
         .map(|col| lerp_f64(b.lon_west_deg, b.lon_east_deg, f64::from(col) * 0.25));
-    geodesy::WGS84.fill_separable_surface_grid(lats, lons, samples, sample_units);
+    geodesy::WGS84.fill_separable_surface_grid(&lats, &lons, samples, Some(sample_units));
 
     if b.lat_north_deg >= b.raw_lat_north_deg && b.lat_south_deg <= b.raw_lat_south_deg {
         return Some(0.0);
@@ -209,7 +204,7 @@ fn sample_web_mercator_grid(
         .map(|row| web_mercator_lat_deg(lerp_f64(merc_n, merc_s, f64::from(row) * 0.25)));
     let lons =
         [0u32, 1, 2, 3, 4].map(|col| lerp_f64(lon_west_deg, lon_east_deg, f64::from(col) * 0.25));
-    geodesy::WGS84.fill_separable_surface_grid(lats, lons, samples, sample_units);
+    geodesy::WGS84.fill_separable_surface_grid(&lats, &lons, samples, Some(sample_units));
 
     // Evaluate the most equatorial mesh cell directly so non-linear
     // Mercator stretching at coarse z=0..1 does not underestimate sag.
@@ -249,29 +244,6 @@ fn sample_polar_cap_grid(
     Some(())
 }
 
-/// Estimate maximum 5x5 subcell diagonal arc from cached unit normals via
-/// squared chord length (`|a - b|^2 = 4 sin^2(theta / 2)`, strictly monotonic on
-/// `[0, pi]`), needing only one `asin` instead of 32 `atan2`s.
-fn max_subcell_arc_deg(sample_units: &[DVec3; 25]) -> f64 {
-    let mut max_chord_sq = 0.0_f64;
-    for row in 0..4usize {
-        for col in 0..4usize {
-            let a = sample_units[row * 5 + col];
-            let b = sample_units[(row + 1) * 5 + (col + 1)];
-            let c = sample_units[row * 5 + (col + 1)];
-            let d = sample_units[(row + 1) * 5 + col];
-            max_chord_sq = max_chord_sq
-                .max((a - b).length_squared())
-                .max((c - d).length_squared());
-        }
-    }
-    2.0 * (0.25 * max_chord_sq)
-        .clamp(0.0, 1.0)
-        .sqrt()
-        .asin()
-        .to_degrees()
-}
-
 fn describe_tile_with_samples(id: QuadTileId, config: &QuadtreeConfig) -> Option<DescribedTile> {
     let grid_cells = f64::from(config.grid_cells.max(1));
     let mut samples = [DVec3::ZERO; 25];
@@ -294,22 +266,21 @@ fn describe_tile_with_samples(id: QuadTileId, config: &QuadtreeConfig) -> Option
 
     // Center point `(s=0.5, t=0.5)` is index 12 (row 2, col 2).
     let origin_ecef_m = samples[12];
-    let max_subcell_arc_deg = max_subcell_arc_deg(&sample_units);
+    let max_subcell_arc_deg = sag::max_subcell_arc_deg(&sample_units, 5);
 
     // Scale 5x5 subcell (`1/4` of tile) to `1/grid_cells`, taking the exact
     // equatorial WebMercator cell when larger.
     let cell_diag_deg =
         (max_subcell_arc_deg * (4.0 / grid_cells)).max(merc_equatorial_cell_diag_deg);
-    let sag_cell_diag_m = sag::sag_m(cell_diag_deg) * POLAR_CURVATURE_SCALE;
+    let sag_cell_diag_m = sag::oblate_sag_m(cell_diag_deg);
     // For clamped Geodetic polar-adjacent tiles, derive skirt depth from the
     // unclamped latitude span so 2:1 coarser neighbors never out-sag a thin sliver.
-    let skirt_sag_m =
-        sag_cell_diag_m.max(sag::sag_m(unclamped_cell_diag_deg) * POLAR_CURVATURE_SCALE);
+    let skirt_sag_m = sag_cell_diag_m.max(sag::oblate_sag_m(unclamped_cell_diag_deg));
     let skirt_depth_m = (4.0 * skirt_sag_m).max(0.001);
 
     // Conservative subcell bulge margin (polar curvature + 15% trapezoid slack)
     // so the bounding sphere strictly encloses the curved ellipsoid surface.
-    let sample_sag_m = sag::sag_m((max_subcell_arc_deg * 1.15).min(180.0)) * POLAR_CURVATURE_SCALE;
+    let sample_sag_m = sag::subcell_bulge_m(max_subcell_arc_deg);
     let ball = Ball::over(&samples).widened(sample_sag_m + skirt_depth_m);
 
     let max_tex = config.max_tex_for(id.scheme);

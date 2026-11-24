@@ -7,31 +7,16 @@ use std::collections::BTreeSet;
 
 use veldmap_core::tile::TileKey;
 
-/// Total-ordering wrapper over [`TileKey`] ordered strictly coarsest-first,
-/// with `(coarsest_first_key(), level)` injective with `Eq`.
+/// Total-ordering wrapper over [`TileKey`] ordered strictly coarsest-first
+/// via [`TileKey::coarsest_first_key`] (which is injective with `Eq`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OrderedTileKey(TileKey);
 
-impl OrderedTileKey {
-    fn sort_tuple(
-        &self,
-    ) -> (
-        u8,
-        veldmap_core::tile::TileScheme,
-        u32,
-        u32,
-        veldmap_core::tile::SourceId,
-        veldmap_core::tile::TileStreamSpec,
-        u8,
-    ) {
-        let (rank, scheme, y, x, source, spec) = self.0.coarsest_first_key();
-        (rank, scheme, y, x, source, spec, self.0.level)
-    }
-}
-
 impl Ord for OrderedTileKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.sort_tuple().cmp(&other.sort_tuple())
+        self.0
+            .coarsest_first_key()
+            .cmp(&other.0.coarsest_first_key())
     }
 }
 

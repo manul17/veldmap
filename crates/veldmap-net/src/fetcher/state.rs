@@ -1,17 +1,20 @@
 //! Queue, in-flight tracking, and failure/backoff state machine for
 //! [`super::LiveTilePipeline`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::OwnedSemaphorePermit;
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{SourceId, TileKey};
+use veldmap_core::tile::{QuadTileId, SourceId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
+use crate::http::{HostLimiters, PermitDenied};
 
 use super::NetworkStatus;
 use super::failures::{BackoffEntry, FailureMarker, FailureTracker};
+use super::in_flight::InFlightTable;
 use super::queue::CoarsestTileQueue;
 
 /// Explicit side-effect summary returned by in-flight state transitions.
@@ -41,62 +44,106 @@ impl Transition {
     }
 }
 
-/// Generation-checked table of active disk/HTTP/decode tasks plus bounded
-/// disk-lookup slot accounting.
 #[derive(Default)]
-struct InFlightTable {
-    entries: HashMap<TileKey, (u64, CancelToken)>,
-    next_gen: u64,
-    disk_in_flight: usize,
+struct StatusCounters {
+    completed_from_disk: u64,
+    completed_from_net: u64,
+    failed_count: u64,
+    offline: bool,
+    last_error: Option<String>,
 }
 
-impl InFlightTable {
+impl StatusCounters {
+    fn reset_errors(&mut self) {
+        self.failed_count = 0;
+        self.offline = false;
+        self.last_error = None;
+    }
+
+    fn record_failure(&mut self, offline: bool, error_msg: Option<String>) {
+        self.failed_count = self.failed_count.saturating_add(1);
+        if offline {
+            self.offline = true;
+        }
+        if let Some(msg) = error_msg {
+            self.last_error = Some(msg);
+        }
+    }
+}
+
+/// Raw disk-lookup task planned under `PipelineState`'s mutex, to be wrapped
+/// in RAII guards immediately upon unlocking `state`.
+pub(super) struct PlannedDiskTask {
+    pub(super) key: TileKey,
+    pub(super) id: QuadTileId,
+    pub(super) generation: u64,
+    pub(super) spec: Arc<LiveBasemapSpec>,
+    pub(super) cancel: CancelToken,
+}
+
+/// Raw HTTP fetch task planned under `PipelineState`'s mutex, to be wrapped
+/// in RAII guards immediately upon unlocking `state`.
+pub(super) struct PlannedHttpTask {
+    pub(super) key: TileKey,
+    pub(super) id: QuadTileId,
+    pub(super) generation: u64,
+    pub(super) spec: Arc<LiveBasemapSpec>,
+    pub(super) host: String,
+    pub(super) cancel: CancelToken,
+    pub(super) permit: OwnedSemaphorePermit,
+}
+
+/// Dispatch batch planned under `PipelineState`'s mutex in `state -> host_limiters`
+/// lock order.
+pub(super) struct PlannedDispatch {
+    pub(super) disk_tasks: Vec<PlannedDiskTask>,
+    pub(super) http_tasks: Vec<PlannedHttpTask>,
+    pub(super) earliest_wakeup: Option<Instant>,
+}
+
+fn min_instant(current: Option<Instant>, candidate: Instant) -> Option<Instant> {
+    Some(match current {
+        Some(cur) if cur < candidate => cur,
+        _ => candidate,
+    })
+}
+
+#[derive(Default)]
+struct PendingQueues {
+    /// Coarsest-first queue awaiting fast local disk-cache lookup.
+    disk: CoarsestTileQueue,
+    /// Coarsest-first queue of disk misses awaiting an HTTP per-host slot.
+    http: CoarsestTileQueue,
+}
+
+impl PendingQueues {
+    fn clear(&mut self) {
+        self.disk.clear();
+        self.http.clear();
+    }
+
     fn len(&self) -> usize {
-        self.entries.len()
+        self.disk.len().saturating_add(self.http.len())
     }
 
     fn contains(&self, key: &TileKey) -> bool {
-        self.entries.contains_key(key)
+        self.disk.contains(key) || self.http.contains(key)
     }
 
-    fn register(&mut self, key: TileKey, shutdown: &CancelToken) -> (u64, CancelToken) {
-        self.next_gen = self.next_gen.wrapping_add(1);
-        let gen_id = self.next_gen;
-        let tile_cancel = shutdown.child_token();
-        self.entries.insert(key, (gen_id, tile_cancel.clone()));
-        (gen_id, tile_cancel)
-    }
-
-    fn remove_if_gen(&mut self, key: &TileKey, generation: u64) -> bool {
-        if self
-            .entries
-            .get(key)
-            .is_some_and(|(gen_id, _)| *gen_id == generation)
-        {
-            self.entries.remove(key);
-            true
+    fn insert_unique(&mut self, key: TileKey, retry_disk: bool) {
+        if retry_disk {
+            self.disk.insert_unique(key);
         } else {
-            false
+            self.http.insert_unique(key);
         }
     }
 
-    fn drain_tokens(&mut self) -> Vec<CancelToken> {
-        self.entries.drain().map(|(_, (_, tok))| tok).collect()
-    }
-
-    fn retain_and_collect_cancelled(
-        &mut self,
-        mut keep: impl FnMut(&TileKey) -> bool,
-    ) -> Vec<CancelToken> {
-        let mut cancelled = Vec::new();
-        self.entries.retain(|key, (_, tok)| {
-            let ok = keep(key);
-            if !ok {
-                cancelled.push(tok.clone());
-            }
-            ok
-        });
-        cancelled
+    /// Retain still-wanted / active-root entries in place, keeping `http`
+    /// entries out of `disk` so disk misses never bounce back.
+    fn retain(&mut self, mut keep: impl FnMut(&TileKey) -> bool) {
+        self.http.retain(&mut keep);
+        let http = &self.http;
+        self.disk.retain(|key| !http.contains(key) && keep(key));
     }
 }
 
@@ -106,17 +153,10 @@ pub(super) struct PipelineState {
     /// Unready, active-source, contract-valid keys from the most recent
     /// `reconcile_wanted`, used by idle backoff retries and `retry_failed`.
     last_wanted: HashSet<TileKey>,
-    /// Coarsest-first queue awaiting fast local disk-cache lookup.
-    pending_disk: CoarsestTileQueue,
-    /// Coarsest-first queue of disk misses awaiting an HTTP per-host slot.
-    pending_http: CoarsestTileQueue,
+    pending: PendingQueues,
     in_flight: InFlightTable,
     failures: FailureTracker,
-    completed_from_disk: u64,
-    completed_from_net: u64,
-    failed_count: u64,
-    offline: bool,
-    last_error: Option<String>,
+    counters: StatusCounters,
 }
 
 impl PipelineState {
@@ -136,6 +176,17 @@ impl PipelineState {
             && !self.failures.is_suppressed(key)
     }
 
+    fn is_pending_eligible(
+        &self,
+        key: &TileKey,
+        active_source: SourceId,
+        is_ready: impl Fn(&TileKey) -> bool,
+    ) -> bool {
+        self.is_queue_eligible(key, active_source)
+            && self.is_wanted_or_root(key, active_source)
+            && !is_ready(key)
+    }
+
     fn finish_in_flight(&mut self, key: &TileKey, expected_gen: u64) -> bool {
         if !self.in_flight.remove_if_gen(key, expected_gen) {
             return false;
@@ -151,23 +202,12 @@ impl PipelineState {
         is_ready: impl Fn(&TileKey) -> bool,
     ) {
         for (key, retry_disk) in entries {
-            if self.is_queue_eligible(&key, active_source)
-                && self.is_wanted_or_root(&key, active_source)
-                && !is_ready(&key)
-                && !self.pending_disk.contains(&key)
-                && !self.pending_http.contains(&key)
+            if self.is_pending_eligible(&key, active_source, &is_ready)
+                && !self.pending.contains(&key)
             {
-                if retry_disk {
-                    self.pending_disk.insert_unique(key);
-                } else {
-                    self.pending_http.insert_unique(key);
-                }
+                self.pending.insert_unique(key, retry_disk);
             }
         }
-    }
-
-    pub(super) fn active_spec(&self) -> Option<Arc<LiveBasemapSpec>> {
-        self.active_spec.clone()
     }
 
     pub(super) fn set_active_spec(
@@ -179,12 +219,9 @@ impl PipelineState {
         }
         self.active_spec = spec.map(Arc::new);
         self.last_wanted.clear();
-        self.pending_disk.clear();
-        self.pending_http.clear();
+        self.clear_pending_queues();
         self.failures.clear();
-        self.failed_count = 0;
-        self.offline = false;
-        self.last_error = None;
+        self.counters.reset_errors();
         Some(self.in_flight.drain_tokens())
     }
 
@@ -199,8 +236,7 @@ impl PipelineState {
     {
         let Some(spec) = self.active_spec.clone() else {
             self.last_wanted.clear();
-            self.pending_disk.clear();
-            self.pending_http.clear();
+            self.clear_pending_queues();
             return None;
         };
         let active_source = spec.source_id();
@@ -223,55 +259,20 @@ impl PipelineState {
             }
         }
 
-        // Retain still-wanted / active-root entries already in `pending_http`
-        // in place so disk misses never bounce back to `pending_disk`.
-        {
-            let Self {
-                last_wanted,
-                failures,
-                in_flight,
-                pending_http,
-                ..
-            } = self;
-            pending_http.retain(|key| {
-                key.source == active_source
-                    && !is_ready(key)
-                    && !in_flight.contains(key)
-                    && !failures.is_suppressed(key)
-                    && (last_wanted.contains(key) || key.is_root_of(active_source))
-            });
-        }
-
-        // Preserve still-unready wanted tiles and pinned active roots already in
-        // `pending_disk` in place before re-queueing expired backoffs and newly
-        // wanted keys.
-        {
-            let Self {
-                last_wanted,
-                failures,
-                in_flight,
-                pending_http,
-                pending_disk,
-                ..
-            } = self;
-            pending_disk.retain(|key| {
-                key.source == active_source
-                    && !is_ready(key)
-                    && !in_flight.contains(key)
-                    && !failures.is_suppressed(key)
-                    && !pending_http.contains(key)
-                    && (last_wanted.contains(key) || key.is_root_of(active_source))
-            });
-        }
+        // Retain still-wanted / active-root entries in place: keep `http`
+        // entries out of `disk` so disk misses never bounce back.
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.retain(|key| self.is_pending_eligible(key, active_source, is_ready));
+        self.pending = pending;
 
         // Drain expired backoffs (`until <= now`), routing `retry_disk: false`
-        // directly to `pending_http` while keeping `retry_disk: true` on disk.
+        // directly to `pending.http` while keeping `retry_disk: true` on disk.
         let expired = self.failures.drain_expired_backoffs(now);
         self.requeue_eligible_entries(active_source, expired, is_ready);
 
         for &key in &self.last_wanted {
-            if self.is_queue_eligible(&key, active_source) && !self.pending_http.contains(&key) {
-                self.pending_disk.insert_unique(key);
+            if self.is_queue_eligible(&key, active_source) && !self.pending.http.contains(&key) {
+                self.pending.disk.insert_unique(key);
             }
         }
 
@@ -280,9 +281,7 @@ impl PipelineState {
 
     pub(super) fn retry_failed(&mut self) {
         let entries = self.failures.drain_for_retry();
-        self.failed_count = 0;
-        self.offline = false;
-        self.last_error = None;
+        self.counters.reset_errors();
 
         let Some(spec) = self.active_spec.as_ref() else {
             return;
@@ -294,15 +293,12 @@ impl PipelineState {
     pub(super) fn status(&self) -> NetworkStatus {
         NetworkStatus {
             in_flight: self.in_flight.len(),
-            queued: self
-                .pending_disk
-                .len()
-                .saturating_add(self.pending_http.len()),
-            completed_from_disk: self.completed_from_disk,
-            completed_from_net: self.completed_from_net,
-            failed_count: self.failed_count,
-            offline: self.offline,
-            last_error: self.last_error.clone(),
+            queued: self.pending.len(),
+            completed_from_disk: self.counters.completed_from_disk,
+            completed_from_net: self.counters.completed_from_net,
+            failed_count: self.counters.failed_count,
+            offline: self.counters.offline,
+            last_error: self.counters.last_error.clone(),
         }
     }
 
@@ -312,44 +308,46 @@ impl PipelineState {
         self.in_flight.drain_tokens()
     }
 
-    pub(super) fn clear_pending_queues(&mut self) {
-        self.pending_disk.clear();
-        self.pending_http.clear();
+    fn clear_pending_queues(&mut self) {
+        self.pending.clear();
     }
 
-    pub(super) fn drain_disk_to_http(&mut self, active_source: SourceId) {
-        if self.pending_disk.is_empty() {
+    fn drain_disk_to_http(&mut self, active_source: SourceId) {
+        if self.pending.disk.is_empty() {
             return;
         }
-        for key in self.pending_disk.drain() {
+        for key in self.pending.disk.drain() {
             if self.is_queue_eligible(&key, active_source) {
-                self.pending_http.insert_unique(key);
+                self.pending.http.insert_unique(key);
             }
         }
     }
 
-    pub(super) fn pop_next_disk(
+    fn pop_next_disk(
         &mut self,
         active_source: SourceId,
         max_concurrent_disk: usize,
         shutdown: &CancelToken,
-    ) -> Option<(TileKey, u64, CancelToken)> {
-        if self.in_flight.disk_in_flight >= max_concurrent_disk {
+    ) -> Option<(TileKey, QuadTileId, u64, CancelToken)> {
+        if self.in_flight.disk_in_flight() >= max_concurrent_disk {
             return None;
         }
-        while let Some(key) = self.pending_disk.pop() {
+        while let Some(key) = self.pending.disk.pop() {
             if !self.is_queue_eligible(&key, active_source) {
                 continue;
             }
+            let Some(id) = key.quad_id() else {
+                continue;
+            };
             let (gen_id, tile_cancel) = self.in_flight.register(key, shutdown);
-            self.in_flight.disk_in_flight += 1;
-            return Some((key, gen_id, tile_cancel));
+            self.in_flight.acquire_disk_slot();
+            return Some((key, id, gen_id, tile_cancel));
         }
         None
     }
 
-    pub(super) fn pop_next_http(&mut self, active_source: SourceId) -> Option<TileKey> {
-        while let Some(key) = self.pending_http.pop() {
+    fn pop_next_http(&mut self, active_source: SourceId) -> Option<TileKey> {
+        while let Some(key) = self.pending.http.pop() {
             if self.is_queue_eligible(&key, active_source) {
                 return Some(key);
             }
@@ -357,6 +355,7 @@ impl PipelineState {
         None
     }
 
+    #[cfg(test)]
     pub(super) fn register_http_in_flight(
         &mut self,
         key: TileKey,
@@ -365,8 +364,124 @@ impl PipelineState {
         self.in_flight.register(key, shutdown)
     }
 
-    pub(super) fn push_deferred_http(&mut self, deferred: Vec<TileKey>) {
-        self.pending_http.push_unique(deferred);
+    fn push_deferred_http(&mut self, deferred: Vec<TileKey>) {
+        self.pending.http.push_unique(deferred);
+    }
+
+    fn plan_disk_tasks(
+        &mut self,
+        spec: &Arc<LiveBasemapSpec>,
+        has_disk_cache: bool,
+        max_concurrent_disk: usize,
+        shutdown: &CancelToken,
+    ) -> Vec<PlannedDiskTask> {
+        let active_source = spec.source_id();
+        if !has_disk_cache {
+            self.drain_disk_to_http(active_source);
+            return Vec::new();
+        }
+
+        let mut tasks = Vec::new();
+        while let Some((key, id, generation, cancel)) =
+            self.pop_next_disk(active_source, max_concurrent_disk, shutdown)
+        {
+            tasks.push(PlannedDiskTask {
+                key,
+                id,
+                generation,
+                spec: Arc::clone(spec),
+                cancel,
+            });
+        }
+        tasks
+    }
+
+    fn plan_http_tasks(
+        &mut self,
+        spec: &Arc<LiveBasemapSpec>,
+        host_limiters: &HostLimiters,
+        shutdown: &CancelToken,
+        now: Instant,
+        earliest_wakeup: &mut Option<Instant>,
+    ) -> Vec<PlannedHttpTask> {
+        let active_source = spec.source_id();
+        let total_hosts = spec.host_count();
+        let mut denied_hosts: HashSet<&str> = HashSet::with_capacity(total_hosts);
+        let mut deferred_http = Vec::new();
+        let mut tasks = Vec::new();
+
+        while let Some(key) = self.pop_next_http(active_source) {
+            let Some(id) = key.quad_id() else {
+                continue;
+            };
+            let host = spec.host_for(id);
+            if denied_hosts.contains(host) {
+                deferred_http.push(key);
+                continue;
+            }
+            match host_limiters.try_acquire_permit(host, now) {
+                Ok(permit) => {
+                    let (generation, cancel) = self.in_flight.register(key, shutdown);
+                    tasks.push(PlannedHttpTask {
+                        key,
+                        id,
+                        generation,
+                        spec: Arc::clone(spec),
+                        host: host.to_owned(),
+                        cancel,
+                        permit,
+                    });
+                }
+                Err(denied) => {
+                    if let PermitDenied::Cooldown(until) = denied {
+                        *earliest_wakeup = min_instant(*earliest_wakeup, until);
+                    }
+                    deferred_http.push(key);
+                    denied_hosts.insert(host);
+                    if denied_hosts.len() >= total_hosts {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.push_deferred_http(deferred_http);
+        tasks
+    }
+
+    /// Prune expired backoffs and plan the next disk + HTTP dispatch batch
+    /// while preserving `state -> host_limiters` lock order.
+    pub(super) fn plan_dispatch(
+        &mut self,
+        has_disk_cache: bool,
+        max_concurrent_disk: usize,
+        host_limiters: &HostLimiters,
+        shutdown: &CancelToken,
+        now: Instant,
+    ) -> PlannedDispatch {
+        self.prune_expired_backoffs(now);
+
+        let mut earliest_wakeup: Option<Instant> = None;
+        let (disk_tasks, http_tasks) = if let Some(spec) = self.active_spec.clone() {
+            let disk_tasks =
+                self.plan_disk_tasks(&spec, has_disk_cache, max_concurrent_disk, shutdown);
+            let http_tasks =
+                self.plan_http_tasks(&spec, host_limiters, shutdown, now, &mut earliest_wakeup);
+            (disk_tasks, http_tasks)
+        } else {
+            self.clear_pending_queues();
+            (Vec::new(), Vec::new())
+        };
+
+        if let Some(backoff_at) = self.earliest_wanted_backoff(now) {
+            earliest_wakeup = min_instant(earliest_wakeup, backoff_at);
+        }
+
+        PlannedDispatch {
+            disk_tasks,
+            http_tasks,
+            earliest_wakeup,
+        }
     }
 
     pub(super) fn remove_in_flight_if_gen(&mut self, key: &TileKey, generation: u64) -> bool {
@@ -383,13 +498,13 @@ impl PipelineState {
             return Transition::Stale;
         }
         if can_requeue && !self.failures.is_suppressed(&key) {
-            self.pending_http.insert_unique(key);
+            self.pending.http.insert_unique(key);
         }
         Transition::APPLIED_SILENT
     }
 
     pub(super) fn release_disk_slot(&mut self) {
-        self.in_flight.disk_in_flight = self.in_flight.disk_in_flight.saturating_sub(1);
+        self.in_flight.release_disk_slot();
     }
 
     pub(super) fn mark_completed(
@@ -403,11 +518,11 @@ impl PipelineState {
         }
         self.last_wanted.remove(&key);
         if from_disk {
-            self.completed_from_disk = self.completed_from_disk.saturating_add(1);
+            self.counters.completed_from_disk = self.counters.completed_from_disk.saturating_add(1);
         } else {
-            self.completed_from_net = self.completed_from_net.saturating_add(1);
-            self.offline = false;
-            self.last_error = None;
+            self.counters.completed_from_net = self.counters.completed_from_net.saturating_add(1);
+            self.counters.offline = false;
+            self.counters.last_error = None;
         }
         Transition::APPLIED_SILENT
     }
@@ -419,7 +534,7 @@ impl PipelineState {
         self.last_wanted.remove(&key);
         self.failures
             .insert_failure(key, FailureMarker::Empty, &self.last_wanted);
-        self.offline = false;
+        self.counters.offline = false;
         Transition::APPLIED_WAKEUP
     }
 
@@ -434,10 +549,7 @@ impl PipelineState {
         }
         self.failures
             .insert_failure(key, FailureMarker::Terminal, &self.last_wanted);
-        self.failed_count = self.failed_count.saturating_add(1);
-        if let Some(msg) = error_msg {
-            self.last_error = Some(msg);
-        }
+        self.counters.record_failure(false, error_msg);
         Transition::APPLIED_WAKEUP
     }
 
@@ -459,13 +571,7 @@ impl PipelineState {
                 retry_disk: false,
             },
         );
-        self.failed_count = self.failed_count.saturating_add(1);
-        if offline {
-            self.offline = true;
-        }
-        if let Some(msg) = error_msg {
-            self.last_error = Some(msg);
-        }
+        self.counters.record_failure(offline, error_msg);
         Transition::APPLIED_WAKEUP
     }
 
@@ -495,14 +601,15 @@ impl PipelineState {
         Transition::APPLIED_SILENT
     }
 
-    pub(super) fn insert_failure(&mut self, key: TileKey, marker: FailureMarker) {
+    #[cfg(test)]
+    fn insert_failure(&mut self, key: TileKey, marker: FailureMarker) {
         self.failures.insert_failure(key, marker, &self.last_wanted);
     }
 
     /// Prune all expired backoff entries (`until <= now`) and re-enqueue any
-    /// that are still wanted or pinned active-source roots into `pending_disk`
-    /// or `pending_http`.
-    pub(super) fn prune_expired_backoffs(&mut self, now: Instant) {
+    /// that are still wanted or pinned active-source roots into `pending.disk`
+    /// or `pending.http`.
+    fn prune_expired_backoffs(&mut self, now: Instant) {
         let Some(spec) = self.active_spec.as_ref() else {
             self.failures.clear_backoffs();
             return;
@@ -515,7 +622,7 @@ impl PipelineState {
     /// Earliest backoff timestamp among currently wanted tiles and pinned
     /// active-source roots (used by `dispatcher_loop` to self-wake for idle
     /// retries without busy-spinning).
-    pub(super) fn earliest_wanted_backoff(&self, now: Instant) -> Option<Instant> {
+    fn earliest_wanted_backoff(&self, now: Instant) -> Option<Instant> {
         let active_source = self.active_spec.as_ref()?.source_id();
         self.failures
             .earliest_wanted_backoff(now, active_source, &self.last_wanted)

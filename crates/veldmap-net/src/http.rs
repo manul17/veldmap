@@ -88,6 +88,18 @@ impl HostLimiters {
         }
     }
 
+    fn with_entry<R>(&self, host: &str, f: impl FnOnce(&mut HostEntry) -> R) -> R {
+        let mut map = lock_unpoisoned(&self.map);
+        if let Some(existing) = map.get_mut(host) {
+            return f(existing);
+        }
+        let entry = map.entry(host.to_owned()).or_insert_with(|| HostEntry {
+            semaphore: Arc::new(Semaphore::new(self.max_per_host)),
+            cooldown_until: None,
+        });
+        f(entry)
+    }
+
     /// Atomically check host cooldown and attempt to acquire a per-host HTTP
     /// permit under a single lock, avoiding string allocation on existing host
     /// hits.
@@ -96,38 +108,24 @@ impl HostLimiters {
         host: &str,
         now: Instant,
     ) -> Result<OwnedSemaphorePermit, PermitDenied> {
-        let mut map = lock_unpoisoned(&self.map);
-        let entry = if let Some(existing) = map.get(host) {
-            existing
-        } else {
-            map.entry(host.to_owned()).or_insert_with(|| HostEntry {
-                semaphore: Arc::new(Semaphore::new(self.max_per_host)),
-                cooldown_until: None,
-            })
-        };
-        if let Some(until) = entry.cooldown_until.filter(|&u| u > now) {
-            return Err(PermitDenied::Cooldown(until));
-        }
-        Arc::clone(&entry.semaphore)
-            .try_acquire_owned()
-            .map_err(|_| PermitDenied::Saturated)
+        self.with_entry(host, |entry| {
+            if let Some(until) = entry.cooldown_until.filter(|&u| u > now) {
+                return Err(PermitDenied::Cooldown(until));
+            }
+            Arc::clone(&entry.semaphore)
+                .try_acquire_owned()
+                .map_err(|_| PermitDenied::Saturated)
+        })
     }
 
     /// Record or extend a per-host cooldown window (e.g. on HTTP `429`/`503`),
     /// avoiding string allocation when `host` is already tracked.
     pub(crate) fn record_cooldown(&self, host: &str, until: Instant) {
-        let mut map = lock_unpoisoned(&self.map);
-        let entry = if let Some(existing) = map.get_mut(host) {
-            existing
-        } else {
-            map.entry(host.to_owned()).or_insert_with(|| HostEntry {
-                semaphore: Arc::new(Semaphore::new(self.max_per_host)),
-                cooldown_until: None,
-            })
-        };
-        entry.cooldown_until = Some(match entry.cooldown_until {
-            Some(existing) if existing > until => existing,
-            _ => until,
+        self.with_entry(host, |entry| {
+            entry.cooldown_until = Some(match entry.cooldown_until {
+                Some(existing) if existing > until => existing,
+                _ => until,
+            });
         });
     }
 
@@ -156,11 +154,18 @@ pub(crate) enum FetchOutcome {
     Empty204,
 }
 
+/// Classification of a transient HTTP/network error so impossible combinations
+/// (such as non-rate-limited errors carrying `Retry-After`) are unrepresentable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransientKind {
+    Network { offline: bool },
+    ServerError,
+    RateLimited { retry_after: Option<Duration> },
+}
+
 pub(crate) struct TransientFetchError {
     pub msg: String,
-    pub offline: bool,
-    pub rate_limited: bool,
-    pub retry_after: Option<Duration>,
+    pub kind: TransientKind,
 }
 
 pub(crate) enum FetchFailure {
@@ -168,20 +173,21 @@ pub(crate) enum FetchFailure {
     Transient(TransientFetchError),
 }
 
+fn map_reqwest_err(err: reqwest::Error) -> FetchFailure {
+    FetchFailure::Transient(TransientFetchError {
+        msg: err.to_string(),
+        kind: TransientKind::Network {
+            offline: err.is_connect() || err.is_timeout(),
+        },
+    })
+}
+
 pub(crate) async fn download_capped(
     client: &reqwest::Client,
     url: &str,
     max_bytes: usize,
 ) -> Result<FetchOutcome, FetchFailure> {
-    let mut resp = client.get(url).send().await.map_err(|err| {
-        let offline = err.is_connect() || err.is_timeout();
-        FetchFailure::Transient(TransientFetchError {
-            msg: err.to_string(),
-            offline,
-            rate_limited: false,
-            retry_after: None,
-        })
-    })?;
+    let mut resp = client.get(url).send().await.map_err(map_reqwest_err)?;
 
     let status = resp.status();
     if status.as_u16() == 204 {
@@ -193,22 +199,18 @@ pub(crate) async fn download_capped(
         if matches!(code, 400 | 401 | 403 | 404 | 410 | 451) {
             return Err(FetchFailure::Terminal(msg));
         }
-        let rate_limited = matches!(code, 429 | 503);
-        let retry_after = if rate_limited {
+        let kind = if matches!(code, 429 | 503) {
             let hdr = resp
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok());
-            parse_retry_after_seconds(hdr)
+            TransientKind::RateLimited {
+                retry_after: parse_retry_after_seconds(hdr),
+            }
         } else {
-            None
+            TransientKind::ServerError
         };
-        return Err(FetchFailure::Transient(TransientFetchError {
-            msg,
-            offline: false,
-            rate_limited,
-            retry_after,
-        }));
+        return Err(FetchFailure::Transient(TransientFetchError { msg, kind }));
     }
 
     if let Some(len) = resp.content_length()
@@ -223,14 +225,7 @@ pub(crate) async fn download_capped(
         (n as usize).min(max_bytes).min(MAX_INITIAL_CAPACITY_BYTES)
     });
     let mut buf = Vec::with_capacity(initial_cap);
-    while let Some(chunk) = resp.chunk().await.map_err(|err| {
-        FetchFailure::Transient(TransientFetchError {
-            msg: err.to_string(),
-            offline: err.is_connect() || err.is_timeout(),
-            rate_limited: false,
-            retry_after: None,
-        })
-    })? {
+    while let Some(chunk) = resp.chunk().await.map_err(map_reqwest_err)? {
         if buf.len().saturating_add(chunk.len()) > max_bytes {
             return Err(FetchFailure::Terminal(format!(
                 "tile payload exceeded limit {max_bytes} B"

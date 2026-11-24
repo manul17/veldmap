@@ -76,16 +76,19 @@ impl TileDecodeExecutor for RasterDecodeExecutor {
             cancel: req.cancel,
             work: Box::new(move || match decode_map_tile_with_mipmaps(&bytes) {
                 Ok(tile) => {
-                    if cancel.is_cancelled() || shutdown.is_cancelled() {
+                    if shutdown.is_cancelled() {
                         on_decoded.complete(Err(DecodeFailure::Aborted));
                         return;
                     }
-                    if done_tx.send((key, tile)).is_err() {
-                        on_decoded.complete(Err(DecodeFailure::Aborted));
-                        return;
+                    match done_tx.send_if_uncancelled((key, tile), &cancel) {
+                        Ok(true) => {
+                            on_decoded.complete(Ok(()));
+                            (wakeup)();
+                        }
+                        Ok(false) | Err(_) => {
+                            on_decoded.complete(Err(DecodeFailure::Aborted));
+                        }
                     }
-                    on_decoded.complete(Ok(()));
-                    (wakeup)();
                 }
                 Err(err) => {
                     tracing::debug!(

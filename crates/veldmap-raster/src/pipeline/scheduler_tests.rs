@@ -61,8 +61,8 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
     let src_a = SourceId::new(10);
     let src_b = SourceId::new(11);
     let meta_a = sample_meta(src_a, 2, 4);
+    let meta_b = sample_meta(src_b, 2, 4);
     let pass_a = meta_a.pass_key();
-    let pass_b = PassKey::new(src_b, BandKey::Display, PixelFormat::Rgba8UnormSrgb, 0);
 
     let k0 = meta_a.tile_key(0, 0, 0);
     let k1 = meta_a.tile_key(0, 1, 0);
@@ -93,20 +93,31 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
     );
     assert!(!sched.is_in_flight(&pass_tile));
 
-    // Only 1 active Serve::Pass per PassKey.
-    let cancel1 = CancelToken::new();
-    let pid1 = sched
-        .begin_pass(pass_a, 3, Some(3), cancel1.clone(), vec![pass_tile])
+    // Only 1 active ServeMode::Pass per PassKey.
+    let p1 = sched
+        .admit_pass(&meta_a, 3, &[pass_tile], |_| false, &root_cancel)
         .expect("first pass succeeds");
     assert!(
         sched
-            .begin_pass(pass_a, 2, Some(2), CancelToken::new(), vec![])
-            .is_err()
+            .admit_pass(
+                &meta_a,
+                2,
+                &[meta_a.tile_key(2, 0, 0)],
+                |_| false,
+                &root_cancel
+            )
+            .is_none()
     );
-    let pid_b = sched
-        .begin_pass(pass_b, 2, Some(2), CancelToken::new(), vec![])
+    let p_b = sched
+        .admit_pass(
+            &meta_b,
+            2,
+            &[meta_b.tile_key(2, 0, 0)],
+            |_| false,
+            &root_cancel,
+        )
         .expect("independent source pass succeeds");
-    assert_ne!(pid1, pid_b);
+    assert_ne!(p1.pass_id, p_b.pass_id);
 
     // Reconciling pointwise tiles must cancel unwanted pointwise jobs without
     // touching the active pass's flight entries.
@@ -123,43 +134,44 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
 
     // Zooming IN (target=1 < active_pass_level=3) does NOT cancel coarser pass.
     assert!(sched.update_target(pass_a, 1, None).is_none());
-    assert!(!cancel1.is_cancelled());
+    assert!(!p1.cancel.is_cancelled());
     assert!(sched.has_active_pass(pass_a));
     assert!(sched.has_any_active_pass(src_a));
 
     // Zooming OUT cancels finer pass.
-    assert!(sched.finish_pass(pass_a, pid1, true));
-    let cancel2 = CancelToken::new();
-    let _pid2 = sched
-        .begin_pass(
-            pass_a,
+    assert!(sched.finish_pass(pass_a, p1.pass_id, true));
+    let p2 = sched
+        .admit_pass(
+            &meta_a,
             2,
-            Some(2),
-            cancel2.clone(),
-            vec![meta_a.tile_key(2, 0, 0)],
+            &[meta_a.tile_key(2, 0, 0)],
+            |_| false,
+            &root_cancel,
         )
         .expect("new pass after finish");
     if let Some(tok) = sched.update_target(pass_a, 3, Some(3)) {
         tok.cancel();
     }
-    assert!(cancel2.is_cancelled());
+    assert!(p2.cancel.is_cancelled());
     assert!(!sched.has_active_pass(pass_a));
     assert!(!sched.has_any_active_pass(src_a));
 
     // Shared `Pass { from: 0 }` cascade is NOT cancelled when zooming out within same pass.
-    let cancel3 = CancelToken::new();
-    let pid3 = sched
-        .begin_pass(
-            pass_a,
+    let mut shared_meta = meta_a.clone();
+    shared_meta.levels[2].serve = ServeMode::Pass { from: 0 };
+    shared_meta.levels[3].serve = ServeMode::Pass { from: 0 };
+    let p3 = sched
+        .admit_pass(
+            &shared_meta,
             2,
-            Some(0),
-            cancel3.clone(),
-            vec![meta_a.tile_key(2, 0, 0)],
+            &[shared_meta.tile_key(2, 0, 0)],
+            |_| false,
+            &root_cancel,
         )
         .expect("shared cascade pass");
     assert!(sched.update_target(pass_a, 3, Some(0)).is_none());
-    assert!(!cancel3.is_cancelled());
-    assert!(sched.finish_pass(pass_a, pid3, true));
+    assert!(!p3.cancel.is_cancelled());
+    assert!(sched.finish_pass(pass_a, p3.pass_id, true));
 }
 
 #[test]
@@ -184,47 +196,31 @@ fn multi_band_streams_under_same_source_schedule_and_forgive_independently() {
     let adm_scl = sched.admit_pointwise(&scl, 0, &[k_b04, k_scl], |_| false, &root_cancel);
     assert_eq!(keys(&adm_scl), vec![k_scl]);
 
-    let c_b04 = CancelToken::new();
-    let c_scl = CancelToken::new();
     let p_b04 = b04.tile_key(1, 0, 0);
     let p_scl = scl.tile_key(1, 0, 0);
-    let pid_b04 = sched
-        .begin_pass(b04.pass_key(), 1, Some(1), c_b04.clone(), vec![p_b04])
+    let pass_b04 = sched
+        .admit_pass(&b04, 1, &[p_b04], |_| false, &root_cancel)
         .expect("B04 pass starts");
-    let pid_scl = sched
-        .begin_pass(scl.pass_key(), 1, Some(1), c_scl.clone(), vec![p_scl])
+    let pass_scl = sched
+        .admit_pass(&scl, 1, &[p_scl], |_| false, &root_cancel)
         .expect("SCL pass starts concurrently");
 
-    sched.finish_pass(b04.pass_key(), pid_b04, false);
-    sched.finish_pass(scl.pass_key(), pid_scl, true);
+    sched.finish_pass(b04.pass_key(), pass_b04.pass_id, false);
+    sched.finish_pass(scl.pass_key(), pass_scl.pass_id, true);
     assert!(sched.is_terminal_failed(&p_b04));
 
-    let c_b04_2 = CancelToken::new();
-    let c_scl_2 = CancelToken::new();
-    sched
-        .begin_pass(
-            b04.pass_key(),
-            2,
-            Some(2),
-            c_b04_2.clone(),
-            vec![b04.tile_key(2, 0, 0)],
-        )
+    let pass_b04_2 = sched
+        .admit_pass(&b04, 2, &[b04.tile_key(2, 0, 0)], |_| false, &root_cancel)
         .expect("restart B04");
-    sched
-        .begin_pass(
-            scl.pass_key(),
-            2,
-            Some(2),
-            c_scl_2.clone(),
-            vec![scl.tile_key(2, 0, 0)],
-        )
+    let pass_scl_2 = sched
+        .admit_pass(&scl, 2, &[scl.tile_key(2, 0, 0)], |_| false, &root_cancel)
         .expect("restart SCL");
     let tokens = sched.reset_source(src);
     for t in &tokens {
         t.cancel();
     }
-    assert!(c_b04_2.is_cancelled());
-    assert!(c_scl_2.is_cancelled());
+    assert!(pass_b04_2.cancel.is_cancelled());
+    assert!(pass_scl_2.cancel.is_cancelled());
     assert!(adm_b04[0].cancel.is_cancelled());
     assert!(adm_scl[0].cancel.is_cancelled());
     assert!(!sched.has_any_active_pass(src));
@@ -236,7 +232,7 @@ fn multi_band_streams_under_same_source_schedule_and_forgive_independently() {
 fn terminal_failures_versioned_job_ids_and_non_penalizing_cancellations() {
     let mut sched = TileScheduler::new();
     let root_cancel = CancelToken::new();
-    let meta = sample_meta(SourceId::new(22), 2, 3);
+    let meta = sample_meta(SourceId::new(22), 1, 3);
     let pass_key = meta.pass_key();
     let k_term = meta.tile_key(0, 0, 0);
     let k_retry = meta.tile_key(0, 1, 0);
@@ -276,30 +272,28 @@ fn terminal_failures_versioned_job_ids_and_non_penalizing_cancellations() {
 
     // Healthy pass forgives single pass failure once; second pass failure escalates.
     let k_pass = meta.tile_key(1, 0, 0);
-    let pid_fail = sched
-        .begin_pass(pass_key, 1, None, CancelToken::new(), vec![k_pass])
-        .expect("begin failing pass");
-    assert!(sched.finish_pass(pass_key, pid_fail, false));
+    let p_fail = sched
+        .admit_pass(&meta, 1, &[k_pass], |_| false, &root_cancel)
+        .expect("admit failing pass");
+    assert!(sched.finish_pass(pass_key, p_fail.pass_id, false));
     assert!(sched.is_terminal_failed(&k_pass));
-    let pid_heal = sched
-        .begin_pass(
-            pass_key,
-            2,
-            Some(2),
-            CancelToken::new(),
-            vec![meta.tile_key(2, 0, 0)],
-        )
-        .expect("begin healing pass");
-    assert!(sched.finish_pass(pass_key, pid_heal, true));
+    let p_heal = sched
+        .admit_pass(&meta, 2, &[meta.tile_key(2, 0, 0)], |_| false, &root_cancel)
+        .expect("admit healing pass");
+    assert!(sched.finish_pass(pass_key, p_heal.pass_id, true));
     assert!(!sched.is_terminal_failed(&k_pass));
 
-    let k_pass_adm = sched.admit_pointwise(&meta, 1, &[k_pass], |_| false, &root_cancel);
-    assert_eq!(keys(&k_pass_adm), vec![k_pass]);
-    assert_eq!(
-        sched.on_pointwise_failed(&k_pass, k_pass_adm[0].job_id, false),
-        Some(TileFailureOutcome::TerminalFailed)
-    );
+    // Forgiven tile is demoted to `RetriedOnce`, so a second failure becomes permanent.
+    let p_fail2 = sched
+        .admit_pass(&meta, 1, &[k_pass], |_| false, &root_cancel)
+        .expect("admit second pass on forgiven tile");
+    assert!(sched.finish_pass(pass_key, p_fail2.pass_id, false));
     assert!(sched.is_terminal_failed(&k_pass));
+    assert!(
+        sched
+            .admit_pass(&meta, 1, &[k_pass], |_| false, &root_cancel)
+            .is_none()
+    );
 
     // Repeated cancellations/evictions clear in-flight without promoting to Permanent.
     let k_cancel = meta.tile_key(0, 2, 0);
@@ -317,14 +311,13 @@ fn terminal_failures_versioned_job_ids_and_non_penalizing_cancellations() {
     // does not penalize tiles.
     let k_abort = meta.tile_key(2, 0, 0);
     for _ in 0..5 {
-        let p_cancel = CancelToken::new();
-        let pid = sched
-            .begin_pass(pass_key, 2, Some(2), p_cancel.clone(), vec![k_abort])
-            .expect("begin aborted pass");
-        assert!(sched.abort_pass(pass_key, pid + 1).is_none());
-        let tok = sched.abort_pass(pass_key, pid).expect("matched pass");
+        let p = sched
+            .admit_pass(&meta, 2, &[k_abort], |_| false, &root_cancel)
+            .expect("admit aborted pass");
+        assert!(sched.abort_pass(pass_key, p.pass_id + 1).is_none());
+        let tok = sched.abort_pass(pass_key, p.pass_id).expect("matched pass");
         tok.cancel();
-        assert!(p_cancel.is_cancelled());
+        assert!(p.cancel.is_cancelled());
         assert!(!sched.has_active_pass(pass_key));
         assert!(!sched.is_in_flight(&k_abort));
         assert!(!sched.is_terminal_failed(&k_abort));
@@ -361,41 +354,32 @@ fn ladder_unfitting_levels_and_pass_only_recovery_respect_budget_fits() {
     );
     assert!(
         sched
-            .check_pass_candidates(&unfitting, 4, &[unfitting.tile_key(4, 0, 0)], |_| false)
-            .is_empty()
+            .admit_pass(
+                &unfitting,
+                4,
+                &[unfitting.tile_key(4, 0, 0)],
+                |_| false,
+                &root_cancel
+            )
+            .is_none()
     );
 
     // Pass-only source: first pass failure stays retryable by a recovery pass.
     let pass_only = sample_meta(SourceId::new(34), 0, 3);
     let k_apex = pass_only.tile_key(2, 0, 0);
-    let pid1 = sched
-        .begin_pass(
-            pass_only.pass_key(),
-            2,
-            Some(2),
-            CancelToken::new(),
-            vec![k_apex],
-        )
-        .expect("begin first pass");
-    sched.finish_pass(pass_only.pass_key(), pid1, false);
+    let p1 = sched
+        .admit_pass(&pass_only, 2, &[k_apex], |_| false, &root_cancel)
+        .expect("admit first pass");
+    sched.finish_pass(pass_only.pass_key(), p1.pass_id, false);
     assert!(sched.is_terminal_failed(&k_apex));
-    assert_eq!(
-        sched.check_pass_candidates(&pass_only, 2, &[k_apex], |_| false),
-        vec![k_apex]
-    );
-    let pid2 = sched
-        .begin_pass(
-            pass_only.pass_key(),
-            2,
-            Some(2),
-            CancelToken::new(),
-            vec![k_apex],
-        )
-        .expect("begin second pass");
-    sched.finish_pass(pass_only.pass_key(), pid2, false);
+    let p2 = sched
+        .admit_pass(&pass_only, 2, &[k_apex], |_| false, &root_cancel)
+        .expect("admit recovery pass");
+    assert_eq!(p2.tiles, vec![k_apex]);
+    sched.finish_pass(pass_only.pass_key(), p2.pass_id, false);
     assert!(
         sched
-            .check_pass_candidates(&pass_only, 2, &[k_apex], |_| false)
-            .is_empty()
+            .admit_pass(&pass_only, 2, &[k_apex], |_| false, &root_cancel)
+            .is_none()
     );
 }

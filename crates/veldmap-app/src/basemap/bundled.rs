@@ -169,10 +169,10 @@ impl BundledBasemapProvider {
                 }
                 match map.render_tile_with_mipmaps(quad_id) {
                     Ok(tile) => {
-                        if work_cancel.is_cancelled() {
-                            return;
-                        }
-                        if done_tx.send((key, tile)).is_ok() {
+                        if matches!(
+                            done_tx.send_if_uncancelled((key, tile), &work_cancel),
+                            Ok(true)
+                        ) {
                             (wakeup)();
                         }
                     }

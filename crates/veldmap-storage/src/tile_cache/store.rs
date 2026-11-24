@@ -1,38 +1,30 @@
 //! File-backed SQLite WAL [`TileDiskCache`] store, concurrent WAL reader pool,
 //! and debounced LRU touch flushing.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Mutex, TryLockError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{Connection, TransactionBehavior};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
 use crate::StorageError;
 
-use super::evict::{evict_in_tx, reclaim_space};
+use super::evict::{EvictionOutcome, evict_in_tx, reclaim_space};
 use super::key::{DiskTileKey, EncodedKey, TileBlobEncoding, valid_source_key};
 use super::queries::{
     clear_all_in_tx, clear_source_in_tx, delete_entry_in_tx, delete_tile_in_tx,
     flush_touches_in_tx, read_cache_meta_totals, select_tile_blob, set_cache_meta_totals,
-    upsert_tile_in_tx, upsert_tile_raw_in_tx,
+    upsert_tile_raw_in_tx,
 };
+use super::readers::ReaderPool;
 use super::schema::{
-    is_corrupt_sqlite_error, open_and_init_file_db, open_read_only_connection, recreate_file_db,
-    sidecar_path,
+    is_corrupt_sqlite_error, open_and_init_file_db, recreate_file_db, sidecar_path,
 };
+use super::touches::{MonotonicClock, TouchBuffer};
 
 /// Maximum encoded payload size admitted for a single cached tile (`16 MiB`).
 pub const MAX_CACHED_TILE_BYTES: usize = 16 * 1024 * 1024;
-
-/// Number of buffered `get()` LRU hits before attempting a best-effort batched
-/// flush (avoids a WAL write transaction on every cache read).
-const TOUCH_FLUSH_THRESHOLD: usize = 64;
-
-/// Maximum pooled read-only WAL connections retained for concurrent lookups.
-const MAX_READ_POOL_CONNS: usize = 4;
 
 /// Summary returned by [`TileDiskCache::put`] and [`TileDiskCache::set_max_bytes`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,6 +32,16 @@ pub struct EvictionReport {
     pub evicted_tiles: usize,
     pub evicted_bytes: u64,
     pub total_bytes_after: u64,
+}
+
+impl EvictionReport {
+    pub(super) const fn unchanged(total_bytes_after: u64) -> Self {
+        Self {
+            evicted_tiles: 0,
+            evicted_bytes: 0,
+            total_bytes_after,
+        }
+    }
 }
 
 /// Observable disk cache utilization metrics.
@@ -63,63 +65,14 @@ pub struct DiskTileEntry {
     read_ts: i64,
 }
 
-fn flush_touches_best_effort(conn: &mut Connection, touches: &HashMap<i64, i64>) {
-    if touches.is_empty() {
-        return;
-    }
-    if let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-        && flush_touches_in_tx(&tx, touches).is_ok()
-    {
-        let _ = tx.commit();
-    }
+struct ValidatedPut<'a> {
+    key: &'a DiskTileKey,
+    enc: EncodedKey<'a>,
+    encoding: TileBlobEncoding,
+    payload: &'a [u8],
 }
 
-struct ReaderPool {
-    db_path: PathBuf,
-    conns: Mutex<Vec<Connection>>,
-}
-
-impl ReaderPool {
-    fn new(db_path: PathBuf) -> Self {
-        Self {
-            db_path,
-            conns: Mutex::new(Vec::with_capacity(MAX_READ_POOL_CONNS)),
-        }
-    }
-
-    fn clear(&self) {
-        lock_unpoisoned(&self.conns).clear();
-    }
-
-    fn with_reader<T>(
-        &self,
-        f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
-    ) -> Result<T, StorageError> {
-        let conn = {
-            let mut guard = lock_unpoisoned(&self.conns);
-            guard.pop()
-        };
-        let conn = match conn {
-            Some(c) => c,
-            None => open_read_only_connection(&self.db_path)?,
-        };
-        let result = f(&conn);
-        if result.is_ok() {
-            let mut guard = lock_unpoisoned(&self.conns);
-            if guard.len() < MAX_READ_POOL_CONNS {
-                guard.push(conn);
-            }
-        }
-        Ok(result?)
-    }
-}
-
-fn skipped_put_report(
-    key: &DiskTileKey,
-    new_bytes: u64,
-    max_bytes: u64,
-    total_bytes_after: u64,
-) -> EvictionReport {
+fn log_skipped_put(key: &DiskTileKey, new_bytes: u64, max_bytes: u64) {
     tracing::debug!(
         source_key = %key.source_key,
         level = key.level,
@@ -129,11 +82,32 @@ fn skipped_put_report(
         max_bytes,
         "Skipping disk cache put outside size bounds"
     );
-    EvictionReport {
-        evicted_tiles: 0,
-        evicted_bytes: 0,
-        total_bytes_after,
+}
+
+fn validate_put_batch<'a>(
+    entries: &'a [(&'a DiskTileKey, TileBlobEncoding, &'a [u8])],
+    max_bytes: u64,
+) -> Result<Vec<ValidatedPut<'a>>, StorageError> {
+    let mut valid = Vec::with_capacity(entries.len());
+    for &(key, encoding, payload) in entries {
+        let enc = EncodedKey::from_key(key)?;
+        let new_bytes = payload.len() as u64;
+        if payload.is_empty()
+            || payload.len() > MAX_CACHED_TILE_BYTES
+            || max_bytes == 0
+            || new_bytes > max_bytes
+        {
+            log_skipped_put(key, new_bytes, max_bytes);
+            continue;
+        }
+        valid.push(ValidatedPut {
+            key,
+            enc,
+            encoding,
+            payload,
+        });
     }
+    Ok(valid)
 }
 
 /// Thread-safe, crash-safe SQLite WAL tile disk cache bounded by `max_bytes`.
@@ -141,32 +115,39 @@ fn skipped_put_report(
 /// Uses a serialized writer connection paired with a small pool of
 /// `SQLITE_OPEN_READ_ONLY` WAL connections so concurrent `get()` and `stats()`
 /// calls never stall behind background evictions or vacuums.
+///
+/// # Lock ordering
+///
+/// - `writer -> pending_touches` (inside `TouchBuffer`): whenever both locks
+///   are held at the same time, `writer` is always acquired first. Touch
+///   recording acquires `pending_touches` briefly as a standalone leaf lock and
+///   releases it before calling `writer.try_lock()`.
+/// - `reader_pool` is an independent leaf lock never acquired while holding
+///   `writer` or `pending_touches` (and never acquiring them while held).
 pub struct TileDiskCache {
     writer: Mutex<Connection>,
     reader_pool: ReaderPool,
-    db_path: PathBuf,
     max_bytes: AtomicU64,
-    last_ts_ms: AtomicI64,
+    clock: MonotonicClock,
     write_generation: AtomicU64,
-    pending_touches: Mutex<HashMap<i64, i64>>,
+    touches: TouchBuffer,
 }
 
 impl Drop for TileDiskCache {
     fn drop(&mut self) {
         self.reader_pool.clear();
-        let touches = self.take_pending_touches();
-        if touches.is_empty() {
+        if self.touches.is_empty() {
             return;
         }
         let mut conn = lock_unpoisoned(&self.writer);
-        flush_touches_best_effort(&mut conn, &touches);
+        self.touches.flush_pending_best_effort(&mut conn);
     }
 }
 
 impl std::fmt::Debug for TileDiskCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TileDiskCache")
-            .field("db_path", &self.db_path)
+            .field("db_path", &self.reader_pool.db_path())
             .field("max_bytes", &self.max_bytes.load(Ordering::Acquire))
             .finish()
     }
@@ -182,7 +163,7 @@ impl TileDiskCache {
             std::fs::create_dir_all(parent)?;
         }
 
-        let (conn, max_ts) = match open_and_init_file_db(&path) {
+        let (mut conn, max_ts) = match open_and_init_file_db(&path) {
             Ok(pair) => pair,
             Err(err) if is_corrupt_sqlite_error(&err) => {
                 tracing::warn!(
@@ -192,23 +173,32 @@ impl TileDiskCache {
                 );
                 recreate_file_db(&path)?
             }
-            Err(err) => return Err(StorageError::Sqlite(err)),
+            Err(err) => return Err(err.into()),
         };
 
         let (total_bytes, _) = read_cache_meta_totals(&conn)?;
-        let cache = Self {
-            writer: Mutex::new(conn),
-            reader_pool: ReaderPool::new(path.clone()),
-            db_path: path,
-            max_bytes: AtomicU64::new(max_bytes),
-            last_ts_ms: AtomicI64::new(max_ts),
-            write_generation: AtomicU64::new(0),
-            pending_touches: Mutex::new(HashMap::new()),
-        };
         if total_bytes > max_bytes {
-            let _ = cache.evict_if_needed()?;
+            let outcome = {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (current_bytes, current_count) = read_cache_meta_totals(&tx)?;
+                let outcome =
+                    evict_in_tx(&tx, current_bytes, current_count, max_bytes, None, None)?;
+                tx.commit()?;
+                outcome
+            };
+            if outcome.report.evicted_tiles > 0 {
+                reclaim_space(&conn, false);
+            }
         }
-        Ok(cache)
+
+        Ok(Self {
+            writer: Mutex::new(conn),
+            reader_pool: ReaderPool::new(path),
+            max_bytes: AtomicU64::new(max_bytes),
+            clock: MonotonicClock::new(max_ts),
+            write_generation: AtomicU64::new(0),
+            touches: TouchBuffer::new(),
+        })
     }
 
     /// Current configured disk cache byte budget (`0` means caching is disabled).
@@ -223,68 +213,12 @@ impl TileDiskCache {
         self.write_generation.load(Ordering::Acquire)
     }
 
-    fn next_monotonic_ts(&self) -> i64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis().min(i64::MAX as u128) as i64);
-        let mut prev = self.last_ts_ms.load(Ordering::Relaxed);
-        loop {
-            let next = if now > prev {
-                now
-            } else {
-                prev.saturating_add(1)
-            };
-            match self.last_ts_ms.compare_exchange_weak(
-                prev,
-                next,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return next,
-                Err(actual) => prev = actual,
-            }
-        }
-    }
-
-    fn record_touch_at(&self, tile_id: i64, ts: i64) {
-        let should_try_flush = {
-            let mut touches = lock_unpoisoned(&self.pending_touches);
-            touches
-                .entry(tile_id)
-                .and_modify(|prev| *prev = (*prev).max(ts))
-                .or_insert(ts);
-            touches.len() >= TOUCH_FLUSH_THRESHOLD
-        };
-        // Non-blocking opportunistic flush: if the writer is busy (e.g. vacuum
-        // or put), the writer will pick up `pending_touches` on its next pass
-        // so concurrent WAL readers never stall.
-        if should_try_flush {
-            let maybe_conn = match self.writer.try_lock() {
-                Ok(guard) => Some(guard),
-                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-                Err(TryLockError::WouldBlock) => None,
-            };
-            if let Some(mut conn) = maybe_conn {
-                let touches = self.take_pending_touches();
-                flush_touches_best_effort(&mut conn, &touches);
-            }
-        }
-    }
-
-    fn record_touch(&self, tile_id: i64) {
-        self.record_touch_at(tile_id, self.next_monotonic_ts());
-    }
-
-    fn take_pending_touches(&self) -> HashMap<i64, i64> {
-        std::mem::take(&mut *lock_unpoisoned(&self.pending_touches))
-    }
-
     fn with_write_tx<T>(
         &self,
         conn: &mut Connection,
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, rusqlite::Error>,
     ) -> Result<T, StorageError> {
-        let touches = self.take_pending_touches();
+        let touches = self.touches.take_all();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         flush_touches_in_tx(&tx, &touches)?;
         let out = f(&tx)?;
@@ -316,7 +250,7 @@ impl TileDiskCache {
         {
             return Ok(None);
         }
-        let read_ts = self.next_monotonic_ts();
+        let read_ts = self.clock.next_ms();
         Ok(Some((
             DiskTileEntry {
                 tile_id: row.tile_id,
@@ -330,7 +264,8 @@ impl TileDiskCache {
 
     /// Record a debounced LRU touch for a previously validated [`DiskTileEntry`].
     pub fn touch_entry(&self, entry: DiskTileEntry) {
-        self.record_touch_at(entry.tile_id, entry.read_ts);
+        self.touches
+            .record_and_maybe_flush(entry.tile_id, entry.read_ts, &self.writer);
     }
 
     /// Delete the exact row version represented by `entry` (matching both
@@ -342,7 +277,7 @@ impl TileDiskCache {
             delete_entry_in_tx(tx, entry.tile_id, entry.row_last_used_ms)
         })?;
         if deleted {
-            lock_unpoisoned(&self.pending_touches).remove(&entry.tile_id);
+            self.touches.prune(&[entry.tile_id]);
             self.write_generation.fetch_add(1, Ordering::AcqRel);
         }
         Ok(deleted)
@@ -357,7 +292,7 @@ impl TileDiskCache {
         else {
             return Ok(None);
         };
-        self.record_touch(entry.tile_id);
+        self.touch_entry(entry);
         Ok(Some(payload))
     }
 
@@ -370,7 +305,7 @@ impl TileDiskCache {
         let Some((entry, encoding, payload)) = self.get_encoded_entry(key, None)? else {
             return Ok(None);
         };
-        self.record_touch(entry.tile_id);
+        self.touch_entry(entry);
         Ok(Some((encoding, payload)))
     }
 
@@ -388,7 +323,7 @@ impl TileDiskCache {
         encoding: TileBlobEncoding,
         payload: &[u8],
     ) -> Result<EvictionReport, StorageError> {
-        self.put_encoded_inner(key, encoding, payload, None)
+        self.put_encoded_batch_inner(&[(key, encoding, payload)], None)
     }
 
     /// Insert or replace tile bytes only if `cancel` has not been triggered.
@@ -403,73 +338,7 @@ impl TileDiskCache {
         payload: &[u8],
         cancel: &CancelToken,
     ) -> Result<EvictionReport, StorageError> {
-        self.put_encoded_inner(key, encoding, payload, Some(cancel))
-    }
-
-    fn put_encoded_inner(
-        &self,
-        key: &DiskTileKey,
-        encoding: TileBlobEncoding,
-        payload: &[u8],
-        cancel: Option<&CancelToken>,
-    ) -> Result<EvictionReport, StorageError> {
-        if cancel.is_some_and(CancelToken::is_cancelled) {
-            return Ok(EvictionReport::default());
-        }
-        let enc = EncodedKey::from_key(key)?;
-        let pre_max_bytes = self.max_bytes.load(Ordering::Acquire);
-        let new_bytes = payload.len() as u64;
-        if payload.is_empty()
-            || payload.len() > MAX_CACHED_TILE_BYTES
-            || pre_max_bytes == 0
-            || new_bytes > pre_max_bytes
-        {
-            let (total_bytes_after, _) = self.reader_pool.with_reader(read_cache_meta_totals)?;
-            return Ok(skipped_put_report(
-                key,
-                new_bytes,
-                pre_max_bytes,
-                total_bytes_after,
-            ));
-        }
-
-        let mut conn = lock_unpoisoned(&self.writer);
-        if cancel.is_some_and(CancelToken::is_cancelled) {
-            return Ok(EvictionReport::default());
-        }
-        // Re-check under `self.writer` so a concurrent `set_max_bytes()` cannot
-        // lower the cap between the lock-free pre-check and transaction commit.
-        let max_bytes = self.max_bytes.load(Ordering::Acquire);
-        if max_bytes == 0 || new_bytes > max_bytes {
-            let (total_bytes_after, _) = read_cache_meta_totals(&conn)?;
-            return Ok(skipped_put_report(
-                key,
-                new_bytes,
-                max_bytes,
-                total_bytes_after,
-            ));
-        }
-
-        let ts_ms = self.next_monotonic_ts();
-        let outcome = self.with_write_tx(&mut conn, |tx| {
-            let (inserted_id, updated_total, updated_count) =
-                upsert_tile_in_tx(tx, &enc, encoding, payload, ts_ms)?;
-            evict_in_tx(
-                tx,
-                updated_total,
-                updated_count,
-                max_bytes,
-                Some(inserted_id),
-                None,
-            )
-        })?;
-        self.prune_pending_touches(&outcome.evicted_ids);
-
-        self.write_generation.fetch_add(1, Ordering::AcqRel);
-        if outcome.report.evicted_tiles > 0 {
-            reclaim_space(&conn, false);
-        }
-        Ok(outcome.report)
+        self.put_encoded_batch_inner(&[(key, encoding, payload)], Some(cancel))
     }
 
     /// Insert a batch of encoded tiles in a single SQLite `IMMEDIATE`
@@ -484,53 +353,65 @@ impl TileDiskCache {
         entries: &[(&DiskTileKey, TileBlobEncoding, &[u8])],
         cancel: &CancelToken,
     ) -> Result<EvictionReport, StorageError> {
-        if entries.is_empty() || cancel.is_cancelled() {
-            return Ok(EvictionReport::default());
-        }
-        let pre_max_bytes = self.max_bytes.load(Ordering::Acquire);
-        if pre_max_bytes == 0 {
+        self.put_encoded_batch_inner(entries, Some(cancel))
+    }
+
+    fn put_encoded_batch_inner(
+        &self,
+        entries: &[(&DiskTileKey, TileBlobEncoding, &[u8])],
+        cancel: Option<&CancelToken>,
+    ) -> Result<EvictionReport, StorageError> {
+        if entries.is_empty() || cancel.is_some_and(CancelToken::is_cancelled) {
             return Ok(EvictionReport::default());
         }
 
-        // Validate keys and filter oversized/empty payloads before locking `writer`.
-        let mut valid = Vec::with_capacity(entries.len());
-        for &(key, encoding, payload) in entries {
-            let enc = EncodedKey::from_key(key)?;
-            let sz = payload.len() as u64;
-            if !payload.is_empty() && payload.len() <= MAX_CACHED_TILE_BYTES && sz <= pre_max_bytes
-            {
-                valid.push((enc, encoding, payload));
-            }
-        }
+        // Validate keys and filter empty/oversized payloads before locking `writer`.
+        let pre_max_bytes = self.max_bytes.load(Ordering::Acquire);
+        let valid = validate_put_batch(entries, pre_max_bytes)?;
         if valid.is_empty() {
-            return Ok(EvictionReport::default());
+            let (total_bytes_after, _) = self.reader_pool.with_reader(read_cache_meta_totals)?;
+            return Ok(EvictionReport::unchanged(total_bytes_after));
         }
 
         let mut conn = lock_unpoisoned(&self.writer);
-        if cancel.is_cancelled() {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
             return Ok(EvictionReport::default());
         }
+        // Re-check under `self.writer` so a concurrent `set_max_bytes()` cannot
+        // lower the cap between the lock-free pre-check and transaction commit.
         let max_bytes = self.max_bytes.load(Ordering::Acquire);
+        self.commit_put_batch_locked(&mut conn, &valid, max_bytes, entries.len() > 1)
+    }
+
+    fn commit_put_batch_locked(
+        &self,
+        conn: &mut Connection,
+        valid: &[ValidatedPut<'_>],
+        max_bytes: u64,
+        is_multi_batch: bool,
+    ) -> Result<EvictionReport, StorageError> {
         if max_bytes == 0 {
-            return Ok(EvictionReport::default());
+            let (total_bytes_after, _) = read_cache_meta_totals(conn)?;
+            return Ok(EvictionReport::unchanged(total_bytes_after));
         }
 
-        let outcome = self.with_write_tx(&mut conn, |tx| {
+        let (outcome, wrote_any) = self.with_write_tx(conn, |tx| {
             let (mut total_bytes, mut tile_count) = read_cache_meta_totals(tx)?;
             let mut batch_start_ts: Option<i64> = None;
             let mut last_id: Option<i64> = None;
 
-            for (enc, encoding, payload) in &valid {
-                let new_bytes = payload.len() as u64;
+            for item in valid {
+                let new_bytes = item.payload.len() as u64;
                 if new_bytes > max_bytes {
+                    log_skipped_put(item.key, new_bytes, max_bytes);
                     continue;
                 }
-                let ts_ms = self.next_monotonic_ts();
-                if batch_start_ts.is_none() {
+                let ts_ms = self.clock.next_ms();
+                if is_multi_batch && batch_start_ts.is_none() {
                     batch_start_ts = Some(ts_ms);
                 }
                 let (inserted_id, old_bytes, count_delta) =
-                    upsert_tile_raw_in_tx(tx, enc, *encoding, payload, ts_ms)?;
+                    upsert_tile_raw_in_tx(tx, &item.enc, item.encoding, item.payload, ts_ms)?;
                 total_bytes = total_bytes
                     .saturating_sub(old_bytes)
                     .saturating_add(new_bytes);
@@ -539,43 +420,35 @@ impl TileDiskCache {
             }
 
             let Some(last_inserted) = last_id else {
-                return Ok(super::evict::EvictionOutcome {
-                    report: EvictionReport {
-                        evicted_tiles: 0,
-                        evicted_bytes: 0,
-                        total_bytes_after: total_bytes,
+                return Ok((
+                    EvictionOutcome {
+                        report: EvictionReport::unchanged(total_bytes),
+                        evicted_ids: Vec::new(),
                     },
-                    evicted_ids: Vec::new(),
-                });
+                    false,
+                ));
             };
 
             set_cache_meta_totals(tx, total_bytes, tile_count)?;
-            evict_in_tx(
+            let outcome = evict_in_tx(
                 tx,
                 total_bytes,
                 tile_count,
                 max_bytes,
                 Some(last_inserted),
                 batch_start_ts,
-            )
+            )?;
+            Ok((outcome, true))
         })?;
-        self.prune_pending_touches(&outcome.evicted_ids);
+        self.touches.prune(&outcome.evicted_ids);
 
-        self.write_generation.fetch_add(1, Ordering::AcqRel);
-        if outcome.report.evicted_tiles > 0 {
-            reclaim_space(&conn, false);
+        if wrote_any {
+            self.write_generation.fetch_add(1, Ordering::AcqRel);
+            if outcome.report.evicted_tiles > 0 {
+                reclaim_space(conn, false);
+            }
         }
         Ok(outcome.report)
-    }
-
-    fn prune_pending_touches(&self, tile_ids: &[i64]) {
-        if tile_ids.is_empty() {
-            return;
-        }
-        let mut touches = lock_unpoisoned(&self.pending_touches);
-        for id in tile_ids {
-            touches.remove(id);
-        }
     }
 
     /// Delete one tile entry (e.g. if a cached payload fails decode validation).
@@ -586,7 +459,7 @@ impl TileDiskCache {
         let Some(tile_id) = deleted_id else {
             return Ok(false);
         };
-        lock_unpoisoned(&self.pending_touches).remove(&tile_id);
+        self.touches.prune(&[tile_id]);
         self.write_generation.fetch_add(1, Ordering::AcqRel);
         Ok(true)
     }
@@ -597,36 +470,15 @@ impl TileDiskCache {
     pub fn set_max_bytes(&self, max_bytes: u64) -> Result<EvictionReport, StorageError> {
         let mut conn = lock_unpoisoned(&self.writer);
         self.max_bytes.store(max_bytes, Ordering::Release);
-        let report = self.evict_with_vacuum_locked(&mut conn, max_bytes, true)?;
-        self.write_generation.fetch_add(1, Ordering::AcqRel);
-        Ok(report)
-    }
-
-    /// Enforce `total_bytes <= max_bytes` on the current database state.
-    fn evict_if_needed(&self) -> Result<EvictionReport, StorageError> {
-        let mut conn = lock_unpoisoned(&self.writer);
-        let max_bytes = self.max_bytes.load(Ordering::Acquire);
-        let report = self.evict_with_vacuum_locked(&mut conn, max_bytes, false)?;
-        if report.evicted_tiles > 0 {
-            self.write_generation.fetch_add(1, Ordering::AcqRel);
-        }
-        Ok(report)
-    }
-
-    fn evict_with_vacuum_locked(
-        &self,
-        conn: &mut Connection,
-        max_bytes: u64,
-        full_vacuum: bool,
-    ) -> Result<EvictionReport, StorageError> {
-        let outcome = self.with_write_tx(conn, |tx| {
+        let outcome = self.with_write_tx(&mut conn, |tx| {
             let (current_bytes, current_count) = read_cache_meta_totals(tx)?;
             evict_in_tx(tx, current_bytes, current_count, max_bytes, None, None)
         })?;
-        self.prune_pending_touches(&outcome.evicted_ids);
+        self.touches.prune(&outcome.evicted_ids);
         if outcome.report.evicted_tiles > 0 {
-            reclaim_space(conn, full_vacuum);
+            reclaim_space(&conn, true);
         }
+        self.write_generation.fetch_add(1, Ordering::AcqRel);
         Ok(outcome.report)
     }
 
@@ -638,7 +490,7 @@ impl TileDiskCache {
         }
         let mut conn = lock_unpoisoned(&self.writer);
         let deleted_ids = self.with_write_tx(&mut conn, |tx| clear_source_in_tx(tx, source_key))?;
-        self.prune_pending_touches(&deleted_ids);
+        self.touches.prune(&deleted_ids);
         let deleted = deleted_ids.len();
         if deleted > 0 {
             reclaim_space(&conn, true);
@@ -650,12 +502,12 @@ impl TileDiskCache {
     /// Delete every cached tile and reclaim both main-DB pages and WAL space.
     pub fn clear(&self) -> Result<(), StorageError> {
         let mut conn = lock_unpoisoned(&self.writer);
-        lock_unpoisoned(&self.pending_touches).clear();
         {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             clear_all_in_tx(&tx)?;
             tx.commit()?;
         }
+        self.touches.clear();
         reclaim_space(&conn, true);
         self.write_generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -665,8 +517,9 @@ impl TileDiskCache {
     /// `cache_meta`), file size (including `-wal` sidecar), and cap.
     pub fn stats(&self) -> Result<DiskCacheStats, StorageError> {
         let (payload_bytes, tile_count) = self.reader_pool.with_reader(read_cache_meta_totals)?;
-        let main = std::fs::metadata(&self.db_path).map_or(0, |m| m.len());
-        let wal = std::fs::metadata(sidecar_path(&self.db_path, "-wal")).map_or(0, |m| m.len());
+        let db_path = self.reader_pool.db_path();
+        let main = std::fs::metadata(db_path).map_or(0, |m| m.len());
+        let wal = std::fs::metadata(sidecar_path(db_path, "-wal")).map_or(0, |m| m.len());
         Ok(DiskCacheStats {
             tile_count,
             payload_bytes,
