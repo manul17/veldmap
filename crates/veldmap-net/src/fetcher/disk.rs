@@ -54,20 +54,30 @@ impl DiskCacheGate {
         id: QuadTileId,
         cancel: &CancelToken,
     ) -> DiskReadOutcome {
+        if cancel.is_cancelled() {
+            return DiskReadOutcome::Cancelled;
+        }
         let store = Arc::clone(&self.store);
         let spec = Arc::clone(spec);
+        let cancel_for_get = cancel.clone();
         let res = tokio::select! {
             _ = cancel.cancelled() => return DiskReadOutcome::Cancelled,
-            res = tokio::task::spawn_blocking(move || store.get(spec.cache_key(), id)) => res,
+            res = tokio::task::spawn_blocking(move || {
+                if cancel_for_get.is_cancelled() {
+                    return DiskReadOutcome::Cancelled;
+                }
+                match store.get(spec.cache_key(), id) {
+                    Ok(Some(bytes)) => DiskReadOutcome::Hit(bytes),
+                    Ok(None) => DiskReadOutcome::Miss,
+                    Err(BlobStoreError::Backend(msg)) => DiskReadOutcome::Error(msg),
+                }
+            }) => res,
         };
         if cancel.is_cancelled() {
             return DiskReadOutcome::Cancelled;
         }
         match res {
-            Ok(Ok(Some(bytes))) => DiskReadOutcome::Hit(bytes),
-            Ok(Ok(None)) => DiskReadOutcome::Miss,
-            Ok(Err(BlobStoreError::Cancelled)) => DiskReadOutcome::Cancelled,
-            Ok(Err(BlobStoreError::Backend(msg))) => DiskReadOutcome::Error(msg),
+            Ok(outcome) => outcome,
             Err(join_err) => DiskReadOutcome::Error(format!("blocking task failed: {join_err}")),
         }
     }
@@ -119,7 +129,7 @@ impl DiskCacheGate {
             }) => res,
         };
         match del_res {
-            Ok(Ok(())) | Ok(Err(BlobStoreError::Cancelled)) => {}
+            Ok(Ok(())) => {}
             Ok(Err(del_err)) => {
                 tracing::debug!(
                     ?key,
@@ -173,14 +183,11 @@ impl DiskCacheGate {
                 if shutdown.is_cancelled() {
                     return;
                 }
-                match store.put(spec.cache_key(), id, &bytes) {
-                    Ok(()) | Err(BlobStoreError::Cancelled) => {}
-                    Err(err) => {
-                        tracing::debug!(
-                            error = %err,
-                            "Failed to persist validated live tile to disk cache"
-                        );
-                    }
+                if let Err(err) = store.put(spec.cache_key(), id, &bytes) {
+                    tracing::debug!(
+                        error = %err,
+                        "Failed to persist validated live tile to disk cache"
+                    );
                 }
             })
             .await;

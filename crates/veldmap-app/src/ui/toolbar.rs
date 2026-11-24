@@ -1,9 +1,13 @@
 //! Top workstation toolbar (Go-To navigation, basemap selector, graticule
 //! toggle, GPU adapter badge) and bottom GIS status bar extracted from `app.rs`.
+//!
+//! Strictly action-only: emits [`ToolbarAction`] values back to `VeldmapApp`
+//! without mutating `Camera`, storage, or scene state directly from UI layout
+//! code.
 
 use eframe::egui;
 use veldmap_core::geo::camera::Camera;
-use veldmap_core::geo::coords::parse_location;
+use veldmap_core::geo::coords::{ParsedLocation, parse_location};
 
 use crate::basemap::BasemapStatusSnapshot;
 use crate::settings::AppSettings;
@@ -11,6 +15,23 @@ use crate::settings::AppSettings;
 use super::ERROR_TEXT_COLOR;
 use super::basemap::{BasemapUiAction, BasemapUiState, show_toolbar_controls};
 use super::hud;
+
+/// User intent emitted by the top workstation toolbar and applied by
+/// `VeldmapApp`.
+#[derive(Clone, Debug)]
+pub(crate) enum ToolbarAction {
+    FocusLocation(ParsedLocation),
+    Basemap(BasemapUiAction),
+    SetGraticule(bool),
+}
+
+/// Read-only inputs rendered by the top workstation toolbar.
+#[derive(Clone, Copy)]
+pub(crate) struct ToolbarInputs<'a> {
+    pub(crate) settings: &'a AppSettings,
+    pub(crate) basemap_status: &'a BasemapStatusSnapshot,
+    pub(crate) adapter_label: &'a str,
+}
 
 /// Transient UI state for the Go-To coordinate input field in the top toolbar.
 #[derive(Clone, Debug, Default)]
@@ -20,38 +41,28 @@ pub(crate) struct GoToBarState {
 }
 
 impl GoToBarState {
-    fn trigger_goto(&mut self, camera: &mut Camera) {
+    fn trigger_goto(&mut self) -> Option<ParsedLocation> {
         match parse_location(&self.input) {
             Ok(loc) => {
-                tracing::info!(
-                    lat = loc.lat_deg,
-                    lon = loc.lon_deg,
-                    radius_deg = loc.radius_deg,
-                    kind = ?loc.kind,
-                    "Flying camera to parsed location"
-                );
-                camera.focus(loc.lat_deg, loc.lon_deg, loc.radius_deg);
                 self.error = None;
+                Some(loc)
             }
             Err(err) => {
                 self.error = Some(err.to_string());
+                None
             }
         }
     }
 }
 
-/// Render the top toolbar and return `(basemap_actions, graticule_toggled)`.
+/// Render the top toolbar and return user actions to apply in `VeldmapApp`.
 pub(crate) fn show_top_toolbar(
     ui: &mut egui::Ui,
-    camera: &mut Camera,
+    inputs: ToolbarInputs<'_>,
     goto: &mut GoToBarState,
-    settings: &AppSettings,
-    basemap_status: &BasemapStatusSnapshot,
     basemap_ui: &mut BasemapUiState,
-    adapter_label: &str,
-) -> (Vec<BasemapUiAction>, Option<bool>) {
-    let mut toolbar_actions = Vec::new();
-    let mut graticule_toggled = None;
+) -> Vec<ToolbarAction> {
+    let mut actions = Vec::new();
     egui::Panel::top("top_toolbar").show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.strong(veldmap_core::APP_NAME);
@@ -67,17 +78,23 @@ pub(crate) fn show_top_toolbar(
             }
             let enter_pressed =
                 edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("Fly").clicked() || enter_pressed {
-                goto.trigger_goto(camera);
+            if (ui.button("Fly").clicked() || enter_pressed)
+                && let Some(loc) = goto.trigger_goto()
+            {
+                actions.push(ToolbarAction::FocusLocation(loc));
             }
 
             ui.separator();
-            toolbar_actions = show_toolbar_controls(ui, settings, basemap_status, basemap_ui);
+            actions.extend(
+                show_toolbar_controls(ui, inputs.settings, inputs.basemap_status, basemap_ui)
+                    .into_iter()
+                    .map(ToolbarAction::Basemap),
+            );
 
             ui.separator();
-            let mut show_graticule = settings.show_graticule;
+            let mut show_graticule = inputs.settings.show_graticule;
             if ui.checkbox(&mut show_graticule, "Graticule").changed() {
-                graticule_toggled = Some(show_graticule);
+                actions.push(ToolbarAction::SetGraticule(show_graticule));
             }
 
             if let Some(err) = &goto.error {
@@ -90,11 +107,11 @@ pub(crate) fn show_top_toolbar(
             }
 
             ui.separator();
-            ui.add(egui::Label::new(egui::RichText::new(adapter_label).weak()).truncate())
-                .on_hover_text(adapter_label);
+            ui.add(egui::Label::new(egui::RichText::new(inputs.adapter_label).weak()).truncate())
+                .on_hover_text(inputs.adapter_label);
         });
     });
-    (toolbar_actions, graticule_toggled)
+    actions
 }
 
 /// Render the bottom GIS status bar (cursor position, camera center, altitude, GSD).

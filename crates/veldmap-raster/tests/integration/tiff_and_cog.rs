@@ -7,9 +7,10 @@ use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::io::ByteSource;
 use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 use veldmap_core::sync::CancelToken;
+use veldmap_core::tile::{RASTER_TILE_SIZE, tile_extent};
 use veldmap_raster::{
-    DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RASTER_TILE_SIZE, RasterError, SharedChunkCache,
-    TiffSource, has_tiff_magic, tile_extent,
+    DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError, SharedChunkCache, TiffSource,
+    has_tiff_magic,
 };
 
 use crate::common::{build_stripped_tiff, build_tiled_cog, fake_fingerprint, rgb_pattern};
@@ -324,8 +325,9 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         .as_ref()
         .expect("projected placement");
     assert_eq!(placement.epsg, Some(32637));
-    assert_eq!(placement.geo_params.get_f64(3081), Some(55.75));
-    assert_eq!(placement.geo_params.get_ascii(1026), Some("VeldMap"));
+    let geo_params = placement.geo_params.as_ref().expect("GeoTIFF params");
+    assert_eq!(geo_params.get_f64(3081), Some(55.75));
+    assert_eq!(geo_params.get_ascii(1026), Some("VeldMap"));
     assert!((placement.affine[2] - 499_995.0).abs() < 1e-9);
     assert!((placement.affine[5] - 6_000_005.0).abs() < 1e-9);
     let tile = big_src

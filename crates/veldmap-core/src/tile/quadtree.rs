@@ -23,10 +23,10 @@ use super::scheme::{GlobeScheme, PlanetaryScheme};
 pub const DEFAULT_GRID_CELLS: u32 = 16;
 
 /// Neutral default planetary tile size in pixels for SSE estimation.
-pub const DEFAULT_TILE_PX: u32 = 256;
+const DEFAULT_TILE_PX: u32 = 256;
 
 /// Neutral default maximum `PolarCap` texture zoom level.
-pub const DEFAULT_POLAR_MAX_TEX_LEVEL: u8 = 0;
+const DEFAULT_POLAR_MAX_TEX_LEVEL: u8 = 0;
 
 /// Default `Geodetic` maximum texture level used by [`QuadtreeConfig::default`].
 const DEFAULT_GEODETIC_MAX_TEX_LEVEL: u8 = 3;

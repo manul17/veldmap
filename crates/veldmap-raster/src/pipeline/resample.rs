@@ -151,18 +151,41 @@ fn overlap(s: u32, a: f64, b: f64) -> f64 {
 pub(crate) fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
     const BLEED_STEPS: u32 = 2;
     let (w, h) = (width as usize, height as usize);
-    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+    let Some(px_count) = w.checked_mul(h) else {
         return;
-    }
-    let mut coloured: Vec<bool> = (0..w * h).map(|at| rgba[at * 4 + 3] != 0).collect();
-    if coloured.iter().all(|has| *has) || coloured.iter().all(|has| !has) {
+    };
+    let Some(byte_len) = px_count.checked_mul(4) else {
+        return;
+    };
+    if px_count == 0 || rgba.len() < byte_len {
         return;
     }
 
-    for _ in 0..BLEED_STEPS {
-        let known = coloured.clone();
+    let mut has_opaque = false;
+    let mut has_transparent = false;
+    for px in rgba[..byte_len].chunks_exact(4) {
+        if px[3] != 0 {
+            has_opaque = true;
+        } else {
+            has_transparent = true;
+        }
+        if has_opaque && has_transparent {
+            break;
+        }
+    }
+    if !has_opaque || !has_transparent {
+        return;
+    }
+
+    let mut known: Vec<bool> = rgba[..byte_len]
+        .chunks_exact(4)
+        .map(|px| px[3] != 0)
+        .collect();
+    let mut next = known.clone();
+
+    for step in 0..BLEED_STEPS {
         let mut spread = false;
-        for at in 0..w * h {
+        for at in 0..px_count {
             if known[at] {
                 continue;
             }
@@ -178,11 +201,16 @@ pub(crate) fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
             };
             let colour = [rgba[from * 4], rgba[from * 4 + 1], rgba[from * 4 + 2]];
             rgba[at * 4..at * 4 + 3].copy_from_slice(&colour);
-            coloured[at] = true;
+            if step + 1 < BLEED_STEPS {
+                next[at] = true;
+            }
             spread = true;
         }
         if !spread {
             break;
+        }
+        if step + 1 < BLEED_STEPS {
+            known.copy_from_slice(&next);
         }
     }
 }

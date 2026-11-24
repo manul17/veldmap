@@ -147,7 +147,7 @@ fn plan_http_tasks(
 
 fn plan_dispatch_batch(ctx: &PipelineContext, now: Instant) -> DispatchBatch {
     let mut st = lock_unpoisoned(&ctx.shared.state);
-    let _ = st.prune_expired_backoffs(now);
+    st.prune_expired_backoffs(now);
 
     let mut earliest_wakeup: Option<Instant> = None;
     let (disk_tasks, http_tasks) = if let Some(spec) = st.active_spec() {

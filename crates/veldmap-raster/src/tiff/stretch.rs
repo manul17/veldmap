@@ -3,7 +3,6 @@
 //! followers) from terminal sampling errors (propagated to current-round
 //! followers without serial retry storms).
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::budget::DecodeBudgetTracker;
@@ -11,51 +10,19 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
 use crate::RasterError;
 use crate::pipeline::grid;
-use crate::pipeline::radiometry::{self, DisplayMapping, PixelLayout, percentile_stretch};
-use crate::pipeline::singleflight::SingleflightSlot;
+use crate::pipeline::radiometry::{self, DisplayMapping, percentile_stretch};
+use crate::pipeline::singleflight::{SingleflightRole, SingleflightSlot, run_singleflight};
 
+use super::TiffFormat;
 use super::chunk_reader::DecoderPool;
 use super::tags::{map_tiff_error, typed_samples};
 
-#[derive(Clone)]
-enum RoundOutcome {
-    Ready(DisplayMapping),
-    LeaderCancelled,
-    Failed(RasterError),
-}
-
-type StretchSlot = SingleflightSlot<RoundOutcome>;
+type StretchSlot = SingleflightSlot<DisplayMapping>;
 
 enum CacheState {
     Uncomputed,
     InFlight(Arc<StretchSlot>),
     Ready(DisplayMapping),
-}
-
-struct RoundGuard<'a> {
-    cache: &'a Mutex<CacheState>,
-    slot: Arc<StretchSlot>,
-    completed: bool,
-}
-
-impl Drop for RoundGuard<'_> {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        {
-            let mut guard = lock_unpoisoned(self.cache);
-            if let CacheState::InFlight(cur) = &*guard
-                && Arc::ptr_eq(cur, &self.slot)
-            {
-                *guard = CacheState::Uncomputed;
-            }
-        }
-        self.slot
-            .resolve(RoundOutcome::Failed(RasterError::DecoderPanicked(
-                "display-mapping sampling leader panicked".to_string(),
-            )));
-    }
 }
 
 pub(super) struct StretchCache {
@@ -77,123 +44,69 @@ impl StretchCache {
         &self,
         req: &StretchRequest<'_>,
     ) -> Result<DisplayMapping, RasterError> {
-        loop {
-            enum Role {
-                Ready(DisplayMapping),
-                Leader(Arc<StretchSlot>),
-                Follower(Arc<StretchSlot>),
-            }
+        self.get_or_compute_with(req.cancel, || compute_mapping(req))
+    }
 
-            let role = {
+    fn get_or_compute_with(
+        &self,
+        cancel: &CancelToken,
+        compute: impl FnOnce() -> Result<DisplayMapping, RasterError>,
+    ) -> Result<DisplayMapping, RasterError> {
+        run_singleflight(
+            cancel,
+            "display-mapping sampling leader panicked",
+            || {
                 let mut guard = lock_unpoisoned(&self.state);
                 match &*guard {
-                    CacheState::Ready(ready) => Role::Ready(*ready),
-                    CacheState::InFlight(slot) => Role::Follower(Arc::clone(slot)),
+                    CacheState::Ready(ready) => SingleflightRole::Ready(*ready),
+                    CacheState::InFlight(slot) => SingleflightRole::Follower(Arc::clone(slot)),
                     CacheState::Uncomputed => {
-                        if req.cancel.is_cancelled() {
-                            return Err(RasterError::Cancelled);
-                        }
                         let slot = Arc::new(SingleflightSlot::new());
                         *guard = CacheState::InFlight(Arc::clone(&slot));
-                        Role::Leader(slot)
+                        SingleflightRole::Leader(slot)
                     }
                 }
-            };
-
-            match role {
-                Role::Ready(ready) => return Ok(ready),
-                Role::Leader(slot) => {
-                    let mut guard = RoundGuard {
-                        cache: &self.state,
-                        slot: Arc::clone(&slot),
-                        completed: false,
-                    };
-                    match catch_unwind(AssertUnwindSafe(|| compute_mapping(req))) {
-                        Ok(Ok(computed)) => {
-                            {
-                                let mut cache = lock_unpoisoned(&self.state);
-                                *cache = CacheState::Ready(computed);
-                            }
-                            slot.resolve(RoundOutcome::Ready(computed));
-                            guard.completed = true;
-                            return Ok(computed);
-                        }
-                        Ok(Err(err)) => {
-                            {
-                                let mut cache = lock_unpoisoned(&self.state);
-                                if let CacheState::InFlight(cur) = &*cache
-                                    && Arc::ptr_eq(cur, &slot)
-                                {
-                                    *cache = CacheState::Uncomputed;
-                                }
-                            }
-                            if err.is_cancelled() {
-                                slot.resolve(RoundOutcome::LeaderCancelled);
-                            } else {
-                                // Current-round followers receive this error
-                                // directly instead of triggering serial retries.
-                                slot.resolve(RoundOutcome::Failed(err.clone()));
-                            }
-                            guard.completed = true;
-                            return Err(err);
-                        }
-                        Err(_) => {
-                            drop(guard);
-                            return Err(RasterError::DecoderPanicked(
-                                "display-mapping sampling leader panicked".to_string(),
-                            ));
-                        }
-                    }
+            },
+            compute,
+            |_slot, &computed| {
+                let mut cache = lock_unpoisoned(&self.state);
+                *cache = CacheState::Ready(computed);
+            },
+            |slot| {
+                let mut cache = lock_unpoisoned(&self.state);
+                if let CacheState::InFlight(cur) = &*cache
+                    && Arc::ptr_eq(cur, slot)
+                {
+                    *cache = CacheState::Uncomputed;
                 }
-                Role::Follower(slot) => match slot.wait(req.cancel)? {
-                    RoundOutcome::Ready(ready) => return Ok(ready),
-                    RoundOutcome::Failed(err) => {
-                        if req.cancel.is_cancelled() {
-                            return Err(RasterError::Cancelled);
-                        }
-                        return Err(err);
-                    }
-                    RoundOutcome::LeaderCancelled => {
-                        // Leader was cancelled; loop so an uncancelled
-                        // follower can elect itself as the new leader.
-                        if req.cancel.is_cancelled() {
-                            return Err(RasterError::Cancelled);
-                        }
-                    }
-                },
-            }
-        }
+            },
+        )
     }
 }
 
 pub(super) struct StretchRequest<'a> {
     pub(super) decoder_pool: &'a DecoderPool,
-    pub(super) pixel_layout: PixelLayout,
+    pub(super) format: TiffFormat,
     pub(super) stats_ifd: usize,
-    pub(super) nodata: Option<f32>,
-    pub(super) sample_bits: u8,
-    pub(super) depth: u32,
     pub(super) budget_tracker: &'a DecodeBudgetTracker,
     pub(super) cancel: &'a CancelToken,
 }
 
 fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterError> {
-    if req.sample_bits <= 8 {
-        return Ok(DisplayMapping::identity(req.nodata));
+    if req.format.sample_bits <= 8 {
+        return Ok(DisplayMapping::identity(req.format.nodata));
     }
     let mut pooled = req.decoder_pool.checkout(req.cancel)?;
     pooled.seek_to_image(req.stats_ifd, req.cancel)?;
-    let (w, h) = pooled
-        .decoder_mut()
-        .dimensions()
-        .map_err(|e| map_tiff_error(e, req.cancel))?;
-    let (cw, ch) = pooled.decoder_mut().chunk_dimensions();
-    if w == 0 || h == 0 || cw == 0 || ch == 0 {
-        return Ok(DisplayMapping::identity(req.nodata));
-    }
-    let pixel = req.pixel_layout;
+    let total = match pooled.ifd_chunk_layout(req.cancel) {
+        Ok(total) => total,
+        Err(RasterError::InvalidDimensions { .. }) => {
+            return Ok(DisplayMapping::identity(req.format.nodata));
+        }
+        Err(err) => return Err(err),
+    };
+    let pixel = req.format.pixel_layout;
 
-    let total = u64::from(w.div_ceil(cw)) * u64::from(h.div_ceil(ch));
     let mut picks = Vec::new();
     if total > 0 {
         let count = total.min(9);
@@ -217,7 +130,10 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
             return Err(RasterError::Cancelled);
         }
         let (dw, dh) = pooled.decoder_mut().chunk_data_dimensions(index);
-        let est_bytes = grid::chunk_working_bytes(dw, dh, req.depth, false);
+        if dw == 0 || dh == 0 {
+            continue;
+        }
+        let est_bytes = grid::chunk_working_bytes(dw, dh, req.format.depth, false);
         let _lease = req.budget_tracker.reserve_blocking(est_bytes, req.cancel)?;
         let raw = pooled
             .decoder_mut()
@@ -231,7 +147,7 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
         for at in (0..pixels).step_by(step) {
             for channel in 0..pixel.colors() {
                 let v = samples.get(at * pixel.channels + channel);
-                if radiometry::is_data(v, req.nodata) {
+                if radiometry::is_data(v, req.format.nodata) {
                     values.push(v);
                 }
             }
@@ -241,7 +157,74 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
     pooled.mark_clean();
 
     Ok(match percentile_stretch(&mut values) {
-        Some((lo, hi)) => DisplayMapping::stretched(lo, hi, req.nodata),
-        None => DisplayMapping::identity(req.nodata),
+        Some((lo, hi)) => DisplayMapping::stretched(lo, hi, req.format.nodata),
+        None => DisplayMapping::identity(req.format.nodata),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn uncancelled_leader_returning_cancelled_propagates_once_without_follower_livelock() {
+        let cache = Arc::new(StretchCache::new(None));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = CancelToken::new();
+
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let started = Arc::clone(&started);
+            let release = release.clone();
+            thread::spawn(move || {
+                cache.get_or_compute_with(&CancelToken::new(), || {
+                    started.store(true, Ordering::Release);
+                    while !release.is_cancelled() {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(RasterError::Cancelled)
+                })
+            })
+        };
+
+        while !started.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let follower = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                cache.get_or_compute_with(&CancelToken::new(), || {
+                    unreachable!("follower must not retry uncancelled leader error")
+                })
+            })
+        };
+
+        thread::sleep(Duration::from_millis(10));
+        release.cancel();
+
+        assert!(matches!(
+            leader.join().unwrap(),
+            Err(RasterError::Cancelled)
+        ));
+        assert!(matches!(
+            follower.join().unwrap(),
+            Err(RasterError::Cancelled)
+        ));
+
+        // Pre-cancelled callers fail immediately at loop entry even when Ready.
+        let ready_cache = StretchCache::new(Some(DisplayMapping::identity(None)));
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            ready_cache.get_or_compute_with(&cancelled, || {
+                unreachable!("pre-cancelled caller must not run compute")
+            }),
+            Err(RasterError::Cancelled)
+        ));
+    }
 }

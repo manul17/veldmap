@@ -30,7 +30,6 @@ pub struct SnapshotBuildParams<'a> {
     pub height_px: u32,
     pub pixels_per_point: f32,
     pub show_graticule: bool,
-    pub carrier_policy: &'a dyn TileCarrierPolicy,
     pub config: &'a QuadtreeConfig,
 }
 
@@ -68,9 +67,13 @@ impl DrawSnapshot {
     }
 
     /// Build a draw snapshot from grouped viewport, camera, graticule, and
-    /// carrier-policy parameters plus an optional [`GpuTileCache`] (`Some` for
-    /// textured rendering, `None` for untextured ellipsoid rendering).
-    pub fn build(params: SnapshotBuildParams<'_>, cache: Option<&mut GpuTileCache>) -> Self {
+    /// quadtree parameters plus an optional ([`TileCarrierPolicy`],
+    /// [`GpuTileCache`]) pair (`Some` for textured rendering, `None` for
+    /// untextured ellipsoid rendering).
+    pub fn build(
+        params: SnapshotBuildParams<'_>,
+        mut carrier: Option<(&dyn TileCarrierPolicy, &mut GpuTileCache)>,
+    ) -> Self {
         let visible = traverse(
             &params.camera,
             params.width_px,
@@ -85,34 +88,22 @@ impl DrawSnapshot {
 
         let mut tiles = Vec::with_capacity(visible.len());
         let mut carrier_keys = HashSet::new();
-        if let Some(gpu_cache) = cache {
-            for vis in visible {
-                if let Some((carrier_key, uv_rect, gpu_tile)) = params
-                    .carrier_policy
-                    .resolve_carrier(vis.tex_id, vis.uv_rect, gpu_cache)
-                {
+        for vis in visible {
+            let resolved = carrier.as_mut().and_then(|(policy, gpu_cache)| {
+                policy.resolve_carrier(vis.tex_id, vis.uv_rect, gpu_cache)
+            });
+            let (texture, uv_rect) = match resolved {
+                Some((carrier_key, uv_rect, gpu_tile)) => {
                     carrier_keys.insert(carrier_key);
-                    tiles.push(DrawTile {
-                        visible: vis,
-                        texture: Some(gpu_tile),
-                        uv_rect,
-                    });
-                } else {
-                    tiles.push(DrawTile {
-                        visible: vis,
-                        texture: None,
-                        uv_rect: vis.uv_rect,
-                    });
+                    (Some(gpu_tile), uv_rect)
                 }
-            }
-        } else {
-            for vis in visible {
-                tiles.push(DrawTile {
-                    visible: vis,
-                    texture: None,
-                    uv_rect: vis.uv_rect,
-                });
-            }
+                None => (None, vis.uv_rect),
+            };
+            tiles.push(DrawTile {
+                visible: vis,
+                texture,
+                uv_rect,
+            });
         }
 
         Self {

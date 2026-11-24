@@ -4,8 +4,10 @@ use std::io::Cursor;
 
 use ::tiff::encoder::{TiffEncoder, colortype};
 use ::tiff::tags::Tag;
-use veldmap_core::tile::{DecodedTile, PixelFormat, SourceFingerprint};
-use veldmap_raster::{RASTER_TILE_SIZE, generate_linear_mipmaps, level_size};
+use veldmap_core::tile::{
+    DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, level_size,
+};
+use veldmap_raster::generate_linear_mipmaps;
 
 pub fn fake_fingerprint(bytes: &[u8]) -> SourceFingerprint {
     let mut digest = [0u8; 32];

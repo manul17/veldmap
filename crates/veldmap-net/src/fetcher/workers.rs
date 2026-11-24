@@ -163,7 +163,7 @@ async fn handle_http_payload(
         DecodeOutcome::Ok => {
             let transition =
                 guard.finish(|st, key, generation| st.mark_completed(key, generation, false));
-            if transition.notify
+            if transition.is_applied()
                 && let Some(gate) = &ctx.disk_cache
             {
                 gate.persist_async(
@@ -211,12 +211,12 @@ fn handle_http_transient_failure(
         // order and only if this task still belongs to the active source &
         // generation, preventing a cancelled/stale task from poisoning a newly
         // switched basemap that shares the same host.
-        if tr.wakeup && rate_limited {
+        if tr.is_applied() && rate_limited {
             ctx.shared.host_limiters.record_cooldown(host, until);
         }
         tr
     });
-    if transition.wakeup {
+    if transition.should_wakeup() {
         (ctx.wakeup)();
     }
 }
@@ -271,8 +271,9 @@ pub(super) async fn run_http_fetch(
         Ok(FetchOutcome::Empty204) => {
             // Valid empty/nodata tile: suppress infinite refetch without
             // bumping `failed_count` or displaying an error badge.
-            if !cancel.is_cancelled() {
-                guard.finish(|st, key, generation| st.mark_empty_204(key, generation));
+            let transition = guard.finish(|st, key, generation| st.mark_empty_204(key, generation));
+            if transition.should_wakeup() {
+                (ctx.wakeup)();
             }
         }
         Err(FetchFailure::Terminal(msg)) => {
@@ -297,7 +298,7 @@ fn record_terminal_failure(
     }
     let transition =
         guard.finish(|st, key, generation| st.mark_terminal_failure(key, generation, error_msg));
-    if transition.wakeup {
+    if transition.should_wakeup() {
         (ctx.wakeup)();
     }
 }

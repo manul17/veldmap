@@ -19,8 +19,6 @@ use std::collections::{HashMap, HashSet};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{SourceId, TileKey};
 
-#[cfg(test)]
-use super::plan::LevelPlan;
 use super::plan::{PassKey, PyramidMeta, ServeMode};
 
 /// Error returned when starting a sequential pass while one is already active

@@ -7,19 +7,41 @@ use veldmap_core::io::BufferedByteReader;
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
-use crate::pipeline::band::{
+use crate::pipeline::metadata::{
     GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie, is_valid_lat_lon,
 };
 
 use super::tags::{opt_tag, read_tag_ascii_opt, read_tag_f64_vec_opt, read_tag_u16_vec_opt};
 
+const GEOKEY_LOCATION_SHORT: u16 = 0;
+const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
+const TAG_GEO_ASCII_PARAMS: u16 = 34737;
+
+const GEOKEY_MODEL_TYPE: u16 = 1024;
+const GEOKEY_RASTER_TYPE: u16 = 1025;
+const GEOKEY_GEOGRAPHIC_TYPE: u16 = 2048;
+const GEOKEY_GEOG_GEODETIC_DATUM: u16 = 2050;
+const GEOKEY_PROJECTED_CS_TYPE: u16 = 3072;
+
+const MODEL_TYPE_PROJECTED: u16 = 1;
+const MODEL_TYPE_GEOGRAPHIC: u16 = 2;
+
+const RASTER_TYPE_PIXEL_IS_AREA: u16 = 1;
+const RASTER_TYPE_PIXEL_IS_POINT: u16 = 2;
+
+const GEOKEY_UNDEFINED: u16 = 0;
+const GEOKEY_USER_DEFINED: u16 = 32767;
+const UNSAID_GEOKEY_CODES: [u16; 2] = [GEOKEY_UNDEFINED, GEOKEY_USER_DEFINED];
+
+const WGS84_GEOGRAPHIC_CODES: [u16; 3] = [4326, 4979, 4055];
+const EPSG_WGS84_DATUM: u16 = 6326;
+const EPSG_PULKOVO_1942: u16 = 4284;
+const PULKOVO_42_GK_START: u16 = 28400;
+const PULKOVO_42_GK_END: u16 = 28499;
+
 /// Parse raw `GeoKeyDirectoryTag` (`34735`), `GeoDoubleParamsTag` (`34736`),
 /// and `GeoAsciiParamsTag` (`34737`) payloads.
-pub(crate) fn parse_geokeys(
-    raw_keys: &[u16],
-    double_params: &[f64],
-    ascii_params: &str,
-) -> GeoKeyParams {
+fn parse_geokeys(raw_keys: &[u16], double_params: &[f64], ascii_params: &str) -> GeoKeyParams {
     let mut out = GeoKeyParams::default();
 
     let Some(&num_keys_raw) = raw_keys.get(3) else {
@@ -39,8 +61,8 @@ pub(crate) fn parse_geokeys(
         let offset_or_val = entry[3];
 
         let value = match location {
-            0 => Some(GeoKeyValue::Short(offset_or_val)),
-            34736 => {
+            GEOKEY_LOCATION_SHORT => Some(GeoKeyValue::Short(offset_or_val)),
+            TAG_GEO_DOUBLE_PARAMS => {
                 let start = usize::from(offset_or_val);
                 let end = start.saturating_add(count);
                 double_params
@@ -48,7 +70,7 @@ pub(crate) fn parse_geokeys(
                     .filter(|vals| vals.iter().all(|v| v.is_finite()))
                     .map(|vals| GeoKeyValue::Double(vals.to_vec()))
             }
-            34737 => {
+            TAG_GEO_ASCII_PARAMS => {
                 let start = usize::from(offset_or_val);
                 let end = start.saturating_add(count);
                 // `tiff::Decoder::get_tag_ascii_string` truncates at the first NUL byte,
@@ -66,11 +88,15 @@ pub(crate) fn parse_geokeys(
 
         if let Some(val) = value {
             match (id, &val) {
-                (1024, GeoKeyValue::Short(v)) => out.model_type = Some(*v),
-                (1025, GeoKeyValue::Short(2)) => out.raster_type = GeoRasterType::PixelIsPoint,
-                (1025, GeoKeyValue::Short(1)) => out.raster_type = GeoRasterType::PixelIsArea,
-                (2048, GeoKeyValue::Short(v)) => out.geographic_crs = Some(*v),
-                (3072, GeoKeyValue::Short(v)) => out.projected_crs = Some(*v),
+                (GEOKEY_MODEL_TYPE, GeoKeyValue::Short(v)) => out.model_type = Some(*v),
+                (GEOKEY_RASTER_TYPE, GeoKeyValue::Short(RASTER_TYPE_PIXEL_IS_POINT)) => {
+                    out.raster_type = GeoRasterType::PixelIsPoint;
+                }
+                (GEOKEY_RASTER_TYPE, GeoKeyValue::Short(RASTER_TYPE_PIXEL_IS_AREA)) => {
+                    out.raster_type = GeoRasterType::PixelIsArea;
+                }
+                (GEOKEY_GEOGRAPHIC_TYPE, GeoKeyValue::Short(v)) => out.geographic_crs = Some(*v),
+                (GEOKEY_PROJECTED_CS_TYPE, GeoKeyValue::Short(v)) => out.projected_crs = Some(*v),
                 _ => {}
             }
             out.keys.push((id, val));
@@ -141,25 +167,23 @@ pub(super) fn georef(
 }
 
 pub(super) fn foreign_datum(geo_params: &GeoKeyParams) -> Option<u16> {
-    const WGS84: [u16; 3] = [4326, 4979, 4055];
-    const UNSAID: [u16; 2] = [0, 32767];
-    if let Some(code) = geo_params
-        .geographic_crs
-        .filter(|code| !WGS84.contains(code) && !UNSAID.contains(code))
-    {
+    if let Some(code) = geo_params.geographic_crs.filter(|code| {
+        !WGS84_GEOGRAPHIC_CODES.contains(code) && !UNSAID_GEOKEY_CODES.contains(code)
+    }) {
         return Some(code);
     }
-    // Check GeogGeodeticDatumGeoKey (2050): 6326 = WGS 84.
     if let Some(datum) = geo_params
-        .get_u16(2050)
-        .filter(|code| *code != 6326 && !UNSAID.contains(code))
+        .get_u16(GEOKEY_GEOG_GEODETIC_DATUM)
+        .filter(|code| *code != EPSG_WGS84_DATUM && !UNSAID_GEOKEY_CODES.contains(code))
     {
         return Some(datum);
     }
-    // Pulkovo 1942 Gauss-Kruger zones (EPSG:28401..=28499) imply Pulkovo-42 (4284)
-    // even when GeoKey 2048 is omitted.
-    if matches!(geo_params.projected_crs, Some(28400..=28499)) {
-        return Some(4284);
+    // Pulkovo 1942 Gauss-Kruger zones imply Pulkovo-42 even when GeoKey 2048 is omitted.
+    if matches!(
+        geo_params.projected_crs,
+        Some(PULKOVO_42_GK_START..=PULKOVO_42_GK_END)
+    ) {
+        return Some(EPSG_PULKOVO_1942);
     }
     None
 }
@@ -208,11 +232,11 @@ pub(super) fn geo_placement(
     width: u32,
     height: u32,
 ) -> Option<GeoPlacement> {
-    if geo_params.model_type != Some(1) || points.len() > 6 {
+    if geo_params.model_type != Some(MODEL_TYPE_PROJECTED) || points.len() > 6 {
         return None;
     }
     let epsg = match geo_params.projected_crs {
-        Some(code) if code != 0 && code != 32767 => Some(u32::from(code)),
+        Some(code) if !UNSAID_GEOKEY_CODES.contains(&code) => Some(u32::from(code)),
         _ => return None,
     };
 
@@ -231,7 +255,7 @@ pub(super) fn geo_placement(
     Some(GeoPlacement {
         epsg,
         affine,
-        geo_params: geo_params.clone(),
+        geo_params: Some(geo_params.clone()),
     })
 }
 
@@ -243,7 +267,7 @@ pub(super) fn geo_ties(
     width: u32,
     height: u32,
 ) -> Vec<GeoTie> {
-    if geo_params.model_type != Some(2) {
+    if geo_params.model_type != Some(MODEL_TYPE_GEOGRAPHIC) {
         return Vec::new();
     }
     let half = geo_params.raster_type.half_pixel_shift();

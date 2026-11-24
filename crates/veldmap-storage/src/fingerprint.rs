@@ -120,17 +120,17 @@ impl LocalFingerprintCache {
             return Err(StorageError::Cancelled);
         }
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let meta = std::fs::metadata(&key)?;
-        if !meta.is_file() {
-            return Err(StorageError::InvalidPath(format!(
-                "'{}' is not a regular file",
-                path.display()
-            )));
-        }
-        let len = meta.len();
-        let mtime_ns = metadata_mtime_ns(&meta);
 
         if !bypass_cache {
+            let meta = std::fs::metadata(&key)?;
+            if !meta.is_file() {
+                return Err(StorageError::InvalidPath(format!(
+                    "'{}' is not a regular file",
+                    path.display()
+                )));
+            }
+            let len = meta.len();
+            let mtime_ns = metadata_mtime_ns(&meta);
             let guard = lock_unpoisoned(&self.entries);
             if let Some(entry) = guard.get(&key)
                 && entry.len == len

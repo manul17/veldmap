@@ -17,10 +17,10 @@ use queue::DecodeQueue;
 pub use queue::{DecodeJob, DecodeJobKey};
 
 /// Default maximum queued decode jobs awaiting a CPU worker.
-pub const DEFAULT_MAX_PENDING_DECODE_JOBS: usize = 128;
+const DEFAULT_MAX_PENDING_DECODE_JOBS: usize = 128;
 
 /// Default maximum cumulative queued bytes awaiting a CPU worker (`64 MiB`).
-pub const DEFAULT_MAX_PENDING_DECODE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_DECODE_BYTES: usize = 64 * 1024 * 1024;
 
 type SharedQueue = Arc<(Mutex<DecodeQueue>, Condvar)>;
 
@@ -228,7 +228,12 @@ pub enum DecodeLane {
 /// [`DecodePoolConfig`] settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TwoLaneDecodePoolConfig {
+    /// Fast pointwise tile lane (worker count clamped to `1..=8` by
+    /// [`DecodePool::spawn_named`]).
     pub fast: DecodePoolConfig,
+    /// Bulk sequential-pass lane (worker count clamped to `1..=4` by
+    /// [`TwoLaneDecodePool::spawn`] so long-running passes do not saturate
+    /// host CPU cores).
     pub bulk: DecodePoolConfig,
 }
 
@@ -295,16 +300,10 @@ pub struct TwoLaneDecodePool {
 }
 
 impl TwoLaneDecodePool {
-    /// Spawn independent fast and bulk decode lanes governed by `shutdown`.
+    /// Spawn independent fast (`1..=8` workers) and bulk (`1..=4` workers)
+    /// decode lanes governed by `shutdown`.
     pub fn spawn(config: TwoLaneDecodePoolConfig, shutdown: CancelToken) -> Self {
-        let fast = DecodePool::spawn_named(
-            "veldmap-decode-fast",
-            DecodePoolConfig {
-                worker_count: config.fast.worker_count.clamp(1, 8),
-                ..config.fast
-            },
-            shutdown.clone(),
-        );
+        let fast = DecodePool::spawn_named("veldmap-decode-fast", config.fast, shutdown.clone());
         let bulk = DecodePool::spawn_named(
             "veldmap-decode-bulk",
             DecodePoolConfig {

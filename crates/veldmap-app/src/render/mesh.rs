@@ -17,9 +17,6 @@ use veldmap_core::tile::{
 use wgpu::util::DeviceExt;
 
 use super::snapshot::DrawTile;
-use super::uniforms::{
-    TILE_KIND_GEO, TILE_KIND_POLAR_CLEAR_SCALE, TILE_KIND_POLAR_NORTH, TILE_KIND_POLAR_SOUTH,
-};
 
 /// Default VRAM budget for cached per-tile geometry vertex buffers (`16 MiB`,
 /// ~1,000 cached `16 x 16` tiles).
@@ -159,7 +156,7 @@ pub(super) struct TileGridAnchor {
 }
 
 impl TileGridAnchor {
-    fn for_tile(id: QuadTileId) -> Self {
+    pub(super) fn for_tile(id: QuadTileId) -> Self {
         match sample_tile_surface(id, 0.5, 0.5) {
             Some(TileSurfaceSample {
                 lat_deg,
@@ -188,60 +185,6 @@ impl TileGridAnchor {
                 dx0: 0.0,
                 dy0: 0.0,
             },
-        }
-    }
-}
-
-/// Compute per-tile `(tile_kind, grid_anchor)` uniform values from a cached
-/// [`TileGridAnchor`] so `GlobeRenderer` never re-samples `sample_tile_surface`
-/// on every dirty frame.
-pub(super) fn tile_graticule_uniform(
-    id: QuadTileId,
-    cached_anchor: Option<TileGridAnchor>,
-    step_deg: f64,
-) -> (f32, [f32; 4]) {
-    let anchor = cached_anchor.unwrap_or_else(|| TileGridAnchor::for_tile(id));
-    match id.scheme {
-        PlanetaryScheme::PolarCap { north } => {
-            let colat_phase = (90.0 - anchor.lat0.abs()).rem_euclid(step_deg);
-            let lon_phase = anchor.lon0.rem_euclid(step_deg);
-
-            // Use cancellation-free relative longitude deltas when the tile's
-            // disk center is strictly clear of the pole (`rho0 > 4 * tile_half_diag`).
-            let rho0 = anchor.dx0.hypot(anchor.dy0);
-            let n = f64::from(1u32 << id.level.min(30));
-            let tile_half_diag = std::f64::consts::SQRT_2 / n;
-            let clear_of_pole = id.level >= 2 && rho0 > 4.0 * tile_half_diag;
-            let sign = if north {
-                TILE_KIND_POLAR_NORTH
-            } else {
-                TILE_KIND_POLAR_SOUTH
-            };
-            let kind = if clear_of_pole {
-                sign * TILE_KIND_POLAR_CLEAR_SCALE
-            } else {
-                sign
-            };
-            (
-                kind,
-                [
-                    anchor.dx0 as f32,
-                    anchor.dy0 as f32,
-                    colat_phase as f32,
-                    lon_phase as f32,
-                ],
-            )
-        }
-        PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => {
-            // Wrap tile anchor phase modulo `grid_step_deg` in f64 on CPU so
-            // `f32` fragment arithmetic preserves sub-millimetre accuracy even
-            // at `2 m` altitude.
-            let lon_phase = anchor.lon0.rem_euclid(step_deg);
-            let lat_phase = anchor.lat0.rem_euclid(step_deg);
-            (
-                TILE_KIND_GEO,
-                [lon_phase as f32, lat_phase as f32, 0.0, 0.0],
-            )
         }
     }
 }

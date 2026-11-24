@@ -13,13 +13,13 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::SourceFingerprint;
 
 use super::georef::{affine_from_matrix, foreign_datum, geo_placement, geo_ties};
-use super::tags::{is_overview, sample_type_from_bits};
+use super::tags::{is_overview, resolve_sample_type};
 use super::{TiffSource, build_tiff_limits};
 use crate::RasterError;
 use crate::pipeline::DecodeContext;
-use crate::pipeline::band::{GeoKeyParams, GeoRasterType, SampleType};
 use crate::pipeline::chunk_cache::SharedChunkCache;
 use crate::pipeline::grid::Grid;
+use crate::pipeline::metadata::{GeoKeyParams, GeoRasterType, SampleType};
 use crate::pipeline::plan::{self, ServeMode};
 
 fn tiny_u16_tiff_bytes() -> Vec<u8> {
@@ -272,10 +272,12 @@ fn georef_tag_limits_and_table_helpers_work_consistently() {
     assert!(!is_overview(0));
     assert!(is_overview(1));
     assert!(!is_overview(5)); // mask bit set
-    assert_eq!(sample_type_from_bits(8).unwrap(), SampleType::U8);
-    assert_eq!(sample_type_from_bits(16).unwrap(), SampleType::U16);
-    assert_eq!(sample_type_from_bits(32).unwrap(), SampleType::F32);
-    assert!(sample_type_from_bits(12).is_err());
+    assert_eq!(resolve_sample_type(1, 8).unwrap(), SampleType::U8);
+    assert_eq!(resolve_sample_type(1, 16).unwrap(), SampleType::U16);
+    assert_eq!(resolve_sample_type(2, 16).unwrap(), SampleType::I16);
+    assert_eq!(resolve_sample_type(3, 32).unwrap(), SampleType::F32);
+    assert!(resolve_sample_type(1, 12).is_err());
+    assert!(resolve_sample_type(1, 32).is_err());
 
     // Foreign datum detection from geographic CRS, datum key, or Pulkovo-42 zone.
     let mut keys = GeoKeyParams {

@@ -8,10 +8,10 @@ use veldmap_core::tile::{POLAR_R_CAP, PixelFormat};
 use crate::gpu_tiles::GpuTile;
 
 use super::CLEAR_COLOR_LINEAR;
-use super::mesh::{TileMeshCache, tile_graticule_uniform};
+use super::mesh::TileMeshCache;
 use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
-use super::uniforms::{CameraUniform, TILE_KIND_GEO, TileUniform};
+use super::uniforms::{CameraUniform, TILE_KIND_GEO, TileUniform, tile_graticule_uniform};
 use super::viewport::{RenderParams, ViewportState};
 
 /// Standalone offscreen `wgpu` WGS84 quadtree globe renderer.
@@ -126,27 +126,33 @@ impl GlobeRenderer {
                     );
                     continue;
                 }
-                self.tile_bind_groups
-                    .entry(gpu_tile.tile_id)
-                    .or_insert_with(|| {
-                        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("globe tile texture bind group"),
-                            layout: &self.pipelines.tile_texture_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(&gpu_tile.view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::Sampler(
-                                        &self.pipelines.tile_sampler,
-                                    ),
-                                },
-                            ],
+                let reuse =
+                    self.tile_bind_groups
+                        .get(&gpu_tile.tile_id)
+                        .is_some_and(|(weak, _)| {
+                            weak.strong_count() > 0
+                                && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
                         });
-                        (Arc::downgrade(gpu_tile), bg)
+                if !reuse {
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("globe tile texture bind group"),
+                        layout: &self.pipelines.tile_texture_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&gpu_tile.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(
+                                    &self.pipelines.tile_sampler,
+                                ),
+                            },
+                        ],
                     });
+                    self.tile_bind_groups
+                        .insert(gpu_tile.tile_id, (Arc::downgrade(gpu_tile), bg));
+                }
             }
         }
     }
@@ -238,7 +244,10 @@ impl GlobeRenderer {
             pass.set_bind_group(1, self.viewport.tile_uniform_bind_group(), &[dyn_offset]);
 
             if let Some(gpu_tile) = &draw.texture
-                && let Some((_, tex_bg)) = self.tile_bind_groups.get(&gpu_tile.tile_id)
+                && gpu_tile.format == PixelFormat::Rgba8UnormSrgb
+                && let Some((weak, tex_bg)) = self.tile_bind_groups.get(&gpu_tile.tile_id)
+                && weak.strong_count() > 0
+                && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
             {
                 if last_textured != Some(true) {
                     pass.set_pipeline(&self.pipelines.body_textured_pipeline);

@@ -2,7 +2,6 @@
 //! deduplication across concurrent tile decode workers.
 
 use std::collections::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
@@ -10,73 +9,35 @@ use veldmap_core::tile::{SourceId, TileCache, TileStreamSpec};
 
 use crate::RasterError;
 
-use super::singleflight::SingleflightSlot;
+use super::singleflight::{SingleflightRole, SingleflightSlot, run_singleflight};
 
 /// Composite key identifying one decoded source chunk (TIFF tile/strip)
 /// partitioned by `(source, spec, image, chunk_index)` so incompatible bands,
 /// formats, gutters, or revisions never alias.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ChunkKey {
-    pub source: SourceId,
-    pub spec: TileStreamSpec,
-    pub image: usize,
-    pub chunk_index: u32,
+pub(crate) struct ChunkKey {
+    pub(crate) source: SourceId,
+    pub(crate) spec: TileStreamSpec,
+    pub(crate) image: usize,
+    pub(crate) chunk_index: u32,
 }
 
 /// Decoded RGBA8 chunk payload with its valid dimensions `(width, height)`.
 #[derive(Clone, Debug)]
-pub struct DecodedChunk {
-    pub data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
+pub(crate) struct DecodedChunk {
+    pub(crate) data: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 impl DecodedChunk {
     /// Byte size accounted against [`SharedChunkCache`].
-    pub fn byte_size(&self) -> usize {
+    pub(crate) fn byte_size(&self) -> usize {
         self.data.len()
     }
 }
 
-#[derive(Clone)]
-enum ChunkOutcome {
-    Ready(Arc<DecodedChunk>),
-    /// The leader's own `CancelToken` fired during decode; uncancelled
-    /// followers should loop and elect a new leader instead of failing.
-    LeaderCancelled,
-    Failed(RasterError),
-}
-
-type ChunkSlot = SingleflightSlot<ChunkOutcome>;
-
-struct LeaderGuard<'a> {
-    state: &'a Mutex<CacheState>,
-    key: ChunkKey,
-    slot: Arc<ChunkSlot>,
-    completed: bool,
-}
-
-impl Drop for LeaderGuard<'_> {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        // Remove the in-flight slot only if it still points to this leader's
-        // `SingleflightSlot`, then wake any waiting followers cleanly.
-        {
-            let mut guard = lock_unpoisoned(self.state);
-            if let Some(current) = guard.in_flight.get(&self.key)
-                && Arc::ptr_eq(current, &self.slot)
-            {
-                guard.in_flight.remove(&self.key);
-            }
-        }
-        self.slot
-            .resolve(ChunkOutcome::Failed(RasterError::DecoderPanicked(
-                "chunk decode leader panicked or exited prematurely".to_string(),
-            )));
-    }
-}
+type ChunkSlot = SingleflightSlot<Arc<DecodedChunk>>;
 
 struct CacheState {
     lru: TileCache<ChunkKey, Arc<DecodedChunk>>,
@@ -137,113 +98,53 @@ impl SharedChunkCache {
     /// If the leader cancels via its own `cancel` token, uncancelled followers
     /// retry and elect a new leader instead of inheriting a spurious
     /// [`RasterError::Cancelled`].
-    pub fn get_or_decode(
+    pub(crate) fn get_or_decode(
         &self,
         key: ChunkKey,
         cancel: &CancelToken,
         decode: impl FnOnce() -> Result<DecodedChunk, RasterError>,
     ) -> Result<Arc<DecodedChunk>, RasterError> {
-        enum Role {
-            Hit(Arc<DecodedChunk>),
-            Leader(Arc<ChunkSlot>),
-            Follower(Arc<ChunkSlot>),
-        }
-
-        loop {
-            if cancel.is_cancelled() {
-                return Err(RasterError::Cancelled);
-            }
-
-            let role = {
+        run_singleflight(
+            cancel,
+            "chunk decode leader panicked",
+            || {
                 let mut guard = lock_unpoisoned(&self.state);
                 if let Some(chunk) = guard.lru.get(&key).map(Arc::clone) {
                     guard.hits += 1;
-                    Role::Hit(chunk)
+                    SingleflightRole::Ready(chunk)
                 } else if let Some(slot) = guard.in_flight.get(&key).map(Arc::clone) {
                     guard.dedup_waits += 1;
-                    Role::Follower(slot)
+                    SingleflightRole::Follower(slot)
                 } else {
                     guard.misses += 1;
                     let slot = Arc::new(SingleflightSlot::new());
                     guard.in_flight.insert(key, Arc::clone(&slot));
-                    Role::Leader(slot)
+                    SingleflightRole::Leader(slot)
                 }
-            };
-
-            match role {
-                Role::Hit(chunk) => return Ok(chunk),
-                Role::Follower(slot) => match slot.wait(cancel)? {
-                    ChunkOutcome::Ready(chunk) => return Ok(chunk),
-                    ChunkOutcome::LeaderCancelled => {
-                        // The previous leader's token cancelled; loop to check
-                        // our own token and either hit cache or elect a leader.
-                        continue;
+            },
+            || decode().map(Arc::new),
+            |slot, arc| {
+                let byte_size = arc.byte_size();
+                let evicted = {
+                    let mut st = lock_unpoisoned(&self.state);
+                    if let Some(cur) = st.in_flight.get(&key)
+                        && Arc::ptr_eq(cur, slot)
+                    {
+                        st.in_flight.remove(&key);
                     }
-                    ChunkOutcome::Failed(_) if cancel.is_cancelled() => {
-                        return Err(RasterError::Cancelled);
-                    }
-                    ChunkOutcome::Failed(err) => return Err(err),
-                },
-                Role::Leader(slot) => {
-                    let mut guard = LeaderGuard {
-                        state: &self.state,
-                        key,
-                        slot: Arc::clone(&slot),
-                        completed: false,
-                    };
-
-                    let outcome = catch_unwind(AssertUnwindSafe(decode));
-                    return match outcome {
-                        Ok(Ok(chunk)) => {
-                            let byte_size = chunk.byte_size();
-                            let arc = Arc::new(chunk);
-                            let evicted = {
-                                let mut st = lock_unpoisoned(&self.state);
-                                if let Some(cur) = st.in_flight.get(&key)
-                                    && Arc::ptr_eq(cur, &slot)
-                                {
-                                    st.in_flight.remove(&key);
-                                }
-                                st.lru.insert(key, Arc::clone(&arc), byte_size).ok()
-                            };
-                            drop(evicted);
-                            slot.resolve(ChunkOutcome::Ready(Arc::clone(&arc)));
-                            guard.completed = true;
-                            Ok(arc)
-                        }
-                        Ok(Err(err)) => {
-                            {
-                                let mut st = lock_unpoisoned(&self.state);
-                                if let Some(cur) = st.in_flight.get(&key)
-                                    && Arc::ptr_eq(cur, &slot)
-                                {
-                                    st.in_flight.remove(&key);
-                                }
-                            }
-                            // Only treat cancellation as retryable when this
-                            // leader's own token fired; an uncancelled leader
-                            // returning `Err(Cancelled)` propagates once to
-                            // avoid follower livelock.
-                            let published = if err.is_cancelled() && cancel.is_cancelled() {
-                                ChunkOutcome::LeaderCancelled
-                            } else {
-                                ChunkOutcome::Failed(err.clone())
-                            };
-                            slot.resolve(published);
-                            guard.completed = true;
-                            Err(err)
-                        }
-                        Err(_) => {
-                            // Drop `guard` cleanly: removes `in_flight` and notifies waiters.
-                            drop(guard);
-                            Err(RasterError::DecoderPanicked(
-                                "chunk decoder panicked".to_string(),
-                            ))
-                        }
-                    };
+                    st.lru.insert(key, Arc::clone(arc), byte_size).ok()
+                };
+                drop(evicted);
+            },
+            |slot| {
+                let mut st = lock_unpoisoned(&self.state);
+                if let Some(cur) = st.in_flight.get(&key)
+                    && Arc::ptr_eq(cur, slot)
+                {
+                    st.in_flight.remove(&key);
                 }
-            }
-        }
+            },
+        )
     }
 }
 

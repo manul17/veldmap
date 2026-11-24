@@ -120,3 +120,17 @@ fn clear_where_and_proportional_budget_cover_pre_3a_hooks() {
     let weighted = cache.proportional_pyramid_byte_cap(4, 10);
     assert!(weighted > 0 && weighted * 2 < cache.max_bytes());
 }
+
+#[test]
+fn dropping_pending_uploads_closes_channel_without_explicit_close() {
+    let pending = PendingUploads::new();
+    let tx = pending.sender().expect("sender");
+    let tile =
+        DecodedTile::try_new(1, 1, PixelFormat::Rgba8UnormSrgb, vec![1, 2, 3, 255]).expect("tile");
+    let key = wm_key(SourceId::BUNDLED_BASEMAP, 0, 0, 0);
+    tx.send((key, tile.clone())).expect("send while open");
+
+    drop(pending);
+
+    assert_eq!(tx.send((key, tile)), Err(UploadChannelClosed));
+}

@@ -8,13 +8,12 @@ use veldmap_core::io::ByteSource;
 use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{
-    BandKey, PixelFormat, PlanetaryScheme, QuadTileId, SourceFingerprint, SourceId, StreamKey,
-    TileKey,
+    BandKey, PixelFormat, PlanetaryScheme, QuadTileId, RASTER_TILE_SIZE, SourceFingerprint,
+    SourceId, StreamKey, TileKey,
 };
 use veldmap_raster::{
-    DecodeContext, DecodeJob, DecodeJobKey, DecodeLane, DecodePoolConfig, RASTER_TILE_SIZE,
-    ServeMode, SharedChunkCache, TiffSource, TileScheduler, TwoLaneDecodePool,
-    TwoLaneDecodePoolConfig,
+    DecodeContext, DecodeJob, DecodeJobKey, DecodeLane, DecodePoolConfig, ServeMode,
+    SharedChunkCache, TiffSource, TileScheduler, TwoLaneDecodePool, TwoLaneDecodePoolConfig,
 };
 
 use crate::common::build_multi_tile_tiff;

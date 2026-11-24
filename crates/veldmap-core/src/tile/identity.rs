@@ -4,8 +4,6 @@
 
 use std::fmt;
 
-use super::key::TileKey;
-
 /// Deterministic 64-bit FNV-1a hash used for stable `Copy` source/band keys.
 pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -197,16 +195,6 @@ impl StreamKey {
             band,
             format,
             gutter,
-        }
-    }
-
-    /// Extract the [`StreamKey`] identifying `key`'s band/format/gutter stream.
-    pub const fn from_tile_key(key: &TileKey) -> Self {
-        Self {
-            source: key.source,
-            band: key.band,
-            format: key.format,
-            gutter: key.gutter,
         }
     }
 }

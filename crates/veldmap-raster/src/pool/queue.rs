@@ -74,14 +74,8 @@ pub struct DecodeJob {
 }
 
 pub(super) struct DecodeQueue {
-    #[cfg(test)]
     pub(super) jobs: Vec<DecodeJob>,
-    #[cfg(not(test))]
-    jobs: Vec<DecodeJob>,
-    #[cfg(test)]
     pub(super) queued_bytes: usize,
-    #[cfg(not(test))]
-    queued_bytes: usize,
     max_pending_jobs: usize,
     max_pending_bytes: usize,
     pub(super) closed: bool,

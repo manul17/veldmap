@@ -1,43 +1,12 @@
-//! `egui_wgpu` viewport bridge (`SnapshotKey`, `GlobePaintCallback`, and
-//! logical-to-physical viewport pixel mapping) extracted from `app.rs`.
+//! `egui_wgpu` viewport bridge ([`GlobePaintCallback`] and logical-to-physical
+//! viewport pixel mapping) extracted from `app.rs`.
 
 use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor};
-use veldmap_core::geo::camera::Camera;
 
 use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotKey {
-    eye_bits: [u64; 3],
-    up_bits: [u64; 3],
-    width_px: u32,
-    height_px: u32,
-    ppp_bits: u32,
-    scene_generation: u64,
-}
-
-impl SnapshotKey {
-    pub(crate) fn new(
-        camera: &Camera,
-        viewport_px: [u32; 2],
-        pixels_per_point: f32,
-        scene_generation: u64,
-    ) -> Self {
-        let eye = camera.eye_ecef();
-        let (_, up, _) = camera.basis();
-        Self {
-            eye_bits: eye.to_array().map(f64::to_bits),
-            up_bits: up.to_array().map(f64::to_bits),
-            width_px: viewport_px[0],
-            height_px: viewport_px[1],
-            ppp_bits: pixels_per_point.to_bits(),
-            scene_generation,
-        }
-    }
-}
 
 /// Estimate physical viewport dimensions from `egui::Context` during `App::ui`
 /// (where `egui_wgpu::ScreenDescriptor::size_in_pixels` is not exposed yet;

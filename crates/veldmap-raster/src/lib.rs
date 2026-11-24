@@ -22,25 +22,16 @@ pub use display::{
     BundledBasemap, BundledBasemapConfig, decode_map_tile, decode_map_tile_with_mipmaps,
     generate_linear_mipmaps,
 };
-pub use pipeline::DecodeContext;
-pub use pipeline::band::{
-    BandInfo, GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie, RasterDescription,
-    SampleType,
+pub use pipeline::{
+    BandInfo, DecodeContext, GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie,
+    LevelPlan, PassBusy, PassKey, PyramidMeta, RasterDescription, SampleType, ServeMode,
+    SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
 };
-pub use pipeline::cascade::TileEmit;
-pub use pipeline::chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
-pub use pipeline::peak::DecodePeak;
-pub use pipeline::plan::{LevelPlan, PassKey, PyramidMeta, ServeMode};
-pub use pipeline::pyramid::{
-    RASTER_TILE_SIZE, cell_image_rect, cell_uv, grid_dim, level_count, level_size, tile_extent,
-};
-pub use pipeline::scheduler::{PassBusy, TileFailureOutcome, TileScheduler};
 pub use pool::{
-    DEFAULT_MAX_PENDING_DECODE_BYTES, DEFAULT_MAX_PENDING_DECODE_JOBS, DecodeJob, DecodeJobKey,
-    DecodeLane, DecodePool, DecodePoolConfig, DecodePoolHandle, TwoLaneDecodePool,
-    TwoLaneDecodePoolConfig, TwoLaneDecodePoolHandle,
+    DecodeJob, DecodeJobKey, DecodeLane, DecodePool, DecodePoolConfig, DecodePoolHandle,
+    TwoLaneDecodePool, TwoLaneDecodePoolConfig, TwoLaneDecodePoolHandle,
 };
-pub use tiff::{MAX_IFDS, MAX_SOURCE_SIDE, TIFF_DECODE_REV, TiffSource, has_tiff_magic};
+pub use tiff::{MAX_IFDS, MAX_SOURCE_SIDE, TiffSource, has_tiff_magic};
 
 /// Errors returned by raster tile decoders and virtual tile providers.
 ///
@@ -53,10 +44,6 @@ pub enum RasterError {
     Cancelled,
     #[error("unsupported or unrecognized image format")]
     UnsupportedFormat,
-    #[error("invalid raster format: {0}")]
-    InvalidFormat(String),
-    #[error("TIFF decode error: {0}")]
-    Tiff(String),
     #[error("codec decoder limits exceeded: {0}")]
     DecoderLimitsExceeded(String),
     #[error("raster decoder panicked: {0}")]
@@ -65,7 +52,7 @@ pub enum RasterError {
     Io(#[source] Arc<IoError>),
     #[error("memory budget exceeded: {0}")]
     Budget(BudgetError),
-    #[error("image decode failed: {0}")]
+    #[error("raster decode failed: {0}")]
     Decode(String),
     #[error("invalid decoded image dimensions {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },

@@ -2,7 +2,7 @@
 //! `BufferedByteReader`, `IoError`) and opt-in test doubles (`testing`,
 //! enabled under `#[cfg(test)]` or `feature = "test-support"`).
 
-pub mod byte_source;
+mod byte_source;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 

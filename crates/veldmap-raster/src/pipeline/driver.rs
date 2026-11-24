@@ -6,14 +6,13 @@ use std::sync::Arc;
 
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::PixelFormat;
+use veldmap_core::tile::{PixelFormat, level_size, tile_extent};
 
 use crate::RasterError;
 
 use super::cascade::{Cascade, TileEmit};
 use super::chunk_cache::DecodedChunk;
 use super::grid::{Grid, Region, region_of};
-use super::pyramid;
 use super::resample::{bleed_alpha, resample_rgba8_window};
 
 /// Chunked raster backend driving [`direct`] and [`pass`].
@@ -77,8 +76,8 @@ pub(crate) fn direct<S: Chunked>(
             height: req.base.1,
         });
     }
-    let lw = pyramid::level_size(req.base.0, u32::from(req.level));
-    let lh = pyramid::level_size(req.base.1, u32::from(req.level));
+    let lw = level_size(req.base.0, u32::from(req.level));
+    let lh = level_size(req.base.1, u32::from(req.level));
     let (image, sw, sh) = req.grid.source_for(req.base, lw, lh);
     let (cw, ch) = req.grid.chunk_of(image);
     if cw == 0 || ch == 0 {
@@ -96,8 +95,8 @@ pub(crate) fn direct<S: Chunked>(
         if req.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
-        let tw = pyramid::tile_extent(tx, lw);
-        let th = pyramid::tile_extent(ty, lh);
+        let tw = tile_extent(tx, lw);
+        let th = tile_extent(ty, lh);
         if tw == 0 || th == 0 {
             continue;
         }
@@ -111,7 +110,7 @@ pub(crate) fn direct<S: Chunked>(
         } = region_of((tx, ty), (tw, th), req.base, (sw, sh), req.level);
         let (rw, rh) = ((sx1 - sx0) as u32, (sy1 - sy0) as u32);
         if rw == 0 || rh == 0 {
-            return Err(RasterError::InvalidFormat(format!(
+            return Err(RasterError::Decode(format!(
                 "tile ({tx}, {ty}) at level {} produced empty source region",
                 req.level
             )));

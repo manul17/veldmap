@@ -5,7 +5,7 @@ use eframe::egui;
 
 /// Format a latitude/longitude pair as human-readable decimal degrees with
 /// hemisphere indicators.
-pub(crate) fn format_lat_lon(lat_deg: f64, lon_deg: f64) -> String {
+pub(super) fn format_lat_lon(lat_deg: f64, lon_deg: f64) -> String {
     let lat_hem = if lat_deg >= 0.0 { 'N' } else { 'S' };
     let lon_hem = if lon_deg >= 0.0 { 'E' } else { 'W' };
     format!(
@@ -18,7 +18,7 @@ pub(crate) fn format_lat_lon(lat_deg: f64, lon_deg: f64) -> String {
 }
 
 /// Format an altitude or ground distance in metres/kilometres.
-pub(crate) fn format_distance_m(metres: f64) -> String {
+pub(super) fn format_distance_m(metres: f64) -> String {
     if metres >= 100_000.0 {
         format!("{:.0} km", metres / 1_000.0)
     } else if metres >= 10_000.0 {
@@ -33,7 +33,7 @@ pub(crate) fn format_distance_m(metres: f64) -> String {
 }
 
 /// Format ground resolution in `mm/px`, `cm/px`, `m/px`, or `km/px`.
-pub(crate) fn format_resolution(m_per_px: f64) -> String {
+pub(super) fn format_resolution(m_per_px: f64) -> String {
     if m_per_px >= 1_000.0 {
         format!("{:.2} km/px", m_per_px / 1_000.0)
     } else if m_per_px >= 1.0 {
@@ -51,7 +51,7 @@ pub(crate) fn format_resolution(m_per_px: f64) -> String {
 /// The returned width always equals `bar_m / m_per_pt` (falling in
 /// `[0.4 * max_width_pt, max_width_pt]`), so the visual bar never distorts
 /// metric scale.
-pub(crate) fn compute_scale_bar(m_per_pt: f64, max_width_pt: f32) -> (String, f32) {
+fn compute_scale_bar(m_per_pt: f64, max_width_pt: f32) -> (String, f32) {
     let max_w = f64::from(max_width_pt).max(1.0);
     if !m_per_pt.is_finite() || m_per_pt <= 0.0 {
         return ("0 m".to_owned(), 0.0);

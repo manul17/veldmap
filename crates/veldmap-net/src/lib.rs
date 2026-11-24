@@ -27,8 +27,6 @@ pub use redact::{redact_secret_label, sanitize_url_for_display};
 /// Structured error returned across the [`TileBlobStore`] seam.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BlobStoreError {
-    #[error("blob store operation cancelled")]
-    Cancelled,
     #[error("blob store error: {0}")]
     Backend(String),
 }

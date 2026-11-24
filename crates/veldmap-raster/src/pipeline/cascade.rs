@@ -2,9 +2,10 @@
 //! level from a top-to-bottom stream of base-level RGBA8 row bands with exact
 //! 2x2 block alignment and predictable working memory (`bytes`).
 
+use veldmap_core::tile::{RASTER_TILE_SIZE, grid_dim, tile_extent};
+
 use crate::RasterError;
 
-use super::pyramid::{self, RASTER_TILE_SIZE};
 use super::resample::halve_rgba8;
 
 /// Callback invoked whenever a cascade tile `(level, tx, ty, w, h, rgba8)`
@@ -130,9 +131,9 @@ impl Cascade {
         let expected_len = (nrows as usize)
             .checked_mul(width)
             .and_then(|px| px.checked_mul(4))
-            .ok_or_else(|| RasterError::InvalidFormat("cascade row slice size overflow".into()))?;
+            .ok_or_else(|| RasterError::Decode("cascade row slice size overflow".into()))?;
         if data.len() < expected_len {
-            return Err(RasterError::InvalidFormat(format!(
+            return Err(RasterError::Decode(format!(
                 "cascade level {} expected at least {expected_len} bytes for {nrows} rows, got {}",
                 self.bands[i].level,
                 data.len()
@@ -143,7 +144,7 @@ impl Cascade {
             let band = &mut self.bands[i];
             let take = (band.rows() - band.filled).min(nrows - fed);
             if take == 0 {
-                return Err(RasterError::InvalidFormat(format!(
+                return Err(RasterError::Decode(format!(
                     "cascade level {} received more rows than declared height {}",
                     band.level, band.height
                 )));
@@ -172,8 +173,8 @@ impl Cascade {
         }
 
         let ty = top / RASTER_TILE_SIZE;
-        for tx in 0..pyramid::grid_dim(width) {
-            let tw = pyramid::tile_extent(tx, width);
+        for tx in 0..grid_dim(width) {
+            let tw = tile_extent(tx, width);
             let mut tile = Vec::with_capacity((tw as usize) * (rows as usize) * 4);
             let buf = &self.bands[i].buf;
             for row in 0..rows as usize {

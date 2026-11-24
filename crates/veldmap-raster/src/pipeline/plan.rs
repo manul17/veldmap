@@ -6,11 +6,10 @@ use std::collections::HashSet;
 
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::tile::{
-    BandKey, PixelFormat, SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec,
+    BandKey, PixelFormat, SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec, level_count,
 };
 
 use super::grid::Grid;
-use super::pyramid;
 
 /// How one pyramid level is produced from its underlying source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,7 +175,7 @@ pub(crate) fn build_chunked_level_table(
 ) -> Vec<LevelPlan> {
     let base = (width, height);
     let whole_pixels = u64::from(width) * u64::from(height);
-    let count = pyramid::level_count(width, height).min(u32::from(u8::MAX));
+    let count = level_count(width, height).min(u32::from(u8::MAX));
 
     (0..count)
         .map(|lvl_u32| {

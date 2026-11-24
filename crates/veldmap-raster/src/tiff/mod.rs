@@ -17,20 +17,20 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{
-    BandKey, DecodedTile, PixelFormat, SourceFingerprint, SourceId, TileStreamSpec,
+    BandKey, DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, SourceId, TileScheme,
+    TileStreamSpec,
 };
 
 use crate::RasterError;
 use crate::pipeline::DecodeContext;
-use crate::pipeline::band::{BandInfo, RasterDescription, SampleType};
 use crate::pipeline::cascade::TileEmit;
 use crate::pipeline::driver::{self, DirectRead};
 use crate::pipeline::grid::{Grid, Overview};
+use crate::pipeline::metadata::{BandInfo, RasterDescription, SampleType};
 use crate::pipeline::plan::{LevelPlan, PyramidMeta, build_chunked_level_table};
-use crate::pipeline::pyramid::RASTER_TILE_SIZE;
 use crate::pipeline::radiometry::{DisplayMapping, PixelLayout};
 
-use chunk_reader::{ChunkReadMode, DecoderPool, TiffChunkReader};
+use chunk_reader::{ChunkReadMode, DecoderPool, TiffChunkReader, open_decoder};
 use georef::{ParsedGeoref, georef, parse_gdal_nodata};
 use stretch::{StretchCache, StretchRequest};
 use tags::{chunk_grid, depth_of_layout, ensure_readable, is_overview, map_tiff_error, opt_tag};
@@ -52,7 +52,7 @@ pub const MAX_IFDS: usize = 64;
 pub const MAX_SOURCE_SIDE: u32 = 65_536;
 
 /// Current display decode revision encoded into `TileKey` and `ChunkKey`.
-pub const TIFF_DECODE_REV: u32 = 1;
+pub(crate) const TIFF_DECODE_REV: u32 = 1;
 
 /// Canonical display stream spec shared across [`TiffSource::pyramid_meta`] and
 /// [`TiffChunkReader`].
@@ -78,16 +78,20 @@ fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
     limits
 }
 
-struct BaseFormat {
-    pixel_layout: PixelLayout,
-    sample_bits: u8,
-    sample_type: SampleType,
-    depth: u32,
+/// Compact sample-layout descriptor shared across TIFF overview scanning,
+/// chunk reading, and lazy display-mapping stretch computation.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TiffFormat {
+    pub(super) pixel_layout: PixelLayout,
+    pub(super) sample_bits: u8,
+    pub(super) sample_type: SampleType,
+    pub(super) depth: u32,
+    pub(super) nodata: Option<f32>,
 }
 
 fn scan_overviews(
     decoder: &mut Decoder<BufferedByteReader>,
-    base: &BaseFormat,
+    format: TiffFormat,
     budget: &MemoryBudget,
     cancel: &CancelToken,
 ) -> Result<(Vec<Overview>, usize, bool), RasterError> {
@@ -117,20 +121,15 @@ fn scan_overviews(
         }
         match ensure_readable(decoder, cancel) {
             Ok((o_layout, o_bits, o_type)) => {
-                if o_layout != base.pixel_layout
-                    || o_bits != base.sample_bits
-                    || o_type != base.sample_type
+                if o_layout != format.pixel_layout
+                    || o_bits != format.sample_bits
+                    || o_type != format.sample_type
                 {
                     continue;
                 }
             }
             Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
-            Err(_) => {
-                if cancel.is_cancelled() {
-                    return Err(RasterError::Cancelled);
-                }
-                continue;
-            }
+            Err(_) => continue,
         }
         let Ok((ow, oh)) = decoder.dimensions() else {
             if cancel.is_cancelled() {
@@ -142,7 +141,7 @@ fn scan_overviews(
             continue;
         }
         // `chunk_grid` checks `ensure_chunky` once per overview.
-        let ochunk = match chunk_grid(decoder, budget, base.depth, cancel) {
+        let ochunk = match chunk_grid(decoder, budget, format.depth, cancel) {
             Ok(c) => c,
             Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
             Err(_) => continue,
@@ -165,10 +164,8 @@ pub struct TiffSource {
     source_id: SourceId,
     description: RasterDescription,
     grid: Grid,
-    pixel_layout: PixelLayout,
+    format: TiffFormat,
     stats_ifd: usize,
-    nodata: Option<f32>,
-    sample_bits: u8,
     stretch: StretchCache,
 }
 
@@ -185,10 +182,7 @@ impl TiffSource {
             return Err(RasterError::Cancelled);
         }
         let limits = build_tiff_limits(budget);
-        let reader = BufferedByteReader::new(Arc::clone(&byte_source), cancel.clone());
-        let mut decoder = Decoder::new(reader)
-            .map_err(|e| map_tiff_error(e, cancel))?
-            .with_limits(limits.clone());
+        let mut decoder = open_decoder(&byte_source, &limits, cancel)?;
 
         let (width, height) = decoder
             .dimensions()
@@ -230,14 +224,15 @@ impl TiffSource {
             trouble: binding_trouble,
         } = georef(&mut decoder, width, height, cancel)?;
 
-        let base_fmt = BaseFormat {
+        let format = TiffFormat {
             pixel_layout,
             sample_bits,
             sample_type,
             depth,
+            nodata,
         };
         let (overviews, ifd_index, decoder_clean) =
-            scan_overviews(&mut decoder, &base_fmt, budget, cancel)?;
+            scan_overviews(&mut decoder, format, budget, cancel)?;
 
         let grid = Grid {
             tiled,
@@ -266,9 +261,9 @@ impl TiffSource {
             width,
             height,
             bands: vec![BandInfo::display(
-                sample_type,
-                pixel_layout.channels,
-                pixel_layout.has_alpha(),
+                format.sample_type,
+                format.pixel_layout.channels,
+                format.pixel_layout.has_alpha(),
                 nodata_f64,
             )],
             ties,
@@ -278,7 +273,8 @@ impl TiffSource {
             levels,
         };
 
-        let initial_mapping = (sample_bits <= 8).then(|| DisplayMapping::identity(nodata));
+        let initial_mapping =
+            (format.sample_bits <= 8).then(|| DisplayMapping::identity(format.nodata));
         let seed_decoder = decoder_clean.then_some((decoder, ifd_index));
 
         Ok(Self {
@@ -287,10 +283,8 @@ impl TiffSource {
             source_id: SourceId::from_fingerprint(&fingerprint),
             description,
             grid,
-            pixel_layout,
+            format,
             stats_ifd,
-            nodata,
-            sample_bits,
             stretch: StretchCache::new(initial_mapping),
         })
     }
@@ -345,14 +339,21 @@ impl TiffSource {
         &self.description.levels
     }
 
+    fn scheme(&self) -> TileScheme {
+        let max_level = self
+            .description
+            .levels
+            .len()
+            .saturating_sub(1)
+            .min(u8::MAX as usize) as u8;
+        TileScheme::RasterPyramid { max_level }
+    }
+
     fn display_mapping(&self, ctx: &DecodeContext<'_>) -> Result<DisplayMapping, RasterError> {
         self.stretch.get_or_compute(&StretchRequest {
             decoder_pool: &self.decoder_pool,
-            pixel_layout: self.pixel_layout,
+            format: self.format,
             stats_ifd: self.stats_ifd,
-            nodata: self.nodata,
-            sample_bits: self.sample_bits,
-            depth: self.grid.depth,
             budget_tracker: ctx.budget_tracker,
             cancel: ctx.cancel,
         })
@@ -374,13 +375,13 @@ impl TiffSource {
             ctx,
             &mut |_lvl, _x, _y, tw, th, rgba| {
                 let tile = DecodedTile::try_new(tw, th, PixelFormat::Rgba8UnormSrgb, rgba)
-                    .map_err(|e| RasterError::InvalidFormat(e.to_string()))?;
+                    .map_err(|e| RasterError::Decode(e.to_string()))?;
                 produced = Some(tile);
                 Ok(())
             },
         )?;
         produced.ok_or_else(|| RasterError::TileOutOfRange {
-            scheme: self.pyramid_meta().scheme(),
+            scheme: self.scheme(),
             level,
             x: tx,
             y: ty,
@@ -401,8 +402,7 @@ impl TiffSource {
         let mut reader = TiffChunkReader::new(
             &self.decoder_pool,
             self.source_id,
-            self.pixel_layout,
-            self.grid.depth,
+            self.format,
             mapping,
             ChunkReadMode::Pointwise {
                 chunk_cache: ctx.chunk_cache,
@@ -443,8 +443,7 @@ impl TiffSource {
         let mut reader = TiffChunkReader::new(
             &self.decoder_pool,
             self.source_id,
-            self.pixel_layout,
-            self.grid.depth,
+            self.format,
             mapping,
             ChunkReadMode::SequentialPass,
         );

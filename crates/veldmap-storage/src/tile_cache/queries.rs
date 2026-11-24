@@ -4,11 +4,11 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension, Params, Statement, Transaction, params};
 
-use super::key::EncodedKey;
+use super::key::{EncodedKey, TileBlobEncoding};
 
 /// Truncate-friendly deletion of all cached blobs and metadata.
-pub(super) const CLEAR_BLOBS_SQL: &str = "DELETE FROM tile_blobs";
-pub(super) const CLEAR_META_SQL: &str = "DELETE FROM tile_meta";
+const CLEAR_BLOBS_SQL: &str = "DELETE FROM tile_blobs";
+const CLEAR_META_SQL: &str = "DELETE FROM tile_meta";
 
 const SELECT_TILE_BLOB_SQL: &str = "SELECT m.tile_id, m.encoding, b.payload
      FROM tile_meta m
@@ -93,7 +93,7 @@ pub(super) fn select_tile_blob(
         .optional()
 }
 
-pub(super) fn select_meta_id_bytes(
+fn select_meta_id_bytes(
     tx: &Transaction<'_>,
     enc: &EncodedKey<'_>,
 ) -> Result<Option<(i64, i64)>, rusqlite::Error> {
@@ -102,7 +102,7 @@ pub(super) fn select_meta_id_bytes(
         .optional()
 }
 
-pub(super) fn upsert_tile_meta(
+fn upsert_tile_meta(
     tx: &Transaction<'_>,
     enc: &EncodedKey<'_>,
     encoding_raw: i64,
@@ -115,7 +115,7 @@ pub(super) fn upsert_tile_meta(
     })
 }
 
-pub(super) fn upsert_tile_blob(
+fn upsert_tile_blob(
     tx: &Transaction<'_>,
     tile_id: i64,
     payload: &[u8],
@@ -123,6 +123,28 @@ pub(super) fn upsert_tile_blob(
     let mut stmt = tx.prepare(UPSERT_BLOB_SQL)?;
     stmt.execute(params![tile_id, payload])?;
     Ok(())
+}
+
+pub(super) fn upsert_tile_in_tx(
+    tx: &Transaction<'_>,
+    enc: &EncodedKey<'_>,
+    encoding: TileBlobEncoding,
+    payload: &[u8],
+    ts_ms: i64,
+) -> Result<(i64, u64, u64), rusqlite::Error> {
+    let new_bytes = payload.len() as u64;
+    let prev_bytes = select_meta_id_bytes(tx, enc)?.map(|(_, sz)| sz);
+    let inserted_id =
+        upsert_tile_meta(tx, enc, i64::from(encoding as u8), new_bytes as i64, ts_ms)?;
+    upsert_tile_blob(tx, inserted_id, payload)?;
+
+    let old = prev_bytes.unwrap_or(0).max(0) as u64;
+    let count_delta = u64::from(prev_bytes.is_none());
+    let (current_total, current_count) = read_cache_meta_totals(tx)?;
+    let updated_total = current_total.saturating_sub(old).saturating_add(new_bytes);
+    let updated_count = current_count.saturating_add(count_delta);
+    set_cache_meta_totals(tx, updated_total, updated_count)?;
+    Ok((inserted_id, updated_total, updated_count))
 }
 
 pub(super) fn flush_touches_in_tx(
@@ -142,10 +164,22 @@ pub(super) fn flush_touches_in_tx(
     Ok(())
 }
 
-pub(super) fn delete_meta_by_id(tx: &Transaction<'_>, tile_id: i64) -> Result<(), rusqlite::Error> {
+fn delete_meta_by_id(tx: &Transaction<'_>, tile_id: i64) -> Result<(), rusqlite::Error> {
     let mut stmt = tx.prepare(DELETE_META_BY_ID_SQL)?;
     stmt.execute(params![tile_id])?;
     Ok(())
+}
+
+pub(super) fn delete_tile_in_tx(
+    tx: &Transaction<'_>,
+    enc: &EncodedKey<'_>,
+) -> Result<Option<i64>, rusqlite::Error> {
+    let Some((tile_id, sz)) = select_meta_id_bytes(tx, enc)? else {
+        return Ok(None);
+    };
+    delete_meta_by_id(tx, tile_id)?;
+    decrement_cache_meta(tx, sz, 1)?;
+    Ok(Some(tile_id))
 }
 
 pub(super) fn delete_meta_ids(
@@ -162,7 +196,7 @@ pub(super) fn delete_meta_ids(
     Ok(())
 }
 
-pub(super) fn delete_source_meta(
+fn delete_source_meta(
     tx: &Transaction<'_>,
     source_key: &str,
 ) -> Result<(Vec<i64>, i64), rusqlite::Error> {
@@ -178,6 +212,26 @@ pub(super) fn delete_source_meta(
         removed_bytes = removed_bytes.saturating_add(byte_size.max(0));
     }
     Ok((ids, removed_bytes))
+}
+
+pub(super) fn clear_source_in_tx(
+    tx: &Transaction<'_>,
+    source_key: &str,
+) -> Result<Vec<i64>, rusqlite::Error> {
+    let (ids, removed_bytes) = delete_source_meta(tx, source_key)?;
+    if !ids.is_empty() {
+        decrement_cache_meta(tx, removed_bytes, ids.len() as i64)?;
+    }
+    Ok(ids)
+}
+
+pub(super) fn clear_all_in_tx(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    // Delete blobs first to avoid per-row cascade work and allow SQLite's
+    // table-truncate optimization.
+    tx.execute(CLEAR_BLOBS_SQL, [])?;
+    tx.execute(CLEAR_META_SQL, [])?;
+    reset_cache_meta(tx)?;
+    Ok(())
 }
 
 fn collect_evict_rows(
@@ -232,7 +286,7 @@ pub(super) fn set_cache_meta_totals(
     Ok(())
 }
 
-pub(super) fn decrement_cache_meta(
+fn decrement_cache_meta(
     tx: &Transaction<'_>,
     removed_bytes: i64,
     removed_count: i64,
@@ -242,7 +296,7 @@ pub(super) fn decrement_cache_meta(
     Ok(())
 }
 
-pub(super) fn reset_cache_meta(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+fn reset_cache_meta(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     let mut stmt = tx.prepare(RESET_CACHE_META_SQL)?;
     stmt.execute([])?;
     Ok(())

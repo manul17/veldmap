@@ -21,14 +21,14 @@ use crate::gpu_tiles::UploadSender;
 pub const BUNDLED_BASEMAP_CONFIG: BundledBasemapConfig = BundledBasemapConfig::DEFAULT;
 
 /// Default tile size in pixels for the bundled offline global basemap.
-pub(crate) const BUNDLED_TILE_PX: u32 = BUNDLED_BASEMAP_CONFIG.tile_px;
+pub(super) const BUNDLED_TILE_PX: u32 = BUNDLED_BASEMAP_CONFIG.tile_px;
 
 /// Maximum `Geodetic` / `WebMercator` zoom level served by the bundled offline
 /// NASA Blue Marble Next Generation asset (`3600 x 1800`).
 pub const BUNDLED_MAX_LEVEL: u8 = BUNDLED_BASEMAP_CONFIG.max_level;
 
 /// Maximum `PolarCap` zoom level served by the bundled offline basemap.
-pub(crate) const BUNDLED_POLAR_MAX_LEVEL: u8 = BUNDLED_BASEMAP_CONFIG.polar_max_level;
+pub(super) const BUNDLED_POLAR_MAX_LEVEL: u8 = BUNDLED_BASEMAP_CONFIG.polar_max_level;
 
 /// Embedded public-domain NASA Blue Marble Next Generation equirectangular
 /// global basemap (`3600 x 1800` JPEG, see `assets/README.md`).
@@ -64,7 +64,7 @@ impl Drop for InFlightGuard {
 
 /// Virtual offline `z = 0..3` Geodetic/WebMercator + `z = 0` PolarCap basemap
 /// tile provider scheduled onto the shared `veldmap-raster` [`DecodePoolHandle`].
-pub(crate) struct BundledBasemapProvider {
+pub(super) struct BundledBasemapProvider {
     pool: DecodePoolHandle,
     done_tx: UploadSender,
     wakeup: Wakeup,
@@ -75,7 +75,7 @@ pub(crate) struct BundledBasemapProvider {
 
 impl BundledBasemapProvider {
     /// Create a lazy bundled offline basemap provider backed by `pool`.
-    pub(crate) fn new(
+    pub(super) fn new(
         pool: DecodePoolHandle,
         done_tx: UploadSender,
         wakeup: Wakeup,
@@ -91,22 +91,22 @@ impl BundledBasemapProvider {
         }
     }
 
-    pub(crate) fn in_flight_count(&self) -> usize {
+    pub(super) fn in_flight_count(&self) -> usize {
         lock_unpoisoned(&self.state).in_flight.len()
     }
 
-    pub(crate) fn is_in_flight(&self, key: &TileKey) -> bool {
+    pub(super) fn is_in_flight(&self, key: &TileKey) -> bool {
         lock_unpoisoned(&self.state).in_flight.contains_key(key)
     }
 
     #[cfg(test)]
-    pub(crate) fn is_basemap_decoded(&self) -> bool {
+    pub(super) fn is_basemap_decoded(&self) -> bool {
         self.basemap.get().is_some()
     }
 
     /// Submit `key` to the shared decode pool if not already in flight or
     /// terminally failed. Returns `true` if a new job was admitted.
-    pub(crate) fn request(&self, key: TileKey) -> bool {
+    pub(super) fn request(&self, key: TileKey) -> bool {
         if self.shutdown.is_cancelled() {
             return false;
         }
@@ -187,7 +187,7 @@ impl BundledBasemapProvider {
 
     /// Cancel and clear in-flight markers for tiles that are already satisfied
     /// (`is_satisfied`), failed terminally, or are no longer requested.
-    pub(crate) fn reconcile<F>(&self, wanted: &HashSet<TileKey>, is_satisfied: F)
+    pub(super) fn reconcile<F>(&self, wanted: &HashSet<TileKey>, is_satisfied: F)
     where
         F: Fn(&TileKey) -> bool,
     {
@@ -225,7 +225,7 @@ impl BundledBasemapProvider {
     /// Pre-seed the coarsest root tiles (`scheme z = 0` + North/South
     /// `PolarCap z = 0`) so the entire planet renders immediately on startup
     /// and offline fallback stays warm.
-    pub(crate) fn seed_roots(&self, scheme: GlobeScheme) {
+    pub(super) fn seed_roots(&self, scheme: GlobeScheme) {
         let planetary = scheme.into_planetary();
         if let Some((cols, rows)) = planetary.grid_dims(0) {
             for y in 0..rows {
@@ -256,7 +256,7 @@ impl BundledBasemapProvider {
     }
 
     /// Cancel all currently in-flight bundled tile jobs.
-    pub(crate) fn cancel_all(&self) {
+    pub(super) fn cancel_all(&self) {
         let tokens: Vec<CancelToken> = {
             let mut st = lock_unpoisoned(&self.state);
             st.in_flight.drain().map(|(_, (_, tok))| tok).collect()

@@ -155,7 +155,7 @@ fn decode_limited_for_target(
 /// Decode a PNG or JPEG image into tightly packed `Rgba8UnormSrgb` pixels
 /// while bounding both decoder working set and RGBA8 output within
 /// `max_alloc_bytes`.
-pub(crate) fn decode_rgba8_limited(
+fn decode_rgba8_limited(
     bytes: &[u8],
     max_dim: u32,
     max_alloc_bytes: u64,
@@ -174,7 +174,7 @@ pub(crate) fn decode_rgba8_limited(
 /// Decode an opaque PNG or JPEG image directly into tightly packed `Rgb8`
 /// bytes while bounding peak memory (including any non-RGB8 conversion buffer)
 /// within `max_alloc_bytes`.
-pub(crate) fn decode_rgb8_limited(
+pub(super) fn decode_rgb8_limited(
     bytes: &[u8],
     max_dim: u32,
     max_alloc_bytes: u64,

@@ -32,7 +32,7 @@ impl InFlightGuard {
 
     /// Atomically apply a terminal state transition under `state`'s mutex,
     /// unconditionally disarm this guard (preventing any duplicate lock/notify
-    /// on drop), and notify the dispatcher iff `Transition::notify` is set.
+    /// on drop), and notify the dispatcher iff the transition was applied.
     pub(super) fn finish(
         mut self,
         f: impl FnOnce(&mut PipelineState, TileKey, u64) -> Transition,
@@ -42,7 +42,7 @@ impl InFlightGuard {
             f(&mut st, self.key, self.generation)
         };
         self.armed = false;
-        if transition.notify {
+        if transition.is_applied() {
             self.shared.notify.notify_one();
         }
         transition

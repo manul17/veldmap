@@ -14,9 +14,10 @@ use crate::gpu_tiles::UploadChannelClosed;
 use crate::render::GlobeRenderer;
 use crate::scene::SceneState;
 use crate::storage::AppStorage;
-use crate::ui::basemap::{self as basemap_ui, BasemapUiAction, BasemapUiState};
+use crate::ui::basemap::{BasemapUiAction, BasemapUiState};
 use crate::ui::hud;
-use crate::ui::toolbar::{self, GoToBarState};
+use crate::ui::show_settings_window;
+use crate::ui::toolbar::{self, GoToBarState, ToolbarAction, ToolbarInputs};
 use crate::viewport_bridge::{GlobePaintCallback, viewport_pixels};
 
 /// Logical scroll points mapped to one discrete globe zoom notch.
@@ -138,43 +139,48 @@ impl VeldmapApp {
         })
     }
 
-    fn apply_basemap_actions(&mut self, actions: Vec<BasemapUiAction>) -> (bool, bool) {
-        let mut scene_changed = false;
+    fn apply_basemap_action(&mut self, action: BasemapUiAction) -> bool {
         let mut needs_repaint = false;
-        for action in actions {
-            match action {
-                BasemapUiAction::SelectBasemap(selection) => {
-                    scene_changed |= self
-                        .storage
-                        .mutate_settings(|s| s.active_basemap = selection);
-                    scene_changed |= self.scene.sync_basemap_settings(self.storage.settings());
-                    // Preserve unsaved edits in an open Settings window; only
-                    // synchronize the active selection field.
-                    self.basemap_ui
-                        .set_draft_active_basemap(self.storage.settings().active_basemap);
-                }
-                BasemapUiAction::ApplyDraft(draft) => {
-                    scene_changed |= self.storage.mutate_settings(|s| draft.apply_into(s));
-                    scene_changed |= self.scene.sync_basemap_settings(self.storage.settings());
-                    self.basemap_ui.sync_from_settings(self.storage.settings());
-                }
-                BasemapUiAction::SettingsOpened => {
-                    self.storage.maybe_refresh_disk_stats(true);
-                }
-                BasemapUiAction::ClearDiskCache => {
-                    self.storage.request_clear_disk_cache();
-                    needs_repaint = true;
-                }
-                BasemapUiAction::ClearDiskCacheNotice => {
-                    self.storage.clear_disk_cache_notice();
-                }
-                BasemapUiAction::RetryLive => {
-                    self.scene.retry_live_and_reconcile();
-                    needs_repaint = true;
-                }
+        match action {
+            BasemapUiAction::SelectBasemap(selection) => {
+                needs_repaint |= self
+                    .storage
+                    .mutate_settings(|s| s.active_basemap = selection);
+                needs_repaint |= self.scene.sync_basemap_settings(self.storage.settings());
+                // Preserve unsaved edits in an open Settings window; only
+                // synchronize the active selection field.
+                self.basemap_ui
+                    .set_draft_active_basemap(self.storage.settings().active_basemap);
+            }
+            BasemapUiAction::ApplyDraft(draft) => {
+                needs_repaint |= self.storage.mutate_settings(|s| draft.apply_into(s));
+                needs_repaint |= self.scene.sync_basemap_settings(self.storage.settings());
+                self.basemap_ui.sync_from_settings(self.storage.settings());
+            }
+            BasemapUiAction::SettingsOpened => {
+                self.storage.maybe_refresh_disk_stats(true);
+            }
+            BasemapUiAction::ClearDiskCache => {
+                self.storage.request_clear_disk_cache();
+                needs_repaint = true;
+            }
+            BasemapUiAction::ClearDiskCacheNotice => {
+                self.storage.clear_disk_cache_notice();
+            }
+            BasemapUiAction::RetryLive => {
+                self.scene.retry_live_and_reconcile();
+                needs_repaint = true;
             }
         }
-        (scene_changed, needs_repaint)
+        needs_repaint
+    }
+
+    fn apply_basemap_actions(&mut self, actions: Vec<BasemapUiAction>) -> bool {
+        let mut needs_repaint = false;
+        for action in actions {
+            needs_repaint |= self.apply_basemap_action(action);
+        }
+        needs_repaint
     }
 
     fn probe_pointer(&self, rect: egui::Rect, pos: egui::Pos2) -> Option<(f64, f64)> {
@@ -325,42 +331,51 @@ impl eframe::App for VeldmapApp {
         }
 
         // Top toolbar and Settings window.
-        let mut scene_changed = false;
         let basemap_status = self.scene.basemap_status();
-        let (toolbar_actions, graticule_toggled) = toolbar::show_top_toolbar(
+        let toolbar_actions = toolbar::show_top_toolbar(
             ui,
-            &mut self.camera,
+            ToolbarInputs {
+                settings: self.storage.settings(),
+                basemap_status: &basemap_status,
+                adapter_label: &self.adapter_label,
+            },
             &mut self.goto_bar,
-            self.storage.settings(),
-            &basemap_status,
             &mut self.basemap_ui,
-            &self.adapter_label,
         );
-        let (tb_changed, tb_repaint) = self.apply_basemap_actions(toolbar_actions);
-        scene_changed |= tb_changed;
-        needs_repaint |= tb_repaint;
-
-        if let Some(show_graticule) = graticule_toggled
-            && self
-                .storage
-                .mutate_settings(|s| s.show_graticule = show_graticule)
-        {
-            self.scene.mark_dirty();
-            scene_changed = true;
+        for action in toolbar_actions {
+            match action {
+                ToolbarAction::FocusLocation(loc) => {
+                    tracing::info!(
+                        lat = loc.lat_deg,
+                        lon = loc.lon_deg,
+                        radius_deg = loc.radius_deg,
+                        kind = ?loc.kind,
+                        "Flying camera to parsed location"
+                    );
+                    self.camera.focus(loc.lat_deg, loc.lon_deg, loc.radius_deg);
+                    needs_repaint = true;
+                }
+                ToolbarAction::SetGraticule(show_graticule) => {
+                    needs_repaint |= self
+                        .storage
+                        .mutate_settings(|s| s.show_graticule = show_graticule);
+                }
+                ToolbarAction::Basemap(basemap_action) => {
+                    needs_repaint |= self.apply_basemap_action(basemap_action);
+                }
+            }
         }
 
         if self.basemap_ui.is_settings_open() {
             self.storage.maybe_refresh_disk_stats(false);
             let disk_status = self.storage.disk_cache_status();
-            let settings_actions = basemap_ui::show_settings_window(
+            let settings_actions = show_settings_window(
                 &ctx,
                 self.storage.settings(),
                 &disk_status,
                 &mut self.basemap_ui,
             );
-            let (st_changed, st_repaint) = self.apply_basemap_actions(settings_actions);
-            scene_changed |= st_changed;
-            needs_repaint |= st_repaint;
+            needs_repaint |= self.apply_basemap_actions(settings_actions);
         }
 
         self.update_cursor_probe(&ctx);
@@ -403,7 +418,6 @@ impl eframe::App for VeldmapApp {
         if self.camera.is_flying()
             || self.camera != camera_before
             || self.last_viewport_rect != rect_before
-            || scene_changed
             || needs_repaint
             || upload_report.remaining_ready > 0
             || (upload_report.uploaded > 0 && upload_report.deferred_protected > 0)

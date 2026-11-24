@@ -254,7 +254,7 @@ impl TileKey {
     /// `None` if `ancestor` is not a valid ancestor of `self`, differs in
     /// source/scheme/stream_spec, or if `gutter != 0` (guttered tiles and
     /// clipped `RasterPyramid` edge tiles should resolve carriers via
-    /// `TileCache::find_carrier` and compute UVs via [`super::pyramid::cell_uv`]).
+    /// `TileCache::find_carrier` and compute UVs via [`super::cell_uv`]).
     pub fn sub_rect_in_ancestor(&self, ancestor: &Self) -> Option<[f32; 4]> {
         if self.source != ancestor.source
             || self.scheme != ancestor.scheme
@@ -274,6 +274,18 @@ impl TileKey {
             return None;
         }
         Some(sub_rect_for_shift(self.x, self.y, dz))
+    }
+}
+
+impl StreamKey {
+    /// Extract the [`StreamKey`] identifying `key`'s band/format/gutter stream.
+    pub const fn from_tile_key(key: &TileKey) -> Self {
+        Self {
+            source: key.source,
+            band: key.band,
+            format: key.format,
+            gutter: key.gutter,
+        }
     }
 }
 

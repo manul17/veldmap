@@ -1,5 +1,7 @@
 use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
 
+use crate::pipeline::plan::LevelPlan;
+
 use super::*;
 
 fn sample_meta(source: SourceId, pointwise_prefix: usize, total_levels: usize) -> PyramidMeta {

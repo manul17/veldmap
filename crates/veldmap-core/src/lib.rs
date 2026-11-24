@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+pub use glam;
+
 pub const APP_NAME: &str = "VeldMap";
 
 pub mod budget;

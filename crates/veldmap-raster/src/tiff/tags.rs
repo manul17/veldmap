@@ -7,8 +7,8 @@ use veldmap_core::io::{BufferedByteReader, IoError};
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
-use crate::pipeline::band::SampleType;
 use crate::pipeline::grid;
+use crate::pipeline::metadata::SampleType;
 use crate::pipeline::peak::DecodePeak;
 use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples};
 
@@ -32,15 +32,29 @@ pub(super) fn map_tiff_error(err: tiff::TiffError, cancel: &CancelToken) -> Rast
             Err(io_err) => RasterError::from(IoError::Io(io_err)),
         },
         tiff::TiffError::LimitsExceeded => RasterError::DecoderLimitsExceeded(err.to_string()),
-        other => RasterError::Tiff(other.to_string()),
+        other => RasterError::Decode(other.to_string()),
     }
 }
 
-pub(super) fn is_missing_tag(err: &tiff::TiffError) -> bool {
+fn is_missing_tag(err: &tiff::TiffError) -> bool {
     matches!(
         err,
         tiff::TiffError::FormatError(tiff::TiffFormatError::RequiredTagNotFound(_))
     )
+}
+
+/// Convert an optional TIFF tag read into `Option<T>`, treating only a missing
+/// tag (`RequiredTagNotFound`) as `Ok(None)` and propagating all other format,
+/// I/O, or cancellation errors.
+fn opt_tag_strict<T>(
+    res: Result<T, tiff::TiffError>,
+    cancel: &CancelToken,
+) -> Result<Option<T>, RasterError> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(err) if is_missing_tag(&err) => Ok(None),
+        Err(err) => Err(map_tiff_error(err, cancel)),
+    }
 }
 
 /// Convert an optional TIFF tag read into `Option<T>`, propagating cancellation
@@ -64,50 +78,42 @@ pub(super) fn is_overview(subfile_type: u32) -> bool {
     subfile_type & REDUCED != 0 && subfile_type & MASK == 0
 }
 
-pub(super) fn ensure_chunky(
+fn ensure_chunky(
     decoder: &mut Decoder<BufferedByteReader>,
     cancel: &CancelToken,
 ) -> Result<(), RasterError> {
-    let planar = match decoder.get_tag_unsigned::<u16>(Tag::PlanarConfiguration) {
-        Ok(v) => v,
-        Err(err) if is_missing_tag(&err) => 1,
-        Err(err) => return Err(map_tiff_error(err, cancel)),
-    };
+    let planar = opt_tag_strict(
+        decoder.get_tag_unsigned::<u16>(Tag::PlanarConfiguration),
+        cancel,
+    )?
+    .unwrap_or(1);
     if planar != 1 {
-        return Err(RasterError::Tiff(
+        return Err(RasterError::Decode(
             "planar sample layout (PlanarConfiguration != 1) is not supported yet".to_string(),
         ));
     }
     Ok(())
 }
 
-pub(super) fn model(
+fn model(
     decoder: &mut Decoder<BufferedByteReader>,
     color: tiff::ColorType,
     cancel: &CancelToken,
-) -> Result<(PixelLayout, u8, SampleType), RasterError> {
+) -> Result<(PixelLayout, u8), RasterError> {
     match color {
-        tiff::ColorType::Gray(bits) => {
-            Ok((PixelLayout::named(1), bits, sample_type_from_bits(bits)?))
-        }
-        tiff::ColorType::RGB(bits) => {
-            Ok((PixelLayout::named(3), bits, sample_type_from_bits(bits)?))
-        }
-        tiff::ColorType::RGBA(bits) => {
-            Ok((PixelLayout::named(4), bits, sample_type_from_bits(bits)?))
-        }
+        tiff::ColorType::Gray(bits) => Ok((PixelLayout::named(1), bits)),
+        tiff::ColorType::RGB(bits) => Ok((PixelLayout::named(3), bits)),
+        tiff::ColorType::RGBA(bits) => Ok((PixelLayout::named(4), bits)),
         tiff::ColorType::Multiband {
             bit_depth,
             num_samples,
         } => {
-            let photometric = match decoder.get_tag_unsigned::<u16>(Tag::PhotometricInterpretation)
-            {
-                Ok(v) => Some(v),
-                Err(err) if is_missing_tag(&err) => None,
-                Err(err) => return Err(map_tiff_error(err, cancel)),
-            };
+            let photometric = opt_tag_strict(
+                decoder.get_tag_unsigned::<u16>(Tag::PhotometricInterpretation),
+                cancel,
+            )?;
             if photometric == Some(0) && num_samples > 1 {
-                return Err(RasterError::Tiff(
+                return Err(RasterError::Decode(
                     "WhiteIsZero with multiple samples is not supported".to_string(),
                 ));
             }
@@ -121,21 +127,22 @@ pub(super) fn model(
             } else {
                 PixelLayout::stack(usize::from(num_samples))
             };
-            Ok((layout, bit_depth, sample_type_from_bits(bit_depth)?))
+            Ok((layout, bit_depth))
         }
-        other => Err(RasterError::Tiff(format!(
+        other => Err(RasterError::Decode(format!(
             "color model {other:?} is not supported"
         ))),
     }
 }
 
-pub(super) fn sample_type_from_bits(bits: u8) -> Result<SampleType, RasterError> {
-    match bits {
-        8 => Ok(SampleType::U8),
-        16 => Ok(SampleType::U16),
-        32 => Ok(SampleType::F32),
-        other => Err(RasterError::Tiff(format!(
-            "unsupported sample bit depth {other}"
+pub(super) fn resolve_sample_type(sample_format: u16, bits: u8) -> Result<SampleType, RasterError> {
+    match (sample_format, bits) {
+        (1, 8) => Ok(SampleType::U8),
+        (1, 16) => Ok(SampleType::U16),
+        (2, 16) => Ok(SampleType::I16),
+        (3, 32) => Ok(SampleType::F32),
+        _ => Err(RasterError::Decode(format!(
+            "unsupported TIFF sample format ({sample_format}, {bits}-bit)"
         ))),
     }
 }
@@ -153,7 +160,10 @@ pub(super) fn chunk_grid(
     ensure_chunky(decoder, cancel)?;
     let (cw, ch) = decoder.chunk_dimensions();
     if cw == 0 || ch == 0 {
-        return Err(RasterError::Tiff("zero TIFF chunk dimensions".to_string()));
+        return Err(RasterError::InvalidDimensions {
+            width: cw,
+            height: ch,
+        });
     }
     DecodePeak::new()
         .with(
@@ -169,12 +179,9 @@ pub(super) fn ensure_readable(
     cancel: &CancelToken,
 ) -> Result<(PixelLayout, u8, SampleType), RasterError> {
     let color = decoder.colortype().map_err(|e| map_tiff_error(e, cancel))?;
-    let (layout, bits, mut stype) = model(decoder, color, cancel)?;
+    let (layout, bits) = model(decoder, color, cancel)?;
     ensure_decodable(decoder, cancel)?;
-    let sample_format = ensure_sampled(decoder, bits, cancel)?;
-    if sample_format == 2 && bits == 16 {
-        stype = SampleType::I16;
-    }
+    let stype = read_sample_type(decoder, bits, cancel)?;
     Ok((layout, bits, stype))
 }
 
@@ -182,39 +189,35 @@ fn ensure_decodable(
     decoder: &mut Decoder<BufferedByteReader>,
     cancel: &CancelToken,
 ) -> Result<(), RasterError> {
-    let code = match decoder.get_tag_unsigned::<u16>(Tag::Compression) {
-        Ok(code) => code,
-        Err(err) if is_missing_tag(&err) => 1,
-        Err(err) => return Err(map_tiff_error(err, cancel)),
-    };
+    let code =
+        opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Compression), cancel)?.unwrap_or(1);
     if DECODED_COMPRESSIONS.contains(&code) {
         return Ok(());
     }
-    Err(RasterError::Tiff(format!(
+    Err(RasterError::Decode(format!(
         "unsupported TIFF compression code {code}"
     )))
 }
 
-fn ensure_sampled(
+fn read_sample_type(
     decoder: &mut Decoder<BufferedByteReader>,
     bits: u8,
     cancel: &CancelToken,
-) -> Result<u16, RasterError> {
-    let format = match decoder.get_tag_u16_vec(Tag::SampleFormat) {
-        Ok(formats) => formats.first().copied().unwrap_or(1),
-        Err(err) if is_missing_tag(&err) => 1,
-        Err(err) => match decoder.get_tag_unsigned::<u16>(Tag::SampleFormat) {
-            Ok(v) => v,
-            Err(inner) if is_missing_tag(&inner) => 1,
-            Err(_) => return Err(map_tiff_error(err, cancel)),
-        },
+) -> Result<SampleType, RasterError> {
+    let format = match opt_tag_strict(decoder.get_tag_u16_vec(Tag::SampleFormat), cancel) {
+        Ok(Some(formats)) => formats.first().copied().unwrap_or(1),
+        Ok(None) => 1,
+        Err(err) if err.is_cancelled() => return Err(err),
+        Err(err) => {
+            match opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::SampleFormat), cancel) {
+                Ok(Some(v)) => v,
+                Ok(None) => 1,
+                Err(inner) if inner.is_cancelled() => return Err(inner),
+                Err(_) => return Err(err),
+            }
+        }
     };
-    if matches!((format, bits), (1, 8) | (1, 16) | (2, 16) | (3, 32)) {
-        return Ok(format);
-    }
-    Err(RasterError::Tiff(format!(
-        "unsupported TIFF sample format ({format}, {bits}-bit)"
-    )))
+    resolve_sample_type(format, bits)
 }
 
 pub(super) fn typed_samples(data: &DecodingResult) -> Result<Samples<'_>, RasterError> {
@@ -223,7 +226,7 @@ pub(super) fn typed_samples(data: &DecodingResult) -> Result<Samples<'_>, Raster
         DecodingResult::U16(v) => Ok(Samples::U16(v)),
         DecodingResult::I16(v) => Ok(Samples::I16(v)),
         DecodingResult::F32(v) => Ok(Samples::F32(v)),
-        other => Err(RasterError::Tiff(format!(
+        other => Err(RasterError::Decode(format!(
             "unsupported TIFF decoded buffer variant ({other:?})"
         ))),
     }
@@ -241,7 +244,7 @@ pub(super) fn chunk_rgba(
     if rgba.len() == pixels * 4 {
         Ok(rgba)
     } else {
-        Err(RasterError::Tiff(format!(
+        Err(RasterError::Decode(format!(
             "chunk {dw}x{dh} decoded {} pixels instead of {pixels}",
             rgba.len() / 4
         )))

@@ -3,11 +3,10 @@
 //! `Footprint`, `Region`, `region_of`).
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::tile::PixelFormat;
+use veldmap_core::tile::{PixelFormat, RASTER_TILE_SIZE, level_size};
 
 use super::cascade;
 use super::peak::DecodePeak;
-use super::pyramid::{self, RASTER_TILE_SIZE};
 use super::resample::Window;
 
 /// Minimum chunk pixel area eligible for pointwise random access.
@@ -30,8 +29,8 @@ pub(crate) fn chunk_working_bytes(
 /// Cost of reading one tile at a pointwise level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Footprint {
-    pub(crate) image: usize,
-    pub(crate) region_pixels: u64,
+    image: usize,
+    region_pixels: u64,
     pub(crate) held_pixels: u64,
 }
 
@@ -99,8 +98,8 @@ impl Grid {
         if base.0 == 0 || base.1 == 0 {
             return None;
         }
-        let lw = pyramid::level_size(base.0, u32::from(level)).max(1);
-        let lh = pyramid::level_size(base.1, u32::from(level)).max(1);
+        let lw = level_size(base.0, u32::from(level)).max(1);
+        let lh = level_size(base.1, u32::from(level)).max(1);
         let (image, sw, sh) = self.source_for(base, lw, lh);
         if sw == 0 || sh == 0 {
             return None;
@@ -138,7 +137,7 @@ impl Grid {
     }
 
     /// Peak memory of decoding one fresh chunk `(cw, ch)` before expansion.
-    pub(crate) fn chunk_bytes(&self, chunk: (u32, u32)) -> u64 {
+    fn chunk_bytes(&self, chunk: (u32, u32)) -> u64 {
         chunk_working_bytes(chunk.0, chunk.1, self.depth, true)
     }
 
@@ -156,7 +155,7 @@ impl Grid {
     /// Estimated per-operation working memory peak for pointwise reading at
     /// `level`.
     #[cfg(test)]
-    pub(crate) fn direct_peak(
+    fn direct_peak(
         &self,
         base: (u32, u32),
         level: u8,
@@ -181,7 +180,7 @@ impl Grid {
     }
 }
 
-pub(crate) fn spanned(side: u64, chunk: u32, source: u32, aligned: bool) -> u64 {
+fn spanned(side: u64, chunk: u32, source: u32, aligned: bool) -> u64 {
     if side == 0 {
         return 0;
     }
@@ -198,25 +197,21 @@ pub(crate) fn spanned(side: u64, chunk: u32, source: u32, aligned: bool) -> u64 
 }
 
 /// Exact rational `(num, den)` source pixels per level-`level` texel along `(x, y)`
-/// matching `pyramid::cell_uv`'s `2^level` base-pixel stride across exact, `ceil`,
-/// and GDAL `floor` overviews.
-pub(crate) fn source_scale(
-    base: (u32, u32),
-    source: (u32, u32),
-    level: u8,
-) -> ((u128, u128), (u128, u128)) {
+/// matching `veldmap_core::tile::cell_uv`'s `2^level` base-pixel stride across
+/// exact, `ceil`, and GDAL `floor` overviews.
+fn source_scale(base: (u32, u32), source: (u32, u32), level: u8) -> ((u128, u128), (u128, u128)) {
     let (bw, bh) = base;
     let (sw, sh) = source;
     let lvl = u32::from(level).min(62);
-    let lw = pyramid::level_size(bw, lvl).max(1);
-    let lh = pyramid::level_size(bh, lvl).max(1);
+    let lw = level_size(bw, lvl).max(1);
+    let lh = level_size(bh, lvl).max(1);
 
     if sw == lw && sh == lh {
         return ((1, 1), (1, 1));
     }
 
     for k in 0..=lvl {
-        if sw == pyramid::level_size(bw, k) && sh == pyramid::level_size(bh, k) {
+        if sw == level_size(bw, k) && sh == level_size(bh, k) {
             let stride = 1u128 << (lvl - k);
             return ((stride, 1), (stride, 1));
         }

@@ -6,7 +6,8 @@ use std::sync::{Arc, OnceLock, mpsc};
 use veldmap_app::basemap_policy::BasemapCarrierPolicy;
 use veldmap_app::gpu_tiles::GpuTileCache;
 use veldmap_app::render::{
-    DrawSnapshot, GlobeRenderer, RenderParams, SnapshotBuildParams, clamp_to_primary_backends,
+    DrawSnapshot, GlobeRenderer, RenderParams, SnapshotBuildParams, TileCarrierPolicy,
+    clamp_to_primary_backends,
 };
 use veldmap_app::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG};
 use veldmap_core::geo::camera::Camera;
@@ -92,6 +93,7 @@ pub(crate) fn build_snapshot(
     cache: Option<&mut GpuTileCache>,
 ) -> Arc<DrawSnapshot> {
     let policy = BasemapCarrierPolicy::new(active_source);
+    let carrier = cache.map(|gpu_cache| (&policy as &dyn TileCarrierPolicy, gpu_cache));
     Arc::new(DrawSnapshot::build(
         SnapshotBuildParams {
             camera,
@@ -99,10 +101,9 @@ pub(crate) fn build_snapshot(
             height_px,
             pixels_per_point: 1.0,
             show_graticule,
-            carrier_policy: &policy,
             config,
         },
-        cache,
+        carrier,
     ))
 }
 

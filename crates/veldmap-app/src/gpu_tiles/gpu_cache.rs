@@ -2,8 +2,13 @@
 //! (`GpuTileCache`).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use veldmap_core::tile::{DecodedTile, PixelFormat, SourceId, TileCache, TileKey};
+
+/// Process-global monotonic tile ID generator preventing cross-cache `tile_id`
+/// collisions when multiple [`GpuTileCache`] instances feed a shared renderer.
+static NEXT_TILE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Immutable GPU-resident tile resource.
 pub struct GpuTile {
@@ -50,7 +55,7 @@ fn wgpu_format(format: PixelFormat) -> wgpu::TextureFormat {
 /// Outcome of attempting to upload and admit a decoded tile into
 /// [`GpuTileCache`] under active-frame protection.
 #[derive(Debug)]
-pub enum UploadInsertOutcome {
+pub(super) enum UploadInsertOutcome {
     /// Tile was uploaded and admitted into VRAM.
     Inserted { tile: Arc<GpuTile>, evicted: usize },
     /// Tile is valid and fits the cache ceiling, but all evictable entries are
@@ -64,7 +69,6 @@ pub enum UploadInsertOutcome {
 /// VRAM-budgeted LRU cache of immutable `Arc<GpuTile>` textures.
 pub struct GpuTileCache {
     cache: TileCache<TileKey, Arc<GpuTile>>,
-    next_tile_id: u64,
 }
 
 impl GpuTileCache {
@@ -72,7 +76,6 @@ impl GpuTileCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             cache: TileCache::new(max_bytes),
-            next_tile_id: 1,
         }
     }
 
@@ -155,7 +158,7 @@ impl GpuTileCache {
     /// Validate and upload a CPU-decoded tile (with full optional mip chain)
     /// into GPU memory while refusing to evict any cached tile for which
     /// `is_protected(&k)` returns `true` (active-frame protection).
-    pub fn upload_and_insert_protecting<F>(
+    pub(super) fn upload_and_insert_protecting<F>(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -206,8 +209,7 @@ impl GpuTileCache {
         let Some((texture, view)) = upload_tile_texture(device, queue, decoded) else {
             return UploadInsertOutcome::Rejected;
         };
-        let tile_id = self.next_tile_id;
-        self.next_tile_id = self.next_tile_id.wrapping_add(1);
+        let tile_id = NEXT_TILE_ID.fetch_add(1, Ordering::Relaxed);
         let tile = Arc::new(GpuTile {
             texture,
             view,

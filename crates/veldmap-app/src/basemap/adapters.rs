@@ -15,7 +15,7 @@ use crate::gpu_tiles::UploadSender;
 
 /// Adapter bridging `veldmap-storage`'s [`TileDiskCache`] into `veldmap-net`'s
 /// storage-agnostic [`TileBlobStore`] trait.
-pub(crate) struct SqliteBlobStore(pub(crate) Arc<TileDiskCache>);
+pub(super) struct SqliteBlobStore(pub(super) Arc<TileDiskCache>);
 
 impl SqliteBlobStore {
     fn disk_key(source_key: &str, id: QuadTileId) -> DiskTileKey {
@@ -29,11 +29,7 @@ impl SqliteBlobStore {
     }
 
     fn map_err(err: StorageError) -> BlobStoreError {
-        if err.is_cancelled() {
-            BlobStoreError::Cancelled
-        } else {
-            BlobStoreError::Backend(err.to_string())
-        }
+        BlobStoreError::Backend(err.to_string())
     }
 }
 
@@ -56,11 +52,11 @@ impl TileBlobStore for SqliteBlobStore {
 
 /// Adapter bridging `veldmap-raster`'s generic [`DecodePoolHandle`] into
 /// `veldmap-net`'s codec-agnostic [`TileDecodeExecutor`] trait.
-pub(crate) struct RasterDecodeExecutor {
-    pub(crate) pool: DecodePoolHandle,
-    pub(crate) done_tx: UploadSender,
-    pub(crate) wakeup: Wakeup,
-    pub(crate) shutdown: CancelToken,
+pub(super) struct RasterDecodeExecutor {
+    pub(super) pool: DecodePoolHandle,
+    pub(super) done_tx: UploadSender,
+    pub(super) wakeup: Wakeup,
+    pub(super) shutdown: CancelToken,
 }
 
 impl TileDecodeExecutor for RasterDecodeExecutor {

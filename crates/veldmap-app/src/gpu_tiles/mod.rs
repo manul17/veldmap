@@ -9,8 +9,8 @@
 mod gpu_cache;
 mod upload_queue;
 
-pub use gpu_cache::{GpuTile, GpuTileCache, UploadInsertOutcome};
+pub use gpu_cache::{GpuTile, GpuTileCache};
+pub(crate) use upload_queue::{DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET};
 pub use upload_queue::{
-    DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, PendingUploads, UploadBatchReport,
-    UploadChannelClosed, UploadPassParams, UploadSender,
+    PendingUploads, UploadBatchReport, UploadChannelClosed, UploadPassParams, UploadSender,
 };

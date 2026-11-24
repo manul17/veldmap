@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Mutex, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, TransactionBehavior};
@@ -15,9 +15,8 @@ use crate::StorageError;
 use super::evict::{evict_in_tx, reclaim_space};
 use super::key::{DiskTileKey, EncodedKey, TileBlobEncoding, valid_source_key};
 use super::queries::{
-    CLEAR_BLOBS_SQL, CLEAR_META_SQL, decrement_cache_meta, delete_meta_by_id, delete_source_meta,
-    flush_touches_in_tx, read_cache_meta_totals, reset_cache_meta, select_meta_id_bytes,
-    select_tile_blob, set_cache_meta_totals, upsert_tile_blob, upsert_tile_meta,
+    clear_all_in_tx, clear_source_in_tx, delete_tile_in_tx, flush_touches_in_tx,
+    read_cache_meta_totals, select_tile_blob, upsert_tile_in_tx,
 };
 use super::schema::{
     is_corrupt_sqlite_error, open_and_init_file_db, open_read_only_connection, recreate_file_db,
@@ -51,26 +50,15 @@ pub struct DiskCacheStats {
     pub max_bytes: u64,
 }
 
-fn upsert_tile_and_update_meta(
-    tx: &rusqlite::Transaction<'_>,
-    enc: &EncodedKey<'_>,
-    encoding: TileBlobEncoding,
-    payload: &[u8],
-    new_bytes: u64,
-    ts_ms: i64,
-) -> Result<(i64, u64, u64), rusqlite::Error> {
-    let prev_bytes = select_meta_id_bytes(tx, enc)?.map(|(_, sz)| sz);
-    let inserted_id =
-        upsert_tile_meta(tx, enc, i64::from(encoding as u8), new_bytes as i64, ts_ms)?;
-    upsert_tile_blob(tx, inserted_id, payload)?;
-
-    let old = prev_bytes.unwrap_or(0).max(0) as u64;
-    let count_delta = u64::from(prev_bytes.is_none());
-    let (current_total, current_count) = read_cache_meta_totals(tx)?;
-    let updated_total = current_total.saturating_sub(old).saturating_add(new_bytes);
-    let updated_count = current_count.saturating_add(count_delta);
-    set_cache_meta_totals(tx, updated_total, updated_count)?;
-    Ok((inserted_id, updated_total, updated_count))
+fn flush_touches_best_effort(conn: &mut Connection, touches: &HashMap<i64, i64>) {
+    if touches.is_empty() {
+        return;
+    }
+    if let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        && flush_touches_in_tx(&tx, touches).is_ok()
+    {
+        let _ = tx.commit();
+    }
 }
 
 struct ReaderPool {
@@ -158,11 +146,7 @@ impl Drop for TileDiskCache {
             return;
         }
         let mut conn = lock_unpoisoned(&self.writer);
-        if let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            && flush_touches_in_tx(&tx, &touches).is_ok()
-        {
-            let _ = tx.commit();
-        }
+        flush_touches_best_effort(&mut conn, &touches);
     }
 }
 
@@ -257,13 +241,15 @@ impl TileDiskCache {
         // Non-blocking opportunistic flush: if the writer is busy (e.g. vacuum
         // or put), the writer will pick up `pending_touches` on its next pass
         // so concurrent WAL readers never stall.
-        if should_try_flush && let Ok(mut conn) = self.writer.try_lock() {
-            let touches = self.take_pending_touches();
-            if !touches.is_empty()
-                && let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-                && flush_touches_in_tx(&tx, &touches).is_ok()
-            {
-                let _ = tx.commit();
+        if should_try_flush {
+            let maybe_conn = match self.writer.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(mut conn) = maybe_conn {
+                let touches = self.take_pending_touches();
+                flush_touches_best_effort(&mut conn, &touches);
             }
         }
     }
@@ -376,7 +362,7 @@ impl TileDiskCache {
         let ts_ms = self.next_monotonic_ts();
         let outcome = self.with_write_tx(&mut conn, |tx| {
             let (inserted_id, updated_total, updated_count) =
-                upsert_tile_and_update_meta(tx, &enc, encoding, payload, new_bytes, ts_ms)?;
+                upsert_tile_in_tx(tx, &enc, encoding, payload, ts_ms)?;
             evict_in_tx(
                 tx,
                 updated_total,
@@ -408,14 +394,7 @@ impl TileDiskCache {
     pub fn delete(&self, key: &DiskTileKey) -> Result<bool, StorageError> {
         let enc = EncodedKey::from_key(key)?;
         let mut conn = lock_unpoisoned(&self.writer);
-        let deleted_id = self.with_write_tx(&mut conn, |tx| {
-            let Some((tile_id, sz)) = select_meta_id_bytes(tx, &enc)? else {
-                return Ok(None);
-            };
-            delete_meta_by_id(tx, tile_id)?;
-            decrement_cache_meta(tx, sz, 1)?;
-            Ok(Some(tile_id))
-        })?;
+        let deleted_id = self.with_write_tx(&mut conn, |tx| delete_tile_in_tx(tx, &enc))?;
         let Some(tile_id) = deleted_id else {
             return Ok(false);
         };
@@ -470,13 +449,7 @@ impl TileDiskCache {
             return Err(StorageError::InvalidSourceKey(source_key.to_owned()));
         }
         let mut conn = lock_unpoisoned(&self.writer);
-        let deleted_ids = self.with_write_tx(&mut conn, |tx| {
-            let (ids, removed_bytes) = delete_source_meta(tx, source_key)?;
-            if !ids.is_empty() {
-                decrement_cache_meta(tx, removed_bytes, ids.len() as i64)?;
-            }
-            Ok(ids)
-        })?;
+        let deleted_ids = self.with_write_tx(&mut conn, |tx| clear_source_in_tx(tx, source_key))?;
         self.prune_pending_touches(&deleted_ids);
         let deleted = deleted_ids.len();
         if deleted > 0 {
@@ -492,11 +465,7 @@ impl TileDiskCache {
         lock_unpoisoned(&self.pending_touches).clear();
         {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Delete blobs first to avoid per-row cascade work and allow SQLite's
-            // table-truncate optimization.
-            tx.execute(CLEAR_BLOBS_SQL, [])?;
-            tx.execute(CLEAR_META_SQL, [])?;
-            reset_cache_meta(&tx)?;
+            clear_all_in_tx(&tx)?;
             tx.commit()?;
         }
         reclaim_space(&conn, true);

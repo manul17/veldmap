@@ -18,9 +18,41 @@ use crate::gpu_tiles::{
     DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
-use crate::render::{DrawSnapshot, SnapshotBuildParams};
+use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
 use crate::settings::AppSettings;
-use crate::viewport_bridge::SnapshotKey;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotKey {
+    eye_bits: [u64; 3],
+    up_bits: [u64; 3],
+    width_px: u32,
+    height_px: u32,
+    ppp_bits: u32,
+    show_graticule: bool,
+    scene_generation: u64,
+}
+
+impl SnapshotKey {
+    fn new(
+        camera: &Camera,
+        viewport_px: [u32; 2],
+        pixels_per_point: f32,
+        show_graticule: bool,
+        scene_generation: u64,
+    ) -> Self {
+        let eye = camera.eye_ecef();
+        let (_, up, _) = camera.basis();
+        Self {
+            eye_bits: eye.to_array().map(f64::to_bits),
+            up_bits: up.to_array().map(f64::to_bits),
+            width_px: viewport_px[0],
+            height_px: viewport_px[1],
+            ppp_bits: pixels_per_point.to_bits(),
+            show_graticule,
+            scene_generation,
+        }
+    }
+}
 
 /// Coordinates tile caches, bounded GPU uploads, shared two-lane CPU decode
 /// threads, active basemap scheduling, and cached frame snapshots.
@@ -85,9 +117,8 @@ impl SceneState {
         self.pending_uploads.set_pinned_root_sources(&sources);
     }
 
-    /// Bump `scene_generation` after any external scene-visible toggle (such as
-    /// toggling the graticule).
-    pub(crate) fn mark_dirty(&mut self) {
+    /// Bump `scene_generation` after internal basemap or upload state changes.
+    fn mark_dirty(&mut self) {
         self.scene_generation = self.scene_generation.wrapping_add(1);
     }
 
@@ -166,8 +197,8 @@ impl SceneState {
     }
 
     /// Return the cached immutable `Arc<DrawSnapshot>` when `(camera, viewport,
-    /// scene_generation)` is unchanged (avoiding quadtree traversal on 120 Hz
-    /// mouse hover), or rebuild and schedule missing tiles.
+    /// show_graticule, scene_generation)` is unchanged (avoiding quadtree
+    /// traversal on 120 Hz mouse hover), or rebuild and schedule missing tiles.
     /// Returns `(snapshot, reconciled_providers)`.
     pub(crate) fn snapshot_for_frame(
         &mut self,
@@ -181,6 +212,7 @@ impl SceneState {
             &camera,
             [width_px, height_px],
             pixels_per_point,
+            show_graticule,
             self.scene_generation,
         );
         if let Some((cached_key, snapshot)) = &self.cached_snapshot
@@ -192,6 +224,8 @@ impl SceneState {
         let textured = self.basemap.is_textured();
         let quadtree_config = self.basemap.quadtree_config();
         let policy = self.basemap.carrier_policy();
+        let carrier =
+            textured.then_some((&policy as &dyn TileCarrierPolicy, &mut self.gpu_tile_cache));
         let snapshot = Arc::new(DrawSnapshot::build(
             SnapshotBuildParams {
                 camera,
@@ -199,17 +233,20 @@ impl SceneState {
                 height_px,
                 pixels_per_point,
                 show_graticule,
-                carrier_policy: &policy,
                 config: &quadtree_config,
             },
-            textured.then_some(&mut self.gpu_tile_cache),
+            carrier,
         ));
 
+        let weight = self.basemap.appetite_weight_bytes();
+        let appetite_bytes = self
+            .gpu_tile_cache
+            .proportional_pyramid_byte_cap(weight, weight);
         self.basemap.schedule_for_tiles(
             snapshot.visible_tex_ids(),
             &self.gpu_tile_cache,
             &self.pending_uploads,
-            1,
+            appetite_bytes,
         );
 
         self.cached_snapshot = Some((key, Arc::clone(&snapshot)));

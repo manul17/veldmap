@@ -1,28 +1,52 @@
-//! Shared cancellable singleflight slot primitive used by [`super::chunk_cache`]
-//! and lazy display-mapping stretch computation.
+//! Shared cancellable, panic-safe singleflight orchestration used by
+//! [`super::chunk_cache`] and lazy display-mapping stretch computation.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned, wait_unpoisoned};
 
 use crate::RasterError;
 
-/// One-shot cancellable singleflight slot storing a resolved value `T`.
+/// Resolution outcome published through a [`SingleflightSlot`].
+#[derive(Clone)]
+enum SingleflightOutcome<T> {
+    Ready(T),
+    /// The leader's own [`CancelToken`] fired during execution; uncancelled
+    /// followers should loop and elect a new leader instead of failing.
+    LeaderCancelled,
+    Failed(RasterError),
+}
+
+/// Classification returned by a cache when entering [`run_singleflight`].
+pub(crate) enum SingleflightRole<T> {
+    /// Cached value already available.
+    Ready(T),
+    /// Caller became the leader responsible for computing and publishing into
+    /// this slot.
+    Leader(Arc<SingleflightSlot<T>>),
+    /// Another leader is already computing this key; wait on this slot.
+    Follower(Arc<SingleflightSlot<T>>),
+}
+
+/// One-shot cancellable singleflight slot storing a resolved outcome for `T`.
 pub(crate) struct SingleflightSlot<T> {
-    state: Mutex<Option<T>>,
+    state: Mutex<Option<SingleflightOutcome<T>>>,
     cvar: Condvar,
 }
 
-impl<T: Clone + Send + 'static> SingleflightSlot<T> {
+impl<T> SingleflightSlot<T> {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(None),
             cvar: Condvar::new(),
         }
     }
+}
 
+impl<T: Clone + Send + 'static> SingleflightSlot<T> {
     /// Resolve the slot if still pending and wake all waiting followers.
-    pub(crate) fn resolve(&self, value: T) {
+    fn resolve(&self, value: SingleflightOutcome<T>) {
         let mut guard = lock_unpoisoned(&self.state);
         if guard.is_none() {
             *guard = Some(value);
@@ -31,7 +55,7 @@ impl<T: Clone + Send + 'static> SingleflightSlot<T> {
     }
 
     /// Wait until this slot resolves or `cancel` fires.
-    pub(crate) fn wait(self: &Arc<Self>, cancel: &CancelToken) -> Result<T, RasterError> {
+    fn wait(self: &Arc<Self>, cancel: &CancelToken) -> Result<SingleflightOutcome<T>, RasterError> {
         if cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
@@ -50,6 +74,119 @@ impl<T: Clone + Send + 'static> SingleflightSlot<T> {
                 return Err(RasterError::Cancelled);
             }
             guard = wait_unpoisoned(&self.cvar, guard);
+        }
+    }
+}
+
+struct LeaderGuard<'a, T: Clone + Send + 'static, F: FnOnce(&Arc<SingleflightSlot<T>>)> {
+    slot: &'a Arc<SingleflightSlot<T>>,
+    abort: Option<F>,
+    resolved: bool,
+    panic_message: &'static str,
+}
+
+impl<T: Clone + Send + 'static, F: FnOnce(&Arc<SingleflightSlot<T>>)> LeaderGuard<'_, T, F> {
+    fn mark_resolved(&mut self) {
+        self.abort = None;
+        self.resolved = true;
+    }
+
+    fn abort_now(&mut self) {
+        if let Some(abort) = self.abort.take() {
+            abort(self.slot);
+        }
+    }
+}
+
+impl<T: Clone + Send + 'static, F: FnOnce(&Arc<SingleflightSlot<T>>)> Drop
+    for LeaderGuard<'_, T, F>
+{
+    fn drop(&mut self) {
+        if let Some(abort) = self.abort.take() {
+            abort(self.slot);
+        }
+        if !self.resolved {
+            self.slot
+                .resolve(SingleflightOutcome::Failed(RasterError::DecoderPanicked(
+                    self.panic_message.to_string(),
+                )));
+        }
+    }
+}
+
+/// Execute a cancellable, panic-safe singleflight lookup/compute loop.
+///
+/// Checks `cancel` at loop entry before calling `acquire`. When the caller is
+/// elected leader, runs `compute` inside `catch_unwind` with a panic-safe
+/// `Drop` guard that invokes `abort` and wakes waiting followers with
+/// [`RasterError::DecoderPanicked`].
+///
+/// Only emits retryable leader cancellation when both `err.is_cancelled()` and
+/// `cancel.is_cancelled()` are true; an uncancelled leader returning
+/// `Err(RasterError::Cancelled)` propagates once to followers to avoid
+/// livelock.
+pub(crate) fn run_singleflight<T, Acquire, Compute, Commit, Abort>(
+    cancel: &CancelToken,
+    panic_message: &'static str,
+    mut acquire: Acquire,
+    compute: Compute,
+    commit: Commit,
+    abort: Abort,
+) -> Result<T, RasterError>
+where
+    T: Clone + Send + 'static,
+    Acquire: FnMut() -> SingleflightRole<T>,
+    Compute: FnOnce() -> Result<T, RasterError>,
+    Commit: FnOnce(&Arc<SingleflightSlot<T>>, &T),
+    Abort: FnOnce(&Arc<SingleflightSlot<T>>),
+{
+    loop {
+        if cancel.is_cancelled() {
+            return Err(RasterError::Cancelled);
+        }
+
+        match acquire() {
+            SingleflightRole::Ready(value) => return Ok(value),
+            SingleflightRole::Follower(slot) => match slot.wait(cancel)? {
+                SingleflightOutcome::Ready(value) => return Ok(value),
+                SingleflightOutcome::LeaderCancelled => continue,
+                SingleflightOutcome::Failed(_) if cancel.is_cancelled() => {
+                    return Err(RasterError::Cancelled);
+                }
+                SingleflightOutcome::Failed(err) => return Err(err),
+            },
+            SingleflightRole::Leader(slot) => {
+                let mut guard = LeaderGuard {
+                    slot: &slot,
+                    abort: Some(abort),
+                    resolved: false,
+                    panic_message,
+                };
+
+                return match catch_unwind(AssertUnwindSafe(compute)) {
+                    Ok(Ok(value)) => {
+                        commit(&slot, &value);
+                        slot.resolve(SingleflightOutcome::Ready(value.clone()));
+                        guard.mark_resolved();
+                        Ok(value)
+                    }
+                    Ok(Err(err)) => {
+                        guard.abort_now();
+                        let published = if err.is_cancelled() && cancel.is_cancelled() {
+                            SingleflightOutcome::LeaderCancelled
+                        } else {
+                            SingleflightOutcome::Failed(err.clone())
+                        };
+                        slot.resolve(published);
+                        guard.mark_resolved();
+                        Err(err)
+                    }
+                    Err(_) => {
+                        drop(guard);
+                        Err(RasterError::DecoderPanicked(panic_message.to_string()))
+                    }
+                };
+            }
         }
     }
 }

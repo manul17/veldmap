@@ -5,8 +5,8 @@ use veldmap_net::{DecodeCompletion, DecodeFailure, DecodeRequest};
 use veldmap_raster::{DecodePool, DecodePoolConfig, TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::StoragePaths;
 
-use super::adapters::RasterDecodeExecutor;
-use super::policy::{bundled_tile_key, source_tile_key};
+use super::super::adapters::RasterDecodeExecutor;
+use super::super::policy::{bundled_tile_key, source_tile_key};
 use super::*;
 use crate::storage::AppStorage;
 use crate::test_support::TempTestRoot;
@@ -125,7 +125,14 @@ fn unavailable_live_pipeline_degrades_cleanly_to_full_bundled_basemap() {
 
     let gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
     let visible = traverse(&Camera::at(0.0, 0.0, 1_500_000.0), 800, 600, &qcfg);
-    manager.schedule_for_tiles(visible.iter().map(|v| v.tex_id), &gpu_cache, &pending, 1);
+    let weight = manager.appetite_weight_bytes();
+    let appetite = gpu_cache.proportional_pyramid_byte_cap(weight, weight);
+    manager.schedule_for_tiles(
+        visible.iter().map(|v| v.tex_id),
+        &gpu_cache,
+        &pending,
+        appetite,
+    );
     assert!(manager.wanted_live.is_empty());
     assert!(
         manager.wanted_bundled.iter().any(|k| k.level >= 2),
@@ -171,7 +178,14 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_evict
 
     let qcfg = manager.quadtree_config();
     let visible = traverse(&Camera::at(-86.0, 0.0, 3_000_000.0), 800, 600, &qcfg);
-    manager.schedule_for_tiles(visible.iter().map(|v| v.tex_id), &gpu_cache, &pending, 1);
+    let weight = manager.appetite_weight_bytes();
+    let appetite = gpu_cache.proportional_pyramid_byte_cap(weight, weight);
+    manager.schedule_for_tiles(
+        visible.iter().map(|v| v.tex_id),
+        &gpu_cache,
+        &pending,
+        appetite,
+    );
 
     assert!(
         manager

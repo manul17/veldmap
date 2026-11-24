@@ -14,10 +14,10 @@ use veldmap_core::tile::{DecodedTile, SourceId, TileKey};
 use super::gpu_cache::{GpuTileCache, UploadInsertOutcome};
 
 /// Default per-frame upload byte budget (`4 MiB`).
-pub const DEFAULT_UPLOAD_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+pub(crate) const DEFAULT_UPLOAD_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
 /// Default per-frame upload wall-clock budget (`2 ms`).
-pub const DEFAULT_UPLOAD_TIME_BUDGET: Duration = Duration::from_millis(2);
+pub(crate) const DEFAULT_UPLOAD_TIME_BUDGET: Duration = Duration::from_millis(2);
 
 /// Default CPU byte cap on decoded tiles buffered in [`PendingUploads`]
 /// awaiting GPU upload (`64 MiB`).
@@ -232,6 +232,12 @@ impl Default for PendingUploads {
     }
 }
 
+impl Drop for PendingUploads {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl PendingUploads {
     /// Create a new upload queue bounded by `DEFAULT_MAX_QUEUED_UPLOAD_BYTES`
     /// (64 MiB).
@@ -304,12 +310,7 @@ impl PendingUploads {
 
     /// Discard any queued decoded tiles belonging to `source`.
     pub fn clear_source(&mut self, source: SourceId) {
-        let mut to_drop = Vec::new();
-        {
-            let mut state = lock_unpoisoned(&self.shared);
-            state.retain_keys(|k| k.source != source, &mut to_drop);
-        }
-        drop(to_drop);
+        self.clear_where(|key| key.source == source);
     }
 
     /// Discard any queued decoded tiles matching `predicate`.

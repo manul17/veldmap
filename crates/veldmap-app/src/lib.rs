@@ -4,12 +4,12 @@
 //! [`BUNDLED_BASEMAP_JPEG`]) for GPU smoke tests and `naga` shader validation.
 
 mod app;
-pub(crate) mod basemap;
+mod basemap;
 pub mod gpu_tiles;
 pub mod render;
 mod scene;
-pub(crate) mod settings;
-pub(crate) mod storage;
+mod settings;
+mod storage;
 mod ui;
 mod viewport_bridge;
 

@@ -13,13 +13,26 @@ use crate::RasterError;
 use crate::pipeline::chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
 use crate::pipeline::driver::Chunked;
 use crate::pipeline::grid;
-use crate::pipeline::radiometry::{DisplayMapping, PixelLayout};
+use crate::pipeline::radiometry::DisplayMapping;
 
-use super::DISPLAY_STREAM_SPEC;
 use super::tags::{chunk_rgba, map_tiff_error};
+use super::{DISPLAY_STREAM_SPEC, TiffFormat};
 
 /// Maximum idle `tiff::decoder::Decoder` handles retained per [`super::TiffSource`].
 const MAX_POOLED_DECODERS: usize = 8;
+
+/// Open a new `tiff::decoder::Decoder` backed by `byte_source` with explicit
+/// `limits` and cancellation token `cancel`.
+pub(super) fn open_decoder(
+    byte_source: &Arc<dyn ByteSource>,
+    limits: &Limits,
+    cancel: &CancelToken,
+) -> Result<Decoder<BufferedByteReader>, RasterError> {
+    let reader = BufferedByteReader::new(Arc::clone(byte_source), cancel.clone());
+    Ok(Decoder::new(reader)
+        .map_err(|e| map_tiff_error(e, cancel))?
+        .with_limits(limits.clone()))
+}
 
 struct DecoderEntry {
     decoder: Decoder<BufferedByteReader>,
@@ -67,10 +80,7 @@ impl DecoderPool {
             cached.decoder.inner().set_cancel(cancel.clone());
             cached
         } else {
-            let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), cancel.clone());
-            let decoder = Decoder::new(reader)
-                .map_err(|e| map_tiff_error(e, cancel))?
-                .with_limits(self.limits.clone());
+            let decoder = open_decoder(&self.byte_source, &self.limits, cancel)?;
             DecoderEntry {
                 decoder,
                 aimed_image: Some(0),
@@ -131,6 +141,30 @@ impl PooledDecoder<'_> {
         entry.aimed_image = Some(image);
         Ok(())
     }
+
+    /// Compute the total chunk count of the currently aimed IFD, returning
+    /// [`RasterError::InvalidDimensions`] when either image or chunk
+    /// dimensions are zero.
+    pub(super) fn ifd_chunk_layout(&mut self, cancel: &CancelToken) -> Result<u64, RasterError> {
+        let (img_w, img_h) = self
+            .decoder_mut()
+            .dimensions()
+            .map_err(|e| map_tiff_error(e, cancel))?;
+        if img_w == 0 || img_h == 0 {
+            return Err(RasterError::InvalidDimensions {
+                width: img_w,
+                height: img_h,
+            });
+        }
+        let (cw, ch) = self.decoder_mut().chunk_dimensions();
+        if cw == 0 || ch == 0 {
+            return Err(RasterError::InvalidDimensions {
+                width: cw,
+                height: ch,
+            });
+        }
+        Ok(u64::from(img_w.div_ceil(cw)) * u64::from(img_h.div_ceil(ch)))
+    }
 }
 
 impl Drop for PooledDecoder<'_> {
@@ -164,8 +198,7 @@ pub(super) enum ChunkReadMode<'a> {
 pub(super) struct TiffChunkReader<'a> {
     decoder_pool: &'a DecoderPool,
     source_id: SourceId,
-    pixel_layout: PixelLayout,
-    depth: u32,
+    format: TiffFormat,
     mapping: DisplayMapping,
     mode: ChunkReadMode<'a>,
     pooled: Option<PooledDecoder<'a>>,
@@ -175,16 +208,14 @@ impl<'a> TiffChunkReader<'a> {
     pub(super) fn new(
         decoder_pool: &'a DecoderPool,
         source_id: SourceId,
-        pixel_layout: PixelLayout,
-        depth: u32,
+        format: TiffFormat,
         mapping: DisplayMapping,
         mode: ChunkReadMode<'a>,
     ) -> Self {
         Self {
             decoder_pool,
             source_id,
-            pixel_layout,
-            depth,
+            format,
             mapping,
             mode,
             pooled: None,
@@ -203,26 +234,9 @@ impl<'a> TiffChunkReader<'a> {
             None => self.pooled.insert(self.decoder_pool.checkout(cancel)?),
         };
         pooled.seek_to_image(image, cancel)?;
-        let (img_w, img_h) = pooled
-            .decoder_mut()
-            .dimensions()
-            .map_err(|e| map_tiff_error(e, cancel))?;
-        let (cw, ch) = pooled.decoder_mut().chunk_dimensions();
-        if img_w == 0 || img_h == 0 {
-            return Err(RasterError::InvalidDimensions {
-                width: img_w,
-                height: img_h,
-            });
-        }
-        if cw == 0 || ch == 0 {
-            return Err(RasterError::InvalidDimensions {
-                width: cw,
-                height: ch,
-            });
-        }
-        let total_chunks = u64::from(img_w.div_ceil(cw)) * u64::from(img_h.div_ceil(ch));
+        let total_chunks = pooled.ifd_chunk_layout(cancel)?;
         if u64::from(index) >= total_chunks {
-            return Err(RasterError::Tiff(format!(
+            return Err(RasterError::Decode(format!(
                 "chunk index {index} out of range for IFD {image} ({total_chunks} chunks)"
             )));
         }
@@ -233,7 +247,7 @@ impl<'a> TiffChunkReader<'a> {
                 height: dh,
             });
         }
-        let est_bytes = grid::chunk_working_bytes(dw, dh, self.depth, true);
+        let est_bytes = grid::chunk_working_bytes(dw, dh, self.format.depth, true);
         let _lease = match budget_tracker {
             Some(tracker) => Some(tracker.reserve_blocking(est_bytes, cancel)?),
             None => None,
@@ -243,7 +257,7 @@ impl<'a> TiffChunkReader<'a> {
             .read_chunk(index)
             .map_err(|e| map_tiff_error(e, cancel))?;
         pooled.mark_clean();
-        let rgba = chunk_rgba(&self.mapping, &raw, self.pixel_layout, dw, dh)?;
+        let rgba = chunk_rgba(&self.mapping, &raw, self.format.pixel_layout, dw, dh)?;
         Ok(DecodedChunk {
             data: rgba,
             width: dw,

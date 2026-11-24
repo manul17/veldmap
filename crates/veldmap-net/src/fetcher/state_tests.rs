@@ -47,7 +47,7 @@ fn expired_backoffs_route_directly_to_http_or_disk_queues() {
         },
     );
 
-    assert!(st.prune_expired_backoffs(now));
+    st.prune_expired_backoffs(now);
     assert!(st.pending_http.contains(&http_key));
     assert!(!st.pending_disk.contains(&http_key));
     assert!(st.pending_disk.contains(&disk_key));
@@ -66,9 +66,12 @@ fn retry_failed_preserves_204_empty_and_ignores_stale_generations() {
     let (empty_gen, _) = st.register_http_in_flight(empty_key, &shutdown);
     assert_eq!(
         st.mark_empty_204(empty_key, empty_gen.wrapping_add(99)),
-        Transition::NONE
+        Transition::Stale
     );
-    assert_eq!(st.mark_empty_204(empty_key, empty_gen), Transition::NOTIFY);
+    assert_eq!(
+        st.mark_empty_204(empty_key, empty_gen),
+        Transition::APPLIED_WAKEUP
+    );
     st.last_wanted.insert(empty_key);
 
     let (term_gen, _) = st.register_http_in_flight(terminal_key, &shutdown);
@@ -78,11 +81,11 @@ fn retry_failed_preserves_204_empty_and_ignores_stale_generations() {
             term_gen.wrapping_add(99),
             Some("stale".to_owned())
         ),
-        Transition::NONE
+        Transition::Stale
     );
     assert_eq!(
         st.mark_terminal_failure(terminal_key, term_gen, Some("bad".to_owned())),
-        Transition::NOTIFY_AND_WAKEUP
+        Transition::APPLIED_WAKEUP
     );
 
     st.retry_failed();
@@ -150,7 +153,7 @@ fn failure_cap_eviction_never_drops_active_backoffs() {
             false,
             None,
         ),
-        Transition::NOTIFY_AND_WAKEUP
+        Transition::APPLIED_WAKEUP
     );
 
     for i in 0..(MAX_FAILURE_ENTRIES as u32 + 16) {
@@ -159,4 +162,95 @@ fn failure_cap_eviction_never_drops_active_backoffs() {
     }
     assert!(st.failures.failure_len() <= MAX_FAILURE_ENTRIES);
     assert!(st.failures.has_backoff(&active_backoff));
+}
+
+#[test]
+fn mark_empty_204_wakes_ui_and_clears_offline_status() {
+    let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
+    let mut st = active_state(&spec);
+    let key = wm_key(&spec, 3, 1, 2);
+    let shutdown = CancelToken::new();
+
+    st.offline = true;
+    st.last_wanted.insert(key);
+    let (gen_id, _) = st.register_http_in_flight(key, &shutdown);
+
+    let stale = st.mark_empty_204(key, gen_id.wrapping_add(1));
+    assert_eq!(stale, Transition::Stale);
+    assert!(!stale.is_applied());
+    assert!(!stale.should_wakeup());
+    assert!(st.offline);
+    assert_eq!(st.status().in_flight, 1);
+
+    let applied = st.mark_empty_204(key, gen_id);
+    assert_eq!(applied, Transition::Applied { wakeup: true });
+    assert!(applied.is_applied());
+    assert!(applied.should_wakeup());
+    assert!(!st.offline);
+    assert_eq!(st.status().in_flight, 0);
+    assert_eq!(st.failures.failure_marker(&key), Some(FailureMarker::Empty));
+}
+
+#[test]
+fn reconcile_wanted_routes_expired_backoffs_and_skips_ready_roots() {
+    let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
+    let mut st = active_state(&spec);
+    let now = Instant::now();
+
+    let root_key = wm_key(&spec, 0, 0, 0);
+    let http_retry_key = wm_key(&spec, 4, 1, 1);
+    let disk_retry_key = wm_key(&spec, 4, 2, 1);
+
+    st.failures.insert_backoff(
+        root_key,
+        BackoffEntry {
+            until: now - Duration::from_secs(1),
+            retry_disk: true,
+        },
+    );
+    st.failures.insert_backoff(
+        http_retry_key,
+        BackoffEntry {
+            until: now - Duration::from_secs(1),
+            retry_disk: false,
+        },
+    );
+    st.failures.insert_backoff(
+        disk_retry_key,
+        BackoffEntry {
+            until: now - Duration::from_secs(1),
+            retry_disk: true,
+        },
+    );
+
+    let wanted = HashSet::from([http_retry_key, disk_retry_key]);
+    st.reconcile_wanted(&wanted, &|k| *k == root_key, now);
+
+    assert!(!st.pending_disk.contains(&root_key));
+    assert!(!st.pending_http.contains(&root_key));
+    assert!(st.pending_http.contains(&http_retry_key));
+    assert!(!st.pending_disk.contains(&http_retry_key));
+    assert!(st.pending_disk.contains(&disk_retry_key));
+    assert!(!st.pending_http.contains(&disk_retry_key));
+}
+
+#[test]
+fn drain_disk_to_http_streams_only_eligible_keys() {
+    let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
+    let other_spec = LiveBasemapSpec::nasa_gibs_blue_marble();
+    let mut st = active_state(&spec);
+
+    let eligible_key = wm_key(&spec, 2, 0, 0);
+    let suppressed_key = wm_key(&spec, 2, 1, 0);
+    let wrong_source_key = wm_key(&other_spec, 2, 0, 0);
+
+    st.insert_failure(suppressed_key, FailureMarker::Terminal);
+    st.pending_disk
+        .push_unique([eligible_key, suppressed_key, wrong_source_key]);
+
+    st.drain_disk_to_http(spec.source_id());
+    assert!(st.pending_disk.is_empty());
+    assert!(st.pending_http.contains(&eligible_key));
+    assert!(!st.pending_http.contains(&suppressed_key));
+    assert!(!st.pending_http.contains(&wrong_source_key));
 }

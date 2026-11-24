@@ -291,10 +291,8 @@ pub fn between(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
         let (head, tail) = (((1.0 - t) * angle).sin() / sin, (t * angle).sin() / sin);
         (a * head + b * tail).normalize()
     };
-    (
-        mid.z.asin().to_degrees(),
-        unwind(from.1, mid.y.atan2(mid.x).to_degrees()),
-    )
+    let (lat, lon) = angles(mid);
+    (lat, unwind(from.1, lon))
 }
 
 /// One full turn of longitude in degrees.

@@ -13,17 +13,17 @@ pub const POLAR_R_CAP: f64 = 0.043_213_918_263_772_28;
 
 /// Latitude/longitude bounds and raw texture range for a non-polar tile.
 #[derive(Clone, Copy, Debug)]
-pub struct LatLonTileBounds {
-    pub lon_west_deg: f64,
-    pub lon_east_deg: f64,
+pub(crate) struct LatLonTileBounds {
+    pub(crate) lon_west_deg: f64,
+    pub(crate) lon_east_deg: f64,
     /// Clamped mesh north latitude (`<= WEB_MERCATOR_LIMIT_DEG`).
-    pub lat_north_deg: f64,
+    pub(crate) lat_north_deg: f64,
     /// Clamped mesh south latitude (`>= -WEB_MERCATOR_LIMIT_DEG`).
-    pub lat_south_deg: f64,
+    pub(crate) lat_south_deg: f64,
     /// Unclamped tile north latitude (for exact `Geodetic` texture UV mapping).
-    pub raw_lat_north_deg: f64,
+    pub(crate) raw_lat_north_deg: f64,
     /// Unclamped tile south latitude (for exact `Geodetic` texture UV mapping).
-    pub raw_lat_south_deg: f64,
+    pub(crate) raw_lat_south_deg: f64,
 }
 
 /// Surface sample evaluated at mesh-local fractions `(s, t)` on a planetary tile.
@@ -66,7 +66,7 @@ pub fn web_mercator_y_bounds(y: u32, rows: u32) -> (f64, f64) {
 /// Compute geographic bounds for a `Geodetic` or `WebMercator` tile, returning
 /// `None` if the tile is a `PolarCap`, out of bounds, or lies entirely inside
 /// the `|lat| >= WEB_MERCATOR_LIMIT_DEG` polar caps.
-pub fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
+pub(crate) fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
     let (cols, rows) = id.checked_grid_dims()?;
     let rows_f = f64::from(rows);
     let (lon_west_deg, lon_east_deg) = tile_lon_bounds(id.x, cols);

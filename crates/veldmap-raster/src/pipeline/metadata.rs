@@ -156,7 +156,7 @@ impl GeoKeyParams {
 }
 
 /// Projected raster binding: optional EPSG code, pixel-to-CRS affine transform,
-/// and parsed GeoKey parameters.
+/// and optional parsed GeoKey parameters (present for GeoTIFF sources).
 #[derive(Clone, Debug, PartialEq)]
 pub struct GeoPlacement {
     pub epsg: Option<u32>,
@@ -164,7 +164,7 @@ pub struct GeoPlacement {
     /// where `(i, j)` are pixel top-left corner coordinates (`j` increasing
     /// southward, with `PixelIsPoint` half-pixel shift already removed).
     pub affine: [f64; 6],
-    pub geo_params: GeoKeyParams,
+    pub geo_params: Option<GeoKeyParams>,
 }
 
 /// Header-derived description of an opened raster source.

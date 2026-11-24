@@ -73,14 +73,8 @@ impl CoarsestTileQueue {
     }
 
     /// Batch-insert keys (skipping keys already present).
-    pub(super) fn push_unique(&mut self, keys: impl IntoIterator<Item = TileKey>) -> bool {
-        let mut added = false;
-        for key in keys {
-            if self.items.insert(OrderedTileKey(key)) {
-                added = true;
-            }
-        }
-        added
+    pub(super) fn push_unique(&mut self, keys: impl IntoIterator<Item = TileKey>) {
+        self.items.extend(keys.into_iter().map(OrderedTileKey));
     }
 
     /// Retain only entries matching `keep` in place with zero auxiliary
@@ -89,11 +83,10 @@ impl CoarsestTileQueue {
         self.items.retain(|entry| keep(&entry.0));
     }
 
-    pub(super) fn drain(&mut self) -> Vec<TileKey> {
+    pub(super) fn drain(&mut self) -> impl Iterator<Item = TileKey> + use<> {
         std::mem::take(&mut self.items)
             .into_iter()
             .map(|entry| entry.0)
-            .collect()
     }
 }
 

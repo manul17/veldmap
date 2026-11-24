@@ -41,6 +41,15 @@ impl LocalFileSource {
     /// Open `path` for safe positioned reading and capture its `(len, mtime_ns)`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path_ref = path.as_ref();
+        // Check regular-file status before `File::open` so Windows directories
+        // report `InvalidPath` (not `PermissionDenied`) and Unix FIFOs do not block.
+        let path_meta = std::fs::metadata(path_ref)?;
+        if !path_meta.is_file() {
+            return Err(StorageError::InvalidPath(format!(
+                "'{}' is not a regular file",
+                path_ref.display()
+            )));
+        }
         let file = File::open(path_ref)?;
         let meta = file.metadata()?;
         if !meta.is_file() {

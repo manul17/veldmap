@@ -7,7 +7,7 @@
 //! `egui_wgpu`'s target format via `view_formats`.
 
 mod globe;
-pub(crate) mod mesh;
+mod mesh;
 mod pipelines;
 mod snapshot;
 mod uniforms;
@@ -19,7 +19,7 @@ pub use viewport::RenderParams;
 
 /// Native desktop primary `wgpu` backends (Vulkan, DX12, Metal), explicitly
 /// excluding OpenGL/GLES and WebGPU.
-pub(crate) const NATIVE_PRIMARY_BACKENDS: wgpu::Backends =
+const NATIVE_PRIMARY_BACKENDS: wgpu::Backends =
     wgpu::Backends::PRIMARY.difference(wgpu::Backends::BROWSER_WEBGPU);
 
 /// Restrict environment-resolved `wgpu` backends to native desktop primary
@@ -46,7 +46,7 @@ pub fn clamp_to_primary_backends(backends: wgpu::Backends) -> wgpu::Backends {
 
 /// Choose a clean graticule step in degrees (dividing `90°` evenly) such that
 /// lines stay roughly `~85 pt` apart on screen across orbital-to-2 m zoom.
-pub(crate) fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
+fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
     const STEPS_DEG: [f64; 13] = [
         0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0,
     ];
@@ -68,7 +68,7 @@ pub const GLOBE_WGSL: &str = include_str!("../shaders/globe.wgsl");
 pub const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
 
 /// Deep-space clear color in exact linear RGB (`#0B1320` in sRGB).
-pub(crate) const CLEAR_COLOR_LINEAR: wgpu::Color = wgpu::Color {
+const CLEAR_COLOR_LINEAR: wgpu::Color = wgpu::Color {
     r: 0.003_347,
     g: 0.006_512,
     b: 0.014_444,
