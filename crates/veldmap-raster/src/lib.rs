@@ -13,6 +13,7 @@ use thiserror::Error;
 use veldmap_core::budget::BudgetError;
 use veldmap_core::geo::BindingError;
 use veldmap_core::io::IoError;
+use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::TileScheme;
 
 mod adapters;
@@ -30,19 +31,32 @@ pub use display::{
 };
 pub use pipeline::{
     AdmittedPass, AdmittedTile, BandInfo, DecodeContext, GeoKeyParams, GeoKeyValue, GeoPlacement,
-    GeoRasterType, GeoTie, LevelPlan, PassKey, PyramidMeta, RasterDescription, RasterSource,
-    SampleType, ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
-    frame_from_description, frame_from_description_with_override,
+    GeoRasterType, GeoTie, LevelPlan, MAX_SOURCE_SIDE, PassKey, PyramidMeta, RasterDescription,
+    RasterSource, SampleType, ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome,
+    TileScheduler, frame_from_description, frame_from_description_with_override,
 };
 pub use pool::{
     DecodeJob, DecodeJobKey, DecodeLane, DecodePool, DecodePoolConfig, DecodePoolHandle,
     SubmitError, TwoLaneDecodePool, TwoLaneDecodePoolConfig, TwoLaneDecodePoolHandle,
 };
 pub use sidecar::{
-    SidecarGeoref, load_sidecar_georef, load_sidecar_placement, parse_prj_text, parse_world_file,
+    MAX_SIDECAR_BYTES, SidecarGeoref, load_sidecar_georef_with, parse_prj_text, parse_world_file,
     prj_file_candidates, world_file_candidates,
 };
-pub use tiff::{MAX_IFDS, MAX_SOURCE_SIDE, TiffSource, has_tiff_magic};
+pub use tiff::{MAX_IFDS, TiffSource, has_tiff_magic};
+
+/// Map a `std::io::Error` produced by a decoder reading from
+/// [`veldmap_core::io::BufferedByteReader`] back into [`RasterError::Cancelled`]
+/// or [`RasterError::Io`], preserving structured core I/O errors.
+pub(crate) fn map_std_io_error(io_err: std::io::Error, cancel: &CancelToken) -> RasterError {
+    if cancel.is_cancelled() {
+        return RasterError::Cancelled;
+    }
+    match io_err.downcast::<IoError>() {
+        Ok(core_err) => RasterError::from(core_err),
+        Err(io_err) => RasterError::from(IoError::Io(io_err)),
+    }
+}
 
 /// Errors returned by raster tile decoders and virtual tile providers.
 ///

@@ -10,7 +10,7 @@ use veldmap_core::geo::FootprintBounds;
 
 use crate::layers::{LayerId, LayerSummary, VectorLayerId, VectorLayerSummary};
 
-use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, hud};
+use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format};
 
 /// User intent emitted by the Layer List panel, applied by `VeldmapApp`.
 #[derive(Clone, Debug)]
@@ -175,6 +175,21 @@ fn paint_loading_shimmer(ui: &mut egui::Ui) {
         .request_repaint_after(std::time::Duration::from_millis(33));
 }
 
+fn show_opacity_slider(ui: &mut egui::Ui, current: f32) -> Option<(f32, bool)> {
+    let mut opacity = current;
+    let mut update = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Opacity").small());
+        let resp = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false));
+        let commit = resp.drag_stopped() || (resp.changed() && !resp.dragged());
+        if resp.changed() || commit {
+            update = Some((opacity, commit));
+        }
+        ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
+    });
+    update
+}
+
 fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<LayerUiAction>) {
     ui.push_id(layer.id, |ui| {
         ui.group(|ui| {
@@ -208,7 +223,7 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
                     "{}×{} · {}",
                     layer.width,
                     layer.height,
-                    hud::format_source_pixel_size(mx, my)
+                    format::format_source_pixel_size(mx, my)
                 ),
                 None => format!("{}×{}", layer.width, layer.height),
             };
@@ -249,16 +264,9 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
                 );
             }
 
-            let mut opacity = layer.opacity;
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Opacity").small());
-                let resp = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false));
-                let commit = resp.drag_stopped() || (resp.changed() && !resp.dragged());
-                if resp.changed() || commit {
-                    actions.push(LayerUiAction::SetOpacity(layer.id, opacity, commit));
-                }
-                ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
-            });
+            if let Some((opacity, commit)) = show_opacity_slider(ui, layer.opacity) {
+                actions.push(LayerUiAction::SetOpacity(layer.id, opacity, commit));
+            }
 
             egui::CollapsingHeader::new(egui::RichText::new("CRS & Metadata").small())
                 .id_salt(("meta", layer.id))
@@ -351,16 +359,9 @@ fn show_vector_card(
             };
             ui.weak(egui::RichText::new(summary_text).small());
 
-            let mut opacity = layer.opacity;
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Opacity").small());
-                let resp = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false));
-                let commit = resp.drag_stopped() || (resp.changed() && !resp.dragged());
-                if resp.changed() || commit {
-                    actions.push(LayerUiAction::SetVectorOpacity(layer.id, opacity, commit));
-                }
-                ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
-            });
+            if let Some((opacity, commit)) = show_opacity_slider(ui, layer.opacity) {
+                actions.push(LayerUiAction::SetVectorOpacity(layer.id, opacity, commit));
+            }
 
             ui.horizontal(|ui| {
                 if let Some(bounds) = layer.footprint

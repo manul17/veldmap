@@ -1,6 +1,7 @@
 //! Read-only GeoJSON parsing, RFC 7946 GeoJSON export (with right-hand
 //! winding), and WGS84 globe vector mesh tessellation ([`VectorMesh`]).
 
+mod cluster;
 mod tessellate;
 
 use serde_json::{Map, Value, json};
@@ -53,6 +54,31 @@ pub struct GeoJsonFeature {
     pub name: Option<String>,
     pub properties: Map<String, Value>,
     pub geometry: GeoJsonGeometry,
+}
+
+impl GeoJsonFeature {
+    /// Construct a feature with an optional name, empty properties, and `geometry`.
+    pub fn new(name: Option<String>, geometry: GeoJsonGeometry) -> Self {
+        Self {
+            name,
+            properties: Map::new(),
+            geometry,
+        }
+    }
+
+    /// Insert a string property on this feature (chainable).
+    pub fn with_string_prop(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties
+            .insert(key.into(), Value::String(value.into()));
+        self
+    }
+
+    /// Insert a numeric (`f64`) property on this feature (chainable; non-finite
+    /// values serialize as JSON `null`).
+    pub fn with_f64_prop(mut self, key: impl Into<String>, value: f64) -> Self {
+        self.properties.insert(key.into(), Value::from(value));
+        self
+    }
 }
 
 /// Parsed collection of GeoJSON features.

@@ -1,16 +1,20 @@
-//! Read-only GeoJSON vector overlay layer stack (`VectorLayerStack`) and
-//! off-UI-thread GeoJSON file loader (`load_vector_file`).
+//! Read-only GeoJSON vector overlay layer stack (`VectorLayerStack`),
+//! off-UI-thread GeoJSON file loader (`load_vector_file`), and dedicated
+//! [`VectorIoWorker`] keeping vector I/O decoupled from raster `OverlayManager`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 
-use veldmap_core::geo::{DEFAULT_VECTOR_MAX_CHORD_DEG, FootprintBounds, VectorMesh, parse_geojson};
+use veldmap_core::geo::{
+    DEFAULT_VECTOR_MAX_CHORD_DEG, FootprintBounds, MAX_GEOJSON_BYTES, VectorMesh, parse_geojson,
+};
+use veldmap_core::sync::{CancelToken, Wakeup};
+use veldmap_storage::read_regular_file_utf8_limited;
 
-use crate::render::DrawVectorLayer;
+use crate::render::{DrawVectorId, DrawVectorLayer};
 use crate::session::SavedVectorEntry;
-
-/// Maximum GeoJSON file size accepted from disk (`64 MiB`).
-const MAX_GEOJSON_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Unique identifier for a loaded read-only GeoJSON vector layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -47,19 +51,8 @@ pub(crate) fn is_geojson_path(path: &Path) -> bool {
 }
 
 /// Read, validate, parse, and tessellate a local GeoJSON file off the UI thread.
-pub(crate) fn load_vector_file(path: &Path) -> Result<LoadedVectorData, String> {
-    let meta =
-        std::fs::metadata(path).map_err(|e| format!("failed to stat '{}': {e}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!("'{}' is not a regular file", path.display()));
-    }
-    if meta.len() > MAX_GEOJSON_FILE_BYTES {
-        return Err(format!(
-            "'{}' exceeds 64 MiB GeoJSON safety limit",
-            path.display()
-        ));
-    }
-    let text = std::fs::read_to_string(path)
+fn load_vector_file(path: &Path) -> Result<LoadedVectorData, String> {
+    let text = read_regular_file_utf8_limited(path, MAX_GEOJSON_BYTES as u64)
         .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
     let collection = parse_geojson(&text)
         .map_err(|e| format!("failed to parse GeoJSON '{}': {e}", path.display()))?;
@@ -81,9 +74,121 @@ pub(crate) fn load_vector_file(path: &Path) -> Result<LoadedVectorData, String> 
     })
 }
 
+struct VectorIoCmd {
+    path: PathBuf,
+    fly_to: bool,
+    visible: bool,
+    opacity: f32,
+    cancel: CancelToken,
+}
+
+pub(crate) struct VectorIoResult {
+    pub(crate) path: PathBuf,
+    pub(crate) fly_to: bool,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
+    pub(crate) outcome: Result<LoadedVectorData, String>,
+}
+
+/// Dedicated single-thread background worker loading and tessellating local
+/// GeoJSON files strictly off the UI thread, independent of raster
+/// `OverlayManager` / `OverlayIoWorker`.
+pub(crate) struct VectorIoWorker {
+    tx: Option<Sender<VectorIoCmd>>,
+    rx: Receiver<VectorIoResult>,
+    shutdown: CancelToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl VectorIoWorker {
+    pub(crate) fn spawn(wakeup: Wakeup, shutdown: CancelToken) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<VectorIoCmd>();
+        let (res_tx, res_rx) = mpsc::channel::<VectorIoResult>();
+        let worker_shutdown = shutdown.clone();
+        let handle = match thread::Builder::new()
+            .name("veldmap-vector-io".to_owned())
+            .spawn(move || {
+                while let Ok(cmd) = cmd_rx.recv() {
+                    if worker_shutdown.is_cancelled() {
+                        break;
+                    }
+                    if cmd.cancel.is_cancelled() {
+                        continue;
+                    }
+                    let outcome = load_vector_file(&cmd.path);
+                    if cmd.cancel.is_cancelled() || worker_shutdown.is_cancelled() {
+                        continue;
+                    }
+                    let _ = res_tx.send(VectorIoResult {
+                        path: cmd.path,
+                        fly_to: cmd.fly_to,
+                        visible: cmd.visible,
+                        opacity: cmd.opacity,
+                        outcome,
+                    });
+                    (wakeup)();
+                }
+            }) {
+            Ok(h) => Some(h),
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to spawn vector I/O worker");
+                None
+            }
+        };
+
+        Self {
+            tx: handle.is_some().then_some(cmd_tx),
+            rx: res_rx,
+            shutdown,
+            handle,
+        }
+    }
+
+    pub(crate) fn begin_open(
+        &self,
+        path: &Path,
+        fly_to: bool,
+        visible: bool,
+        opacity: f32,
+    ) -> Result<(), String> {
+        let cmd = VectorIoCmd {
+            path: path.to_path_buf(),
+            fly_to,
+            visible,
+            opacity: opacity.clamp(0.0, 1.0),
+            cancel: self.shutdown.child_token(),
+        };
+        if self.tx.as_ref().is_some_and(|tx| tx.send(cmd).is_ok()) {
+            Ok(())
+        } else {
+            Err("vector I/O worker is unavailable".to_owned())
+        }
+    }
+
+    pub(crate) fn try_recv(&self) -> Option<VectorIoResult> {
+        self.rx.try_recv().ok()
+    }
+
+    pub(crate) fn close_channel(&mut self) {
+        self.tx = None;
+    }
+
+    pub(crate) fn join(&mut self) {
+        self.tx = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for VectorIoWorker {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
 struct VectorLayer {
     id: VectorLayerId,
-    rev: u64,
     name: String,
     path: PathBuf,
     visible: bool,
@@ -144,8 +249,8 @@ impl Default for VectorLayerStack {
 }
 
 impl VectorLayerStack {
-    /// Insert a pre-parsed [`LoadedVectorData`] produced by the background I/O
-    /// worker into the stack.
+    /// Insert a pre-parsed [`LoadedVectorData`] produced by [`VectorIoWorker`]
+    /// into the stack.
     pub(crate) fn push_loaded(
         &mut self,
         data: LoadedVectorData,
@@ -165,7 +270,6 @@ impl VectorLayerStack {
 
         self.layers.push(VectorLayer {
             id,
-            rev: 1,
             name,
             path: data.path,
             visible,
@@ -238,8 +342,8 @@ impl VectorLayerStack {
             .iter()
             .filter(|l| l.visible && l.opacity > 0.001)
             .map(|l| DrawVectorLayer {
-                id: l.id.0,
-                rev: l.rev,
+                id: DrawVectorId::Layer(l.id.0),
+                rev: 1,
                 opacity: l.opacity,
                 fill_color: l.fill_color,
                 line_color: l.line_color,

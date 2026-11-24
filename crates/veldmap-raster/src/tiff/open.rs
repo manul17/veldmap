@@ -12,8 +12,8 @@ use veldmap_core::tile::{SourceFingerprint, SourceId};
 
 use crate::RasterError;
 use crate::pipeline::grid::{Grid, Overview};
-use crate::pipeline::metadata::{BandInfo, RasterDescription};
-use crate::pipeline::plan::build_chunked_level_table;
+use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription};
+use crate::pipeline::plan::{build_chunked_level_table, check_max_source_side};
 use crate::pipeline::radiometry::DisplayMapping;
 
 use super::chunk_reader::{DecoderPool, open_decoder};
@@ -23,7 +23,8 @@ use super::tags::{
     chunk_grid, depth_of_layout, ensure_readable, is_overview, map_tiff_error, opt_tag,
     parse_gdal_nodata,
 };
-use super::{MAX_IFDS, MAX_SOURCE_SIDE, TiffFormat, TiffSource};
+use super::ycbcr::YCbCrParams;
+use super::{MAX_IFDS, TiffFormat, TiffSource};
 
 fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
     let mut limits = Limits::default();
@@ -36,7 +37,7 @@ fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
 
 struct ScannedOverviews {
     overviews: Vec<Overview>,
-    overview_ycbcr: Vec<(usize, super::tags::YCbCrParams)>,
+    overview_ycbcr: Vec<(usize, YCbCrParams)>,
     ifd_index: usize,
     decoder_clean: bool,
 }
@@ -118,6 +119,50 @@ fn scan_overviews(
     })
 }
 
+fn merge_georef_with_sidecar(
+    placement: Option<GeoPlacement>,
+    ties_empty: bool,
+    embedded_affine: Option<[f64; 6]>,
+    trouble: Option<String>,
+    sidecar: Option<crate::sidecar::SidecarGeoref>,
+) -> (Option<GeoPlacement>, Option<String>) {
+    if placement.is_some() || !ties_empty {
+        return (placement, trouble);
+    }
+    let Some(sc) = sidecar else {
+        let fallback_placement = embedded_affine.map(|affine| GeoPlacement {
+            epsg: None,
+            custom_crs: None,
+            datum_warning: None,
+            affine,
+            geo_params: None,
+        });
+        return (fallback_placement, trouble);
+    };
+    let Some(affine) = sc.affine.or(embedded_affine) else {
+        return (None, trouble);
+    };
+    let has_crs = sc.crs.is_some();
+    let merged_placement = Some(GeoPlacement {
+        epsg: None,
+        custom_crs: sc.crs,
+        datum_warning: None,
+        affine,
+        geo_params: None,
+    });
+    let merged_trouble = if has_crs {
+        None
+    } else {
+        trouble.or_else(|| {
+            Some(
+                "TIFF has pixel affine / world file (.tfw/.wld) but no accompanying .prj CRS sidecar; assign a CRS to place it"
+                    .to_string(),
+            )
+        })
+    };
+    (merged_placement, merged_trouble)
+}
+
 impl TiffSource {
     /// Open and describe a GeoTIFF/BigTIFF/COG from `byte_source` using
     /// `fingerprint`, `budget`, and `cancel` without reading base-level pixels.
@@ -128,23 +173,6 @@ impl TiffSource {
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
         Self::open_with_sidecar(byte_source, fingerprint, None, budget, cancel)
-    }
-
-    /// Open a GeoTIFF/BigTIFF/COG, falling back to an injected external
-    /// `sidecar_placement` (e.g. from `.tfw` + `.prj` sidecars) when the TIFF
-    /// itself carries no embedded georeferencing.
-    pub fn open_with_placement(
-        byte_source: Arc<dyn ByteSource>,
-        fingerprint: SourceFingerprint,
-        sidecar_placement: Option<crate::pipeline::metadata::GeoPlacement>,
-        budget: &MemoryBudget,
-        cancel: &CancelToken,
-    ) -> Result<Self, RasterError> {
-        let sidecar = sidecar_placement.map(|p| crate::sidecar::SidecarGeoref {
-            affine: Some(p.affine),
-            crs: p.custom_crs,
-        });
-        Self::open_with_sidecar(byte_source, fingerprint, sidecar, budget, cancel)
     }
 
     /// Open a GeoTIFF/BigTIFF/COG with optional external [`crate::SidecarGeoref`]
@@ -176,17 +204,8 @@ impl TiffSource {
         let (pixel_layout, sample_bits, sample_type, ycbcr) =
             ensure_readable(&mut decoder, cancel)?;
         let tiled = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::TileWidth), cancel)?.is_some();
-        if !tiled && (width > MAX_SOURCE_SIDE || height > MAX_SOURCE_SIDE) {
-            return Err(RasterError::LimitExceeded {
-                width,
-                height,
-                estimated_bytes: u64::from(width)
-                    .saturating_mul(u64::from(height))
-                    .saturating_mul(4),
-                limit_bytes: u64::from(MAX_SOURCE_SIDE)
-                    .saturating_mul(u64::from(MAX_SOURCE_SIDE))
-                    .saturating_mul(4),
-            });
+        if !tiled {
+            check_max_source_side(width, height)?;
         }
         let depth = depth_of_layout(pixel_layout, sample_bits);
         let chunk = chunk_grid(&mut decoder, budget, depth, cancel)?;
@@ -202,38 +221,20 @@ impl TiffSource {
 
         let ParsedGeoref {
             ties,
-            mut placement,
+            placement,
             embedded_affine,
             foreign_datum_epsg,
             geographic_datum,
-            mut trouble,
+            trouble,
         } = georef(&mut decoder, width, height, cancel)?;
 
-        if placement.is_none() && ties.is_empty() {
-            if let Some(sc) = sidecar {
-                let affine = sc.affine.or(embedded_affine);
-                if let Some(affine) = affine {
-                    placement = Some(crate::pipeline::metadata::GeoPlacement {
-                        epsg: None,
-                        custom_crs: sc.crs,
-                        datum_warning: None,
-                        affine,
-                        geo_params: None,
-                    });
-                    trouble = None;
-                }
-            } else if let Some(affine) = embedded_affine {
-                // Expose embedded affine without CRS so CRS Override can still bind it.
-                placement = Some(crate::pipeline::metadata::GeoPlacement {
-                    epsg: None,
-                    custom_crs: None,
-                    datum_warning: None,
-                    affine,
-                    geo_params: None,
-                });
-            }
-        }
-        let binding_trouble = trouble;
+        let (placement, binding_trouble) = merge_georef_with_sidecar(
+            placement,
+            ties.is_empty(),
+            embedded_affine,
+            trouble,
+            sidecar,
+        );
 
         let format = TiffFormat {
             pixel_layout,
@@ -320,5 +321,52 @@ mod tests {
         let limits = build_tiff_limits(&tiny_budget);
         assert!(limits.intermediate_buffer_size >= 4 * 1024 * 1024);
         assert!(limits.intermediate_buffer_size <= 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn merge_georef_with_sidecar_preserves_trouble_when_sidecar_lacks_crs() {
+        let affine = [1.0, 0.0, 100.0, 0.0, -1.0, 200.0];
+        let sidecar_no_crs = crate::sidecar::SidecarGeoref {
+            affine: Some(affine),
+            crs: None,
+        };
+        let (placement, trouble) = merge_georef_with_sidecar(
+            None,
+            true,
+            None,
+            Some("embedded CRS error".to_owned()),
+            Some(sidecar_no_crs.clone()),
+        );
+        assert_eq!(placement.as_ref().map(|p| p.affine), Some(affine));
+        assert_eq!(trouble.as_deref(), Some("embedded CRS error"));
+
+        // Without prior embedded trouble, missing `.prj` still reports guidance.
+        let (_, fallback_trouble) =
+            merge_georef_with_sidecar(None, true, None, None, Some(sidecar_no_crs));
+        assert!(
+            fallback_trouble
+                .as_deref()
+                .is_some_and(|msg| msg.contains(".prj"))
+        );
+
+        // When sidecar supplies a CRS, trouble is cleared.
+        let sidecar_with_crs = crate::sidecar::SidecarGeoref {
+            affine: Some(affine),
+            crs: Some(veldmap_core::geo::CrsSpec::from_epsg(4326).expect("EPSG:4326")),
+        };
+        let (placement_ok, trouble_ok) = merge_georef_with_sidecar(
+            None,
+            true,
+            None,
+            Some("embedded CRS error".to_owned()),
+            Some(sidecar_with_crs),
+        );
+        assert!(
+            placement_ok
+                .as_ref()
+                .and_then(|p| p.custom_crs.as_ref())
+                .is_some()
+        );
+        assert!(trouble_ok.is_none());
     }
 }

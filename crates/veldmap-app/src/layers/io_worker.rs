@@ -1,6 +1,5 @@
-//! Dedicated off-UI-thread [`OverlayIoWorker`] for non-blocking local file
-//! fingerprinting, GeoTIFF/PNG/JPEG/GeoJSON opening, and reload disk-cache
-//! invalidation.
+//! Dedicated off-UI-thread [`OverlayIoWorker`] for non-blocking local raster
+//! fingerprinting, GeoTIFF/PNG/JPEG opening, and reload disk-cache invalidation.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,23 +15,14 @@ use crate::session::SavedCrsOverride;
 use super::LayerId;
 use super::opener::{OpenRasterError, open_local_raster};
 use super::runtime::OverlayRuntime;
-use super::vectors::{LoadedVectorData, load_vector_file};
+use super::stack::LayerInitOptions;
 
 /// Commands processed off the UI thread by [`OverlayIoWorker`].
 pub(super) enum OverlayIoCmd {
     Open {
         path: PathBuf,
         fly_to: bool,
-        visible: bool,
-        opacity: f32,
-        crs_override: Option<SavedCrsOverride>,
-        cancel: CancelToken,
-    },
-    OpenVector {
-        path: PathBuf,
-        fly_to: bool,
-        visible: bool,
-        opacity: f32,
+        options: LayerInitOptions,
         cancel: CancelToken,
     },
     Reload {
@@ -51,17 +41,8 @@ pub(super) enum OverlayIoResult {
     Opened {
         path: PathBuf,
         fly_to: bool,
-        visible: bool,
-        opacity: f32,
-        crs_override: Option<SavedCrsOverride>,
+        options: LayerInitOptions,
         outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
-    },
-    VectorOpened {
-        path: PathBuf,
-        fly_to: bool,
-        visible: bool,
-        opacity: f32,
-        outcome: Result<LoadedVectorData, String>,
     },
     Reloaded {
         id: LayerId,
@@ -77,9 +58,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
         OverlayIoCmd::Open {
             path,
             fly_to,
-            visible,
-            opacity,
-            crs_override,
+            options,
             cancel,
         } => {
             if cancel.is_cancelled() {
@@ -90,7 +69,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
                 &runtime.fingerprint_cache,
                 &runtime.budget,
                 false,
-                crs_override.as_ref(),
+                options.crs_override.as_ref(),
                 &cancel,
             );
             if cancel.is_cancelled() {
@@ -99,32 +78,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             let _ = res_tx.send(OverlayIoResult::Opened {
                 path,
                 fly_to,
-                visible,
-                opacity,
-                crs_override,
-                outcome,
-            });
-            (runtime.wakeup)();
-        }
-        OverlayIoCmd::OpenVector {
-            path,
-            fly_to,
-            visible,
-            opacity,
-            cancel,
-        } => {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let outcome = load_vector_file(&path);
-            if cancel.is_cancelled() {
-                return;
-            }
-            let _ = res_tx.send(OverlayIoResult::VectorOpened {
-                path,
-                fly_to,
-                visible,
-                opacity,
+                options,
                 outcome,
             });
             (runtime.wakeup)();
@@ -177,9 +131,9 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
     }
 }
 
-/// Dedicated single-thread background worker handling local GeoTIFF/COG,
-/// PNG/JPEG, and GeoJSON opening plus reload SQLite cache clearing strictly off
-/// the UI thread (joined deterministically on shutdown).
+/// Dedicated single-thread background worker handling local GeoTIFF/COG and
+/// PNG/JPEG opening plus reload SQLite cache clearing strictly off the UI
+/// thread (joined deterministically on shutdown).
 pub(super) struct OverlayIoWorker {
     tx: Option<Sender<OverlayIoCmd>>,
     rx: Receiver<OverlayIoResult>,

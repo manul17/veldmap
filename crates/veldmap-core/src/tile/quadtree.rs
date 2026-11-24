@@ -330,7 +330,7 @@ fn approx_tile_width_m(tile: &VisibleTile) -> f64 {
             PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator
         )
     {
-        return (2.0 * std::f64::consts::PI * geodesy::SEMI_MAJOR_M) / f64::from(cols);
+        return geodesy::EQUATORIAL_CIRCUMFERENCE_M / f64::from(cols);
     }
     // Bounding-sphere radius is ~half the tile diagonal (`sqrt(2)/2 * width`).
     (tile.ball.radius * std::f64::consts::SQRT_2).max(1.0)

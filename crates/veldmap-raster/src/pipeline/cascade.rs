@@ -6,12 +6,24 @@ use veldmap_core::tile::{RASTER_TILE_SIZE, grid_dim, tile_extent};
 
 use crate::RasterError;
 
-use super::resample::halve_rgba8;
+use super::resample::{bleed_alpha, halve_rgba8};
 
 /// Callback invoked whenever a cascade tile `(level, tx, ty, w, h, rgba8)`
 /// is completed.
 pub type TileEmit<'a> =
     &'a mut dyn FnMut(u8, u32, u32, u32, u32, Vec<u8>) -> Result<(), RasterError>;
+
+/// Wrap a display-track [`TileEmit`] callback so every emitted RGBA8 tile runs
+/// [`bleed_alpha`] before delivery (kept composable outside [`Cascade`] so
+/// non-display scientific/categorical tracks can opt out cleanly).
+pub(crate) fn bleed_display_emit<'a>(
+    emit: TileEmit<'a>,
+) -> impl FnMut(u8, u32, u32, u32, u32, Vec<u8>) -> Result<(), RasterError> + 'a {
+    move |lvl, tx, ty, tw, th, mut rgba| {
+        bleed_alpha(&mut rgba, tw, th);
+        emit(lvl, tx, ty, tw, th, rgba)
+    }
+}
 
 struct CascadeBand {
     level: u8,

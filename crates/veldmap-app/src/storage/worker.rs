@@ -32,6 +32,29 @@ pub(crate) struct DiskCacheStatus {
     pub(crate) notice: Option<DiskCacheNotice>,
 }
 
+enum CoalesceStep<T> {
+    Update(T),
+    Defer(DiskCacheCmd),
+}
+
+fn drain_coalesced<T>(
+    rx: &mpsc::Receiver<DiskCacheCmd>,
+    pending_cmd: &mut Option<DiskCacheCmd>,
+    mut latest: T,
+    mut classify: impl FnMut(DiskCacheCmd) -> CoalesceStep<T>,
+) -> T {
+    while let Ok(cmd) = rx.try_recv() {
+        match classify(cmd) {
+            CoalesceStep::Update(newer) => latest = newer,
+            CoalesceStep::Defer(other) => {
+                *pending_cmd = Some(other);
+                break;
+            }
+        }
+    }
+    latest
+}
+
 enum DiskCacheCmd {
     RefreshStats,
     SetMaxBytes(u64),
@@ -127,34 +150,26 @@ impl DiskCacheWorker {
                             }
                             (wakeup)();
                         }
-                        DiskCacheCmd::SaveSettings(mut settings) => {
-                            loop {
-                                match rx.try_recv() {
-                                    Ok(DiskCacheCmd::SaveSettings(newer)) => settings = newer,
-                                    Ok(other) => {
-                                        pending_cmd = Some(other);
-                                        break;
+                        DiskCacheCmd::SaveSettings(initial) => {
+                            let settings =
+                                drain_coalesced(&rx, &mut pending_cmd, initial, |cmd| match cmd {
+                                    DiskCacheCmd::SaveSettings(newer) => {
+                                        CoalesceStep::Update(newer)
                                     }
-                                    Err(_) => break,
-                                }
-                            }
+                                    other => CoalesceStep::Defer(other),
+                                });
                             if let Some(paths) = &paths
                                 && let Err(err) = settings.save(paths)
                             {
                                 tracing::warn!(error = %err, "Failed to persist user settings");
                             }
                         }
-                        DiskCacheCmd::SaveSession(mut session) => {
-                            loop {
-                                match rx.try_recv() {
-                                    Ok(DiskCacheCmd::SaveSession(newer)) => session = newer,
-                                    Ok(other) => {
-                                        pending_cmd = Some(other);
-                                        break;
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
+                        DiskCacheCmd::SaveSession(initial) => {
+                            let session =
+                                drain_coalesced(&rx, &mut pending_cmd, initial, |cmd| match cmd {
+                                    DiskCacheCmd::SaveSession(newer) => CoalesceStep::Update(newer),
+                                    other => CoalesceStep::Defer(other),
+                                });
                             if let Some(paths) = &paths
                                 && let Err(err) = session.save(paths)
                             {

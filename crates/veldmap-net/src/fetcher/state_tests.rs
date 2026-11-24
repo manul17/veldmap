@@ -283,8 +283,8 @@ fn plan_dispatch_carries_quad_id_and_defers_cooled_down_hosts() {
     // With disk cache enabled, disk tasks are planned with unpacked QuadTileId.
     let disk_batch = st.plan_dispatch(true, 1, &limiters, &shutdown, now);
     assert_eq!(disk_batch.disk_tasks.len(), 1);
-    assert_eq!(disk_batch.disk_tasks[0].key, k0);
-    assert_eq!(disk_batch.disk_tasks[0].id, id0);
+    assert_eq!(disk_batch.disk_tasks[0].target.key, k0);
+    assert_eq!(disk_batch.disk_tasks[0].target.id, id0);
     assert!(disk_batch.http_tasks.is_empty());
 
     // Without disk cache, remaining pending.disk drains to HTTP and respects host cooldown.
@@ -299,6 +299,6 @@ fn plan_dispatch_carries_quad_id_and_defers_cooled_down_hosts() {
     // After cooldown expires, HTTP task is planned with exact QuadTileId.
     let http_batch = st.plan_dispatch(false, 4, &limiters, &shutdown, cooldown_until);
     assert_eq!(http_batch.http_tasks.len(), 1);
-    assert_eq!(http_batch.http_tasks[0].key, k1);
-    assert_eq!(http_batch.http_tasks[0].id, id1);
+    assert_eq!(http_batch.http_tasks[0].target.key, k1);
+    assert_eq!(http_batch.http_tasks[0].target.id, id1);
 }

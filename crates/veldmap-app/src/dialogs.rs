@@ -139,7 +139,7 @@ impl DialogHost {
         self.spawn_dialog_future("veldmap-save-dialog", async move {
             let handle = fut.await?;
             let path = PathBuf::from(handle);
-            let result = std::fs::write(&path, geojson_payload.as_bytes())
+            let result = veldmap_storage::write_atomic_durable(&path, geojson_payload.as_bytes())
                 .map_err(|e| format!("failed to write '{}': {e}", path.display()));
             Some(FileDialogEvent::GeoJsonSaved { path, result })
         })

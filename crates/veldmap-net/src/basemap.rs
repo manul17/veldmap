@@ -380,7 +380,7 @@ impl LiveBasemapSpec {
 
     /// Resolve the concrete HTTP(S) tile URL for `id`, rejecting `PolarCap`
     /// keys and any `level > self.max_level`.
-    pub fn resolve_url(&self, id: QuadTileId) -> Result<String, NetError> {
+    pub(crate) fn resolve_url(&self, id: QuadTileId) -> Result<String, NetError> {
         let (_cols, rows) = self.validate_tile(id)?;
         let tms_y = rows - 1 - id.y;
         let effective_y = if self.tms_flip_y { tms_y } else { id.y };
@@ -430,7 +430,11 @@ impl LiveBasemapSpec {
     /// Redact any configured API key (raw or percent-encoded) as well as any
     /// inline URL `user:pass@` authority credentials and `?query` tokens from
     /// `text` before logging or displaying error messages in the UI.
-    pub fn redact_secrets(&self, text: &str) -> String {
+    pub(crate) fn redact_secrets(&self, text: &str) -> String {
         redact_text(text, self.api_key.as_ref())
     }
 }
+
+#[cfg(test)]
+#[path = "basemap_tests.rs"]
+mod tests;

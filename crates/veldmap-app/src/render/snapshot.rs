@@ -75,11 +75,20 @@ pub struct DrawOverlayLayer {
     pub patches: Vec<DrawOverlayPatch>,
 }
 
+/// Typed GPU buffer cache key for [`DrawVectorLayer`], keeping loaded vector
+/// layer IDs strictly separate from transient overlays such as interactive
+/// geodesic measurements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DrawVectorId {
+    Layer(u64),
+    Measurement,
+}
+
 /// Draped GeoJSON / measurement vector layer drawn in Pass 2 above raster
 /// overlays and below the procedural graticule.
 #[derive(Clone, Debug)]
 pub struct DrawVectorLayer {
-    pub id: u64,
+    pub id: DrawVectorId,
     pub rev: u64,
     pub opacity: f32,
     pub fill_color: [f32; 4],

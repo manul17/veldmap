@@ -9,7 +9,7 @@ use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::{DVec3, Vec3};
 use wgpu::util::DeviceExt;
 
-use super::snapshot::DrawSnapshot;
+use super::snapshot::{DrawSnapshot, DrawVectorId, DrawVectorLayer};
 use super::uniforms::{DynamicUniformArena, VectorUniform};
 
 /// Compact 24-byte GPU vertex matching `shaders/vector.wgsl` (`@location(0..1)`).
@@ -101,9 +101,95 @@ fn create_checked_buffer<T: Pod>(
     )
 }
 
+fn pack_layer_buffers(device: &wgpu::Device, layer: &DrawVectorLayer) -> CachedVectorBuffers {
+    let mut all_fill_verts: Vec<GpuVectorVertex> = Vec::new();
+    let mut all_fill_indices: Vec<u32> = Vec::new();
+    let mut all_line_verts: Vec<GpuVectorVertex> = Vec::new();
+    let mut all_point_verts: Vec<GpuVectorVertex> = Vec::new();
+    let mut clusters = Vec::with_capacity(layer.mesh.clusters.len());
+
+    for cluster in &layer.mesh.clusters {
+        let fill_start = all_fill_indices.len() as u32;
+        if !cluster.fill_vertices.is_empty() && !cluster.fill_indices.is_empty() {
+            let base_v = all_fill_verts.len() as u32;
+            all_fill_verts.extend(cluster.fill_vertices.iter().map(|v| GpuVectorVertex {
+                rel_pos: v.rel_pos,
+                normal: v.normal,
+            }));
+            all_fill_indices.extend(cluster.fill_indices.iter().map(|&idx| base_v + idx));
+        }
+        let fill_end = all_fill_indices.len() as u32;
+
+        let line_start = all_line_verts.len() as u32;
+        all_line_verts.extend(cluster.line_vertices.iter().map(|v| GpuVectorVertex {
+            rel_pos: v.rel_pos,
+            normal: v.normal,
+        }));
+        let line_end = all_line_verts.len() as u32;
+
+        let point_start = all_point_verts.len() as u32;
+        for v in &cluster.point_vertices {
+            let n = Vec3::from_array(v.normal);
+            if n.is_finite() && n.length_squared() > 1e-12 {
+                let unit_n = n.normalize();
+                all_point_verts.push(GpuVectorVertex {
+                    rel_pos: v.rel_pos,
+                    normal: unit_n.to_array(),
+                });
+            }
+        }
+        let point_end = all_point_verts.len() as u32;
+
+        clusters.push(ClusterDrawRange {
+            origin_ecef_m: cluster.origin_ecef_m,
+            fill_indices: fill_start..fill_end,
+            line_vertices: line_start..line_end,
+            point_instances: point_start..point_end,
+        });
+    }
+
+    let fill_vb = create_checked_buffer(
+        device,
+        "vector fill vertex buffer",
+        &all_fill_verts,
+        wgpu::BufferUsages::VERTEX,
+    );
+    let fill_ib = if fill_vb.is_some() {
+        create_checked_buffer(
+            device,
+            "vector fill index buffer",
+            &all_fill_indices,
+            wgpu::BufferUsages::INDEX,
+        )
+    } else {
+        None
+    };
+    let line_vb = create_checked_buffer(
+        device,
+        "vector line vertex buffer",
+        &all_line_verts,
+        wgpu::BufferUsages::VERTEX,
+    );
+    let point_vb = create_checked_buffer(
+        device,
+        "vector point instance buffer",
+        &all_point_verts,
+        wgpu::BufferUsages::VERTEX,
+    );
+
+    CachedVectorBuffers {
+        rev: layer.rev,
+        fill_vb,
+        fill_ib,
+        line_vb,
+        point_vb,
+        clusters,
+    }
+}
+
 /// GPU buffer cache and Pass-2 recorder for draped vector layers.
 pub(super) struct VectorRenderer {
-    buffers: HashMap<u64, CachedVectorBuffers>,
+    buffers: HashMap<DrawVectorId, CachedVectorBuffers>,
     draw_offsets: Vec<Vec<ClusterDrawOffsets>>,
 }
 
@@ -120,7 +206,7 @@ impl VectorRenderer {
             self.buffers.clear();
             return;
         }
-        let active_ids: HashSet<u64> = snapshot.vectors.iter().map(|v| v.id).collect();
+        let active_ids: HashSet<DrawVectorId> = snapshot.vectors.iter().map(|v| v.id).collect();
         self.buffers.retain(|id, _| active_ids.contains(id));
 
         for layer in &snapshot.vectors {
@@ -131,93 +217,8 @@ impl VectorRenderer {
             if !needs_upload {
                 continue;
             }
-
-            let mut all_fill_verts: Vec<GpuVectorVertex> = Vec::new();
-            let mut all_fill_indices: Vec<u32> = Vec::new();
-            let mut all_line_verts: Vec<GpuVectorVertex> = Vec::new();
-            let mut all_point_verts: Vec<GpuVectorVertex> = Vec::new();
-            let mut clusters = Vec::with_capacity(layer.mesh.clusters.len());
-
-            for cluster in &layer.mesh.clusters {
-                let fill_start = all_fill_indices.len() as u32;
-                if !cluster.fill_vertices.is_empty() && !cluster.fill_indices.is_empty() {
-                    let base_v = all_fill_verts.len() as u32;
-                    all_fill_verts.extend(cluster.fill_vertices.iter().map(|v| GpuVectorVertex {
-                        rel_pos: v.rel_pos,
-                        normal: v.normal,
-                    }));
-                    all_fill_indices.extend(cluster.fill_indices.iter().map(|&idx| base_v + idx));
-                }
-                let fill_end = all_fill_indices.len() as u32;
-
-                let line_start = all_line_verts.len() as u32;
-                all_line_verts.extend(cluster.line_vertices.iter().map(|v| GpuVectorVertex {
-                    rel_pos: v.rel_pos,
-                    normal: v.normal,
-                }));
-                let line_end = all_line_verts.len() as u32;
-
-                let point_start = all_point_verts.len() as u32;
-                for v in &cluster.point_vertices {
-                    let n = Vec3::from_array(v.normal);
-                    if n.is_finite() && n.length_squared() > 1e-12 {
-                        let unit_n = n.normalize();
-                        all_point_verts.push(GpuVectorVertex {
-                            rel_pos: v.rel_pos,
-                            normal: unit_n.to_array(),
-                        });
-                    }
-                }
-                let point_end = all_point_verts.len() as u32;
-
-                clusters.push(ClusterDrawRange {
-                    origin_ecef_m: cluster.origin_ecef_m,
-                    fill_indices: fill_start..fill_end,
-                    line_vertices: line_start..line_end,
-                    point_instances: point_start..point_end,
-                });
-            }
-
-            let fill_vb = create_checked_buffer(
-                device,
-                "vector fill vertex buffer",
-                &all_fill_verts,
-                wgpu::BufferUsages::VERTEX,
-            );
-            let fill_ib = if fill_vb.is_some() {
-                create_checked_buffer(
-                    device,
-                    "vector fill index buffer",
-                    &all_fill_indices,
-                    wgpu::BufferUsages::INDEX,
-                )
-            } else {
-                None
-            };
-            let line_vb = create_checked_buffer(
-                device,
-                "vector line vertex buffer",
-                &all_line_verts,
-                wgpu::BufferUsages::VERTEX,
-            );
-            let point_vb = create_checked_buffer(
-                device,
-                "vector point instance buffer",
-                &all_point_verts,
-                wgpu::BufferUsages::VERTEX,
-            );
-
-            self.buffers.insert(
-                layer.id,
-                CachedVectorBuffers {
-                    rev: layer.rev,
-                    fill_vb,
-                    fill_ib,
-                    line_vb,
-                    point_vb,
-                    clusters,
-                },
-            );
+            let packed = pack_layer_buffers(device, layer);
+            self.buffers.insert(layer.id, packed);
         }
     }
 
@@ -315,7 +316,7 @@ impl VectorRenderer {
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         bound = true;
                     }
-                    pass.set_bind_group(1, arena.overlay_bind_group(), &[dyn_off]);
+                    pass.set_bind_group(1, arena.vector_bind_group(), &[dyn_off]);
                     pass.draw_indexed(cluster.fill_indices.clone(), 0, 0..1);
                 }
             }
@@ -334,7 +335,7 @@ impl VectorRenderer {
                         pass.set_vertex_buffer(0, vb.slice(..));
                         bound = true;
                     }
-                    pass.set_bind_group(1, arena.overlay_bind_group(), &[dyn_off]);
+                    pass.set_bind_group(1, arena.vector_bind_group(), &[dyn_off]);
                     pass.draw(cluster.line_vertices.clone(), 0..1);
                 }
             }
@@ -353,7 +354,7 @@ impl VectorRenderer {
                         pass.set_vertex_buffer(0, vb.slice(..));
                         bound = true;
                     }
-                    pass.set_bind_group(1, arena.overlay_bind_group(), &[dyn_off]);
+                    pass.set_bind_group(1, arena.vector_bind_group(), &[dyn_off]);
                     pass.draw(0..6, cluster.point_instances.clone());
                 }
             }

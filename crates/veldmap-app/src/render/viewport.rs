@@ -91,6 +91,7 @@ impl ViewportState {
             device,
             &pipelines.tile_uniform_layout,
             &pipelines.overlay_uniform_layout,
+            &pipelines.vector_uniform_layout,
         );
 
         Self {

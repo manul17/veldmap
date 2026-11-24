@@ -15,8 +15,9 @@ use crate::{DecodeCompletion, DecodeFailure, DecodeRequest};
 
 use super::PipelineContext;
 use super::disk::{DiskCacheGate, DiskReadOutcome};
-use super::dispatch::{DiskTask, HttpFetchInput};
-use super::guards::{InFlightGuard, PermitGuard};
+use super::dispatch::{DiskTask, HttpTask};
+use super::guards::InFlightGuard;
+use super::state::TileTarget;
 use super::state::{PipelineState, Transition};
 
 /// Short silent cooldown before re-attempting a tile whose decode submission
@@ -110,10 +111,13 @@ pub(super) async fn run_disk_lookup(
     task: DiskTask,
 ) {
     let DiskTask {
-        key,
-        id,
-        spec,
-        cancel,
+        target:
+            TileTarget {
+                key,
+                id,
+                spec,
+                cancel,
+            },
         guard,
         disk_slot,
     } = task;
@@ -121,9 +125,9 @@ pub(super) async fn run_disk_lookup(
         return;
     }
 
-    let read_outcome = gate.get(&spec, id, &cancel).await;
-    // Release the disk-lookup concurrency slot immediately before decode/HTTP.
-    drop(disk_slot);
+    // Move `disk_slot` into `gate.get` so the concurrency slot stays held until
+    // the blocking SQLite read returns even if `cancel` fires mid-read.
+    let read_outcome = gate.get(&spec, id, &cancel, disk_slot).await;
 
     match read_outcome {
         DiskReadOutcome::Cancelled => {}
@@ -238,19 +242,19 @@ fn handle_http_transient_failure(
     });
 }
 
-pub(super) async fn run_http_fetch(
-    ctx: Arc<PipelineContext>,
-    input: HttpFetchInput,
-    guard: InFlightGuard,
-    permit_guard: PermitGuard,
-) {
-    let HttpFetchInput {
-        key,
-        id,
-        spec,
+pub(super) async fn run_http_fetch(ctx: Arc<PipelineContext>, task: HttpTask) {
+    let HttpTask {
+        target:
+            TileTarget {
+                key,
+                id,
+                spec,
+                cancel,
+            },
         host,
-        cancel,
-    } = input;
+        guard,
+        permit_guard,
+    } = task;
 
     if cancel.is_cancelled() {
         return;

@@ -119,10 +119,23 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
         .expect("independent source pass succeeds");
     assert_ne!(p1.pass_id, p_b.pass_id);
 
-    // Reconciling pointwise tiles must cancel unwanted pointwise jobs without
-    // touching the active pass's flight entries.
+    // Reconciling pointwise tiles must cancel unwanted pointwise jobs for
+    // `pass_a` without touching the active pass's flight entries or sibling
+    // band streams sharing the same `SourceId`.
+    let mut sibling_band_meta = meta_a.clone();
+    sibling_band_meta.spec.band = veldmap_core::tile::BandKey::from_name("B08");
+    let sibling_key = sibling_band_meta.tile_key(0, 0, 0);
+    let sibling_admitted = sched.admit_pointwise(
+        &sibling_band_meta,
+        0,
+        &[sibling_key],
+        |_| false,
+        &root_cancel,
+    );
+    assert_eq!(keys(&sibling_admitted), vec![sibling_key]);
+
     let wanted: HashSet<TileKey> = [k0].into_iter().collect();
-    let cancelled = sched.reconcile_pointwise(src_a, &wanted, |_| false);
+    let cancelled = sched.reconcile_pointwise(pass_a, &wanted, |_| false);
     for t in &cancelled {
         t.cancel();
     }
@@ -130,7 +143,9 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
     assert!(sched.is_in_flight(&k0));
     assert!(!sched.is_in_flight(&k1));
     assert!(sched.is_in_flight(&pass_tile));
+    assert!(sched.is_in_flight(&sibling_key));
     assert!(sched.has_active_pass(pass_a));
+    assert!(sched.cancel_in_flight(&sibling_key, sibling_admitted[0].job_id));
 
     // Zooming IN (target=1 < active_pass_level=3) does NOT cancel coarser pass.
     assert!(sched.update_target(pass_a, 1, None).is_none());

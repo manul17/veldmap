@@ -10,6 +10,8 @@ use veldmap_core::tile::{QuadTileId, TileKey};
 use crate::basemap::LiveBasemapSpec;
 use crate::{BlobStoreError, TileBlobStore};
 
+use super::guards::DiskSlotGuard;
+
 /// Maximum concurrent blocking disk-cache write/delete tasks (`cache.put()` /
 /// `cache.delete()`) so burst completions serialize cleanly without piling up
 /// contending Tokio blocking threads on a single-writer backend.
@@ -48,11 +50,16 @@ impl DiskCacheGate {
     }
 
     /// Perform a cancellable blocking lookup for `(spec.cache_key(), id)`.
+    ///
+    /// Moves `disk_slot` into `spawn_blocking` so cancelling mid-read never
+    /// releases the disk-lookup concurrency slot while the blocking SQLite
+    /// `store.get()` call is still executing.
     pub(super) async fn get(
         &self,
         spec: &Arc<LiveBasemapSpec>,
         id: QuadTileId,
         cancel: &CancelToken,
+        disk_slot: DiskSlotGuard,
     ) -> DiskReadOutcome {
         if cancel.is_cancelled() {
             return DiskReadOutcome::Cancelled;
@@ -63,6 +70,7 @@ impl DiskCacheGate {
         let res = tokio::select! {
             _ = cancel.cancelled() => return DiskReadOutcome::Cancelled,
             res = tokio::task::spawn_blocking(move || {
+                let _disk_slot = disk_slot;
                 if cancel_for_get.is_cancelled() {
                     return DiskReadOutcome::Cancelled;
                 }

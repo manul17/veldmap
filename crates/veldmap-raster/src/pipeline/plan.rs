@@ -5,9 +5,49 @@
 use std::collections::HashSet;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec, level_count};
+use veldmap_core::tile::{
+    BandKey, PixelFormat, SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec, level_count,
+};
+
+use crate::RasterError;
 
 use super::grid::Grid;
+
+/// Maximum raster side dimension accepted for untiled/stripped rasters and
+/// full-frame PNG sources.
+///
+/// Tiled TIFFs/COGs may exceed this limit provided their chunk grid and at
+/// least one pyramid level fit within [`MemoryBudget`].
+pub const MAX_SOURCE_SIDE: u32 = 65_536;
+
+/// Current display decode revision encoded into analytical display `TileKey`s.
+const DISPLAY_DECODE_REV: u32 = 1;
+
+/// Canonical display stream spec shared across analytical display decoders
+/// (`TiffSource`, `PngSource`, `JpegSource`).
+pub(crate) const DISPLAY_STREAM_SPEC: TileStreamSpec = TileStreamSpec::new(
+    BandKey::Display,
+    PixelFormat::Rgba8UnormSrgb,
+    0,
+    DISPLAY_DECODE_REV,
+);
+
+/// Enforce [`MAX_SOURCE_SIDE`] on untiled/full-frame raster dimensions.
+pub(crate) fn check_max_source_side(width: u32, height: u32) -> Result<(), RasterError> {
+    if width > MAX_SOURCE_SIDE || height > MAX_SOURCE_SIDE {
+        return Err(RasterError::LimitExceeded {
+            width,
+            height,
+            estimated_bytes: u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(4),
+            limit_bytes: u64::from(MAX_SOURCE_SIDE)
+                .saturating_mul(u64::from(MAX_SOURCE_SIDE))
+                .saturating_mul(4),
+        });
+    }
+    Ok(())
+}
 
 /// How one pyramid level is produced from its underlying source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

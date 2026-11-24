@@ -130,8 +130,14 @@ impl GeoKeyParams {
 
     /// Look up a `f64` scalar GeoKey value.
     pub fn get_f64(&self, id: u16) -> Option<f64> {
+        self.get_f64_slice(id)
+            .and_then(|vals| vals.first().copied())
+    }
+
+    /// Look up a slice of `f64` GeoKey values (e.g. `GeogTOWGS84GeoKey`).
+    pub fn get_f64_slice(&self, id: u16) -> Option<&[f64]> {
         self.keys.iter().find_map(|(k, v)| match (k, v) {
-            (key, GeoKeyValue::Double(vals)) if *key == id => vals.first().copied(),
+            (key, GeoKeyValue::Double(vals)) if *key == id => Some(vals.as_slice()),
             _ => None,
         })
     }

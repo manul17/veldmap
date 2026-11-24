@@ -1,5 +1,7 @@
 //! Native desktop binary entrypoint for VeldMap.
 
+#![forbid(unsafe_code)]
+
 use eframe::egui;
 use eframe::egui_wgpu;
 use tracing_subscriber::EnvFilter;

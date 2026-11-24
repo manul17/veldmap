@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{SourceId, TileKey};
-use veldmap_raster::{DecodeContext, DecodePoolHandle, SharedChunkCache, TileScheduler};
+use veldmap_raster::{DecodeContext, DecodePoolHandle, PassKey, SharedChunkCache, TileScheduler};
 use veldmap_storage::{LocalFingerprintCache, TileDiskCache};
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadSender};
@@ -109,18 +109,18 @@ impl OverlayRuntime {
         Some(deadline.saturating_duration_since(Instant::now()))
     }
 
-    /// Reconcile in-flight pointwise jobs for a single `source` against
+    /// Reconcile in-flight pointwise jobs for a single `stream_key` against
     /// `wanted` and current GPU/pending cache state, cancelling stale tokens
     /// strictly outside the scheduler lock.
-    pub(super) fn reconcile_pointwise_source(
+    pub(super) fn reconcile_pointwise_stream(
         &self,
-        source: SourceId,
+        stream_key: PassKey,
         wanted: &HashSet<TileKey>,
         gpu_cache: &GpuTileCache,
         pending: &PendingUploads,
     ) {
         let stale_tokens =
-            lock_unpoisoned(&self.scheduler).reconcile_pointwise(source, wanted, |k| {
+            lock_unpoisoned(&self.scheduler).reconcile_pointwise(stream_key, wanted, |k| {
                 gpu_cache.contains(k) || pending.contains(k)
             });
         for tok in stale_tokens {
@@ -145,7 +145,7 @@ impl OverlayRuntime {
                     continue;
                 }
                 to_cancel.extend(sched.reconcile_pointwise(
-                    layer.source_id(),
+                    layer.meta.pass_key(),
                     &layer.wanted,
                     |k| gpu_cache.contains(k) || pending.contains(k),
                 ));

@@ -11,7 +11,16 @@ use veldmap_raster::{PyramidMeta, RasterSource};
 
 use crate::session::SavedCrsOverride;
 
-use super::{LayerId, default_display_tile_bytes};
+use super::{LayerId, LayerSummary, default_display_tile_bytes};
+
+/// Initial display and georeference override options when inserting an opened
+/// raster layer into [`LayerStack`].
+#[derive(Clone, Debug)]
+pub(super) struct LayerInitOptions {
+    pub(super) visible: bool,
+    pub(super) opacity: f32,
+    pub(super) crs_override: Option<SavedCrsOverride>,
+}
 
 /// Single georeferenced raster overlay inside [`LayerStack`].
 pub(super) struct OverlayLayer {
@@ -44,18 +53,12 @@ pub(super) struct OverlayLayer {
 }
 
 impl OverlayLayer {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "internal layer constructor grouping immutable source metadata and initial UI state"
-    )]
     pub(super) fn from_source(
         id: LayerId,
         path: PathBuf,
         source: Arc<dyn RasterSource>,
         frame: Frame,
-        crs_override: Option<SavedCrsOverride>,
-        visible: bool,
-        opacity: f32,
+        options: LayerInitOptions,
         relaid: u64,
     ) -> Self {
         let name = path
@@ -76,13 +79,13 @@ impl OverlayLayer {
             meta,
             fingerprint_hex,
             frame: Arc::new(frame),
-            crs_override,
+            crs_override: options.crs_override,
             crs_override_epoch: 0,
             last_error: None,
             relaid,
             cull,
-            visible,
-            opacity: opacity.clamp(0.0, 1.0),
+            visible: options.visible,
+            opacity: options.opacity.clamp(0.0, 1.0),
             source_pixel_size_m,
             footprint,
             wanted_shared: Arc::new(Mutex::new(HashSet::new())),
@@ -91,6 +94,52 @@ impl OverlayLayer {
             reloading: false,
             reload_seq: 0,
             reload_cancel: None,
+        }
+    }
+
+    pub(super) fn to_summary(
+        &self,
+        in_flight: usize,
+        pass_active: bool,
+        can_move_up: bool,
+        can_move_down: bool,
+    ) -> LayerSummary {
+        let desc = self.source.description();
+        let sample_info = desc.bands.first().map_or_else(
+            || "Display RGBA".to_owned(),
+            |b| {
+                let nodata_str = b
+                    .nodata
+                    .map(|v| format!(", nodata={v}"))
+                    .unwrap_or_default();
+                format!("{} ch, {:?}{nodata_str}", b.channels, b.sample_type)
+            },
+        );
+        LayerSummary {
+            id: self.id,
+            name: self.name.clone(),
+            path: self.path.clone(),
+            visible: self.visible,
+            opacity: self.opacity,
+            width: desc.width,
+            height: desc.height,
+            source_pixel_size_m: self.source_pixel_size_m,
+            footprint: self.footprint,
+            in_flight,
+            pass_active,
+            reloading: self.is_reloading(),
+            crs_label: self.frame.crs_label(),
+            datum_warning: self.frame.datum_warning().map(|w| w.message()),
+            sample_info,
+            detail_limit_level: self
+                .meta
+                .finest_fitting_level()
+                .unwrap_or(self.meta.max_level()),
+            can_override_crs: desc.placement.is_some() || !desc.ties.is_empty(),
+            has_crs_override: self.crs_override.is_some(),
+            last_error: self.last_error.clone(),
+            can_move_up,
+            can_move_down,
         }
     }
 
@@ -166,9 +215,11 @@ impl OverlayLayer {
             path,
             source,
             frame,
-            self.crs_override.clone(),
-            self.visible,
-            self.opacity,
+            LayerInitOptions {
+                crs_override: self.crs_override.clone(),
+                visible: self.visible,
+                opacity: self.opacity,
+            },
             relaid,
         );
         replacement.reload_seq = seq;

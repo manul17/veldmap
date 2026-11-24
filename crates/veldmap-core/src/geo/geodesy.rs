@@ -15,6 +15,9 @@ use glam::DVec3;
 /// WGS84 semi-major axis in metres.
 pub const SEMI_MAJOR_M: f64 = 6_378_137.0;
 
+/// WGS84 equatorial circumference in metres (`2 * pi * a`).
+pub(crate) const EQUATORIAL_CIRCUMFERENCE_M: f64 = 2.0 * std::f64::consts::PI * SEMI_MAJOR_M;
+
 /// WGS84 flattening (`1 / 298.257223563`).
 pub const FLATTENING: f64 = 1.0 / 298.257_223_563;
 

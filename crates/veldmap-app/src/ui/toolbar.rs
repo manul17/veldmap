@@ -17,7 +17,7 @@ use crate::settings::AppSettings;
 
 use super::ERROR_TEXT_COLOR;
 use super::basemap::{BasemapUiAction, BasemapUiState, show_toolbar_controls};
-use super::hud;
+use super::format;
 
 /// User intent emitted by the top workstation toolbar and applied by
 /// `VeldmapApp`.
@@ -178,9 +178,9 @@ pub(crate) fn show_top_toolbar(
                         ui.horizontal(|ui| {
                             let tip = format!(
                                 "{} · Alt {} · Hdg {:.1}°",
-                                hud::format_lat_lon(bm.lat_deg, bm.lon_deg),
-                                hud::format_distance_m(bm.height_m),
-                                bm.heading_deg
+                                format::format_lat_lon(bm.pose.lat_deg, bm.pose.lon_deg),
+                                format::format_distance_m(bm.pose.height_m),
+                                bm.pose.heading_deg
                             );
                             if ui.button(&bm.name).on_hover_text(tip).clicked() {
                                 actions.push(ToolbarAction::GoToBookmark(bm.clone()));

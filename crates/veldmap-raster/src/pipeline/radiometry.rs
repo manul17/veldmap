@@ -82,10 +82,16 @@ impl PixelLayout {
     }
 }
 
-/// Expand raw 8-bit samples directly to RGBA8 without stretching or nodata
-/// keying.
-fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(pixels * 4);
+/// Expand raw 8-bit samples directly into a reusable RGBA8 buffer without
+/// stretching or nodata keying.
+pub(crate) fn expand_u8_into_rgba(
+    samples: &[u8],
+    pixel: PixelLayout,
+    pixels: usize,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    out.reserve(pixels.saturating_mul(4));
     for px in samples.chunks_exact(pixel.channels).take(pixels) {
         let (rgb, alpha) = match (pixel.colors(), pixel.has_alpha()) {
             (1, false) => ([px[0], px[0], px[0]], 255),
@@ -93,9 +99,16 @@ fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
             (_, false) => ([px[0], px[1], px[2]], 255),
             (_, true) => ([px[0], px[1], px[2]], px[pixel.channels - 1]),
         };
-        rgba.extend_from_slice(&rgb);
-        rgba.push(alpha);
+        out.extend_from_slice(&rgb);
+        out.push(alpha);
     }
+}
+
+/// Expand raw 8-bit samples directly to RGBA8 without stretching or nodata
+/// keying.
+fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
+    let mut rgba = Vec::new();
+    expand_u8_into_rgba(samples, pixel, pixels, &mut rgba);
     rgba
 }
 

@@ -4,37 +4,10 @@
 mod jpeg;
 mod png;
 
-use veldmap_core::io::IoError;
-use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
-
-use crate::RasterError;
 use crate::pipeline::metadata::GeoPlacement;
 
 pub use jpeg::{JpegSource, has_jpeg_magic};
 pub use png::{PngSource, has_png_magic};
-
-const ADAPTER_DECODE_REV: u32 = 1;
-
-pub(super) const DISPLAY_STREAM_SPEC: TileStreamSpec = TileStreamSpec::new(
-    BandKey::Display,
-    PixelFormat::Rgba8UnormSrgb,
-    0,
-    ADAPTER_DECODE_REV,
-);
-
-/// Map a `std::io::Error` produced by a decoder reading from
-/// [`veldmap_core::io::BufferedByteReader`] back into [`RasterError::Cancelled`]
-/// or [`RasterError::Io`], preserving structured core I/O errors.
-pub(crate) fn map_std_io_error(io_err: std::io::Error, cancel: &CancelToken) -> RasterError {
-    if cancel.is_cancelled() {
-        return RasterError::Cancelled;
-    }
-    match io_err.downcast::<IoError>() {
-        Ok(core_err) => RasterError::from(core_err),
-        Err(io_err) => RasterError::from(IoError::Io(io_err)),
-    }
-}
 
 pub(super) fn world_file_binding_trouble(
     format_name: &str,

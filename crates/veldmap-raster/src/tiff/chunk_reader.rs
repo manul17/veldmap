@@ -13,10 +13,12 @@ use crate::RasterError;
 use crate::pipeline::chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
 use crate::pipeline::driver::Chunked;
 use crate::pipeline::grid;
+use crate::pipeline::plan::DISPLAY_STREAM_SPEC;
 use crate::pipeline::radiometry::DisplayMapping;
 
+use super::TiffFormat;
 use super::tags::{chunk_rgba, map_tiff_error};
-use super::{DISPLAY_STREAM_SPEC, TiffFormat};
+use super::ycbcr::YCbCrParams;
 
 /// Maximum idle `tiff::decoder::Decoder` handles retained per [`super::TiffSource`].
 const MAX_POOLED_DECODERS: usize = 8;
@@ -257,7 +259,7 @@ pub(super) struct TiffChunkReader<'a> {
     decoder_pool: &'a DecoderPool,
     source_id: SourceId,
     format: TiffFormat,
-    ifd_ycbcr: &'a [(usize, super::tags::YCbCrParams)],
+    ifd_ycbcr: &'a [(usize, YCbCrParams)],
     mapping: DisplayMapping,
     mode: ChunkReadMode<'a>,
     pooled: Option<PooledDecoder<'a>>,
@@ -268,7 +270,7 @@ impl<'a> TiffChunkReader<'a> {
         decoder_pool: &'a DecoderPool,
         source_id: SourceId,
         format: TiffFormat,
-        ifd_ycbcr: &'a [(usize, super::tags::YCbCrParams)],
+        ifd_ycbcr: &'a [(usize, YCbCrParams)],
         mapping: DisplayMapping,
         mode: ChunkReadMode<'a>,
     ) -> Self {
@@ -283,7 +285,7 @@ impl<'a> TiffChunkReader<'a> {
         }
     }
 
-    fn ycbcr_for(&self, image: usize) -> Option<super::tags::YCbCrParams> {
+    fn ycbcr_for(&self, image: usize) -> Option<YCbCrParams> {
         self.ifd_ycbcr
             .iter()
             .find_map(|&(idx, params)| (idx == image).then_some(params))

@@ -3,14 +3,17 @@
 
 use super::mesh::TileVertex;
 use super::overlay::OverlayVertex;
-use super::uniforms::{CameraUniform, OverlayPatchUniform, TileUniform};
+use super::uniforms::{CameraUniform, OverlayPatchUniform, TileUniform, VectorUniform};
 use super::vector::GpuVectorVertex;
 use super::{COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_WGSL, VECTOR_WGSL};
 
 struct GlobePipelineSpec<'a> {
     label: &'a str,
+    vertex_entry: &'a str,
     vertex_layout: wgpu::VertexBufferLayout<'static>,
     fragment_entry: &'a str,
+    topology: wgpu::PrimitiveTopology,
+    cull_mode: Option<wgpu::Face>,
     blend: wgpu::BlendState,
     depth_stencil: Option<wgpu::DepthStencilState>,
 }
@@ -26,7 +29,7 @@ fn create_globe_pipeline(
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(spec.vertex_entry),
             buffers: &[Some(spec.vertex_layout)],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
@@ -41,8 +44,8 @@ fn create_globe_pipeline(
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: Some(wgpu::Face::Back),
+            topology: spec.topology,
+            cull_mode: spec.cull_mode,
             front_face: wgpu::FrontFace::Ccw,
             ..Default::default()
         },
@@ -57,6 +60,7 @@ pub(super) struct GlobePipelines {
     pub(super) camera_layout: wgpu::BindGroupLayout,
     pub(super) tile_uniform_layout: wgpu::BindGroupLayout,
     pub(super) overlay_uniform_layout: wgpu::BindGroupLayout,
+    pub(super) vector_uniform_layout: wgpu::BindGroupLayout,
     pub(super) tile_texture_layout: wgpu::BindGroupLayout,
     pub(super) tile_sampler: wgpu::Sampler,
     pub(super) body_ellipsoid_pipeline: wgpu::RenderPipeline,
@@ -75,6 +79,7 @@ struct SharedLayouts {
     camera_layout: wgpu::BindGroupLayout,
     tile_uniform_layout: wgpu::BindGroupLayout,
     overlay_uniform_layout: wgpu::BindGroupLayout,
+    vector_uniform_layout: wgpu::BindGroupLayout,
     tile_texture_layout: wgpu::BindGroupLayout,
 }
 
@@ -108,6 +113,8 @@ fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
         "overlay patch dynamic uniform layout",
         true,
     );
+    let vector_uniform_layout =
+        uniform_buffer_layout::<VectorUniform>(device, "vector dynamic uniform layout", true);
 
     let tile_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("tile Rgba8UnormSrgb texture layout"),
@@ -135,6 +142,7 @@ fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
         camera_layout,
         tile_uniform_layout,
         overlay_uniform_layout,
+        vector_uniform_layout,
         tile_texture_layout,
     }
 }
@@ -287,8 +295,11 @@ impl GlobePipelines {
             &untextured_pipeline_layout,
             GlobePipelineSpec {
                 label: "globe body ellipsoid pipeline (Reverse-Z)",
+                vertex_entry: "vs_main",
                 vertex_layout: TileVertex::LAYOUT,
                 fragment_entry: "fs_body_ellipsoid",
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
                 blend: wgpu::BlendState::REPLACE,
                 depth_stencil: body_depth(),
             },
@@ -300,8 +311,11 @@ impl GlobePipelines {
             &textured_pipeline_layout,
             GlobePipelineSpec {
                 label: "globe body textured pipeline (Reverse-Z)",
+                vertex_entry: "vs_main",
                 vertex_layout: TileVertex::LAYOUT,
                 fragment_entry: "fs_body_textured",
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
                 blend: wgpu::BlendState::REPLACE,
                 depth_stencil: body_depth(),
             },
@@ -313,8 +327,11 @@ impl GlobePipelines {
             &overlay_pipeline_layout,
             GlobePipelineSpec {
                 label: "overlay warp-mesh pipeline (depth-less)",
+                vertex_entry: "vs_main",
                 vertex_layout: OverlayVertex::LAYOUT,
                 fragment_entry: "fs_overlay",
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
                 blend: wgpu::BlendState::ALPHA_BLENDING,
                 depth_stencil: None,
             },
@@ -329,7 +346,7 @@ impl GlobePipelines {
                 label: Some("vector draped pipeline layout"),
                 bind_group_layouts: &[
                     Some(&layouts.camera_layout),
-                    Some(&layouts.overlay_uniform_layout),
+                    Some(&layouts.vector_uniform_layout),
                 ],
                 immediate_size: 0,
             });
@@ -339,72 +356,45 @@ impl GlobePipelines {
             &vector_pipeline_layout,
             GlobePipelineSpec {
                 label: "vector polygon fill pipeline (depth-less)",
+                vertex_entry: "vs_main",
                 vertex_layout: GpuVectorVertex::LAYOUT,
                 fragment_entry: "fs_vector",
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
                 blend: wgpu::BlendState::ALPHA_BLENDING,
                 depth_stencil: None,
             },
         );
-        let vector_line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("vector polyline stroke pipeline (depth-less)"),
-            layout: Some(&vector_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &vector_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(GpuVectorVertex::LAYOUT)],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &vector_shader,
-                entry_point: Some("fs_vector"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
+        let vector_line_pipeline = create_globe_pipeline(
+            device,
+            &vector_shader,
+            &vector_pipeline_layout,
+            GlobePipelineSpec {
+                label: "vector polyline stroke pipeline (depth-less)",
+                vertex_entry: "vs_main",
+                vertex_layout: GpuVectorVertex::LAYOUT,
+                fragment_entry: "fs_vector",
                 topology: wgpu::PrimitiveTopology::LineList,
                 cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let vector_point_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("vector instanced point marker pipeline (depth-less)"),
-                layout: Some(&vector_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &vector_shader,
-                    entry_point: Some("vs_point"),
-                    buffers: &[Some(GpuVectorVertex::INSTANCE_LAYOUT)],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &vector_shader,
-                    entry_point: Some("fs_vector"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: Some(wgpu::Face::Back),
-                    front_face: wgpu::FrontFace::Ccw,
-                    ..Default::default()
-                },
+                blend: wgpu::BlendState::ALPHA_BLENDING,
                 depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+            },
+        );
+        let vector_point_pipeline = create_globe_pipeline(
+            device,
+            &vector_shader,
+            &vector_pipeline_layout,
+            GlobePipelineSpec {
+                label: "vector instanced point marker pipeline (depth-less)",
+                vertex_entry: "vs_point",
+                vertex_layout: GpuVectorVertex::INSTANCE_LAYOUT,
+                fragment_entry: "fs_vector",
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                blend: wgpu::BlendState::ALPHA_BLENDING,
+                depth_stencil: None,
+            },
+        );
 
         // Post-body graticule runs inside the depth-less (`depth_stencil_attachment: None`)
         // color pass directly above draped raster overlays and vector layers.
@@ -414,8 +404,11 @@ impl GlobePipelines {
             &untextured_pipeline_layout,
             GlobePipelineSpec {
                 label: "globe post-overlay procedural graticule pipeline (depth-less)",
+                vertex_entry: "vs_main",
                 vertex_layout: TileVertex::LAYOUT,
                 fragment_entry: "fs_grid",
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
                 blend: wgpu::BlendState::ALPHA_BLENDING,
                 depth_stencil: None,
             },
@@ -428,6 +421,7 @@ impl GlobePipelines {
             camera_layout: layouts.camera_layout,
             tile_uniform_layout: layouts.tile_uniform_layout,
             overlay_uniform_layout: layouts.overlay_uniform_layout,
+            vector_uniform_layout: layouts.vector_uniform_layout,
             tile_texture_layout: layouts.tile_texture_layout,
             tile_sampler,
             body_ellipsoid_pipeline,

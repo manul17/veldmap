@@ -194,9 +194,9 @@ fn a_raster_lands_where_its_binding_puts_it() {
         );
         let segs = level_segments(&case.frame, case.width, case.height, case.level);
         let drift_m = max_surface_drift_m(&case.frame, case.width, case.height, cell, segs);
-        let base_px_m = case
+        let (base_px_m, _) = case
             .frame
-            .ground_m_per_px(case.width)
+            .pixel_size_m(case.width, case.height)
             .expect("measurable binding");
         let level_px_m = base_px_m * f64::from(1u32 << case.level);
         let drift_px = drift_m / level_px_m;

@@ -1,7 +1,7 @@
-use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId};
-use veldmap_net::{
+use crate::{
     CustomBasemapConfig, LiveBasemapSpec, NetError, is_valid_gibs_date, sanitize_url_for_display,
 };
+use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId};
 
 #[test]
 fn gibs_and_eox_specs_enforce_polar_cap_and_max_level_contracts() {

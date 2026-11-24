@@ -1,8 +1,10 @@
 //! Format-dispatching local raster opener seam (`open_local_raster`).
 //!
-//! Dispatches GeoTIFF/BigTIFF/COG, PNG, and JPEG by file magic header, loads
+//! Dispatches GeoTIFF/BigTIFF/COG, PNG, and JPEG by file magic header, opens
+//! and fingerprints the file handle once (closing TOCTOU windows), loads
 //! optional external world-file (`.tfw`/`.pgw`/`.jgw`/`.wld`) and `.prj`
-//! sidecars, and applies optional CRS overrides cleanly off the UI thread.
+//! sidecars via TOCTOU-safe `veldmap-storage` reads, and applies optional CRS
+//! overrides cleanly off the UI thread.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,11 +14,11 @@ use veldmap_core::geo::Frame;
 use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_raster::{
-    JpegSource, PngSource, RasterError, RasterSource, TiffSource,
+    JpegSource, PngSource, RasterDescription, RasterError, RasterSource, TiffSource,
     frame_from_description_with_override, has_jpeg_magic, has_png_magic, has_tiff_magic,
-    load_sidecar_georef,
+    load_sidecar_georef_with,
 };
-use veldmap_storage::{LocalFileSource, LocalFingerprintCache};
+use veldmap_storage::{LocalFingerprintCache, StorageError, read_regular_file_utf8_limited};
 
 use crate::session::SavedCrsOverride;
 
@@ -44,9 +46,37 @@ impl OpenRasterError {
     }
 }
 
+/// Resolve an optional [`SavedCrsOverride`] and bind `desc` into a [`Frame`].
+pub(super) fn bind_frame_with_saved_override(
+    desc: &RasterDescription,
+    crs_override: Option<&SavedCrsOverride>,
+) -> Result<Frame, String> {
+    let resolved = match crs_override {
+        Some(saved) => Some(saved.to_crs_spec()?),
+        None => None,
+    };
+    frame_from_description_with_override(desc, resolved.as_ref()).map_err(|e| e.to_string())
+}
+
+fn read_sidecar_candidate(path: &Path, max_bytes: u64) -> Result<Option<String>, String> {
+    match read_regular_file_utf8_limited(path, max_bytes) {
+        Ok(text) => Ok(Some(text)),
+        Err(StorageError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(StorageError::InvalidPath(_)) => Ok(None),
+        Err(StorageError::FileTooLarge { limit_bytes, .. }) => Err(format!(
+            "sidecar '{}' exceeds {limit_bytes} byte size limit",
+            path.display()
+        )),
+        Err(err) => Err(format!(
+            "failed to read sidecar '{}': {err}",
+            path.display()
+        )),
+    }
+}
+
 /// Open a local raster file (GeoTIFF/BigTIFF/COG, PNG, or JPEG + optional
-/// world-file/`.prj` sidecars), compute its sampled fingerprint, decode
-/// metadata, and bind its geodetic [`Frame`].
+/// world-file/`.prj` sidecars), compute its sampled fingerprint on the same
+/// opened handle, decode metadata, and bind its geodetic [`Frame`].
 pub(super) fn open_local_raster(
     path: &Path,
     fingerprint_cache: &LocalFingerprintCache,
@@ -55,14 +85,15 @@ pub(super) fn open_local_raster(
     crs_override: Option<&SavedCrsOverride>,
     cancel: &CancelToken,
 ) -> Result<(Arc<dyn RasterSource>, Frame), OpenRasterError> {
-    let fingerprint = fingerprint_cache
-        .get_or_compute_with_bypass(path, bypass_cache, cancel)
+    let (local_source, fingerprint) = fingerprint_cache
+        .open_and_fingerprint(path, bypass_cache, cancel)
         .map_err(|e| {
-            OpenRasterError::other(format!("failed to fingerprint '{}': {e}", path.display()))
+            OpenRasterError::other(format!(
+                "failed to open/fingerprint '{}': {e}",
+                path.display()
+            ))
         })?;
-    let file_source: Arc<dyn ByteSource> = Arc::new(LocalFileSource::open(path).map_err(|e| {
-        OpenRasterError::other(format!("failed to open '{}': {e}", path.display()))
-    })?);
+    let file_source: Arc<dyn ByteSource> = Arc::new(local_source);
 
     let mut head = [0u8; 16];
     let n = file_source.read_at(0, &mut head, cancel).map_err(|e| {
@@ -73,7 +104,7 @@ pub(super) fn open_local_raster(
     })?;
     let head = &head[..n];
 
-    let sidecar_res = load_sidecar_georef(path);
+    let sidecar_res = load_sidecar_georef_with(path, read_sidecar_candidate);
 
     let (source, sidecar_err): (Arc<dyn RasterSource>, Option<RasterError>) =
         if has_tiff_magic(head) {

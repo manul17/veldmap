@@ -11,18 +11,18 @@ use veldmap_storage::{
 };
 
 /// Current on-disk schema version for `session.json`.
-pub const SESSION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SESSION_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum number of recent files kept in `session.json`.
-pub const MAX_RECENT_FILES: usize = 16;
+pub(crate) const MAX_RECENT_FILES: usize = 16;
 
 /// Maximum number of camera bookmarks kept in `session.json`.
-pub const MAX_BOOKMARKS: usize = 64;
+pub(crate) const MAX_BOOKMARKS: usize = 64;
 
 /// Serializable datum choice for custom Transverse Mercator overrides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SavedCustomTmDatum {
+pub(crate) enum SavedCustomTmDatum {
     #[default]
     Wgs84,
     Pulkovo1942,
@@ -46,35 +46,9 @@ impl From<SavedCustomTmDatum> for DatumPreset {
     }
 }
 
-/// Serializable CRS override stored alongside a saved raster layer entry.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SavedCrsOverride {
-    Epsg {
-        code: u32,
-    },
-    Wkt {
-        wkt: String,
-    },
-    Proj {
-        proj: String,
-    },
-    CustomTm {
-        name: String,
-        #[serde(default)]
-        datum: SavedCustomTmDatum,
-        central_meridian_deg: f64,
-        origin_lat_deg: f64,
-        scale: f64,
-        false_easting_m: f64,
-        false_northing_m: f64,
-        unit: SavedLinearUnit,
-    },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SavedLinearUnit {
+pub(crate) enum SavedLinearUnit {
     #[default]
     Metre,
     InternationalFoot,
@@ -101,33 +75,69 @@ impl From<SavedLinearUnit> for LinearUnit {
     }
 }
 
+/// Serializable custom Transverse Mercator parameters matching [`CustomTmParams`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SavedCustomTmParams {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) datum: SavedCustomTmDatum,
+    pub(crate) central_meridian_deg: f64,
+    pub(crate) origin_lat_deg: f64,
+    pub(crate) scale: f64,
+    pub(crate) false_easting_m: f64,
+    pub(crate) false_northing_m: f64,
+    pub(crate) unit: SavedLinearUnit,
+}
+
+impl From<&CustomTmParams> for SavedCustomTmParams {
+    fn from(p: &CustomTmParams) -> Self {
+        Self {
+            name: p.name.clone(),
+            datum: p.datum.into(),
+            central_meridian_deg: p.central_meridian_deg,
+            origin_lat_deg: p.origin_lat_deg,
+            scale: p.scale,
+            false_easting_m: p.false_easting_m,
+            false_northing_m: p.false_northing_m,
+            unit: p.unit.into(),
+        }
+    }
+}
+
+impl From<&SavedCustomTmParams> for CustomTmParams {
+    fn from(p: &SavedCustomTmParams) -> Self {
+        Self {
+            name: p.name.clone(),
+            datum: p.datum.into(),
+            central_meridian_deg: p.central_meridian_deg,
+            origin_lat_deg: p.origin_lat_deg,
+            scale: p.scale,
+            false_easting_m: p.false_easting_m,
+            false_northing_m: p.false_northing_m,
+            unit: p.unit.into(),
+        }
+    }
+}
+
+/// Serializable CRS override stored alongside a saved raster layer entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SavedCrsOverride {
+    Epsg { code: u32 },
+    Wkt { wkt: String },
+    Proj { proj: String },
+    CustomTm(SavedCustomTmParams),
+}
+
 impl SavedCrsOverride {
     /// Resolve back into a live [`CrsSpec`].
-    pub fn to_crs_spec(&self) -> Result<CrsSpec, String> {
+    pub(crate) fn to_crs_spec(&self) -> Result<CrsSpec, String> {
         match self {
             Self::Epsg { code } => CrsSpec::from_epsg(*code).map_err(|e| e.to_string()),
             Self::Wkt { wkt } => CrsSpec::from_wkt(wkt).map_err(|e| e.to_string()),
             Self::Proj { proj } => CrsSpec::from_user_string(proj).map_err(|e| e.to_string()),
-            Self::CustomTm {
-                name,
-                datum,
-                central_meridian_deg,
-                origin_lat_deg,
-                scale,
-                false_easting_m,
-                false_northing_m,
-                unit,
-            } => {
-                let params = CustomTmParams {
-                    name: name.clone(),
-                    datum: (*datum).into(),
-                    central_meridian_deg: *central_meridian_deg,
-                    origin_lat_deg: *origin_lat_deg,
-                    scale: *scale,
-                    false_easting_m: *false_easting_m,
-                    false_northing_m: *false_northing_m,
-                    unit: (*unit).into(),
-                };
+            Self::CustomTm(saved) => {
+                let params = CustomTmParams::from(saved);
                 let proj = params.to_projection().map_err(|e| e.to_string())?;
                 Ok(CrsSpec::Projected(proj))
             }
@@ -138,11 +148,11 @@ impl SavedCrsOverride {
 /// Saved local raster layer entry in painter's order (bottom-to-top).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SavedLayerEntry {
-    pub path: PathBuf,
-    pub visible: bool,
-    pub opacity: f32,
-    pub crs_override: Option<SavedCrsOverride>,
+pub(crate) struct SavedLayerEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
+    pub(crate) crs_override: Option<SavedCrsOverride>,
 }
 
 impl Default for SavedLayerEntry {
@@ -159,10 +169,10 @@ impl Default for SavedLayerEntry {
 /// Saved read-only GeoJSON vector layer entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SavedVectorEntry {
-    pub path: PathBuf,
-    pub visible: bool,
-    pub opacity: f32,
+pub(crate) struct SavedVectorEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
 }
 
 impl Default for SavedVectorEntry {
@@ -175,37 +185,46 @@ impl Default for SavedVectorEntry {
     }
 }
 
-/// Named camera bookmark.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CameraBookmark {
-    pub name: String,
-    pub lat_deg: f64,
-    pub lon_deg: f64,
-    pub height_m: f64,
+/// Persisted camera pose (shared by `last_camera` and [`CameraBookmark`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SavedCameraPose {
+    pub(crate) lat_deg: f64,
+    pub(crate) lon_deg: f64,
+    pub(crate) height_m: f64,
     #[serde(default)]
-    pub heading_deg: f64,
+    pub(crate) heading_deg: f64,
 }
 
-/// Persisted last-viewed camera pose.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SavedCameraPose {
-    pub lat_deg: f64,
-    pub lon_deg: f64,
-    pub height_m: f64,
-    #[serde(default)]
-    pub heading_deg: f64,
+impl SavedCameraPose {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.lat_deg.is_finite()
+            && (-90.0..=90.0).contains(&self.lat_deg)
+            && self.lon_deg.is_finite()
+            && (-360.0..=360.0).contains(&self.lon_deg)
+            && self.height_m.is_finite()
+            && self.height_m > 0.0
+            && self.heading_deg.is_finite()
+    }
+}
+
+/// Named camera bookmark.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CameraBookmark {
+    pub(crate) name: String,
+    #[serde(flatten)]
+    pub(crate) pose: SavedCameraPose,
 }
 
 /// Durable minimal local workstation session persisted in `session.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AppSession {
-    pub version: u32,
-    pub open_layers: Vec<SavedLayerEntry>,
-    pub open_vectors: Vec<SavedVectorEntry>,
-    pub recent_files: Vec<PathBuf>,
-    pub bookmarks: Vec<CameraBookmark>,
-    pub last_camera: Option<SavedCameraPose>,
+pub(crate) struct AppSession {
+    pub(crate) version: u32,
+    pub(crate) open_layers: Vec<SavedLayerEntry>,
+    pub(crate) open_vectors: Vec<SavedVectorEntry>,
+    pub(crate) recent_files: Vec<PathBuf>,
+    pub(crate) bookmarks: Vec<CameraBookmark>,
+    pub(crate) last_camera: Option<SavedCameraPose>,
 }
 
 impl Default for AppSession {
@@ -221,35 +240,25 @@ impl Default for AppSession {
     }
 }
 
-fn is_valid_camera_pose(lat_deg: f64, lon_deg: f64, height_m: f64, heading_deg: f64) -> bool {
-    lat_deg.is_finite()
-        && (-90.0..=90.0).contains(&lat_deg)
-        && lon_deg.is_finite()
-        && (-360.0..=360.0).contains(&lon_deg)
-        && height_m.is_finite()
-        && height_m > 0.0
-        && heading_deg.is_finite()
+fn normalize_opacity(opacity: f32) -> f32 {
+    if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 impl AppSession {
     /// Normalize bounds, deduplicate recent files, and drop invalid entries.
-    pub fn normalize(&mut self) {
+    pub(crate) fn normalize(&mut self) {
         self.version = SESSION_SCHEMA_VERSION;
         self.open_layers.retain(|l| !l.path.as_os_str().is_empty());
         for layer in &mut self.open_layers {
-            layer.opacity = if layer.opacity.is_finite() {
-                layer.opacity.clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
+            layer.opacity = normalize_opacity(layer.opacity);
         }
         self.open_vectors.retain(|v| !v.path.as_os_str().is_empty());
         for vec_layer in &mut self.open_vectors {
-            vec_layer.opacity = if vec_layer.opacity.is_finite() {
-                vec_layer.opacity.clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
+            vec_layer.opacity = normalize_opacity(vec_layer.opacity);
         }
         let mut deduped = Vec::with_capacity(self.recent_files.len().min(MAX_RECENT_FILES));
         for p in self.recent_files.drain(..) {
@@ -261,20 +270,18 @@ impl AppSession {
             }
         }
         self.recent_files = deduped;
-        self.bookmarks.retain(|b| {
-            !b.name.trim().is_empty()
-                && is_valid_camera_pose(b.lat_deg, b.lon_deg, b.height_m, b.heading_deg)
-        });
+        self.bookmarks
+            .retain(|b| !b.name.trim().is_empty() && b.pose.is_valid());
         self.bookmarks.truncate(MAX_BOOKMARKS);
         if let Some(cam) = self.last_camera
-            && !is_valid_camera_pose(cam.lat_deg, cam.lon_deg, cam.height_m, cam.heading_deg)
+            && !cam.is_valid()
         {
             self.last_camera = None;
         }
     }
 
     /// Push `path` to the front of `recent_files` (deduplicated, capped).
-    pub fn record_recent_file(&mut self, path: &Path) {
+    pub(crate) fn record_recent_file(&mut self, path: &Path) {
         if path.as_os_str().is_empty() {
             return;
         }
@@ -284,14 +291,14 @@ impl AppSession {
     }
 
     /// Load `session.json` from `paths` (backing up corrupt files to `.corrupt`).
-    pub fn load_or_default(paths: &StoragePaths) -> Self {
+    pub(crate) fn load_or_default(paths: &StoragePaths) -> Self {
         let mut session: Self = read_json_or_default_with_backup(&paths.session_path());
         session.normalize();
         session
     }
 
     /// Persist a normalized copy to `session.json` via durable private atomic write.
-    pub fn save(&self, paths: &StoragePaths) -> Result<(), StorageError> {
+    pub(crate) fn save(&self, paths: &StoragePaths) -> Result<(), StorageError> {
         let mut copy = self.clone();
         copy.normalize();
         write_json_durable_private(&paths.session_path(), &copy)
@@ -313,7 +320,7 @@ mod tests {
             path: PathBuf::from("/tmp/ortho.tif"),
             visible: true,
             opacity: 0.75,
-            crs_override: Some(SavedCrsOverride::CustomTm {
+            crs_override: Some(SavedCrsOverride::CustomTm(SavedCustomTmParams {
                 name: "MSK-61 Custom".to_string(),
                 datum: SavedCustomTmDatum::Pulkovo1942,
                 central_meridian_deg: 37.983_333_333_33,
@@ -322,7 +329,7 @@ mod tests {
                 false_easting_m: 1_300_000.0,
                 false_northing_m: -4_811_057.628,
                 unit: SavedLinearUnit::Metre,
-            }),
+            })),
         });
         session.open_vectors.push(SavedVectorEntry {
             path: PathBuf::from("/tmp/parcels.geojson"),
@@ -332,21 +339,26 @@ mod tests {
         session.record_recent_file(Path::new("/tmp/a.tif"));
         session.record_recent_file(Path::new("/tmp/b.tif"));
         session.record_recent_file(Path::new("/tmp/a.tif"));
+        let pose = SavedCameraPose {
+            lat_deg: 47.23,
+            lon_deg: 39.72,
+            height_m: 15_000.0,
+            heading_deg: 12.5,
+        };
         session.bookmarks.push(CameraBookmark {
             name: "Rostov".to_string(),
-            lat_deg: 47.23,
-            lon_deg: 39.72,
-            height_m: 15_000.0,
-            heading_deg: 12.5,
+            pose,
         });
-        session.last_camera = Some(SavedCameraPose {
-            lat_deg: 47.23,
-            lon_deg: 39.72,
-            height_m: 15_000.0,
-            heading_deg: 12.5,
-        });
+        session.last_camera = Some(pose);
 
         session.save(&paths).expect("save session");
+        // Verify on-disk JSON stays flat for `custom_tm` and `CameraBookmark`.
+        let raw = std::fs::read_to_string(paths.session_path()).expect("read raw json");
+        assert!(raw.contains(r#""kind": "custom_tm""#));
+        assert!(raw.contains(r#""central_meridian_deg""#));
+        assert!(raw.contains(r#""name": "Rostov""#));
+        assert!(!raw.contains(r#""pose""#));
+
         let loaded = AppSession::load_or_default(&paths);
         assert_eq!(loaded, session);
         assert_eq!(
@@ -373,10 +385,12 @@ mod tests {
         });
         session.bookmarks.push(CameraBookmark {
             name: "Invalid Lat".to_string(),
-            lat_deg: 120.0,
-            lon_deg: 0.0,
-            height_m: 1000.0,
-            heading_deg: 0.0,
+            pose: SavedCameraPose {
+                lat_deg: 120.0,
+                lon_deg: 0.0,
+                height_m: 1000.0,
+                heading_deg: 0.0,
+            },
         });
         session.last_camera = Some(SavedCameraPose {
             lat_deg: -95.0,

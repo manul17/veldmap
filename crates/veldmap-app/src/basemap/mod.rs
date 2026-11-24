@@ -47,7 +47,7 @@ impl From<NetworkStatus> for LiveStreamStatus {
 }
 
 /// Plain read-only basemap status view model passed to UI toolbar controls so
-/// `basemap_ui` never depends directly on [`BasemapManager`] or `veldmap-net`.
+/// `ui::basemap` never depends directly on [`BasemapManager`] or `veldmap-net`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BasemapStatusSnapshot {
     pub(crate) stream: LiveStreamStatus,

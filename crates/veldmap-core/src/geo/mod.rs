@@ -5,13 +5,15 @@
 mod binding;
 pub mod camera;
 mod coords;
-pub mod crs;
+mod crs;
 mod cull;
+mod datum;
 pub mod footprint;
-pub mod geodesic;
+mod geodesic;
 pub mod geodesy;
-pub mod geojson;
+mod geojson;
 pub mod mgrs;
+mod proj4;
 pub mod projection;
 pub(crate) mod sag;
 
@@ -19,11 +21,14 @@ pub use binding::{BindingError, Frame, Tie, TieGrid};
 pub use camera::Camera;
 pub use coords::{LocationKind, ParseLocationError, ParsedLocation, parse_location};
 pub use crs::{
-    CrsError, CrsPreset, CrsSpec, CustomTmParams, DatumPreset, DatumWarning, LinearUnit,
-    Proj4Projection, builtin_crs_presets, ellipsoid_from_epsg, known_datum_from_code,
+    CrsPreset, CrsSpec, CrsTextKind, CustomTmParams, DatumPreset, builtin_crs_presets,
     search_crs_presets,
 };
 pub use cull::{Ball, CullFrustum};
+pub use datum::{
+    AIRY_1830, Datum, DatumWarning, HelmertConvention, INTERNATIONAL_FOOT_M, KRASOVSKY, LinearUnit,
+    PULKOVO_1942, US_SURVEY_FOOT_M, WGS84_DATUM, ellipsoid_from_epsg, known_datum_from_code,
+};
 pub use footprint::{FootprintBounds, GeoPoint, Polygon, Ring};
 pub use geodesic::{
     GeodesicInverse, GeodesicPolygonMeasurement, geodesic_direct, geodesic_distance_m,
@@ -33,11 +38,9 @@ pub use geodesic::{
 pub use geodesy::{Ellipsoid, Geodetic, WGS84};
 pub use geojson::{
     DEFAULT_VECTOR_MAX_CHORD_DEG, GeoJsonError, GeoJsonFeature, GeoJsonFeatureCollection,
-    GeoJsonGeometry, VectorCluster, VectorMesh, VectorVertex, export_geojson_feature_collection,
-    parse_geojson,
+    GeoJsonGeometry, MAX_GEOJSON_BYTES, VectorCluster, VectorMesh, VectorVertex,
+    export_geojson_feature_collection, parse_geojson,
 };
 pub use mgrs::{MgrsError, MgrsGranuleFrame};
-pub use projection::{
-    Datum, HelmertConvention, INTERNATIONAL_FOOT_M, KRASOVSKY, PULKOVO_1942, Projection, System,
-    US_SURVEY_FOOT_M, WGS84_DATUM,
-};
+pub use proj4::{CrsError, Proj4Projection};
+pub use projection::{Projection, System};

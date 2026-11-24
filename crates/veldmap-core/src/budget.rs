@@ -160,10 +160,25 @@ impl DecodeBudgetTracker {
             return Err(BudgetError::ExceedsCap {
                 requested: bytes,
                 cap: self.inner.cap_bytes,
-                detail: format!("requested {bytes} B > cap {} B", self.inner.cap_bytes),
+                detail: "single decode reservation exceeds total decode cap".to_string(),
             });
         }
         Ok(())
+    }
+
+    fn try_reserve_unchecked(&self, bytes: u64) -> Option<BudgetLease> {
+        let mut state = lock_unpoisoned(&self.inner.state);
+        if !state.waiters.is_empty()
+            || bytes > self.inner.cap_bytes.saturating_sub(state.active_bytes)
+        {
+            return None;
+        }
+        state.active_bytes += bytes;
+        state.peak_bytes = state.peak_bytes.max(state.active_bytes);
+        Some(BudgetLease {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        })
     }
 
     /// Attempt to reserve `bytes` immediately without blocking.
@@ -173,18 +188,7 @@ impl DecodeBudgetTracker {
     /// ahead, or `Ok(Some(lease))` on success.
     pub fn try_reserve(&self, bytes: u64) -> Result<Option<BudgetLease>, BudgetError> {
         self.check_cap(bytes)?;
-        let mut state = lock_unpoisoned(&self.inner.state);
-        if !state.waiters.is_empty()
-            || bytes > self.inner.cap_bytes.saturating_sub(state.active_bytes)
-        {
-            return Ok(None);
-        }
-        state.active_bytes += bytes;
-        state.peak_bytes = state.peak_bytes.max(state.active_bytes);
-        Ok(Some(BudgetLease {
-            inner: Arc::clone(&self.inner),
-            bytes,
-        }))
+        Ok(self.try_reserve_unchecked(bytes))
     }
 
     /// Block in FIFO waiter order until `bytes` can be reserved within the
@@ -199,7 +203,7 @@ impl DecodeBudgetTracker {
         if cancel.is_cancelled() {
             return Err(BudgetError::Cancelled);
         }
-        if let Some(lease) = self.try_reserve(bytes)? {
+        if let Some(lease) = self.try_reserve_unchecked(bytes) {
             return Ok(lease);
         }
 

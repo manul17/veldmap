@@ -283,20 +283,22 @@ impl TileScheduler {
     }
 
     /// Remove and collect [`CancelToken`]s for in-flight **pointwise** jobs of
-    /// `source` that are no longer in `wanted` or are already cached.
+    /// `stream_key` that are no longer in `wanted` or are already cached.
     ///
-    /// Never touches `ServeMode::Pass` flight entries. Callers should invoke
-    /// `token.cancel()` on every returned token after releasing any lock around
-    /// `TileScheduler`.
+    /// Scoped strictly to `stream_key` (`PassKey`: `source`, `band`, `format`,
+    /// `gutter`) so multi-band datasets sharing a single [`SourceId`] never
+    /// cancel sibling bands' pointwise jobs. Never touches `ServeMode::Pass`
+    /// flight entries. Callers should invoke `token.cancel()` on every returned
+    /// token after releasing any lock around `TileScheduler`.
     pub fn reconcile_pointwise(
         &mut self,
-        source: SourceId,
+        stream_key: PassKey,
         wanted: &HashSet<TileKey>,
         is_cached: impl Fn(&TileKey) -> bool,
     ) -> Vec<CancelToken> {
         let mut cancelled = Vec::new();
         self.in_flight.retain(|key, entry| {
-            if key.source != source {
+            if key.stream_key() != stream_key {
                 return true;
             }
             match entry {

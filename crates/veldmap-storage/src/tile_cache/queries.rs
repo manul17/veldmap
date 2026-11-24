@@ -57,6 +57,19 @@ const UPSERT_BLOB_SQL: &str = "INSERT INTO tile_blobs (tile_id, payload)
 const TOUCH_META_SQL: &str =
     "UPDATE tile_meta SET last_used_ms = ?1 WHERE tile_id = ?2 AND last_used_ms < ?1";
 
+const DELETE_META_BY_KEY_SQL: &str = "DELETE FROM tile_meta
+     WHERE source_key = ?1
+       AND band_kind = ?2
+       AND band_id = ?3
+       AND scheme = ?4
+       AND format = ?5
+       AND gutter = ?6
+       AND decode_rev = ?7
+       AND level = ?8
+       AND x = ?9
+       AND y = ?10
+     RETURNING tile_id, byte_size";
+
 const DELETE_META_BY_ID_SQL: &str = "DELETE FROM tile_meta WHERE tile_id = ?1";
 
 const DELETE_META_BY_ID_AND_TS_SQL: &str =
@@ -182,11 +195,14 @@ pub(super) fn delete_tile_in_tx(
     tx: &Transaction<'_>,
     enc: &EncodedKey<'_>,
 ) -> Result<Option<i64>, rusqlite::Error> {
-    let Some((tile_id, sz)) = select_meta_id_bytes(tx, enc)? else {
+    let mut stmt = tx.prepare(DELETE_META_BY_KEY_SQL)?;
+    let deleted: Option<(i64, i64)> = stmt
+        .query_row(enc.key_params(), |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((tile_id, sz)) = deleted else {
         return Ok(None);
     };
-    delete_meta_ids(tx, &[tile_id])?;
-    decrement_cache_meta(tx, sz, 1)?;
+    decrement_cache_meta(tx, sz.max(0), 1)?;
     Ok(Some(tile_id))
 }
 

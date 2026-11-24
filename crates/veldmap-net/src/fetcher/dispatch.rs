@@ -4,41 +4,29 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use veldmap_core::sync::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{QuadTileId, TileKey};
-
-use crate::basemap::LiveBasemapSpec;
+use veldmap_core::sync::lock_unpoisoned;
 
 use super::PipelineContext;
 use super::disk::DiskCacheGate;
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
+use super::state::TileTarget;
 use super::workers::{run_disk_lookup, run_http_fetch};
 
 /// Maximum concurrent blocking disk-cache lookup tasks so cached tiles stay
 /// responsive and never starve behind slow HTTP hosts.
 const MAX_CONCURRENT_DISK_LOOKUPS: usize = 4;
 
-pub(super) struct HttpFetchInput {
-    pub(super) key: TileKey,
-    pub(super) id: QuadTileId,
-    pub(super) spec: Arc<LiveBasemapSpec>,
-    pub(super) host: String,
-    pub(super) cancel: CancelToken,
-}
-
 pub(super) struct DiskTask {
-    pub(super) key: TileKey,
-    pub(super) id: QuadTileId,
-    pub(super) spec: Arc<LiveBasemapSpec>,
-    pub(super) cancel: CancelToken,
+    pub(super) target: TileTarget,
     pub(super) guard: InFlightGuard,
     pub(super) disk_slot: DiskSlotGuard,
 }
 
-struct HttpTask {
-    input: HttpFetchInput,
-    guard: InFlightGuard,
-    permit_guard: PermitGuard,
+pub(super) struct HttpTask {
+    pub(super) target: TileTarget,
+    pub(super) host: String,
+    pub(super) guard: InFlightGuard,
+    pub(super) permit_guard: PermitGuard,
 }
 
 struct DispatchBatch {
@@ -65,29 +53,27 @@ fn plan_dispatch_batch(ctx: &PipelineContext, now: Instant) -> DispatchBatch {
     let disk_tasks = planned
         .disk_tasks
         .into_iter()
-        .map(|task| DiskTask {
-            key: task.key,
-            id: task.id,
-            spec: task.spec,
-            cancel: task.cancel,
-            guard: InFlightGuard::new(Arc::clone(&ctx.shared), task.key, task.generation),
-            disk_slot: DiskSlotGuard::new(Arc::clone(&ctx.shared)),
+        .map(|task| {
+            let key = task.target.key;
+            DiskTask {
+                target: task.target,
+                guard: InFlightGuard::new(Arc::clone(&ctx.shared), key, task.generation),
+                disk_slot: DiskSlotGuard::new(Arc::clone(&ctx.shared)),
+            }
         })
         .collect();
 
     let http_tasks = planned
         .http_tasks
         .into_iter()
-        .map(|task| HttpTask {
-            input: HttpFetchInput {
-                key: task.key,
-                id: task.id,
-                spec: task.spec,
+        .map(|task| {
+            let key = task.target.key;
+            HttpTask {
+                target: task.target,
                 host: task.host,
-                cancel: task.cancel,
-            },
-            guard: InFlightGuard::new(Arc::clone(&ctx.shared), task.key, task.generation),
-            permit_guard: PermitGuard::new(task.permit, Arc::clone(&ctx.shared)),
+                guard: InFlightGuard::new(Arc::clone(&ctx.shared), key, task.generation),
+                permit_guard: PermitGuard::new(task.permit, Arc::clone(&ctx.shared)),
+            }
         })
         .collect();
 
@@ -125,7 +111,7 @@ fn spawn_disk_task(ctx: &Arc<PipelineContext>, gate: &DiskCacheGate, task: DiskT
 fn spawn_http_task(ctx: &Arc<PipelineContext>, task: HttpTask) {
     let task_ctx = Arc::clone(ctx);
     tokio::spawn(async move {
-        run_http_fetch(task_ctx, task.input, task.guard, task.permit_guard).await;
+        run_http_fetch(task_ctx, task).await;
     });
 }
 

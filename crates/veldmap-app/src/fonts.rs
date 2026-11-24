@@ -9,14 +9,14 @@ use std::sync::Arc;
 use eframe::egui;
 
 /// Font registry key for the bundled DejaVu Sans proportional fallback.
-pub const FALLBACK_PROPORTIONAL_FONT: &str = "dejavu_sans";
+pub(crate) const FALLBACK_PROPORTIONAL_FONT: &str = "dejavu_sans";
 
 /// Font registry key for the bundled DejaVu Sans Mono monospace fallback.
-pub const FALLBACK_MONOSPACE_FONT: &str = "dejavu_sans_mono";
+pub(crate) const FALLBACK_MONOSPACE_FONT: &str = "dejavu_sans_mono";
 
 /// Build `egui::FontDefinitions` keeping `eframe`'s built-in default fonts
 /// first and appending DejaVu Sans / DejaVu Sans Mono as non-Latin fallbacks.
-pub fn build_font_definitions() -> egui::FontDefinitions {
+pub(crate) fn build_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
     fonts.font_data.insert(

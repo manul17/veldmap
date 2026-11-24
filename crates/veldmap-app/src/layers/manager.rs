@@ -6,15 +6,15 @@
 //! `SceneState`.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::geo::Camera;
+use veldmap_core::geo::{Camera, Frame};
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{SourceId, TileKey};
-use veldmap_raster::{DecodePoolHandle, frame_from_description_with_override};
+use veldmap_raster::{DecodePoolHandle, RasterSource};
 use veldmap_storage::TileDiskCache;
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSender};
@@ -24,17 +24,17 @@ use crate::session::{SavedCrsOverride, SavedLayerEntry};
 use super::cursor::CursorProber;
 use super::frame::{LayerFrameCtx, build_and_schedule_layer};
 use super::io_worker::{OverlayIoCmd, OverlayIoResult, OverlayIoWorker};
+use super::opener::{OpenRasterError, bind_frame_with_saved_override};
 use super::runtime::OverlayRuntime;
-use super::stack::{LayerStack, OverlayLayer};
-use super::{CursorReadout, LayerId, LayerSummary, LoadedVectorData, OverlayIoEvent};
+use super::stack::{LayerInitOptions, LayerStack, OverlayLayer};
+use super::{CursorReadout, LayerId, LayerSummary, OverlayIoEvent};
 
-/// Pre-parsed GeoJSON vector payload completed on [`OverlayIoWorker`], handed
-/// up to `SceneState` for insertion into `VectorLayerStack`.
-pub(crate) struct PendingVectorOpen {
-    pub(crate) data: LoadedVectorData,
-    pub(crate) fly_to: bool,
-    pub(crate) visible: bool,
-    pub(crate) opacity: f32,
+struct ReloadedPayload {
+    id: LayerId,
+    reload_seq: u64,
+    crs_override_epoch: u64,
+    path: PathBuf,
+    outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
 }
 
 /// Per-frame camera, viewport, cache, and appetite inputs for
@@ -129,44 +129,13 @@ impl OverlayManager {
             .iter()
             .enumerate()
             .map(|(idx, layer)| {
-                let desc = layer.source.description();
                 let pass_key = layer.meta.pass_key();
-                let sample_info = desc.bands.first().map_or_else(
-                    || "Display RGBA".to_owned(),
-                    |b| {
-                        let nodata_str = b
-                            .nodata
-                            .map(|v| format!(", nodata={v}"))
-                            .unwrap_or_default();
-                        format!("{} ch, {:?}{nodata_str}", b.channels, b.sample_type)
-                    },
-                );
-                LayerSummary {
-                    id: layer.id,
-                    name: layer.name.clone(),
-                    path: layer.path.clone(),
-                    visible: layer.visible,
-                    opacity: layer.opacity,
-                    width: desc.width,
-                    height: desc.height,
-                    source_pixel_size_m: layer.source_pixel_size_m,
-                    footprint: layer.footprint,
-                    in_flight: sched.in_flight_count_for_source(layer.source_id()),
-                    pass_active: sched.has_active_pass(pass_key),
-                    reloading: layer.is_reloading(),
-                    crs_label: layer.frame.crs_label(),
-                    datum_warning: layer.frame.datum_warning().map(|w| w.message()),
-                    sample_info,
-                    detail_limit_level: layer
-                        .meta
-                        .finest_fitting_level()
-                        .unwrap_or(layer.meta.max_level()),
-                    can_override_crs: desc.placement.is_some() || !desc.ties.is_empty(),
-                    has_crs_override: layer.crs_override.is_some(),
-                    last_error: layer.last_error.clone(),
-                    can_move_up: idx + 1 < len,
-                    can_move_down: idx > 0,
-                }
+                layer.to_summary(
+                    sched.in_flight_count_for_source(layer.source_id()),
+                    sched.has_active_pass(pass_key),
+                    idx + 1 < len,
+                    idx > 0,
+                )
             })
             .collect()
     }
@@ -216,31 +185,11 @@ impl OverlayManager {
         if self.io_worker.send(OverlayIoCmd::Open {
             path: path.to_path_buf(),
             fly_to,
-            visible,
-            opacity: opacity.clamp(0.0, 1.0),
-            crs_override,
-            cancel,
-        }) {
-            Ok(())
-        } else {
-            Err("overlay I/O worker is unavailable".to_owned())
-        }
-    }
-
-    /// Queue a non-blocking local GeoJSON vector file open onto [`OverlayIoWorker`].
-    pub(crate) fn begin_open_vector_file(
-        &self,
-        path: &Path,
-        fly_to: bool,
-        visible: bool,
-        opacity: f32,
-    ) -> Result<(), String> {
-        let cancel = self.runtime.shutdown.child_token();
-        if self.io_worker.send(OverlayIoCmd::OpenVector {
-            path: path.to_path_buf(),
-            fly_to,
-            visible,
-            opacity: opacity.clamp(0.0, 1.0),
+            options: LayerInitOptions {
+                visible,
+                opacity: opacity.clamp(0.0, 1.0),
+                crs_override,
+            },
             cancel,
         }) {
             Ok(())
@@ -312,171 +261,169 @@ impl OverlayManager {
         })
     }
 
-    /// Drain completed background open/reload operations from
+    /// Drain completed background raster open/reload operations from
     /// [`OverlayIoWorker`].
-    pub(crate) fn poll_io_events(
-        &mut self,
-    ) -> (Vec<OverlayIoEvent>, OverlayMutation, Vec<PendingVectorOpen>) {
+    pub(crate) fn poll_io_events(&mut self) -> (Vec<OverlayIoEvent>, OverlayMutation) {
         let mut events = Vec::new();
         let mut mutation = OverlayMutation::default();
-        let mut vectors = Vec::new();
 
         while let Some(res) = self.io_worker.try_recv() {
             match res {
                 OverlayIoResult::Opened {
                     path,
                     fly_to,
-                    visible,
-                    opacity,
-                    crs_override,
+                    options,
                     outcome,
-                } => match outcome {
-                    Ok((source, frame)) => {
-                        let id = LayerId(self.next_layer_id);
-                        self.next_layer_id = self.next_layer_id.saturating_add(1);
-                        let relaid = self.alloc_relaid();
-                        let event_path = path.clone();
-                        let layer = OverlayLayer::from_source(
-                            id,
-                            path,
-                            source,
-                            frame,
-                            crs_override,
-                            visible,
-                            opacity,
-                            relaid,
-                        );
-                        let bounds = layer.footprint;
-                        self.stack.push(layer);
-                        mutation.changed = true;
-                        events.push(OverlayIoEvent::Opened {
-                            id,
-                            path: event_path,
-                            bounds,
-                            fly_to,
-                        });
-                    }
-                    Err(err) => {
-                        events.push(OverlayIoEvent::Failed {
-                            path,
-                            error: err.message,
-                            can_assign_crs: err.can_assign_crs,
-                        });
-                    }
-                },
-                OverlayIoResult::VectorOpened {
+                } => self.handle_opened_result(
                     path,
                     fly_to,
-                    visible,
-                    opacity,
+                    options,
                     outcome,
-                } => match outcome {
-                    Ok(data) => {
-                        vectors.push(PendingVectorOpen {
-                            data,
-                            fly_to,
-                            visible,
-                            opacity,
-                        });
-                    }
-                    Err(error) => {
-                        events.push(OverlayIoEvent::VectorFailed { path, error });
-                    }
-                },
+                    &mut events,
+                    &mut mutation,
+                ),
                 OverlayIoResult::Reloaded {
                     id,
                     reload_seq,
                     crs_override_epoch,
                     path,
                     outcome,
-                } => {
-                    let Some(live_override) = self.stack.get(id).and_then(|slot| {
-                        slot.matches_reload_seq(reload_seq).then(|| {
-                            (slot.crs_override_epoch != crs_override_epoch)
-                                .then(|| slot.crs_override.clone())
-                        })
-                    }) else {
-                        // Layer was removed or superseded by a newer reload trigger.
-                        continue;
-                    };
-                    match outcome {
-                        Ok((source, mut frame)) => {
-                            // If `override_layer_crs` ran while this reload was
-                            // in flight, re-bind the reloaded source against the
-                            // live `crs_override` so it never silently reverts.
-                            if let Some(current_override) = live_override {
-                                let rebind_res = match &current_override {
-                                    Some(saved) => saved.to_crs_spec().and_then(|spec| {
-                                        frame_from_description_with_override(
-                                            source.description(),
-                                            Some(&spec),
-                                        )
-                                        .map_err(|e| e.to_string())
-                                    }),
-                                    None => frame_from_description_with_override(
-                                        source.description(),
-                                        None,
-                                    )
-                                    .map_err(|e| e.to_string()),
-                                };
-                                match rebind_res {
-                                    Ok(rebound) => frame = rebound,
-                                    Err(error) => {
-                                        if let Some(slot) = self.stack.get_mut(id)
-                                            && slot.finish_reload_err(reload_seq)
-                                        {
-                                            slot.last_error = Some(error.clone());
-                                            mutation.changed = true;
-                                            events.push(OverlayIoEvent::Failed {
-                                                path,
-                                                error,
-                                                can_assign_crs: true,
-                                            });
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-                            let new_src = source.source_id();
-                            let relaid = self.alloc_relaid();
-                            let Some(old_src) = self.stack.get_mut(id).and_then(|slot| {
-                                slot.replace_reloaded(reload_seq, path, source, frame, relaid)
-                            }) else {
-                                continue;
-                            };
-
-                            // Purge runtime/GPU state for both `old_src` and `new_src`
-                            // (in case a sibling layer decoded tiles during reload).
-                            self.purge_source(old_src);
-                            mutation.purge_sources.push(old_src);
-                            if new_src != old_src {
-                                self.purge_source(new_src);
-                                mutation.purge_sources.push(new_src);
-                            }
-                            mutation.changed = true;
-                            events.push(OverlayIoEvent::Reloaded { id });
-                        }
-                        Err(err) => {
-                            if let Some(slot) = self.stack.get_mut(id)
-                                && slot.finish_reload_err(reload_seq)
-                            {
-                                slot.last_error = Some(err.message.clone());
-                                // Reload failed: leave the existing layer intact and
-                                // resume normal rendering on the next frame.
-                                mutation.changed = true;
-                                events.push(OverlayIoEvent::Failed {
-                                    path,
-                                    error: err.message,
-                                    can_assign_crs: err.can_assign_crs,
-                                });
-                            }
-                        }
-                    }
-                }
+                } => self.handle_reloaded_result(
+                    ReloadedPayload {
+                        id,
+                        reload_seq,
+                        crs_override_epoch,
+                        path,
+                        outcome,
+                    },
+                    &mut events,
+                    &mut mutation,
+                ),
             }
         }
 
-        (events, mutation, vectors)
+        (events, mutation)
+    }
+
+    fn handle_opened_result(
+        &mut self,
+        path: PathBuf,
+        fly_to: bool,
+        options: LayerInitOptions,
+        outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
+        events: &mut Vec<OverlayIoEvent>,
+        mutation: &mut OverlayMutation,
+    ) {
+        match outcome {
+            Ok((source, frame)) => {
+                let id = LayerId(self.next_layer_id);
+                self.next_layer_id = self.next_layer_id.saturating_add(1);
+                let relaid = self.alloc_relaid();
+                let event_path = path.clone();
+                let layer = OverlayLayer::from_source(id, path, source, frame, options, relaid);
+                let bounds = layer.footprint;
+                self.stack.push(layer);
+                mutation.changed = true;
+                events.push(OverlayIoEvent::Opened {
+                    id,
+                    path: event_path,
+                    bounds,
+                    fly_to,
+                });
+            }
+            Err(err) => {
+                events.push(OverlayIoEvent::Failed {
+                    path,
+                    error: err.message,
+                    can_assign_crs: err.can_assign_crs,
+                });
+            }
+        }
+    }
+
+    fn handle_reloaded_result(
+        &mut self,
+        reloaded: ReloadedPayload,
+        events: &mut Vec<OverlayIoEvent>,
+        mutation: &mut OverlayMutation,
+    ) {
+        let ReloadedPayload {
+            id,
+            reload_seq,
+            crs_override_epoch,
+            path,
+            outcome,
+        } = reloaded;
+        let Some(live_override) = self.stack.get(id).and_then(|slot| {
+            slot.matches_reload_seq(reload_seq).then(|| {
+                (slot.crs_override_epoch != crs_override_epoch).then(|| slot.crs_override.clone())
+            })
+        }) else {
+            // Layer was removed or superseded by a newer reload trigger.
+            return;
+        };
+        match outcome {
+            Ok((source, mut frame)) => {
+                // If `override_layer_crs` ran while this reload was in flight,
+                // re-bind the reloaded source against the live `crs_override`
+                // so it never silently reverts.
+                if let Some(current_override) = live_override {
+                    match bind_frame_with_saved_override(
+                        source.description(),
+                        current_override.as_ref(),
+                    ) {
+                        Ok(rebound) => frame = rebound,
+                        Err(error) => {
+                            if let Some(slot) = self.stack.get_mut(id)
+                                && slot.finish_reload_err(reload_seq)
+                            {
+                                slot.last_error = Some(error.clone());
+                                mutation.changed = true;
+                                events.push(OverlayIoEvent::Failed {
+                                    path,
+                                    error,
+                                    can_assign_crs: true,
+                                });
+                            }
+                            return;
+                        }
+                    }
+                }
+                let new_src = source.source_id();
+                let relaid = self.alloc_relaid();
+                let Some(old_src) = self.stack.get_mut(id).and_then(|slot| {
+                    slot.replace_reloaded(reload_seq, path, source, frame, relaid)
+                }) else {
+                    return;
+                };
+
+                // Purge runtime/GPU state for both `old_src` and `new_src`
+                // (in case a sibling layer decoded tiles during reload).
+                self.purge_source(old_src);
+                mutation.purge_sources.push(old_src);
+                if new_src != old_src {
+                    self.purge_source(new_src);
+                    mutation.purge_sources.push(new_src);
+                }
+                mutation.changed = true;
+                events.push(OverlayIoEvent::Reloaded { id });
+            }
+            Err(err) => {
+                if let Some(slot) = self.stack.get_mut(id)
+                    && slot.finish_reload_err(reload_seq)
+                {
+                    slot.last_error = Some(err.message.clone());
+                    // Reload failed: leave the existing layer intact and
+                    // resume normal rendering on the next frame.
+                    mutation.changed = true;
+                    events.push(OverlayIoEvent::Failed {
+                        path,
+                        error: err.message,
+                        can_assign_crs: err.can_assign_crs,
+                    });
+                }
+            }
+        }
     }
 
     /// Move layer toward the top of painter's order.
@@ -497,17 +444,12 @@ impl OverlayManager {
         id: LayerId,
         crs_override: Option<SavedCrsOverride>,
     ) -> Result<Option<veldmap_core::geo::FootprintBounds>, String> {
-        let resolved = match &crs_override {
-            Some(saved) => Some(saved.to_crs_spec()?),
-            None => None,
-        };
         let relaid = self.alloc_relaid();
         let Some(layer) = self.stack.get_mut(id) else {
             return Err("layer no longer exists".to_owned());
         };
         let frame =
-            frame_from_description_with_override(layer.source.description(), resolved.as_ref())
-                .map_err(|e| e.to_string())?;
+            bind_frame_with_saved_override(layer.source.description(), crs_override.as_ref())?;
         layer.apply_rebound_frame(frame, crs_override, relaid);
         Ok(layer.footprint)
     }

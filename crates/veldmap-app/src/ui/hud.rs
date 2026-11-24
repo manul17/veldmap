@@ -1,60 +1,7 @@
 //! Baseline GIS HUD widgets: dynamic metric scale bar, North compass /
-//! Reset-North control, and coordinate/resolution formatting.
+//! Reset-North control, and basemap attribution badge.
 
 use eframe::egui;
-
-/// Format a latitude/longitude pair as human-readable decimal degrees with
-/// hemisphere indicators.
-pub(crate) fn format_lat_lon(lat_deg: f64, lon_deg: f64) -> String {
-    let lat_hem = if lat_deg >= 0.0 { 'N' } else { 'S' };
-    let lon_hem = if lon_deg >= 0.0 { 'E' } else { 'W' };
-    format!(
-        "{:.5}° {}, {:.5}° {}",
-        lat_deg.abs(),
-        lat_hem,
-        lon_deg.abs(),
-        lon_hem
-    )
-}
-
-/// Format an altitude or ground distance in metres/kilometres.
-pub(super) fn format_distance_m(metres: f64) -> String {
-    if metres >= 100_000.0 {
-        format!("{:.0} km", metres / 1_000.0)
-    } else if metres >= 10_000.0 {
-        format!("{:.1} km", metres / 1_000.0)
-    } else if metres >= 1_000.0 {
-        format!("{:.2} km", metres / 1_000.0)
-    } else if metres >= 10.0 {
-        format!("{metres:.1} m")
-    } else {
-        format!("{metres:.2} m")
-    }
-}
-
-/// Format ground resolution in `mm/px`, `cm/px`, `m/px`, or `km/px`.
-pub(super) fn format_resolution(m_per_px: f64) -> String {
-    if m_per_px >= 1_000.0 {
-        format!("{:.2} km/px", m_per_px / 1_000.0)
-    } else if m_per_px >= 1.0 {
-        format!("{m_per_px:.2} m/px")
-    } else if m_per_px >= 0.01 {
-        format!("{:.1} cm/px", m_per_px * 100.0)
-    } else {
-        format!("{:.1} mm/px", m_per_px * 1_000.0)
-    }
-}
-
-/// Format an `(x, y)` native source pixel size, collapsing nearly isotropic
-/// pixels (`<= 2%` difference) to a single value and formatting anisotropic
-/// pixels as `mx × my`.
-pub(super) fn format_source_pixel_size(mx: f64, my: f64) -> String {
-    if (mx - my).abs() / mx.max(1e-9) <= 0.02 {
-        format_resolution(mx)
-    } else {
-        format!("{} × {}", format_resolution(mx), format_resolution(my))
-    }
-}
 
 /// Choose a clean `1–2–5` metric scale-bar distance and its exact screen width
 /// in logical points for `m_per_pt` ground metres per logical point.
@@ -357,23 +304,5 @@ mod tests {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(compute_scale_bar(bad, 160.0), ("0 m".to_owned(), 0.0));
         }
-    }
-
-    #[test]
-    fn formats_coordinates_distances_and_resolutions_cleanly() {
-        assert_eq!(format_lat_lon(47.2357, 39.7015), "47.23570° N, 39.70150° E");
-        assert_eq!(
-            format_lat_lon(-33.8688, -70.6693),
-            "33.86880° S, 70.66930° W"
-        );
-        assert_eq!(format_distance_m(2.5), "2.50 m");
-        assert_eq!(format_distance_m(42.3), "42.3 m");
-        assert_eq!(format_distance_m(1_500.0), "1.50 km");
-        assert_eq!(format_distance_m(25_400.0), "25.4 km");
-        assert_eq!(format_distance_m(14_000_000.0), "14000 km");
-        assert_eq!(format_resolution(0.002), "2.0 mm/px");
-        assert_eq!(format_resolution(0.15), "15.0 cm/px");
-        assert_eq!(format_resolution(10.0), "10.00 m/px");
-        assert_eq!(format_resolution(2_500.0), "2.50 km/px");
     }
 }

@@ -76,29 +76,13 @@ fn segments_for(span_deg: f64) -> u32 {
 }
 
 fn cell_span_deg(frame: &Frame, width: f64, height: f64, cell: [f64; 4]) -> f64 {
-    let at = |x: f64, y: f64| frame.geodetic(x / width, y / height);
-    let xs = [cell[0], (cell[0] + cell[2]) * 0.5, cell[2]];
-    let ys = [cell[1], (cell[1] + cell[3]) * 0.5, cell[3]];
-    let mut probes = [(0.0_f64, 0.0_f64); 9];
-    for row in 0..3 {
-        for col in 0..3 {
-            probes[row * 3 + col] = at(xs[col], ys[row]);
-        }
-    }
-    let mut span = 0.0_f64;
-    for row in 0..3 {
-        let a = probes[row * 3];
-        let b = probes[row * 3 + 1];
-        let c = probes[row * 3 + 2];
-        span = span.max(geodesy::separation(a, b) + geodesy::separation(b, c));
-    }
-    for col in 0..3 {
-        let a = probes[col];
-        let b = probes[3 + col];
-        let c = probes[6 + col];
-        span = span.max(geodesy::separation(a, b) + geodesy::separation(b, c));
-    }
-    span
+    let (span_x, span_y) = frame.probe_rect_spans_deg(
+        cell[0] / width,
+        cell[2] / width,
+        cell[1] / height,
+        cell[3] / height,
+    );
+    span_x.max(span_y)
 }
 
 /// CPU `f64` RTC warp-mesh patch for a single raster pyramid cell.

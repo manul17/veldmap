@@ -10,7 +10,7 @@ use veldmap_core::tile::{PixelFormat, level_size, tile_extent};
 
 use crate::RasterError;
 
-use super::cascade::{Cascade, TileEmit};
+use super::cascade::{Cascade, TileEmit, bleed_display_emit};
 use super::chunk_cache::DecodedChunk;
 use super::grid::{Grid, Region, region_of};
 use super::resample::{bleed_alpha, resample_rgba8_window};
@@ -188,16 +188,7 @@ pub(crate) fn pass<S: Chunked>(
     let down = height.div_ceil(ch);
 
     let mut cascade = Cascade::new(0, width, height);
-    let mut bled_emit = |lvl: u8,
-                         tx: u32,
-                         ty: u32,
-                         tw: u32,
-                         th: u32,
-                         mut rgba: Vec<u8>|
-     -> Result<(), RasterError> {
-        bleed_alpha(&mut rgba, tw, th);
-        emit(lvl, tx, ty, tw, th, rgba)
-    };
+    let mut bled_emit = bleed_display_emit(emit);
 
     for cy in 0..down {
         if cancel.is_cancelled() {

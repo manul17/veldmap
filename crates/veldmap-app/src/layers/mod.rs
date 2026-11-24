@@ -7,11 +7,12 @@ mod frame;
 mod io_worker;
 mod jobs;
 mod manager;
+mod measure;
 mod opener;
 mod qoi_cache;
 mod runtime;
 mod stack;
-pub(crate) mod vectors;
+mod vectors;
 
 use std::path::PathBuf;
 
@@ -21,8 +22,9 @@ use veldmap_core::tile::RASTER_TILE_SIZE;
 use crate::gpu_tiles::display_tile_mip_bytes;
 
 pub(crate) use manager::{OverlayFrameCtx, OverlayManager, OverlayMutation};
+pub(crate) use measure::{MeasureMode, MeasureSession};
 pub(crate) use vectors::{
-    LoadedVectorData, VectorLayerId, VectorLayerStack, VectorLayerSummary, is_geojson_path,
+    VectorIoWorker, VectorLayerId, VectorLayerStack, VectorLayerSummary, is_geojson_path,
 };
 
 /// Default unpacked VRAM byte weight for an 8-bit `512 x 512` display tile

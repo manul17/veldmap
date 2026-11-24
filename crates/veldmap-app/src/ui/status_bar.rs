@@ -7,7 +7,7 @@ use veldmap_core::geo::Camera;
 
 use crate::layers::{CursorReadout, CursorReadoutValue};
 
-use super::hud;
+use super::format;
 
 /// Render the bottom GIS status bar.
 pub(crate) fn show_status_bar(
@@ -21,7 +21,7 @@ pub(crate) fn show_status_bar(
     egui::Panel::bottom("gis_status_bar").show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             let cursor_text = match cursor_geo {
-                Some((lat, lon)) => format!("Cursor: {}", hud::format_lat_lon(lat, lon)),
+                Some((lat, lon)) => format!("Cursor: {}", format::format_lat_lon(lat, lon)),
                 None => "Cursor: Off globe".to_owned(),
             };
             ui.monospace(cursor_text);
@@ -60,12 +60,12 @@ pub(crate) fn show_status_bar(
 
             ui.separator();
             let (clat, clon) = camera.center();
-            ui.monospace(format!("Center: {}", hud::format_lat_lon(clat, clon)));
+            ui.monospace(format!("Center: {}", format::format_lat_lon(clat, clon)));
             ui.separator();
 
             ui.monospace(format!(
                 "Alt: {}",
-                hud::format_distance_m(camera.height_m())
+                format::format_distance_m(camera.height_m())
             ));
 
             let heading = camera.heading_deg();
@@ -76,7 +76,7 @@ pub(crate) fn show_status_bar(
 
             ui.separator();
             let mpp = camera.metres_per_pixel(viewport_height_px);
-            ui.monospace(format!("Viewport GSD: {}", hud::format_resolution(mpp)));
+            ui.monospace(format!("Viewport GSD: {}", format::format_resolution(mpp)));
 
             let source_px = cursor_readout
                 .and_then(|r| r.source_pixel_size_m)
@@ -85,7 +85,7 @@ pub(crate) fn show_status_bar(
                 ui.separator();
                 ui.monospace(format!(
                     "Source px: {}",
-                    hud::format_source_pixel_size(mx, my)
+                    format::format_source_pixel_size(mx, my)
                 ));
             }
         });

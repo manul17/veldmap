@@ -245,10 +245,13 @@ fn per_cluster_rtc_preserves_submillimetre_precision_across_continents_and_tiny_
         features: vec![marker(55.75, 37.62), marker(43.115, 131.885)],
     };
     let mesh = VectorMesh::from_collection(&fc, DEFAULT_VECTOR_MAX_CHORD_DEG);
-    // Must separate into 2 localized RTC clusters, and preserve both 25 cm^2 drone triangles!
+    // Must separate into 2 localized RTC clusters, preserve all 4 triangles, and
+    // deduplicate shared vertices inside each cluster (4 corners vs 6 indices).
     assert_eq!(mesh.clusters.len(), 2);
     assert_eq!(mesh.fill_triangle_count(), 4);
     for c in &mesh.clusters {
+        assert_eq!(c.fill_indices.len(), 6);
+        assert_eq!(c.fill_vertices.len(), 4);
         for v in &c.fill_vertices {
             let offset_m = DVec3::new(
                 f64::from(v.rel_pos[0]),

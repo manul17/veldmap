@@ -15,7 +15,7 @@ use crate::RasterError;
 use crate::pipeline::metadata::GeoPlacement;
 
 /// Maximum sidecar file size (1 MiB) to guard against reading huge accidental files.
-const MAX_SIDECAR_BYTES: u64 = 1024 * 1024;
+pub const MAX_SIDECAR_BYTES: u64 = 1024 * 1024;
 
 /// Parsed external georeferencing sidecars accompanying a local raster file.
 ///
@@ -110,11 +110,9 @@ pub fn parse_prj_text(text: &str) -> Result<CrsSpec, RasterError> {
             ".prj sidecar file is empty".to_string(),
         ));
     }
-    match CrsSpec::from_wkt(trimmed) {
-        Ok(crs) => Ok(crs),
-        Err(wkt_err) => CrsSpec::from_user_string(trimmed)
-            .map_err(|_| RasterError::Binding(format!("could not parse .prj CRS: {wkt_err}"))),
-    }
+    CrsSpec::parse_text(trimmed)
+        .map(|(crs, _)| crs)
+        .map_err(|err| RasterError::Binding(format!("could not parse .prj CRS: {err}")))
 }
 
 /// Return ordered candidate paths for an ESRI world file accompanying
@@ -170,44 +168,44 @@ pub fn prj_file_candidates(raster_path: &Path) -> Vec<PathBuf> {
 }
 
 /// Discover and parse any accompanying world file and/or `.prj` sidecar for
-/// `raster_path` on the local filesystem.
-pub fn load_sidecar_georef(raster_path: &Path) -> Result<SidecarGeoref, RasterError> {
-    let affine = match read_first_existing_text(&world_file_candidates(raster_path))? {
-        Some(world_text) => Some(parse_world_file(&world_text)?),
-        None => None,
-    };
-    let crs = match read_first_existing_text(&prj_file_candidates(raster_path))? {
+/// `raster_path` using a caller-supplied text loader `read_candidate`.
+///
+/// Keeping filesystem reads injected at the caller seam leaves `veldmap-raster`
+/// completely free of `std::fs` calls. `read_candidate(path, MAX_SIDECAR_BYTES)`
+/// returns `Ok(None)` when `path` does not exist or is not a regular file,
+/// `Ok(Some(text))` when read, or `Err(msg)` on size-limit/read errors.
+pub fn load_sidecar_georef_with<F>(
+    raster_path: &Path,
+    mut read_candidate: F,
+) -> Result<SidecarGeoref, RasterError>
+where
+    F: FnMut(&Path, u64) -> Result<Option<String>, String>,
+{
+    let affine =
+        match read_first_candidate(&world_file_candidates(raster_path), &mut read_candidate)? {
+            Some(world_text) => Some(parse_world_file(&world_text)?),
+            None => None,
+        };
+    let crs = match read_first_candidate(&prj_file_candidates(raster_path), &mut read_candidate)? {
         Some(prj_text) => Some(parse_prj_text(&prj_text)?),
         None => None,
     };
     Ok(SidecarGeoref { affine, crs })
 }
 
-/// Discover and parse an optional world file (+ optional `.prj`) placement
-/// accompanying `raster_path` on the local filesystem.
-pub fn load_sidecar_placement(raster_path: &Path) -> Result<Option<GeoPlacement>, RasterError> {
-    Ok(load_sidecar_georef(raster_path)?.into_placement())
-}
-
-fn read_first_existing_text(candidates: &[PathBuf]) -> Result<Option<String>, RasterError> {
+fn read_first_candidate<F>(
+    candidates: &[PathBuf],
+    read_candidate: &mut F,
+) -> Result<Option<String>, RasterError>
+where
+    F: FnMut(&Path, u64) -> Result<Option<String>, String>,
+{
     for path in candidates {
-        let Ok(meta) = std::fs::metadata(path) else {
-            continue;
-        };
-        if !meta.is_file() {
-            continue;
+        match read_candidate(path, MAX_SIDECAR_BYTES) {
+            Ok(Some(text)) => return Ok(Some(text)),
+            Ok(None) => continue,
+            Err(msg) => return Err(RasterError::Binding(msg)),
         }
-        if meta.len() > MAX_SIDECAR_BYTES {
-            return Err(RasterError::Binding(format!(
-                "sidecar '{}' exceeds {} byte size limit",
-                path.display(),
-                MAX_SIDECAR_BYTES
-            )));
-        }
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            RasterError::Binding(format!("failed to read sidecar '{}': {e}", path.display()))
-        })?;
-        return Ok(Some(text));
     }
     Ok(None)
 }

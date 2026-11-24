@@ -15,7 +15,7 @@ use crate::http::{HostLimiters, PermitDenied};
 use super::NetworkStatus;
 use super::failures::{BackoffEntry, FailureMarker, FailureTracker};
 use super::in_flight::InFlightTable;
-use super::queue::CoarsestTileQueue;
+use super::queue::PendingQueues;
 
 /// Explicit side-effect summary returned by in-flight state transitions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,25 +71,27 @@ impl StatusCounters {
     }
 }
 
+/// Shared tile metadata passed from dispatch planning to disk/HTTP workers.
+pub(super) struct TileTarget {
+    pub(super) key: TileKey,
+    pub(super) id: QuadTileId,
+    pub(super) spec: Arc<LiveBasemapSpec>,
+    pub(super) cancel: CancelToken,
+}
+
 /// Raw disk-lookup task planned under `PipelineState`'s mutex, to be wrapped
 /// in RAII guards immediately upon unlocking `state`.
 pub(super) struct PlannedDiskTask {
-    pub(super) key: TileKey,
-    pub(super) id: QuadTileId,
+    pub(super) target: TileTarget,
     pub(super) generation: u64,
-    pub(super) spec: Arc<LiveBasemapSpec>,
-    pub(super) cancel: CancelToken,
 }
 
 /// Raw HTTP fetch task planned under `PipelineState`'s mutex, to be wrapped
 /// in RAII guards immediately upon unlocking `state`.
 pub(super) struct PlannedHttpTask {
-    pub(super) key: TileKey,
-    pub(super) id: QuadTileId,
+    pub(super) target: TileTarget,
     pub(super) generation: u64,
-    pub(super) spec: Arc<LiveBasemapSpec>,
     pub(super) host: String,
-    pub(super) cancel: CancelToken,
     pub(super) permit: OwnedSemaphorePermit,
 }
 
@@ -106,45 +108,6 @@ fn min_instant(current: Option<Instant>, candidate: Instant) -> Option<Instant> 
         Some(cur) if cur < candidate => cur,
         _ => candidate,
     })
-}
-
-#[derive(Default)]
-struct PendingQueues {
-    /// Coarsest-first queue awaiting fast local disk-cache lookup.
-    disk: CoarsestTileQueue,
-    /// Coarsest-first queue of disk misses awaiting an HTTP per-host slot.
-    http: CoarsestTileQueue,
-}
-
-impl PendingQueues {
-    fn clear(&mut self) {
-        self.disk.clear();
-        self.http.clear();
-    }
-
-    fn len(&self) -> usize {
-        self.disk.len().saturating_add(self.http.len())
-    }
-
-    fn contains(&self, key: &TileKey) -> bool {
-        self.disk.contains(key) || self.http.contains(key)
-    }
-
-    fn insert_unique(&mut self, key: TileKey, retry_disk: bool) {
-        if retry_disk {
-            self.disk.insert_unique(key);
-        } else {
-            self.http.insert_unique(key);
-        }
-    }
-
-    /// Retain still-wanted / active-root entries in place, keeping `http`
-    /// entries out of `disk` so disk misses never bounce back.
-    fn retain(&mut self, mut keep: impl FnMut(&TileKey) -> bool) {
-        self.http.retain(&mut keep);
-        let http = &self.http;
-        self.disk.retain(|key| !http.contains(key) && keep(key));
-    }
 }
 
 #[derive(Default)]
@@ -386,11 +349,13 @@ impl PipelineState {
             self.pop_next_disk(active_source, max_concurrent_disk, shutdown)
         {
             tasks.push(PlannedDiskTask {
-                key,
-                id,
+                target: TileTarget {
+                    key,
+                    id,
+                    spec: Arc::clone(spec),
+                    cancel,
+                },
                 generation,
-                spec: Arc::clone(spec),
-                cancel,
             });
         }
         tasks
@@ -423,12 +388,14 @@ impl PipelineState {
                 Ok(permit) => {
                     let (generation, cancel) = self.in_flight.register(key, shutdown);
                     tasks.push(PlannedHttpTask {
-                        key,
-                        id,
+                        target: TileTarget {
+                            key,
+                            id,
+                            spec: Arc::clone(spec),
+                            cancel,
+                        },
                         generation,
-                        spec: Arc::clone(spec),
                         host: host.to_owned(),
-                        cancel,
                         permit,
                     });
                 }

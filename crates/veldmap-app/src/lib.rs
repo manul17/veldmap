@@ -3,6 +3,8 @@
 //! (`render`, `gpu_tiles`, `basemap_policy`, [`BUNDLED_BASEMAP_CONFIG`], and
 //! [`BUNDLED_BASEMAP_JPEG`]) for GPU smoke tests and `naga` shader validation.
 
+#![forbid(unsafe_code)]
+
 mod app;
 mod basemap;
 mod dialogs;

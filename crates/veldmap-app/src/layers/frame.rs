@@ -158,7 +158,7 @@ fn update_wanted_and_reconcile(
     }
     layer.sync_wanted_shared();
 
-    runtime.reconcile_pointwise_source(layer.source_id(), &layer.wanted, gpu_cache, pending);
+    runtime.reconcile_pointwise_stream(layer.meta.pass_key(), &layer.wanted, gpu_cache, pending);
 }
 
 fn build_draw_patches(

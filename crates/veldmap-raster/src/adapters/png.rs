@@ -12,16 +12,16 @@ use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{RASTER_TILE_SIZE, SourceFingerprint, SourceId, level_count};
 
-use crate::RasterError;
-use crate::pipeline::cascade::{self, Cascade, TileEmit};
+use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
 use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
-use crate::pipeline::plan::{LevelPlan, PyramidMeta, ServeMode};
-use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples};
-use crate::pipeline::resample::bleed_alpha;
+use crate::pipeline::plan::{
+    DISPLAY_STREAM_SPEC, LevelPlan, PyramidMeta, ServeMode, check_max_source_side,
+};
+use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples, expand_u8_into_rgba};
 use crate::pipeline::{DecodeContext, RasterSource};
-use crate::tiff::MAX_SOURCE_SIDE;
+use crate::{RasterError, map_std_io_error};
 
-use super::{DISPLAY_STREAM_SPEC, map_std_io_error, world_file_binding_trouble};
+use super::world_file_binding_trouble;
 
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -76,18 +76,7 @@ impl PngSource {
         if width == 0 || height == 0 {
             return Err(RasterError::InvalidDimensions { width, height });
         }
-        if width > MAX_SOURCE_SIDE || height > MAX_SOURCE_SIDE {
-            return Err(RasterError::LimitExceeded {
-                width,
-                height,
-                estimated_bytes: u64::from(width)
-                    .saturating_mul(u64::from(height))
-                    .saturating_mul(4),
-                limit_bytes: u64::from(MAX_SOURCE_SIDE)
-                    .saturating_mul(u64::from(MAX_SOURCE_SIDE))
-                    .saturating_mul(4),
-            });
-        }
+        check_max_source_side(width, height)?;
 
         let has_alpha = matches!(
             info.color_type,
@@ -157,6 +146,19 @@ impl PngSource {
             description,
         })
     }
+    fn open_normalized_reader(
+        &self,
+        ctx: &DecodeContext<'_>,
+    ) -> Result<(png::Reader<BufferedByteReader>, PixelLayout), RasterError> {
+        let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
+        let mut decoder = build_png_decoder(reader, ctx.budget);
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let png_reader = decoder
+            .read_info()
+            .map_err(|e| map_png_error(e, ctx.cancel))?;
+        let layout = PixelLayout::named(png_reader.output_color_type().0.samples());
+        Ok((png_reader, layout))
+    }
 }
 
 impl RasterSource for PngSource {
@@ -204,13 +206,7 @@ impl RasterSource for PngSource {
             return Err(RasterError::Cancelled);
         }
 
-        let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
-        let mut decoder = build_png_decoder(reader, ctx.budget);
-        decoder.set_transformations(png::Transformations::normalize_to_color8());
-        let mut png_reader = decoder
-            .read_info()
-            .map_err(|e| map_png_error(e, ctx.cancel))?;
-
+        let (mut png_reader, layout) = self.open_normalized_reader(ctx)?;
         let (w, h, interlaced) = {
             let info = png_reader.info();
             (info.width, info.height, info.interlaced)
@@ -223,10 +219,7 @@ impl RasterSource for PngSource {
 
         let mapping = DisplayMapping::identity(None);
         let mut cascade = Cascade::new(0, w, h);
-        let mut bled_emit = |lvl: u8, x: u32, y: u32, tw: u32, th: u32, mut rgba: Vec<u8>| {
-            bleed_alpha(&mut rgba, tw, th);
-            emit(lvl, x, y, tw, th, rgba)
-        };
+        let mut bled_emit = bleed_display_emit(emit);
 
         if interlaced || self.interlaced {
             let buf_len = png_reader.output_buffer_size().ok_or_else(|| {
@@ -265,8 +258,6 @@ impl RasterSource for PngSource {
         let _lease = ctx
             .budget_tracker
             .reserve_blocking(self.pass_peak_bytes, ctx.cancel)?;
-        let channels = png_reader.output_color_type().0.samples();
-        let layout = PixelLayout::named(channels);
         let mut row_rgba = Vec::with_capacity((w as usize).saturating_mul(4));
         let mut row_idx = 0u32;
         while let Some(row) = png_reader
@@ -276,7 +267,7 @@ impl RasterSource for PngSource {
             if row_idx.is_multiple_of(64) && ctx.cancel.is_cancelled() {
                 return Err(RasterError::Cancelled);
             }
-            expand_u8_row_to_rgba(row.data(), layout, w as usize, &mut row_rgba);
+            expand_u8_into_rgba(row.data(), layout, w as usize, &mut row_rgba);
             cascade.push_rows(&row_rgba, 1, &mut bled_emit)?;
             row_idx = row_idx.saturating_add(1);
         }
@@ -309,14 +300,7 @@ impl RasterSource for PngSource {
         let _lease = ctx
             .budget_tracker
             .reserve_blocking(probe_bytes, ctx.cancel)?;
-        let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
-        let mut decoder = build_png_decoder(reader, ctx.budget);
-        decoder.set_transformations(png::Transformations::normalize_to_color8());
-        let mut png_reader = decoder
-            .read_info()
-            .map_err(|e| map_png_error(e, ctx.cancel))?;
-        let channels = png_reader.output_color_type().0.samples();
-        let layout = PixelLayout::named(channels);
+        let (mut png_reader, layout) = self.open_normalized_reader(ctx)?;
         let mut row_rgba = Vec::new();
         for row_idx in 0..=py {
             if row_idx.is_multiple_of(128) && ctx.cancel.is_cancelled() {
@@ -329,7 +313,7 @@ impl RasterSource for PngSource {
                 return Ok(None);
             };
             if row_idx == py {
-                expand_u8_row_to_rgba(
+                expand_u8_into_rgba(
                     row.data(),
                     layout,
                     self.description.width as usize,
@@ -344,21 +328,6 @@ impl RasterSource for PngSource {
             }
         }
         Ok(None)
-    }
-}
-
-fn expand_u8_row_to_rgba(samples: &[u8], layout: PixelLayout, pixels: usize, out: &mut Vec<u8>) {
-    out.clear();
-    out.reserve(pixels.saturating_mul(4));
-    for px in samples.chunks_exact(layout.channels).take(pixels) {
-        let (rgb, alpha) = match (layout.colors(), layout.has_alpha()) {
-            (1, false) => ([px[0], px[0], px[0]], 255),
-            (1, true) => ([px[0], px[0], px[0]], px[layout.channels - 1]),
-            (_, false) => ([px[0], px[1], px[2]], 255),
-            (_, true) => ([px[0], px[1], px[2]], px[layout.channels - 1]),
-        };
-        out.extend_from_slice(&rgb);
-        out.push(alpha);
     }
 }
 

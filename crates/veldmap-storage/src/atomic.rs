@@ -84,8 +84,7 @@ fn rename_replace(tmp: &Path, target: &Path) -> std::io::Result<()> {
 /// data and metadata via `sync_all()`, **closes the `File` handle synchronously
 /// before renaming** (required on Windows), atomically renames over `path`,
 /// and best-effort fsyncs the parent directory on Unix.
-#[cfg(test)]
-fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+pub fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     write_atomic_impl(path, bytes, false)
 }
 
@@ -156,29 +155,15 @@ fn write_atomic_impl(path: &Path, bytes: &[u8], private: bool) -> Result<(), Sto
     Ok(())
 }
 
-fn write_json_impl<T: Serialize>(
-    path: &Path,
-    value: &T,
-    private: bool,
-) -> Result<(), StorageError> {
-    let mut bytes = serde_json::to_vec_pretty(value)?;
-    bytes.push(b'\n');
-    write_atomic_impl(path, &bytes, private)
-}
-
-/// Serialize `value` as pretty JSON and persist it via [`write_atomic_durable`].
-#[cfg(test)]
-fn write_json_durable<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
-    write_json_impl(path, value, false)
-}
-
 /// Serialize `value` as pretty JSON and persist it via
 /// [`write_atomic_durable_private`] (`0600` permissions on Unix).
 pub fn write_json_durable_private<T: Serialize>(
     path: &Path,
     value: &T,
 ) -> Result<(), StorageError> {
-    write_json_impl(path, value, true)
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    write_atomic_impl(path, &bytes, true)
 }
 
 /// Read JSON from `path`, returning `T::default()` if the file does not exist.
@@ -201,13 +186,25 @@ pub fn read_json_or_default_with_backup<T: DeserializeOwned + Default>(path: &Pa
             let mut backup_os = path.as_os_str().to_os_string();
             backup_os.push(".corrupt");
             let backup = PathBuf::from(backup_os);
-            let _ = fs::rename(path, &backup);
-            tracing::warn!(
-                path = %path.display(),
-                backup = %backup.display(),
-                error = %err,
-                "Failed to parse persisted JSON; backed up corrupt file and using defaults"
-            );
+            match rename_replace(path, &backup) {
+                Ok(()) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        backup = %backup.display(),
+                        error = %err,
+                        "Failed to parse persisted JSON; backed up corrupt file and using defaults"
+                    );
+                }
+                Err(rename_err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        backup = %backup.display(),
+                        parse_error = %err,
+                        backup_error = %rename_err,
+                        "Failed to parse persisted JSON and failed to back up corrupt file; using defaults"
+                    );
+                }
+            }
             T::default()
         }
         Err(err) => {
@@ -303,7 +300,7 @@ mod tests {
         let missing: Sample = read_json_or_default(&path).expect("missing returns default");
         assert_eq!(missing, Sample { count: 0 });
 
-        write_json_durable(&path, &Sample { count: 42 }).expect("write json");
+        write_json_durable_private(&path, &Sample { count: 42 }).expect("write json");
         let loaded: Sample = read_json_or_default(&path).expect("read json");
         assert_eq!(loaded, Sample { count: 42 });
 

@@ -431,3 +431,114 @@ fn unwound_span_m(from: (f64, f64), to: (f64, f64)) -> f64 {
     let along = (to.1 - from.1) * ((from.0 + to.0) * 0.5).to_radians().cos();
     (to.0 - from.0).hypot(along).to_radians() * geodesy::SEMI_MAJOR_M
 }
+
+fn snap_deg_bound(v: f64, limit: f64) -> f64 {
+    const EPS_DEG: f64 = 1e-6;
+    if v > limit && v <= limit + EPS_DEG {
+        limit
+    } else if v < -limit && v >= -limit - EPS_DEG {
+        -limit
+    } else {
+        v
+    }
+}
+
+impl TieGrid {
+    /// Synthesize a validated [`TieGrid`] from a geographic pixel-space affine
+    /// transform (`lon = a[0]*i + a[1]*j + a[2]`, `lat = a[3]*i + a[4]*j + a[5]`).
+    pub(super) fn from_geographic_affine(
+        pixel_affine: [f64; 6],
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        const EPS_DEG: f64 = 1e-6;
+
+        let w = f64::from(width);
+        let h = f64::from(height);
+        let eval = |i: f64, j: f64| {
+            let lon = pixel_affine[0] * i + pixel_affine[1] * j + pixel_affine[2];
+            let lat = pixel_affine[3] * i + pixel_affine[4] * j + pixel_affine[5];
+            (lat, lon)
+        };
+        // Sample ties at outer pixel centers whenever an axis has `> 1` pixel so
+        // `PixelIsPoint` and world-file rasters whose outer pixel centers sit on
+        // `±90°` or `[0°, 360°]` stay exact (`0.0°` pixel-center error) while
+        // `TieGrid::geodetic` linearly extrapolates outer half-pixel edges (and
+        // clamps pole overshoot cleanly without compressing interior rows).
+        let (px0, px1) = if width > 1 { (0.5, w - 0.5) } else { (0.0, w) };
+        let (py0, py1) = if height > 1 { (0.5, h - 0.5) } else { (0.0, h) };
+
+        let corners = [
+            eval(px0, py0),
+            eval(px1, py0),
+            eval(px0, py1),
+            eval(px1, py1),
+        ];
+        let lat_limit = if height > 1 {
+            90.0 + EPS_DEG
+        } else {
+            90.0 + ((pixel_affine[3].abs() + pixel_affine[4].abs()) * 0.501).clamp(EPS_DEG, 2.0)
+        };
+        let lon_limit = if width > 1 {
+            360.0 + EPS_DEG
+        } else {
+            360.0 + ((pixel_affine[0].abs() + pixel_affine[1].abs()) * 0.501).clamp(EPS_DEG, 2.0)
+        };
+        if !corners.iter().all(|(lat, lon)| {
+            lat.is_finite() && lon.is_finite() && lat.abs() <= lat_limit && lon.abs() <= lon_limit
+        }) {
+            return None;
+        }
+
+        let dlon_x = (corners[1].1 - corners[0].1)
+            .abs()
+            .max((corners[3].1 - corners[2].1).abs());
+        let dlon_y = (corners[2].1 - corners[0].1)
+            .abs()
+            .max((corners[3].1 - corners[1].1).abs());
+        if !dlon_x.is_finite() || !dlon_y.is_finite() || dlon_x > 720.0 || dlon_y > 720.0 {
+            return None;
+        }
+
+        let cols = if dlon_x > 170.0 {
+            (dlon_x / 90.0).ceil().max(2.0) as usize
+        } else {
+            1
+        };
+        let rows = if dlon_y > 170.0 {
+            (dlon_y / 90.0).ceil().max(2.0) as usize
+        } else {
+            1
+        };
+        let mut ties = Vec::with_capacity((cols + 1) * (rows + 1));
+        for r in 0..=rows {
+            let py = if r == rows {
+                py1
+            } else {
+                py0 + (py1 - py0) * (r as f64 / rows as f64)
+            };
+            let fy = py / h;
+            for c in 0..=cols {
+                let px = if c == cols {
+                    px1
+                } else {
+                    px0 + (px1 - px0) * (c as f64 / cols as f64)
+                };
+                let fx = px / w;
+                let (raw_lat, raw_lon) = eval(px, py);
+                let lat = if height > 1 {
+                    snap_deg_bound(raw_lat, 90.0)
+                } else {
+                    raw_lat.clamp(-90.0, 90.0)
+                };
+                let lon = if width > 1 {
+                    snap_deg_bound(raw_lon, 360.0)
+                } else {
+                    raw_lon.clamp(-360.0, 360.0)
+                };
+                ties.push(Tie { fx, fy, lat, lon });
+            }
+        }
+        Self::new(&ties)
+    }
+}

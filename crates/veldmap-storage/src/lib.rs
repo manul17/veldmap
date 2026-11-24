@@ -17,9 +17,10 @@ mod paths;
 mod tile_cache;
 
 pub use atomic::{
-    read_json_or_default_with_backup, write_atomic_durable_private, write_json_durable_private,
+    read_json_or_default_with_backup, write_atomic_durable, write_atomic_durable_private,
+    write_json_durable_private,
 };
-pub use file_source::LocalFileSource;
+pub use file_source::{LocalFileSource, read_regular_file_utf8_limited};
 pub use fingerprint::{LocalFingerprintCache, fingerprint_byte_source};
 pub use host::detect_memory_budget;
 pub use paths::StoragePaths;
@@ -79,6 +80,8 @@ pub enum StorageError {
     NoPlatformDirs,
     #[error("invalid storage path: {0}")]
     InvalidPath(String),
+    #[error("file '{path}' exceeds {limit_bytes} B limit")]
+    FileTooLarge { path: String, limit_bytes: u64 },
     #[error("invalid tile cache source key: '{0}'")]
     InvalidSourceKey(String),
     #[error("I/O error: {0}")]

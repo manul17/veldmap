@@ -8,21 +8,13 @@
 
 use std::sync::Arc;
 
-use glam::DVec3;
+use super::datum::DatumWarning;
+use super::geodesy::{Ellipsoid, SEMI_MAJOR_M, unwind};
+use super::proj4::Proj4Projection;
 
-use super::crs::{CrsError, DatumWarning, Proj4Projection};
-use super::geodesy::{Ellipsoid, Geodetic, SEMI_MAJOR_M, WGS84, unwind};
-
-/// International foot in metres (EPSG:9002).
-pub const INTERNATIONAL_FOOT_M: f64 = 0.3048;
-
-/// US Survey foot in metres (EPSG:9003, `1200 / 3937`).
-pub const US_SURVEY_FOOT_M: f64 = 1200.0 / 3937.0;
-
-/// Krasovsky 1940 ellipsoid (SK-42, Gauss-Kruger zones, MSK local systems).
-pub const KRASOVSKY: Ellipsoid = Ellipsoid {
-    semi_major_m: 6_378_245.0,
-    flattening: 1.0 / 298.3,
+pub use super::datum::{
+    Datum, HelmertConvention, INTERNATIONAL_FOOT_M, KRASOVSKY, PULKOVO_1942, US_SURVEY_FOOT_M,
+    WGS84_DATUM,
 };
 
 fn rectifying_radius(ellipsoid: Ellipsoid) -> f64 {
@@ -83,142 +75,6 @@ fn geodetic_from_conformal(e: f64, tau_c: f64, rounds: u32) -> f64 {
 
 const CONFORMAL_ROUNDS: u32 = 8;
 
-/// Rotation sign convention for 7-parameter Helmert datum transformations.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum HelmertConvention {
-    /// Coordinate Frame Rotation (EPSG:9607; used by GOST R 51794-2008 /
-    /// Pulkovo 1942 and US/Australian surveying standards).
-    ///
-    /// Forward matrix: `[[1, +wz, -wy], [-wz, 1, +wx], [+wy, -wx, 1]]`.
-    #[default]
-    CoordinateFrame,
-    /// Position Vector Transformation (EPSG:9606; used by PROJ `+towgs84` and
-    /// WKT `TOWGS84` clauses).
-    ///
-    /// Forward matrix: `[[1, -rz, +ry], [+rz, 1, -rx], [-ry, +rx, 1]]`
-    /// (negated rotation parameters relative to [`Self::CoordinateFrame`]).
-    PositionVector,
-}
-
-/// Geodetic datum: reference ellipsoid plus 7-parameter Helmert shift to WGS84
-/// with an explicit rotation sign [`HelmertConvention`].
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Datum {
-    pub ellipsoid: Ellipsoid,
-    /// Origin shift in metres.
-    pub shift_m: [f64; 3],
-    /// Axis rotations in arc-seconds under [`Self::convention`].
-    pub rotate_sec: [f64; 3],
-    /// Scale correction in parts per million.
-    pub scale_ppm: f64,
-    /// Sign convention for [`Self::rotate_sec`] (EPSG:9607 vs. EPSG:9606).
-    pub convention: HelmertConvention,
-}
-
-/// Identity WGS84 datum.
-pub const WGS84_DATUM: Datum = Datum {
-    ellipsoid: WGS84,
-    shift_m: [0.0; 3],
-    rotate_sec: [0.0; 3],
-    scale_ppm: 0.0,
-    convention: HelmertConvention::CoordinateFrame,
-};
-
-/// Pulkovo 1942 (SK-42) to WGS84 parameters per GOST R 51794-2008
-/// (Coordinate Frame Rotation, EPSG:9607; equivalent to PROJ Position Vector
-/// `+towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22`).
-pub const PULKOVO_1942: Datum = Datum {
-    ellipsoid: KRASOVSKY,
-    shift_m: [23.57, -140.95, -79.8],
-    rotate_sec: [0.0, -0.35, -0.79],
-    scale_ppm: -0.22,
-    convention: HelmertConvention::CoordinateFrame,
-};
-
-impl Datum {
-    /// Construct a datum from WKT / PROJ `+towgs84` parameters
-    /// (`PositionVector`, EPSG:9606).
-    pub const fn from_towgs84(ellipsoid: Ellipsoid, towgs84: [f64; 7]) -> Self {
-        Self {
-            ellipsoid,
-            shift_m: [towgs84[0], towgs84[1], towgs84[2]],
-            rotate_sec: [towgs84[3], towgs84[4], towgs84[5]],
-            scale_ppm: towgs84[6],
-            convention: HelmertConvention::PositionVector,
-        }
-    }
-
-    /// Return whether this datum is mathematically identical to WGS84.
-    pub fn is_wgs84(&self) -> bool {
-        self.ellipsoid == WGS84
-            && self.shift_m == [0.0; 3]
-            && self.rotate_sec == [0.0; 3]
-            && self.scale_ppm == 0.0
-    }
-
-    /// Return Coordinate-Frame rotation angles `(wx, wy, wz)` in radians and
-    /// linear scale factor.
-    fn turn(&self) -> ([f64; 3], f64) {
-        let second = std::f64::consts::PI / (180.0 * 3600.0);
-        let sign = match self.convention {
-            HelmertConvention::CoordinateFrame => 1.0,
-            HelmertConvention::PositionVector => -1.0,
-        };
-        (
-            self.rotate_sec.map(|value| value * sign * second),
-            1.0 + self.scale_ppm * 1e-6,
-        )
-    }
-
-    fn helmert(&self, point: DVec3) -> DVec3 {
-        let ([wx, wy, wz], scale) = self.turn();
-        let [dx, dy, dz] = self.shift_m;
-        DVec3::new(
-            dx + scale * (point.x + wz * point.y - wy * point.z),
-            dy + scale * (-wz * point.x + point.y + wx * point.z),
-            dz + scale * (wy * point.x - wx * point.y + point.z),
-        )
-    }
-
-    /// Exact closed-form inverse of `I + W`: `(I - W + w w^T) / (1 + |w|^2)`.
-    fn helmert_back(&self, point: DVec3) -> DVec3 {
-        let ([wx, wy, wz], scale) = self.turn();
-        let x = (point.x - self.shift_m[0]) / scale;
-        let y = (point.y - self.shift_m[1]) / scale;
-        let z = (point.z - self.shift_m[2]) / scale;
-
-        let square = wx * wx + wy * wy + wz * wz;
-        let along = wx * x + wy * y + wz * z;
-        DVec3::new(
-            (x - (wz * y - wy * z) + wx * along) / (1.0 + square),
-            (y - (-wz * x + wx * z) + wy * along) / (1.0 + square),
-            (z - (wy * x - wx * y) + wz * along) / (1.0 + square),
-        )
-    }
-
-    /// Convert 2D `(lat_deg, lon_deg)` from this datum into WGS84 (discarding
-    /// the phantom Helmert ellipsoidal height `Delta h` on 2D output).
-    pub fn to_wgs84(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
-        if self.is_wgs84() {
-            return (lat_deg, lon_deg);
-        }
-        let point = self.ellipsoid.to_ecef(Geodetic::surface(lat_deg, lon_deg));
-        let shifted = WGS84.from_ecef(self.helmert(point));
-        (shifted.lat_deg, shifted.lon_deg)
-    }
-
-    /// Convert 2D WGS84 `(lat_deg, lon_deg)` into this datum (discarding
-    /// phantom Helmert `Delta h` on 2D output).
-    pub fn from_wgs84(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
-        if self.is_wgs84() {
-            return (lat_deg, lon_deg);
-        }
-        let point = WGS84.to_ecef(Geodetic::surface(lat_deg, lon_deg));
-        let shifted = self.ellipsoid.from_ecef(self.helmert_back(point));
-        (shifted.lat_deg, shifted.lon_deg)
-    }
-}
-
 /// Supported projected coordinate systems.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Projection {
@@ -241,6 +97,18 @@ impl From<System> for Projection {
     }
 }
 
+const WEB_MERCATOR_RADIUS_M: f64 = SEMI_MAJOR_M;
+
+/// Maximum latitude of the square Web Mercator domain (`atan(sinh(pi))`).
+pub const WEB_MERCATOR_LIMIT_DEG: f64 = 85.051_128_779_806_59;
+
+/// Convert normalized Web Mercator Y radians (`[-pi, +pi]`) to geodetic
+/// latitude in degrees.
+#[inline]
+pub fn web_mercator_lat_deg(merc_rad: f64) -> f64 {
+    merc_rad.sinh().atan().to_degrees()
+}
+
 impl Projection {
     /// Construct a named in-house Transverse Mercator projection.
     pub fn transverse_named(system: System, name: impl Into<Arc<str>>) -> Self {
@@ -255,21 +123,16 @@ impl Projection {
         };
         Self::Transverse { system, name }
     }
-}
 
-const WEB_MERCATOR_RADIUS_M: f64 = SEMI_MAJOR_M;
+    /// Resolve an EPSG (or MSK-61 `633610x`) code via fast in-house formulas
+    /// only, without falling back to `proj4rs`.
+    pub(crate) fn from_epsg_in_house(code: u32) -> Option<Self> {
+        if code == 3857 {
+            return Some(Self::WebMercator);
+        }
+        System::from_epsg(code).map(|system| Self::Transverse { system, name: None })
+    }
 
-/// Maximum latitude of the square Web Mercator domain (`atan(sinh(pi))`).
-pub const WEB_MERCATOR_LIMIT_DEG: f64 = 85.051_128_779_806_59;
-
-/// Convert normalized Web Mercator Y radians (`[-pi, +pi]`) to geodetic
-/// latitude in degrees.
-#[inline]
-pub fn web_mercator_lat_deg(merc_rad: f64) -> f64 {
-    merc_rad.sinh().atan().to_degrees()
-}
-
-impl Projection {
     /// Look up a projected CRS by EPSG (or regional MSK-61 `633610x`) code.
     ///
     /// Retains fast exact in-house implementations for EPSG:3857, WGS84 UTM
@@ -278,39 +141,11 @@ impl Projection {
     /// pure-Rust `proj4rs` + `crs-definitions` for all other projected EPSG
     /// codes.
     pub fn from_epsg(code: u32) -> Option<Self> {
-        if code == 3857 {
-            return Some(Self::WebMercator);
-        }
-        if let Some(sys) = System::from_epsg(code) {
-            return Some(Self::Transverse {
-                system: sys,
-                name: None,
-            });
+        if let Some(in_house) = Self::from_epsg_in_house(code) {
+            return Some(in_house);
         }
         let proj4 = Proj4Projection::from_epsg(code).ok()?;
         (!proj4.is_geographic()).then(|| Self::Proj4(Arc::new(proj4)))
-    }
-
-    /// Parse a projected CRS from WKT1 or WKT2 (such as a `.prj` sidecar).
-    pub fn from_wkt(wkt: &str) -> Result<Self, CrsError> {
-        let proj4 = Proj4Projection::from_wkt(wkt)?;
-        if proj4.is_geographic() {
-            return Err(CrsError::InvalidWkt(
-                "WKT defines a geographic CRS, not a projected CRS".to_string(),
-            ));
-        }
-        Ok(Self::Proj4(Arc::new(proj4)))
-    }
-
-    /// Parse a projected CRS from a PROJ.4 string.
-    pub fn from_proj_string(proj_string: &str, label: Option<String>) -> Result<Self, CrsError> {
-        let proj4 = Proj4Projection::from_proj_string(proj_string, label)?;
-        if proj4.is_geographic() {
-            return Err(CrsError::InvalidProj(
-                "PROJ string defines a geographic CRS, not a projected CRS".to_string(),
-            ));
-        }
-        Ok(Self::Proj4(Arc::new(proj4)))
     }
 
     /// Convert WGS84 `(lat_deg, lon_deg)` to projected `(easting, northing)`

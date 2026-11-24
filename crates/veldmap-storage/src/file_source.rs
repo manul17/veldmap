@@ -30,6 +30,42 @@ pub(crate) fn ensure_regular_file(meta: &Metadata, path: &Path) -> Result<(), St
     Ok(())
 }
 
+/// Safely read a regular UTF-8 text file up to `max_bytes` without a TOCTOU
+/// window between metadata size checking and reading.
+///
+/// Rejects directories, FIFOs, and device nodes before and after `File::open`,
+/// checks `file.metadata().len() <= max_bytes`, and caps the actual read via
+/// [`std::io::Read::take`] so a file growing concurrently cannot exhaust RAM.
+pub fn read_regular_file_utf8_limited(path: &Path, max_bytes: u64) -> Result<String, StorageError> {
+    use std::io::Read;
+
+    let path_meta = std::fs::metadata(path)?;
+    ensure_regular_file(&path_meta, path)?;
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    ensure_regular_file(&meta, path)?;
+    if meta.len() > max_bytes {
+        return Err(StorageError::FileTooLarge {
+            path: path.display().to_string(),
+            limit_bytes: max_bytes,
+        });
+    }
+    let initial_cap = usize::try_from(meta.len().min(max_bytes))
+        .unwrap_or(0)
+        .min(4 * 1024 * 1024);
+    let mut bytes = Vec::with_capacity(initial_cap);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(StorageError::FileTooLarge {
+            path: path.display().to_string(),
+            limit_bytes: max_bytes,
+        });
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, err)))
+}
+
 /// Maximum idle read-only `File` handles cached per [`LocalFileSource`] on
 /// platforms where positioned reads mutate the kernel file pointer.
 #[cfg(not(unix))]
@@ -281,6 +317,43 @@ mod tests {
 
         assert!(matches!(
             LocalFileSource::open(dir.path()),
+            Err(StorageError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn read_regular_file_utf8_limited_enforces_cap_utf8_and_regular_file() {
+        let dir = TestTempDir::new("utf8_limited");
+        let path = dir.path().join("sample.txt");
+
+        // Multi-byte UTF-8: "abé" is 4 bytes (`[0x61, 0x62, 0xC3, 0xA9]`).
+        std::fs::write(&path, "abé").expect("write utf8");
+        assert_eq!(
+            read_regular_file_utf8_limited(&path, 4).expect("exact limit"),
+            "abé"
+        );
+        assert_eq!(
+            read_regular_file_utf8_limited(&path, u64::MAX).expect("u64::MAX limit"),
+            "abé"
+        );
+        // Limit smaller than file size (even splitting a multi-byte char) must
+        // report `FileTooLarge`, never `Io(InvalidData)`.
+        assert!(matches!(
+            read_regular_file_utf8_limited(&path, 2),
+            Err(StorageError::FileTooLarge { limit_bytes: 2, .. })
+        ));
+
+        // Invalid UTF-8 within limit reports `Io(InvalidData)`.
+        let bad_utf8 = dir.path().join("bad.bin");
+        std::fs::write(&bad_utf8, [0xFF, 0xFE, 0xFD]).expect("write invalid utf8");
+        assert!(matches!(
+            read_regular_file_utf8_limited(&bad_utf8, 16),
+            Err(StorageError::Io(ref err)) if err.kind() == io::ErrorKind::InvalidData
+        ));
+
+        // Directories are rejected as non-regular files.
+        assert!(matches!(
+            read_regular_file_utf8_limited(dir.path(), 64),
             Err(StorageError::InvalidPath(_))
         ));
     }

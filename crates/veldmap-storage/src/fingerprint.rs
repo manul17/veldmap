@@ -108,6 +108,43 @@ impl LocalFingerprintCache {
         self.get_or_compute_with_bypass(path, false, cancel)
     }
 
+    /// Open `path` once as a [`LocalFileSource`] and return both the opened
+    /// handle and its [`SourceFingerprint`], avoiding a second `File::open` and
+    /// closing the TOCTOU window between fingerprinting and decoding.
+    ///
+    /// On cache hit (matching canonical `(len, mtime_ns)` on the opened file
+    /// handle), skips BLAKE3 I/O; when `bypass_cache` is `true` or on cache
+    /// miss, hashes the exact returned [`LocalFileSource`].
+    pub fn open_and_fingerprint(
+        &self,
+        path: &Path,
+        bypass_cache: bool,
+        cancel: &CancelToken,
+    ) -> Result<(LocalFileSource, SourceFingerprint), StorageError> {
+        if cancel.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let source = LocalFileSource::open(&key)?;
+
+        if !bypass_cache {
+            let guard = lock_unpoisoned(&self.entries);
+            if let Some(entry) = guard.get(&key)
+                && entry.len == source.len()
+                && entry.mtime_ns.is_some()
+                && entry.mtime_ns == source.mtime_ns()
+            {
+                return Ok((source, entry.fingerprint));
+            }
+        }
+
+        if cancel.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        let fingerprint = self.compute_and_cache(&key, &source, cancel)?;
+        Ok((source, fingerprint))
+    }
+
     /// Return the [`SourceFingerprint`] for `path`, bypassing the in-memory stat
     /// cache when `bypass_cache` is `true` ("Reload / bypass cache").
     pub fn get_or_compute_with_bypass(
@@ -140,11 +177,20 @@ impl LocalFingerprintCache {
             return Err(StorageError::Cancelled);
         }
         let source = LocalFileSource::open(&key)?;
-        let fingerprint = fingerprint_byte_source(&source, cancel)?;
+        self.compute_and_cache(&key, &source, cancel)
+    }
+
+    fn compute_and_cache(
+        &self,
+        key: &Path,
+        source: &LocalFileSource,
+        cancel: &CancelToken,
+    ) -> Result<SourceFingerprint, StorageError> {
+        let fingerprint = fingerprint_byte_source(source, cancel)?;
 
         // Re-stat after hashing so concurrent in-place edits or replacements
         // during the read never cache a torn `(mtime_ns, fingerprint)` pair.
-        let post_stable = std::fs::metadata(&key).ok().is_some_and(|post| {
+        let post_stable = std::fs::metadata(key).ok().is_some_and(|post| {
             source.mtime_ns().is_some()
                 && post.len() == source.len()
                 && metadata_mtime_ns(&post) == source.mtime_ns()
@@ -152,11 +198,11 @@ impl LocalFingerprintCache {
 
         let mut guard = lock_unpoisoned(&self.entries);
         if post_stable {
-            if !guard.contains_key(&key) && guard.len() >= MAX_FINGERPRINT_CACHE_ENTRIES {
+            if !guard.contains_key(key) && guard.len() >= MAX_FINGERPRINT_CACHE_ENTRIES {
                 guard.clear();
             }
             guard.insert(
-                key,
+                key.to_path_buf(),
                 CachedStat {
                     len: source.len(),
                     mtime_ns: source.mtime_ns(),
@@ -164,7 +210,7 @@ impl LocalFingerprintCache {
                 },
             );
         } else {
-            guard.remove(&key);
+            guard.remove(key);
         }
         Ok(fingerprint)
     }
@@ -245,6 +291,16 @@ mod tests {
             f.write_all(&data).expect("write");
         }
         let cache = LocalFingerprintCache::new();
+        let (opened_src, opened_fp) = cache
+            .open_and_fingerprint(&path, false, &cancel)
+            .expect("open_and_fingerprint miss");
+        assert_eq!(opened_fp, fp2);
+        assert_eq!(opened_src.len(), data.len() as u64);
+        let (hit_src, hit_fp) = cache
+            .open_and_fingerprint(&path, false, &cancel)
+            .expect("open_and_fingerprint hit");
+        assert_eq!(hit_fp, fp2);
+        assert_eq!(hit_src.len(), data.len() as u64);
         let cached1 = cache.get_or_compute(&path, &cancel).expect("initial");
         assert_eq!(cached1, fp2);
         let cached2 = cache

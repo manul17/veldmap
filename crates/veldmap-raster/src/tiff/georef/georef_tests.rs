@@ -1,5 +1,5 @@
 use super::*;
-use crate::pipeline::{RasterDescription, frame_from_description};
+use crate::pipeline::{GeoRasterType, RasterDescription, frame_from_description};
 
 #[test]
 fn geokey_parse_respects_count_and_nul_stripped_ascii_tail() {

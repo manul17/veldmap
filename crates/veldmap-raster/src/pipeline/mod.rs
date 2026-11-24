@@ -5,6 +5,7 @@
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::CancelToken;
 
+mod binding;
 pub(crate) mod cascade;
 pub(crate) mod chunk_cache;
 pub(crate) mod driver;
@@ -18,15 +19,16 @@ mod scheduler;
 pub(crate) mod singleflight;
 mod source;
 
+pub use binding::{frame_from_description, frame_from_description_with_override};
 pub use cascade::TileEmit;
 pub use chunk_cache::SharedChunkCache;
 pub use metadata::{
     BandInfo, GeoKeyParams, GeoKeyValue, GeoPlacement, GeoRasterType, GeoTie, RasterDescription,
     SampleType,
 };
-pub use plan::{LevelPlan, PassKey, PyramidMeta, ServeMode};
+pub use plan::{LevelPlan, MAX_SOURCE_SIDE, PassKey, PyramidMeta, ServeMode};
 pub use scheduler::{AdmittedPass, AdmittedTile, TileFailureOutcome, TileScheduler};
-pub use source::{RasterSource, frame_from_description, frame_from_description_with_override};
+pub use source::RasterSource;
 
 /// Shared runtime context passed into analytical raster decoding calls.
 pub struct DecodeContext<'a> {

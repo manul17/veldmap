@@ -2,28 +2,58 @@
 //! [`super::TileDiskCache`] reads and O(1) stats queries.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use rusqlite::Connection;
-use veldmap_core::sync::lock_unpoisoned;
+use veldmap_core::sync::{lock_unpoisoned, wait_unpoisoned};
 
 use crate::StorageError;
 
 use super::schema::open_read_only_connection;
 
-/// Maximum pooled read-only WAL connections retained for concurrent lookups.
+/// Maximum concurrent and retained read-only WAL connections for lookups.
 const MAX_READ_POOL_CONNS: usize = 4;
+
+struct ReaderPoolState {
+    idle: Vec<Connection>,
+    active: usize,
+}
+
+struct ActiveReaderGuard<'a> {
+    pool: &'a ReaderPool,
+    conn: Option<Connection>,
+    keep: bool,
+}
+
+impl Drop for ActiveReaderGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = lock_unpoisoned(&self.pool.state);
+        state.active = state.active.saturating_sub(1);
+        if self.keep
+            && state.idle.len() < MAX_READ_POOL_CONNS
+            && let Some(conn) = self.conn.take()
+        {
+            state.idle.push(conn);
+        }
+        self.pool.cvar.notify_one();
+    }
+}
 
 pub(super) struct ReaderPool {
     db_path: PathBuf,
-    conns: Mutex<Vec<Connection>>,
+    state: Mutex<ReaderPoolState>,
+    cvar: Condvar,
 }
 
 impl ReaderPool {
     pub(super) fn new(db_path: PathBuf) -> Self {
         Self {
             db_path,
-            conns: Mutex::new(Vec::with_capacity(MAX_READ_POOL_CONNS)),
+            state: Mutex::new(ReaderPoolState {
+                idle: Vec::with_capacity(MAX_READ_POOL_CONNS),
+                active: 0,
+            }),
+            cvar: Condvar::new(),
         }
     }
 
@@ -32,27 +62,42 @@ impl ReaderPool {
     }
 
     pub(super) fn clear(&self) {
-        lock_unpoisoned(&self.conns).clear();
+        lock_unpoisoned(&self.state).idle.clear();
     }
 
     pub(super) fn with_reader<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
     ) -> Result<T, StorageError> {
-        let conn = {
-            let mut guard = lock_unpoisoned(&self.conns);
-            guard.pop()
-        };
-        let conn = match conn {
-            Some(c) => c,
-            None => open_read_only_connection(&self.db_path)?,
-        };
-        let result = f(&conn);
-        if result.is_ok() {
-            let mut guard = lock_unpoisoned(&self.conns);
-            if guard.len() < MAX_READ_POOL_CONNS {
-                guard.push(conn);
+        let pooled = {
+            let mut state = lock_unpoisoned(&self.state);
+            while state.active >= MAX_READ_POOL_CONNS {
+                state = wait_unpoisoned(&self.cvar, state);
             }
+            state.active += 1;
+            state.idle.pop()
+        };
+
+        // Guard ensures `active` is always decremented and a waiter is woken
+        // even if opening a connection or executing `f` returns an error or panics.
+        let mut guard = ActiveReaderGuard {
+            pool: self,
+            conn: pooled,
+            keep: false,
+        };
+
+        if guard.conn.is_none() {
+            guard.conn = Some(open_read_only_connection(&self.db_path)?);
+        }
+
+        let Some(conn) = guard.conn.as_ref() else {
+            return Err(StorageError::Sqlite(
+                "reader pool connection missing".to_string(),
+            ));
+        };
+        let result = f(conn);
+        if result.is_ok() {
+            guard.keep = true;
         }
         Ok(result?)
     }

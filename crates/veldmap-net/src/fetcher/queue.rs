@@ -75,6 +75,45 @@ impl CoarsestTileQueue {
     }
 }
 
+#[derive(Default)]
+pub(super) struct PendingQueues {
+    /// Coarsest-first queue awaiting fast local disk-cache lookup.
+    pub(super) disk: CoarsestTileQueue,
+    /// Coarsest-first queue of disk misses awaiting an HTTP per-host slot.
+    pub(super) http: CoarsestTileQueue,
+}
+
+impl PendingQueues {
+    pub(super) fn clear(&mut self) {
+        self.disk.clear();
+        self.http.clear();
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.disk.len().saturating_add(self.http.len())
+    }
+
+    pub(super) fn contains(&self, key: &TileKey) -> bool {
+        self.disk.contains(key) || self.http.contains(key)
+    }
+
+    pub(super) fn insert_unique(&mut self, key: TileKey, retry_disk: bool) {
+        if retry_disk {
+            self.disk.insert_unique(key);
+        } else {
+            self.http.insert_unique(key);
+        }
+    }
+
+    /// Retain still-wanted / active-root entries in place, keeping `http`
+    /// entries out of `disk` so disk misses never bounce back.
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&TileKey) -> bool) {
+        self.http.retain(&mut keep);
+        let http = &self.http;
+        self.disk.retain(|key| !http.contains(key) && keep(key));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use veldmap_core::tile::{PlanetaryScheme, QuadTileId};

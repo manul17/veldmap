@@ -144,19 +144,17 @@ fn web_mercator_antimeridian_fraction_at_and_anisotropic_sharpest_level() {
 }
 
 #[test]
-fn invalid_epsg_and_degenerate_frames_return_typed_errors() {
-    assert_eq!(
-        Frame::from_epsg_pixel_affine(999_999, [1.0, 0.0, 0.0, 0.0, -1.0, 0.0], 64, 64),
-        Err(BindingError::UnsupportedEpsg(999_999))
-    );
-    assert_eq!(
-        Frame::from_epsg_pixel_affine(
-            32637,
+fn invalid_epsg_and_degenerate_frames_are_rejected() {
+    assert!(CrsSpec::from_epsg(999_999).is_err());
+    let utm37 = CrsSpec::from_epsg(32637).expect("EPSG:32637");
+    assert!(
+        Frame::from_crs_pixel_affine(
+            &utm37,
             [0.0, 0.0, 500_000.0, 0.0, -10.0, 5_000_000.0],
             64,
             64
-        ),
-        Err(BindingError::InvalidExtent(32637))
+        )
+        .is_none()
     );
     assert!(
         Frame::quad([(10.0, 0.0), (10.0, 5.0), (10.0, 5.0), (10.0, 0.0)]).is_none(),

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use earcut::Earcut;
 use glam::DVec3;
 
+use super::cluster::build_rtc_clusters;
 use super::{GeoJsonFeatureCollection, GeoJsonGeometry};
 use crate::geo::footprint::{FootprintBounds, GeoPoint, Polygon, dedup_geo_ring};
 use crate::geo::geodesic::sample_geodesic_arc;
@@ -29,17 +30,6 @@ const MAX_LINE_VERTICES: usize = 1_000_000;
 /// Maximum point marker instances emitted across all clusters of a vector mesh
 /// (`500_000 * 24 B = 12 MiB`).
 const MAX_POINT_VERTICES: usize = 500_000;
-
-/// Maximum Euclidean radius (metres) for greedy spatial clustering of local
-/// features (`<= 16 km` guarantees `< 1 mm` `f32` RTC quantization error).
-const LOCAL_CLUSTER_RADIUS_M: f64 = 16_384.0;
-
-/// Spatial cell size (metres) used to partition giant features (`> 16 km`
-/// radius) into regional RTC clusters.
-const REGIONAL_CELL_SIZE_M: f64 = 262_144.0;
-
-/// Maximum number of RTC clusters per vector mesh before coarsening cell size.
-const MAX_CLUSTERS: usize = 256;
 
 /// A single RTC globe vertex for draped vector fills, lines, or point centers.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -131,13 +121,13 @@ impl VectorMesh {
 /// Intermediate `f64` ECEF primitive accumulator prior to per-cluster RTC
 /// encoding.
 #[derive(Default)]
-struct RawPrimitives {
+pub(super) struct RawPrimitives {
     /// Triangles stored as `(p0, n0, p1, n1, p2, n2)` in `f64` ECEF metres.
-    fill_tris: Vec<[(DVec3, DVec3); 3]>,
+    pub(super) fill_tris: Vec<[(DVec3, DVec3); 3]>,
     /// Line segments stored as `(p0, n0, p1, n1)` in `f64` ECEF metres.
-    line_segs: Vec<[(DVec3, DVec3); 2]>,
+    pub(super) line_segs: Vec<[(DVec3, DVec3); 2]>,
     /// Point centers stored as `(p, n)` in `f64` ECEF metres.
-    points: Vec<(DVec3, DVec3)>,
+    pub(super) points: Vec<(DVec3, DVec3)>,
 }
 
 impl RawPrimitives {
@@ -185,11 +175,11 @@ fn tessellate_geometry(
             }
         }
         GeoJsonGeometry::LineString(pts) => {
-            append_polyline(pts, false, max_chord_deg, raw);
+            append_polyline(pts, max_chord_deg, raw);
         }
         GeoJsonGeometry::MultiLineString(lines) => {
             for line in lines {
-                append_polyline(line, false, max_chord_deg, raw);
+                append_polyline(line, max_chord_deg, raw);
             }
         }
         GeoJsonGeometry::Polygon(poly) => {
@@ -203,15 +193,12 @@ fn tessellate_geometry(
     }
 }
 
-fn append_polyline(pts: &[GeoPoint], closed: bool, max_chord_deg: f64, raw: &mut RawPrimitives) {
+fn append_polyline(pts: &[GeoPoint], max_chord_deg: f64, raw: &mut RawPrimitives) {
     if pts.len() < 2 {
         return;
     }
-    let count = if closed { pts.len() } else { pts.len() - 1 };
-    for i in 0..count {
-        let a = pts[i];
-        let b = pts[(i + 1) % pts.len()];
-        let arc = sample_geodesic_arc(a, b, max_chord_deg);
+    for seg_endpoints in pts.windows(2) {
+        let arc = sample_geodesic_arc(seg_endpoints[0], seg_endpoints[1], max_chord_deg);
         for seg in arc.windows(2) {
             let p0 = WGS84.surface_ecef_and_normal(seg[0].lat, seg[0].lon);
             let p1 = WGS84.surface_ecef_and_normal(seg[1].lat, seg[1].lon);
@@ -689,183 +676,6 @@ fn emit_two_edge_split(
 }
 
 fn unit_to_surface(u: DVec3) -> (DVec3, DVec3) {
-    let u = u.normalize_or_zero();
-    let lat = u.z.clamp(-1.0, 1.0).asin().to_degrees();
-    let lon = u.y.atan2(u.x).to_degrees();
+    let (lat, lon) = geodesy::angles(u.normalize_or_zero());
     WGS84.surface_ecef_and_normal(lat, lon)
-}
-
-/// Partition `f64` ECEF primitives into spatial RTC clusters so every vertex's
-/// `f32` relative coordinate stays accurate down to `MIN_HEIGHT_M = 2.0 m`
-/// without blowing up draw-call count on continental polygons.
-fn build_rtc_clusters(raw: RawPrimitives) -> Vec<VectorCluster> {
-    if raw.fill_tris.is_empty() && raw.line_segs.is_empty() && raw.points.is_empty() {
-        return Vec::new();
-    }
-
-    // First try local `32 km` cell bucketing; if a multi-continental dataset
-    // occupies more than `MAX_CLUSTERS` cells, step up cell size so cluster
-    // count remains tightly bounded while still keeping regional RTC origins.
-    let mut cell_size = LOCAL_CLUSTER_RADIUS_M * 2.0;
-    let mut buckets: HashMap<(i32, i32, i32), RawPrimitives> = HashMap::new();
-
-    for attempt in 0..4 {
-        buckets.clear();
-        let inv_cell = 1.0 / cell_size;
-        let cell_of = |p: DVec3| {
-            (
-                (p.x * inv_cell).floor() as i32,
-                (p.y * inv_cell).floor() as i32,
-                (p.z * inv_cell).floor() as i32,
-            )
-        };
-
-        let mut overflowed = false;
-        for &tri in &raw.fill_tris {
-            let c = (tri[0].0 + tri[1].0 + tri[2].0) / 3.0;
-            let key = cell_of(c);
-            if !buckets.contains_key(&key) && buckets.len() >= MAX_CLUSTERS && attempt < 3 {
-                overflowed = true;
-                break;
-            }
-            buckets.entry(key).or_default().fill_tris.push(tri);
-        }
-        if !overflowed {
-            for &seg in &raw.line_segs {
-                let c = (seg[0].0 + seg[1].0) * 0.5;
-                let key = cell_of(c);
-                if !buckets.contains_key(&key) && buckets.len() >= MAX_CLUSTERS && attempt < 3 {
-                    overflowed = true;
-                    break;
-                }
-                buckets.entry(key).or_default().line_segs.push(seg);
-            }
-        }
-        if !overflowed {
-            for &pt in &raw.points {
-                let key = cell_of(pt.0);
-                if !buckets.contains_key(&key) && buckets.len() >= MAX_CLUSTERS && attempt < 3 {
-                    overflowed = true;
-                    break;
-                }
-                buckets.entry(key).or_default().points.push(pt);
-            }
-        }
-
-        if !overflowed {
-            break;
-        }
-        cell_size = if attempt == 0 {
-            REGIONAL_CELL_SIZE_M
-        } else {
-            cell_size * 4.0
-        };
-    }
-
-    // Deterministic cluster ordering by cell key.
-    let mut sorted_keys: Vec<(i32, i32, i32)> = buckets.keys().copied().collect();
-    sorted_keys.sort_unstable();
-
-    let mut clusters = Vec::with_capacity(sorted_keys.len());
-    for key in sorted_keys {
-        if let Some(bucket) = buckets.remove(&key) {
-            let cluster = encode_cluster(bucket);
-            if !cluster.is_empty() {
-                clusters.push(cluster);
-            }
-        }
-    }
-    clusters
-}
-
-fn encode_cluster(bucket: RawPrimitives) -> VectorCluster {
-    let mut sum = DVec3::ZERO;
-    let mut count = 0usize;
-    for tri in &bucket.fill_tris {
-        for (p, _) in tri {
-            sum += *p;
-            count += 1;
-        }
-    }
-    for seg in &bucket.line_segs {
-        for (p, _) in seg {
-            sum += *p;
-            count += 1;
-        }
-    }
-    for (p, _) in &bucket.points {
-        sum += *p;
-        count += 1;
-    }
-    let origin_ecef_m = if count > 0 {
-        sum / count as f64
-    } else {
-        DVec3::ZERO
-    };
-
-    let encode = |(p, n): (DVec3, DVec3)| -> VectorVertex {
-        let rel = p - origin_ecef_m;
-        VectorVertex {
-            rel_pos: [rel.x as f32, rel.y as f32, rel.z as f32],
-            normal: [n.x as f32, n.y as f32, n.z as f32],
-        }
-    };
-
-    let mut fill_vertices = Vec::with_capacity(bucket.fill_tris.len() * 3);
-    let mut fill_indices = Vec::with_capacity(bucket.fill_tris.len() * 3);
-    for tri in bucket.fill_tris {
-        let v0 = encode(tri[0]);
-        let v1 = encode(tri[1]);
-        let v2 = encode(tri[2]);
-        // Re-verify outward CCW winding in GPU-encoded `f32` RTC space so `f32`
-        // quantization never flips a sliver triangle against backface culling.
-        let p0 = DVec3::new(
-            f64::from(v0.rel_pos[0]),
-            f64::from(v0.rel_pos[1]),
-            f64::from(v0.rel_pos[2]),
-        );
-        let p1 = DVec3::new(
-            f64::from(v1.rel_pos[0]),
-            f64::from(v1.rel_pos[1]),
-            f64::from(v1.rel_pos[2]),
-        );
-        let p2 = DVec3::new(
-            f64::from(v2.rel_pos[0]),
-            f64::from(v2.rel_pos[1]),
-            f64::from(v2.rel_pos[2]),
-        );
-        let avg_n = tri[0].1 + tri[1].1 + tri[2].1;
-        let face_n = (p1 - p0).cross(p2 - p0);
-        if face_n.length_squared() <= 1e-12 {
-            continue;
-        }
-        let base = fill_vertices.len() as u32;
-        fill_vertices.push(v0);
-        fill_vertices.push(v1);
-        fill_vertices.push(v2);
-        if face_n.dot(avg_n) >= 0.0 {
-            fill_indices.extend_from_slice(&[base, base + 1, base + 2]);
-        } else {
-            fill_indices.extend_from_slice(&[base, base + 2, base + 1]);
-        }
-    }
-
-    let mut line_vertices = Vec::with_capacity(bucket.line_segs.len() * 2);
-    for seg in bucket.line_segs {
-        line_vertices.push(encode(seg[0]));
-        line_vertices.push(encode(seg[1]));
-    }
-
-    let mut point_vertices = Vec::with_capacity(bucket.points.len());
-    for pt in bucket.points {
-        point_vertices.push(encode(pt));
-    }
-
-    VectorCluster {
-        origin_ecef_m,
-        fill_vertices,
-        fill_indices,
-        line_vertices,
-        point_vertices,
-    }
 }

@@ -12,13 +12,15 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use super::crs::{CrsSpec, DatumWarning, Proj4Projection};
+use super::crs::CrsSpec;
+use super::datum::{Datum, DatumWarning, WGS84_DATUM};
 use super::footprint::FootprintBounds;
 use super::geodesy;
-use super::projection::{self, Datum, Projection, WGS84_DATUM};
+use super::proj4::Proj4Projection;
+use super::projection::{self, Projection};
 
 /// Web Mercator equatorial circumference in metres (`2 * pi * a`).
-const WEB_MERCATOR_WORLD_M: f64 = 2.0 * std::f64::consts::PI * geodesy::SEMI_MAJOR_M;
+const WEB_MERCATOR_WORLD_M: f64 = geodesy::EQUATORIAL_CIRCUMFERENCE_M;
 
 /// Errors returned when constructing a georeference [`Frame`].
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -145,19 +147,6 @@ impl Frame {
         frame.measurable().then_some(frame)
     }
 
-    /// Resolve `epsg` through [`Projection::from_epsg`] and build a projected
-    /// frame from a pixel-space affine transform.
-    pub fn from_epsg_pixel_affine(
-        epsg: u32,
-        pixel_affine: [f64; 6],
-        width: u32,
-        height: u32,
-    ) -> Result<Self, BindingError> {
-        let system = Projection::from_epsg(epsg).ok_or(BindingError::UnsupportedEpsg(epsg))?;
-        Self::from_pixel_affine(system, pixel_affine, width, height)
-            .ok_or(BindingError::InvalidExtent(epsg))
-    }
-
     /// Construct a frame from any [`CrsSpec`] (projected or geographic) and a
     /// pixel-space affine transform `x = a[0]*i + a[1]*j + a[2]`,
     /// `y = a[3]*i + a[4]*j + a[5]`.
@@ -179,15 +168,13 @@ impl Frame {
                 label,
                 warning,
             } => {
-                let grid = tie_grid_from_geographic_affine(pixel_affine, width, height)?;
-                let mut frame = Self::from_grid_with_datum(grid, *datum, label.clone());
-                if frame.datum_warning.is_none() {
-                    frame.datum_warning = warning.clone();
-                }
+                let grid = TieGrid::from_geographic_affine(pixel_affine, width, height)?;
+                let frame = Self::from_grid_with_datum(grid, *datum, label.clone())
+                    .with_datum_warning(warning.clone());
                 frame.measurable().then_some(frame)
             }
             CrsSpec::GeographicProj(proj) => {
-                let grid = tie_grid_from_geographic_affine(pixel_affine, width, height)?;
+                let grid = TieGrid::from_geographic_affine(pixel_affine, width, height)?;
                 let frame = Self::from_grid_with_proj(grid, Arc::clone(proj));
                 frame.measurable().then_some(frame)
             }
@@ -366,13 +353,6 @@ impl Frame {
         }
     }
 
-    /// Ground metres per horizontal pixel at native resolution.
-    #[cfg(test)]
-    pub(crate) fn ground_m_per_px(&self, width: u32) -> Option<f64> {
-        self.cached_ground_spans_m
-            .map(|(span_x, _)| span_x / f64::from(width.max(1)))
-    }
-
     /// Ground pixel size `(m_per_px_x, m_per_px_y)` at native resolution for
     /// HUD display (distinct from viewport GSD) and pyramid level selection.
     pub fn pixel_size_m(&self, width: u32, height: u32) -> Option<(f64, f64)> {
@@ -390,6 +370,41 @@ impl Frame {
             FrameKind::Grid { grid, .. } => Some(grid.widest_spans_m()),
             FrameKind::Projected { .. } => None,
         }
+    }
+
+    /// Probe a `3 x 3` grid over normalized rectangle `[fx0, fx1] x [fy0, fy1]`
+    /// in a single 9-point pass, returning the widest horizontal and vertical
+    /// great-circle arc spans in degrees.
+    pub(crate) fn probe_rect_spans_deg(
+        &self,
+        fx0: f64,
+        fx1: f64,
+        fy0: f64,
+        fy1: f64,
+    ) -> (f64, f64) {
+        let xs = [fx0, (fx0 + fx1) * 0.5, fx1];
+        let ys = [fy0, (fy0 + fy1) * 0.5, fy1];
+        let mut probes = [(0.0_f64, 0.0_f64); 9];
+        for row in 0..3 {
+            for col in 0..3 {
+                probes[row * 3 + col] = self.geodetic(xs[col], ys[row]);
+            }
+        }
+        let mut span_x = 0.0_f64;
+        for row in 0..3 {
+            let a = probes[row * 3];
+            let b = probes[row * 3 + 1];
+            let c = probes[row * 3 + 2];
+            span_x = span_x.max(geodesy::separation(a, b) + geodesy::separation(b, c));
+        }
+        let mut span_y = 0.0_f64;
+        for col in 0..3 {
+            let a = probes[col];
+            let b = probes[3 + col];
+            let c = probes[6 + col];
+            span_y = span_y.max(geodesy::separation(a, b) + geodesy::separation(b, c));
+        }
+        (span_x, span_y)
     }
 
     fn compute_ground_spans_m(&self) -> (f64, f64) {
@@ -422,8 +437,9 @@ impl Frame {
                 let unit = proj.unit_to_metres();
                 let nominal_x = affine[0].hypot(affine[3]) * unit;
                 let nominal_y = affine[1].hypot(affine[4]) * unit;
-                let probed_x = self.probe_grid_span(|s, t| (s, t));
-                let probed_y = self.probe_grid_span(|s, t| (t, s));
+                let (deg_x, deg_y) = self.probe_rect_spans_deg(0.0, 1.0, 0.0, 1.0);
+                let probed_x = deg_x.to_radians() * geodesy::SEMI_MAJOR_M;
+                let probed_y = deg_y.to_radians() * geodesy::SEMI_MAJOR_M;
                 (
                     if probed_x > 0.0 { probed_x } else { nominal_x },
                     if probed_y > 0.0 { probed_y } else { nominal_y },
@@ -431,26 +447,12 @@ impl Frame {
             }
             FrameKind::Grid { grid, .. } => {
                 let (widest_x, widest_y) = grid.widest_spans_m();
-                let probed_x = self.probe_grid_span(|s, t| (s, t));
-                let probed_y = self.probe_grid_span(|s, t| (t, s));
+                let (deg_x, deg_y) = self.probe_rect_spans_deg(0.0, 1.0, 0.0, 1.0);
+                let probed_x = deg_x.to_radians() * geodesy::SEMI_MAJOR_M;
+                let probed_y = deg_y.to_radians() * geodesy::SEMI_MAJOR_M;
                 (probed_x.max(widest_x), probed_y.max(widest_y))
             }
         }
-    }
-
-    fn probe_grid_span(&self, coords: impl Fn(f64, f64) -> (f64, f64)) -> f64 {
-        [0.0, 0.5, 1.0]
-            .into_iter()
-            .map(|fixed| {
-                let (ax, ay) = coords(0.0, fixed);
-                let (bx, by) = coords(0.5, fixed);
-                let (cx, cy) = coords(1.0, fixed);
-                let a = self.geodetic(ax, ay);
-                let b = self.geodetic(bx, by);
-                let c = self.geodetic(cx, cy);
-                geodesic_span_m(a, b) + geodesic_span_m(b, c)
-            })
-            .fold(0.0, f64::max)
     }
 
     /// Whether rows follow parallels and columns follow meridians (enabling
@@ -570,117 +572,6 @@ impl Frame {
             radius_deg,
         })
     }
-}
-
-fn geodesic_span_m(from: (f64, f64), to: (f64, f64)) -> f64 {
-    geodesy::separation(from, to).to_radians() * geodesy::SEMI_MAJOR_M
-}
-
-fn snap_deg_bound(v: f64, limit: f64) -> f64 {
-    const EPS_DEG: f64 = 1e-6;
-    if v > limit && v <= limit + EPS_DEG {
-        limit
-    } else if v < -limit && v >= -limit - EPS_DEG {
-        -limit
-    } else {
-        v
-    }
-}
-
-fn tie_grid_from_geographic_affine(
-    pixel_affine: [f64; 6],
-    width: u32,
-    height: u32,
-) -> Option<TieGrid> {
-    const EPS_DEG: f64 = 1e-6;
-
-    let w = f64::from(width);
-    let h = f64::from(height);
-    let eval = |i: f64, j: f64| {
-        let lon = pixel_affine[0] * i + pixel_affine[1] * j + pixel_affine[2];
-        let lat = pixel_affine[3] * i + pixel_affine[4] * j + pixel_affine[5];
-        (lat, lon)
-    };
-    // Sample ties at outer pixel centers whenever an axis has `> 1` pixel so
-    // `PixelIsPoint` and world-file rasters whose outer pixel centers sit on
-    // `±90°` or `[0°, 360°]` stay exact (`0.0°` pixel-center error) while
-    // `TieGrid::geodetic` linearly extrapolates outer half-pixel edges (and
-    // clamps pole overshoot cleanly without compressing interior rows).
-    let (px0, px1) = if width > 1 { (0.5, w - 0.5) } else { (0.0, w) };
-    let (py0, py1) = if height > 1 { (0.5, h - 0.5) } else { (0.0, h) };
-
-    let corners = [
-        eval(px0, py0),
-        eval(px1, py0),
-        eval(px0, py1),
-        eval(px1, py1),
-    ];
-    let lat_limit = if height > 1 {
-        90.0 + EPS_DEG
-    } else {
-        90.0 + ((pixel_affine[3].abs() + pixel_affine[4].abs()) * 0.501).clamp(EPS_DEG, 2.0)
-    };
-    let lon_limit = if width > 1 {
-        360.0 + EPS_DEG
-    } else {
-        360.0 + ((pixel_affine[0].abs() + pixel_affine[1].abs()) * 0.501).clamp(EPS_DEG, 2.0)
-    };
-    if !corners.iter().all(|(lat, lon)| {
-        lat.is_finite() && lon.is_finite() && lat.abs() <= lat_limit && lon.abs() <= lon_limit
-    }) {
-        return None;
-    }
-
-    let dlon_x = (corners[1].1 - corners[0].1)
-        .abs()
-        .max((corners[3].1 - corners[2].1).abs());
-    let dlon_y = (corners[2].1 - corners[0].1)
-        .abs()
-        .max((corners[3].1 - corners[1].1).abs());
-    if !dlon_x.is_finite() || !dlon_y.is_finite() || dlon_x > 720.0 || dlon_y > 720.0 {
-        return None;
-    }
-
-    let cols = if dlon_x > 170.0 {
-        (dlon_x / 90.0).ceil().max(2.0) as usize
-    } else {
-        1
-    };
-    let rows = if dlon_y > 170.0 {
-        (dlon_y / 90.0).ceil().max(2.0) as usize
-    } else {
-        1
-    };
-    let mut ties = Vec::with_capacity((cols + 1) * (rows + 1));
-    for r in 0..=rows {
-        let py = if r == rows {
-            py1
-        } else {
-            py0 + (py1 - py0) * (r as f64 / rows as f64)
-        };
-        let fy = py / h;
-        for c in 0..=cols {
-            let px = if c == cols {
-                px1
-            } else {
-                px0 + (px1 - px0) * (c as f64 / cols as f64)
-            };
-            let fx = px / w;
-            let (raw_lat, raw_lon) = eval(px, py);
-            let lat = if height > 1 {
-                snap_deg_bound(raw_lat, 90.0)
-            } else {
-                raw_lat.clamp(-90.0, 90.0)
-            };
-            let lon = if width > 1 {
-                snap_deg_bound(raw_lon, 360.0)
-            } else {
-                raw_lon.clamp(-360.0, 360.0)
-            };
-            ties.push(Tie { fx, fy, lat, lon });
-        }
-    }
-    TieGrid::new(&ties)
 }
 
 #[cfg(test)]

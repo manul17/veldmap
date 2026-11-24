@@ -412,7 +412,7 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
 
 #[test]
 fn draped_geojson_polygon_with_hole_renders_fill_and_excludes_hole_in_pass2() {
-    use veldmap_app::render::DrawVectorLayer;
+    use veldmap_app::render::{DrawVectorId, DrawVectorLayer};
     use veldmap_core::geo::{DEFAULT_VECTOR_MAX_CHORD_DEG, VectorMesh, parse_geojson};
 
     let Some((device, queue)) = shared_headless_device() else {
@@ -455,7 +455,7 @@ fn draped_geojson_polygon_with_hole_renders_fill_and_excludes_hole_in_pass2() {
 
     let mut snap = build_empty_snapshot(cam, width, height, &config);
     snap.vectors.push(DrawVectorLayer {
-        id: 1,
+        id: DrawVectorId::Layer(1),
         rev: 1,
         opacity: 1.0,
         fill_color: [1.0, 0.0, 0.0, 0.9],
@@ -482,7 +482,7 @@ fn draped_geojson_polygon_with_hole_renders_fill_and_excludes_hole_in_pass2() {
 
 #[test]
 fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
-    use veldmap_app::render::DrawVectorLayer;
+    use veldmap_app::render::{DrawVectorId, DrawVectorLayer};
     use veldmap_core::geo::{DEFAULT_VECTOR_MAX_CHORD_DEG, VectorMesh, parse_geojson};
 
     let Some((device, queue)) = shared_headless_device() else {
@@ -513,7 +513,7 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
 
     let mut snap = build_empty_snapshot(cam, width, height, &config);
     snap.vectors.push(DrawVectorLayer {
-        id: 7,
+        id: DrawVectorId::Layer(7),
         rev: 1,
         opacity: 1.0,
         fill_color: [0.0, 0.0, 1.0, 0.3],
@@ -533,7 +533,7 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
     let close_cam = Camera::at(48.0, 40.0, 10_000.0);
     let mut close_snap = build_empty_snapshot(close_cam, width, height, &config);
     close_snap.vectors.push(DrawVectorLayer {
-        id: 7,
+        id: DrawVectorId::Layer(7),
         rev: 1,
         opacity: 1.0,
         fill_color: [0.0, 0.0, 1.0, 0.3],
@@ -557,7 +557,7 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
 
 #[test]
 fn draped_geojson_linestring_respects_layer_opacity_in_pass2() {
-    use veldmap_app::render::DrawVectorLayer;
+    use veldmap_app::render::{DrawVectorId, DrawVectorLayer};
     use veldmap_core::geo::{DEFAULT_VECTOR_MAX_CHORD_DEG, VectorMesh, parse_geojson};
 
     let Some((device, queue)) = shared_headless_device() else {
@@ -597,7 +597,7 @@ fn draped_geojson_linestring_respects_layer_opacity_in_pass2() {
 
     let mut full_snap = build_empty_snapshot(cam, width, height, &config);
     full_snap.vectors.push(DrawVectorLayer {
-        id: 9,
+        id: DrawVectorId::Layer(9),
         rev: 1,
         opacity: 1.0,
         fill_color: [0.0, 0.0, 0.0, 0.0],
@@ -615,7 +615,7 @@ fn draped_geojson_linestring_respects_layer_opacity_in_pass2() {
 
     let mut half_snap = build_empty_snapshot(cam, width, height, &config);
     half_snap.vectors.push(DrawVectorLayer {
-        id: 9,
+        id: DrawVectorId::Layer(9),
         rev: 1,
         opacity: 0.35,
         fill_color: [0.0, 0.0, 0.0, 0.0],

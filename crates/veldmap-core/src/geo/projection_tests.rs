@@ -1,4 +1,7 @@
+use glam::DVec3;
+
 use super::*;
+use crate::geo::geodesy::{Geodetic, WGS84};
 
 #[test]
 fn web_mercator_world_is_square() {
@@ -119,127 +122,6 @@ fn system_origin_latitude_and_linear_units_round_trip() {
     let (e_ft, n_ft) = sys_ft.from_geodetic(39.5, -74.2);
     let back_ft = sys_ft.to_geodetic(e_ft, n_ft);
     assert!(ground_m(back_ft, (39.5, -74.2)) < 1e-4);
-}
-
-#[test]
-fn proj4_epsg_and_wkt_round_trip_and_warn_on_grid_datums() {
-    use super::super::crs::{CrsSpec, DatumWarning, search_crs_presets};
-
-    // EPSG:3035 (ETRS89 / LAEA Europe)
-    let laea = Projection::from_epsg(3035).expect("EPSG:3035");
-    let (x, y) = laea.from_geodetic(52.52, 13.405);
-    let back = laea.to_geodetic(x, y);
-    assert!(ground_m(back, (52.52, 13.405)) < 0.05);
-
-    // EPSG:3413 (WGS84 / Polar Stereographic North)
-    let polar = Projection::from_epsg(3413).expect("EPSG:3413");
-    let (px, py) = polar.from_geodetic(78.22, 15.63);
-    let pback = polar.to_geodetic(px, py);
-    assert!(ground_m(pback, (78.22, 15.63)) < 0.05);
-
-    // WKT1 Lambert Conformal Conic (NAD83 Massachusetts)
-    let wkt1 = concat!(
-        r#"PROJCS["NAD83 / Massachusetts Mainland",GEOGCS["NAD83","#,
-        r#"DATUM["North_American_Datum_1983",SPHEROID["GRS 1980",6378137,298.257222101,"#,
-        r#"AUTHORITY["EPSG","7019"]],AUTHORITY["EPSG","6269"]],PRIMEM["Greenwich",0,"#,
-        r#"AUTHORITY["EPSG","8901"]],UNIT["degree",0.01745329251994328,"#,
-        r#"AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4269"]],UNIT["metre",1,"#,
-        r#"AUTHORITY["EPSG","9001"]],PROJECTION["Lambert_Conformal_Conic_2SP"],"#,
-        r#"PARAMETER["standard_parallel_1",42.68333333333333],"#,
-        r#"PARAMETER["standard_parallel_2",41.71666666666667],"#,
-        r#"PARAMETER["latitude_of_origin",41],PARAMETER["central_meridian",-71.5],"#,
-        r#"PARAMETER["false_easting",200000],PARAMETER["false_northing",750000],"#,
-        r#"AUTHORITY["EPSG","26986"]]"#,
-    );
-    let spec = CrsSpec::from_wkt(wkt1).expect("WKT1 LCC");
-    assert!(matches!(
-        spec.datum_warning(),
-        Some(DatumWarning::GridShiftRecommended { .. })
-    ));
-    let CrsSpec::Projected(lcc) = spec else {
-        panic!("expected projected CRS");
-    };
-    let (lx, ly) = lcc.from_geodetic(42.36, -71.06);
-    let lback = lcc.to_geodetic(lx, ly);
-    assert!(ground_m(lback, (42.36, -71.06)) < 0.05);
-
-    // Searchable presets find both curated (`32637`) and non-curated catalog (`26911`) EPSG codes.
-    let hits = search_crs_presets("32637", 10);
-    assert!(hits.iter().any(|p| p.epsg == 32637));
-    let catalog_hits = search_crs_presets("26911", 10);
-    assert!(
-        catalog_hits
-            .iter()
-            .any(|p| p.epsg == 26911 && p.category == "EPSG Catalog")
-    );
-}
-
-#[test]
-fn crs_guards_geocentric_nad27_sphere_foreign_ellipsoids_and_named_custom_tm() {
-    use super::super::crs::{CrsSpec, CustomTmParams, DatumWarning, Proj4Projection};
-
-    // 3D geocentric CRS (+proj=geocent) must be rejected as a 2D map CRS.
-    assert!(CrsSpec::from_epsg(4978).is_err());
-    assert!(Proj4Projection::from_proj_string("+proj=geocent +datum=WGS84", None).is_err());
-
-    // NAD27 (missing NADCON grids) must construct via fallback Helmert + GridShiftRecommended.
-    let nad27 = CrsSpec::from_epsg(26710).expect("NAD27 UTM 10N fallback");
-    assert!(matches!(
-        nad27.datum_warning(),
-        Some(DatumWarning::GridShiftRecommended { .. })
-    ));
-    let CrsSpec::Projected(nad27_proj) = nad27 else {
-        panic!("expected projected NAD27 CRS");
-    };
-    let (e, n) = nad27_proj.from_geodetic(37.7749, -122.4194);
-    let back = nad27_proj.to_geodetic(e, n);
-    assert!(ground_m(back, (37.7749, -122.4194)) < 1.0);
-
-    // ETRS89 / RGF93 plate-fixed presets emit GridShiftRecommended consistently with EPSG:4258.
-    for code in [3035, 25832, 2154] {
-        let spec = CrsSpec::from_epsg(code).expect("ETRS89/RGF93 CRS");
-        assert!(
-            matches!(
-                spec.datum_warning(),
-                Some(DatumWarning::GridShiftRecommended { .. })
-            ),
-            "EPSG:{code} should emit GridShiftRecommended"
-        );
-    }
-
-    // Foreign ellipsoid without +towgs84= or +datum= must warn (not just +ellps=krass).
-    let bessel = Proj4Projection::from_proj_string("+proj=utm +zone=32 +ellps=bessel", None)
-        .expect("bessel UTM");
-    assert!(matches!(
-        bessel.datum_warning(),
-        Some(DatumWarning::UnshiftedForeignDatum { .. })
-    ));
-
-    // EPSG:4055 (Popular Visualisation Sphere) must NOT be mislabeled WGS 84.
-    let sphere = CrsSpec::from_epsg(4055).expect("EPSG:4055");
-    assert!(!sphere.label().contains("WGS 84"));
-
-    // CustomTmParams::to_projection preserves user-supplied name in label().
-    let params = CustomTmParams {
-        name: "MSK-77 Test".to_string(),
-        ..CustomTmParams::default()
-    };
-    let proj = params.to_projection().expect("valid custom TM");
-    assert_eq!(proj.label(), "MSK-77 Test");
-
-    // In-house GK and MSK-61 labels are recognized without requiring a manual name.
-    assert!(
-        Projection::from_epsg(28407)
-            .expect("GK 7")
-            .label()
-            .contains("28407")
-    );
-    assert!(
-        Projection::from_epsg(6_336_101)
-            .expect("MSK-61 z1")
-            .label()
-            .contains("MSK-61")
-    );
 }
 
 fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {

@@ -10,16 +10,15 @@ mod georef;
 mod open;
 mod stretch;
 mod tags;
+mod ycbcr;
 
-use veldmap_core::tile::{
-    BandKey, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, SourceId, TileStreamSpec,
-};
+use veldmap_core::tile::{RASTER_TILE_SIZE, SourceFingerprint, SourceId};
 
 use crate::RasterError;
 use crate::pipeline::driver::{self, Chunked as _, DirectRead};
 use crate::pipeline::grid::{Grid, chunk_working_bytes};
 use crate::pipeline::metadata::{RasterDescription, SampleType};
-use crate::pipeline::plan::PyramidMeta;
+use crate::pipeline::plan::{DISPLAY_STREAM_SPEC, PyramidMeta};
 use crate::pipeline::radiometry::{DisplayMapping, PixelLayout};
 use crate::pipeline::{DecodeContext, RasterSource, TileEmit};
 
@@ -41,24 +40,6 @@ const MAX_CURSOR_CHUNK_RGBA_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum number of IFD directories scanned during `open` to guard against
 /// malformed or pathological multi-IFD files.
 pub const MAX_IFDS: usize = 64;
-
-/// Maximum raster side dimension accepted for untiled/stripped TIFF sources.
-///
-/// Tiled TIFFs/COGs may exceed this limit provided their chunk grid and at
-/// least one pyramid level fit within [`veldmap_core::budget::MemoryBudget`].
-pub const MAX_SOURCE_SIDE: u32 = 65_536;
-
-/// Current display decode revision encoded into `TileKey` and `ChunkKey`.
-const TIFF_DECODE_REV: u32 = 1;
-
-/// Canonical display stream spec shared across [`RasterSource::pyramid_meta`]
-/// and [`TiffChunkReader`].
-pub(super) const DISPLAY_STREAM_SPEC: TileStreamSpec = TileStreamSpec::new(
-    BandKey::Display,
-    PixelFormat::Rgba8UnormSrgb,
-    0,
-    TIFF_DECODE_REV,
-);
 
 /// Return whether `head` begins with a classic TIFF or BigTIFF signature.
 pub fn has_tiff_magic(head: &[u8]) -> bool {
@@ -87,7 +68,7 @@ pub struct TiffSource {
     description: RasterDescription,
     grid: Grid,
     format: TiffFormat,
-    ifd_ycbcr: Vec<(usize, tags::YCbCrParams)>,
+    ifd_ycbcr: Vec<(usize, ycbcr::YCbCrParams)>,
     stats_ifd: usize,
     stretch: StretchCache,
 }

@@ -102,6 +102,16 @@ pub fn polyline_length_m(points: &[GeoPoint]) -> f64 {
         .sum()
 }
 
+fn compute_ring_polygon_area(pts: &[GeoPoint]) -> (f64, f64) {
+    let g = Geodesic::wgs84();
+    let mut pa = PolygonArea::new(&g, Winding::CounterClockwise);
+    for p in pts {
+        pa.add_point(p.lat, p.lon);
+    }
+    let (perimeter_m, signed_area_m2, _) = pa.compute(true);
+    (perimeter_m, signed_area_m2)
+}
+
 /// Exact WGS84 ellipsoidal perimeter (m) and unsigned area (m²) of a closed
 /// ring (automatically tolerating either clockwise or counter-clockwise winding
 /// and optional duplicate closing vertex).
@@ -113,12 +123,7 @@ pub fn ring_perimeter_and_area(ring: &[GeoPoint]) -> GeodesicPolygonMeasurement 
             area_m2: 0.0,
         };
     }
-    let g = Geodesic::wgs84();
-    let mut pa = PolygonArea::new(&g, Winding::CounterClockwise);
-    for p in &pts {
-        pa.add_point(p.lat, p.lon);
-    }
-    let (perimeter_m, signed_area_m2, _) = pa.compute(true);
+    let (perimeter_m, signed_area_m2) = compute_ring_polygon_area(&pts);
     GeodesicPolygonMeasurement {
         perimeter_m: if perimeter_m.is_finite() {
             perimeter_m.max(0.0)
@@ -140,12 +145,7 @@ pub fn ring_signed_area_m2(ring: &[GeoPoint]) -> f64 {
     if pts.len() < 3 {
         return 0.0;
     }
-    let g = Geodesic::wgs84();
-    let mut pa = PolygonArea::new(&g, Winding::CounterClockwise);
-    for p in &pts {
-        pa.add_point(p.lat, p.lon);
-    }
-    let (_, signed_area_m2, _) = pa.compute(true);
+    let (_, signed_area_m2) = compute_ring_polygon_area(&pts);
     if signed_area_m2.is_finite() {
         signed_area_m2
     } else {

@@ -90,7 +90,7 @@ fn write_tiled_geotiff_cog(path: &Path, width: u32, height: u32, rgb: [u8; 3]) {
 fn wait_for_io_event(mgr: &mut OverlayManager) -> OverlayIoEvent {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        let (events, _mut, _vecs) = mgr.poll_io_events();
+        let (events, _mut) = mgr.poll_io_events();
         if let Some(ev) = events.into_iter().next() {
             return ev;
         }

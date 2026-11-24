@@ -20,7 +20,7 @@ mod viewport;
 pub use globe::GlobeRenderer;
 pub use overlay::OverlayMeshKey;
 pub use snapshot::{
-    DrawOverlayLayer, DrawOverlayPatch, DrawSnapshot, DrawTile, DrawVectorLayer,
+    DrawOverlayLayer, DrawOverlayPatch, DrawSnapshot, DrawTile, DrawVectorId, DrawVectorLayer,
     SnapshotBuildParams, TileCarrierPolicy,
 };
 pub use viewport::RenderParams;
