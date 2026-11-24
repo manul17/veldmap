@@ -4,6 +4,7 @@
 //! Raw GeoTIFF binary tag parsing (`GeoKeyDirectoryTag` / `34735`–`34737`)
 //! lives in `crate::tiff::georef`.
 
+use veldmap_core::geo::{CrsSpec, DatumWarning};
 use veldmap_core::tile::{BandKey, PixelFormat};
 
 use super::plan::LevelPlan;
@@ -144,11 +145,18 @@ impl GeoKeyParams {
     }
 }
 
-/// Projected raster binding: optional EPSG code, pixel-to-CRS affine transform,
-/// and optional parsed GeoKey parameters (present for GeoTIFF sources).
+/// Projected or affine-georeferenced raster binding: optional EPSG code,
+/// optional custom/WKT CRS specification, pixel-to-CRS affine transform, and
+/// optional parsed GeoKey parameters (present for GeoTIFF sources).
 #[derive(Clone, Debug, PartialEq)]
 pub struct GeoPlacement {
     pub epsg: Option<u32>,
+    /// Resolved CRS from user-defined GeoTIFF GeoKeys (`3072 == 32767`),
+    /// `.prj` WKT1/WKT2 sidecars, or an explicit user override.
+    pub custom_crs: Option<CrsSpec>,
+    /// Optional datum warning attached to a user-defined projected CRS (e.g.
+    /// grid-shifted NAD83/OSGB36 on a user-defined TM GeoTIFF).
+    pub datum_warning: Option<DatumWarning>,
     /// `x = a[0] * i + a[1] * j + a[2]`, `y = a[3] * i + a[4] * j + a[5]`,
     /// where `(i, j)` are pixel top-left corner coordinates (`j` increasing
     /// southward, with `PixelIsPoint` half-pixel shift already removed).

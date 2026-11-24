@@ -14,13 +14,14 @@ mod overlay;
 mod pipelines;
 mod snapshot;
 mod uniforms;
+mod vector;
 mod viewport;
 
 pub use globe::GlobeRenderer;
 pub use overlay::OverlayMeshKey;
 pub use snapshot::{
-    DrawOverlayLayer, DrawOverlayPatch, DrawSnapshot, DrawTile, SnapshotBuildParams,
-    TileCarrierPolicy,
+    DrawOverlayLayer, DrawOverlayPatch, DrawSnapshot, DrawTile, DrawVectorLayer,
+    SnapshotBuildParams, TileCarrierPolicy,
 };
 pub use viewport::RenderParams;
 
@@ -73,6 +74,8 @@ fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
 pub const GLOBE_WGSL: &str = include_str!("../shaders/globe.wgsl");
 /// Embedded WGSL source for depth-less post-body raster overlay warp meshes.
 pub const OVERLAY_WGSL: &str = include_str!("../shaders/overlay.wgsl");
+/// Embedded WGSL source for depth-less post-body draped vector geometry.
+pub const VECTOR_WGSL: &str = include_str!("../shaders/vector.wgsl");
 /// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.
 pub const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
 

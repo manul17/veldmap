@@ -68,8 +68,8 @@ fn a_raster_lands_where_its_binding_puts_it() {
         -gsd * cos_a,
         5_230_000.0,
     ];
-    let rotated_frame =
-        Frame::from_pixel_affine(utm37, rotated_affine, 8_000, 5_000).expect("rotated frame");
+    let rotated_frame = Frame::from_pixel_affine(utm37.clone(), rotated_affine, 8_000, 5_000)
+        .expect("rotated frame");
 
     // WebMercator axial benchmark (~10 m/px around 45N).
     let (wm_x0, wm_y0) = Projection::WebMercator.from_geodetic(45.0, 39.0);
@@ -81,8 +81,14 @@ fn a_raster_lands_where_its_binding_puts_it() {
         // 1. Drone orthophoto at 2 cm/px (UTM 37N)
         Case {
             name: "utm37_drone_2cm",
-            frame: Frame::projected_bounds(utm37, 550_000.0, 5_230_000.0, 550_200.0, 5_230_200.0)
-                .expect("drone"),
+            frame: Frame::projected_bounds(
+                utm37.clone(),
+                550_000.0,
+                5_230_000.0,
+                550_200.0,
+                5_230_200.0,
+            )
+            .expect("drone"),
             width: 10_000,
             height: 10_000,
             level: 0,
@@ -92,8 +98,14 @@ fn a_raster_lands_where_its_binding_puts_it() {
         // 2. Sentinel-2 granule at 10 m/px (UTM 37N near zone edge)
         Case {
             name: "utm37_sentinel2_10m",
-            frame: Frame::projected_bounds(utm37, 600_000.0, 5_200_000.0, 709_800.0, 5_309_800.0)
-                .expect("s2"),
+            frame: Frame::projected_bounds(
+                utm37.clone(),
+                600_000.0,
+                5_200_000.0,
+                709_800.0,
+                5_309_800.0,
+            )
+            .expect("s2"),
             width: 10_980,
             height: 10_980,
             level: 0,
@@ -103,8 +115,14 @@ fn a_raster_lands_where_its_binding_puts_it() {
         // 3. Landsat scene at 30 m/px (UTM 37N)
         Case {
             name: "utm37_landsat_30m",
-            frame: Frame::projected_bounds(utm37, 450_000.0, 5_100_000.0, 681_000.0, 5_331_000.0)
-                .expect("landsat"),
+            frame: Frame::projected_bounds(
+                utm37.clone(),
+                450_000.0,
+                5_100_000.0,
+                681_000.0,
+                5_331_000.0,
+            )
+            .expect("landsat"),
             width: 7_700,
             height: 7_700,
             level: 0,
@@ -209,7 +227,7 @@ fn negative_determinant_and_south_up_affines_wind_outward_and_emit_outward_norma
     let cell = [0.0, 0.0, 512.0, 512.0];
 
     let north_up = Frame::from_pixel_affine(
-        utm37,
+        utm37.clone(),
         [10.0, 0.0, 500_000.0, 0.0, -10.0, 5_250_000.0],
         512,
         512,
@@ -219,7 +237,7 @@ fn negative_determinant_and_south_up_affines_wind_outward_and_emit_outward_norma
     assert!(!patch_normal.flip_winding);
 
     let south_up = Frame::from_pixel_affine(
-        utm37,
+        utm37.clone(),
         [10.0, 0.0, 500_000.0, 0.0, 10.0, 5_240_000.0],
         512,
         512,

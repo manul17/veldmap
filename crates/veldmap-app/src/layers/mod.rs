@@ -11,6 +11,7 @@ mod opener;
 mod qoi_cache;
 mod runtime;
 mod stack;
+pub(crate) mod vectors;
 
 use std::path::PathBuf;
 
@@ -20,6 +21,7 @@ use veldmap_core::tile::RASTER_TILE_SIZE;
 use crate::gpu_tiles::display_tile_mip_bytes;
 
 pub(crate) use manager::{OverlayFrameCtx, OverlayManager, OverlayMutation};
+pub(crate) use vectors::{VectorLayerId, VectorLayerStack, VectorLayerSummary, is_geojson_path};
 
 /// Default unpacked VRAM byte weight for an 8-bit `512 x 512` display tile
 /// with full linear-light mip chain (`~1.33 MiB`), matching `BasemapManager`.
@@ -46,6 +48,15 @@ pub(crate) struct LayerSummary {
     pub(crate) in_flight: usize,
     pub(crate) pass_active: bool,
     pub(crate) reloading: bool,
+    pub(crate) crs_label: String,
+    pub(crate) datum_warning: Option<String>,
+    pub(crate) sample_info: String,
+    pub(crate) detail_limit_level: u8,
+    pub(crate) can_override_crs: bool,
+    pub(crate) has_crs_override: bool,
+    pub(crate) last_error: Option<String>,
+    pub(crate) can_move_up: bool,
+    pub(crate) can_move_down: bool,
 }
 
 /// Classified value returned by a zoom-invariant CPU cursor probe so decode

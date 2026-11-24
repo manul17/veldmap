@@ -210,6 +210,19 @@ impl Camera {
         self.settle();
     }
 
+    /// Rotate the camera heading clockwise around the nadir normal by
+    /// `delta_rad` radians (positive values rotate the top of the viewport
+    /// clockwise relative to North, increasing [`Self::heading_deg`]).
+    pub fn rotate_heading(&mut self, delta_rad: f64) {
+        if !delta_rad.is_finite() || delta_rad == 0.0 {
+            return;
+        }
+        self.flight = None;
+        let spin = DQuat::from_axis_angle(self.at, -delta_rad);
+        self.up = spin * self.up;
+        self.settle();
+    }
+
     /// Zoom by `steps` scroll notches while holding the point under
     /// `(hold_x, hold_y)` (offset from viewport center in fractions of
     /// viewport height; positive `hold_y` is downward).
@@ -309,11 +322,24 @@ impl Camera {
 
     /// Start a smooth North-up flight to `(lat_deg, lon_deg)` at `height_m`.
     pub fn fly_to(&mut self, lat_deg: f64, lon_deg: f64, height_m: f64) {
-        if !(lat_deg.is_finite() && lon_deg.is_finite() && height_m.is_finite()) {
+        self.fly_to_pose(lat_deg, lon_deg, height_m, 0.0);
+    }
+
+    /// Start a smooth flight to `(lat_deg, lon_deg)` at `height_m` with
+    /// clockwise heading `heading_deg` degrees from North.
+    pub fn fly_to_pose(&mut self, lat_deg: f64, lon_deg: f64, height_m: f64, heading_deg: f64) {
+        if !(lat_deg.is_finite()
+            && lon_deg.is_finite()
+            && height_m.is_finite()
+            && heading_deg.is_finite())
+        {
             return;
         }
         let at = geodesy::unit(lat_deg.clamp(-90.0, 90.0), lon_deg);
-        let up = frame_up(at, self.up);
+        let mut up = frame_up(at, self.up);
+        if heading_deg.abs() > 1e-12 {
+            up = DQuat::from_axis_angle(at, -heading_deg.to_radians()) * up;
+        }
         let height_m = height_m.clamp(HEIGHT_RANGE_M.0, HEIGHT_RANGE_M.1);
         let to = orientation(at, up);
 

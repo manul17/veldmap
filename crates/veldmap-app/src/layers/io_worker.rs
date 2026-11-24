@@ -10,6 +10,8 @@ use veldmap_core::geo::Frame;
 use veldmap_core::sync::CancelToken;
 use veldmap_raster::RasterSource;
 
+use crate::session::SavedCrsOverride;
+
 use super::LayerId;
 use super::opener::open_local_raster;
 use super::runtime::OverlayRuntime;
@@ -19,6 +21,9 @@ pub(super) enum OverlayIoCmd {
     Open {
         path: PathBuf,
         fly_to: bool,
+        visible: bool,
+        opacity: f32,
+        crs_override: Option<SavedCrsOverride>,
         cancel: CancelToken,
     },
     Reload {
@@ -26,6 +31,7 @@ pub(super) enum OverlayIoCmd {
         reload_seq: u64,
         path: PathBuf,
         old_fingerprint_hex: String,
+        crs_override: Option<SavedCrsOverride>,
         cancel: CancelToken,
     },
 }
@@ -35,6 +41,9 @@ pub(super) enum OverlayIoResult {
     Opened {
         path: PathBuf,
         fly_to: bool,
+        visible: bool,
+        opacity: f32,
+        crs_override: Option<SavedCrsOverride>,
         outcome: Result<(Arc<dyn RasterSource>, Frame), String>,
     },
     Reloaded {
@@ -50,6 +59,9 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
         OverlayIoCmd::Open {
             path,
             fly_to,
+            visible,
+            opacity,
+            crs_override,
             cancel,
         } => {
             if cancel.is_cancelled() {
@@ -60,6 +72,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
                 &runtime.fingerprint_cache,
                 &runtime.budget,
                 false,
+                crs_override.as_ref(),
                 &cancel,
             );
             if cancel.is_cancelled() {
@@ -68,6 +81,9 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             let _ = res_tx.send(OverlayIoResult::Opened {
                 path,
                 fly_to,
+                visible,
+                opacity,
+                crs_override,
                 outcome,
             });
             (runtime.wakeup)();
@@ -77,6 +93,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             reload_seq,
             path,
             old_fingerprint_hex,
+            crs_override,
             cancel,
         } => {
             if cancel.is_cancelled() {
@@ -88,6 +105,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
                 &runtime.fingerprint_cache,
                 &runtime.budget,
                 true,
+                crs_override.as_ref(),
                 &cancel,
             );
             if cancel.is_cancelled() {

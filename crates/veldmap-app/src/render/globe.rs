@@ -17,6 +17,7 @@ use super::overlay::OverlayRenderer;
 use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
 use super::uniforms::{CameraUniform, TileUniform};
+use super::vector::VectorRenderer;
 use super::viewport::{RenderParams, ViewportState};
 
 /// Standalone offscreen `wgpu` WGS84 quadtree globe renderer.
@@ -27,6 +28,8 @@ pub struct GlobeRenderer {
     meshes: TileMeshCache,
     /// Extracted post-body warp-mesh overlay renderer.
     overlay: OverlayRenderer,
+    /// Post-body draped vector geometry renderer (GeoJSON + measurements).
+    vector: VectorRenderer,
     /// `Weak<GpuTile>`-guarded texture `BindGroup` cache (`Rgba8UnormSrgb`).
     tile_bind_groups: TileBindGroupCache,
     /// Per-frame dynamic uniform byte offsets for `snapshot.tiles`.
@@ -41,12 +44,14 @@ impl GlobeRenderer {
         let pipelines = GlobePipelines::new(device, target_format);
         let meshes = TileMeshCache::new(device);
         let overlay = OverlayRenderer::new();
+        let vector = VectorRenderer::new();
         let viewport = ViewportState::new(device, target_format, &pipelines);
 
         Self {
             pipelines,
             meshes,
             overlay,
+            vector,
             tile_bind_groups: TileBindGroupCache::default(),
             tile_uniform_offsets: Vec::new(),
             viewport,
@@ -124,6 +129,7 @@ impl GlobeRenderer {
             &mut self.tile_bind_groups,
             snapshot,
         );
+        self.vector.prepare_resources(device, snapshot);
     }
 
     fn upload_uniforms(
@@ -175,6 +181,7 @@ impl GlobeRenderer {
         }
 
         self.overlay.push_uniforms(arena, snapshot, eye);
+        self.vector.push_uniforms(arena, snapshot);
 
         arena.flush(device, queue);
     }
@@ -281,10 +288,11 @@ impl GlobeRenderer {
         }
 
         // Pass 2: Depth-less (`depth_stencil_attachment: None`, `LoadOp::Load`)
-        // post-body raster overlays + procedural `fwidth()` graticule.
-        if !snapshot.overlays.is_empty() || snapshot.show_graticule {
+        // post-body raster overlays + draped vector layers + procedural `fwidth()` graticule.
+        if !snapshot.overlays.is_empty() || !snapshot.vectors.is_empty() || snapshot.show_graticule
+        {
             let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("globe post-body overlay & graticule pass"),
+                label: Some("globe post-body overlay, vector & graticule pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target.color_srgb_view,
                     depth_slice: None,
@@ -306,6 +314,13 @@ impl GlobeRenderer {
                 &self.pipelines.overlay_pipeline,
                 self.viewport.uniform_arena(),
                 &self.tile_bind_groups,
+                snapshot,
+            );
+            self.vector.record_pass(
+                &mut post_pass,
+                &self.pipelines.vector_fill_pipeline,
+                &self.pipelines.vector_line_pipeline,
+                self.viewport.uniform_arena(),
                 snapshot,
             );
             if snapshot.show_graticule {

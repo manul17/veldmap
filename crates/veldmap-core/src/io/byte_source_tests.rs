@@ -144,3 +144,37 @@ fn buffered_reader_caches_window_and_counting_source_tracks_spans() {
             .is_err_and(|e| e.is_cancelled())
     );
 }
+
+#[test]
+fn buffered_reader_bufread_interleaved_with_seeks_and_bypass_stays_consistent() {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+
+    let payload: Vec<u8> = (0..128u8).collect();
+    let src: Arc<dyn ByteSource> = Arc::new(crate::io::testing::MemoryByteSource::new(
+        payload.clone().into(),
+    ));
+    let mut reader = BufferedByteReader::with_capacity(src, CancelToken::new(), 16);
+
+    // Fill window at offset 32..48
+    reader.seek(SeekFrom::Start(32)).expect("seek 32");
+    assert_eq!(reader.fill_buf().expect("fill 32"), &payload[32..48]);
+    reader.consume(4);
+    assert_eq!(reader.stream_position().expect("pos"), 36);
+
+    // Seek backward BEFORE buf_offset (pos=8 < buf_offset=32): calling consume
+    // without fill_buf must be a no-op rather than advancing across unbuffered bytes.
+    reader.seek(SeekFrom::Start(8)).expect("seek 8");
+    reader.consume(10);
+    assert_eq!(reader.stream_position().expect("pos stays 8"), 8);
+    assert_eq!(reader.fill_buf().expect("fill 8"), &payload[8..24]);
+    reader.consume(6);
+    assert_eq!(reader.stream_position().expect("pos 14"), 14);
+
+    // Large bypass read jumps past window; subsequent consume must not overshoot.
+    reader.seek(SeekFrom::Start(40)).expect("seek 40");
+    let mut big = vec![0u8; 32];
+    reader.read_exact(&mut big).expect("bypass read");
+    assert_eq!(big, &payload[40..72]);
+    reader.consume(100);
+    assert_eq!(reader.stream_position().expect("pos stays 72"), 72);
+}

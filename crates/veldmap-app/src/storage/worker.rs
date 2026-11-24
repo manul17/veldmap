@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 use veldmap_storage::{DiskCacheStats, StoragePaths, TileDiskCache};
 
+use crate::session::AppSession;
 use crate::settings::AppSettings;
 
 /// Typed asynchronous maintenance outcome reported by [`DiskCacheWorker`]
@@ -36,6 +37,7 @@ enum DiskCacheCmd {
     SetMaxBytes(u64),
     Clear,
     SaveSettings(AppSettings),
+    SaveSession(AppSession),
 }
 
 /// Serialized off-UI-thread worker handling SQLite stats, cap changes, full
@@ -130,6 +132,13 @@ impl DiskCacheWorker {
                                 tracing::warn!(error = %err, "Failed to persist user settings");
                             }
                         }
+                        DiskCacheCmd::SaveSession(session) => {
+                            if let Some(paths) = &paths
+                                && let Err(err) = session.save(paths)
+                            {
+                                tracing::warn!(error = %err, "Failed to persist session");
+                            }
+                        }
                     }
                 }
             }) {
@@ -176,6 +185,12 @@ impl DiskCacheWorker {
         self.tx
             .as_ref()
             .is_some_and(|tx| tx.send(DiskCacheCmd::SaveSettings(settings)).is_ok())
+    }
+
+    pub(super) fn request_save_session(&self, session: AppSession) -> bool {
+        self.tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(DiskCacheCmd::SaveSession(session)).is_ok())
     }
 
     pub(super) fn request_clear(&self) {

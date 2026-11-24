@@ -55,13 +55,119 @@ fn web_mercator_clamps_beyond_domain() {
 }
 
 #[test]
-fn web_mercator_recognized_by_epsg() {
+fn web_mercator_and_expanded_epsg_recognized() {
     assert_eq!(Projection::from_epsg(3857), Some(Projection::WebMercator));
     assert!(matches!(
         Projection::from_epsg(32637),
         Some(Projection::Transverse(_))
     ));
-    assert_eq!(Projection::from_epsg(3035), None);
+    assert!(matches!(
+        Projection::from_epsg(3035),
+        Some(Projection::Proj4(_))
+    ));
+    assert_eq!(Projection::from_epsg(999_999), None);
+}
+
+#[test]
+fn helmert_coordinate_frame_and_position_vector_conventions_agree() {
+    let pv = Datum::from_towgs84(KRASOVSKY, [23.57, -140.95, -79.8, 0.0, 0.35, 0.79, -0.22]);
+    assert_eq!(pv.convention, HelmertConvention::PositionVector);
+    assert_eq!(PULKOVO_1942.convention, HelmertConvention::CoordinateFrame);
+
+    for (lat, lon) in [(47.23, 39.72), (55.75, 37.62), (66.53, 66.60)] {
+        let cf_wgs = PULKOVO_1942.to_wgs84(lat, lon);
+        let pv_wgs = pv.to_wgs84(lat, lon);
+        assert!(
+            ground_m(cf_wgs, pv_wgs) < 1e-6,
+            "conventions diverged: {cf_wgs:?} vs {pv_wgs:?}"
+        );
+        let back_pv = pv.from_wgs84(pv_wgs.0, pv_wgs.1);
+        assert!(ground_m(back_pv, (lat, lon)) < 1e-3);
+    }
+}
+
+#[test]
+fn system_origin_latitude_and_linear_units_round_trip() {
+    // Non-zero origin latitude (e.g., British National Grid-style 49 deg N) + US Survey Feet
+    let sys = System {
+        datum: WGS84_DATUM,
+        central_meridian_deg: -75.0,
+        origin_lat_deg: 38.0,
+        scale: 0.9999,
+        false_easting_m: 200_000.0,
+        false_northing_m: 0.0,
+        unit_to_metres: US_SURVEY_FOOT_M,
+    };
+    let (e_origin, n_origin) = sys.from_geodetic(38.0, -75.0);
+    assert!((e_origin * US_SURVEY_FOOT_M - 200_000.0).abs() < 1e-6);
+    assert!(n_origin.abs() < 1e-6);
+
+    for (lat, lon) in [(39.5, -74.2), (37.1, -76.3), (40.7, -74.0)] {
+        let (e, n) = sys.from_geodetic(lat, lon);
+        let back = sys.to_geodetic(e, n);
+        assert!(
+            ground_m(back, (lat, lon)) < 1e-4,
+            "round-trip error too high: {back:?} vs ({lat}, {lon})"
+        );
+    }
+
+    // International Foot check
+    let sys_ft = System {
+        unit_to_metres: INTERNATIONAL_FOOT_M,
+        ..sys
+    };
+    let (e_ft, n_ft) = sys_ft.from_geodetic(39.5, -74.2);
+    let back_ft = sys_ft.to_geodetic(e_ft, n_ft);
+    assert!(ground_m(back_ft, (39.5, -74.2)) < 1e-4);
+}
+
+#[test]
+fn proj4_epsg_and_wkt_round_trip_and_warn_on_grid_datums() {
+    use super::super::crs::{CrsSpec, DatumWarning, search_crs_presets};
+
+    // EPSG:3035 (ETRS89 / LAEA Europe)
+    let laea = Projection::from_epsg(3035).expect("EPSG:3035");
+    let (x, y) = laea.from_geodetic(52.52, 13.405);
+    let back = laea.to_geodetic(x, y);
+    assert!(ground_m(back, (52.52, 13.405)) < 0.05);
+
+    // EPSG:3413 (WGS84 / Polar Stereographic North)
+    let polar = Projection::from_epsg(3413).expect("EPSG:3413");
+    let (px, py) = polar.from_geodetic(78.22, 15.63);
+    let pback = polar.to_geodetic(px, py);
+    assert!(ground_m(pback, (78.22, 15.63)) < 0.05);
+
+    // WKT1 Lambert Conformal Conic (NAD83 Massachusetts)
+    let wkt1 = concat!(
+        r#"PROJCS["NAD83 / Massachusetts Mainland",GEOGCS["NAD83","#,
+        r#"DATUM["North_American_Datum_1983",SPHEROID["GRS 1980",6378137,298.257222101,"#,
+        r#"AUTHORITY["EPSG","7019"]],AUTHORITY["EPSG","6269"]],PRIMEM["Greenwich",0,"#,
+        r#"AUTHORITY["EPSG","8901"]],UNIT["degree",0.01745329251994328,"#,
+        r#"AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4269"]],UNIT["metre",1,"#,
+        r#"AUTHORITY["EPSG","9001"]],PROJECTION["Lambert_Conformal_Conic_2SP"],"#,
+        r#"PARAMETER["standard_parallel_1",42.68333333333333],"#,
+        r#"PARAMETER["standard_parallel_2",41.71666666666667],"#,
+        r#"PARAMETER["latitude_of_origin",41],PARAMETER["central_meridian",-71.5],"#,
+        r#"PARAMETER["false_easting",200000],PARAMETER["false_northing",750000],"#,
+        r#"AUTHORITY["EPSG","26986"]]"#,
+    );
+    let spec = CrsSpec::from_wkt(wkt1).expect("WKT1 LCC");
+    assert!(matches!(
+        spec.datum_warning(),
+        Some(DatumWarning::GridShiftRecommended { .. })
+    ));
+    let CrsSpec::Projected(lcc) = spec else {
+        panic!("expected projected CRS");
+    };
+    let (lx, ly) = lcc.from_geodetic(42.36, -71.06);
+    let lback = lcc.to_geodetic(lx, ly);
+    assert!(ground_m(lback, (42.36, -71.06)) < 0.05);
+
+    // Searchable presets find both curated and catalog EPSG codes
+    let hits = search_crs_presets("32637", 10);
+    assert!(hits.iter().any(|p| p.epsg == 32637));
+    let catalog_hits = search_crs_presets("2154", 10);
+    assert!(catalog_hits.iter().any(|p| p.epsg == 2154));
 }
 
 fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {

@@ -25,6 +25,29 @@ pub struct Ring {
     pub points: Vec<GeoPoint>,
 }
 
+/// An explicit geographic polygon with an exterior boundary and zero or more
+/// interior holes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Polygon {
+    pub exterior: Ring,
+    pub holes: Vec<Ring>,
+}
+
+impl Polygon {
+    /// Construct a polygon without holes.
+    pub fn new(exterior: Ring) -> Self {
+        Self {
+            exterior,
+            holes: Vec::new(),
+        }
+    }
+
+    /// Construct a polygon with explicit interior holes.
+    pub fn with_holes(exterior: Ring, holes: Vec<Ring>) -> Self {
+        Self { exterior, holes }
+    }
+}
+
 /// Spherical bounding circle around a set of footprint rings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FootprintBounds {
@@ -49,9 +72,33 @@ pub fn frame(rings: &[Ring]) -> Option<FootprintBounds> {
     })
 }
 
+/// Compute the spherical framing circle enclosing `polygons` (their exterior
+/// boundaries), or `None` if empty.
+pub fn frame_polygons(polygons: &[Polygon]) -> Option<FootprintBounds> {
+    let exteriors: Vec<Ring> = polygons.iter().map(|p| p.exterior.clone()).collect();
+    frame(&exteriors)
+}
+
 /// Return whether any ring in `rings` covers `(lat, lon)`.
 pub fn covers(rings: &[Ring], lat: f64, lon: f64) -> bool {
     rings.iter().any(|ring| inside(&angles(ring), lat, lon))
+}
+
+/// Return whether `polygon` covers `(lat, lon)` (inside its exterior ring and
+/// outside all of its interior holes).
+pub fn covers_polygon(polygon: &Polygon, lat: f64, lon: f64) -> bool {
+    if !inside(&angles(&polygon.exterior), lat, lon) {
+        return false;
+    }
+    !polygon
+        .holes
+        .iter()
+        .any(|hole| inside(&angles(hole), lat, lon))
+}
+
+/// Return whether any polygon in `polygons` covers `(lat, lon)`.
+pub fn covers_polygons(polygons: &[Polygon], lat: f64, lon: f64) -> bool {
+    polygons.iter().any(|poly| covers_polygon(poly, lat, lon))
 }
 
 fn points(rings: &[Ring]) -> impl Iterator<Item = (f64, f64)> + '_ {
@@ -237,21 +284,22 @@ fn band_seam_cuts(places: &[(f64, f64)]) -> Vec<usize> {
     if carried { cuts } else { Vec::new() }
 }
 
+/// Pole-safe 3D spherical dihedral winding sum around `p = unit(lat, lon)`.
 fn turn(ring: &[(f64, f64)], lat: f64, lon: f64) -> f64 {
+    let p = geodesy::unit(lat, lon);
     let mut turned = 0.0;
     for (index, from) in ring.iter().enumerate() {
         let to = ring[(index + 1) % ring.len()];
-        turned += wrap(bearing(lat, lon, to.0, to.1) - bearing(lat, lon, from.0, from.1));
+        let na = p.cross(geodesy::unit(from.0, from.1));
+        let nb = p.cross(geodesy::unit(to.0, to.1));
+        if na.length_squared() <= 1e-24 || nb.length_squared() <= 1e-24 {
+            continue;
+        }
+        let sin_term = p.dot(na.cross(nb));
+        let cos_term = na.dot(nb);
+        turned += sin_term.atan2(cos_term).to_degrees();
     }
     turned
-}
-
-fn bearing(from_lat: f64, from_lon: f64, to_lat: f64, to_lon: f64) -> f64 {
-    let (from, to) = (from_lat.to_radians(), to_lat.to_radians());
-    let delta = (to_lon - from_lon).to_radians();
-    let east = delta.sin() * to.cos();
-    let north = from.cos() * to.sin() - from.sin() * to.cos() * delta.cos();
-    east.atan2(north).to_degrees()
 }
 
 fn wrap(degrees: f64) -> f64 {

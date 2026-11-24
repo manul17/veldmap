@@ -9,7 +9,13 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+crs-definitions.workspace = true
+earcut.workspace = true
+geographiclib-rs.workspace = true
 glam.workspace = true
+proj4rs.workspace = true
+proj4wkt.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]

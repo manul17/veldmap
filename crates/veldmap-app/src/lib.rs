@@ -5,10 +5,13 @@
 
 mod app;
 mod basemap;
+mod dialogs;
+pub mod fonts;
 pub mod gpu_tiles;
 mod layers;
 pub mod render;
 mod scene;
+mod session;
 mod settings;
 mod storage;
 mod ui;

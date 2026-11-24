@@ -8,11 +8,14 @@ mod tie_grid;
 
 pub use tie_grid::{Tie, TieGrid};
 
+use std::sync::Arc;
+
 use thiserror::Error;
 
+use super::crs::{CrsSpec, DatumWarning, Proj4Projection};
 use super::footprint::FootprintBounds;
 use super::geodesy;
-use super::projection::{self, Projection};
+use super::projection::{self, Datum, Projection, WGS84_DATUM};
 
 /// Web Mercator equatorial circumference in metres (`2 * pi * a`).
 const WEB_MERCATOR_WORLD_M: f64 = 2.0 * std::f64::consts::PI * geodesy::SEMI_MAJOR_M;
@@ -27,6 +30,14 @@ pub enum BindingError {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum GeographicShift {
+    /// Static 7-parameter Helmert datum (identity when [`WGS84_DATUM`]).
+    Datum(Datum),
+    /// General `proj4rs` geographic CRS (e.g. from `.prj` WKT).
+    Proj4(Arc<Proj4Projection>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum FrameKind {
     /// Exact map-projection binding:
     /// `x = affine[0]*fx + affine[1]*fy + affine[2]`,
@@ -36,8 +47,13 @@ enum FrameKind {
         system: Projection,
         affine: [f64; 6],
     },
-    /// Rectangular tie-point lattice (for geographic, quad, or curvilinear swaths).
-    Grid(TieGrid),
+    /// Rectangular tie-point lattice (for geographic, quad, or curvilinear
+    /// swaths) with optional horizontal datum conversion to WGS84.
+    Grid {
+        grid: TieGrid,
+        shift: GeographicShift,
+        label: String,
+    },
 }
 
 /// Validated georeference binding mapping normalized raster fractions
@@ -45,6 +61,7 @@ enum FrameKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     kind: FrameKind,
+    datum_warning: Option<DatumWarning>,
 }
 
 impl Frame {
@@ -61,11 +78,14 @@ impl Frame {
         if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
             return None;
         }
+        let system = system.into();
+        let datum_warning = system.datum_warning().cloned();
         let frame = Self {
             kind: FrameKind::Projected {
-                system: system.into(),
+                system,
                 affine: [x1 - x0, 0.0, x0, 0.0, -(y1 - y0), y1],
             },
+            datum_warning,
         };
         frame.measurable().then_some(frame)
     }
@@ -87,6 +107,7 @@ impl Frame {
         }
         let across = f64::from(width);
         let down = f64::from(height);
+        let datum_warning = system.datum_warning().cloned();
         let frame = Self {
             kind: FrameKind::Projected {
                 system,
@@ -99,6 +120,7 @@ impl Frame {
                     pixel_affine[5],
                 ],
             },
+            datum_warning,
         };
         frame.measurable().then_some(frame)
     }
@@ -116,10 +138,100 @@ impl Frame {
             .ok_or(BindingError::InvalidExtent(epsg))
     }
 
-    /// Wrap a validated [`TieGrid`] as a georeference [`Frame`].
+    /// Construct a frame from any [`CrsSpec`] (projected or geographic) and a
+    /// pixel-space affine transform `x = a[0]*i + a[1]*j + a[2]`,
+    /// `y = a[3]*i + a[4]*j + a[5]`.
+    pub fn from_crs_pixel_affine(
+        crs: &CrsSpec,
+        pixel_affine: [f64; 6],
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        if width == 0 || height == 0 || !pixel_affine.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        match crs {
+            CrsSpec::Projected(proj) => {
+                Self::from_pixel_affine(proj.clone(), pixel_affine, width, height)
+            }
+            CrsSpec::Geographic {
+                datum,
+                label,
+                warning,
+            } => {
+                let grid = tie_grid_from_geographic_affine(pixel_affine, width, height)?;
+                let mut frame = Self::from_grid_with_datum(grid, *datum, label.clone());
+                if frame.datum_warning.is_none() {
+                    frame.datum_warning = warning.clone();
+                }
+                frame.measurable().then_some(frame)
+            }
+            CrsSpec::GeographicProj(proj) => {
+                let grid = tie_grid_from_geographic_affine(pixel_affine, width, height)?;
+                let frame = Self::from_grid_with_proj(grid, Arc::clone(proj));
+                frame.measurable().then_some(frame)
+            }
+        }
+    }
+
+    /// Wrap a validated [`TieGrid`] on WGS84 as a georeference [`Frame`].
     pub fn from_grid(grid: TieGrid) -> Self {
         Self {
-            kind: FrameKind::Grid(grid),
+            kind: FrameKind::Grid {
+                grid,
+                shift: GeographicShift::Datum(WGS84_DATUM),
+                label: "EPSG:4326 (WGS 84)".to_string(),
+            },
+            datum_warning: None,
+        }
+    }
+
+    /// Wrap a validated [`TieGrid`] on a specific horizontal [`Datum`],
+    /// shifting coordinates to/from WGS84 via [`Datum::to_wgs84`] /
+    /// [`Datum::from_wgs84`] (discarding phantom Helmert `Delta h`).
+    pub fn from_grid_with_datum(grid: TieGrid, datum: Datum, label: impl Into<String>) -> Self {
+        Self {
+            kind: FrameKind::Grid {
+                grid,
+                shift: GeographicShift::Datum(datum),
+                label: label.into(),
+            },
+            datum_warning: None,
+        }
+    }
+
+    /// Wrap a validated [`TieGrid`] on an arbitrary `proj4rs` geographic CRS.
+    pub fn from_grid_with_proj(grid: TieGrid, proj: Arc<Proj4Projection>) -> Self {
+        let datum_warning = proj.datum_warning().cloned();
+        let label = proj.label().to_string();
+        Self {
+            kind: FrameKind::Grid {
+                grid,
+                shift: GeographicShift::Proj4(proj),
+                label,
+            },
+            datum_warning,
+        }
+    }
+
+    /// Attach or replace a diagnostic [`DatumWarning`] on this frame.
+    pub fn with_datum_warning(mut self, warning: Option<DatumWarning>) -> Self {
+        if warning.is_some() {
+            self.datum_warning = warning;
+        }
+        self
+    }
+
+    /// Optional datum diagnostic warning for UI banners.
+    pub fn datum_warning(&self) -> Option<&DatumWarning> {
+        self.datum_warning.as_ref()
+    }
+
+    /// Concise human-readable CRS label for UI metadata inspectors.
+    pub fn crs_label(&self) -> String {
+        match &self.kind {
+            FrameKind::Projected { system, .. } => system.label(),
+            FrameKind::Grid { label, .. } => label.clone(),
         }
     }
 
@@ -166,7 +278,13 @@ impl Frame {
                 let y = affine[3] * fx + affine[4] * fy + affine[5];
                 system.to_geodetic(x, y)
             }
-            FrameKind::Grid(grid) => grid.geodetic(fx, fy),
+            FrameKind::Grid { grid, shift, .. } => {
+                let (lat, lon) = grid.geodetic(fx, fy);
+                match shift {
+                    GeographicShift::Datum(datum) => datum.to_wgs84(lat, lon),
+                    GeographicShift::Proj4(proj) => proj.to_wgs84_geodetic(lon, lat),
+                }
+            }
         }
     }
 
@@ -183,6 +301,7 @@ impl Frame {
                         projection::web_mercator_from_geodetic_strict(lat_deg, lon_deg)?
                     }
                     Projection::Transverse(tm) => tm.from_geodetic(lat_deg, lon_deg),
+                    Projection::Proj4(proj) => proj.from_wgs84_geodetic(lat_deg, lon_deg),
                 };
                 if !(x_base.is_finite() && y.is_finite()) {
                     return None;
@@ -210,7 +329,19 @@ impl Frame {
                 }
                 None
             }
-            FrameKind::Grid(grid) => grid.fraction_at(lat_deg, lon_deg),
+            FrameKind::Grid { grid, shift, .. } => {
+                let (src_lat, src_lon) = match shift {
+                    GeographicShift::Datum(datum) => datum.from_wgs84(lat_deg, lon_deg),
+                    GeographicShift::Proj4(proj) => {
+                        let (lon, lat) = proj.from_wgs84_geodetic(lat_deg, lon_deg);
+                        (lat, lon)
+                    }
+                };
+                if !(src_lat.is_finite() && src_lon.is_finite()) {
+                    return None;
+                }
+                grid.fraction_at(src_lat, src_lon)
+            }
         }
     }
 
@@ -237,7 +368,7 @@ impl Frame {
     /// Widest grid row/column ground spans in metres for [`TieGrid`] bindings.
     pub(crate) fn widest_grid_spans_m(&self) -> Option<(f64, f64)> {
         match &self.kind {
-            FrameKind::Grid(grid) => Some(grid.widest_spans_m()),
+            FrameKind::Grid { grid, .. } => Some(grid.widest_spans_m()),
             FrameKind::Projected { .. } => None,
         }
     }
@@ -255,10 +386,31 @@ impl Frame {
                     affine[1].hypot(affine[4]) * scale,
                 )
             }
-            FrameKind::Projected { affine, .. } => {
-                (affine[0].hypot(affine[3]), affine[1].hypot(affine[4]))
+            FrameKind::Projected {
+                system: Projection::Transverse(sys),
+                affine,
+            } => {
+                let unit = sys.safe_unit_to_metres();
+                (
+                    affine[0].hypot(affine[3]) * unit,
+                    affine[1].hypot(affine[4]) * unit,
+                )
             }
-            FrameKind::Grid(grid) => {
+            FrameKind::Projected {
+                system: Projection::Proj4(proj),
+                affine,
+            } => {
+                let unit = proj.unit_to_metres();
+                let nominal_x = affine[0].hypot(affine[3]) * unit;
+                let nominal_y = affine[1].hypot(affine[4]) * unit;
+                let probed_x = self.probe_grid_span(|s, t| (s, t));
+                let probed_y = self.probe_grid_span(|s, t| (t, s));
+                (
+                    if probed_x > 0.0 { probed_x } else { nominal_x },
+                    if probed_y > 0.0 { probed_y } else { nominal_y },
+                )
+            }
+            FrameKind::Grid { grid, .. } => {
                 let (widest_x, widest_y) = grid.widest_spans_m();
                 let probed_x = self.probe_grid_span(|s, t| (s, t));
                 let probed_y = self.probe_grid_span(|s, t| (t, s));
@@ -291,7 +443,9 @@ impl Frame {
                 affine,
             } => affine[1] == 0.0 && affine[3] == 0.0,
             FrameKind::Projected { .. } => false,
-            FrameKind::Grid(grid) => grid.is_axial(),
+            FrameKind::Grid { grid, shift, .. } => {
+                matches!(shift, GeographicShift::Datum(d) if d.is_wgs84()) && grid.is_axial()
+            }
         }
     }
 
@@ -397,6 +551,57 @@ impl Frame {
 
 fn geodesic_span_m(from: (f64, f64), to: (f64, f64)) -> f64 {
     geodesy::separation(from, to).to_radians() * geodesy::SEMI_MAJOR_M
+}
+
+fn tie_grid_from_geographic_affine(
+    pixel_affine: [f64; 6],
+    width: u32,
+    height: u32,
+) -> Option<TieGrid> {
+    let w = f64::from(width);
+    let h = f64::from(height);
+    let eval = |i: f64, j: f64| {
+        let lon = pixel_affine[0] * i + pixel_affine[1] * j + pixel_affine[2];
+        let lat = pixel_affine[3] * i + pixel_affine[4] * j + pixel_affine[5];
+        (lat, lon)
+    };
+    let corners = [eval(0.0, 0.0), eval(w, 0.0), eval(0.0, h), eval(w, h)];
+    if !corners.iter().all(|(lat, lon)| {
+        lat.is_finite() && lon.is_finite() && lat.abs() <= 90.001 && lon.abs() <= 360.001
+    }) {
+        return None;
+    }
+    let dlon_x = (corners[1].1 - corners[0].1)
+        .abs()
+        .max((corners[3].1 - corners[2].1).abs());
+    let dlon_y = (corners[2].1 - corners[0].1)
+        .abs()
+        .max((corners[3].1 - corners[1].1).abs());
+    let cols = if dlon_x > 170.0 {
+        (dlon_x / 90.0).ceil().max(2.0) as usize
+    } else {
+        1
+    };
+    let rows = if dlon_y > 170.0 {
+        (dlon_y / 90.0).ceil().max(2.0) as usize
+    } else {
+        1
+    };
+    let mut ties = Vec::with_capacity((cols + 1) * (rows + 1));
+    for r in 0..=rows {
+        let fy = r as f64 / rows as f64;
+        for c in 0..=cols {
+            let fx = c as f64 / cols as f64;
+            let (lat, lon) = eval(fx * w, fy * h);
+            ties.push(Tie {
+                fx,
+                fy,
+                lat: lat.clamp(-90.0, 90.0),
+                lon: lon.clamp(-360.0, 360.0),
+            });
+        }
+    }
+    TieGrid::new(&ties)
 }
 
 #[cfg(test)]

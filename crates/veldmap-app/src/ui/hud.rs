@@ -5,7 +5,7 @@ use eframe::egui;
 
 /// Format a latitude/longitude pair as human-readable decimal degrees with
 /// hemisphere indicators.
-pub(super) fn format_lat_lon(lat_deg: f64, lon_deg: f64) -> String {
+pub(crate) fn format_lat_lon(lat_deg: f64, lon_deg: f64) -> String {
     let lat_hem = if lat_deg >= 0.0 { 'N' } else { 'S' };
     let lon_hem = if lon_deg >= 0.0 { 'E' } else { 'W' };
     format!(

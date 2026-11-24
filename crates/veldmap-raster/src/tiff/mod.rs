@@ -69,12 +69,13 @@ pub fn has_tiff_magic(head: &[u8]) -> bool {
 /// Compact sample-layout descriptor shared across TIFF overview scanning,
 /// chunk reading, and lazy display-mapping stretch computation.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct TiffFormat {
+pub(in crate::tiff) struct TiffFormat {
     pub(super) pixel_layout: PixelLayout,
     pub(super) sample_bits: u8,
     pub(super) sample_type: SampleType,
     pub(super) depth: u32,
     pub(super) nodata: Option<f32>,
+    pub(super) ycbcr: Option<tags::YCbCrParams>,
 }
 
 /// Thread-safe opened GeoTIFF/BigTIFF/COG source backed by a positioned

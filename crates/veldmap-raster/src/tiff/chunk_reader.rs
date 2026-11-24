@@ -305,6 +305,7 @@ impl<'a> TiffChunkReader<'a> {
             &self.mapping,
             &chunk.raw,
             self.format.pixel_layout,
+            self.format.ycbcr,
             chunk.width,
             chunk.height,
         )?;

@@ -65,10 +65,11 @@ fn scan_overviews(
             continue;
         }
         match ensure_readable(decoder, cancel) {
-            Ok((o_layout, o_bits, o_type)) => {
+            Ok((o_layout, o_bits, o_type, o_ycbcr)) => {
                 if o_layout != format.pixel_layout
                     || o_bits != format.sample_bits
                     || o_type != format.sample_type
+                    || o_ycbcr != format.ycbcr
                 {
                     continue;
                 }
@@ -110,6 +111,19 @@ impl TiffSource {
         budget: &MemoryBudget,
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
+        Self::open_with_placement(byte_source, fingerprint, None, budget, cancel)
+    }
+
+    /// Open a GeoTIFF/BigTIFF/COG, falling back to an injected external
+    /// `sidecar_placement` (e.g. from `.tfw` + `.prj` sidecars) when the TIFF
+    /// itself carries no embedded georeferencing.
+    pub fn open_with_placement(
+        byte_source: Arc<dyn ByteSource>,
+        fingerprint: SourceFingerprint,
+        sidecar_placement: Option<crate::pipeline::metadata::GeoPlacement>,
+        budget: &MemoryBudget,
+        cancel: &CancelToken,
+    ) -> Result<Self, RasterError> {
         if cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
@@ -123,7 +137,8 @@ impl TiffSource {
             return Err(RasterError::InvalidDimensions { width, height });
         }
 
-        let (pixel_layout, sample_bits, sample_type) = ensure_readable(&mut decoder, cancel)?;
+        let (pixel_layout, sample_bits, sample_type, ycbcr) =
+            ensure_readable(&mut decoder, cancel)?;
         let tiled = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::TileWidth), cancel)?.is_some();
         if !tiled && (width > MAX_SOURCE_SIDE || height > MAX_SOURCE_SIDE) {
             return Err(RasterError::LimitExceeded {
@@ -151,10 +166,16 @@ impl TiffSource {
 
         let ParsedGeoref {
             ties,
-            placement,
+            mut placement,
             foreign_datum_epsg,
-            trouble: binding_trouble,
+            mut trouble,
         } = georef(&mut decoder, width, height, cancel)?;
+
+        if placement.is_none() && ties.is_empty() && sidecar_placement.is_some() {
+            placement = sidecar_placement;
+            trouble = None;
+        }
+        let binding_trouble = trouble;
 
         let format = TiffFormat {
             pixel_layout,
@@ -162,6 +183,7 @@ impl TiffSource {
             sample_type,
             depth,
             nodata,
+            ycbcr,
         };
         let (overviews, ifd_index, decoder_clean) =
             scan_overviews(&mut decoder, format, budget, cancel)?;

@@ -1,25 +1,34 @@
-//! Collapsible Layer List side panel and minimal File Open trigger for local
-//! GeoTIFF/BigTIFF/COG overlays.
+//! Collapsible Layer List side panel for local raster overlays (GeoTIFF/COG,
+//! PNG/JPEG + world files) and read-only GeoJSON vector overlays, with layer
+//! reordering, CRS/radiometry metadata inspection, diagnostic banners, detail
+//! limit captions, and loading shimmer indicators.
 
 use std::path::PathBuf;
 
 use eframe::egui;
 use veldmap_core::geo::FootprintBounds;
 
-use crate::layers::{LayerId, LayerSummary};
+use crate::layers::{LayerId, LayerSummary, VectorLayerId, VectorLayerSummary};
 
-use super::{ERROR_TEXT_COLOR, hud};
+use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, hud};
 
-/// User intent emitted by the Layer List panel and File Open trigger, applied
-/// by `VeldmapApp`.
+/// User intent emitted by the Layer List panel, applied by `VeldmapApp`.
 #[derive(Clone, Debug)]
 pub(crate) enum LayerUiAction {
+    OpenFileDialog,
     OpenPath(PathBuf),
     ToggleVisibility(LayerId, bool),
     SetOpacity(LayerId, f32),
+    MoveUp(LayerId),
+    MoveDown(LayerId),
+    OpenCrsPicker(LayerId, String),
+    OpenCrsPickerForPendingPath(PathBuf),
     ZoomToExtent(FootprintBounds),
     ReloadBypassCache(LayerId),
     Remove(LayerId),
+    ToggleVectorVisibility(VectorLayerId, bool),
+    SetVectorOpacity(VectorLayerId, f32),
+    RemoveVector(VectorLayerId),
 }
 
 /// Transient UI state for the Layer List side panel and File Open input.
@@ -30,6 +39,7 @@ pub(crate) struct LayersPanelState {
     focus_path_input: bool,
     path_input: String,
     error: Option<String>,
+    failed_unbound_path: Option<PathBuf>,
 }
 
 impl LayersPanelState {
@@ -45,6 +55,7 @@ impl LayersPanelState {
         self.open = true;
         self.path_input.clear();
         self.open_prompt_visible = false;
+        self.failed_unbound_path = None;
     }
 
     pub(crate) fn show_open_prompt(&mut self) {
@@ -65,12 +76,23 @@ impl LayersPanelState {
         }
     }
 
+    pub(crate) fn note_failed_path(&mut self, path: PathBuf, msg: String) {
+        self.failed_unbound_path = Some(path);
+        self.push_error(msg);
+    }
+
     pub(crate) fn clear_error(&mut self) {
         self.error = None;
+        self.failed_unbound_path = None;
     }
 }
 
-fn show_panel_header(ui: &mut egui::Ui, layer_count: usize, state: &mut LayersPanelState) {
+fn show_panel_header(
+    ui: &mut egui::Ui,
+    layer_count: usize,
+    state: &mut LayersPanelState,
+    actions: &mut Vec<LayerUiAction>,
+) {
     ui.horizontal(|ui| {
         ui.strong(format!("Layers ({layer_count})"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -78,14 +100,21 @@ fn show_panel_header(ui: &mut egui::Ui, layer_count: usize, state: &mut LayersPa
                 state.open = false;
             }
             if ui
-                .small_button("Open…")
-                .on_hover_text("Open local GeoTIFF / BigTIFF / COG")
+                .small_button("Path…")
+                .on_hover_text("Type a local file path (fallback for minimal WMs)")
                 .clicked()
             {
                 state.open_prompt_visible = !state.open_prompt_visible;
                 if state.open_prompt_visible {
                     state.focus_path_input = true;
                 }
+            }
+            if ui
+                .small_button("Open…")
+                .on_hover_text("Open raster or GeoJSON via native file dialog")
+                .clicked()
+            {
+                actions.push(LayerUiAction::OpenFileDialog);
             }
         });
     });
@@ -97,7 +126,9 @@ fn show_open_prompt(
     state: &mut LayersPanelState,
     actions: &mut Vec<LayerUiAction>,
 ) {
-    ui.label(egui::RichText::new("Local GeoTIFF / COG path (or drag & drop):").small());
+    ui.label(
+        egui::RichText::new("Local GeoTIFF / PNG / JPEG / GeoJSON path (or drag & drop):").small(),
+    );
     ui.horizontal(|ui| {
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.path_input)
@@ -122,6 +153,26 @@ fn show_open_prompt(
     ui.separator();
 }
 
+fn paint_loading_shimmer(ui: &mut egui::Ui) {
+    let width = ui.available_width().max(40.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 3.0), egui::Sense::hover());
+    let t = ui.input(|i| i.time) as f32;
+    let phase = (t * 0.9) % 1.0;
+    let bar_w = (rect.width() * 0.35).max(16.0);
+    let x0 = rect.left() - bar_w + phase * (rect.width() + bar_w);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 1.5, egui::Color32::from_gray(50));
+    let highlight = egui::Rect::from_min_max(
+        egui::pos2(x0.max(rect.left()), rect.top()),
+        egui::pos2((x0 + bar_w).min(rect.right()), rect.bottom()),
+    );
+    if highlight.width() > 0.0 {
+        painter.rect_filled(highlight, 1.5, egui::Color32::from_rgb(80, 175, 245));
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+}
+
 fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<LayerUiAction>) {
     ui.push_id(layer.id, |ui| {
         ui.group(|ui| {
@@ -132,6 +183,22 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
                 }
                 ui.add(egui::Label::new(egui::RichText::new(&layer.name).strong()).truncate())
                     .on_hover_text(layer.path.display().to_string());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(layer.can_move_down, egui::Button::new("↓").small())
+                        .on_hover_text("Move layer down")
+                        .clicked()
+                    {
+                        actions.push(LayerUiAction::MoveDown(layer.id));
+                    }
+                    if ui
+                        .add_enabled(layer.can_move_up, egui::Button::new("↑").small())
+                        .on_hover_text("Move layer up")
+                        .clicked()
+                    {
+                        actions.push(LayerUiAction::MoveUp(layer.id));
+                    }
+                });
             });
 
             let px_label = match layer.source_pixel_size_m {
@@ -143,14 +210,42 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
                 ),
                 None => format!("{}×{}", layer.width, layer.height),
             };
+            let is_loading =
+                layer.reloading || (layer.visible && (layer.pass_active || layer.in_flight > 0));
             ui.horizontal(|ui| {
                 ui.weak(egui::RichText::new(px_label).small());
                 if layer.reloading {
                     ui.weak(egui::RichText::new("· reloading…").small());
-                } else if layer.visible && (layer.pass_active || layer.in_flight > 0) {
+                } else if is_loading {
                     ui.weak(egui::RichText::new("· loading…").small());
                 }
             });
+
+            if is_loading {
+                paint_loading_shimmer(ui);
+            }
+
+            if layer.detail_limit_level > 0 {
+                ui.colored_label(
+                    WARN_TEXT_COLOR,
+                    egui::RichText::new(format!(
+                        "Detail limited to level {} (memory budget)",
+                        layer.detail_limit_level
+                    ))
+                    .small(),
+                );
+            }
+
+            if let Some(warn) = &layer.datum_warning {
+                ui.colored_label(WARN_TEXT_COLOR, egui::RichText::new(warn).small());
+            }
+
+            if let Some(err) = &layer.last_error {
+                ui.colored_label(
+                    ERROR_TEXT_COLOR,
+                    egui::RichText::new(format!("Partial/reload error: {err}")).small(),
+                );
+            }
 
             let mut opacity = layer.opacity;
             ui.horizontal(|ui| {
@@ -164,7 +259,21 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
                 ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
             });
 
-            ui.horizontal(|ui| {
+            egui::CollapsingHeader::new(egui::RichText::new("CRS & Metadata").small())
+                .id_salt(("meta", layer.id))
+                .default_open(false)
+                .show(ui, |ui| {
+                    let crs_tag = if layer.has_crs_override {
+                        format!("CRS: {} (override)", layer.crs_label)
+                    } else {
+                        format!("CRS: {}", layer.crs_label)
+                    };
+                    ui.small(crs_tag);
+                    ui.small(format!("Radiometry: {}", layer.sample_info));
+                    ui.small(format!("Path: {}", layer.path.display()));
+                });
+
+            ui.horizontal_wrapped(|ui| {
                 if let Some(bounds) = layer.footprint
                     && ui
                         .small_button("Zoom")
@@ -172,6 +281,14 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
                         .clicked()
                 {
                     actions.push(LayerUiAction::ZoomToExtent(bounds));
+                }
+                if layer.can_override_crs
+                    && ui
+                        .small_button("CRS…")
+                        .on_hover_text("Override CRS or custom Transverse Mercator parameters")
+                        .clicked()
+                {
+                    actions.push(LayerUiAction::OpenCrsPicker(layer.id, layer.name.clone()));
                 }
                 if ui
                     .add_enabled(!layer.reloading, egui::Button::new("Reload").small())
@@ -193,10 +310,81 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
     ui.add_space(4.0);
 }
 
+fn show_vector_card(
+    ui: &mut egui::Ui,
+    layer: &VectorLayerSummary,
+    actions: &mut Vec<LayerUiAction>,
+) {
+    ui.push_id(("vec", layer.id), |ui| {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                let mut visible = layer.visible;
+                if ui.checkbox(&mut visible, "").changed() {
+                    actions.push(LayerUiAction::ToggleVectorVisibility(layer.id, visible));
+                }
+                let swatch = egui::Color32::from_rgb(
+                    layer.color_rgb[0],
+                    layer.color_rgb[1],
+                    layer.color_rgb[2],
+                );
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 2.0, swatch);
+                ui.add(egui::Label::new(egui::RichText::new(&layer.name).strong()).truncate())
+                    .on_hover_text(layer.path.display().to_string());
+            });
+
+            let summary_text = if layer.point_count > 0 {
+                format!(
+                    "GeoJSON · {} features ({} tris, {} segs, {} pts)",
+                    layer.feature_count,
+                    layer.triangle_count,
+                    layer.line_segment_count,
+                    layer.point_count
+                )
+            } else {
+                format!(
+                    "GeoJSON · {} features ({} tris, {} segs)",
+                    layer.feature_count, layer.triangle_count, layer.line_segment_count
+                )
+            };
+            ui.weak(egui::RichText::new(summary_text).small());
+
+            let mut opacity = layer.opacity;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Opacity").small());
+                if ui
+                    .add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false))
+                    .changed()
+                {
+                    actions.push(LayerUiAction::SetVectorOpacity(layer.id, opacity));
+                }
+                ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
+            });
+
+            ui.horizontal(|ui| {
+                if let Some(bounds) = layer.footprint
+                    && ui
+                        .small_button("Zoom")
+                        .on_hover_text("Fly camera to vector layer extent")
+                        .clicked()
+                {
+                    actions.push(LayerUiAction::ZoomToExtent(bounds));
+                }
+                if ui.small_button("Remove").clicked() {
+                    actions.push(LayerUiAction::RemoveVector(layer.id));
+                }
+            });
+        });
+    });
+    ui.add_space(4.0);
+}
+
 /// Render the collapsible left Layer List panel and return user actions.
 pub(crate) fn show_layers_panel(
     ui: &mut egui::Ui,
     layers: &[LayerSummary],
+    vectors: &[VectorLayerSummary],
     state: &mut LayersPanelState,
 ) -> Vec<LayerUiAction> {
     let mut actions = Vec::new();
@@ -204,13 +392,14 @@ pub(crate) fn show_layers_panel(
         return actions;
     }
 
+    let total = layers.len() + vectors.len();
     egui::Panel::left("layer_list_panel")
         .resizable(true)
-        .default_size(270.0)
-        .min_size(210.0)
-        .max_size(420.0)
+        .default_size(285.0)
+        .min_size(220.0)
+        .max_size(440.0)
         .show(ui, |ui| {
-            show_panel_header(ui, layers.len(), state);
+            show_panel_header(ui, total, state, &mut actions);
 
             if state.open_prompt_visible {
                 show_open_prompt(ui, state, &mut actions);
@@ -220,22 +409,49 @@ pub(crate) fn show_layers_panel(
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(ERROR_TEXT_COLOR, err);
                 });
+                ui.horizontal(|ui| {
+                    if let Some(path) = state.failed_unbound_path.clone()
+                        && ui
+                            .small_button("Assign CRS…")
+                            .on_hover_text("Pick a CRS and retry opening this file")
+                            .clicked()
+                    {
+                        actions.push(LayerUiAction::OpenCrsPickerForPendingPath(path));
+                    }
+                    if ui.small_button("Dismiss").clicked() {
+                        state.clear_error();
+                    }
+                });
                 ui.separator();
             }
 
-            if layers.is_empty() {
-                ui.weak("No raster overlays loaded.");
+            if total == 0 {
+                ui.weak("No raster or GeoJSON layers loaded.");
                 ui.weak(
-                    "Drop a GeoTIFF/COG onto the globe, pass a path on the CLI, or click Open….",
+                    "Drop a GeoTIFF/PNG/JPEG/GeoJSON onto the globe, pass a path on the CLI, or click Open….",
                 );
                 return;
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                // Display top-to-bottom (reverse of painter's order), keyed
-                // strictly by `LayerId` so removals never shift widget state.
-                for layer in layers.iter().rev() {
-                    show_layer_card(ui, layer, &mut actions);
+                if !vectors.is_empty() {
+                    ui.small(egui::RichText::new("Vector Overlays (GeoJSON)").strong());
+                    ui.add_space(2.0);
+                    for vec_layer in vectors.iter().rev() {
+                        show_vector_card(ui, vec_layer, &mut actions);
+                    }
+                    if !layers.is_empty() {
+                        ui.separator();
+                    }
+                }
+                if !layers.is_empty() {
+                    ui.small(egui::RichText::new("Raster Overlays").strong());
+                    ui.add_space(2.0);
+                    // Display top-to-bottom (reverse of painter's order), keyed
+                    // strictly by `LayerId` so removals/reorders never shift widget state.
+                    for layer in layers.iter().rev() {
+                        show_layer_card(ui, layer, &mut actions);
+                    }
                 }
             });
         });

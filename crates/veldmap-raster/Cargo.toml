@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 image.workspace = true
+jpeg-decoder.workspace = true
+png.workspace = true
 qoi.workspace = true
 thiserror.workspace = true
 tiff.workspace = true
@@ -14,6 +16,7 @@ tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 
 [dev-dependencies]
+image-webp.workspace = true
 veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
 zstd.workspace = true
 

@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use veldmap_core::geo::{Camera, Frame};
+use veldmap_core::geo::{Camera, Frame, VectorMesh};
 use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, traverse};
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
@@ -75,6 +75,18 @@ pub struct DrawOverlayLayer {
     pub patches: Vec<DrawOverlayPatch>,
 }
 
+/// Draped GeoJSON / measurement vector layer drawn in Pass 2 above raster
+/// overlays and below the procedural graticule.
+#[derive(Clone, Debug)]
+pub struct DrawVectorLayer {
+    pub id: u64,
+    pub rev: u64,
+    pub opacity: f32,
+    pub fill_color: [f32; 4],
+    pub line_color: [f32; 4],
+    pub mesh: Arc<VectorMesh>,
+}
+
 /// Immutable per-frame draw snapshot built on the app thread (cached by
 /// `(camera_key, scene_generation)` so 120 Hz mouse hover never rebuilds tile
 /// lists) and handed to `GlobePaintCallback`.
@@ -86,6 +98,9 @@ pub struct DrawSnapshot {
     /// Pass 2 (`depth_stencil_attachment: None`) before the procedural
     /// graticule.
     pub overlays: Vec<DrawOverlayLayer>,
+    /// Ordered draped vector overlays (GeoJSON + active geodesic measurements)
+    /// rendered in Pass 2 above raster overlays and below the graticule.
+    pub vectors: Vec<DrawVectorLayer>,
     /// Exact GPU carrier tile keys referenced by `tiles` and `overlays`, used
     /// for active-frame `TileCache` protection so uploads never evict currently
     /// visible tiles.
@@ -146,6 +161,7 @@ impl DrawSnapshot {
             camera: params.camera,
             tiles,
             overlays: Vec::new(),
+            vectors: Vec::new(),
             carrier_keys,
             grid_cells: params.config.grid_cells.max(1),
             show_graticule: params.show_graticule,

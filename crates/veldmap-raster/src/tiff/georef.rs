@@ -1,7 +1,13 @@
 //! GeoTIFF georeference and `GeoKeyDirectoryTag` (`34735`–`34737`) parsing.
 
+use std::sync::Arc;
+
 use tiff::decoder::Decoder;
 use tiff::tags::Tag;
+use veldmap_core::geo::{
+    CrsSpec, Datum, DatumWarning, Ellipsoid, LinearUnit, Proj4Projection, Projection, System,
+    WGS84, WGS84_DATUM, datum_from_towgs84, ellipsoid_from_epsg, known_datum_from_code,
+};
 use veldmap_core::io::BufferedByteReader;
 use veldmap_core::sync::CancelToken;
 
@@ -20,7 +26,35 @@ const GEOKEY_MODEL_TYPE: u16 = 1024;
 const GEOKEY_RASTER_TYPE: u16 = 1025;
 const GEOKEY_GEOGRAPHIC_TYPE: u16 = 2048;
 const GEOKEY_GEOG_GEODETIC_DATUM: u16 = 2050;
+const GEOKEY_GEOG_ELLIPSOID: u16 = 2056;
+const GEOKEY_GEOG_SEMI_MAJOR_AXIS: u16 = 2057;
+const GEOKEY_GEOG_SEMI_MINOR_AXIS: u16 = 2058;
+const GEOKEY_GEOG_INV_FLATTENING: u16 = 2059;
+const GEOKEY_GEOG_TOWGS84: u16 = 2062;
 const GEOKEY_PROJECTED_CS_TYPE: u16 = 3072;
+const GEOKEY_PCS_CITATION: u16 = 3073;
+const GEOKEY_PROJ_COORD_TRANS: u16 = 3075;
+const GEOKEY_PROJ_LINEAR_UNITS: u16 = 3076;
+const GEOKEY_PROJ_LINEAR_UNIT_SIZE: u16 = 3077;
+const GEOKEY_PROJ_STD_PARALLEL1: u16 = 3078;
+const GEOKEY_PROJ_STD_PARALLEL2: u16 = 3079;
+const GEOKEY_PROJ_NAT_ORIGIN_LONG: u16 = 3080;
+const GEOKEY_PROJ_NAT_ORIGIN_LAT: u16 = 3081;
+const GEOKEY_PROJ_FALSE_EASTING: u16 = 3082;
+const GEOKEY_PROJ_FALSE_NORTHING: u16 = 3083;
+const GEOKEY_PROJ_CENTER_LONG: u16 = 3088;
+const GEOKEY_PROJ_CENTER_LAT: u16 = 3089;
+const GEOKEY_PROJ_SCALE_AT_NAT_ORIGIN: u16 = 3092;
+const GEOKEY_PROJ_SCALE_AT_CENTER: u16 = 3093;
+const GEOKEY_PROJ_STRAIGHT_VERT_POLE_LONG: u16 = 3095;
+
+const CT_TRANSVERSE_MERCATOR: u16 = 1;
+const CT_MERCATOR: u16 = 7;
+const CT_LAMBERT_CONF_CONIC_2SP: u16 = 8;
+const CT_LAMBERT_CONF_CONIC_1SP: u16 = 9;
+const CT_LAMBERT_AZIMUTHAL_EQUAL_AREA: u16 = 10;
+const CT_ALBERS_EQUAL_AREA: u16 = 11;
+const CT_POLAR_STEREOGRAPHIC: u16 = 15;
 
 const MODEL_TYPE_PROJECTED: u16 = 1;
 const MODEL_TYPE_GEOGRAPHIC: u16 = 2;
@@ -230,8 +264,12 @@ fn geo_placement(
     if geo_params.model_type != Some(MODEL_TYPE_PROJECTED) || points.len() > 6 {
         return None;
     }
-    let epsg = match geo_params.projected_crs {
-        Some(code) if !UNSAID_GEOKEY_CODES.contains(&code) => Some(u32::from(code)),
+    let (epsg, custom_crs, datum_warning) = match geo_params.projected_crs {
+        Some(code) if !UNSAID_GEOKEY_CODES.contains(&code) => (Some(u32::from(code)), None, None),
+        Some(GEOKEY_USER_DEFINED) | Some(GEOKEY_UNDEFINED) | None => {
+            let (custom, warning) = build_user_defined_projected_crs(geo_params)?;
+            (None, Some(custom), warning)
+        }
         _ => return None,
     };
 
@@ -249,9 +287,247 @@ fn geo_placement(
 
     Some(GeoPlacement {
         epsg,
+        custom_crs,
+        datum_warning,
         affine,
         geo_params: Some(geo_params.clone()),
     })
+}
+
+fn resolve_user_datum(geo_params: &GeoKeyParams) -> (Datum, Option<DatumWarning>) {
+    let base_ellipsoid = geo_params
+        .get_u16(GEOKEY_GEOG_ELLIPSOID)
+        .and_then(ellipsoid_from_epsg)
+        .or_else(|| {
+            let a = geo_params.get_f64(GEOKEY_GEOG_SEMI_MAJOR_AXIS)?;
+            if !(a.is_finite() && a > 0.0) {
+                return None;
+            }
+            if let Some(rf) = geo_params.get_f64(GEOKEY_GEOG_INV_FLATTENING)
+                && rf.is_finite()
+                && rf > 1.0
+            {
+                return Some(Ellipsoid {
+                    semi_major_m: a,
+                    flattening: 1.0 / rf,
+                });
+            }
+            if let Some(b) = geo_params.get_f64(GEOKEY_GEOG_SEMI_MINOR_AXIS)
+                && b.is_finite()
+                && b > 0.0
+                && b <= a
+            {
+                return Some(Ellipsoid {
+                    semi_major_m: a,
+                    flattening: (a - b) / a,
+                });
+            }
+            None
+        });
+
+    let datum_code = geo_params
+        .geographic_crs
+        .or_else(|| geo_params.get_u16(GEOKEY_GEOG_GEODETIC_DATUM));
+    let known = datum_code.and_then(|code| known_datum_from_code(u32::from(code)));
+
+    let towgs84_vals = geo_params.keys.iter().find_map(|(k, v)| match (k, v) {
+        (id, GeoKeyValue::Double(vals)) if *id == GEOKEY_GEOG_TOWGS84 => Some(vals.as_slice()),
+        _ => None,
+    });
+    if let Some(vals) = towgs84_vals
+        && (vals.len() == 3 || vals.len() == 7)
+        && vals.iter().all(|v| v.is_finite())
+    {
+        // Preserve ellipsoid from explicit GeoKey 2056/2057-2059, or fall back
+        // to the ellipsoid of the referenced datum/geographic CRS (2048/2050)
+        // before defaulting to WGS84.
+        let ell = base_ellipsoid
+            .or_else(|| known.as_ref().map(|(d, _)| d.ellipsoid))
+            .unwrap_or(WGS84);
+        let p7 = [
+            vals[0],
+            vals[1],
+            vals[2],
+            vals.get(3).copied().unwrap_or(0.0),
+            vals.get(4).copied().unwrap_or(0.0),
+            vals.get(5).copied().unwrap_or(0.0),
+            vals.get(6).copied().unwrap_or(0.0),
+        ];
+        return (datum_from_towgs84(ell, p7), None);
+    }
+
+    if let Some((datum, warning)) = known {
+        return (datum, warning);
+    }
+
+    if let Some(ell) = base_ellipsoid {
+        let non_wgs84 = (ell.semi_major_m - WGS84.semi_major_m).abs() > 1.0
+            || (ell.flattening - WGS84.flattening).abs() > 1e-6;
+        let warning = non_wgs84.then(|| DatumWarning::UnshiftedForeignDatum {
+            label: "user-defined ellipsoid".to_string(),
+        });
+        return (
+            Datum {
+                ellipsoid: ell,
+                ..WGS84_DATUM
+            },
+            warning,
+        );
+    }
+
+    if let Some(code) = datum_code
+        && !UNSAID_GEOKEY_CODES.contains(&code)
+        && !WGS84_GEOGRAPHIC_CODES.contains(&code)
+        && code != EPSG_WGS84_DATUM
+    {
+        return (
+            WGS84_DATUM,
+            Some(DatumWarning::UnshiftedForeignDatum {
+                label: format!("EPSG:{code}"),
+            }),
+        );
+    }
+
+    (WGS84_DATUM, None)
+}
+
+fn resolve_linear_unit_m(geo_params: &GeoKeyParams) -> f64 {
+    if let Some(code) = geo_params.get_u16(GEOKEY_PROJ_LINEAR_UNITS) {
+        if let Some(unit) = LinearUnit::from_geotiff_code(code) {
+            return unit.to_metres();
+        }
+        if code == GEOKEY_USER_DEFINED
+            && let Some(size) = geo_params.get_f64(GEOKEY_PROJ_LINEAR_UNIT_SIZE)
+            && size.is_finite()
+            && size > 0.0
+        {
+            return size;
+        }
+    }
+    1.0
+}
+
+fn build_user_defined_projected_crs(
+    geo_params: &GeoKeyParams,
+) -> Option<(CrsSpec, Option<DatumWarning>)> {
+    let ct = geo_params.get_u16(GEOKEY_PROJ_COORD_TRANS)?;
+    let unit_m = resolve_linear_unit_m(geo_params);
+    let (datum, warning) = resolve_user_datum(geo_params);
+    let lon_0 = geo_params
+        .get_f64(GEOKEY_PROJ_NAT_ORIGIN_LONG)
+        .or_else(|| geo_params.get_f64(GEOKEY_PROJ_CENTER_LONG))
+        .unwrap_or(0.0);
+    let lat_0 = geo_params
+        .get_f64(GEOKEY_PROJ_NAT_ORIGIN_LAT)
+        .or_else(|| geo_params.get_f64(GEOKEY_PROJ_CENTER_LAT))
+        .unwrap_or(0.0);
+    let scale = geo_params
+        .get_f64(GEOKEY_PROJ_SCALE_AT_NAT_ORIGIN)
+        .or_else(|| geo_params.get_f64(GEOKEY_PROJ_SCALE_AT_CENTER))
+        .unwrap_or(1.0);
+    // GeoTIFF false easting/northing are stored in the CRS linear unit.
+    let false_easting_m = geo_params.get_f64(GEOKEY_PROJ_FALSE_EASTING).unwrap_or(0.0) * unit_m;
+    let false_northing_m = geo_params
+        .get_f64(GEOKEY_PROJ_FALSE_NORTHING)
+        .unwrap_or(0.0)
+        * unit_m;
+
+    if ct == CT_TRANSVERSE_MERCATOR {
+        if !(lon_0.is_finite()
+            && lat_0.is_finite()
+            && scale.is_finite()
+            && scale > 0.0
+            && false_easting_m.is_finite()
+            && false_northing_m.is_finite())
+        {
+            return None;
+        }
+        let sys = System {
+            datum,
+            central_meridian_deg: lon_0,
+            origin_lat_deg: lat_0,
+            scale,
+            false_easting_m,
+            false_northing_m,
+            unit_to_metres: unit_m,
+        };
+        return Some((CrsSpec::Projected(Projection::Transverse(sys)), warning));
+    }
+
+    // Build a PROJ.4 string for other user-defined GeoTIFF coordinate transforms.
+    let proj_name = match ct {
+        CT_MERCATOR => "merc",
+        CT_LAMBERT_CONF_CONIC_2SP | CT_LAMBERT_CONF_CONIC_1SP => "lcc",
+        CT_LAMBERT_AZIMUTHAL_EQUAL_AREA => "laea",
+        CT_ALBERS_EQUAL_AREA => "aea",
+        CT_POLAR_STEREOGRAPHIC => "stere",
+        _ => return None,
+    };
+    let mut parts = vec![format!("+proj={proj_name}")];
+    if ct == CT_POLAR_STEREOGRAPHIC {
+        let pole_lon = geo_params
+            .get_f64(GEOKEY_PROJ_STRAIGHT_VERT_POLE_LONG)
+            .unwrap_or(lon_0);
+        let lat_ts = geo_params
+            .get_f64(GEOKEY_PROJ_STD_PARALLEL1)
+            .or_else(|| geo_params.get_f64(GEOKEY_PROJ_NAT_ORIGIN_LAT))
+            .unwrap_or(lat_0);
+        let pole_lat = if lat_ts < 0.0 { -90.0 } else { 90.0 };
+        parts.push(format!("+lat_0={pole_lat}"));
+        parts.push(format!("+lon_0={pole_lon}"));
+        if lat_ts.is_finite() && lat_ts.abs() < 90.0 {
+            parts.push(format!("+lat_ts={lat_ts}"));
+        } else {
+            parts.push(format!("+k_0={scale}"));
+        }
+    } else {
+        parts.push(format!("+lat_0={lat_0}"));
+        parts.push(format!("+lon_0={lon_0}"));
+        parts.push(format!("+k_0={scale}"));
+    }
+    parts.extend([
+        format!("+x_0={false_easting_m}"),
+        format!("+y_0={false_northing_m}"),
+        format!("+to_meter={unit_m}"),
+        format!("+a={}", datum.ellipsoid.semi_major_m),
+        format!("+b={}", datum.ellipsoid.semi_minor_m()),
+    ]);
+    if ct != CT_POLAR_STEREOGRAPHIC {
+        if let Some(lat1) = geo_params.get_f64(GEOKEY_PROJ_STD_PARALLEL1) {
+            parts.push(format!("+lat_1={lat1}"));
+        }
+        if let Some(lat2) = geo_params.get_f64(GEOKEY_PROJ_STD_PARALLEL2) {
+            parts.push(format!("+lat_2={lat2}"));
+        }
+    }
+    if !datum.is_wgs84() {
+        let sign = match datum.convention {
+            veldmap_core::geo::HelmertConvention::CoordinateFrame => -1.0,
+            veldmap_core::geo::HelmertConvention::PositionVector => 1.0,
+        };
+        parts.push(format!(
+            "+towgs84={},{},{},{},{},{},{}",
+            datum.shift_m[0],
+            datum.shift_m[1],
+            datum.shift_m[2],
+            datum.rotate_sec[0] * sign,
+            datum.rotate_sec[1] * sign,
+            datum.rotate_sec[2] * sign,
+            datum.scale_ppm
+        ));
+    }
+    parts.push("+no_defs".to_string());
+    let proj_str = parts.join(" ");
+    let label = geo_params
+        .get_ascii(GEOKEY_PCS_CITATION)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("User-Defined ({proj_name})"));
+    let p4 = Proj4Projection::from_proj_string(&proj_str, Some(label)).ok()?;
+    let final_warning = warning.or_else(|| p4.datum_warning().cloned());
+    Some((
+        CrsSpec::Projected(Projection::Proj4(Arc::new(p4))),
+        final_warning,
+    ))
 }
 
 fn snap_deg_bound(v: f64, limit: f64) -> f64 {

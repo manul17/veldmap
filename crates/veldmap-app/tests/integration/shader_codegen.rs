@@ -4,7 +4,7 @@
 use naga::back::{hlsl, msl, spv};
 use naga::proc::Layouter;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use veldmap_app::render::{COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_WGSL};
+use veldmap_app::render::{COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_WGSL, VECTOR_WGSL};
 
 fn parse_and_validate(name: &str, wgsl_source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
     let module = naga::front::wgsl::parse_str(wgsl_source).unwrap_or_else(|err| {
@@ -107,6 +107,7 @@ fn validate_and_compile_all_backends(name: &str, wgsl_source: &str) -> naga::Mod
 fn globe_overlay_and_composite_shaders_compile_and_match_rust_uniform_layouts() {
     let globe = validate_and_compile_all_backends("globe.wgsl", GLOBE_WGSL);
     let overlay = validate_and_compile_all_backends("overlay.wgsl", OVERLAY_WGSL);
+    let vector = validate_and_compile_all_backends("vector.wgsl", VECTOR_WGSL);
     let _composite = validate_and_compile_all_backends("composite.wgsl", COMPOSITE_WGSL);
 
     let camera_members = &[
@@ -117,6 +118,7 @@ fn globe_overlay_and_composite_shaders_compile_and_match_rust_uniform_layouts() 
     ];
     assert_struct_layout(&globe, "CameraUniform", 80, camera_members);
     assert_struct_layout(&overlay, "CameraUniform", 80, camera_members);
+    assert_struct_layout(&vector, "CameraUniform", 80, camera_members);
     assert_struct_layout(
         &globe,
         "TileUniform",
@@ -133,5 +135,11 @@ fn globe_overlay_and_composite_shaders_compile_and_match_rust_uniform_layouts() 
         "OverlayPatchUniform",
         32,
         &[("offset_eye", 0), ("opacity", 12), ("uv_rect", 16)],
+    );
+    assert_struct_layout(
+        &vector,
+        "VectorUniform",
+        32,
+        &[("offset_eye", 0), ("color", 16)],
     );
 }

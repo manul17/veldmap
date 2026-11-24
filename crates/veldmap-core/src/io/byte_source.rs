@@ -4,7 +4,7 @@
 //! Avoids memory-mapped files (`memmap2`) to prevent `SIGBUS` UB on truncated,
 //! removable, or network-backed inputs.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -217,6 +217,33 @@ impl Read for BufferedByteReader {
         out[..copy_len].copy_from_slice(&self.buf[start..start + copy_len]);
         self.pos = self.pos.saturating_add(copy_len as u64);
         Ok(copy_len)
+    }
+}
+
+impl BufRead for BufferedByteReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.cancel.is_cancelled() {
+            return Err(IoError::Cancelled.into_std_io());
+        }
+        if self.pos >= self.len {
+            return Ok(&[]);
+        }
+        let end = self.buffered_end();
+        let in_window = self.pos >= self.buf_offset && self.pos < end;
+        if !in_window && self.refill_at(self.pos)? == 0 {
+            return Ok(&[]);
+        }
+        let start = (self.pos - self.buf_offset) as usize;
+        Ok(&self.buf[start..self.buf_len])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        let end = self.buffered_end();
+        if self.pos >= self.buf_offset && self.pos < end {
+            let avail = (end - self.pos) as usize;
+            let take = amt.min(avail);
+            self.pos = self.pos.saturating_add(take as u64);
+        }
     }
 }
 

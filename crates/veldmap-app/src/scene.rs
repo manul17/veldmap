@@ -23,9 +23,10 @@ use crate::gpu_tiles::{
 };
 use crate::layers::{
     CursorReadout, LayerId, LayerSummary, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
-    OverlayMutation,
+    OverlayMutation, VectorLayerId, VectorLayerStack, VectorLayerSummary,
 };
-use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
+use crate::render::{DrawSnapshot, DrawVectorLayer, SnapshotBuildParams, TileCarrierPolicy};
+use crate::session::{SavedCrsOverride, SavedLayerEntry, SavedVectorEntry};
 use crate::settings::AppSettings;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +92,8 @@ pub(crate) struct SceneState {
     decode_pool: Option<TwoLaneDecodePool>,
     basemap: BasemapManager,
     overlays: OverlayManager,
+    vectors: VectorLayerStack,
+    transient_vector: Option<DrawVectorLayer>,
     cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
     scene_generation: u64,
     active_frame: Option<FrameState>,
@@ -142,6 +145,8 @@ impl SceneState {
             decode_pool: Some(decode_pool),
             basemap,
             overlays,
+            vectors: VectorLayerStack::default(),
+            transient_vector: None,
             cached_snapshot: None,
             scene_generation: 1,
             active_frame: None,
@@ -201,6 +206,76 @@ impl SceneState {
         self.overlays.layer_summaries()
     }
 
+    /// Snapshot Layer List UI summaries for all loaded GeoJSON vector layers.
+    pub(crate) fn vector_summaries(&self) -> Vec<VectorLayerSummary> {
+        self.vectors.summaries()
+    }
+
+    /// Total count of loaded raster + vector layers.
+    pub(crate) fn total_layer_count(&self) -> usize {
+        self.overlays.layer_summaries().len() + self.vectors.len()
+    }
+
+    /// Snapshot raster layers for session persistence.
+    pub(crate) fn saved_layer_entries(&self) -> Vec<SavedLayerEntry> {
+        self.overlays.saved_layer_entries()
+    }
+
+    /// Snapshot vector layers for session persistence.
+    pub(crate) fn saved_vector_entries(&self) -> Vec<SavedVectorEntry> {
+        self.vectors.saved_entries()
+    }
+
+    /// Open a local read-only GeoJSON vector layer.
+    pub(crate) fn open_vector_file(
+        &mut self,
+        path: &Path,
+        visible: bool,
+        opacity: f32,
+    ) -> Result<(VectorLayerId, Option<veldmap_core::geo::FootprintBounds>), String> {
+        let res = self.vectors.open_file(path, visible, opacity)?;
+        self.mark_dirty();
+        Ok(res)
+    }
+
+    pub(crate) fn set_vector_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
+        let changed = self.vectors.set_visible(id, visible);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    pub(crate) fn set_vector_opacity(&mut self, id: VectorLayerId, opacity: f32) -> bool {
+        let changed = self.vectors.set_opacity(id, opacity);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    pub(crate) fn remove_vector(&mut self, id: VectorLayerId) -> bool {
+        let changed = self.vectors.remove(id);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    /// Update the transient measurement overlay vector mesh (rendered above
+    /// loaded GeoJSON layers in Pass 2).
+    pub(crate) fn set_transient_vector(&mut self, layer: Option<DrawVectorLayer>) {
+        let changed = match (&self.transient_vector, &layer) {
+            (None, None) => false,
+            (Some(a), Some(b)) => a.id != b.id || a.rev != b.rev,
+            _ => true,
+        };
+        if changed {
+            self.transient_vector = layer;
+            self.mark_dirty();
+        }
+    }
+
     fn apply_overlay_mutation(&mut self, mutation: OverlayMutation) -> bool {
         for src in mutation.purge_sources {
             self.purge_source_caches(src);
@@ -211,10 +286,43 @@ impl SceneState {
         mutation.changed
     }
 
-    /// Queue a non-blocking local GeoTIFF/BigTIFF/COG overlay open onto the
-    /// background overlay I/O worker.
-    pub(crate) fn begin_open_overlay_file(&self, path: &Path, fly_to: bool) -> Result<(), String> {
-        self.overlays.begin_open_file(path, fly_to)
+    /// Queue a non-blocking local raster overlay open with explicit initial state.
+    pub(crate) fn begin_open_overlay_file_with_options(
+        &self,
+        path: &Path,
+        fly_to: bool,
+        visible: bool,
+        opacity: f32,
+        crs_override: Option<SavedCrsOverride>,
+    ) -> Result<(), String> {
+        self.overlays
+            .begin_open_file_with_options(path, fly_to, visible, opacity, crs_override)
+    }
+
+    pub(crate) fn move_overlay_up(&mut self, id: LayerId) -> bool {
+        let changed = self.overlays.move_layer_up(id);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    pub(crate) fn move_overlay_down(&mut self, id: LayerId) -> bool {
+        let changed = self.overlays.move_layer_down(id);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    pub(crate) fn override_overlay_crs(
+        &mut self,
+        id: LayerId,
+        crs_override: Option<SavedCrsOverride>,
+    ) -> Result<Option<veldmap_core::geo::FootprintBounds>, String> {
+        let bounds = self.overlays.override_layer_crs(id, crs_override)?;
+        self.mark_dirty();
+        Ok(bounds)
     }
 
     /// Queue a non-blocking reload of an existing overlay layer from disk,
@@ -414,6 +522,11 @@ impl SceneState {
             carrier_keys: &mut snapshot_inner.carrier_keys,
         });
         snapshot_inner.overlays = overlay_layers;
+        let mut draw_vectors = self.vectors.draw_layers();
+        if let Some(ref transient) = self.transient_vector {
+            draw_vectors.push(transient.clone());
+        }
+        snapshot_inner.vectors = draw_vectors;
 
         let snapshot = Arc::new(snapshot_inner);
 

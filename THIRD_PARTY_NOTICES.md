@@ -8,10 +8,18 @@ Third-party Rust crate licenses are verified on every CI run using `cargo-deny` 
 
 ## UI Fonts
 
-No standalone font binaries are stored in this repository. The desktop UI currently uses `eframe`'s `default_fonts` feature (`epaint_default_fonts`), which embeds:
+No standalone font binaries are stored in this repository. The desktop UI layers two permissively licensed Rust-crate font sources:
 
-- **Ubuntu-Light** — licensed under the Ubuntu Font License 1.0 (`Ubuntu-font-1.0`).
-- **Hack** / **NotoEmoji** / **emoji-icon-font** / **egui-icons** — licensed under the SIL Open Font License 1.1 (`OFL-1.1`) / MIT / Apache-2.0 as packaged by `epaint_default_fonts`.
+- **`epaint_default_fonts`** (`eframe`'s `default_fonts` feature):
+  - **Ubuntu-Light** — licensed under the Ubuntu Font License 1.0 (`Ubuntu-font-1.0`).
+  - **Hack** / **NotoEmoji** / **emoji-icon-font** / **egui-icons** — licensed under the SIL Open Font License 1.1 (`OFL-1.1`) / MIT / Apache-2.0 as packaged by `epaint_default_fonts`.
+- **`dejavu` (`2.37.0`)** (non-Latin proportional & monospace fallback — **DejaVu Sans** and **DejaVu Sans Mono**):
+  - Rust wrapper crate licensed under `MIT OR Apache-2.0`.
+  - Bitstream Vera Fonts Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved (permissive Bitstream Vera license); DejaVu changes are in the Public Domain.
+
+## Geospatial Definitions
+
+- **`crs-definitions` (`0.6.0`)** — EPSG CRS definition table licensed under `CC0-1.0`.
 
 ## Bundled Imagery Assets
 

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use veldmap_core::sync::Wakeup;
 use veldmap_storage::{StoragePaths, TileDiskCache};
 
+use crate::session::AppSession;
 use crate::settings::AppSettings;
 
 use self::worker::DiskCacheWorker;
@@ -29,6 +30,7 @@ const DISK_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) struct AppStorage {
     paths: Option<StoragePaths>,
     settings: AppSettings,
+    session: AppSession,
     disk_cache: Option<Arc<TileDiskCache>>,
     disk_worker: Option<DiskCacheWorker>,
     last_stats_write_gen: u64,
@@ -56,6 +58,11 @@ impl AppStorage {
             .map(AppSettings::load_or_default)
             .unwrap_or_default();
 
+        let session = resolved_paths
+            .as_ref()
+            .map(AppSession::load_or_default)
+            .unwrap_or_default();
+
         let disk_cache = resolved_paths.as_ref().and_then(|p| {
             match TileDiskCache::open(p.tile_cache_db_path(), settings.disk_cache_max_bytes()) {
                 Ok(cache) => Some(Arc::new(cache)),
@@ -78,6 +85,7 @@ impl AppStorage {
         Self {
             paths: resolved_paths,
             settings,
+            session,
             disk_cache,
             disk_worker,
             last_stats_write_gen: 0,
@@ -88,6 +96,41 @@ impl AppStorage {
 
     pub(crate) fn settings(&self) -> &AppSettings {
         &self.settings
+    }
+
+    pub(crate) fn session(&self) -> &AppSession {
+        &self.session
+    }
+
+    /// Update and durably persist [`AppSession`] asynchronously when changed.
+    pub(crate) fn update_session(&mut self, mut next: AppSession) -> bool {
+        next.normalize();
+        if next == self.session {
+            return false;
+        }
+        self.session = next;
+        self.save_session();
+        true
+    }
+
+    /// Mutate `AppSession` in place, normalize, and enqueue durable write if changed.
+    pub(crate) fn mutate_session(&mut self, edit: impl FnOnce(&mut AppSession)) -> bool {
+        let mut next = self.session.clone();
+        edit(&mut next);
+        self.update_session(next)
+    }
+
+    fn save_session(&self) {
+        if let Some(worker) = &self.disk_worker
+            && worker.request_save_session(self.session.clone())
+        {
+            return;
+        }
+        if let Some(paths) = &self.paths
+            && let Err(err) = self.session.save(paths)
+        {
+            tracing::warn!(error = %err, "Failed to persist session");
+        }
     }
 
     pub(crate) fn disk_cache(&self) -> Option<Arc<TileDiskCache>> {

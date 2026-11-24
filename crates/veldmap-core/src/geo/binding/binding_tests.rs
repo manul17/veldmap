@@ -268,3 +268,57 @@ fn pole_touching_pixel_is_point_tie_grid_is_measurable_and_clamps_outer_half_pix
     assert!(lat_mid.abs() < 1e-12);
     assert!(lon_mid.abs() < 1e-12);
 }
+
+#[test]
+fn foreign_datum_geographic_frame_shifts_to_wgs84_and_inverts_cleanly() {
+    use super::super::projection::PULKOVO_1942;
+
+    let ties = [
+        Tie {
+            fx: 0.0,
+            fy: 0.0,
+            lat: 47.5,
+            lon: 39.5,
+        },
+        Tie {
+            fx: 1.0,
+            fy: 0.0,
+            lat: 47.5,
+            lon: 40.0,
+        },
+        Tie {
+            fx: 0.0,
+            fy: 1.0,
+            lat: 47.0,
+            lon: 39.5,
+        },
+        Tie {
+            fx: 1.0,
+            fy: 1.0,
+            lat: 47.0,
+            lon: 40.0,
+        },
+    ];
+    let grid = TieGrid::new(&ties).expect("pulkovo geographic grid");
+    let frame = Frame::from_grid_with_datum(grid, PULKOVO_1942, "EPSG:4284");
+    assert!(!frame.axial(), "datum-shifted grid is not WGS84-axial");
+
+    let (wgs_lat, wgs_lon) = frame.geodetic(0.5, 0.5);
+    let expected = PULKOVO_1942.to_wgs84(47.25, 39.75);
+    assert!((wgs_lat - expected.0).abs() < 1e-12);
+    assert!((wgs_lon - expected.1).abs() < 1e-12);
+
+    // Must differ from unshifted WGS84 by ~100-130 m
+    let unshifted_deg = (wgs_lat - 47.25).hypot(wgs_lon - 39.75);
+    assert!(
+        unshifted_deg > 5e-4,
+        "expected datum shift, got {unshifted_deg} deg"
+    );
+
+    // Inverse lookup maps shifted WGS84 coordinates back to (0.5, 0.5).
+    let (fx, fy) = frame
+        .fraction_at(wgs_lat, wgs_lon)
+        .expect("inverse hit on Pulkovo geographic frame");
+    assert!((fx - 0.5).abs() < 1e-6);
+    assert!((fy - 0.5).abs() < 1e-6);
+}

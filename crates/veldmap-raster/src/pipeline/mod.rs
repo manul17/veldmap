@@ -5,7 +5,7 @@
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::CancelToken;
 
-mod cascade;
+pub(crate) mod cascade;
 pub(crate) mod chunk_cache;
 pub(crate) mod driver;
 pub(crate) mod grid;
@@ -13,7 +13,7 @@ pub(crate) mod metadata;
 pub(crate) mod peak;
 pub(crate) mod plan;
 pub(crate) mod radiometry;
-mod resample;
+pub(crate) mod resample;
 mod scheduler;
 pub(crate) mod singleflight;
 mod source;
@@ -26,7 +26,7 @@ pub use metadata::{
 };
 pub use plan::{LevelPlan, PassKey, PyramidMeta, ServeMode};
 pub use scheduler::{AdmittedPass, AdmittedTile, TileFailureOutcome, TileScheduler};
-pub use source::{RasterSource, frame_from_description};
+pub use source::{RasterSource, frame_from_description, frame_from_description_with_override};
 
 /// Shared runtime context passed into analytical raster decoding calls.
 pub struct DecodeContext<'a> {

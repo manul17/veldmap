@@ -1,28 +1,35 @@
-//! Top workstation toolbar (File Open, Layers toggle, Go-To navigation,
-//! basemap selector, graticule toggle, GPU adapter badge) and bottom GIS status
-//! bar extracted from `app.rs`.
+//! Top workstation toolbar (native File Open, Recent files, Bookmarks,
+//! Layers toggle, Geodesic Measure toggle, Go-To navigation, basemap selector,
+//! graticule toggle, and GPU adapter badge).
 //!
 //! Strictly action-only: emits [`ToolbarAction`] values back to `VeldmapApp`
 //! without mutating `Camera`, storage, or scene state directly from UI layout
 //! code.
 
+use std::path::PathBuf;
+
 use eframe::egui;
-use veldmap_core::geo::{Camera, ParsedLocation, parse_location};
+use veldmap_core::geo::{ParsedLocation, parse_location};
 
 use crate::basemap::BasemapStatusSnapshot;
-use crate::layers::{CursorReadout, CursorReadoutValue};
+use crate::session::CameraBookmark;
 use crate::settings::AppSettings;
 
 use super::ERROR_TEXT_COLOR;
 use super::basemap::{BasemapUiAction, BasemapUiState, show_toolbar_controls};
-use super::hud;
 
 /// User intent emitted by the top workstation toolbar and applied by
 /// `VeldmapApp`.
 #[derive(Clone, Debug)]
 pub(crate) enum ToolbarAction {
-    OpenFileTrigger,
+    OpenFileDialog,
+    OpenPathPrompt,
+    OpenRecentFile(PathBuf),
     ToggleLayersPanel,
+    ToggleMeasureTool,
+    SaveBookmark(String),
+    GoToBookmark(CameraBookmark),
+    DeleteBookmark(usize),
     FocusLocation(ParsedLocation),
     Basemap(BasemapUiAction),
     SetGraticule(bool),
@@ -36,13 +43,17 @@ pub(crate) struct ToolbarInputs<'a> {
     pub(crate) adapter_label: &'a str,
     pub(crate) layer_count: usize,
     pub(crate) layers_open: bool,
+    pub(crate) measure_active: bool,
+    pub(crate) recent_files: &'a [PathBuf],
+    pub(crate) bookmarks: &'a [CameraBookmark],
 }
 
-/// Transient UI state for the Go-To coordinate input field in the top toolbar.
+/// Transient UI state for the Go-To coordinate input and bookmark name input.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GoToBarState {
     input: String,
     error: Option<String>,
+    bookmark_name: String,
 }
 
 impl GoToBarState {
@@ -75,11 +86,39 @@ pub(crate) fn show_top_toolbar(
 
             if ui
                 .button("Open…")
-                .on_hover_text("Open local GeoTIFF / BigTIFF / COG")
+                .on_hover_text("Open local GeoTIFF / PNG / JPEG / GeoJSON via native picker")
                 .clicked()
             {
-                actions.push(ToolbarAction::OpenFileTrigger);
+                actions.push(ToolbarAction::OpenFileDialog);
             }
+
+            ui.menu_button("Recent", |ui| {
+                if ui.button("Open by path…").clicked() {
+                    actions.push(ToolbarAction::OpenPathPrompt);
+                    ui.close();
+                }
+                if !inputs.recent_files.is_empty() {
+                    ui.separator();
+                    for path in inputs.recent_files {
+                        let label = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map_or_else(|| path.display().to_string(), str::to_owned);
+                        if ui
+                            .button(&label)
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            actions.push(ToolbarAction::OpenRecentFile(path.clone()));
+                            ui.close();
+                        }
+                    }
+                } else {
+                    ui.separator();
+                    ui.weak("No recent files");
+                }
+            });
+
             let layers_label = if inputs.layer_count > 0 {
                 format!("Layers ({})", inputs.layer_count)
             } else {
@@ -93,11 +132,55 @@ pub(crate) fn show_top_toolbar(
                 actions.push(ToolbarAction::ToggleLayersPanel);
             }
 
+            if ui
+                .selectable_label(inputs.measure_active, "Measure")
+                .on_hover_text("WGS84 Karney geodesic distance & area tool")
+                .clicked()
+            {
+                actions.push(ToolbarAction::ToggleMeasureTool);
+            }
+
+            ui.menu_button("Bookmarks", |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut goto.bookmark_name)
+                            .desired_width(130.0)
+                            .hint_text("Bookmark name"),
+                    );
+                    if ui.button("Save View").clicked() {
+                        let name = goto.bookmark_name.trim().to_owned();
+                        actions.push(ToolbarAction::SaveBookmark(name));
+                        goto.bookmark_name.clear();
+                    }
+                });
+                if !inputs.bookmarks.is_empty() {
+                    ui.separator();
+                    for (idx, bm) in inputs.bookmarks.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.button(&bm.name).clicked() {
+                                actions.push(ToolbarAction::GoToBookmark(bm.clone()));
+                                ui.close();
+                            }
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("Delete bookmark")
+                                .clicked()
+                            {
+                                actions.push(ToolbarAction::DeleteBookmark(idx));
+                            }
+                        });
+                    }
+                } else {
+                    ui.separator();
+                    ui.weak("No saved camera bookmarks");
+                }
+            });
+
             ui.separator();
 
             ui.label("Go to:");
             let text_edit = egui::TextEdit::singleline(&mut goto.input)
-                .desired_width(170.0)
+                .desired_width(160.0)
                 .hint_text("DD, DMS, or MGRS (e.g. 47.23, 39.70 / 37UDQ)");
             let edit_resp = ui.add(text_edit);
             if edit_resp.changed() {
@@ -139,83 +222,4 @@ pub(crate) fn show_top_toolbar(
         });
     });
     actions
-}
-
-/// Render the bottom GIS status bar (cursor position, zoom-invariant RGB
-/// readout, camera center, altitude, viewport GSD, and native source pixel
-/// size).
-pub(crate) fn show_status_bar(
-    ui: &mut egui::Ui,
-    cursor_geo: Option<(f64, f64)>,
-    cursor_readout: Option<&CursorReadout>,
-    topmost_source_px: Option<(f64, f64)>,
-    camera: &Camera,
-    viewport_height_px: f64,
-) {
-    egui::Panel::bottom("gis_status_bar").show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            let cursor_text = match cursor_geo {
-                Some((lat, lon)) => format!("Cursor: {}", hud::format_lat_lon(lat, lon)),
-                None => "Cursor: Off globe".to_owned(),
-            };
-            ui.monospace(cursor_text);
-
-            if let Some(readout) = cursor_readout {
-                ui.separator();
-                let val_text = match readout.value {
-                    CursorReadoutValue::Rgba([r, g, b, a]) => {
-                        if a == 255 {
-                            format!(
-                                "RGB({r},{g},{b}) @ ({},{})",
-                                readout.pixel.0, readout.pixel.1
-                            )
-                        } else {
-                            format!(
-                                "RGBA({r},{g},{b},{a}) @ ({},{})",
-                                readout.pixel.0, readout.pixel.1
-                            )
-                        }
-                    }
-                    CursorReadoutValue::Pending => {
-                        format!("RGB(…) @ ({},{})", readout.pixel.0, readout.pixel.1)
-                    }
-                    CursorReadoutValue::Nodata => {
-                        format!("nodata @ ({},{})", readout.pixel.0, readout.pixel.1)
-                    }
-                    CursorReadoutValue::Unavailable => {
-                        format!("RGB(n/a) @ ({},{})", readout.pixel.0, readout.pixel.1)
-                    }
-                };
-                ui.monospace(val_text).on_hover_text(format!(
-                    "Native base-resolution readout: {}",
-                    readout.layer_name
-                ));
-            }
-
-            ui.separator();
-            let (clat, clon) = camera.center();
-            ui.monospace(format!("Center: {}", hud::format_lat_lon(clat, clon)));
-            ui.separator();
-
-            ui.monospace(format!(
-                "Alt: {}",
-                hud::format_distance_m(camera.height_m())
-            ));
-            ui.separator();
-
-            let mpp = camera.metres_per_pixel(viewport_height_px);
-            ui.monospace(format!("Viewport GSD: {}", hud::format_resolution(mpp)));
-
-            let source_px = cursor_readout
-                .and_then(|r| r.source_pixel_size_m)
-                .or(topmost_source_px);
-            if let Some((mx, my)) = source_px {
-                ui.separator();
-                ui.monospace(format!(
-                    "Source px: {}",
-                    hud::format_source_pixel_size(mx, my)
-                ));
-            }
-        });
-    });
 }

@@ -12,6 +12,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "accurate"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f209f0bc218ee6cf50db56ec0d9fe10b3cbfb6f3900d019b36c8fdb6d3bc03e"
+dependencies = [
+ "cfg-if",
+ "ieee754",
+ "num-traits",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -367,6 +378,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_log"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86919cef3e37b9356ccf54d4421208c17ecfda01beae61393e7ffd72916c0ef1"
+dependencies = [
+ "log",
+ "web-sys",
+]
+
+[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -447,6 +468,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "crs-definitions"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed764c927c2a19ec1cb85deb88e93560872c04653b0e9e63fbdf6a8edf968bcb"
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -457,6 +484,12 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "dejavu"
+version = "2.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "017b75b5fbc5806d490da36acc5c4d0e4ae1b69890d02f24c268da971813fbc1"
 
 [[package]]
 name = "directories"
@@ -492,6 +525,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
+ "libc",
  "objc2 0.6.5",
 ]
 
@@ -535,6 +570,15 @@ name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
+
+[[package]]
+name = "earcut"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beecb4bee051769371e9fd229b2168782e484bd50fc5f48e9ccce4172a0037d7"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "ecolor"
@@ -893,6 +937,16 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "geographiclib-rs"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5a7f08910fd98737a6eda7568e7c5e645093e073328eeef49758cfe8b0489c7"
+dependencies = [
+ "accurate",
+ "libm",
 ]
 
 [[package]]
@@ -1357,6 +1411,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ieee754"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9007da9cacbd3e6343da136e98b0d2df013f553d35bdec8b518f07bea768e19c"
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1370,6 +1430,16 @@ dependencies = [
  "tiff",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
 ]
 
 [[package]]
@@ -1470,6 +1540,12 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
 ]
+
+[[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
 
 [[package]]
 name = "js-sys"
@@ -1849,6 +1925,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
+ "objc2-uniform-type-identifiers 0.3.2",
 ]
 
 [[package]]
@@ -2067,7 +2144,7 @@ dependencies = [
  "objc2-link-presentation",
  "objc2-quartz-core 0.2.2",
  "objc2-symbols",
- "objc2-uniform-type-identifiers",
+ "objc2-uniform-type-identifiers 0.2.2",
  "objc2-user-notifications",
 ]
 
@@ -2092,6 +2169,16 @@ dependencies = [
  "block2 0.5.1",
  "objc2 0.5.3",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-uniform-type-identifiers"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7902ac02859fc1f7045f8b598c63f1ae0cc7efeaa06a9bc9f3d9a3c955974fa4"
+dependencies = [
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -2342,6 +2429,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
+name = "proj4rs"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1ee6afb8b75ae1ca17036298626d981dff6ba14278ccf0c6cf3bbb473228177"
+dependencies = [
+ "console_log",
+ "crs-definitions",
+ "js-sys",
+ "proj4rs-geodesic",
+ "thiserror 2.0.21",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "proj4rs-geodesic"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdb2ff6e4d7329dc428ca2cb40f4c1ea85ef6c10aa6bd410294a1c835cd55567"
+dependencies = [
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "proj4wkt"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58c81c82adeaefed1216edce88aae980cba2c1eff3e8be8fc0f405b04765f82a"
+dependencies = [
+ "console_log",
+ "js-sys",
+ "nom",
+ "thiserror 2.0.21",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2520,6 +2645,34 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "rfd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4b9d4857b10297ffb0f64cae711e983a7aeaee561848d56d429d3858bd8ed93"
+dependencies = [
+ "block2 0.6.2",
+ "dispatch2",
+ "js-sys",
+ "libc",
+ "log",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-uniform-type-identifiers 0.3.2",
+ "percent-encoding",
+ "pollster",
+ "raw-window-handle",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "web-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3096,6 +3249,7 @@ dependencies = [
  "fax",
  "flate2",
  "half",
+ "image-webp",
  "quick-error",
  "weezl",
  "zstd",
@@ -3411,10 +3565,13 @@ name = "veldmap-app"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "dejavu",
  "eframe",
  "naga",
  "pollster",
+ "rfd",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tiff",
  "tracing",
@@ -3430,7 +3587,13 @@ dependencies = [
 name = "veldmap-core"
 version = "0.1.0"
 dependencies = [
+ "crs-definitions",
+ "earcut",
+ "geographiclib-rs",
  "glam",
+ "proj4rs",
+ "proj4wkt",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -3451,6 +3614,9 @@ name = "veldmap-raster"
 version = "0.1.0"
 dependencies = [
  "image",
+ "image-webp",
+ "jpeg-decoder",
+ "png",
  "qoi",
  "thiserror 2.0.21",
  "tiff",

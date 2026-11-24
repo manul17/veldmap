@@ -295,6 +295,27 @@ fn a_gesture_calls_off_the_flight() {
 }
 
 #[test]
+fn rotate_heading_turns_clockwise_around_nadir_and_preserves_center() {
+    let mut camera = at(47.23, 39.72, 100_000.0);
+    let center_before = camera.center();
+    assert!(camera.heading_deg().abs() < 1e-9);
+
+    camera.rotate_heading(30.0_f64.to_radians());
+    assert!(
+        (camera.heading_deg() - 30.0).abs() < 1e-9,
+        "expected +30 deg heading, got {}",
+        camera.heading_deg()
+    );
+    let center_after = camera.center();
+    assert!((center_after.0 - center_before.0).abs() < 1e-12);
+    assert!((center_after.1 - center_before.1).abs() < 1e-12);
+
+    // Opposite rotation returns to North-up.
+    camera.rotate_heading(-30.0_f64.to_radians());
+    assert!(camera.heading_deg().abs() < 1e-9);
+}
+
+#[test]
 fn zoom_respects_height_range() {
     let mut camera = Camera::default();
     camera.zoom_at(1e4, 0.0, 0.0);

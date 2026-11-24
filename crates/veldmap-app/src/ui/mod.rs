@@ -1,9 +1,12 @@
 //! `egui` UI chrome, floating GIS HUD widgets, and basemap settings panels.
 
 pub(crate) mod basemap;
+pub(crate) mod crs_picker;
 pub(crate) mod hud;
 pub(crate) mod layers;
+pub(crate) mod measure;
 mod settings_window;
+pub(crate) mod status_bar;
 pub(crate) mod toolbar;
 
 pub(crate) use settings_window::show_settings_window;

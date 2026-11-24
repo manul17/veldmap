@@ -47,11 +47,22 @@ pub(super) struct OverlayPatchUniform {
     pub(super) uv_rect: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct VectorUniform {
+    pub(super) offset_eye: [f32; 3],
+    pub(super) _pad0: f32,
+    pub(super) color: [f32; 4],
+}
+
 const _: () = {
     assert!(std::mem::size_of::<OverlayPatchUniform>() == 32);
     assert!(std::mem::offset_of!(OverlayPatchUniform, offset_eye) == 0);
     assert!(std::mem::offset_of!(OverlayPatchUniform, opacity) == 12);
     assert!(std::mem::offset_of!(OverlayPatchUniform, uv_rect) == 16);
+    assert!(std::mem::size_of::<VectorUniform>() == 32);
+    assert!(std::mem::offset_of!(VectorUniform, offset_eye) == 0);
+    assert!(std::mem::offset_of!(VectorUniform, color) == 16);
 };
 
 fn dynamic_uniform_bind_group<T>(

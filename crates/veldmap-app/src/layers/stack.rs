@@ -9,6 +9,8 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::{OverlayCullTree, SourceId, TileKey};
 use veldmap_raster::{PyramidMeta, RasterSource};
 
+use crate::session::SavedCrsOverride;
+
 use super::{LayerId, default_display_tile_bytes};
 
 /// Single georeferenced raster overlay inside [`LayerStack`].
@@ -20,6 +22,8 @@ pub(super) struct OverlayLayer {
     pub(super) meta: PyramidMeta,
     pub(super) fingerprint_hex: String,
     pub(super) frame: Arc<Frame>,
+    pub(super) crs_override: Option<SavedCrsOverride>,
+    pub(super) last_error: Option<String>,
     pub(super) relaid: u64,
     pub(super) cull: OverlayCullTree,
     pub(super) visible: bool,
@@ -39,11 +43,16 @@ pub(super) struct OverlayLayer {
 }
 
 impl OverlayLayer {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal layer constructor grouping immutable source metadata and initial UI state"
+    )]
     pub(super) fn from_source(
         id: LayerId,
         path: PathBuf,
         source: Arc<dyn RasterSource>,
         frame: Frame,
+        crs_override: Option<SavedCrsOverride>,
         visible: bool,
         opacity: f32,
         relaid: u64,
@@ -66,6 +75,8 @@ impl OverlayLayer {
             meta,
             fingerprint_hex,
             frame: Arc::new(frame),
+            crs_override,
+            last_error: None,
             relaid,
             cull,
             visible,
@@ -79,6 +90,22 @@ impl OverlayLayer {
             reload_seq: 0,
             reload_cancel: None,
         }
+    }
+
+    pub(super) fn apply_rebound_frame(
+        &mut self,
+        frame: Frame,
+        crs_override: Option<SavedCrsOverride>,
+        relaid: u64,
+    ) {
+        let desc = self.source.description();
+        self.source_pixel_size_m = frame.pixel_size_m(desc.width, desc.height);
+        self.footprint = frame.footprint_bounds();
+        self.frame = Arc::new(frame);
+        self.crs_override = crs_override;
+        self.last_error = None;
+        self.relaid = relaid;
+        self.cull = OverlayCullTree::new(desc.width, desc.height, self.meta.max_level());
     }
 
     pub(super) fn source_id(&self) -> SourceId {
@@ -136,6 +163,7 @@ impl OverlayLayer {
             path,
             source,
             frame,
+            self.crs_override.clone(),
             self.visible,
             self.opacity,
             relaid,
@@ -184,6 +212,30 @@ impl LayerStack {
     pub(super) fn remove(&mut self, id: LayerId) -> Option<OverlayLayer> {
         let idx = self.layers.iter().position(|l| l.id == id)?;
         Some(self.layers.remove(idx))
+    }
+
+    /// Move layer toward the top of painter's order (higher index, drawn later).
+    pub(super) fn move_up(&mut self, id: LayerId) -> bool {
+        let Some(idx) = self.layers.iter().position(|l| l.id == id) else {
+            return false;
+        };
+        if idx + 1 >= self.layers.len() {
+            return false;
+        }
+        self.layers.swap(idx, idx + 1);
+        true
+    }
+
+    /// Move layer toward the bottom of painter's order (lower index, drawn earlier).
+    pub(super) fn move_down(&mut self, id: LayerId) -> bool {
+        let Some(idx) = self.layers.iter().position(|l| l.id == id) else {
+            return false;
+        };
+        if idx == 0 {
+            return false;
+        }
+        self.layers.swap(idx - 1, idx);
+        true
     }
 
     pub(super) fn get(&self, id: LayerId) -> Option<&OverlayLayer> {

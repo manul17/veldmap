@@ -44,6 +44,11 @@ impl StoragePaths {
         self.config_dir.join("settings.json")
     }
 
+    /// Path to durable local workstation session JSON (`config_dir/session.json`).
+    pub fn session_path(&self) -> PathBuf {
+        self.config_dir.join("session.json")
+    }
+
     /// Path to the single-file SQLite WAL tile cache (`cache_dir/tiles.sqlite3`).
     pub fn tile_cache_db_path(&self) -> PathBuf {
         self.cache_dir.join("tiles.sqlite3")
