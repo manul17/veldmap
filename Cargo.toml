@@ -30,7 +30,7 @@ jpeg-decoder = { version = "0.3.2", default-features = false }
 naga = { version = "30.0.2", features = ["wgsl-in", "spv-out", "hlsl-out", "msl-out"] }
 png = "0.18.1"
 pollster = "1.0.3"
-proj4rs = { version = "0.3.1", features = ["crs-definitions"] }
+proj4rs = "0.3.1"
 proj4wkt = "0.2.0"
 qoi = "0.4.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy"] }

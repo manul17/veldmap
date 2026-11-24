@@ -34,12 +34,14 @@ fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
     }
 }
 
-/// Tracks globe viewport geometry, foreground compass bounds, hovered geodetic
+/// Tracks globe viewport geometry, HUD overlay bounds, hovered geodetic
 /// cursor coordinates, and pointer/keyboard navigation gestures.
 pub(crate) struct ViewportInteraction {
     cursor_geo: Option<(f64, f64)>,
     last_viewport_rect: Option<egui::Rect>,
     last_compass_rect: Option<egui::Rect>,
+    last_scale_bar_rect: Option<egui::Rect>,
+    last_attribution_rect: Option<egui::Rect>,
     last_viewport_height_px: f64,
     last_viewport_aspect: f64,
 }
@@ -50,6 +52,8 @@ impl Default for ViewportInteraction {
             cursor_geo: None,
             last_viewport_rect: None,
             last_compass_rect: None,
+            last_scale_bar_rect: None,
+            last_attribution_rect: None,
             last_viewport_height_px: 800.0,
             last_viewport_aspect: 1.6,
         }
@@ -78,10 +82,27 @@ impl ViewportInteraction {
     pub(crate) fn clear_viewport(&mut self) {
         self.last_viewport_rect = None;
         self.last_compass_rect = None;
+        self.last_scale_bar_rect = None;
+        self.last_attribution_rect = None;
     }
 
     pub(crate) fn set_compass_rect(&mut self, rect: egui::Rect) {
         self.last_compass_rect = Some(rect);
+    }
+
+    pub(crate) fn set_hud_rects(
+        &mut self,
+        scale_bar: Option<egui::Rect>,
+        attribution: Option<egui::Rect>,
+    ) {
+        self.last_scale_bar_rect = scale_bar;
+        self.last_attribution_rect = attribution;
+    }
+
+    fn is_over_hud(&self, pos: egui::Pos2) -> bool {
+        self.last_compass_rect.is_some_and(|r| r.contains(pos))
+            || self.last_scale_bar_rect.is_some_and(|r| r.contains(pos))
+            || self.last_attribution_rect.is_some_and(|r| r.contains(pos))
     }
 
     fn probe_pointer(
@@ -104,8 +125,12 @@ impl ViewportInteraction {
         if let Some(rect) = self.last_viewport_rect.filter(|r| r.is_positive()) {
             let hover_pos = ctx.input(|i| i.pointer.hover_pos());
             self.cursor_geo = hover_pos.and_then(|pos| {
-                let over_compass = self.last_compass_rect.is_some_and(|c| c.contains(pos));
-                (rect.contains(pos) && !over_compass)
+                // Skip probing whenever a floating window, menu, or compass
+                // `Area` sits above the globe `CentralPanel` (`LayerId::background`).
+                let covered_by_ui_layer = ctx
+                    .layer_id_at(pos)
+                    .is_some_and(|layer| layer != egui::LayerId::background());
+                (rect.contains(pos) && !covered_by_ui_layer && !self.is_over_hud(pos))
                     .then(|| self.probe_pointer(camera, rect, pos))
                     .flatten()
             });
@@ -246,11 +271,10 @@ impl ViewportInteraction {
             && response.clicked_by(egui::PointerButton::Primary)
             && !shift_held
             && let Some(pos) = response.interact_pointer_pos()
+            && !self.is_over_hud(pos)
+            && let Some((lat, lon)) = self.probe_pointer(camera, rect, pos)
         {
-            let over_compass = self.last_compass_rect.is_some_and(|c| c.contains(pos));
-            if !over_compass && let Some((lat, lon)) = self.probe_pointer(camera, rect, pos) {
-                return Some(GeoPoint::new(lat, lon));
-            }
+            return Some(GeoPoint::new(lat, lon));
         }
         None
     }

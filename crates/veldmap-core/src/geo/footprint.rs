@@ -57,11 +57,14 @@ pub struct FootprintBounds {
     pub radius_deg: f64,
 }
 
-/// Compute the spherical framing circle enclosing `rings`, or `None` if empty.
-pub fn frame(rings: &[Ring]) -> Option<FootprintBounds> {
-    let first = rings.iter().flat_map(|ring| &ring.points).next()?;
-    let (lat, lon) = geodesy::spherical_centroid(points(rings)).unwrap_or((first.lat, first.lon));
-    let radius_deg = points(rings)
+/// Compute the spherical framing circle enclosing an iterator of `(lat, lon)`
+/// degree coordinates, or `None` if empty.
+pub(crate) fn frame_coords(
+    coords: impl Iterator<Item = (f64, f64)> + Clone,
+) -> Option<FootprintBounds> {
+    let first = coords.clone().next()?;
+    let (lat, lon) = geodesy::spherical_centroid(coords.clone()).unwrap_or(first);
+    let radius_deg = coords
         .map(|point| geodesy::separation((lat, lon), point))
         .fold(0.0, f64::max);
 
@@ -72,11 +75,45 @@ pub fn frame(rings: &[Ring]) -> Option<FootprintBounds> {
     })
 }
 
+/// Remove consecutive duplicate points (including wrap-around `last == first`)
+/// from a closed [`GeoPoint`] ring, dropping non-finite coordinates.
+pub(crate) fn dedup_geo_ring(points: &[GeoPoint]) -> Vec<GeoPoint> {
+    let mut out: Vec<GeoPoint> = Vec::with_capacity(points.len());
+    for &p in points {
+        if !(p.lat.is_finite() && p.lon.is_finite()) {
+            continue;
+        }
+        if out
+            .last()
+            .is_none_or(|prev| (prev.lat - p.lat).abs() > 1e-12 || (prev.lon - p.lon).abs() > 1e-12)
+        {
+            out.push(p);
+        }
+    }
+    if out.len() > 1
+        && let (Some(first), Some(last)) = (out.first(), out.last())
+        && (first.lat - last.lat).abs() <= 1e-12
+        && (first.lon - last.lon).abs() <= 1e-12
+    {
+        out.pop();
+    }
+    out
+}
+
+/// Compute the spherical framing circle enclosing `rings`, or `None` if empty.
+pub fn frame(rings: &[Ring]) -> Option<FootprintBounds> {
+    frame_coords(points(rings))
+}
+
 /// Compute the spherical framing circle enclosing `polygons` (their exterior
 /// boundaries), or `None` if empty.
 pub fn frame_polygons(polygons: &[Polygon]) -> Option<FootprintBounds> {
-    let exteriors: Vec<Ring> = polygons.iter().map(|p| p.exterior.clone()).collect();
-    frame(&exteriors)
+    frame_coords(
+        polygons
+            .iter()
+            .flat_map(|p| &p.exterior.points)
+            .map(|p| (p.lat, p.lon)),
+    )
 }
 
 /// Return whether any ring in `rings` covers `(lat, lon)`.
@@ -101,7 +138,7 @@ pub fn covers_polygons(polygons: &[Polygon], lat: f64, lon: f64) -> bool {
     polygons.iter().any(|poly| covers_polygon(poly, lat, lon))
 }
 
-fn points(rings: &[Ring]) -> impl Iterator<Item = (f64, f64)> + '_ {
+fn points(rings: &[Ring]) -> impl Iterator<Item = (f64, f64)> + Clone + '_ {
     rings
         .iter()
         .flat_map(|ring| &ring.points)

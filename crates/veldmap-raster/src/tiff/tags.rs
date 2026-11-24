@@ -3,14 +3,15 @@
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::io::{BufferedByteReader, IoError};
+use veldmap_core::io::BufferedByteReader;
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
+use crate::adapters::map_std_io_error;
 use crate::pipeline::grid;
 use crate::pipeline::metadata::SampleType;
 use crate::pipeline::peak::DecodePeak;
-use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples};
+use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples, is_data};
 
 const DECODED_COMPRESSIONS: [u16; 8] = [
     1,      // None
@@ -45,7 +46,14 @@ impl Default for YCbCrParams {
 }
 
 impl YCbCrParams {
-    pub(super) fn convert_u8_to_rgb(&self, ycbcr: &[u8]) -> Vec<u8> {
+    /// Convert upsampled 8-bit `YCbCr` triplets directly to tightly packed
+    /// `RGBA8` without allocating an intermediate `RGB` buffer.
+    pub(super) fn convert_u8_to_rgba(
+        &self,
+        ycbcr: &[u8],
+        pixels: usize,
+        nodata: Option<f32>,
+    ) -> Vec<u8> {
         let [lr, lg, lb] = self.luma;
         let [rb_y, rw_y, rb_cb, rw_cb, rb_cr, rw_cr] = self.ref_black_white;
         let scale_y = if (rw_y - rb_y).abs() > 1e-6 {
@@ -71,19 +79,28 @@ impl YCbCrParams {
             1.0 / 0.587
         };
 
-        let mut rgb = Vec::with_capacity(ycbcr.len());
-        for px in ycbcr.chunks_exact(3) {
+        let count = pixels.min(ycbcr.len() / 3);
+        let mut rgba = Vec::with_capacity(count * 4);
+        for px in ycbcr.chunks_exact(3).take(count) {
             let y = (f64::from(px[0]) - rb_y) * scale_y;
             let cb = (f64::from(px[1]) - rb_cb) * scale_cb;
             let cr = (f64::from(px[2]) - rb_cr) * scale_cr;
-            let r = cr * kr + y;
-            let b = cb * kb + y;
-            let g = (y - lb * b - lr * r) * inv_lg;
-            rgb.push(r.clamp(0.0, 255.0).round() as u8);
-            rgb.push(g.clamp(0.0, 255.0).round() as u8);
-            rgb.push(b.clamp(0.0, 255.0).round() as u8);
+            let r = (cr * kr + y).clamp(0.0, 255.0).round() as u8;
+            let b = (cb * kb + y).clamp(0.0, 255.0).round() as u8;
+            let g = ((y - lb * f64::from(b) - lr * f64::from(r)) * inv_lg)
+                .clamp(0.0, 255.0)
+                .round() as u8;
+            let void = nodata.is_some()
+                && !is_data(f32::from(r), nodata)
+                && !is_data(f32::from(g), nodata)
+                && !is_data(f32::from(b), nodata);
+            if void {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                rgba.extend_from_slice(&[r, g, b, 255]);
+            }
         }
-        rgb
+        rgba
     }
 }
 
@@ -92,10 +109,7 @@ pub(super) fn map_tiff_error(err: tiff::TiffError, cancel: &CancelToken) -> Rast
         return RasterError::Cancelled;
     }
     match err {
-        tiff::TiffError::IoError(io_err) => match io_err.downcast::<IoError>() {
-            Ok(core_err) => RasterError::from(core_err),
-            Err(io_err) => RasterError::from(IoError::Io(io_err)),
-        },
+        tiff::TiffError::IoError(io_err) => map_std_io_error(io_err, cancel),
         tiff::TiffError::LimitsExceeded => RasterError::DecoderLimitsExceeded(err.to_string()),
         other => RasterError::Decode(other.to_string()),
     }
@@ -309,7 +323,17 @@ pub(super) fn ensure_readable(
 ) -> Result<(PixelLayout, u8, SampleType, Option<YCbCrParams>), RasterError> {
     let color = decoder.colortype().map_err(|e| map_tiff_error(e, cancel))?;
     let (layout, bits, ycbcr) = model(decoder, color, cancel)?;
-    ensure_decodable(decoder, cancel)?;
+    let compression = ensure_decodable(decoder, cancel)?;
+    // Non-JPEG TIFFs with YCbCr chroma subsampling != (1, 1) cannot be decoded
+    // by `tiff 0.11.3`; reject upfront at open() instead of failing mid-tile.
+    if ycbcr.is_some() && compression != 7 {
+        let sub = read_tag_u16_vec_opt(decoder, Tag::ChromaSubsampling, cancel)?;
+        if !sub.is_empty() && sub.as_slice() != [1, 1] {
+            return Err(RasterError::Decode(format!(
+                "non-JPEG subsampled YCbCr TIFF (YCbCrSubSampling={sub:?}) is not supported"
+            )));
+        }
+    }
     let stype = read_sample_type(decoder, bits, cancel)?;
     Ok((layout, bits, stype, ycbcr))
 }
@@ -317,11 +341,11 @@ pub(super) fn ensure_readable(
 fn ensure_decodable(
     decoder: &mut Decoder<BufferedByteReader>,
     cancel: &CancelToken,
-) -> Result<(), RasterError> {
+) -> Result<u16, RasterError> {
     let code =
         opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Compression), cancel)?.unwrap_or(1);
     if DECODED_COMPRESSIONS.contains(&code) {
-        return Ok(());
+        return Ok(code);
     }
     Err(RasterError::Decode(format!(
         "unsupported TIFF compression code {code}"
@@ -371,8 +395,7 @@ pub(super) fn chunk_rgba(
 ) -> Result<Vec<u8>, RasterError> {
     let pixels = (dw as usize) * (dh as usize);
     let rgba = if let (Some(params), DecodingResult::U8(raw)) = (ycbcr, data) {
-        let rgb = params.convert_u8_to_rgb(raw);
-        mapping.rgba(&Samples::U8(&rgb), pixel, pixels)
+        params.convert_u8_to_rgba(raw, pixels, mapping.nodata())
     } else {
         mapping.rgba(&typed_samples(data)?, pixel, pixels)
     };

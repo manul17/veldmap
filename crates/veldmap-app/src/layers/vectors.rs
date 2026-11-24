@@ -1,4 +1,5 @@
-//! Read-only GeoJSON vector overlay layer stack (`VectorLayerStack`).
+//! Read-only GeoJSON vector overlay layer stack (`VectorLayerStack`) and
+//! off-UI-thread GeoJSON file loader (`load_vector_file`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,11 +32,53 @@ pub(crate) struct VectorLayerSummary {
     pub(crate) color_rgb: [u8; 3],
 }
 
+/// Pre-parsed and CPU-tessellated GeoJSON payload produced off the UI thread.
+pub(crate) struct LoadedVectorData {
+    pub(crate) path: PathBuf,
+    pub(crate) feature_count: usize,
+    pub(crate) mesh: Arc<VectorMesh>,
+}
+
 /// Check whether `path` has a GeoJSON extension (`.geojson` or `.json`).
 pub(crate) fn is_geojson_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("geojson") || e.eq_ignore_ascii_case("json"))
+}
+
+/// Read, validate, parse, and tessellate a local GeoJSON file off the UI thread.
+pub(crate) fn load_vector_file(path: &Path) -> Result<LoadedVectorData, String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("failed to stat '{}': {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("'{}' is not a regular file", path.display()));
+    }
+    if meta.len() > MAX_GEOJSON_FILE_BYTES {
+        return Err(format!(
+            "'{}' exceeds 64 MiB GeoJSON safety limit",
+            path.display()
+        ));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    let collection = parse_geojson(&text)
+        .map_err(|e| format!("failed to parse GeoJSON '{}': {e}", path.display()))?;
+    let feature_count = collection.features.len();
+    let mesh = Arc::new(VectorMesh::from_collection(
+        &collection,
+        DEFAULT_VECTOR_MAX_CHORD_DEG,
+    ));
+    if mesh.is_empty() {
+        return Err(format!(
+            "'{}' contains no renderable GeoJSON geometries",
+            path.display()
+        ));
+    }
+    Ok(LoadedVectorData {
+        path: path.to_path_buf(),
+        feature_count,
+        mesh,
+    })
 }
 
 struct VectorLayer {
@@ -101,60 +144,39 @@ impl Default for VectorLayerStack {
 }
 
 impl VectorLayerStack {
-    /// Load and tessellate a local GeoJSON file into the stack.
-    pub(crate) fn open_file(
+    /// Insert a pre-parsed [`LoadedVectorData`] produced by the background I/O
+    /// worker into the stack.
+    pub(crate) fn push_loaded(
         &mut self,
-        path: &Path,
+        data: LoadedVectorData,
         visible: bool,
         opacity: f32,
-    ) -> Result<(VectorLayerId, Option<FootprintBounds>), String> {
-        let meta = std::fs::metadata(path)
-            .map_err(|e| format!("failed to stat '{}': {e}", path.display()))?;
-        if meta.len() > MAX_GEOJSON_FILE_BYTES {
-            return Err(format!(
-                "'{}' exceeds 64 MiB GeoJSON safety limit",
-                path.display()
-            ));
-        }
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
-        let collection = parse_geojson(&text)
-            .map_err(|e| format!("failed to parse GeoJSON '{}': {e}", path.display()))?;
-        let feature_count = collection.features.len();
-        let mesh = Arc::new(VectorMesh::from_collection(
-            &collection,
-            DEFAULT_VECTOR_MAX_CHORD_DEG,
-        ));
-        if mesh.is_empty() {
-            return Err(format!(
-                "'{}' contains no renderable GeoJSON geometries",
-                path.display()
-            ));
-        }
-        let bounds = mesh.bounds;
+    ) -> (VectorLayerId, Option<FootprintBounds>) {
+        let bounds = data.mesh.bounds;
         let id = VectorLayerId(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
-        let (fill_color, line_color, color_rgb) =
-            VECTOR_PALETTE[(id.0 as usize) % VECTOR_PALETTE.len()];
-        let name = path
+        let palette_idx = id.0.saturating_sub(1) as usize % VECTOR_PALETTE.len();
+        let (fill_color, line_color, color_rgb) = VECTOR_PALETTE[palette_idx];
+        let name = data
+            .path
             .file_name()
             .and_then(|n| n.to_str())
-            .map_or_else(|| path.display().to_string(), str::to_owned);
+            .map_or_else(|| data.path.display().to_string(), str::to_owned);
 
         self.layers.push(VectorLayer {
             id,
             rev: 1,
             name,
-            path: path.to_path_buf(),
+            path: data.path,
             visible,
             opacity: opacity.clamp(0.0, 1.0),
             fill_color,
             line_color,
             color_rgb,
-            feature_count,
-            mesh,
+            feature_count: data.feature_count,
+            mesh: data.mesh,
         });
-        Ok((id, bounds))
+        (id, bounds)
     }
 
     pub(crate) fn set_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
@@ -202,9 +224,9 @@ impl VectorLayerStack {
                 visible: l.visible,
                 opacity: l.opacity,
                 feature_count: l.feature_count,
-                triangle_count: l.mesh.fill_indices.len() / 3,
-                line_segment_count: l.mesh.line_vertices.len() / 2,
-                point_count: l.mesh.point_vertices.len(),
+                triangle_count: l.mesh.fill_triangle_count(),
+                line_segment_count: l.mesh.line_segment_count(),
+                point_count: l.mesh.point_count(),
                 footprint: l.mesh.bounds,
                 color_rgb: l.color_rgb,
             })

@@ -1,19 +1,23 @@
-//! Pure-`ByteSource` JPEG [`RasterSource`] adapter (`jpeg-decoder` without
-//! rayon threadpools).
+//! Pure-`ByteSource` JPEG [`RasterSource`] adapter (`jpeg-decoder` with
+//! `default-features = false`, using DCT `Decoder::scale()` for memory-bounded
+//! progressive-pyramid opens).
 //!
-//! Enforces pre-allocation frame budget checks via `Decoder::scale()` **before**
-//! calling `Decoder::decode()`, drops the raw pixel buffer immediately after
-//! RGBA8 conversion, and feeds the exact pyramid level grid into [`Cascade`].
+//! Enforces pre-allocation frame budget checks **before** calling
+//! `Decoder::decode()` (accounting for full-resolution coefficient buffers on
+//! progressive and lossless JPEGs where `scale()` does not reduce working
+//! memory), sets `set_max_decoding_buffer_size`, drops the raw pixel buffer
+//! immediately after RGBA8 conversion, and feeds the exact pyramid level grid
+//! into [`Cascade`]. Note: EXIF Orientation tags are not auto-rotated because
+//! georeferenced world-file coordinates are defined in stored pixel coordinates;
+//! `jpeg-decoder`'s built-in `MpscWorker` may use helper threads on large frames
+//! even with `rayon` disabled.
 
 use std::sync::Arc;
 
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{
-    BandKey, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, SourceId, TileStreamSpec,
-    level_count, level_size,
-};
+use veldmap_core::tile::{RASTER_TILE_SIZE, SourceFingerprint, SourceId, level_count, level_size};
 
 use crate::RasterError;
 use crate::pipeline::cascade::{self, Cascade, TileEmit};
@@ -23,15 +27,9 @@ use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples};
 use crate::pipeline::resample::{Window, bleed_alpha, resample_rgba8_window};
 use crate::pipeline::{DecodeContext, RasterSource};
 
-const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
-const JPEG_DECODE_REV: u32 = 1;
+use super::{DISPLAY_STREAM_SPEC, map_std_io_error, world_file_binding_trouble};
 
-const DISPLAY_STREAM_SPEC: TileStreamSpec = TileStreamSpec::new(
-    BandKey::Display,
-    PixelFormat::Rgba8UnormSrgb,
-    0,
-    JPEG_DECODE_REV,
-);
+const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
 /// Return whether `head` begins with a JPEG SOI + marker prefix (`FF D8 FF`).
 pub fn has_jpeg_magic(head: &[u8]) -> bool {
@@ -43,6 +41,8 @@ pub struct JpegSource {
     byte_source: Arc<dyn ByteSource>,
     fingerprint: SourceFingerprint,
     source_id: SourceId,
+    coding_process: jpeg_decoder::CodingProcess,
+    channels: usize,
     pass_level: u8,
     pass_peak_bytes: u64,
     description: RasterDescription,
@@ -63,6 +63,7 @@ impl JpegSource {
         }
         let reader = BufferedByteReader::new(Arc::clone(&byte_source), cancel.clone());
         let mut decoder = jpeg_decoder::Decoder::new(reader);
+        decoder.set_max_decoding_buffer_size(budget.decode_working_bytes as usize);
         decoder.read_info().map_err(|e| map_jpeg_error(e, cancel))?;
         let info = decoder
             .info()
@@ -78,6 +79,7 @@ impl JpegSource {
             jpeg_decoder::PixelFormat::RGB24 => 3,
             jpeg_decoder::PixelFormat::CMYK32 => 4,
         };
+        let coding_process = info.coding_process;
 
         let n_levels = level_count(width, height).min(u32::from(u8::MAX)) as u8;
         let mut levels = Vec::with_capacity(usize::from(n_levels));
@@ -86,8 +88,12 @@ impl JpegSource {
         for lvl in 0..n_levels {
             let lw = level_size(width, u32::from(lvl));
             let lh = level_size(height, u32::from(lvl));
-            let (dw, dh) = dct_decoded_size(width, height, lvl);
-            let peak = jpeg_level_peak_bytes(dw, dh, lw, lh);
+            let (dw, dh) = match coding_process {
+                jpeg_decoder::CodingProcess::Lossless => (width, height),
+                _ => dct_decoded_size(width, height, lvl),
+            };
+            let peak =
+                jpeg_level_peak_bytes(width, height, dw, dh, lw, lh, channels, coding_process);
             let fits = peak <= budget.decode_working_bytes;
             if fits && finest_fitting.is_none() {
                 finest_fitting = Some((lvl, peak));
@@ -115,10 +121,7 @@ impl JpegSource {
             row.serve = ServeMode::Pass { from: pass_level };
         }
 
-        let binding_trouble = placement.is_none().then(|| {
-            "JPEG has no accompanying world file (.jgw/.wld); assign CRS or add a world file"
-                .to_string()
-        });
+        let binding_trouble = world_file_binding_trouble("JPEG", ".jgw/.wld", placement.as_ref());
 
         let description = RasterDescription {
             width,
@@ -127,6 +130,7 @@ impl JpegSource {
             ties: Vec::new(),
             placement,
             foreign_datum_epsg: None,
+            geographic_datum: None,
             binding_trouble,
             levels,
         };
@@ -135,6 +139,8 @@ impl JpegSource {
             byte_source,
             fingerprint,
             source_id: SourceId::from_fingerprint(&fingerprint),
+            coding_process,
+            channels,
             pass_level,
             pass_peak_bytes,
             description,
@@ -191,17 +197,25 @@ impl RasterSource for JpegSource {
 
         let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
         let mut decoder = jpeg_decoder::Decoder::new(reader);
-        decoder
-            .read_info()
-            .map_err(|e| map_jpeg_error(e, ctx.cancel))?;
+        decoder.set_max_decoding_buffer_size(ctx.budget.decode_working_bytes as usize);
 
-        // Check scaled output dimensions BEFORE allocating the decoded frame buffer.
+        // `scale()` internally calls `read_info()` and computes the scaled output
+        // dimensions BEFORE allocating the decoded frame buffer.
         let (dw, dh) = decoder
             .scale(clamp_u16(lw), clamp_u16(lh))
             .map(|(w, h)| (u32::from(w), u32::from(h)))
             .map_err(|e| map_jpeg_error(e, ctx.cancel))?;
 
-        let peak = jpeg_level_peak_bytes(dw, dh, lw, lh);
+        let peak = jpeg_level_peak_bytes(
+            self.description.width,
+            self.description.height,
+            dw,
+            dh,
+            lw,
+            lh,
+            self.channels,
+            self.coding_process,
+        );
         if peak > ctx.budget.decode_working_bytes {
             return Err(RasterError::LimitExceeded {
                 width: dw,
@@ -232,11 +246,26 @@ impl RasterSource for JpegSource {
                 mapping.rgba(&Samples::U8(&pixels), PixelLayout::named(3), pixel_count)
             }
             jpeg_decoder::PixelFormat::L16 => {
-                let bytes: Vec<u8> = pixels
+                // Lossless JPEG L16 stores unshifted 9..=16-bit samples; normalize
+                // to the observed peak bit range so 12-bit frames don't render black.
+                let samples: Vec<u16> = pixels
                     .chunks_exact(2)
-                    .map(|p| (u16::from_ne_bytes([p[0], p[1]]) >> 8) as u8)
+                    .take(pixel_count)
+                    .map(|p| u16::from_ne_bytes([p[0], p[1]]))
                     .collect();
-                mapping.rgba(&Samples::U8(&bytes), PixelLayout::named(1), pixel_count)
+                let max_val = samples.iter().copied().max().unwrap_or(255);
+                let hi = if max_val <= 255 {
+                    255.0
+                } else if max_val <= 4095 {
+                    4095.0
+                } else {
+                    65_535.0
+                };
+                DisplayMapping::stretched(0.0, hi, None).rgba(
+                    &Samples::U16(&samples),
+                    PixelLayout::named(1),
+                    pixel_count,
+                )
             }
             jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_rgba8(&pixels, pixel_count),
         };
@@ -282,14 +311,15 @@ impl RasterSource for JpegSource {
     }
 }
 
-fn cmyk_to_rgba8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
+/// Convert `jpeg-decoder`'s un-inverted standard `[C, M, Y, K]` bytes (`0` = no
+/// ink / white, `255` = full ink / black) into opaque RGBA8.
+pub(crate) fn cmyk_to_rgba8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(pixel_count.saturating_mul(4));
     for px in cmyk.chunks_exact(4).take(pixel_count) {
-        // Adobe/JPEG APP14 inverted CMYK convention used by `jpeg-decoder`.
-        let k = f32::from(px[3]) / 255.0;
-        let r = (f32::from(px[0]) * k).round().clamp(0.0, 255.0) as u8;
-        let g = (f32::from(px[1]) * k).round().clamp(0.0, 255.0) as u8;
-        let b = (f32::from(px[2]) * k).round().clamp(0.0, 255.0) as u8;
+        let kf = 1.0 - f32::from(px[3]) / 255.0;
+        let r = ((255.0 - f32::from(px[0])) * kf).round().clamp(0.0, 255.0) as u8;
+        let g = ((255.0 - f32::from(px[1])) * kf).round().clamp(0.0, 255.0) as u8;
+        let b = ((255.0 - f32::from(px[2])) * kf).round().clamp(0.0, 255.0) as u8;
         out.extend_from_slice(&[r, g, b, 255]);
     }
     out
@@ -313,7 +343,33 @@ fn dct_decoded_size(width: u32, height: u32, level: u8) -> (u32, u32) {
     (scaled(width, eighths), scaled(height, eighths))
 }
 
-fn jpeg_level_peak_bytes(dw: u32, dh: u32, lw: u32, lh: u32) -> u64 {
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit geometric and codec dimensions keep peak memory accounting clear"
+)]
+fn jpeg_level_peak_bytes(
+    full_w: u32,
+    full_h: u32,
+    dw: u32,
+    dh: u32,
+    lw: u32,
+    lh: u32,
+    channels: usize,
+    coding_process: jpeg_decoder::CodingProcess,
+) -> u64 {
+    let full_pixels = u64::from(full_w).saturating_mul(u64::from(full_h));
+    // Progressive JPEGs allocate full-resolution `i16` DCT coefficient buffers
+    // (~2 B/px/component) before IDCT scaling; lossless JPEGs allocate two
+    // full-resolution `u16` buffers (~4 B/px/component) and ignore `scale()`.
+    let codec_working = match coding_process {
+        jpeg_decoder::CodingProcess::DctProgressive => full_pixels
+            .saturating_mul(channels as u64)
+            .saturating_mul(2),
+        jpeg_decoder::CodingProcess::Lossless => full_pixels
+            .saturating_mul(channels as u64)
+            .saturating_mul(4),
+        jpeg_decoder::CodingProcess::DctSequential => 0,
+    };
     let raw_decoded = u64::from(dw)
         .saturating_mul(u64::from(dh))
         .saturating_mul(4);
@@ -330,12 +386,60 @@ fn jpeg_level_peak_bytes(dw: u32, dh: u32, lw: u32, lh: u32) -> u64 {
     let max_frame_pair = raw_decoded
         .saturating_add(rgba)
         .max(rgba.saturating_add(resampled));
-    max_frame_pair.saturating_add(cascade::bytes(lw, lh))
+    codec_working
+        .saturating_add(max_frame_pair)
+        .saturating_add(cascade::bytes(lw, lh))
 }
 
 fn map_jpeg_error(err: jpeg_decoder::Error, cancel: &CancelToken) -> RasterError {
     if cancel.is_cancelled() {
         return RasterError::Cancelled;
     }
-    RasterError::Decode(err.to_string())
+    match err {
+        jpeg_decoder::Error::Io(io_err) => map_std_io_error(io_err, cancel),
+        other => RasterError::Decode(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmyk_to_rgba8_handles_uninverted_standard_cmyk() {
+        // White (0,0,0,0), pure cyan (255,0,0,0), pure black (0,0,0,255), mid-gray (0,0,0,128).
+        let input = [0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 128];
+        let rgba = cmyk_to_rgba8(&input, 4);
+        assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&rgba[4..8], &[0, 255, 255, 255]);
+        assert_eq!(&rgba[8..12], &[0, 0, 0, 255]);
+        assert_eq!(rgba[12], 127);
+        assert_eq!(rgba[15], 255);
+    }
+
+    #[test]
+    fn progressive_and_lossless_peak_accounting_includes_full_resolution_buffers() {
+        let seq = jpeg_level_peak_bytes(
+            16_384,
+            16_384,
+            2048,
+            2048,
+            2048,
+            2048,
+            3,
+            jpeg_decoder::CodingProcess::DctSequential,
+        );
+        let prog = jpeg_level_peak_bytes(
+            16_384,
+            16_384,
+            2048,
+            2048,
+            2048,
+            2048,
+            3,
+            jpeg_decoder::CodingProcess::DctProgressive,
+        );
+        // Full 16384x16384x3x2 = 1.6 GiB coefficient buffer must be charged.
+        assert!(prog > seq + 1_500_000_000);
+    }
 }

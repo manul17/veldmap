@@ -3,7 +3,7 @@ use crate::geo::projection::System;
 
 #[test]
 fn projected_and_axial_tie_grid_fraction_inverse_round_trip() {
-    let utm37 = Projection::Transverse(System::utm(37, true));
+    let utm37 = Projection::from(System::utm(37, true));
     let frame = Frame::projected_bounds(utm37, 500_000.0, 5_200_000.0, 510_000.0, 5_210_000.0)
         .expect("valid projected frame");
     let (lat, lon) = frame.geodetic(0.37, 0.64);

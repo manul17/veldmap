@@ -13,7 +13,7 @@ sudo apt-get install -y \
   libxcursor-dev libxi-dev libxrandr-dev pkg-config
 ```
 
-For headless GPU tests on Linux CI or machines without a hardware GPU, install `mesa-vulkan-drivers` (Lavapipe software Vulkan).
+For headless GPU tests on Linux CI or machines without a hardware GPU, install `mesa-vulkan-drivers` (Lavapipe software Vulkan). Native OS file dialogs on Linux use `xdg-desktop-portal` over D-Bus (with `zenity` fallback); minimal window managers without a portal backend can still open files via drag-and-drop, the Layers panel `Path…` prompt, or CLI path arguments.
 
 ## Build, Run & Verify
 

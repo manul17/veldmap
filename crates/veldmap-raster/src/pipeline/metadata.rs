@@ -4,7 +4,7 @@
 //! Raw GeoTIFF binary tag parsing (`GeoKeyDirectoryTag` / `34735`–`34737`)
 //! lives in `crate::tiff::georef`.
 
-use veldmap_core::geo::{CrsSpec, DatumWarning};
+use veldmap_core::geo::{CrsSpec, Datum, DatumWarning};
 use veldmap_core::tile::{BandKey, PixelFormat};
 
 use super::plan::LevelPlan;
@@ -175,6 +175,9 @@ pub struct RasterDescription {
     /// Non-WGS84 geographic datum EPSG code if declared on either a projected
     /// or geographic binding (e.g. Pulkovo-42 `4284`).
     pub foreign_datum_epsg: Option<u16>,
+    /// User-defined geographic datum + warning parsed from GeoTIFF GeoKeys
+    /// (`2048 == 32767` with `2062` `TOWGS84` or `2056`–`2059` ellipsoid keys).
+    pub geographic_datum: Option<(Datum, Option<DatumWarning>)>,
     pub binding_trouble: Option<String>,
     pub levels: Vec<LevelPlan>,
 }

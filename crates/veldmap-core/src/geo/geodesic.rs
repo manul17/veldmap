@@ -5,9 +5,12 @@
 //! area computation (including holes), and geodesic arc densification for
 //! vector rendering on the smooth WGS84 ellipsoid.
 
-use geographiclib_rs::{DirectGeodesic, Geodesic, InverseGeodesic, PolygonArea, Winding};
+use geographiclib_rs::{
+    DirectGeodesic, Geodesic, GeodesicLine, InverseGeodesic, PolygonArea, Winding,
+    geodesic_capability as caps,
+};
 
-use super::footprint::GeoPoint;
+use super::footprint::{GeoPoint, dedup_geo_ring};
 
 /// Result of Karney's inverse geodesic problem between two WGS84 points.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -80,6 +83,13 @@ pub fn geodesic_direct(
     azimuth1_deg: f64,
     distance_m: f64,
 ) -> (f64, f64, f64) {
+    if !(lat1_deg.is_finite()
+        && lon1_deg.is_finite()
+        && azimuth1_deg.is_finite()
+        && distance_m.is_finite())
+    {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
     let g = Geodesic::wgs84();
     g.direct(lat1_deg, lon1_deg, azimuth1_deg, distance_m)
 }
@@ -96,19 +106,17 @@ pub fn polyline_length_m(points: &[GeoPoint]) -> f64 {
 /// ring (automatically tolerating either clockwise or counter-clockwise winding
 /// and optional duplicate closing vertex).
 pub fn ring_perimeter_and_area(ring: &[GeoPoint]) -> GeodesicPolygonMeasurement {
-    let pts = strip_closing_duplicate(ring);
+    let pts = dedup_geo_ring(ring);
     if pts.len() < 3 {
         return GeodesicPolygonMeasurement {
-            perimeter_m: polyline_length_m(ring),
+            perimeter_m: polyline_length_m(&pts),
             area_m2: 0.0,
         };
     }
     let g = Geodesic::wgs84();
     let mut pa = PolygonArea::new(&g, Winding::CounterClockwise);
-    for p in pts {
-        if p.lat.is_finite() && p.lon.is_finite() {
-            pa.add_point(p.lat, p.lon);
-        }
+    for p in &pts {
+        pa.add_point(p.lat, p.lon);
     }
     let (perimeter_m, signed_area_m2, _) = pa.compute(true);
     GeodesicPolygonMeasurement {
@@ -125,19 +133,17 @@ pub fn ring_perimeter_and_area(ring: &[GeoPoint]) -> GeodesicPolygonMeasurement 
     }
 }
 
-/// Signed ellipsoidal area (m²) of a ring with counter-clockwise = positive,
-/// useful for RFC 7946 right-hand winding normalization.
+/// Signed ellipsoidal area (m²) of a ring with counter-clockwise = positive
+/// (folded into `(-A_earth/2, +A_earth/2]` by `PolygonArea::compute(true)`).
 pub fn ring_signed_area_m2(ring: &[GeoPoint]) -> f64 {
-    let pts = strip_closing_duplicate(ring);
+    let pts = dedup_geo_ring(ring);
     if pts.len() < 3 {
         return 0.0;
     }
     let g = Geodesic::wgs84();
     let mut pa = PolygonArea::new(&g, Winding::CounterClockwise);
-    for p in pts {
-        if p.lat.is_finite() && p.lon.is_finite() {
-            pa.add_point(p.lat, p.lon);
-        }
+    for p in &pts {
+        pa.add_point(p.lat, p.lon);
     }
     let (_, signed_area_m2, _) = pa.compute(true);
     if signed_area_m2.is_finite() {
@@ -171,38 +177,37 @@ pub fn polygon_with_holes_measurement(
 /// consecutive samples are separated by at most `max_chord_deg` degrees of arc
 /// (clamped to `[0.05, 10.0]` degrees and capped at `256` segments).
 pub fn sample_geodesic_arc(from: GeoPoint, to: GeoPoint, max_chord_deg: f64) -> Vec<GeoPoint> {
+    if !(from.lat.is_finite() && from.lon.is_finite() && to.lat.is_finite() && to.lon.is_finite()) {
+        return Vec::new();
+    }
     let inv = geodesic_inverse(from.lat, from.lon, to.lat, to.lon);
     if inv.distance_m <= 1e-6 {
         return vec![from, to];
     }
-    let step_deg = max_chord_deg.clamp(0.05, 10.0);
+    let step_deg = if max_chord_deg.is_finite() {
+        max_chord_deg.clamp(0.05, 10.0)
+    } else {
+        2.0
+    };
     let arc_deg = (inv.distance_m / super::geodesy::SEMI_MAJOR_M).to_degrees();
     let segments = ((arc_deg / step_deg).ceil() as usize).clamp(1, 256);
     if segments <= 1 {
         return vec![from, to];
     }
+    let g = Geodesic::wgs84();
+    let line = GeodesicLine::new(&g, from.lat, from.lon, inv.azimuth1_deg, None, None, None);
     let mut out = Vec::with_capacity(segments + 1);
     out.push(from);
     for i in 1..segments {
         let dist = inv.distance_m * (i as f64 / segments as f64);
-        let (lat, lon, _) = geodesic_direct(from.lat, from.lon, inv.azimuth1_deg, dist);
+        let (_a12, lat, lon, ..) =
+            line._gen_position(false, dist, caps::LATITUDE | caps::LONGITUDE);
         if lat.is_finite() && lon.is_finite() {
             out.push(GeoPoint::new(lat, lon));
         }
     }
     out.push(to);
     out
-}
-
-fn strip_closing_duplicate(ring: &[GeoPoint]) -> &[GeoPoint] {
-    if ring.len() >= 2
-        && let (Some(first), Some(last)) = (ring.first(), ring.last())
-        && (first.lat - last.lat).abs() <= 1e-12
-        && (first.lon - last.lon).abs() <= 1e-12
-    {
-        return &ring[..ring.len() - 1];
-    }
-    ring
 }
 
 #[cfg(test)]

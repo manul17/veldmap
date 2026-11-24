@@ -6,7 +6,7 @@
 mod app;
 mod basemap;
 mod dialogs;
-pub mod fonts;
+mod fonts;
 pub mod gpu_tiles;
 mod layers;
 pub mod render;

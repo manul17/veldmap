@@ -118,21 +118,25 @@ fn available_right_overlay_width(viewport_width_pt: f32, pad_x: f32, margin: f32
 }
 
 /// Paint a crisp floating dynamic metric scale bar in the bottom-left corner
-/// of `viewport_rect`.
-pub(crate) fn paint_scale_bar(painter: &egui::Painter, viewport_rect: egui::Rect, m_per_pt: f64) {
+/// of `viewport_rect`, returning its painted bounding rectangle if visible.
+pub(crate) fn paint_scale_bar(
+    painter: &egui::Painter,
+    viewport_rect: egui::Rect,
+    m_per_pt: f64,
+) -> Option<egui::Rect> {
     if !m_per_pt.is_finite()
         || m_per_pt <= 0.0
         || viewport_rect.width() < 120.0
         || viewport_rect.height() < 80.0
     {
-        return;
+        return None;
     }
     let max_width_pt =
         (viewport_rect.width() * 0.35).clamp(SCALE_BAR_MIN_WIDTH_PT, SCALE_BAR_MAX_WIDTH_PT);
     // Hide the tangent-plane scale bar at extreme orbital zoom where the bar
     // would exceed 10,000 km and no longer reflects curved planetary scale.
     if m_per_pt * f64::from(max_width_pt) > 10_000_000.0 {
-        return;
+        return None;
     }
     let (label, bar_w) = compute_scale_bar(m_per_pt, max_width_pt);
     let margin = SCALE_BAR_MARGIN_PT;
@@ -186,11 +190,13 @@ pub(crate) fn paint_scale_bar(painter: &egui::Painter, viewport_rect: egui::Rect
         egui::FontId::monospace(12.0),
         egui::Color32::from_rgb(245, 242, 232),
     );
+    Some(box_rect)
 }
 
 /// Interactive floating North compass dial in the top-right corner of
-/// `viewport_rect`. Hosted in a foreground `egui::Area` so clicks and hovers
-/// never bleed into the globe viewport underneath. Returns `(clicked, rect)`.
+/// `viewport_rect`. Hosted in a `Background`-ordered `egui::Area` so it sits
+/// cleanly above the `CentralPanel` globe (capturing clicks/hovers) while
+/// staying strictly beneath floating `Order::Middle` windows.
 pub(crate) fn show_north_compass(
     ctx: &egui::Context,
     viewport_rect: egui::Rect,
@@ -204,7 +210,7 @@ pub(crate) fn show_north_compass(
     );
 
     let area_resp = egui::Area::new(egui::Id::unique("north_compass_overlay"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Background)
         .fixed_pos(pos)
         .interactable(true)
         .show(ctx, |ui| {
@@ -275,13 +281,14 @@ pub(crate) fn show_north_compass(
 /// Paint a compact, high-contrast attribution pill in the bottom-right corner
 /// of the globe viewport so NASA GIBS and EOX CC BY 4.0 credits remain visible
 /// without overlapping the bottom-left metric scale bar at narrow widths.
+/// Returns its painted bounding rectangle if visible.
 pub(crate) fn paint_attribution_badge(
     painter: &egui::Painter,
     rect: egui::Rect,
     attribution: &str,
-) {
+) -> Option<egui::Rect> {
     if attribution.is_empty() || rect.height() < 60.0 {
-        return;
+        return None;
     }
 
     let pad_x = 8.0;
@@ -289,7 +296,7 @@ pub(crate) fn paint_attribution_badge(
     let margin = 10.0;
     let avail = available_right_overlay_width(rect.width(), pad_x, margin);
     if avail < 100.0 {
-        return;
+        return None;
     }
 
     let font = egui::FontId::proportional(11.0);
@@ -320,6 +327,7 @@ pub(crate) fn paint_attribution_badge(
         galley,
         egui::Color32::WHITE,
     );
+    Some(badge_rect)
 }
 
 #[cfg(test)]

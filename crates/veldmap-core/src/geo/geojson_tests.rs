@@ -1,5 +1,7 @@
 use super::*;
 use crate::geo::footprint::{covers_polygon, frame_polygons};
+use crate::geo::geodesy::WGS84;
+use glam::DVec3;
 
 #[test]
 fn parses_feature_collection_with_holes_and_round_trips_rfc7946_winding() {
@@ -28,12 +30,10 @@ fn parses_feature_collection_with_holes_and_round_trips_rfc7946_winding() {
     let GeoJsonGeometry::Polygon(ref poly) = fc.features[0].geometry else {
         panic!("expected polygon");
     };
-    // Footprint covers exterior ring but excludes hole.
     assert!(covers_polygon(poly, 47.1, 39.1));
     assert!(!covers_polygon(poly, 47.5, 39.5));
     assert!(frame_polygons(std::slice::from_ref(poly)).is_some());
 
-    // Export and re-parse: verify RFC 7946 winding (exterior CCW > 0, hole CW < 0) and closure.
     let exported = export_geojson_feature_collection(&fc);
     let reparsed = parse_geojson(&exported).expect("reparse exported geojson");
     let GeoJsonGeometry::Polygon(ref poly2) = reparsed.features[0].geometry else {
@@ -47,8 +47,35 @@ fn parses_feature_collection_with_holes_and_round_trips_rfc7946_winding() {
 }
 
 #[test]
-fn tessellates_holed_concave_and_continental_hemispheric_polygons_with_interior_subdivision() {
-    // 1. Large continental concave polygon spanning > 100 degrees across North Pole / high latitudes
+fn rejects_invalid_geojson_nesting_and_out_of_range_positions() {
+    let nested_fc =
+        r#"{"type":"FeatureCollection","features":[{"type":"FeatureCollection","features":[]}]}"#;
+    assert!(matches!(
+        parse_geojson(nested_fc),
+        Err(GeoJsonError::Structure(_))
+    ));
+
+    let nested_feature = r#"{"type":"Feature","properties":{},"geometry":{"type":"Feature","properties":{},"geometry":null}}"#;
+    assert!(matches!(
+        parse_geojson(nested_feature),
+        Err(GeoJsonError::Structure(_))
+    ));
+
+    let huge_lon = r#"{"type":"Point","coordinates":[1e200, 10.0]}"#;
+    assert!(matches!(
+        parse_geojson(huge_lon),
+        Err(GeoJsonError::Structure(_))
+    ));
+
+    let tiny_ring = r#"{"type":"Polygon","coordinates":[[[0,0],[1,1]]]}"#;
+    assert!(matches!(
+        parse_geojson(tiny_ring),
+        Err(GeoJsonError::Structure(_))
+    ));
+}
+
+#[test]
+fn tessellates_holed_concave_and_continental_polygons_with_subdivision_and_rtc_clusters() {
     let continental = Polygon::with_holes(
         Ring {
             points: vec![
@@ -79,67 +106,59 @@ fn tessellates_holed_concave_and_continental_hemispheric_polygons_with_interior_
 
     let max_chord = 4.0;
     let mesh = VectorMesh::from_collection(&fc, max_chord);
-    assert!(!mesh.fill_indices.is_empty());
-    assert!(!mesh.line_vertices.is_empty());
-    // Interior subdivision must emit many more triangles than raw 9 boundary vertices (~9 tris).
-    assert!(
-        mesh.fill_indices.len() / 3 > 100,
-        "expected subdivided interior triangles, got {}",
-        mesh.fill_indices.len() / 3
-    );
+    assert!(mesh.fill_triangle_count() > 100);
+    assert!(mesh.line_segment_count() > 10);
 
-    // Every triangle must have outward CCW winding, unit outward normals, and
-    // bounded chord length (no triangle spanning 60 deg straight through the Earth).
-    for tri in mesh.fill_indices.chunks_exact(3) {
-        let v0 = mesh.fill_vertices[tri[0] as usize];
-        let v1 = mesh.fill_vertices[tri[1] as usize];
-        let v2 = mesh.fill_vertices[tri[2] as usize];
-        let p0 = DVec3::new(
-            v0.rel_pos[0] as f64,
-            v0.rel_pos[1] as f64,
-            v0.rel_pos[2] as f64,
-        );
-        let p1 = DVec3::new(
-            v1.rel_pos[0] as f64,
-            v1.rel_pos[1] as f64,
-            v1.rel_pos[2] as f64,
-        );
-        let p2 = DVec3::new(
-            v2.rel_pos[0] as f64,
-            v2.rel_pos[1] as f64,
-            v2.rel_pos[2] as f64,
-        );
-        let n0 = DVec3::new(
-            v0.normal[0] as f64,
-            v0.normal[1] as f64,
-            v0.normal[2] as f64,
-        );
-        let n1 = DVec3::new(
-            v1.normal[0] as f64,
-            v1.normal[1] as f64,
-            v1.normal[2] as f64,
-        );
-        let n2 = DVec3::new(
-            v2.normal[0] as f64,
-            v2.normal[1] as f64,
-            v2.normal[2] as f64,
-        );
-        assert!((n0.length() - 1.0).abs() < 1e-4);
-        let face = (p1 - p0).cross(p2 - p0);
-        assert!(face.dot(n0 + n1 + n2) >= 0.0, "inward triangle winding");
+    for cluster in &mesh.clusters {
+        for tri in cluster.fill_indices.chunks_exact(3) {
+            let v0 = cluster.fill_vertices[tri[0] as usize];
+            let v1 = cluster.fill_vertices[tri[1] as usize];
+            let v2 = cluster.fill_vertices[tri[2] as usize];
+            let p0 = DVec3::new(
+                f64::from(v0.rel_pos[0]),
+                f64::from(v0.rel_pos[1]),
+                f64::from(v0.rel_pos[2]),
+            );
+            let p1 = DVec3::new(
+                f64::from(v1.rel_pos[0]),
+                f64::from(v1.rel_pos[1]),
+                f64::from(v1.rel_pos[2]),
+            );
+            let p2 = DVec3::new(
+                f64::from(v2.rel_pos[0]),
+                f64::from(v2.rel_pos[1]),
+                f64::from(v2.rel_pos[2]),
+            );
+            let n0 = DVec3::new(
+                f64::from(v0.normal[0]),
+                f64::from(v0.normal[1]),
+                f64::from(v0.normal[2]),
+            );
+            let n1 = DVec3::new(
+                f64::from(v1.normal[0]),
+                f64::from(v1.normal[1]),
+                f64::from(v1.normal[2]),
+            );
+            let n2 = DVec3::new(
+                f64::from(v2.normal[0]),
+                f64::from(v2.normal[1]),
+                f64::from(v2.normal[2]),
+            );
+            assert!((n0.length() - 1.0).abs() < 1e-4);
+            let face = (p1 - p0).cross(p2 - p0);
+            assert!(face.dot(n0 + n1 + n2) >= 0.0, "inward triangle winding");
 
-        // Edge chord length bounded by ~max_chord + slack (4 deg ~ 450 km, allow 550 km).
-        let max_edge_m = p0.distance(p1).max(p1.distance(p2)).max(p2.distance(p0));
-        assert!(
-            max_edge_m < 600_000.0,
-            "interior edge was not subdivided: {max_edge_m} m"
-        );
+            let max_edge_m = p0.distance(p1).max(p1.distance(p2)).max(p2.distance(p0));
+            assert!(
+                max_edge_m < 550_000.0,
+                "interior edge was not subdivided: {max_edge_m} m"
+            );
+        }
     }
 }
 
 #[test]
-fn tessellates_polar_antimeridian_and_over_hemispheric_polygons_without_blowup() {
-    // Polar cap polygon surrounding the North Pole
+fn tessellates_polar_antimeridian_and_over_hemisphere_polygons_accurately() {
     let polar = Polygon::new(Ring {
         points: vec![
             GeoPoint::new(82.0, 0.0),
@@ -148,7 +167,6 @@ fn tessellates_polar_antimeridian_and_over_hemispheric_polygons_without_blowup()
             GeoPoint::new(82.0, -90.0),
         ],
     });
-    // Antimeridian-crossing polygon
     let antimeridian = Polygon::new(Ring {
         points: vec![
             GeoPoint::new(50.0, 172.0),
@@ -163,23 +181,98 @@ fn tessellates_polar_antimeridian_and_over_hemispheric_polygons_without_blowup()
     assert!(covers_polygon(&antimeridian, 55.0, 179.0));
     assert!(covers_polygon(&antimeridian, 55.0, -179.0));
 
-    let fc = GeoJsonFeatureCollection {
-        features: vec![
-            GeoJsonFeature {
-                name: None,
-                properties: Map::new(),
-                geometry: GeoJsonGeometry::Polygon(polar),
-            },
-            GeoJsonFeature {
-                name: None,
-                properties: Map::new(),
-                geometry: GeoJsonGeometry::Polygon(antimeridian),
-            },
+    // >hemisphere RFC 7946 CCW cap: boundary at lat = -20 deg going East,
+    // enclosing the Northern Hemisphere + equatorial band down to -20 deg
+    // (radius 110 deg > 90 deg, covering ~67% of Earth's surface).
+    let over_hemisphere = Polygon::new(Ring {
+        points: vec![
+            GeoPoint::new(-20.0, 0.0),
+            GeoPoint::new(-20.0, 90.0),
+            GeoPoint::new(-20.0, 180.0),
+            GeoPoint::new(-20.0, -90.0),
         ],
+    });
+    let fc = GeoJsonFeatureCollection {
+        features: vec![GeoJsonFeature {
+            name: Some("Over-hemisphere cap".to_string()),
+            properties: Map::new(),
+            geometry: GeoJsonGeometry::Polygon(over_hemisphere),
+        }],
     };
-    let mesh = VectorMesh::from_collection(&fc, 2.0);
-    assert!(!mesh.fill_indices.is_empty());
-    assert!(mesh.fill_vertices.iter().all(|v| {
-        v.rel_pos.iter().all(|c| c.is_finite()) && v.normal.iter().all(|c| c.is_finite())
-    }));
+    let mesh = VectorMesh::from_collection(&fc, 10.0);
+    assert!(mesh.fill_triangle_count() > 50);
+
+    // Verify triangles cover the North Pole (z > 0) and NOT the South Pole (z < -0.95 R):
+    // if complement inversion happened, triangles would cluster around z = -R instead.
+    let mut max_z = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    for c in &mesh.clusters {
+        for v in &c.fill_vertices {
+            assert!(v.rel_pos.iter().all(|x| x.is_finite()));
+            assert!(v.normal.iter().all(|x| x.is_finite()));
+            let wz = c.origin_ecef_m.z + f64::from(v.rel_pos[2]);
+            max_z = max_z.max(wz);
+            min_z = min_z.min(wz);
+        }
+    }
+    assert!(
+        max_z > 5_000_000.0,
+        "expected >hemisphere cap to cover Northern Hemisphere, max_z={max_z}"
+    );
+    assert!(
+        min_z > -3_000_000.0,
+        "over-hemisphere cap leaked into South Polar complement, min_z={min_z}"
+    );
+}
+
+#[test]
+fn per_cluster_rtc_preserves_submillimetre_precision_across_continents_and_tiny_drone_polygons() {
+    // Two tiny ~5 cm x 5 cm survey markers placed 6,400 km apart (Moscow & Vladivostok).
+    let d_deg = 5e-7; // ~5.5 cm
+    let marker = |lat: f64, lon: f64| GeoJsonFeature {
+        name: None,
+        properties: Map::new(),
+        geometry: GeoJsonGeometry::Polygon(Polygon::new(Ring {
+            points: vec![
+                GeoPoint::new(lat, lon),
+                GeoPoint::new(lat, lon + d_deg),
+                GeoPoint::new(lat + d_deg, lon + d_deg),
+                GeoPoint::new(lat + d_deg, lon),
+            ],
+        })),
+    };
+    let fc = GeoJsonFeatureCollection {
+        features: vec![marker(55.75, 37.62), marker(43.115, 131.885)],
+    };
+    let mesh = VectorMesh::from_collection(&fc, DEFAULT_VECTOR_MAX_CHORD_DEG);
+    // Must separate into 2 localized RTC clusters, and preserve both 25 cm^2 drone triangles!
+    assert_eq!(mesh.clusters.len(), 2);
+    assert_eq!(mesh.fill_triangle_count(), 4);
+    for c in &mesh.clusters {
+        for v in &c.fill_vertices {
+            let offset_m = DVec3::new(
+                f64::from(v.rel_pos[0]),
+                f64::from(v.rel_pos[1]),
+                f64::from(v.rel_pos[2]),
+            )
+            .length();
+            assert!(
+                offset_m < 10.0,
+                "expected localized RTC offset < 10 m, got {offset_m} m"
+            );
+        }
+        // Verify reconstructed f64 ECEF stays on WGS84 within < 1 mm.
+        let p0 = c.origin_ecef_m
+            + DVec3::new(
+                f64::from(c.fill_vertices[0].rel_pos[0]),
+                f64::from(c.fill_vertices[0].rel_pos[1]),
+                f64::from(c.fill_vertices[0].rel_pos[2]),
+            );
+        let geo = WGS84.from_ecef(p0);
+        assert!(
+            geo.height_m.abs() < 1e-3,
+            "height drift: {} m",
+            geo.height_m
+        );
+    }
 }

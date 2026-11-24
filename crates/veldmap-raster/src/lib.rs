@@ -20,7 +20,7 @@ mod color;
 mod display;
 mod pipeline;
 mod pool;
-pub mod sidecar;
+mod sidecar;
 mod tiff;
 
 pub use adapters::{JpegSource, PngSource, has_jpeg_magic, has_png_magic};
@@ -39,8 +39,8 @@ pub use pool::{
     SubmitError, TwoLaneDecodePool, TwoLaneDecodePoolConfig, TwoLaneDecodePoolHandle,
 };
 pub use sidecar::{
-    load_sidecar_placement, parse_prj_text, parse_world_file, prj_file_candidates,
-    world_file_candidates,
+    SidecarGeoref, load_sidecar_georef, load_sidecar_placement, parse_prj_text, parse_world_file,
+    prj_file_candidates, world_file_candidates,
 };
 pub use tiff::{MAX_IFDS, MAX_SOURCE_SIDE, TiffSource, has_tiff_magic};
 

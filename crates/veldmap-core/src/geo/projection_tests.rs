@@ -59,7 +59,7 @@ fn web_mercator_and_expanded_epsg_recognized() {
     assert_eq!(Projection::from_epsg(3857), Some(Projection::WebMercator));
     assert!(matches!(
         Projection::from_epsg(32637),
-        Some(Projection::Transverse(_))
+        Some(Projection::Transverse { .. })
     ));
     assert!(matches!(
         Projection::from_epsg(3035),
@@ -163,11 +163,83 @@ fn proj4_epsg_and_wkt_round_trip_and_warn_on_grid_datums() {
     let lback = lcc.to_geodetic(lx, ly);
     assert!(ground_m(lback, (42.36, -71.06)) < 0.05);
 
-    // Searchable presets find both curated and catalog EPSG codes
+    // Searchable presets find both curated (`32637`) and non-curated catalog (`26911`) EPSG codes.
     let hits = search_crs_presets("32637", 10);
     assert!(hits.iter().any(|p| p.epsg == 32637));
-    let catalog_hits = search_crs_presets("2154", 10);
-    assert!(catalog_hits.iter().any(|p| p.epsg == 2154));
+    let catalog_hits = search_crs_presets("26911", 10);
+    assert!(
+        catalog_hits
+            .iter()
+            .any(|p| p.epsg == 26911 && p.category == "EPSG Catalog")
+    );
+}
+
+#[test]
+fn crs_guards_geocentric_nad27_sphere_foreign_ellipsoids_and_named_custom_tm() {
+    use super::super::crs::{CrsSpec, CustomTmParams, DatumWarning, Proj4Projection};
+
+    // 3D geocentric CRS (+proj=geocent) must be rejected as a 2D map CRS.
+    assert!(CrsSpec::from_epsg(4978).is_err());
+    assert!(Proj4Projection::from_proj_string("+proj=geocent +datum=WGS84", None).is_err());
+
+    // NAD27 (missing NADCON grids) must construct via fallback Helmert + GridShiftRecommended.
+    let nad27 = CrsSpec::from_epsg(26710).expect("NAD27 UTM 10N fallback");
+    assert!(matches!(
+        nad27.datum_warning(),
+        Some(DatumWarning::GridShiftRecommended { .. })
+    ));
+    let CrsSpec::Projected(nad27_proj) = nad27 else {
+        panic!("expected projected NAD27 CRS");
+    };
+    let (e, n) = nad27_proj.from_geodetic(37.7749, -122.4194);
+    let back = nad27_proj.to_geodetic(e, n);
+    assert!(ground_m(back, (37.7749, -122.4194)) < 1.0);
+
+    // ETRS89 / RGF93 plate-fixed presets emit GridShiftRecommended consistently with EPSG:4258.
+    for code in [3035, 25832, 2154] {
+        let spec = CrsSpec::from_epsg(code).expect("ETRS89/RGF93 CRS");
+        assert!(
+            matches!(
+                spec.datum_warning(),
+                Some(DatumWarning::GridShiftRecommended { .. })
+            ),
+            "EPSG:{code} should emit GridShiftRecommended"
+        );
+    }
+
+    // Foreign ellipsoid without +towgs84= or +datum= must warn (not just +ellps=krass).
+    let bessel = Proj4Projection::from_proj_string("+proj=utm +zone=32 +ellps=bessel", None)
+        .expect("bessel UTM");
+    assert!(matches!(
+        bessel.datum_warning(),
+        Some(DatumWarning::UnshiftedForeignDatum { .. })
+    ));
+
+    // EPSG:4055 (Popular Visualisation Sphere) must NOT be mislabeled WGS 84.
+    let sphere = CrsSpec::from_epsg(4055).expect("EPSG:4055");
+    assert!(!sphere.label().contains("WGS 84"));
+
+    // CustomTmParams::to_projection preserves user-supplied name in label().
+    let params = CustomTmParams {
+        name: "MSK-77 Test".to_string(),
+        ..CustomTmParams::default()
+    };
+    let proj = params.to_projection().expect("valid custom TM");
+    assert_eq!(proj.label(), "MSK-77 Test");
+
+    // In-house GK and MSK-61 labels are recognized without requiring a manual name.
+    assert!(
+        Projection::from_epsg(28407)
+            .expect("GK 7")
+            .label()
+            .contains("28407")
+    );
+    assert!(
+        Projection::from_epsg(6_336_101)
+            .expect("MSK-61 z1")
+            .label()
+            .contains("MSK-61")
+    );
 }
 
 fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {
@@ -245,7 +317,8 @@ fn epsg_names_a_system_only_inside_its_bands() {
     assert_eq!(System::from_epsg(32660), Some(System::utm(60, false)));
     assert_eq!(System::from_epsg(32701), Some(System::utm(1, true)));
     assert_eq!(System::from_epsg(32760), Some(System::utm(60, true)));
-    assert_eq!(System::from_epsg(28401), Some(System::gauss_kruger(1)));
+    assert_eq!(System::from_epsg(28401), None);
+    assert_eq!(System::from_epsg(28402), Some(System::gauss_kruger(2)));
     assert_eq!(System::from_epsg(28408), Some(System::gauss_kruger(8)));
     assert_eq!(System::from_epsg(28432), Some(System::gauss_kruger(32)));
     assert_eq!(System::from_epsg(6_336_101), System::msk61(1));

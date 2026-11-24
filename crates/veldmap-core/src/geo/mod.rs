@@ -20,8 +20,8 @@ pub use camera::Camera;
 pub use coords::{LocationKind, ParseLocationError, ParsedLocation, parse_location};
 pub use crs::{
     CrsError, CrsPreset, CrsSpec, CustomTmParams, DatumPreset, DatumWarning, LinearUnit,
-    Proj4Projection, builtin_crs_presets, datum_from_towgs84, ellipsoid_from_epsg,
-    known_datum_from_code, search_crs_presets,
+    Proj4Projection, builtin_crs_presets, ellipsoid_from_epsg, known_datum_from_code,
+    search_crs_presets,
 };
 pub use cull::{Ball, CullFrustum};
 pub use footprint::{FootprintBounds, GeoPoint, Polygon, Ring};
@@ -33,7 +33,8 @@ pub use geodesic::{
 pub use geodesy::{Ellipsoid, Geodetic, WGS84};
 pub use geojson::{
     DEFAULT_VECTOR_MAX_CHORD_DEG, GeoJsonError, GeoJsonFeature, GeoJsonFeatureCollection,
-    GeoJsonGeometry, VectorMesh, VectorVertex, export_geojson_feature_collection, parse_geojson,
+    GeoJsonGeometry, VectorCluster, VectorMesh, VectorVertex, export_geojson_feature_collection,
+    parse_geojson,
 };
 pub use mgrs::{MgrsError, MgrsGranuleFrame};
 pub use projection::{

@@ -1,6 +1,6 @@
 //! Serialized off-UI-thread maintenance worker (`DiskCacheWorker`) handling
-//! SQLite disk-cache stats, cap updates, full clears, and durable
-//! `settings.json` saves in FIFO order.
+//! SQLite disk-cache stats, cap updates, full clears, and coalesced durable
+//! `settings.json` / `session.json` saves in FIFO order.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -41,8 +41,9 @@ enum DiskCacheCmd {
 }
 
 /// Serialized off-UI-thread worker handling SQLite stats, cap changes, full
-/// clears, and durable `settings.json` writes in FIFO order (never blocking
-/// the egui frame loop and draining cleanly before joining on shutdown).
+/// clears, and coalesced durable `settings.json` / `session.json` writes in
+/// FIFO order (never blocking the egui frame loop and draining cleanly before
+/// joining on shutdown).
 pub(super) struct DiskCacheWorker {
     tx: Option<Sender<DiskCacheCmd>>,
     state: Arc<Mutex<DiskCacheStatus>>,
@@ -72,7 +73,8 @@ impl DiskCacheWorker {
         let handle = match thread::Builder::new()
             .name("veldmap-disk-cache-ui".to_owned())
             .spawn(move || {
-                while let Ok(cmd) = rx.recv() {
+                let mut pending_cmd: Option<DiskCacheCmd> = None;
+                while let Some(cmd) = pending_cmd.take().or_else(|| rx.recv().ok()) {
                     match cmd {
                         DiskCacheCmd::RefreshStats => {
                             if let Some(cache) = &cache
@@ -125,14 +127,34 @@ impl DiskCacheWorker {
                             }
                             (wakeup)();
                         }
-                        DiskCacheCmd::SaveSettings(settings) => {
+                        DiskCacheCmd::SaveSettings(mut settings) => {
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(DiskCacheCmd::SaveSettings(newer)) => settings = newer,
+                                    Ok(other) => {
+                                        pending_cmd = Some(other);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
                             if let Some(paths) = &paths
                                 && let Err(err) = settings.save(paths)
                             {
                                 tracing::warn!(error = %err, "Failed to persist user settings");
                             }
                         }
-                        DiskCacheCmd::SaveSession(session) => {
+                        DiskCacheCmd::SaveSession(mut session) => {
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(DiskCacheCmd::SaveSession(newer)) => session = newer,
+                                    Ok(other) => {
+                                        pending_cmd = Some(other);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
                             if let Some(paths) = &paths
                                 && let Err(err) = session.save(paths)
                             {

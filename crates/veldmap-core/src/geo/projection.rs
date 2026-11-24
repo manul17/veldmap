@@ -223,8 +223,11 @@ impl Datum {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Projection {
     /// Fast exact in-house Transverse Mercator family (UTM, Gauss-Kruger,
-    /// MSK-xx, and custom user-defined TM systems).
-    Transverse(System),
+    /// MSK-xx, and custom user-defined TM systems) with an optional display name.
+    Transverse {
+        system: System,
+        name: Option<Arc<str>>,
+    },
     /// Web Mercator (EPSG:3857).
     WebMercator,
     /// General pure-Rust `proj4rs` projection (EPSG catalog via
@@ -234,7 +237,23 @@ pub enum Projection {
 
 impl From<System> for Projection {
     fn from(system: System) -> Self {
-        Self::Transverse(system)
+        Self::Transverse { system, name: None }
+    }
+}
+
+impl Projection {
+    /// Construct a named in-house Transverse Mercator projection.
+    pub fn transverse_named(system: System, name: impl Into<Arc<str>>) -> Self {
+        let name_arc: Arc<str> = name.into();
+        let trimmed_len = name_arc.trim().len();
+        let name = if trimmed_len == 0 {
+            None
+        } else if trimmed_len == name_arc.len() {
+            Some(name_arc)
+        } else {
+            Some(Arc::<str>::from(name_arc.trim()))
+        };
+        Self::Transverse { system, name }
     }
 }
 
@@ -255,7 +274,7 @@ impl Projection {
     ///
     /// Retains fast exact in-house implementations for EPSG:3857, WGS84 UTM
     /// (`32601..=32660`, `32701..=32760`), Pulkovo 1942 Gauss-Kruger
-    /// (`28401..=28432`), and MSK-61 (`6336101..=6336103`), falling back to
+    /// (`28402..=28432`), and MSK-61 (`6336101..=6336103`), falling back to
     /// pure-Rust `proj4rs` + `crs-definitions` for all other projected EPSG
     /// codes.
     pub fn from_epsg(code: u32) -> Option<Self> {
@@ -263,7 +282,10 @@ impl Projection {
             return Some(Self::WebMercator);
         }
         if let Some(sys) = System::from_epsg(code) {
-            return Some(Self::Transverse(sys));
+            return Some(Self::Transverse {
+                system: sys,
+                name: None,
+            });
         }
         let proj4 = Proj4Projection::from_epsg(code).ok()?;
         (!proj4.is_geographic()).then(|| Self::Proj4(Arc::new(proj4)))
@@ -295,7 +317,7 @@ impl Projection {
     /// in the projection's native linear units.
     pub fn from_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         match self {
-            Self::Transverse(system) => system.from_geodetic(lat_deg, lon_deg),
+            Self::Transverse { system, .. } => system.from_geodetic(lat_deg, lon_deg),
             Self::WebMercator => web_mercator_xy_unchecked(
                 lat_deg.clamp(-WEB_MERCATOR_LIMIT_DEG, WEB_MERCATOR_LIMIT_DEG),
                 lon_deg,
@@ -308,7 +330,7 @@ impl Projection {
     /// linear units to WGS84 `(lat_deg, lon_deg)`.
     pub fn to_geodetic(&self, easting: f64, northing: f64) -> (f64, f64) {
         match self {
-            Self::Transverse(system) => system.to_geodetic(easting, northing),
+            Self::Transverse { system, .. } => system.to_geodetic(easting, northing),
             Self::WebMercator => {
                 let lon = (easting / WEB_MERCATOR_RADIUS_M).to_degrees();
                 let lat = web_mercator_lat_deg(northing / WEB_MERCATOR_RADIUS_M);
@@ -321,7 +343,7 @@ impl Projection {
     /// Scale factor from this projection's linear units to metres.
     pub fn unit_to_metres(&self) -> f64 {
         match self {
-            Self::Transverse(sys) => sys.safe_unit_to_metres(),
+            Self::Transverse { system, .. } => system.safe_unit_to_metres(),
             Self::WebMercator => 1.0,
             Self::Proj4(proj) => proj.unit_to_metres(),
         }
@@ -331,7 +353,7 @@ impl Projection {
     pub fn datum_warning(&self) -> Option<&DatumWarning> {
         match self {
             Self::Proj4(proj) => proj.datum_warning(),
-            Self::Transverse(_) | Self::WebMercator => None,
+            Self::Transverse { .. } | Self::WebMercator => None,
         }
     }
 
@@ -339,7 +361,10 @@ impl Projection {
     pub fn label(&self) -> String {
         match self {
             Self::WebMercator => "EPSG:3857 (Web Mercator)".to_string(),
-            Self::Transverse(sys) => sys.label(),
+            Self::Transverse {
+                name: Some(name), ..
+            } => name.to_string(),
+            Self::Transverse { system, name: None } => system.label(),
             Self::Proj4(proj) => proj.label().to_string(),
         }
     }
@@ -439,7 +464,7 @@ impl System {
         match code {
             32601..=32660 => Some(Self::utm(code - 32600, false)),
             32701..=32760 => Some(Self::utm(code - 32700, true)),
-            28401..=28432 => Some(Self::gauss_kruger(code - 28400)),
+            28402..=28432 => Some(Self::gauss_kruger(code - 28400)),
             6_336_101..=6_336_103 => Self::msk61(code - 6_336_100),
             _ => None,
         }
@@ -469,6 +494,30 @@ impl System {
                 }
                 if (self.false_northing_m - UTM_FALSE_NORTHING_SOUTH).abs() < 1e-6 {
                     return format!("EPSG:{} (UTM {zone}S)", 32700 + zone);
+                }
+            }
+        }
+        if self.datum == PULKOVO_1942
+            && self.origin_lat_deg == 0.0
+            && (self.scale - 1.0).abs() < 1e-12
+            && (self.safe_unit_to_metres() - 1.0).abs() < 1e-12
+        {
+            let zone_f = (self.central_meridian_deg + 3.0) / 6.0;
+            let zone = zone_f.round() as u32;
+            if (2..=32).contains(&zone)
+                && (zone_f - f64::from(zone)).abs() < 1e-9
+                && (self.false_easting_m - (f64::from(zone) * 1_000_000.0 + 500_000.0)).abs() < 1e-3
+                && self.false_northing_m.abs() < 1e-3
+            {
+                return format!("EPSG:{} (Pulkovo 1942 / GK zone {zone})", 28_400 + zone);
+            }
+            for zone in 1..=3 {
+                if let Some(msk) = Self::msk61(zone)
+                    && (self.central_meridian_deg - msk.central_meridian_deg).abs() < 1e-8
+                    && (self.false_easting_m - msk.false_easting_m).abs() < 1e-3
+                    && (self.false_northing_m - msk.false_northing_m).abs() < 1e-3
+                {
+                    return format!("MSK-61 / Pulkovo 1942 zone {zone}");
                 }
             }
         }

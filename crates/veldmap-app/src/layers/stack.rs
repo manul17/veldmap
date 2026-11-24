@@ -23,6 +23,7 @@ pub(super) struct OverlayLayer {
     pub(super) fingerprint_hex: String,
     pub(super) frame: Arc<Frame>,
     pub(super) crs_override: Option<SavedCrsOverride>,
+    pub(super) crs_override_epoch: u64,
     pub(super) last_error: Option<String>,
     pub(super) relaid: u64,
     pub(super) cull: OverlayCullTree,
@@ -76,6 +77,7 @@ impl OverlayLayer {
             fingerprint_hex,
             frame: Arc::new(frame),
             crs_override,
+            crs_override_epoch: 0,
             last_error: None,
             relaid,
             cull,
@@ -103,6 +105,7 @@ impl OverlayLayer {
         self.footprint = frame.footprint_bounds();
         self.frame = Arc::new(frame);
         self.crs_override = crs_override;
+        self.crs_override_epoch = self.crs_override_epoch.saturating_add(1);
         self.last_error = None;
         self.relaid = relaid;
         self.cull = OverlayCullTree::new(desc.width, desc.height, self.meta.max_level());
@@ -169,6 +172,7 @@ impl OverlayLayer {
             relaid,
         );
         replacement.reload_seq = seq;
+        replacement.crs_override_epoch = self.crs_override_epoch;
         *self = replacement;
         Some(old_src)
     }

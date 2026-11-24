@@ -34,13 +34,21 @@ fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
     limits
 }
 
+struct ScannedOverviews {
+    overviews: Vec<Overview>,
+    overview_ycbcr: Vec<(usize, super::tags::YCbCrParams)>,
+    ifd_index: usize,
+    decoder_clean: bool,
+}
+
 fn scan_overviews(
     decoder: &mut Decoder<BufferedByteReader>,
     format: TiffFormat,
     budget: &MemoryBudget,
     cancel: &CancelToken,
-) -> Result<(Vec<Overview>, usize, bool), RasterError> {
+) -> Result<ScannedOverviews, RasterError> {
     let mut overviews = Vec::new();
+    let mut overview_ycbcr = Vec::new();
     let mut ifd_index = 0usize;
     let mut decoder_clean = true;
     while ifd_index + 1 < MAX_IFDS && decoder.more_images() {
@@ -64,19 +72,19 @@ fn scan_overviews(
         if !is_overview(subfile) {
             continue;
         }
-        match ensure_readable(decoder, cancel) {
+        let o_ycbcr = match ensure_readable(decoder, cancel) {
             Ok((o_layout, o_bits, o_type, o_ycbcr)) => {
                 if o_layout != format.pixel_layout
                     || o_bits != format.sample_bits
                     || o_type != format.sample_type
-                    || o_ycbcr != format.ycbcr
                 {
                     continue;
                 }
+                o_ycbcr
             }
             Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
             Err(_) => continue,
-        }
+        };
         let Ok((ow, oh)) = decoder.dimensions() else {
             if cancel.is_cancelled() {
                 return Err(RasterError::Cancelled);
@@ -92,6 +100,9 @@ fn scan_overviews(
             Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
             Err(_) => continue,
         };
+        if let Some(params) = o_ycbcr {
+            overview_ycbcr.push((ifd_index, params));
+        }
         overviews.push(Overview {
             image: ifd_index,
             width: ow,
@@ -99,7 +110,12 @@ fn scan_overviews(
             chunk: ochunk,
         });
     }
-    Ok((overviews, ifd_index, decoder_clean))
+    Ok(ScannedOverviews {
+        overviews,
+        overview_ycbcr,
+        ifd_index,
+        decoder_clean,
+    })
 }
 
 impl TiffSource {
@@ -111,7 +127,7 @@ impl TiffSource {
         budget: &MemoryBudget,
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
-        Self::open_with_placement(byte_source, fingerprint, None, budget, cancel)
+        Self::open_with_sidecar(byte_source, fingerprint, None, budget, cancel)
     }
 
     /// Open a GeoTIFF/BigTIFF/COG, falling back to an injected external
@@ -121,6 +137,26 @@ impl TiffSource {
         byte_source: Arc<dyn ByteSource>,
         fingerprint: SourceFingerprint,
         sidecar_placement: Option<crate::pipeline::metadata::GeoPlacement>,
+        budget: &MemoryBudget,
+        cancel: &CancelToken,
+    ) -> Result<Self, RasterError> {
+        let sidecar = sidecar_placement.map(|p| crate::sidecar::SidecarGeoref {
+            affine: Some(p.affine),
+            crs: p.custom_crs,
+        });
+        Self::open_with_sidecar(byte_source, fingerprint, sidecar, budget, cancel)
+    }
+
+    /// Open a GeoTIFF/BigTIFF/COG with optional external [`crate::SidecarGeoref`]
+    /// (`.tfw`/`.wld` and/or `.prj` sidecar).
+    ///
+    /// Embedded GeoTIFF georeferencing always takes precedence; when the TIFF
+    /// carries embedded pixel affine tags without a CRS, an external `.prj`
+    /// sidecar can supply the missing CRS without requiring a `.tfw`.
+    pub fn open_with_sidecar(
+        byte_source: Arc<dyn ByteSource>,
+        fingerprint: SourceFingerprint,
+        sidecar: Option<crate::sidecar::SidecarGeoref>,
         budget: &MemoryBudget,
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
@@ -167,13 +203,35 @@ impl TiffSource {
         let ParsedGeoref {
             ties,
             mut placement,
+            embedded_affine,
             foreign_datum_epsg,
+            geographic_datum,
             mut trouble,
         } = georef(&mut decoder, width, height, cancel)?;
 
-        if placement.is_none() && ties.is_empty() && sidecar_placement.is_some() {
-            placement = sidecar_placement;
-            trouble = None;
+        if placement.is_none() && ties.is_empty() {
+            if let Some(sc) = sidecar {
+                let affine = sc.affine.or(embedded_affine);
+                if let Some(affine) = affine {
+                    placement = Some(crate::pipeline::metadata::GeoPlacement {
+                        epsg: None,
+                        custom_crs: sc.crs,
+                        datum_warning: None,
+                        affine,
+                        geo_params: None,
+                    });
+                    trouble = None;
+                }
+            } else if let Some(affine) = embedded_affine {
+                // Expose embedded affine without CRS so CRS Override can still bind it.
+                placement = Some(crate::pipeline::metadata::GeoPlacement {
+                    epsg: None,
+                    custom_crs: None,
+                    datum_warning: None,
+                    affine,
+                    geo_params: None,
+                });
+            }
         }
         let binding_trouble = trouble;
 
@@ -183,10 +241,16 @@ impl TiffSource {
             sample_type,
             depth,
             nodata,
-            ycbcr,
         };
-        let (overviews, ifd_index, decoder_clean) =
-            scan_overviews(&mut decoder, format, budget, cancel)?;
+        let ScannedOverviews {
+            overviews,
+            overview_ycbcr: mut ifd_ycbcr,
+            ifd_index,
+            decoder_clean,
+        } = scan_overviews(&mut decoder, format, budget, cancel)?;
+        if let Some(base_ycbcr) = ycbcr {
+            ifd_ycbcr.push((0, base_ycbcr));
+        }
 
         let grid = Grid {
             tiled,
@@ -223,6 +287,7 @@ impl TiffSource {
             ties,
             placement,
             foreign_datum_epsg,
+            geographic_datum,
             binding_trouble,
             levels,
         };
@@ -238,6 +303,7 @@ impl TiffSource {
             description,
             grid,
             format,
+            ifd_ycbcr,
             stats_ifd,
             stretch: StretchCache::new(initial_mapping),
         })

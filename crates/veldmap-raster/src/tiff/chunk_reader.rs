@@ -257,6 +257,7 @@ pub(super) struct TiffChunkReader<'a> {
     decoder_pool: &'a DecoderPool,
     source_id: SourceId,
     format: TiffFormat,
+    ifd_ycbcr: &'a [(usize, super::tags::YCbCrParams)],
     mapping: DisplayMapping,
     mode: ChunkReadMode<'a>,
     pooled: Option<PooledDecoder<'a>>,
@@ -267,6 +268,7 @@ impl<'a> TiffChunkReader<'a> {
         decoder_pool: &'a DecoderPool,
         source_id: SourceId,
         format: TiffFormat,
+        ifd_ycbcr: &'a [(usize, super::tags::YCbCrParams)],
         mapping: DisplayMapping,
         mode: ChunkReadMode<'a>,
     ) -> Self {
@@ -274,10 +276,17 @@ impl<'a> TiffChunkReader<'a> {
             decoder_pool,
             source_id,
             format,
+            ifd_ycbcr,
             mapping,
             mode,
             pooled: None,
         }
+    }
+
+    fn ycbcr_for(&self, image: usize) -> Option<super::tags::YCbCrParams> {
+        self.ifd_ycbcr
+            .iter()
+            .find_map(|&(idx, params)| (idx == image).then_some(params))
     }
 
     fn decode_chunk_uncached(
@@ -305,7 +314,7 @@ impl<'a> TiffChunkReader<'a> {
             &self.mapping,
             &chunk.raw,
             self.format.pixel_layout,
-            self.format.ycbcr,
+            self.ycbcr_for(image),
             chunk.width,
             chunk.height,
         )?;

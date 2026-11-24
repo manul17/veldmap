@@ -37,6 +37,7 @@ pub(crate) enum MeasureAction {
 #[derive(Clone, Debug)]
 pub(crate) struct MeasureState {
     mode: MeasureMode,
+    last_active_mode: MeasureMode,
     points: Vec<GeoPoint>,
     rev: u64,
     cached_draw: Option<DrawVectorLayer>,
@@ -47,6 +48,7 @@ impl Default for MeasureState {
     fn default() -> Self {
         Self {
             mode: MeasureMode::Off,
+            last_active_mode: MeasureMode::Distance,
             points: Vec::new(),
             rev: 1,
             cached_draw: None,
@@ -62,8 +64,12 @@ impl MeasureState {
 
     pub(crate) fn toggle_open(&mut self) {
         if self.mode == MeasureMode::Off {
-            self.mode = MeasureMode::Distance;
+            self.mode = match self.last_active_mode {
+                MeasureMode::Area => MeasureMode::Area,
+                _ => MeasureMode::Distance,
+            };
         } else {
+            self.last_active_mode = self.mode;
             self.mode = MeasureMode::Off;
         }
         self.rebuild_mesh();
@@ -71,6 +77,9 @@ impl MeasureState {
 
     pub(crate) fn set_mode(&mut self, mode: MeasureMode) {
         if self.mode != mode {
+            if mode != MeasureMode::Off {
+                self.last_active_mode = mode;
+            }
             self.mode = mode;
             self.rebuild_mesh();
         }
@@ -153,14 +162,23 @@ impl MeasureState {
 
     fn rebuild_mesh(&mut self) {
         self.rev = self.rev.saturating_add(1);
-        if self.mode == MeasureMode::Off || self.points.len() < 2 {
+        if self.mode == MeasureMode::Off || self.points.is_empty() {
             self.cached_draw = None;
             return;
         }
-        let Some(fc) = self.to_geojson_collection() else {
+        let Some(mut fc) = self.to_geojson_collection() else {
             self.cached_draw = None;
             return;
         };
+        // Also emit explicit point markers for every placed vertex so the very
+        // first click and all polyline/polygon vertices are clearly visible.
+        if self.points.len() >= 2 {
+            fc.features.push(GeoJsonFeature {
+                name: None,
+                properties: Map::new(),
+                geometry: GeoJsonGeometry::MultiPoint(self.points.clone()),
+            });
+        }
         let mesh = Arc::new(VectorMesh::from_collection(
             &fc,
             DEFAULT_VECTOR_MAX_CHORD_DEG,

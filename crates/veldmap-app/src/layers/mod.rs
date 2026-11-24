@@ -21,7 +21,9 @@ use veldmap_core::tile::RASTER_TILE_SIZE;
 use crate::gpu_tiles::display_tile_mip_bytes;
 
 pub(crate) use manager::{OverlayFrameCtx, OverlayManager, OverlayMutation};
-pub(crate) use vectors::{VectorLayerId, VectorLayerStack, VectorLayerSummary, is_geojson_path};
+pub(crate) use vectors::{
+    LoadedVectorData, VectorLayerId, VectorLayerStack, VectorLayerSummary, is_geojson_path,
+};
 
 /// Default unpacked VRAM byte weight for an 8-bit `512 x 512` display tile
 /// with full linear-light mip chain (`~1.33 MiB`), matching `BasemapManager`.
@@ -85,6 +87,7 @@ pub(crate) struct CursorReadout {
 pub(crate) enum OverlayIoEvent {
     Opened {
         id: LayerId,
+        path: PathBuf,
         bounds: Option<FootprintBounds>,
         fly_to: bool,
     },
@@ -92,6 +95,17 @@ pub(crate) enum OverlayIoEvent {
         id: LayerId,
     },
     Failed {
+        path: PathBuf,
+        error: String,
+        can_assign_crs: bool,
+    },
+    VectorOpened {
+        id: VectorLayerId,
+        path: PathBuf,
+        bounds: Option<FootprintBounds>,
+        fly_to: bool,
+    },
+    VectorFailed {
         path: PathBuf,
         error: String,
     },

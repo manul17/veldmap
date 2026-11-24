@@ -75,7 +75,6 @@ pub(in crate::tiff) struct TiffFormat {
     pub(super) sample_type: SampleType,
     pub(super) depth: u32,
     pub(super) nodata: Option<f32>,
-    pub(super) ycbcr: Option<tags::YCbCrParams>,
 }
 
 /// Thread-safe opened GeoTIFF/BigTIFF/COG source backed by a positioned
@@ -88,6 +87,7 @@ pub struct TiffSource {
     description: RasterDescription,
     grid: Grid,
     format: TiffFormat,
+    ifd_ycbcr: Vec<(usize, tags::YCbCrParams)>,
     stats_ifd: usize,
     stretch: StretchCache,
 }
@@ -123,6 +123,7 @@ impl TiffSource {
             &self.decoder_pool,
             self.source_id,
             self.format,
+            &self.ifd_ycbcr,
             mapping,
             ChunkReadMode::Pointwise {
                 chunk_cache: ctx.chunk_cache,
@@ -199,6 +200,7 @@ impl RasterSource for TiffSource {
             &self.decoder_pool,
             self.source_id,
             self.format,
+            &self.ifd_ycbcr,
             mapping,
             ChunkReadMode::SequentialPass,
         );

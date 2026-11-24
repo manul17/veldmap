@@ -140,6 +140,6 @@ fn globe_overlay_and_composite_shaders_compile_and_match_rust_uniform_layouts() 
         &vector,
         "VectorUniform",
         32,
-        &[("offset_eye", 0), ("color", 16)],
+        &[("offset_eye", 0), ("point_radius_m", 12), ("color", 16)],
     );
 }

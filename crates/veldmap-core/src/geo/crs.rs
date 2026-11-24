@@ -12,10 +12,10 @@ use std::sync::{Arc, OnceLock};
 use proj4rs::proj::Proj;
 use thiserror::Error;
 
-use super::geodesy::Ellipsoid;
+use super::geodesy::{Ellipsoid, WGS84};
 use super::projection::{
-    Datum, HelmertConvention, INTERNATIONAL_FOOT_M, KRASOVSKY, PULKOVO_1942, Projection, System,
-    US_SURVEY_FOOT_M, WGS84_DATUM,
+    Datum, INTERNATIONAL_FOOT_M, KRASOVSKY, PULKOVO_1942, Projection, System, US_SURVEY_FOOT_M,
+    WGS84_DATUM,
 };
 
 /// Errors produced when parsing or instantiating a CRS definition.
@@ -55,7 +55,7 @@ impl DatumWarning {
                 "Foreign datum ({label}) has no bundled shift to WGS84; placement may be offset."
             ),
             Self::GridShiftRecommended { label } => format!(
-                "Datum ({label}) uses a grid shift (e.g. NADCON/NTv2/OSTN15) not bundled in v0.2; decimetre-to-metre offset possible."
+                "Datum ({label}) uses a grid shift (e.g. NADCON/NTv2/OSTN15) that is not bundled; decimetre-to-metre offset possible."
             ),
         }
     }
@@ -133,13 +133,32 @@ impl Proj4Projection {
     /// Construct from a PROJ.4 parameter string.
     pub fn from_proj_string(proj_string: &str, label: Option<String>) -> Result<Self, CrsError> {
         let trimmed = proj_string.trim();
-        let proj =
-            Proj::from_proj_string(trimmed).map_err(|e| CrsError::InvalidProj(e.to_string()))?;
+        let (proj, fallback_grid_shift) = match Proj::from_proj_string(trimmed) {
+            Ok(proj) => (proj, false),
+            Err(proj4rs::errors::Error::NadGridNotAvailable) => {
+                let rewritten = rewrite_missing_nadgrid_proj(trimmed);
+                let proj = Proj::from_proj_string(&rewritten)
+                    .map_err(|e| CrsError::InvalidProj(e.to_string()))?;
+                (proj, true)
+            }
+            Err(e) => return Err(CrsError::InvalidProj(e.to_string())),
+        };
+        if proj.is_geocent() {
+            return Err(CrsError::InvalidProj(
+                "3D geocentric CRS (+proj=geocent) is not supported as a 2D map CRS".to_string(),
+            ));
+        }
         if !proj.is_latlong() && (!proj.has_inverse() || !proj.has_forward()) {
             return Err(CrsError::NonInvertible);
         }
         let display_label = label.unwrap_or_else(|| trimmed.to_string());
-        let warning = detect_proj_datum_warning(trimmed, &display_label);
+        let warning = if fallback_grid_shift {
+            Some(DatumWarning::GridShiftRecommended {
+                label: display_label.clone(),
+            })
+        } else {
+            detect_proj_datum_warning(&proj, trimmed, &display_label)
+        };
         Ok(Self {
             proj,
             label: display_label,
@@ -150,7 +169,7 @@ impl Proj4Projection {
 
     /// Construct from a WKT1 or WKT2 CRS string (such as a `.prj` sidecar).
     pub fn from_wkt(wkt: &str) -> Result<Self, CrsError> {
-        let trimmed = wkt.trim();
+        let trimmed = wkt.trim().trim_start_matches('\u{FEFF}').trim();
         let proj_string = proj4wkt::wkt_to_projstring(trimmed)
             .map_err(|e| CrsError::InvalidWkt(e.to_string()))?;
         let label = extract_wkt_name(trimmed).unwrap_or_else(|| proj_string.clone());
@@ -166,7 +185,11 @@ impl Proj4Projection {
         let code16 = u16::try_from(code).map_err(|_| CrsError::UnsupportedEpsg(code))?;
         let def = crs_definitions::from_code(code16).ok_or(CrsError::UnsupportedEpsg(code))?;
         let label = format!("EPSG:{code}");
-        Self::from_proj_string(def.proj4, Some(label))
+        let mut out = Self::from_proj_string(def.proj4, Some(label.clone()))?;
+        if out.warning.is_none() && is_plate_fixed_grid_epsg(code) {
+            out.warning = Some(DatumWarning::GridShiftRecommended { label });
+        }
+        Ok(out)
     }
 
     /// Whether this PROJ definition is geographic (longitude/latitude) rather
@@ -260,7 +283,7 @@ impl CrsSpec {
     /// Resolve any supported EPSG (or MSK-61 `633610x`) code into a [`CrsSpec`].
     pub fn from_epsg(code: u32) -> Result<Self, CrsError> {
         match code {
-            4326 | 4979 | 4055 => Ok(Self::Geographic {
+            4326 | 4979 => Ok(Self::Geographic {
                 datum: WGS84_DATUM,
                 label: format!("EPSG:{code} (WGS 84)"),
                 warning: None,
@@ -284,6 +307,15 @@ impl CrsSpec {
                     label: "ETRS89 / EPSG:4258".to_string(),
                 }),
             }),
+            4277 => {
+                let (datum, warning) =
+                    known_datum_from_code(4277).ok_or(CrsError::UnsupportedEpsg(4277))?;
+                Ok(Self::Geographic {
+                    datum,
+                    label: "EPSG:4277 (OSGB36)".to_string(),
+                    warning,
+                })
+            }
             _ => {
                 if let Some(proj) = Projection::from_epsg(code) {
                     return Ok(Self::Projected(proj));
@@ -436,6 +468,13 @@ impl CustomTmParams {
             unit_to_metres: self.unit.to_metres(),
         })
     }
+
+    /// Validate and convert into a named [`Projection::Transverse`], preserving
+    /// [`Self::name`] in UI labels and metadata inspectors.
+    pub fn to_projection(&self) -> Result<Projection, CrsError> {
+        let sys = self.to_system()?;
+        Ok(Projection::transverse_named(sys, self.name.as_str()))
+    }
 }
 
 /// Searchable CRS preset entry for the UI CRS picker.
@@ -444,6 +483,18 @@ pub struct CrsPreset {
     pub epsg: u32,
     pub name: String,
     pub category: &'static str,
+}
+
+impl CrsPreset {
+    /// Display code label (`EPSG:<code>` for standard registry codes, or
+    /// `MSK-61:z<n>` for non-standard regional pseudo-codes).
+    pub fn code_label(&self) -> String {
+        if (6_336_101..=6_336_103).contains(&self.epsg) {
+            format!("MSK-61:z{}", self.epsg - 6_336_100)
+        } else {
+            format!("EPSG:{}", self.epsg)
+        }
+    }
 }
 
 /// Curated searchable CRS preset catalog (WGS84, Web Mercator, UTM 1–60 N/S,
@@ -524,7 +575,7 @@ pub fn builtin_crs_presets() -> &'static [CrsPreset] {
                 category: "MSK / Pulkovo",
             });
         }
-        for zone in 1..=32 {
+        for zone in 2..=32 {
             out.push(CrsPreset {
                 epsg: 28_400 + zone,
                 name: format!("Pulkovo 1942 / Gauss-Kruger zone {zone}"),
@@ -589,23 +640,11 @@ pub fn search_crs_presets(query: &str, limit: usize) -> Vec<CrsPreset> {
     results
 }
 
-/// Construct a [`Datum`] from an explicit ellipsoid and 7-parameter WKT/PROJ
-/// `TOWGS84` array (`PositionVector`, EPSG:9606).
-pub const fn datum_from_towgs84(ellipsoid: Ellipsoid, towgs84: [f64; 7]) -> Datum {
-    Datum {
-        ellipsoid,
-        shift_m: [towgs84[0], towgs84[1], towgs84[2]],
-        rotate_sec: [towgs84[3], towgs84[4], towgs84[5]],
-        scale_ppm: towgs84[6],
-        convention: HelmertConvention::PositionVector,
-    }
-}
-
 /// Resolve a known static [`Datum`] from a geographic CRS EPSG code (`2048`) or
 /// geodetic datum EPSG code (`2050`).
 pub fn known_datum_from_code(code: u32) -> Option<(Datum, Option<DatumWarning>)> {
     match code {
-        4326 | 4979 | 4055 | 6326 => Some((WGS84_DATUM, None)),
+        4326 | 4979 | 6326 => Some((WGS84_DATUM, None)),
         4284 | 6284 => Some((PULKOVO_1942, None)),
         4269 | 6269 => Some((
             WGS84_DATUM,
@@ -620,7 +659,7 @@ pub fn known_datum_from_code(code: u32) -> Option<(Datum, Option<DatumWarning>)>
             }),
         )),
         4277 | 6277 => Some((
-            datum_from_towgs84(
+            Datum::from_towgs84(
                 Ellipsoid {
                     semi_major_m: 6_377_563.396,
                     flattening: 1.0 / 299.324_964_6,
@@ -638,7 +677,7 @@ pub fn known_datum_from_code(code: u32) -> Option<(Datum, Option<DatumWarning>)>
 /// Resolve an ellipsoid from common GeoTIFF `GeogEllipsoidGeoKey` (2056) codes.
 pub const fn ellipsoid_from_epsg(code: u16) -> Option<Ellipsoid> {
     match code {
-        7030 => Some(super::geodesy::WGS84),
+        7030 => Some(WGS84),
         7019 => Some(Ellipsoid {
             semi_major_m: 6_378_137.0,
             flattening: 1.0 / 298.257_222_101,
@@ -656,6 +695,42 @@ pub const fn ellipsoid_from_epsg(code: u16) -> Option<Ellipsoid> {
     }
 }
 
+/// Rewrite a PROJ string whose mandatory `+nadgrids=` or `+datum=NAD27` grid
+/// files are not bundled, substituting a North-America mean 3-parameter Helmert
+/// shift for NAD27 (`+ellps=clrk66 +towgs84=-8,160,176`) and stripping
+/// unavailable `+nadgrids=` tokens so the CRS still opens with a visible
+/// [`DatumWarning::GridShiftRecommended`] banner.
+fn rewrite_missing_nadgrid_proj(proj_str: &str) -> String {
+    let has_towgs84 = proj_str
+        .split_whitespace()
+        .any(|tok| tok.to_ascii_lowercase().starts_with("+towgs84="));
+    let mut out = Vec::new();
+    for tok in proj_str.split_whitespace() {
+        let lower = tok.to_ascii_lowercase();
+        if lower == "+datum=nad27" {
+            out.push("+ellps=clrk66".to_string());
+            if !has_towgs84 {
+                out.push("+towgs84=-8,160,176".to_string());
+            }
+        } else if lower.starts_with("+nadgrids=") {
+            if lower == "+nadgrids=@null" {
+                out.push(tok.to_string());
+            }
+            // Drop unavailable shift-grid filenames; callers emit GridShiftRecommended.
+        } else {
+            out.push(tok.to_string());
+        }
+    }
+    out.join(" ")
+}
+
+fn is_plate_fixed_grid_epsg(code: u32) -> bool {
+    matches!(
+        code,
+        2154 | 3035 | 4171 | 4258 | 25_828..=25_838 | 3038..=3051
+    )
+}
+
 fn extract_wkt_name(wkt: &str) -> Option<String> {
     let start = wkt.find('"')? + 1;
     let rest = wkt.get(start..)?;
@@ -664,39 +739,74 @@ fn extract_wkt_name(wkt: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-fn detect_proj_datum_warning(proj_str: &str, label: &str) -> Option<DatumWarning> {
+fn has_nonzero_towgs84(proj_lower: &str) -> bool {
+    proj_lower.split_whitespace().any(|tok| {
+        tok.strip_prefix("+towgs84=").is_some_and(|vals| {
+            vals.split(',')
+                .filter_map(|s| s.parse::<f64>().ok())
+                .any(|v| v.is_finite() && v.abs() > 1e-12)
+        })
+    })
+}
+
+fn detect_proj_datum_warning(proj: &Proj, proj_str: &str, label: &str) -> Option<DatumWarning> {
     let lower = proj_str.to_ascii_lowercase();
     if lower.contains("+nadgrids=") && !lower.contains("+nadgrids=@null") {
         return Some(DatumWarning::GridShiftRecommended {
             label: label.to_string(),
         });
     }
-    if lower.contains("+datum=nad27") || lower.contains("+datum=nad83") {
+    if lower.contains("+datum=nad27")
+        || lower.contains("+datum=nad83")
+        || lower.contains("+datum=osgb36")
+    {
         return Some(DatumWarning::GridShiftRecommended {
             label: label.to_string(),
         });
     }
-    if lower.contains("+datum=osgb36") {
-        return Some(DatumWarning::GridShiftRecommended {
-            label: label.to_string(),
-        });
-    }
-    if lower.contains("+ellps=krass") && !lower.contains("+towgs84=") {
-        return Some(DatumWarning::UnshiftedForeignDatum {
-            label: label.to_string(),
-        });
+    let has_towgs84 = lower.contains("+towgs84=");
+    let has_datum = lower.contains("+datum=");
+    let has_null_nadgrid = lower.contains("+nadgrids=@null");
+    if !has_towgs84 && !has_datum && !has_null_nadgrid {
+        let (a, b) = proj.ellipse_parameters();
+        let is_sphere = (a - b).abs() <= 1.0;
+        let differs_from_wgs84 =
+            (a - WGS84.semi_major_m).abs() > 1.0 || (b - WGS84.semi_minor_m()).abs() > 1.0;
+        if !is_sphere && differs_from_wgs84 {
+            return Some(DatumWarning::UnshiftedForeignDatum {
+                label: label.to_string(),
+            });
+        }
     }
     None
+}
+
+fn is_itrf_aligned_wkt(wkt_upper: &str) -> bool {
+    const ITRF_TOKENS: &[&str] = &[
+        "WGS_1984",
+        "WGS 84",
+        "WORLD GEODETIC SYSTEM 1984",
+        "ITRF",
+        "GDA2020",
+        "GDA_2020",
+        "GEOCENTRIC_DATUM_OF_AUSTRALIA_2020",
+        "SIRGAS",
+        "NZGD2000",
+        "NZGD_2000",
+        "JGD2000",
+        "JGD2011",
+        "CGCS2000",
+        "GSK-2011",
+        "GSK_2011",
+        "PZ-90.11",
+    ];
+    ITRF_TOKENS.iter().any(|tok| wkt_upper.contains(tok))
 }
 
 fn detect_wkt_datum_warning(wkt: &str, proj_str: &str, label: &str) -> Option<DatumWarning> {
     let wkt_upper = wkt.to_ascii_uppercase();
     let proj_lower = proj_str.to_ascii_lowercase();
-    let is_wgs84 = wkt_upper.contains("WGS_1984")
-        || wkt_upper.contains("WGS 84")
-        || wkt_upper.contains("WORLD GEODETIC SYSTEM 1984")
-        || proj_lower.contains("+datum=wgs84");
-    if is_wgs84 {
+    if is_itrf_aligned_wkt(&wkt_upper) || proj_lower.contains("+datum=wgs84") {
         return None;
     }
     if wkt_upper.contains("NAD83")
@@ -705,16 +815,15 @@ fn detect_wkt_datum_warning(wkt: &str, proj_str: &str, label: &str) -> Option<Da
         || wkt_upper.contains("OSGB_1936")
         || wkt_upper.contains("OSGB36")
         || wkt_upper.contains("ETRS89")
+        || wkt_upper.contains("RGF93")
+        || wkt_upper.contains("RESEAU_GEODESIQUE_FRANCAIS")
         || wkt_upper.contains("GDA94")
     {
         return Some(DatumWarning::GridShiftRecommended {
             label: label.to_string(),
         });
     }
-    let has_nonzero_towgs84 = proj_lower.contains("+towgs84=")
-        && !proj_lower.contains("+towgs84=0,0,0,0,0,0,0")
-        && !proj_lower.contains("+towgs84=0,0,0");
-    if !has_nonzero_towgs84 {
+    if !has_nonzero_towgs84(&proj_lower) {
         return Some(DatumWarning::UnshiftedForeignDatum {
             label: label.to_string(),
         });

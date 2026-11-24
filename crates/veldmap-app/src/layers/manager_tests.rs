@@ -90,7 +90,7 @@ fn write_tiled_geotiff_cog(path: &Path, width: u32, height: u32, rgb: [u8; 3]) {
 fn wait_for_io_event(mgr: &mut OverlayManager) -> OverlayIoEvent {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        let (events, _mut) = mgr.poll_io_events();
+        let (events, _mut, _vecs) = mgr.poll_io_events();
         if let Some(ev) = events.into_iter().next() {
             return ev;
         }
@@ -150,7 +150,9 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     // 1. Non-blocking open completes off the UI thread.
     mgr.begin_open_file(&tif_path, true).expect("queue open");
     let (layer_id, bounds) = match wait_for_io_event(&mut mgr) {
-        OverlayIoEvent::Opened { id, bounds, fly_to } => {
+        OverlayIoEvent::Opened {
+            id, bounds, fly_to, ..
+        } => {
             assert!(fly_to);
             (id, bounds.expect("valid footprint"))
         }

@@ -214,7 +214,8 @@ impl Frame {
         }
     }
 
-    /// Attach or replace a diagnostic [`DatumWarning`] on this frame.
+    /// Attach a diagnostic [`DatumWarning`] on this frame (leaving any existing
+    /// warning intact when `warning` is `None`).
     pub fn with_datum_warning(mut self, warning: Option<DatumWarning>) -> Self {
         if warning.is_some() {
             self.datum_warning = warning;
@@ -300,7 +301,7 @@ impl Frame {
                     Projection::WebMercator => {
                         projection::web_mercator_from_geodetic_strict(lat_deg, lon_deg)?
                     }
-                    Projection::Transverse(tm) => tm.from_geodetic(lat_deg, lon_deg),
+                    Projection::Transverse { system: tm, .. } => tm.from_geodetic(lat_deg, lon_deg),
                     Projection::Proj4(proj) => proj.from_wgs84_geodetic(lat_deg, lon_deg),
                 };
                 if !(x_base.is_finite() && y.is_finite()) {
@@ -387,7 +388,7 @@ impl Frame {
                 )
             }
             FrameKind::Projected {
-                system: Projection::Transverse(sys),
+                system: Projection::Transverse { system: sys, .. },
                 affine,
             } => {
                 let unit = sys.safe_unit_to_metres();
@@ -566,8 +567,13 @@ fn tie_grid_from_geographic_affine(
         (lat, lon)
     };
     let corners = [eval(0.0, 0.0), eval(w, 0.0), eval(0.0, h), eval(w, h)];
+    // Allow up to one half-pixel overshoot beyond +/-90 deg for `PixelIsPoint`
+    // rasters whose outermost pixel centers sit right on the poles; outer ties
+    // are clamped cleanly to [-90, 90] below.
+    let lat_half_px_margin = (pixel_affine[3].abs() + pixel_affine[4].abs()) * 0.501;
+    let lat_limit = 90.0 + lat_half_px_margin.clamp(0.001, 2.0);
     if !corners.iter().all(|(lat, lon)| {
-        lat.is_finite() && lon.is_finite() && lat.abs() <= 90.001 && lon.abs() <= 360.001
+        lat.is_finite() && lon.is_finite() && lat.abs() <= lat_limit && lon.abs() <= 360.001
     }) {
         return None;
     }

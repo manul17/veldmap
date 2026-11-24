@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use veldmap_core::geo::{CrsSpec, CustomTmParams, DatumPreset, LinearUnit, Projection};
+use veldmap_core::geo::{CrsSpec, CustomTmParams, DatumPreset, LinearUnit};
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
 };
@@ -18,6 +18,33 @@ pub const MAX_RECENT_FILES: usize = 16;
 
 /// Maximum number of camera bookmarks kept in `session.json`.
 pub const MAX_BOOKMARKS: usize = 64;
+
+/// Serializable datum choice for custom Transverse Mercator overrides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedCustomTmDatum {
+    #[default]
+    Wgs84,
+    Pulkovo1942,
+}
+
+impl From<DatumPreset> for SavedCustomTmDatum {
+    fn from(d: DatumPreset) -> Self {
+        match d {
+            DatumPreset::Wgs84 => Self::Wgs84,
+            DatumPreset::Pulkovo1942 => Self::Pulkovo1942,
+        }
+    }
+}
+
+impl From<SavedCustomTmDatum> for DatumPreset {
+    fn from(d: SavedCustomTmDatum) -> Self {
+        match d {
+            SavedCustomTmDatum::Wgs84 => Self::Wgs84,
+            SavedCustomTmDatum::Pulkovo1942 => Self::Pulkovo1942,
+        }
+    }
+}
 
 /// Serializable CRS override stored alongside a saved raster layer entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,7 +61,8 @@ pub enum SavedCrsOverride {
     },
     CustomTm {
         name: String,
-        pulkovo42: bool,
+        #[serde(default)]
+        datum: SavedCustomTmDatum,
         central_meridian_deg: f64,
         origin_lat_deg: f64,
         scale: f64,
@@ -82,7 +110,7 @@ impl SavedCrsOverride {
             Self::Proj { proj } => CrsSpec::from_user_string(proj).map_err(|e| e.to_string()),
             Self::CustomTm {
                 name,
-                pulkovo42,
+                datum,
                 central_meridian_deg,
                 origin_lat_deg,
                 scale,
@@ -92,11 +120,7 @@ impl SavedCrsOverride {
             } => {
                 let params = CustomTmParams {
                     name: name.clone(),
-                    datum: if *pulkovo42 {
-                        DatumPreset::Pulkovo1942
-                    } else {
-                        DatumPreset::Wgs84
-                    },
+                    datum: (*datum).into(),
                     central_meridian_deg: *central_meridian_deg,
                     origin_lat_deg: *origin_lat_deg,
                     scale: *scale,
@@ -104,8 +128,8 @@ impl SavedCrsOverride {
                     false_northing_m: *false_northing_m,
                     unit: (*unit).into(),
                 };
-                let sys = params.to_system().map_err(|e| e.to_string())?;
-                Ok(CrsSpec::Projected(Projection::Transverse(sys)))
+                let proj = params.to_projection().map_err(|e| e.to_string())?;
+                Ok(CrsSpec::Projected(proj))
             }
         }
     }
@@ -197,6 +221,16 @@ impl Default for AppSession {
     }
 }
 
+fn is_valid_camera_pose(lat_deg: f64, lon_deg: f64, height_m: f64, heading_deg: f64) -> bool {
+    lat_deg.is_finite()
+        && (-90.0..=90.0).contains(&lat_deg)
+        && lon_deg.is_finite()
+        && (-360.0..=360.0).contains(&lon_deg)
+        && height_m.is_finite()
+        && height_m > 0.0
+        && heading_deg.is_finite()
+}
+
 impl AppSession {
     /// Normalize bounds, deduplicate recent files, and drop invalid entries.
     pub fn normalize(&mut self) {
@@ -229,19 +263,11 @@ impl AppSession {
         self.recent_files = deduped;
         self.bookmarks.retain(|b| {
             !b.name.trim().is_empty()
-                && b.lat_deg.is_finite()
-                && b.lon_deg.is_finite()
-                && b.height_m.is_finite()
-                && b.height_m > 0.0
-                && b.heading_deg.is_finite()
+                && is_valid_camera_pose(b.lat_deg, b.lon_deg, b.height_m, b.heading_deg)
         });
         self.bookmarks.truncate(MAX_BOOKMARKS);
         if let Some(cam) = self.last_camera
-            && !(cam.lat_deg.is_finite()
-                && cam.lon_deg.is_finite()
-                && cam.height_m.is_finite()
-                && cam.height_m > 0.0
-                && cam.heading_deg.is_finite())
+            && !is_valid_camera_pose(cam.lat_deg, cam.lon_deg, cam.height_m, cam.heading_deg)
         {
             self.last_camera = None;
         }
@@ -275,19 +301,28 @@ impl AppSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use veldmap_storage::test_support::TestTempDir;
 
     #[test]
     fn session_persists_layers_crs_overrides_recent_files_and_bookmarks() {
-        let dir = std::env::temp_dir().join(format!("veldmap-session-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let paths = StoragePaths::with_root(&dir);
+        let tmp = TestTempDir::new("session-roundtrip");
+        let paths = StoragePaths::with_root(tmp.path());
 
         let mut session = AppSession::default();
         session.open_layers.push(SavedLayerEntry {
             path: PathBuf::from("/tmp/ortho.tif"),
             visible: true,
             opacity: 0.75,
-            crs_override: Some(SavedCrsOverride::Epsg { code: 32637 }),
+            crs_override: Some(SavedCrsOverride::CustomTm {
+                name: "MSK-61 Custom".to_string(),
+                datum: SavedCustomTmDatum::Pulkovo1942,
+                central_meridian_deg: 37.983_333_333_33,
+                origin_lat_deg: 0.0,
+                scale: 1.0,
+                false_easting_m: 1_300_000.0,
+                false_northing_m: -4_811_057.628,
+                unit: SavedLinearUnit::Metre,
+            }),
         });
         session.open_vectors.push(SavedVectorEntry {
             path: PathBuf::from("/tmp/parcels.geojson"),
@@ -318,15 +353,40 @@ mod tests {
             loaded.recent_files,
             vec![PathBuf::from("/tmp/a.tif"), PathBuf::from("/tmp/b.tif")]
         );
-        assert!(
-            loaded.open_layers[0]
-                .crs_override
-                .as_ref()
-                .expect("crs override")
-                .to_crs_spec()
-                .is_ok()
-        );
+        let spec = loaded.open_layers[0]
+            .crs_override
+            .as_ref()
+            .expect("crs override")
+            .to_crs_spec()
+            .expect("valid custom TM");
+        assert_eq!(spec.label(), "MSK-61 Custom");
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn session_normalize_rejects_out_of_range_poses_and_nan_opacity() {
+        let mut session = AppSession::default();
+        session.open_layers.push(SavedLayerEntry {
+            path: PathBuf::from("/tmp/a.tif"),
+            visible: true,
+            opacity: f32::NAN,
+            crs_override: None,
+        });
+        session.bookmarks.push(CameraBookmark {
+            name: "Invalid Lat".to_string(),
+            lat_deg: 120.0,
+            lon_deg: 0.0,
+            height_m: 1000.0,
+            heading_deg: 0.0,
+        });
+        session.last_camera = Some(SavedCameraPose {
+            lat_deg: -95.0,
+            lon_deg: 0.0,
+            height_m: 1000.0,
+            heading_deg: 0.0,
+        });
+        session.normalize();
+        assert_eq!(session.open_layers[0].opacity, 1.0);
+        assert!(session.bookmarks.is_empty());
+        assert!(session.last_camera.is_none());
     }
 }

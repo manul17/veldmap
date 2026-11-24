@@ -211,9 +211,14 @@ impl SceneState {
         self.vectors.summaries()
     }
 
-    /// Total count of loaded raster + vector layers.
+    /// Total count of loaded raster + vector layers (O(1), lock-free).
     pub(crate) fn total_layer_count(&self) -> usize {
-        self.overlays.layer_summaries().len() + self.vectors.len()
+        self.overlays.layer_count() + self.vectors.len()
+    }
+
+    /// Look up the current saved CRS override for a raster layer, if any.
+    pub(crate) fn overlay_crs_override(&self, id: LayerId) -> Option<SavedCrsOverride> {
+        self.overlays.layer_crs_override(id)
     }
 
     /// Snapshot raster layers for session persistence.
@@ -226,16 +231,17 @@ impl SceneState {
         self.vectors.saved_entries()
     }
 
-    /// Open a local read-only GeoJSON vector layer.
-    pub(crate) fn open_vector_file(
-        &mut self,
+    /// Queue a non-blocking local read-only GeoJSON vector layer open onto the
+    /// background I/O worker.
+    pub(crate) fn begin_open_vector_file(
+        &self,
         path: &Path,
+        fly_to: bool,
         visible: bool,
         opacity: f32,
-    ) -> Result<(VectorLayerId, Option<veldmap_core::geo::FootprintBounds>), String> {
-        let res = self.vectors.open_file(path, visible, opacity)?;
-        self.mark_dirty();
-        Ok(res)
+    ) -> Result<(), String> {
+        self.overlays
+            .begin_open_vector_file(path, fly_to, visible, opacity)
     }
 
     pub(crate) fn set_vector_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
@@ -333,10 +339,25 @@ impl SceneState {
         Ok(())
     }
 
-    /// Drain completed background overlay open/reload events.
+    /// Drain completed background overlay and vector open/reload events.
     pub(crate) fn poll_overlay_io_events(&mut self) -> Vec<OverlayIoEvent> {
-        let (events, mutation) = self.overlays.poll_io_events();
+        let (mut events, mutation, pending_vectors) = self.overlays.poll_io_events();
         let _ = self.apply_overlay_mutation(mutation);
+        if !pending_vectors.is_empty() {
+            for pending in pending_vectors {
+                let path = pending.data.path.clone();
+                let (id, bounds) =
+                    self.vectors
+                        .push_loaded(pending.data, pending.visible, pending.opacity);
+                events.push(OverlayIoEvent::VectorOpened {
+                    id,
+                    path,
+                    bounds,
+                    fly_to: pending.fly_to,
+                });
+            }
+            self.mark_dirty();
+        }
         events
     }
 

@@ -1,19 +1,16 @@
 //! Pure-`ByteSource` PNG [`RasterSource`] adapter.
 //!
-//! Non-interlaced PNGs stream row-by-row directly into [`Cascade`] so working
-//! memory is independent of image height; Adam7 interlaced PNGs enforce an
-//! upfront whole-frame budget check against `MemoryBudget::decode_working_bytes`
-//! before allocation.
+//! Non-interlaced PNGs stream row-by-row directly into [`Cascade`] (reusing a
+//! single row RGBA8 buffer) so working memory is independent of image height;
+//! Adam7 interlaced PNGs enforce an upfront whole-frame budget check against
+//! `MemoryBudget::decode_working_bytes` before allocation.
 
 use std::sync::Arc;
 
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{
-    BandKey, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, SourceId, TileStreamSpec,
-    level_count, level_size,
-};
+use veldmap_core::tile::{RASTER_TILE_SIZE, SourceFingerprint, SourceId, level_count};
 
 use crate::RasterError;
 use crate::pipeline::cascade::{self, Cascade, TileEmit};
@@ -24,19 +21,28 @@ use crate::pipeline::resample::bleed_alpha;
 use crate::pipeline::{DecodeContext, RasterSource};
 use crate::tiff::MAX_SOURCE_SIDE;
 
-const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-const PNG_DECODE_REV: u32 = 1;
+use super::{DISPLAY_STREAM_SPEC, map_std_io_error, world_file_binding_trouble};
 
-const DISPLAY_STREAM_SPEC: TileStreamSpec = TileStreamSpec::new(
-    BandKey::Display,
-    PixelFormat::Rgba8UnormSrgb,
-    0,
-    PNG_DECODE_REV,
-);
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// Return whether `head` begins with an 8-byte PNG file signature.
 pub fn has_png_magic(head: &[u8]) -> bool {
     head.starts_with(&PNG_MAGIC)
+}
+
+fn build_png_decoder(
+    reader: BufferedByteReader,
+    budget: &MemoryBudget,
+) -> png::Decoder<BufferedByteReader> {
+    let limits = png::Limits {
+        bytes: budget.decode_working_bytes.min(usize::MAX as u64) as usize,
+    };
+    let mut decoder = png::Decoder::new_with_limits(reader, limits);
+    // Ignore ancillary text/iCCP chunks so adversarial metadata cannot exhaust
+    // decode working memory during header parsing.
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    decoder
 }
 
 /// Pure-`ByteSource` PNG source implementing [`RasterSource`].
@@ -63,7 +69,7 @@ impl PngSource {
             return Err(RasterError::Cancelled);
         }
         let reader = BufferedByteReader::new(Arc::clone(&byte_source), cancel.clone());
-        let decoder = png::Decoder::new(reader);
+        let decoder = build_png_decoder(reader, budget);
         let info_reader = decoder.read_info().map_err(|e| map_png_error(e, cancel))?;
         let info = info_reader.info();
         let (width, height, interlaced) = (info.width, info.height, info.interlaced);
@@ -89,7 +95,10 @@ impl PngSource {
         ) || info.trns.is_some();
         let channels = match info.color_type {
             png::ColorType::Indexed => 3 + usize::from(has_alpha),
-            _ => info.color_type.samples(),
+            png::ColorType::Grayscale => 1 + usize::from(has_alpha),
+            png::ColorType::Rgb => 3 + usize::from(has_alpha),
+            png::ColorType::GrayscaleAlpha => 2,
+            png::ColorType::Rgba => 4,
         };
 
         let cascade_bytes = cascade::bytes(width, height);
@@ -115,23 +124,17 @@ impl PngSource {
         }
 
         let n_levels = level_count(width, height);
+        let full_pixels = u64::from(width).saturating_mul(u64::from(height));
         let levels: Vec<LevelPlan> = (0..n_levels)
-            .map(|lvl| {
-                let lw = level_size(width, lvl);
-                let lh = level_size(height, lvl);
-                LevelPlan {
-                    serve: ServeMode::Pass { from: 0 },
-                    source_pixels: u64::from(lw).saturating_mul(u64::from(lh)),
-                    estimated_peak_bytes: pass_peak_bytes,
-                    fits: true,
-                }
+            .map(|_| LevelPlan {
+                serve: ServeMode::Pass { from: 0 },
+                source_pixels: full_pixels,
+                estimated_peak_bytes: pass_peak_bytes,
+                fits: true,
             })
             .collect();
 
-        let binding_trouble = placement.is_none().then(|| {
-            "PNG has no accompanying world file (.pgw/.wld); assign CRS or add a world file"
-                .to_string()
-        });
+        let binding_trouble = world_file_binding_trouble("PNG", ".pgw/.wld", placement.as_ref());
 
         let description = RasterDescription {
             width,
@@ -140,6 +143,7 @@ impl PngSource {
             ties: Vec::new(),
             placement,
             foreign_datum_epsg: None,
+            geographic_datum: None,
             binding_trouble,
             levels,
         };
@@ -199,12 +203,9 @@ impl RasterSource for PngSource {
         if ctx.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
-        let _lease = ctx
-            .budget_tracker
-            .reserve_blocking(self.pass_peak_bytes, ctx.cancel)?;
 
         let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
-        let mut decoder = png::Decoder::new(reader);
+        let mut decoder = build_png_decoder(reader, ctx.budget);
         decoder.set_transformations(png::Transformations::normalize_to_color8());
         let mut png_reader = decoder
             .read_info()
@@ -242,6 +243,7 @@ impl RasterSource for PngSource {
                     limit_bytes: ctx.budget.decode_working_bytes,
                 });
             }
+            let _lease = ctx.budget_tracker.reserve_blocking(est, ctx.cancel)?;
             let mut buf = vec![0u8; buf_len];
             let out = png_reader
                 .next_frame(&mut buf)
@@ -260,8 +262,12 @@ impl RasterSource for PngSource {
             return cascade.finish(&mut bled_emit);
         }
 
+        let _lease = ctx
+            .budget_tracker
+            .reserve_blocking(self.pass_peak_bytes, ctx.cancel)?;
         let channels = png_reader.output_color_type().0.samples();
         let layout = PixelLayout::named(channels);
+        let mut row_rgba = Vec::with_capacity((w as usize).saturating_mul(4));
         let mut row_idx = 0u32;
         while let Some(row) = png_reader
             .next_row()
@@ -270,8 +276,8 @@ impl RasterSource for PngSource {
             if row_idx.is_multiple_of(64) && ctx.cancel.is_cancelled() {
                 return Err(RasterError::Cancelled);
             }
-            let rgba = mapping.rgba(&Samples::U8(row.data()), layout, w as usize);
-            cascade.push_rows(&rgba, 1, &mut bled_emit)?;
+            expand_u8_row_to_rgba(row.data(), layout, w as usize, &mut row_rgba);
+            cascade.push_rows(&row_rgba, 1, &mut bled_emit)?;
             row_idx = row_idx.saturating_add(1);
         }
         cascade.finish(&mut bled_emit)
@@ -286,25 +292,32 @@ impl RasterSource for PngSource {
         if px >= self.description.width || py >= self.description.height {
             return Ok(None);
         }
-        // Only perform on-demand row scans for reasonably sized non-interlaced PNGs
-        // to avoid stalling the fast probe lane on giant full-image streams.
+        // Only perform on-demand row scans for compact non-interlaced PNGs
+        // (<= 2 MP) under an explicit budget lease so hover probes never stall
+        // the fast lane on large sequential PNG streams.
         let total_px =
             u64::from(self.description.width).saturating_mul(u64::from(self.description.height));
-        if self.interlaced || total_px > 16_000_000 {
+        if self.interlaced || total_px > 2_000_000 {
             return Ok(None);
         }
         if ctx.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
+        let probe_bytes = u64::from(self.description.width)
+            .saturating_mul(8)
+            .max(65_536);
+        let _lease = ctx
+            .budget_tracker
+            .reserve_blocking(probe_bytes, ctx.cancel)?;
         let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
-        let mut decoder = png::Decoder::new(reader);
+        let mut decoder = build_png_decoder(reader, ctx.budget);
         decoder.set_transformations(png::Transformations::normalize_to_color8());
         let mut png_reader = decoder
             .read_info()
             .map_err(|e| map_png_error(e, ctx.cancel))?;
         let channels = png_reader.output_color_type().0.samples();
         let layout = PixelLayout::named(channels);
-        let mapping = DisplayMapping::identity(None);
+        let mut row_rgba = Vec::new();
         for row_idx in 0..=py {
             if row_idx.is_multiple_of(128) && ctx.cancel.is_cancelled() {
                 return Err(RasterError::Cancelled);
@@ -316,13 +329,14 @@ impl RasterSource for PngSource {
                 return Ok(None);
             };
             if row_idx == py {
-                let rgba = mapping.rgba(
-                    &Samples::U8(row.data()),
+                expand_u8_row_to_rgba(
+                    row.data(),
                     layout,
                     self.description.width as usize,
+                    &mut row_rgba,
                 );
                 let idx = (px as usize).saturating_mul(4);
-                let Some(px_bytes) = rgba.get(idx..idx + 4) else {
+                let Some(px_bytes) = row_rgba.get(idx..idx + 4) else {
                     return Ok(None);
                 };
                 let color = [px_bytes[0], px_bytes[1], px_bytes[2], px_bytes[3]];
@@ -333,12 +347,27 @@ impl RasterSource for PngSource {
     }
 }
 
+fn expand_u8_row_to_rgba(samples: &[u8], layout: PixelLayout, pixels: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(pixels.saturating_mul(4));
+    for px in samples.chunks_exact(layout.channels).take(pixels) {
+        let (rgb, alpha) = match (layout.colors(), layout.has_alpha()) {
+            (1, false) => ([px[0], px[0], px[0]], 255),
+            (1, true) => ([px[0], px[0], px[0]], px[layout.channels - 1]),
+            (_, false) => ([px[0], px[1], px[2]], 255),
+            (_, true) => ([px[0], px[1], px[2]], px[layout.channels - 1]),
+        };
+        out.extend_from_slice(&rgb);
+        out.push(alpha);
+    }
+}
+
 fn map_png_error(err: png::DecodingError, cancel: &CancelToken) -> RasterError {
     if cancel.is_cancelled() {
         return RasterError::Cancelled;
     }
     match err {
-        png::DecodingError::IoError(io_err) => RasterError::Decode(io_err.to_string()),
+        png::DecodingError::IoError(io_err) => map_std_io_error(io_err, cancel),
         png::DecodingError::LimitsExceeded => RasterError::DecoderLimitsExceeded(err.to_string()),
         other => RasterError::Decode(other.to_string()),
     }

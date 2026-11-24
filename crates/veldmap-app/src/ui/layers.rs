@@ -18,7 +18,7 @@ pub(crate) enum LayerUiAction {
     OpenFileDialog,
     OpenPath(PathBuf),
     ToggleVisibility(LayerId, bool),
-    SetOpacity(LayerId, f32),
+    SetOpacity(LayerId, f32, bool),
     MoveUp(LayerId),
     MoveDown(LayerId),
     OpenCrsPicker(LayerId, String),
@@ -27,7 +27,7 @@ pub(crate) enum LayerUiAction {
     ReloadBypassCache(LayerId),
     Remove(LayerId),
     ToggleVectorVisibility(VectorLayerId, bool),
-    SetVectorOpacity(VectorLayerId, f32),
+    SetVectorOpacity(VectorLayerId, f32, bool),
     RemoveVector(VectorLayerId),
 }
 
@@ -76,8 +76,10 @@ impl LayersPanelState {
         }
     }
 
-    pub(crate) fn note_failed_path(&mut self, path: PathBuf, msg: String) {
-        self.failed_unbound_path = Some(path);
+    pub(crate) fn note_failed_path(&mut self, path: PathBuf, msg: String, can_assign_crs: bool) {
+        if can_assign_crs {
+            self.failed_unbound_path = Some(path);
+        }
         self.push_error(msg);
     }
 
@@ -140,7 +142,7 @@ fn show_open_prompt(
             state.focus_path_input = false;
         }
         if resp.changed() {
-            state.error = None;
+            state.clear_error();
         }
         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if ui.button("Load").clicked() || enter {
@@ -250,11 +252,10 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
             let mut opacity = layer.opacity;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Opacity").small());
-                if ui
-                    .add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false))
-                    .changed()
-                {
-                    actions.push(LayerUiAction::SetOpacity(layer.id, opacity));
+                let resp = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false));
+                let commit = resp.drag_stopped() || (resp.changed() && !resp.dragged());
+                if resp.changed() || commit {
+                    actions.push(LayerUiAction::SetOpacity(layer.id, opacity, commit));
                 }
                 ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
             });
@@ -353,11 +354,10 @@ fn show_vector_card(
             let mut opacity = layer.opacity;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Opacity").small());
-                if ui
-                    .add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false))
-                    .changed()
-                {
-                    actions.push(LayerUiAction::SetVectorOpacity(layer.id, opacity));
+                let resp = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).show_value(false));
+                let commit = resp.drag_stopped() || (resp.changed() && !resp.dragged());
+                if resp.changed() || commit {
+                    actions.push(LayerUiAction::SetVectorOpacity(layer.id, opacity, commit));
                 }
                 ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
             });

@@ -29,7 +29,7 @@ fn build_raw_tiff(entries: &mut [(u16, u16, u32, Vec<u8>)], pixel_payload: &[u8]
     out.extend_from_slice(&n_entries.to_le_bytes());
 
     let ifd_size = 2 + entries.len() * 12 + 4;
-    let mut extra_data_offset = (8 + ifd_size) as u32;
+    let extra_data_offset = (8 + ifd_size) as u32;
     let mut extra_blobs: Vec<u8> = Vec::new();
 
     // Reserve pixel_payload right after extra blobs.
@@ -55,7 +55,6 @@ fn build_raw_tiff(entries: &mut [(u16, u16, u32, Vec<u8>)], pixel_payload: &[u8]
     }
 
     let pixel_offset = extra_data_offset + extra_blobs.len() as u32;
-    let _ = &mut extra_data_offset;
     for (tag, ty, count, mut val, is_strip_off) in inline_or_deferred {
         if is_strip_off {
             val = pixel_offset.to_le_bytes();
@@ -485,9 +484,9 @@ fn user_defined_geotiff_handles_datum_ellipsoid_polar_stere_sphere_and_warnings(
         .as_ref()
         .expect("geo placement");
     match placement_p42.custom_crs.as_ref() {
-        Some(veldmap_core::geo::CrsSpec::Projected(veldmap_core::geo::Projection::Transverse(
-            sys,
-        ))) => {
+        Some(veldmap_core::geo::CrsSpec::Projected(
+            veldmap_core::geo::Projection::Transverse { system: sys, .. },
+        )) => {
             assert!(
                 (sys.datum.ellipsoid.semi_major_m - KRASOVSKY.semi_major_m).abs() < 1e-3,
                 "expected Krasovsky ellipsoid, got {:?}",
@@ -622,4 +621,141 @@ fn user_defined_geotiff_handles_datum_ellipsoid_polar_stere_sphere_and_warnings(
         "expected GridShiftRecommended warning for NAD83 user-defined CRS, got {:?}",
         frame_nad.datum_warning()
     );
+}
+
+#[test]
+fn user_defined_geotiff_handles_false_origin_lcc_1sp_2sp_and_2048_32767_datum_fallback() {
+    use veldmap_core::geo::{CrsSpec, KRASOVSKY, Projection};
+
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let payload = vec![128u8; 4 * 4 * 3];
+
+    let build_rgb_4x4 = |extra: &[(u16, u16, u32, Vec<u8>)]| -> Vec<u8> {
+        let mut entries = vec![
+            tag_u32(256, 4),
+            tag_u32(257, 4),
+            tag_u16_vec(258, &[8, 8, 8]),
+            tag_u16(259, 1),
+            tag_u16(262, 2),
+            tag_u32(273, 0),
+            tag_u16(277, 3),
+            tag_u32(278, 4),
+            tag_u32(279, payload.len() as u32),
+            tag_u16(284, 1),
+        ];
+        entries.extend_from_slice(extra);
+        build_raw_tiff(&mut entries, &payload)
+    };
+
+    // 1) GeoKey 2048=32767 (User-Defined) + 2050=6284 (Pulkovo 1942): must fall
+    //    through to GeoKey 2050 and preserve Krasovsky ellipsoid instead of WGS84.
+    let doubles_2050 = [39.0_f64, 0.0, 500_000.0, 1.0];
+    let geokeys_2050: Vec<u16> = vec![
+        1, 1, 0, 10, 1024, 0, 1, 1, 1025, 0, 1, 1, 2048, 0, 1, 32767, 2050, 0, 1, 6284, 3072, 0, 1,
+        32767, 3075, 0, 1, 1, 3080, 34736, 1, 0, 3081, 34736, 1, 1, 3082, 34736, 1, 2, 3092, 34736,
+        1, 3,
+    ];
+    let tiff_2050 = TiffSource::open(
+        Arc::new(MemoryByteSource::new(
+            build_rgb_4x4(&[
+                tag_f64_vec(33550, &[10.0, 10.0, 0.0]),
+                tag_f64_vec(33922, &[0.0, 0.0, 0.0, 500_000.0, 5_230_000.0, 0.0]),
+                tag_u16_vec(34735, &geokeys_2050),
+                tag_f64_vec(34736, &doubles_2050),
+            ])
+            .into(),
+        )),
+        SourceFingerprint::from_digest([20; 32]),
+        &budget,
+        &cancel,
+    )
+    .expect("2048=32767 + 2050=6284 opens");
+    match tiff_2050
+        .description()
+        .placement
+        .as_ref()
+        .and_then(|p| p.custom_crs.as_ref())
+    {
+        Some(CrsSpec::Projected(Projection::Transverse { system, .. })) => {
+            assert!((system.datum.ellipsoid.semi_major_m - KRASOVSKY.semi_major_m).abs() < 1e-3);
+        }
+        other => panic!("expected Krasovsky TM from GeoKey 2050, got {other:?}"),
+    }
+
+    // 2) CT_LambertConfConic_2SP (8) using ProjFalseOrigin* GeoKeys 3084-3087.
+    let doubles_lcc2 = [
+        -71.5_f64, 41.0, 200_000.0, 750_000.0, 42.683_333, 41.716_667,
+    ];
+    let geokeys_lcc2: Vec<u16> = vec![
+        1, 1, 0, 11, 1024, 0, 1, 1, 1025, 0, 1, 1, 2048, 0, 1, 4326, 3072, 0, 1, 32767, 3075, 0, 1,
+        8, 3084, 34736, 1, 0, 3085, 34736, 1, 1, 3086, 34736, 1, 2, 3087, 34736, 1, 3, 3078, 34736,
+        1, 4, 3079, 34736, 1, 5,
+    ];
+    let tiff_lcc2 = TiffSource::open(
+        Arc::new(MemoryByteSource::new(
+            build_rgb_4x4(&[
+                tag_f64_vec(33550, &[10.0, 10.0, 0.0]),
+                tag_f64_vec(33922, &[0.0, 0.0, 0.0, 200_000.0, 750_000.0, 0.0]),
+                tag_u16_vec(34735, &geokeys_lcc2),
+                tag_f64_vec(34736, &doubles_lcc2),
+            ])
+            .into(),
+        )),
+        SourceFingerprint::from_digest([21; 32]),
+        &budget,
+        &cancel,
+    )
+    .expect("LCC-2SP with 3084-3087 opens");
+    let frame_lcc2 = frame_from_description(tiff_lcc2.description()).expect("LCC-2SP binds");
+    let (lat_l2, lon_l2) = frame_lcc2.geodetic(0.0, 0.0);
+    assert!((lat_l2 - 41.0).abs() < 1e-3 && (lon_l2 + 71.5).abs() < 1e-3);
+
+    // 3) CT_LambertConfConic_1SP (9) using NatOriginLat (3081) -> emits +lat_1={lat_0}.
+    let doubles_lcc1 = [2.337_229_f64, 46.8, 600_000.0, 2_200_000.0, 0.999_877];
+    let geokeys_lcc1: Vec<u16> = vec![
+        1, 1, 0, 10, 1024, 0, 1, 1, 1025, 0, 1, 1, 2048, 0, 1, 4326, 3072, 0, 1, 32767, 3075, 0, 1,
+        9, 3080, 34736, 1, 0, 3081, 34736, 1, 1, 3082, 34736, 1, 2, 3083, 34736, 1, 3, 3092, 34736,
+        1, 4,
+    ];
+    let tiff_lcc1 = TiffSource::open(
+        Arc::new(MemoryByteSource::new(
+            build_rgb_4x4(&[
+                tag_f64_vec(33550, &[10.0, 10.0, 0.0]),
+                tag_f64_vec(33922, &[0.0, 0.0, 0.0, 600_000.0, 2_200_000.0, 0.0]),
+                tag_u16_vec(34735, &geokeys_lcc1),
+                tag_f64_vec(34736, &doubles_lcc1),
+            ])
+            .into(),
+        )),
+        SourceFingerprint::from_digest([22; 32]),
+        &budget,
+        &cancel,
+    )
+    .expect("LCC-1SP opens");
+    let frame_lcc1 = frame_from_description(tiff_lcc1.description()).expect("LCC-1SP binds");
+    let (lat_l1, lon_l1) = frame_lcc1.geodetic(0.0, 0.0);
+    assert!((lat_l1 - 46.8).abs() < 1e-3 && (lon_l1 - 2.337_229).abs() < 1e-3);
+
+    // 4) TIFF with embedded tiepoint+pixelscale (no GeoKeys) + `.prj`-only sidecar.
+    let tiff_prj_only = TiffSource::open_with_sidecar(
+        Arc::new(MemoryByteSource::new(
+            build_rgb_4x4(&[
+                tag_f64_vec(33550, &[10.0, 10.0, 0.0]),
+                tag_f64_vec(33922, &[0.0, 0.0, 0.0, 500_000.0, 5_230_000.0, 0.0]),
+            ])
+            .into(),
+        )),
+        SourceFingerprint::from_digest([23; 32]),
+        Some(veldmap_raster::SidecarGeoref {
+            affine: None,
+            crs: Some(CrsSpec::from_epsg(32637).expect("UTM 37N")),
+        }),
+        &budget,
+        &cancel,
+    )
+    .expect("TIFF with embedded affine + .prj-only sidecar opens");
+    let frame_prj = frame_from_description(tiff_prj_only.description()).expect("binds via .prj");
+    let (lat_p, lon_p) = frame_prj.geodetic(0.0, 0.0);
+    assert!((lat_p - 47.22).abs() < 0.05 && (lon_p - 39.0).abs() < 0.05);
 }

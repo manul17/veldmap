@@ -1,7 +1,15 @@
 //! Non-blocking native OS file picker and save dialog wrapper (`rfd` with
-//! pure-Rust `xdg-portal` + `wayland`, zero `gtk3`), preserving text-path and
-//! drag-and-drop fallbacks on minimal Linux window managers.
+//! `xdg-portal` + `wayland`, zero `gtk3` build dependencies; dynamically loads
+//! `libdbus-1` at runtime with `zenity` fallback on Linux), preserving
+//! text-path and drag-and-drop fallbacks on minimal Linux window managers.
+//!
+//! Uses `rfd::AsyncFileDialog` constructed on the UI thread with
+//! `.set_parent(frame)` (starting a non-blocking sheet on macOS and a lazy
+//! future on Windows/Linux) and drives the resulting `Send + 'static` future
+//! off-thread via `pollster::block_on`, so modal pickers never freeze `eframe`
+//! on any OS.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +22,10 @@ use veldmap_core::sync::Wakeup;
 #[derive(Clone, Debug)]
 pub(crate) enum FileDialogEvent {
     OpenFiles(Vec<PathBuf>),
-    SaveGeoJson(PathBuf),
+    GeoJsonSaved {
+        path: PathBuf,
+        result: Result<(), String>,
+    },
 }
 
 struct BusyResetGuard {
@@ -53,37 +64,19 @@ impl DialogHost {
         self.busy.load(Ordering::Acquire)
     }
 
-    /// Spawn a background native multi-file open dialog for GeoTIFF, PNG,
-    /// JPEG, and GeoJSON files.
-    pub(crate) fn spawn_open_files(&self) -> bool {
-        if self
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
+    fn spawn_dialog_future<F>(&self, thread_name: &str, fut: F) -> bool
+    where
+        F: Future<Output = Option<FileDialogEvent>> + Send + 'static,
+    {
         let tx = self.tx.clone();
         let busy = Arc::clone(&self.busy);
         let wakeup = Arc::clone(&self.wakeup);
         let spawned = thread::Builder::new()
-            .name("veldmap-file-dialog".to_owned())
+            .name(thread_name.to_owned())
             .spawn(move || {
                 let _guard = BusyResetGuard { busy, wakeup };
-                let picked = rfd::FileDialog::new()
-                    .set_title("Open Raster or GeoJSON")
-                    .add_filter(
-                        "Geospatial Rasters & GeoJSON",
-                        &["tif", "tiff", "png", "jpg", "jpeg", "geojson", "json"],
-                    )
-                    .add_filter("GeoTIFF / COG", &["tif", "tiff"])
-                    .add_filter("Images (with world file)", &["png", "jpg", "jpeg"])
-                    .add_filter("GeoJSON", &["geojson", "json"])
-                    .pick_files();
-                if let Some(paths) = picked
-                    && !paths.is_empty()
-                {
-                    let _ = tx.send(FileDialogEvent::OpenFiles(paths));
+                if let Some(ev) = pollster::block_on(fut) {
+                    let _ = tx.send(ev);
                 }
             });
         if spawned.is_err() {
@@ -93,37 +86,63 @@ impl DialogHost {
         true
     }
 
-    /// Spawn a background native save dialog for RFC 7946 GeoJSON export.
-    pub(crate) fn spawn_save_geojson(&self, default_name: &str) -> bool {
-        if self
-            .busy
+    fn try_acquire_busy(&self) -> bool {
+        self.busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+            .is_ok()
+    }
+
+    /// Spawn a non-blocking native multi-file open dialog for GeoTIFF, PNG,
+    /// JPEG, and GeoJSON files, parented to `frame`.
+    pub(crate) fn spawn_open_files(&self, frame: &eframe::Frame) -> bool {
+        if !self.try_acquire_busy() {
             return false;
         }
-        let tx = self.tx.clone();
-        let busy = Arc::clone(&self.busy);
-        let wakeup = Arc::clone(&self.wakeup);
-        let file_name = default_name.to_owned();
-        let spawned = thread::Builder::new()
-            .name("veldmap-save-dialog".to_owned())
-            .spawn(move || {
-                let _guard = BusyResetGuard { busy, wakeup };
-                let picked = rfd::FileDialog::new()
-                    .set_title("Export Measurement as RFC 7946 GeoJSON")
-                    .set_file_name(&file_name)
-                    .add_filter("GeoJSON", &["geojson", "json"])
-                    .save_file();
-                if let Some(path) = picked {
-                    let _ = tx.send(FileDialogEvent::SaveGeoJson(path));
-                }
-            });
-        if spawned.is_err() {
-            self.busy.store(false, Ordering::Release);
+        // Construct the future on the UI thread so macOS begins a non-blocking
+        // sheet on AppKit's main thread; Windows/Linux return a lazy future.
+        let fut = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Open Raster or GeoJSON")
+            .add_filter(
+                "Geospatial Rasters & GeoJSON",
+                &["tif", "tiff", "png", "jpg", "jpeg", "geojson", "json"],
+            )
+            .add_filter("GeoTIFF / COG", &["tif", "tiff"])
+            .add_filter("Images (with world file)", &["png", "jpg", "jpeg"])
+            .add_filter("GeoJSON", &["geojson", "json"])
+            .pick_files();
+        self.spawn_dialog_future("veldmap-file-dialog", async move {
+            let handles = fut.await?;
+            let paths: Vec<PathBuf> = handles.into_iter().map(PathBuf::from).collect();
+            (!paths.is_empty()).then_some(FileDialogEvent::OpenFiles(paths))
+        })
+    }
+
+    /// Spawn a non-blocking native save dialog for RFC 7946 GeoJSON export,
+    /// capturing `geojson_payload` at click time and writing the file off the
+    /// UI thread once the user selects a destination.
+    pub(crate) fn spawn_save_geojson(
+        &self,
+        default_name: &str,
+        geojson_payload: String,
+        frame: &eframe::Frame,
+    ) -> bool {
+        if !self.try_acquire_busy() {
             return false;
         }
-        true
+        let fut = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Export Measurement as RFC 7946 GeoJSON")
+            .set_file_name(default_name)
+            .add_filter("GeoJSON", &["geojson", "json"])
+            .save_file();
+        self.spawn_dialog_future("veldmap-save-dialog", async move {
+            let handle = fut.await?;
+            let path = PathBuf::from(handle);
+            let result = std::fs::write(&path, geojson_payload.as_bytes())
+                .map_err(|e| format!("failed to write '{}': {e}", path.display()));
+            Some(FileDialogEvent::GeoJsonSaved { path, result })
+        })
     }
 
     /// Drain any completed file dialog events without blocking.

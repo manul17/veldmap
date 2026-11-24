@@ -123,6 +123,11 @@ impl DisplayMapping {
         }
     }
 
+    /// Optional raw `nodata` value configured on this mapping.
+    pub(crate) const fn nodata(&self) -> Option<f32> {
+        self.nodata
+    }
+
     /// Convert up to `pixels` raw samples into tightly packed RGBA8 bytes.
     pub(crate) fn rgba(&self, samples: &Samples<'_>, pixel: PixelLayout, pixels: usize) -> Vec<u8> {
         if let (Samples::U8(v), None, None) = (samples, self.stretch, self.nodata) {

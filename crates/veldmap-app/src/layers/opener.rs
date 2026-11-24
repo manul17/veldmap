@@ -12,12 +12,37 @@ use veldmap_core::geo::Frame;
 use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_raster::{
-    JpegSource, PngSource, RasterSource, TiffSource, frame_from_description_with_override,
-    has_jpeg_magic, has_png_magic, has_tiff_magic, load_sidecar_placement,
+    JpegSource, PngSource, RasterError, RasterSource, TiffSource,
+    frame_from_description_with_override, has_jpeg_magic, has_png_magic, has_tiff_magic,
+    load_sidecar_georef,
 };
 use veldmap_storage::{LocalFileSource, LocalFingerprintCache};
 
 use crate::session::SavedCrsOverride;
+
+/// Structured open failure distinguishing missing/invalid georeferencing (where
+/// offering `"Assign CRS…"` in the UI makes sense) from I/O or format errors.
+#[derive(Clone, Debug)]
+pub(super) struct OpenRasterError {
+    pub(super) message: String,
+    pub(super) can_assign_crs: bool,
+}
+
+impl OpenRasterError {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            can_assign_crs: false,
+        }
+    }
+
+    fn binding(message: String) -> Self {
+        Self {
+            message,
+            can_assign_crs: true,
+        }
+    }
+}
 
 /// Open a local raster file (GeoTIFF/BigTIFF/COG, PNG, or JPEG + optional
 /// world-file/`.prj` sidecars), compute its sampled fingerprint, decode
@@ -29,57 +54,113 @@ pub(super) fn open_local_raster(
     bypass_cache: bool,
     crs_override: Option<&SavedCrsOverride>,
     cancel: &CancelToken,
-) -> Result<(Arc<dyn RasterSource>, Frame), String> {
+) -> Result<(Arc<dyn RasterSource>, Frame), OpenRasterError> {
     let fingerprint = fingerprint_cache
         .get_or_compute_with_bypass(path, bypass_cache, cancel)
-        .map_err(|e| format!("failed to fingerprint '{}': {e}", path.display()))?;
-    let file_source: Arc<dyn ByteSource> = Arc::new(
-        LocalFileSource::open(path)
-            .map_err(|e| format!("failed to open '{}': {e}", path.display()))?,
-    );
+        .map_err(|e| {
+            OpenRasterError::other(format!("failed to fingerprint '{}': {e}", path.display()))
+        })?;
+    let file_source: Arc<dyn ByteSource> = Arc::new(LocalFileSource::open(path).map_err(|e| {
+        OpenRasterError::other(format!("failed to open '{}': {e}", path.display()))
+    })?);
 
     let mut head = [0u8; 16];
-    let n = file_source
-        .read_at(0, &mut head, cancel)
-        .map_err(|e| format!("failed to read header of '{}': {e}", path.display()))?;
+    let n = file_source.read_at(0, &mut head, cancel).map_err(|e| {
+        OpenRasterError::other(format!(
+            "failed to read header of '{}': {e}",
+            path.display()
+        ))
+    })?;
     let head = &head[..n];
 
-    let sidecar = load_sidecar_placement(path)
-        .map_err(|e| format!("failed to load sidecar for '{}': {e}", path.display()))?;
+    let sidecar_res = load_sidecar_georef(path);
 
-    let source: Arc<dyn RasterSource> = if has_tiff_magic(head) {
-        Arc::new(
-            TiffSource::open_with_placement(file_source, fingerprint, sidecar, budget, cancel)
-                .map_err(|e| format!("failed to read GeoTIFF '{}': {e}", path.display()))?,
-        )
-    } else if has_png_magic(head) {
-        Arc::new(
-            PngSource::open(file_source, fingerprint, sidecar, budget, cancel)
-                .map_err(|e| format!("failed to read PNG '{}': {e}", path.display()))?,
-        )
-    } else if has_jpeg_magic(head) {
-        Arc::new(
-            JpegSource::open(file_source, fingerprint, sidecar, budget, cancel)
-                .map_err(|e| format!("failed to read JPEG '{}': {e}", path.display()))?,
-        )
-    } else {
-        return Err(format!(
-            "'{}': unsupported file format (expected GeoTIFF/COG, PNG, JPEG, or GeoJSON)",
-            path.display()
-        ));
-    };
+    let (source, sidecar_err): (Arc<dyn RasterSource>, Option<RasterError>) =
+        if has_tiff_magic(head) {
+            // For GeoTIFFs, do not let a corrupt/unrelated sibling `.prj`/`.wld`
+            // block opening a valid self-contained GeoTIFF; only surface the
+            // sidecar error if embedded georeferencing is missing.
+            let (sidecar, err) = match sidecar_res {
+                Ok(sc) if !sc.is_empty() => (Some(sc), None),
+                Ok(_) => (None, None),
+                Err(e) => (None, Some(e)),
+            };
+            let src =
+                TiffSource::open_with_sidecar(file_source, fingerprint, sidecar, budget, cancel)
+                    .map_err(|e| {
+                        OpenRasterError::other(format!(
+                            "failed to read GeoTIFF '{}': {e}",
+                            path.display()
+                        ))
+                    })?;
+            (Arc::new(src), err)
+        } else if has_png_magic(head) {
+            let sidecar = sidecar_res
+                .map_err(|e| {
+                    OpenRasterError::binding(format!(
+                        "failed to load sidecar for '{}': {e}",
+                        path.display()
+                    ))
+                })?
+                .into_placement();
+            let src = PngSource::open(file_source, fingerprint, sidecar, budget, cancel).map_err(
+                |e| OpenRasterError::other(format!("failed to read PNG '{}': {e}", path.display())),
+            )?;
+            (Arc::new(src), None)
+        } else if has_jpeg_magic(head) {
+            let sidecar = sidecar_res
+                .map_err(|e| {
+                    OpenRasterError::binding(format!(
+                        "failed to load sidecar for '{}': {e}",
+                        path.display()
+                    ))
+                })?
+                .into_placement();
+            let src = JpegSource::open(file_source, fingerprint, sidecar, budget, cancel).map_err(
+                |e| {
+                    OpenRasterError::other(format!("failed to read JPEG '{}': {e}", path.display()))
+                },
+            )?;
+            (Arc::new(src), None)
+        } else {
+            return Err(OpenRasterError::other(format!(
+                "'{}': unsupported file format (expected GeoTIFF/COG, PNG, JPEG, or GeoJSON)",
+                path.display()
+            )));
+        };
 
     let resolved_override = match crs_override {
-        Some(saved) => Some(
-            saved
-                .to_crs_spec()
-                .map_err(|e| format!("invalid CRS override for '{}': {e}", path.display()))?,
-        ),
+        Some(saved) => Some(saved.to_crs_spec().map_err(|e| {
+            OpenRasterError::binding(format!(
+                "invalid CRS override for '{}': {e}",
+                path.display()
+            ))
+        })?),
         None => None,
     };
 
     let frame =
         frame_from_description_with_override(source.description(), resolved_override.as_ref())
-            .map_err(|e| format!("'{}': {e}", path.display()))?;
+            .map_err(|e| {
+                let can_assign_crs = matches!(e, RasterError::Binding(_))
+                    && (source.description().placement.is_some()
+                        || !source.description().ties.is_empty());
+                let msg = if let Some(sc_err) = sidecar_err.as_ref() {
+                    format!("'{}': {e} (sidecar error: {sc_err})", path.display())
+                } else {
+                    format!("'{}': {e}", path.display())
+                };
+                OpenRasterError {
+                    message: msg,
+                    can_assign_crs,
+                }
+            })?;
+    if let Some(sc_err) = sidecar_err {
+        tracing::warn!(
+            path = %path.display(),
+            error = %sc_err,
+            "Ignored invalid sibling sidecar because GeoTIFF carries embedded georeferencing"
+        );
+    }
     Ok((source, frame))
 }

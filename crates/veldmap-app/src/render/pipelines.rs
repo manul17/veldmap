@@ -64,6 +64,7 @@ pub(super) struct GlobePipelines {
     pub(super) overlay_pipeline: wgpu::RenderPipeline,
     pub(super) vector_fill_pipeline: wgpu::RenderPipeline,
     pub(super) vector_line_pipeline: wgpu::RenderPipeline,
+    pub(super) vector_point_pipeline: wgpu::RenderPipeline,
     pub(super) grid_pipeline: wgpu::RenderPipeline,
     pub(super) composite_layout: wgpu::BindGroupLayout,
     pub(super) composite_sampler: wgpu::Sampler,
@@ -373,6 +374,37 @@ impl GlobePipelines {
             multiview_mask: None,
             cache: None,
         });
+        let vector_point_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("vector instanced point marker pipeline (depth-less)"),
+                layout: Some(&vector_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &vector_shader,
+                    entry_point: Some("vs_point"),
+                    buffers: &[Some(GpuVectorVertex::INSTANCE_LAYOUT)],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &vector_shader,
+                    entry_point: Some("fs_vector"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: Some(wgpu::Face::Back),
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
         // Post-body graticule runs inside the depth-less (`depth_stencil_attachment: None`)
         // color pass directly above draped raster overlays and vector layers.
@@ -403,6 +435,7 @@ impl GlobePipelines {
             overlay_pipeline,
             vector_fill_pipeline,
             vector_line_pipeline,
+            vector_point_pipeline,
             grid_pipeline,
             composite_layout,
             composite_sampler,

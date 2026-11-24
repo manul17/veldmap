@@ -4,12 +4,17 @@
 use std::path::PathBuf;
 
 use eframe::egui;
-use veldmap_core::geo::{CrsSpec, CustomTmParams, DatumPreset, LinearUnit, search_crs_presets};
+use veldmap_core::geo::{
+    CrsPreset, CrsSpec, CustomTmParams, DatumPreset, LinearUnit, builtin_crs_presets,
+    search_crs_presets,
+};
 
 use crate::layers::LayerId;
-use crate::session::{SavedCrsOverride, SavedLinearUnit};
+use crate::session::{SavedCrsOverride, SavedCustomTmDatum, SavedLinearUnit};
 
 use super::ERROR_TEXT_COLOR;
+
+const MAX_VISIBLE_PRESETS: usize = 48;
 
 /// Target that the CRS Picker is configuring.
 #[derive(Clone, Debug)]
@@ -43,6 +48,8 @@ pub(crate) struct CrsPickerState {
     target: Option<CrsPickerTarget>,
     tab: CrsTab,
     search_query: String,
+    cached_query: Option<String>,
+    cached_presets: Vec<CrsPreset>,
     custom_tm: CustomTmParams,
     wkt_input: String,
     error: Option<String>,
@@ -55,6 +62,8 @@ impl Default for CrsPickerState {
             target: None,
             tab: CrsTab::Presets,
             search_query: String::new(),
+            cached_query: None,
+            cached_presets: Vec::new(),
             custom_tm: CustomTmParams::default(),
             wkt_input: String::new(),
             error: None,
@@ -63,16 +72,76 @@ impl Default for CrsPickerState {
 }
 
 impl CrsPickerState {
-    pub(crate) fn open_for_layer(&mut self, id: LayerId, name: String) {
-        self.target = Some(CrsPickerTarget::Layer { id, name });
+    fn reset_form_from(&mut self, existing: Option<&SavedCrsOverride>) {
         self.error = None;
+        self.search_query.clear();
+        self.cached_query = None;
+        self.custom_tm = CustomTmParams::default();
+        self.wkt_input.clear();
+        self.tab = CrsTab::Presets;
+
+        if let Some(ov) = existing {
+            match ov {
+                SavedCrsOverride::Epsg { code } => {
+                    self.search_query = code.to_string();
+                    self.tab = CrsTab::Presets;
+                }
+                SavedCrsOverride::Wkt { wkt } => {
+                    self.wkt_input = wkt.clone();
+                    self.tab = CrsTab::WktProj;
+                }
+                SavedCrsOverride::Proj { proj } => {
+                    self.wkt_input = proj.clone();
+                    self.tab = CrsTab::WktProj;
+                }
+                SavedCrsOverride::CustomTm {
+                    name,
+                    datum,
+                    central_meridian_deg,
+                    origin_lat_deg,
+                    scale,
+                    false_easting_m,
+                    false_northing_m,
+                    unit,
+                } => {
+                    self.custom_tm = CustomTmParams {
+                        name: name.clone(),
+                        datum: (*datum).into(),
+                        central_meridian_deg: *central_meridian_deg,
+                        origin_lat_deg: *origin_lat_deg,
+                        scale: *scale,
+                        false_easting_m: *false_easting_m,
+                        false_northing_m: *false_northing_m,
+                        unit: (*unit).into(),
+                    };
+                    self.tab = CrsTab::CustomTm;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn open_for_layer(
+        &mut self,
+        id: LayerId,
+        name: String,
+        existing: Option<SavedCrsOverride>,
+    ) {
+        self.target = Some(CrsPickerTarget::Layer { id, name });
+        self.reset_form_from(existing.as_ref());
         self.open = true;
     }
 
     pub(crate) fn open_for_pending_path(&mut self, path: PathBuf) {
         self.target = Some(CrsPickerTarget::PendingPath(path));
-        self.error = None;
+        self.reset_form_from(None);
         self.open = true;
+    }
+
+    fn ensure_presets_cached(&mut self) {
+        if self.cached_query.as_deref() != Some(self.search_query.as_str()) {
+            self.cached_presets = search_crs_presets(&self.search_query, MAX_VISIBLE_PRESETS);
+            self.cached_query = Some(self.search_query.clone());
+        }
     }
 
     fn emit_selection(&mut self, selection: SavedCrsOverride) -> Option<CrsPickerAction> {
@@ -92,6 +161,22 @@ impl CrsPickerState {
             }
         }
     }
+}
+
+fn looks_like_wkt(raw: &str) -> bool {
+    let upper = raw.trim_start().to_ascii_uppercase();
+    [
+        "PROJCS[",
+        "GEOGCS[",
+        "PROJCRS[",
+        "GEOGCRS[",
+        "BOUNDCRS[",
+        "COMPOUNDCRS[",
+        "COMPD_CS[",
+        "LOCAL_CS[",
+    ]
+    .iter()
+    .any(|prefix| upper.starts_with(prefix))
 }
 
 /// Render the CRS Picker window if open and return any resulting action.
@@ -114,10 +199,11 @@ pub(crate) fn show_crs_picker_window(
     };
 
     egui::Window::new(title)
+        .id(egui::Id::unique("crs_picker_window"))
         .open(&mut open)
         .resizable(true)
-        .default_width(430.0)
-        .default_height(380.0)
+        .default_width(440.0)
+        .default_height(390.0)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut state.tab, CrsTab::Presets, "EPSG Presets");
@@ -135,8 +221,22 @@ pub(crate) fn show_crs_picker_window(
                                 .hint_text("EPSG code or name (e.g. 32637, 28407, MSK, 27700)"),
                         );
                     });
+                    state.ensure_presets_cached();
+                    let total_presets = builtin_crs_presets().len();
+                    if state.search_query.trim().is_empty()
+                        && state.cached_presets.len() < total_presets
+                    {
+                        ui.weak(
+                            egui::RichText::new(format!(
+                                "Showing {} of {} curated presets — type to filter or enter any EPSG code.",
+                                state.cached_presets.len(),
+                                total_presets
+                            ))
+                            .small(),
+                        );
+                    }
                     ui.add_space(4.0);
-                    let presets = search_crs_presets(&state.search_query, 32);
+                    let presets = state.cached_presets.clone();
                     egui::ScrollArea::vertical()
                         .max_height(240.0)
                         .show(ui, |ui| {
@@ -145,10 +245,7 @@ pub(crate) fn show_crs_picker_window(
                             }
                             for preset in presets {
                                 ui.horizontal(|ui| {
-                                    if ui
-                                        .button(format!("EPSG:{}", preset.epsg))
-                                        .clicked()
-                                    {
+                                    if ui.button(preset.code_label()).clicked() {
                                         action = state.emit_selection(SavedCrsOverride::Epsg {
                                             code: preset.epsg,
                                         });
@@ -206,12 +303,13 @@ pub(crate) fn show_crs_picker_window(
                             ui.add(
                                 egui::DragValue::new(&mut state.custom_tm.scale)
                                     .speed(0.0001)
-                                    .range(0.5..=1.5)
+                                    .range(0.0001..=2.0)
                                     .max_decimals(6),
                             );
                             ui.end_row();
 
-                            ui.label("False Easting (m):");
+                            ui.label("False Easting (m):")
+                                .on_hover_text("Always specified in metres, even when Linear Unit is feet.");
                             ui.add(
                                 egui::DragValue::new(&mut state.custom_tm.false_easting_m)
                                     .speed(100.0)
@@ -219,7 +317,8 @@ pub(crate) fn show_crs_picker_window(
                             );
                             ui.end_row();
 
-                            ui.label("False Northing (m):");
+                            ui.label("False Northing (m):")
+                                .on_hover_text("Always specified in metres, even when Linear Unit is feet.");
                             ui.add(
                                 egui::DragValue::new(&mut state.custom_tm.false_northing_m)
                                     .speed(100.0)
@@ -250,7 +349,7 @@ pub(crate) fn show_crs_picker_window(
                         let p = &state.custom_tm;
                         let sel = SavedCrsOverride::CustomTm {
                             name: p.name.clone(),
-                            pulkovo42: p.datum == DatumPreset::Pulkovo1942,
+                            datum: SavedCustomTmDatum::from(p.datum),
                             central_meridian_deg: p.central_meridian_deg,
                             origin_lat_deg: p.origin_lat_deg,
                             scale: p.scale,
@@ -267,17 +366,16 @@ pub(crate) fn show_crs_picker_window(
                         egui::TextEdit::multiline(&mut state.wkt_input)
                             .desired_rows(7)
                             .desired_width(f32::INFINITY)
-                            .hint_text("+proj=tmerc +lat_0=0 +lon_0=39 +k=1 +x_0=1300000 +y_0=-4811057.628 ..."),
+                            .hint_text("+proj=tmerc +lat_0=0 +lon_0=37.98333333333 +k=1 +x_0=1300000 +y_0=-4811057.628 ..."),
                     );
                     ui.add_space(6.0);
                     if ui.button("Apply WKT / PROJ").clicked() {
                         let raw = state.wkt_input.trim().to_owned();
-                        let sel = if CrsSpec::from_wkt(&raw).is_ok() {
-                            SavedCrsOverride::Wkt { wkt: raw }
+                        if looks_like_wkt(&raw) || CrsSpec::from_wkt(&raw).is_ok() {
+                            action = state.emit_selection(SavedCrsOverride::Wkt { wkt: raw });
                         } else {
-                            SavedCrsOverride::Proj { proj: raw }
-                        };
-                        action = state.emit_selection(sel);
+                            action = state.emit_selection(SavedCrsOverride::Proj { proj: raw });
+                        }
                     }
                 }
             }

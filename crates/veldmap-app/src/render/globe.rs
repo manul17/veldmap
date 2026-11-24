@@ -320,6 +320,7 @@ impl GlobeRenderer {
                 &mut post_pass,
                 &self.pipelines.vector_fill_pipeline,
                 &self.pipelines.vector_line_pipeline,
+                &self.pipelines.vector_point_pipeline,
                 self.viewport.uniform_arena(),
                 snapshot,
             );

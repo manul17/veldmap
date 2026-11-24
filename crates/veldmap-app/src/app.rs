@@ -18,7 +18,9 @@ use crate::gpu_tiles::UploadChannelClosed;
 use crate::layers::{OverlayIoEvent, is_geojson_path};
 use crate::render::GlobeRenderer;
 use crate::scene::{SceneRepaintHint, SceneState};
-use crate::session::{CameraBookmark, SavedCameraPose, SavedCrsOverride, SavedLayerEntry};
+use crate::session::{
+    CameraBookmark, SavedCameraPose, SavedCrsOverride, SavedLayerEntry, SavedVectorEntry,
+};
 use crate::storage::AppStorage;
 use crate::ui::basemap::{BasemapUiAction, BasemapUiState};
 use crate::ui::crs_picker::{CrsPickerAction, CrsPickerState, show_crs_picker_window};
@@ -62,6 +64,9 @@ pub struct VeldmapApp {
     /// whose `OverlayIoEvent` has not yet drained; preserved on early exit so
     /// quitting before background open finishes never wipes persisted layers.
     pending_restored_layers: Vec<SavedLayerEntry>,
+    /// GeoJSON vector layers queued for background restoration from
+    /// `session.json` at startup; preserved on early exit.
+    pending_restored_vectors: Vec<SavedVectorEntry>,
 }
 
 impl Drop for VeldmapApp {
@@ -156,34 +161,39 @@ impl VeldmapApp {
             viewport: ViewportInteraction::default(),
             goto_bar: GoToBarState::default(),
             pending_restored_layers: Vec::new(),
+            pending_restored_vectors: Vec::new(),
         };
 
-        // Restore persisted open layers/vectors from `session.json` silently if
-        // they still exist on disk.
+        // Queue persisted open layers/vectors from `session.json` strictly off
+        // the UI thread (avoiding startup `is_file()` stat stalls on network
+        // mounts and synchronous 64 MiB GeoJSON tessellation).
         for saved in restored_session.open_layers {
-            if saved.path.is_file()
-                && app
-                    .scene
-                    .begin_open_overlay_file_with_options(
-                        &saved.path,
-                        false,
-                        saved.visible,
-                        saved.opacity,
-                        saved.crs_override.clone(),
-                    )
-                    .is_ok()
+            if app
+                .scene
+                .begin_open_overlay_file_with_options(
+                    &saved.path,
+                    false,
+                    saved.visible,
+                    saved.opacity,
+                    saved.crs_override.clone(),
+                )
+                .is_ok()
             {
                 app.pending_restored_layers.push(saved);
             }
         }
         for saved_vec in restored_session.open_vectors {
-            if saved_vec.path.is_file()
-                && app
-                    .scene
-                    .open_vector_file(&saved_vec.path, saved_vec.visible, saved_vec.opacity)
-                    .is_ok()
+            if app
+                .scene
+                .begin_open_vector_file(
+                    &saved_vec.path,
+                    false,
+                    saved_vec.visible,
+                    saved_vec.opacity,
+                )
+                .is_ok()
             {
-                app.layers_ui.on_layer_opened();
+                app.pending_restored_vectors.push(saved_vec);
             }
         }
 
@@ -196,12 +206,9 @@ impl VeldmapApp {
 
     fn persist_session_snapshot(&mut self, include_camera: bool) {
         let mut open_layers = self.scene.saved_layer_entries();
-        for pending in &self.pending_restored_layers {
-            if !open_layers.iter().any(|l| l.path == pending.path) {
-                open_layers.push(pending.clone());
-            }
-        }
-        let open_vectors = self.scene.saved_vector_entries();
+        open_layers.extend(self.pending_restored_layers.iter().cloned());
+        let mut open_vectors = self.scene.saved_vector_entries();
+        open_vectors.extend(self.pending_restored_vectors.iter().cloned());
         let cam_pose = if include_camera {
             let (lat_deg, lon_deg) = self.camera.center();
             Some(SavedCameraPose {
@@ -232,24 +239,9 @@ impl VeldmapApp {
         crs_override: Option<SavedCrsOverride>,
     ) {
         if is_geojson_path(path) {
-            match self.scene.open_vector_file(path, true, 1.0) {
-                Ok((id, bounds)) => {
-                    tracing::info!(?id, path = %path.display(), "Opened GeoJSON vector layer");
-                    self.layers_ui.on_layer_opened();
-                    self.layers_ui.clear_error();
-                    if fly_to && let Some(b) = bounds {
-                        self.focus_footprint(b);
-                    }
-                    let owned = path.to_path_buf();
-                    let _ = self
-                        .storage
-                        .mutate_session(|s| s.record_recent_file(&owned));
-                    self.persist_session_snapshot(false);
-                }
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), error = %err, "Failed to open GeoJSON");
-                    self.layers_ui.push_error(err);
-                }
+            if let Err(err) = self.scene.begin_open_vector_file(path, fly_to, true, 1.0) {
+                tracing::warn!(path = %path.display(), error = %err, "Failed to queue GeoJSON open");
+                self.layers_ui.push_error(err);
             }
             return;
         }
@@ -260,16 +252,11 @@ impl VeldmapApp {
         {
             tracing::warn!(path = %path.display(), error = %err, "Failed to queue overlay open");
             self.layers_ui.push_error(err);
-        } else {
-            let owned = path.to_path_buf();
-            let _ = self
-                .storage
-                .mutate_session(|s| s.record_recent_file(&owned));
         }
     }
 
-    fn trigger_native_open_dialog(&mut self) {
-        if !self.dialogs.spawn_open_files() && !self.dialogs.is_busy() {
+    fn trigger_native_open_dialog(&mut self, frame: &eframe::Frame) {
+        if !self.dialogs.spawn_open_files(frame) && !self.dialogs.is_busy() {
             // Fallback to inline path prompt if spawning the dialog thread failed.
             self.layers_ui.show_open_prompt();
         }
@@ -288,19 +275,15 @@ impl VeldmapApp {
                         self.open_local_path(&path, true, None);
                     }
                 }
-                FileDialogEvent::SaveGeoJson(path) => {
-                    if let Some(json) = self.measure_ui.export_geojson_string() {
-                        match std::fs::write(&path, json.as_bytes()) {
-                            Ok(()) => {
-                                self.measure_ui
-                                    .set_notice(format!("Exported to {}", path.display()));
-                            }
-                            Err(err) => {
-                                self.measure_ui.set_notice(format!("Export failed: {err}"));
-                            }
-                        }
+                FileDialogEvent::GeoJsonSaved { path, result } => match result {
+                    Ok(()) => {
+                        self.measure_ui
+                            .set_notice(format!("Exported to {}", path.display()));
                     }
-                }
+                    Err(err) => {
+                        self.measure_ui.set_notice(format!("Export failed: {err}"));
+                    }
+                },
             }
         }
         true
@@ -311,14 +294,27 @@ impl VeldmapApp {
         if events.is_empty() {
             return false;
         }
-        let mut had_error = false;
-        let mut had_open = false;
+        let mut session_changed = false;
+        let mut newly_opened_paths: Vec<PathBuf> = Vec::new();
         for event in events {
             match event {
-                OverlayIoEvent::Opened { id, bounds, fly_to } => {
-                    tracing::info!(?id, "Opened local overlay layer");
+                OverlayIoEvent::Opened {
+                    id,
+                    path,
+                    bounds,
+                    fly_to,
+                } => {
+                    tracing::info!(?id, path = %path.display(), "Opened local overlay layer");
                     self.layers_ui.on_layer_opened();
-                    had_open = true;
+                    if let Some(pos) = self
+                        .pending_restored_layers
+                        .iter()
+                        .position(|p| p.path == path)
+                    {
+                        self.pending_restored_layers.remove(pos);
+                    }
+                    newly_opened_paths.push(path);
+                    session_changed = true;
                     if fly_to && let Some(b) = bounds {
                         self.focus_footprint(b);
                     }
@@ -327,40 +323,94 @@ impl VeldmapApp {
                     tracing::info!(?id, "Reloaded local overlay layer");
                     self.layers_ui.clear_error();
                 }
-                OverlayIoEvent::Failed { path, error } => {
-                    tracing::warn!(path = %path.display(), error = %error, "Overlay I/O failed");
-                    self.pending_restored_layers.retain(|p| p.path != path);
-                    self.layers_ui.note_failed_path(path, error);
-                    had_error = true;
+                OverlayIoEvent::Failed {
+                    path,
+                    error,
+                    can_assign_crs,
+                } => {
+                    let was_restored = self
+                        .pending_restored_layers
+                        .iter()
+                        .position(|p| p.path == path)
+                        .map(|pos| self.pending_restored_layers.remove(pos))
+                        .is_some();
+                    if was_restored {
+                        tracing::info!(
+                            path = %path.display(),
+                            error = %error,
+                            "Skipped unavailable layer from previous session"
+                        );
+                        session_changed = true;
+                    } else {
+                        tracing::warn!(path = %path.display(), error = %error, "Overlay I/O failed");
+                        self.layers_ui.note_failed_path(path, error, can_assign_crs);
+                    }
+                }
+                OverlayIoEvent::VectorOpened {
+                    id,
+                    path,
+                    bounds,
+                    fly_to,
+                } => {
+                    tracing::info!(?id, path = %path.display(), "Opened GeoJSON vector layer");
+                    self.layers_ui.on_layer_opened();
+                    if let Some(pos) = self
+                        .pending_restored_vectors
+                        .iter()
+                        .position(|p| p.path == path)
+                    {
+                        self.pending_restored_vectors.remove(pos);
+                    }
+                    newly_opened_paths.push(path);
+                    session_changed = true;
+                    if fly_to && let Some(b) = bounds {
+                        self.focus_footprint(b);
+                    }
+                }
+                OverlayIoEvent::VectorFailed { path, error } => {
+                    let was_restored = self
+                        .pending_restored_vectors
+                        .iter()
+                        .position(|p| p.path == path)
+                        .map(|pos| self.pending_restored_vectors.remove(pos))
+                        .is_some();
+                    if was_restored {
+                        tracing::info!(
+                            path = %path.display(),
+                            error = %error,
+                            "Skipped unavailable GeoJSON layer from previous session"
+                        );
+                        session_changed = true;
+                    } else {
+                        tracing::warn!(path = %path.display(), error = %error, "Failed to open GeoJSON");
+                        self.layers_ui.push_error(error);
+                    }
                 }
             }
         }
-        if had_open {
-            if !self.pending_restored_layers.is_empty() {
-                let opened_paths: Vec<PathBuf> = self
-                    .scene
-                    .saved_layer_entries()
-                    .into_iter()
-                    .map(|l| l.path)
-                    .collect();
-                self.pending_restored_layers
-                    .retain(|p| !opened_paths.iter().any(|open| open == &p.path));
-            }
-            self.persist_session_snapshot(false);
-            if !had_error {
-                self.layers_ui.clear_error();
-            }
+        if session_changed || !newly_opened_paths.is_empty() {
+            let mut open_layers = self.scene.saved_layer_entries();
+            open_layers.extend(self.pending_restored_layers.iter().cloned());
+            let mut open_vectors = self.scene.saved_vector_entries();
+            open_vectors.extend(self.pending_restored_vectors.iter().cloned());
+            let _ = self.storage.mutate_session(|s| {
+                s.open_layers = open_layers;
+                s.open_vectors = open_vectors;
+                for p in &newly_opened_paths {
+                    s.record_recent_file(p);
+                }
+            });
         }
         true
     }
 
-    fn apply_layer_actions(&mut self, actions: Vec<LayerUiAction>) -> bool {
+    fn apply_layer_actions(&mut self, actions: Vec<LayerUiAction>, frame: &eframe::Frame) -> bool {
         let mut needs_repaint = false;
         let mut session_dirty = false;
         for action in actions {
             match action {
                 LayerUiAction::OpenFileDialog => {
-                    self.trigger_native_open_dialog();
+                    self.trigger_native_open_dialog(frame);
                     needs_repaint = true;
                 }
                 LayerUiAction::OpenPath(path) => {
@@ -373,10 +423,10 @@ impl VeldmapApp {
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
-                LayerUiAction::SetOpacity(id, opacity) => {
+                LayerUiAction::SetOpacity(id, opacity, commit) => {
                     let changed = self.scene.set_overlay_opacity(id, opacity);
                     needs_repaint |= changed;
-                    session_dirty |= changed;
+                    session_dirty |= commit;
                 }
                 LayerUiAction::MoveUp(id) => {
                     let changed = self.scene.move_overlay_up(id);
@@ -389,7 +439,8 @@ impl VeldmapApp {
                     session_dirty |= changed;
                 }
                 LayerUiAction::OpenCrsPicker(id, name) => {
-                    self.crs_picker_ui.open_for_layer(id, name);
+                    let existing = self.scene.overlay_crs_override(id);
+                    self.crs_picker_ui.open_for_layer(id, name, existing);
                     needs_repaint = true;
                 }
                 LayerUiAction::OpenCrsPickerForPendingPath(path) => {
@@ -417,10 +468,10 @@ impl VeldmapApp {
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
-                LayerUiAction::SetVectorOpacity(id, opacity) => {
+                LayerUiAction::SetVectorOpacity(id, opacity, commit) => {
                     let changed = self.scene.set_vector_opacity(id, opacity);
                     needs_repaint |= changed;
-                    session_dirty |= changed;
+                    session_dirty |= commit;
                 }
                 LayerUiAction::RemoveVector(id) => {
                     let changed = self.scene.remove_vector(id);
@@ -551,14 +602,14 @@ impl VeldmapApp {
                         GlobePaintCallback { rect, snapshot },
                     ));
 
-                    // Floating dynamic metric scale bar.
+                    // Floating dynamic metric scale bar & basemap attribution pill.
                     let m_per_pt = self.camera.metres_per_pixel(height_pt);
-                    hud::paint_scale_bar(&painter, rect, m_per_pt);
-
-                    // Visible basemap attribution pill (NASA GIBS / EOX CC BY 4.0 / Custom).
-                    if let Some(attr) = self.scene.attribution() {
-                        hud::paint_attribution_badge(&painter, rect, attr);
-                    }
+                    let scale_rect = hud::paint_scale_bar(&painter, rect, m_per_pt);
+                    let attr_rect = self
+                        .scene
+                        .attribution()
+                        .and_then(|attr| hud::paint_attribution_badge(&painter, rect, attr));
+                    self.viewport.set_hud_rects(scale_rect, attr_rect);
                 } else {
                     self.scene.clear_cached_snapshot();
                     self.viewport.clear_viewport();
@@ -598,12 +649,16 @@ impl VeldmapApp {
         active
     }
 
-    fn apply_toolbar_actions(&mut self, actions: Vec<ToolbarAction>) -> bool {
+    fn apply_toolbar_actions(
+        &mut self,
+        actions: Vec<ToolbarAction>,
+        frame: &eframe::Frame,
+    ) -> bool {
         let mut needs_repaint = false;
         for action in actions {
             match action {
                 ToolbarAction::OpenFileDialog => {
-                    self.trigger_native_open_dialog();
+                    self.trigger_native_open_dialog(frame);
                     needs_repaint = true;
                 }
                 ToolbarAction::OpenPathPrompt => {
@@ -613,6 +668,10 @@ impl VeldmapApp {
                 ToolbarAction::OpenRecentFile(path) => {
                     self.layers_ui.clear_error();
                     self.open_local_path(&path, true, None);
+                    needs_repaint = true;
+                }
+                ToolbarAction::ClearRecentFiles => {
+                    let _ = self.storage.mutate_session(|s| s.recent_files.clear());
                     needs_repaint = true;
                 }
                 ToolbarAction::ToggleLayersPanel => {
@@ -714,7 +773,7 @@ impl VeldmapApp {
 }
 
 impl eframe::App for VeldmapApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // Drain native file dialogs & overlay I/O events BEFORE `begin_frame`.
         let mut needs_repaint = self.drain_file_dialog_events();
@@ -729,8 +788,6 @@ impl eframe::App for VeldmapApp {
         needs_repaint |= self.handle_global_input_and_drops(&ctx);
 
         let basemap_status = self.scene.basemap_status();
-        let layer_summaries = self.scene.layer_summaries();
-        let vector_summaries = self.scene.vector_summaries();
         let toolbar_actions = toolbar::show_top_toolbar(
             ui,
             ToolbarInputs {
@@ -746,7 +803,7 @@ impl eframe::App for VeldmapApp {
             &mut self.goto_bar,
             &mut self.basemap_ui,
         );
-        needs_repaint |= self.apply_toolbar_actions(toolbar_actions);
+        needs_repaint |= self.apply_toolbar_actions(toolbar_actions, frame);
         needs_repaint |= self.show_settings_if_open(&ctx);
 
         if let Some(crs_action) = show_crs_picker_window(&ctx, &mut self.crs_picker_ui) {
@@ -755,7 +812,18 @@ impl eframe::App for VeldmapApp {
 
         if let Some(MeasureAction::ExportGeoJson) = show_measure_window(&ctx, &mut self.measure_ui)
         {
-            let _ = self.dialogs.spawn_save_geojson("measurement.geojson");
+            if let Some(payload) = self.measure_ui.export_geojson_string()
+                && !self
+                    .dialogs
+                    .spawn_save_geojson("measurement.geojson", payload, frame)
+            {
+                let msg = if self.dialogs.is_busy() {
+                    "Another file dialog is already open."
+                } else {
+                    "Unable to open native save dialog on this system."
+                };
+                self.measure_ui.set_notice(msg.to_owned());
+            }
             needs_repaint = true;
         }
 
@@ -781,9 +849,13 @@ impl eframe::App for VeldmapApp {
             self.viewport.viewport_height_px(),
         );
 
-        let layer_actions =
-            show_layers_panel(ui, &layer_summaries, &vector_summaries, &mut self.layers_ui);
-        needs_repaint |= self.apply_layer_actions(layer_actions);
+        if self.layers_ui.is_open() {
+            let layer_summaries = self.scene.layer_summaries();
+            let vector_summaries = self.scene.vector_summaries();
+            let layer_actions =
+                show_layers_panel(ui, &layer_summaries, &vector_summaries, &mut self.layers_ui);
+            needs_repaint |= self.apply_layer_actions(layer_actions, frame);
+        }
 
         let viewport_rect = self.show_globe_viewport(&ctx, ui);
         let scene_hint = self.scene.end_frame();

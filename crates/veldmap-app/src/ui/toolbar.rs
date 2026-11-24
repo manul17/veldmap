@@ -12,11 +12,12 @@ use eframe::egui;
 use veldmap_core::geo::{ParsedLocation, parse_location};
 
 use crate::basemap::BasemapStatusSnapshot;
-use crate::session::CameraBookmark;
+use crate::session::{CameraBookmark, MAX_BOOKMARKS};
 use crate::settings::AppSettings;
 
 use super::ERROR_TEXT_COLOR;
 use super::basemap::{BasemapUiAction, BasemapUiState, show_toolbar_controls};
+use super::hud;
 
 /// User intent emitted by the top workstation toolbar and applied by
 /// `VeldmapApp`.
@@ -25,6 +26,7 @@ pub(crate) enum ToolbarAction {
     OpenFileDialog,
     OpenPathPrompt,
     OpenRecentFile(PathBuf),
+    ClearRecentFiles,
     ToggleLayersPanel,
     ToggleMeasureTool,
     SaveBookmark(String),
@@ -81,7 +83,10 @@ pub(crate) fn show_top_toolbar(
     let mut actions = Vec::new();
     egui::Panel::top("top_toolbar").show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.strong(veldmap_core::APP_NAME);
+            ui.strong(veldmap_core::APP_NAME).on_hover_text(format!(
+                "GPU: {}\nControls: Drag orbit · Right/Shift+drag or Q/E rotate · WASD/Arrows pan · Scroll/+/- zoom · N reset North",
+                inputs.adapter_label
+            ));
             ui.separator();
 
             if ui
@@ -113,6 +118,11 @@ pub(crate) fn show_top_toolbar(
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    if ui.button("Clear Recent").clicked() {
+                        actions.push(ToolbarAction::ClearRecentFiles);
+                        ui.close();
+                    }
                 } else {
                     ui.separator();
                     ui.weak("No recent files");
@@ -141,13 +151,22 @@ pub(crate) fn show_top_toolbar(
             }
 
             ui.menu_button("Bookmarks", |ui| {
+                let at_cap = inputs.bookmarks.len() >= MAX_BOOKMARKS;
                 ui.horizontal(|ui| {
-                    ui.add(
+                    let bm_resp = ui.add(
                         egui::TextEdit::singleline(&mut goto.bookmark_name)
                             .desired_width(130.0)
                             .hint_text("Bookmark name"),
                     );
-                    if ui.button("Save View").clicked() {
+                    let enter =
+                        bm_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let save_clicked = ui
+                        .add_enabled(!at_cap, egui::Button::new("Save View"))
+                        .on_disabled_hover_text(format!(
+                            "Bookmark limit reached ({MAX_BOOKMARKS}); delete one to add more."
+                        ))
+                        .clicked();
+                    if !at_cap && (save_clicked || enter) {
                         let name = goto.bookmark_name.trim().to_owned();
                         actions.push(ToolbarAction::SaveBookmark(name));
                         goto.bookmark_name.clear();
@@ -157,7 +176,13 @@ pub(crate) fn show_top_toolbar(
                     ui.separator();
                     for (idx, bm) in inputs.bookmarks.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui.button(&bm.name).clicked() {
+                            let tip = format!(
+                                "{} · Alt {} · Hdg {:.1}°",
+                                hud::format_lat_lon(bm.lat_deg, bm.lon_deg),
+                                hud::format_distance_m(bm.height_m),
+                                bm.heading_deg
+                            );
+                            if ui.button(&bm.name).on_hover_text(tip).clicked() {
                                 actions.push(ToolbarAction::GoToBookmark(bm.clone()));
                                 ui.close();
                             }
@@ -215,10 +240,6 @@ pub(crate) fn show_top_toolbar(
                 )
                 .on_hover_text(err);
             }
-
-            ui.separator();
-            ui.add(egui::Label::new(egui::RichText::new(inputs.adapter_label).weak()).truncate())
-                .on_hover_text(inputs.adapter_label);
         });
     });
     actions

@@ -1,7 +1,8 @@
 //! Application-wide storage ownership (`AppStorage`): platform storage paths,
-//! persisted [`AppSettings`], shared SQLite WAL [`TileDiskCache`], and the
-//! serialized off-UI-thread [`worker::DiskCacheWorker`] (handling SQLite
-//! maintenance AND durable `settings.json` saves off the UI thread).
+//! persisted [`AppSettings`] and [`AppSession`], shared SQLite WAL
+//! [`TileDiskCache`], and the serialized off-UI-thread
+//! [`worker::DiskCacheWorker`] (handling SQLite maintenance and durable
+//! `settings.json` / `session.json` saves off the UI thread).
 //!
 //! Stays completely decoupled from `veldmap-net` (using
 //! `veldmap_core::sync::Wakeup` and `TileDiskCache::write_generation()`) so

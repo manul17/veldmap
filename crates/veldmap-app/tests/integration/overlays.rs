@@ -502,9 +502,9 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
         &fc,
         DEFAULT_VECTOR_MAX_CHORD_DEG,
     ));
-    assert_eq!(mesh.point_vertices.len(), 1);
-    assert!(mesh.fill_indices.is_empty());
-    assert!(mesh.line_vertices.is_empty());
+    assert_eq!(mesh.point_count(), 1);
+    assert_eq!(mesh.fill_triangle_count(), 0);
+    assert_eq!(mesh.line_segment_count(), 0);
 
     let (width, height) = (128u32, 128u32);
     let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -518,7 +518,7 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
         opacity: 1.0,
         fill_color: [0.0, 0.0, 1.0, 0.3],
         line_color: [0.0, 1.0, 0.0, 1.0],
-        mesh,
+        mesh: Arc::clone(&mesh),
     });
     let pixels = render_srgb(&mut renderer, device, queue, width, height, &Arc::new(snap));
 
@@ -526,5 +526,126 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
     assert!(
         center_px[1] > 235 && center_px[0] < 20 && center_px[2] < 20,
         "GeoJSON Point marker at screen center must render bright green diamond, got {center_px:?}"
+    );
+
+    // Zooming in by 20x must keep the instanced point marker visible at the same
+    // screen-space scale without rebuilding the CPU VectorMesh.
+    let close_cam = Camera::at(48.0, 40.0, 10_000.0);
+    let mut close_snap = build_empty_snapshot(close_cam, width, height, &config);
+    close_snap.vectors.push(DrawVectorLayer {
+        id: 7,
+        rev: 1,
+        opacity: 1.0,
+        fill_color: [0.0, 0.0, 1.0, 0.3],
+        line_color: [0.0, 1.0, 0.0, 1.0],
+        mesh,
+    });
+    let close_pixels = render_srgb(
+        &mut renderer,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(close_snap),
+    );
+    let close_center = pixel_at(&close_pixels, width, width / 2, height / 2);
+    assert!(
+        close_center[1] > 235 && close_center[0] < 20 && close_center[2] < 20,
+        "Zoomed-in instanced Point marker must remain crisp green at screen center, got {close_center:?}"
+    );
+}
+
+#[test]
+fn draped_geojson_linestring_respects_layer_opacity_in_pass2() {
+    use veldmap_app::render::DrawVectorLayer;
+    use veldmap_core::geo::{DEFAULT_VECTOR_MAX_CHORD_DEG, VectorMesh, parse_geojson};
+
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let raw = r#"{
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {"name": "Track"},
+            "geometry": { "type": "LineString", "coordinates": [[38.0, 48.0], [42.0, 48.0]] }
+        }]
+    }"#;
+    let fc = parse_geojson(raw).expect("parse linestring geojson");
+    let mesh = Arc::new(VectorMesh::from_collection(
+        &fc,
+        DEFAULT_VECTOR_MAX_CHORD_DEG,
+    ));
+    assert_eq!(mesh.fill_triangle_count(), 0);
+    assert!(mesh.line_segment_count() >= 4);
+    assert_eq!(mesh.point_count(), 0);
+
+    let (width, height) = (128u32, 128u32);
+    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let cam = Camera::at(48.0, 40.0, 250_000.0);
+    let config = QuadtreeConfig::default();
+
+    let baseline = render_srgb(
+        &mut renderer,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(build_empty_snapshot(cam, width, height, &config)),
+    );
+
+    let mut full_snap = build_empty_snapshot(cam, width, height, &config);
+    full_snap.vectors.push(DrawVectorLayer {
+        id: 9,
+        rev: 1,
+        opacity: 1.0,
+        fill_color: [0.0, 0.0, 0.0, 0.0],
+        line_color: [0.0, 0.2, 1.0, 1.0],
+        mesh: Arc::clone(&mesh),
+    });
+    let full_px = render_srgb(
+        &mut renderer,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(full_snap),
+    );
+
+    let mut half_snap = build_empty_snapshot(cam, width, height, &config);
+    half_snap.vectors.push(DrawVectorLayer {
+        id: 9,
+        rev: 1,
+        opacity: 0.35,
+        fill_color: [0.0, 0.0, 0.0, 0.0],
+        line_color: [0.0, 0.2, 1.0, 1.0],
+        mesh,
+    });
+    let half_px = render_srgb(
+        &mut renderer,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(half_snap),
+    );
+
+    // Search a small vertical window around center in case rasterization lands on row 63 or 64.
+    // The default ellipsoid is bright off-white (~[251, 248, 240]), so a blue line [0, 0.2, 1]
+    // drops the red channel sharply.
+    let best_row = (height / 2 - 2..=height / 2 + 2)
+        .min_by_key(|&y| pixel_at(&full_px, width, width / 2, y)[0])
+        .expect("non-empty row window");
+    let base_c = pixel_at(&baseline, width, width / 2, best_row);
+    let full_c = pixel_at(&full_px, width, width / 2, best_row);
+    let half_c = pixel_at(&half_px, width, width / 2, best_row);
+    assert!(
+        base_c[0] > full_c[0].saturating_add(180) && full_c[2] > 230,
+        "full-opacity blue line must stand out clearly over baseline: base={base_c:?}, full={full_c:?}"
+    );
+    assert!(
+        half_c[0] < base_c[0].saturating_sub(20) && half_c[0] > full_c[0].saturating_add(20),
+        "partial-opacity line must blend between baseline and full opacity: base={base_c:?}, half={half_c:?}, full={full_c:?}"
     );
 }

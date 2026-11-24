@@ -85,6 +85,7 @@ fn wide_and_global_pixel_is_point_geographic_geotiffs_bind_without_wrapping_or_r
         placement: None,
         ties,
         foreign_datum_epsg: None,
+        geographic_datum: None,
         binding_trouble: None,
         levels: Vec::new(),
     };
