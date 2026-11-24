@@ -25,7 +25,7 @@ cargo run -p veldmap-app
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
 
 # Verify headless non-UI crates in isolation
 cargo test --locked -p veldmap-core --no-default-features

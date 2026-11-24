@@ -13,11 +13,10 @@ use veldmap_core::tile::SourceId;
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
-use crate::app::AppError;
 use crate::basemap::{BasemapManager, BasemapStatusSnapshot};
 use crate::gpu_tiles::{
     DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
-    UploadBatchReport, UploadPassParams,
+    UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::render::{DrawSnapshot, SnapshotBuildParams};
 use crate::settings::AppSettings;
@@ -43,11 +42,9 @@ impl SceneState {
         disk_cache: Option<Arc<TileDiskCache>>,
         wakeup: Wakeup,
         budget: &MemoryBudget,
-    ) -> Result<Self, AppError> {
+    ) -> Result<Self, UploadChannelClosed> {
         let pending_uploads = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
-        let done_tx = pending_uploads
-            .sender()
-            .ok_or(AppError::UploadChannelClosed)?;
+        let done_tx = pending_uploads.sender().ok_or(UploadChannelClosed)?;
 
         let decode_shutdown = CancelToken::new();
         let mut decode_cfg = TwoLaneDecodePoolConfig::from_budget(budget);

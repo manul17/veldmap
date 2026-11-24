@@ -188,7 +188,7 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
         .dimensions()
         .map_err(|e| map_tiff_error(e, req.cancel))?;
     let (cw, ch) = pooled.decoder_mut().chunk_dimensions();
-    if cw == 0 || ch == 0 {
+    if w == 0 || h == 0 || cw == 0 || ch == 0 {
         return Ok(DisplayMapping::identity(req.nodata));
     }
     let pixel = req.pixel_layout;

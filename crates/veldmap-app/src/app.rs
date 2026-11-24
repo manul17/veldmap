@@ -10,6 +10,7 @@ use veldmap_core::geo::camera::{Camera, ZOOM_PER_CLICK};
 use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
+use crate::gpu_tiles::UploadChannelClosed;
 use crate::render::GlobeRenderer;
 use crate::scene::SceneState;
 use crate::storage::AppStorage;
@@ -40,6 +41,12 @@ pub enum AppError {
     MissingWgpu,
     #[error("tile upload completion channel was closed during initialization")]
     UploadChannelClosed,
+}
+
+impl From<UploadChannelClosed> for AppError {
+    fn from(_: UploadChannelClosed) -> Self {
+        Self::UploadChannelClosed
+    }
 }
 
 pub struct VeldmapApp {

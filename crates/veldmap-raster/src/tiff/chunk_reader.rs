@@ -203,6 +203,29 @@ impl<'a> TiffChunkReader<'a> {
             None => self.pooled.insert(self.decoder_pool.checkout(cancel)?),
         };
         pooled.seek_to_image(image, cancel)?;
+        let (img_w, img_h) = pooled
+            .decoder_mut()
+            .dimensions()
+            .map_err(|e| map_tiff_error(e, cancel))?;
+        let (cw, ch) = pooled.decoder_mut().chunk_dimensions();
+        if img_w == 0 || img_h == 0 {
+            return Err(RasterError::InvalidDimensions {
+                width: img_w,
+                height: img_h,
+            });
+        }
+        if cw == 0 || ch == 0 {
+            return Err(RasterError::InvalidDimensions {
+                width: cw,
+                height: ch,
+            });
+        }
+        let total_chunks = u64::from(img_w.div_ceil(cw)) * u64::from(img_h.div_ceil(ch));
+        if u64::from(index) >= total_chunks {
+            return Err(RasterError::Tiff(format!(
+                "chunk index {index} out of range for IFD {image} ({total_chunks} chunks)"
+            )));
+        }
         let (dw, dh) = pooled.decoder_mut().chunk_data_dimensions(index);
         if dw == 0 || dh == 0 {
             return Err(RasterError::InvalidDimensions {
