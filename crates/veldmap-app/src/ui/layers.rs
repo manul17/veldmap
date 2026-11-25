@@ -15,11 +15,25 @@ use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
 use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format, submitted_with_enter};
 
+/// Immutable summary of a layer from the previous `session.json` that could not
+/// be reopened at startup (kept in `session.json` until reopened or explicitly
+/// forgotten so custom CRS overrides and stretch styles are never lost).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnavailableLayerNotice {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) error: String,
+    pub(crate) is_vector: bool,
+}
+
 /// User intent emitted by the Layer List panel, applied by `VeldmapApp`.
 #[derive(Clone, Debug)]
 pub(crate) enum LayerUiAction {
     OpenFileDialog,
     OpenPath(PathBuf),
+    RetryUnavailableSessionLayers,
+    HideUnavailableSessionNotice,
+    ForgetUnavailableSessionLayers,
     ToggleVisibility(LayerId, bool),
     SetOpacity(LayerId, f32, bool),
     SetStream(LayerId, TileStreamSpec),
@@ -57,6 +71,10 @@ impl LayersPanelState {
 
     pub(crate) fn toggle_open(&mut self) {
         self.open = !self.open;
+    }
+
+    pub(crate) fn open_panel(&mut self) {
+        self.open = true;
     }
 
     pub(crate) fn on_layer_opened(&mut self) {
@@ -722,11 +740,70 @@ fn show_vector_card(
     ui.add_space(4.0);
 }
 
+fn show_unavailable_session_banner(
+    ui: &mut egui::Ui,
+    unavailable: &[UnavailableLayerNotice],
+    actions: &mut Vec<LayerUiAction>,
+) {
+    if unavailable.is_empty() {
+        return;
+    }
+    let count = unavailable.len();
+    let noun = if count == 1 { "layer" } else { "layers" };
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.colored_label(
+            WARN_TEXT_COLOR,
+            format!("{count} saved session {noun} unavailable"),
+        );
+        ui.small(
+            egui::RichText::new("Preserved in session.json with style/CRS settings intact.").weak(),
+        );
+        for item in unavailable.iter().take(4) {
+            let kind_tag = if item.is_vector { "Vector" } else { "Raster" };
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("• [{kind_tag}] {}", item.name)).small(),
+                )
+                .truncate(),
+            )
+            .on_hover_text(format!("{}\n{}", item.path.display(), item.error));
+        }
+        if count > 4 {
+            ui.small(egui::RichText::new(format!("… and {} more", count - 4)).weak());
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Retry")
+                .on_hover_text("Retry opening unavailable layers from the previous session")
+                .clicked()
+            {
+                actions.push(LayerUiAction::RetryUnavailableSessionLayers);
+            }
+            if ui
+                .small_button("Hide")
+                .on_hover_text("Hide this notice for now (keeps layers saved in session.json)")
+                .clicked()
+            {
+                actions.push(LayerUiAction::HideUnavailableSessionNotice);
+            }
+            if ui
+                .small_button("Forget")
+                .on_hover_text("Remove unavailable layers from saved session.json")
+                .clicked()
+            {
+                actions.push(LayerUiAction::ForgetUnavailableSessionLayers);
+            }
+        });
+    });
+    ui.separator();
+}
+
 /// Render the collapsible left Layer List panel and return user actions.
 pub(crate) fn show_layers_panel(
     ui: &mut egui::Ui,
     layers: &[LayerSummary],
     vectors: &[VectorLayerSummary],
+    unavailable_session_layers: &[UnavailableLayerNotice],
     state: &mut LayersPanelState,
 ) -> Vec<LayerUiAction> {
     let mut actions = Vec::new();
@@ -766,6 +843,8 @@ pub(crate) fn show_layers_panel(
                 });
                 ui.separator();
             }
+
+            show_unavailable_session_banner(ui, unavailable_session_layers, &mut actions);
 
             if total == 0 {
                 ui.weak("No raster or GeoJSON layers loaded.");

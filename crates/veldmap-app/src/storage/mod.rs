@@ -22,8 +22,8 @@ use veldmap_storage::{StorageError, StoragePaths, TileDiskCache};
 
 use self::session::AppSession;
 use self::settings::AppSettings;
-use self::worker::DiskCacheWorker;
 pub(crate) use self::worker::{DiskCacheNotice, DiskCacheStatus};
+use self::worker::{DiskCacheWorker, PersistenceFaults};
 
 /// Minimum interval between event-driven disk-cache stats refreshes while the
 /// Settings window is open and new tiles are being written.
@@ -38,6 +38,7 @@ pub(crate) struct AppStorage {
     session: AppSession,
     disk_cache: Option<Arc<TileDiskCache>>,
     disk_worker: Option<DiskCacheWorker>,
+    persistence_faults: Arc<PersistenceFaults>,
     last_stats_write_gen: u64,
     last_stats_refresh: Option<Instant>,
     last_handled_clear_gen: u64,
@@ -82,10 +83,12 @@ impl AppStorage {
             }
         });
 
+        let persistence_faults = Arc::new(PersistenceFaults::default());
         let disk_worker = DiskCacheWorker::spawn(
             disk_cache.as_ref().map(Arc::clone),
             resolved_paths.clone(),
             wakeup,
+            Arc::clone(&persistence_faults),
         );
 
         Self {
@@ -94,6 +97,7 @@ impl AppStorage {
             session,
             disk_cache,
             disk_worker,
+            persistence_faults,
             last_stats_write_gen: 0,
             last_stats_refresh: None,
             last_handled_clear_gen: 0,
@@ -131,16 +135,23 @@ impl AppStorage {
         label: &str,
         try_enqueue: impl FnOnce(&DiskCacheWorker) -> bool,
         save_direct: impl FnOnce(&StoragePaths) -> Result<(), StorageError>,
+        record_direct_result: impl FnOnce(&PersistenceFaults, Option<String>) -> bool,
     ) {
         if let Some(worker) = &self.disk_worker
             && try_enqueue(worker)
         {
             return;
         }
-        if let Some(paths) = &self.paths
-            && let Err(err) = save_direct(paths)
-        {
-            tracing::warn!(error = %err, "Failed to persist {label}");
+        if let Some(paths) = &self.paths {
+            match save_direct(paths) {
+                Ok(()) => {
+                    let _ = record_direct_result(&self.persistence_faults, None);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "Failed to persist {label}");
+                    let _ = record_direct_result(&self.persistence_faults, Some(err.to_string()));
+                }
+            }
         }
     }
 
@@ -149,7 +160,19 @@ impl AppStorage {
             "session",
             |worker| worker.request_save_session(self.session.clone()),
             |paths| self.session.save(paths),
+            PersistenceFaults::set_session_result,
         );
+    }
+
+    /// Lock-free fast-path summary of any active `settings.json` / `session.json`
+    /// save failure (`None` with zero mutex acquisitions on healthy frames).
+    pub(crate) fn persistence_fault_summary(&self) -> Option<String> {
+        self.persistence_faults.summary()
+    }
+
+    /// Dismiss active persistence save failure notices from the UI banner.
+    pub(crate) fn dismiss_persistence_fault(&self) {
+        self.persistence_faults.dismiss();
     }
 
     pub(crate) fn disk_cache(&self) -> Option<Arc<TileDiskCache>> {
@@ -194,6 +217,7 @@ impl AppStorage {
             "user settings",
             |worker| worker.request_save_settings(self.settings.clone()),
             |paths| self.settings.save(paths),
+            PersistenceFaults::set_settings_result,
         );
     }
 

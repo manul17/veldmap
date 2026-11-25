@@ -10,13 +10,14 @@ mod viewport_bridge;
 mod viewport_input;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use eframe::egui_wgpu;
 use thiserror::Error;
 use veldmap_core::geo::{Camera, FootprintBounds};
-use veldmap_core::sync::Wakeup;
+use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 use veldmap_storage::detect_memory_budget;
 
 use crate::gpu_tiles::UploadChannelClosed;
@@ -74,10 +75,75 @@ impl UiPanels {
     }
 }
 
+#[derive(Default)]
+struct GpuFaultInner {
+    device_lost: Option<String>,
+    uncaptured_error: Option<String>,
+}
+
+/// Lock-free fast-path holder for asynchronous `wgpu` device faults surfaced in
+/// the UI banner without per-frame mutex locks or error-frame repaint storms.
+#[derive(Default)]
+struct GpuFaultState {
+    has_fault: AtomicBool,
+    inner: Mutex<GpuFaultInner>,
+}
+
+impl GpuFaultState {
+    fn record_device_lost(&self, msg: String) -> bool {
+        let mut guard = lock_unpoisoned(&self.inner);
+        let changed = guard.device_lost.as_deref() != Some(msg.as_str());
+        guard.device_lost = Some(msg);
+        self.has_fault.store(true, Ordering::Release);
+        changed
+    }
+
+    fn record_uncaptured_error(&self, msg: String) -> bool {
+        let mut guard = lock_unpoisoned(&self.inner);
+        if guard.device_lost.is_some() {
+            return false;
+        }
+        if guard.uncaptured_error.as_deref() == Some(msg.as_str()) {
+            return false;
+        }
+        guard.uncaptured_error = Some(msg);
+        self.has_fault.store(true, Ordering::Release);
+        true
+    }
+
+    fn summary(&self) -> Option<(String, bool)> {
+        if !self.has_fault.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = lock_unpoisoned(&self.inner);
+        if let Some(lost) = &guard.device_lost {
+            return Some((
+                format!("GPU device lost (restart recommended): {lost}"),
+                true,
+            ));
+        }
+        guard
+            .uncaptured_error
+            .as_ref()
+            .map(|err| (format!("GPU error: {err}"), false))
+    }
+
+    fn dismiss(&self) {
+        if !self.has_fault.load(Ordering::Acquire) {
+            return;
+        }
+        let mut guard = lock_unpoisoned(&self.inner);
+        guard.device_lost = None;
+        guard.uncaptured_error = None;
+        self.has_fault.store(false, Ordering::Release);
+    }
+}
+
 pub struct VeldmapApp {
     adapter_label: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    gpu_faults: Arc<GpuFaultState>,
     camera: Camera,
     scene: SceneState,
     storage: AppStorage,
@@ -125,14 +191,42 @@ impl VeldmapApp {
             "Initialized wgpu render state"
         );
 
-        render_state.device.on_uncaptured_error(Arc::new(|err| {
-            tracing::error!(error = %err, "Uncaptured wgpu device error");
-        }));
-        render_state
-            .device
-            .set_device_lost_callback(|reason, message| {
-                tracing::error!(?reason, %message, "wgpu device lost");
-            });
+        let egui_ctx = cc.egui_ctx.clone();
+        let wakeup: Wakeup = Arc::new(move || {
+            egui_ctx.request_repaint();
+        });
+
+        let gpu_faults = Arc::new(GpuFaultState::default());
+        {
+            let faults = Arc::clone(&gpu_faults);
+            let wake = Arc::clone(&wakeup);
+            render_state
+                .device
+                .on_uncaptured_error(Arc::new(move |err| {
+                    let msg = err.to_string();
+                    tracing::error!(error = %msg, "Uncaptured wgpu device error");
+                    if faults.record_uncaptured_error(msg) {
+                        (wake)();
+                    }
+                }));
+        }
+        {
+            let faults = Arc::clone(&gpu_faults);
+            let wake = Arc::clone(&wakeup);
+            render_state
+                .device
+                .set_device_lost_callback(move |reason, message| {
+                    // Normal shutdown destroys the wgpu device; ignore expected teardown.
+                    if reason == wgpu::DeviceLostReason::Destroyed {
+                        tracing::debug!(?reason, %message, "wgpu device destroyed during teardown");
+                        return;
+                    }
+                    tracing::error!(?reason, %message, "wgpu device lost");
+                    if faults.record_device_lost(message) {
+                        (wake)();
+                    }
+                });
+        }
 
         let bind_groups = TileBindGroupCache::new(&render_state.device);
         let renderer = GlobeRenderer::new_with_shared_bind_groups(
@@ -151,11 +245,6 @@ impl VeldmapApp {
         let device = render_state.device.clone();
         let queue = render_state.queue.clone();
 
-        let egui_ctx = cc.egui_ctx.clone();
-        let wakeup: Wakeup = Arc::new(move || {
-            egui_ctx.request_repaint();
-        });
-
         let budget = detect_memory_budget();
         let storage = AppStorage::open(Arc::clone(&wakeup), None);
         let dialogs = DialogHost::new(Arc::clone(&wakeup));
@@ -171,6 +260,7 @@ impl VeldmapApp {
             adapter_label,
             device,
             queue,
+            gpu_faults,
             camera,
             scene,
             storage,
@@ -308,6 +398,25 @@ impl VeldmapApp {
         needs_repaint
     }
 
+    fn show_system_fault_banner(&self, ui: &mut egui::Ui) -> bool {
+        let gpu_fault = self.gpu_faults.summary();
+        let storage_fault = self.storage.persistence_fault_summary();
+        let action = ui::show_system_fault_banner(
+            ui,
+            gpu_fault
+                .as_ref()
+                .map(|(msg, is_lost)| (msg.as_str(), *is_lost)),
+            storage_fault.as_deref(),
+        );
+        if action.dismiss_gpu {
+            self.gpu_faults.dismiss();
+        }
+        if action.dismiss_storage {
+            self.storage.dismiss_persistence_fault();
+        }
+        action.dismiss_gpu || action.dismiss_storage
+    }
+
     fn schedule_next_repaint(
         &self,
         ctx: &egui::Context,
@@ -352,6 +461,7 @@ impl eframe::App for VeldmapApp {
                 basemap_status: &basemap_status,
                 adapter_label: &self.adapter_label,
                 layer_count: self.scene.total_layer_count(),
+                unavailable_layer_count: self.restore_tracker.unavailable_count(),
                 layers_open: self.panels.layers.is_open(),
                 measure_active: self.scene.measure().is_active(),
                 recent_files: &self.storage.session().recent_files,
@@ -361,6 +471,7 @@ impl eframe::App for VeldmapApp {
             &mut self.panels.basemap,
         );
         needs_repaint |= self.apply_toolbar_actions(toolbar_actions, frame);
+        needs_repaint |= self.show_system_fault_banner(ui);
         needs_repaint |= self.show_settings_if_open(&ctx);
 
         if let Some(crs_action) = show_crs_picker_window(&ctx, &mut self.panels.crs_picker) {
@@ -396,6 +507,7 @@ impl eframe::App for VeldmapApp {
                 ui,
                 &layer_summaries,
                 &vector_summaries,
+                self.restore_tracker.visible_notices(),
                 &mut self.panels.layers,
             );
             needs_repaint |= self.apply_layer_actions(layer_actions, frame);
@@ -415,5 +527,33 @@ impl eframe::App for VeldmapApp {
         }
 
         self.schedule_next_repaint(&ctx, camera_before, rect_before, needs_repaint, scene_hint);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_fault_state_deduplicates_errors_preserves_device_lost_and_dismisses() {
+        let faults = GpuFaultState::default();
+        assert!(faults.summary().is_none());
+
+        // Identical repeated uncaptured errors return false (no repaint storm).
+        assert!(faults.record_uncaptured_error("validation fail".to_owned()));
+        assert!(!faults.record_uncaptured_error("validation fail".to_owned()));
+        let (msg, is_lost) = faults.summary().expect("uncaptured summary");
+        assert!(!is_lost);
+        assert!(msg.contains("validation fail"));
+
+        // Device lost overrides uncaptured errors and cannot be overwritten by later errors.
+        assert!(faults.record_device_lost("driver reset".to_owned()));
+        assert!(!faults.record_uncaptured_error("later error".to_owned()));
+        let (lost_msg, is_lost) = faults.summary().expect("device lost summary");
+        assert!(is_lost);
+        assert!(lost_msg.contains("driver reset"));
+
+        faults.dismiss();
+        assert!(faults.summary().is_none());
     }
 }

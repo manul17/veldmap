@@ -144,6 +144,11 @@ pub(crate) enum OverlayIoEvent {
     Reloaded {
         id: LayerId,
     },
+    ReloadFailed {
+        path: PathBuf,
+        error: String,
+        can_assign_crs: bool,
+    },
     Failed {
         path: PathBuf,
         error: String,

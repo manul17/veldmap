@@ -2,7 +2,7 @@
 //! SQLite disk-cache stats, cap updates, full clears, and coalesced durable
 //! `settings.json` / `session.json` saves in FIFO order.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +13,72 @@ use crate::worker::{CommandSendError, CommandWorker};
 
 use super::session::AppSession;
 use super::settings::AppSettings;
+
+#[derive(Default)]
+struct PersistenceFaultInner {
+    settings: Option<String>,
+    session: Option<String>,
+}
+
+/// Lock-free fast-path tracker for `settings.json` / `session.json` persistence
+/// failures, kept separate from [`DiskCacheStatus::notice`] so opening the
+/// Settings window never clears save errors.
+#[derive(Default)]
+pub(super) struct PersistenceFaults {
+    has_fault: AtomicBool,
+    inner: Mutex<PersistenceFaultInner>,
+}
+
+impl PersistenceFaults {
+    fn update_slot(
+        &self,
+        next: Option<String>,
+        slot_of: impl FnOnce(&mut PersistenceFaultInner) -> &mut Option<String>,
+    ) -> bool {
+        let mut guard = lock_unpoisoned(&self.inner);
+        let slot = slot_of(&mut guard);
+        if *slot == next {
+            return false;
+        }
+        *slot = next;
+        let any = guard.settings.is_some() || guard.session.is_some();
+        self.has_fault.store(any, Ordering::Release);
+        true
+    }
+
+    pub(super) fn set_settings_result(&self, err: Option<String>) -> bool {
+        self.update_slot(err, |inner| &mut inner.settings)
+    }
+
+    pub(super) fn set_session_result(&self, err: Option<String>) -> bool {
+        self.update_slot(err, |inner| &mut inner.session)
+    }
+
+    pub(super) fn summary(&self) -> Option<String> {
+        if !self.has_fault.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = lock_unpoisoned(&self.inner);
+        match (&guard.settings, &guard.session) {
+            (Some(s), Some(sess)) => Some(format!(
+                "Failed to save settings ({s}) and session ({sess})"
+            )),
+            (Some(s), None) => Some(format!("Failed to save settings: {s}")),
+            (None, Some(sess)) => Some(format!("Failed to save session: {sess}")),
+            (None, None) => None,
+        }
+    }
+
+    pub(super) fn dismiss(&self) {
+        if !self.has_fault.load(Ordering::Acquire) {
+            return;
+        }
+        let mut guard = lock_unpoisoned(&self.inner);
+        guard.settings = None;
+        guard.session = None;
+        self.has_fault.store(false, Ordering::Release);
+    }
+}
 
 /// Typed asynchronous maintenance outcome reported by [`DiskCacheWorker`]
 /// (formatted into user-facing copy by the UI layer).
@@ -70,6 +136,7 @@ struct DiskWorkerCtx<'a> {
     wakeup: &'a Wakeup,
     state: &'a Mutex<DiskCacheStatus>,
     clear_gen: &'a AtomicU64,
+    persistence_faults: &'a PersistenceFaults,
 }
 
 fn handle_disk_cmd(
@@ -134,10 +201,18 @@ fn handle_disk_cmd(
                 DiskCacheCmd::SaveSettings(newer) => CoalesceStep::Update(newer),
                 other => CoalesceStep::Defer(other),
             });
-            if let Some(paths) = ctx.paths
-                && let Err(err) = settings.save(paths)
-            {
-                tracing::warn!(error = %err, "Failed to persist user settings");
+            if let Some(paths) = ctx.paths {
+                let changed = match settings.save(paths) {
+                    Ok(()) => ctx.persistence_faults.set_settings_result(None),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to persist user settings");
+                        ctx.persistence_faults
+                            .set_settings_result(Some(err.to_string()))
+                    }
+                };
+                if changed {
+                    (ctx.wakeup)();
+                }
             }
         }
         DiskCacheCmd::SaveSession(initial) => {
@@ -145,10 +220,18 @@ fn handle_disk_cmd(
                 DiskCacheCmd::SaveSession(newer) => CoalesceStep::Update(newer),
                 other => CoalesceStep::Defer(other),
             });
-            if let Some(paths) = ctx.paths
-                && let Err(err) = session.save(paths)
-            {
-                tracing::warn!(error = %err, "Failed to persist session");
+            if let Some(paths) = ctx.paths {
+                let changed = match session.save(paths) {
+                    Ok(()) => ctx.persistence_faults.set_session_result(None),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to persist session");
+                        ctx.persistence_faults
+                            .set_session_result(Some(err.to_string()))
+                    }
+                };
+                if changed {
+                    (ctx.wakeup)();
+                }
             }
         }
     }
@@ -169,6 +252,7 @@ impl DiskCacheWorker {
         cache: Option<Arc<TileDiskCache>>,
         paths: Option<StoragePaths>,
         wakeup: Wakeup,
+        persistence_faults: Arc<PersistenceFaults>,
     ) -> Option<Self> {
         if cache.is_none() && paths.is_none() {
             return None;
@@ -190,6 +274,7 @@ impl DiskCacheWorker {
                 wakeup: &wakeup,
                 state: &worker_state,
                 clear_gen: &worker_clear_gen,
+                persistence_faults: &persistence_faults,
             };
             let mut pending_cmd: Option<DiskCacheCmd> = None;
             while let Some(cmd) = pending_cmd.take().or_else(|| rx.recv().ok()) {

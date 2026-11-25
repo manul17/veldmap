@@ -108,6 +108,20 @@ impl VeldmapApp {
                     self.open_user_paths(vec![path], None);
                     needs_repaint = true;
                 }
+                LayerUiAction::RetryUnavailableSessionLayers => {
+                    self.retry_unavailable_session_layers();
+                    needs_repaint = true;
+                }
+                LayerUiAction::HideUnavailableSessionNotice => {
+                    self.restore_tracker.hide_notices();
+                    needs_repaint = true;
+                }
+                LayerUiAction::ForgetUnavailableSessionLayers => {
+                    if self.restore_tracker.forget_unavailable() {
+                        session_dirty = true;
+                    }
+                    needs_repaint = true;
+                }
                 LayerUiAction::ToggleVisibility(id, visible) => {
                     let changed = self.scene.set_overlay_visible(id, visible);
                     needs_repaint |= changed;
@@ -295,6 +309,11 @@ impl VeldmapApp {
                 }
                 ToolbarAction::ToggleLayersPanel => {
                     self.panels.layers.toggle_open();
+                    needs_repaint = true;
+                }
+                ToolbarAction::ShowUnavailableSessionLayers => {
+                    self.restore_tracker.unhide_notices();
+                    self.panels.layers.open_panel();
                     needs_repaint = true;
                 }
                 ToolbarAction::ToggleMeasureTool => {

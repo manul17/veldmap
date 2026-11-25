@@ -488,7 +488,7 @@ impl OverlayManager {
                                 slot.fail_reload(error.clone());
                                 mutation.changed = true;
                                 mutation.topology_changed = true;
-                                events.push(OverlayIoEvent::Failed {
+                                events.push(OverlayIoEvent::ReloadFailed {
                                     path,
                                     error,
                                     can_assign_crs: true,
@@ -508,7 +508,7 @@ impl OverlayManager {
                     // resume normal rendering on the next frame.
                     mutation.changed = true;
                     mutation.topology_changed = true;
-                    events.push(OverlayIoEvent::Failed {
+                    events.push(OverlayIoEvent::ReloadFailed {
                         path,
                         error: err.message,
                         can_assign_crs: err.can_assign_crs,
@@ -683,9 +683,7 @@ impl OverlayManager {
     pub(crate) fn record_upload_report(&mut self, report: &UploadBatchReport) {
         for &(stream_key, max_bytes) in &report.max_tile_bytes_by_stream {
             for layer in self.stack.layers_mut() {
-                if layer.source_id() == stream_key.source {
-                    layer.observe_stream_tile_bytes(stream_key, max_bytes);
-                }
+                layer.observe_stream_tile_bytes(stream_key, max_bytes);
             }
         }
     }

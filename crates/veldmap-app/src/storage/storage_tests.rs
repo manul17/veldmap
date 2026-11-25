@@ -102,3 +102,61 @@ fn disk_cache_worker_handles_refresh_cap_clear_and_disconnected_recovery() {
 
     storage.finish_shutdown();
 }
+
+#[test]
+fn persistence_fault_surfaces_save_errors_dismisses_and_auto_clears_on_recovery() {
+    let dir = TestTempDir::new("storage-fault");
+    let paths = StoragePaths::with_root(dir.path());
+    let settings_path = paths.settings_path();
+    std::fs::create_dir_all(&settings_path).expect("create blocking dir at settings.json path");
+    std::fs::write(settings_path.join("blocker"), b"x").expect("populate blocking dir");
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let wakes_c = Arc::clone(&wakes);
+    let wakeup: Wakeup = Arc::new(move || {
+        wakes_c.fetch_add(1, Ordering::AcqRel);
+    });
+
+    let mut storage = AppStorage::open(wakeup, Some(paths));
+    assert!(storage.persistence_fault_summary().is_none());
+
+    // Saving onto a non-empty directory fails atomically on every OS and wakes UI.
+    assert!(storage.mutate_settings(|s| s.show_graticule = !s.show_graticule));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while storage.persistence_fault_summary().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let summary = storage
+        .persistence_fault_summary()
+        .expect("settings save error surfaced");
+    assert!(summary.contains("settings"), "summary={summary}");
+    assert!(wakes.load(Ordering::Acquire) > 0);
+    // Must stay independent of DiskCacheStatus.notice.
+    assert!(storage.disk_cache_status().notice.is_none());
+
+    // Dismissing clears the banner; removing blocker and saving again stays clean.
+    storage.dismiss_persistence_fault();
+    assert!(storage.persistence_fault_summary().is_none());
+
+    // Trigger failure once more, then remove blocker and verify auto-clear on successful save.
+    assert!(storage.mutate_settings(|s| s.show_graticule = !s.show_graticule));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while storage.persistence_fault_summary().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(storage.persistence_fault_summary().is_some());
+
+    std::fs::remove_dir_all(&settings_path).expect("remove blocking dir");
+    assert!(storage.mutate_settings(|s| s.show_graticule = !s.show_graticule));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while storage.persistence_fault_summary().is_some() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        storage.persistence_fault_summary().is_none(),
+        "subsequent successful save must auto-clear persistence fault"
+    );
+
+    storage.begin_shutdown();
+    storage.finish_shutdown();
+}

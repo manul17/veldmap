@@ -173,8 +173,8 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         .begin_reload_bypass_cache(layer_id)
         .expect("queue failing reload");
     match wait_for_io_event(&mut mgr) {
-        OverlayIoEvent::Failed { .. } => {}
-        other => panic!("expected Failed event, got {other:?}"),
+        OverlayIoEvent::ReloadFailed { .. } => {}
+        other => panic!("expected ReloadFailed event, got {other:?}"),
     }
     assert_eq!(mgr.layer_summaries().len(), 1);
     assert!(!mgr.layer_summaries()[0].reloading);

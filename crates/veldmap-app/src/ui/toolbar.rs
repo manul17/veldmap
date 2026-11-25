@@ -17,7 +17,7 @@ use crate::storage::session::{CameraBookmark, MAX_BOOKMARKS};
 use crate::storage::settings::AppSettings;
 
 use super::basemap::{BasemapUiAction, BasemapUiState, show_toolbar_controls};
-use super::{ERROR_TEXT_COLOR, format, submitted_with_enter};
+use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format, submitted_with_enter};
 
 /// User intent emitted by the top workstation toolbar and applied by
 /// `VeldmapApp`.
@@ -28,6 +28,7 @@ pub(crate) enum ToolbarAction {
     OpenRecentFile(PathBuf),
     ClearRecentFiles,
     ToggleLayersPanel,
+    ShowUnavailableSessionLayers,
     ToggleMeasureTool,
     SaveBookmark(String),
     GoToBookmark(CameraBookmark),
@@ -44,6 +45,7 @@ pub(crate) struct ToolbarInputs<'a> {
     pub(crate) basemap_status: &'a BasemapStatusSnapshot,
     pub(crate) adapter_label: &'a str,
     pub(crate) layer_count: usize,
+    pub(crate) unavailable_layer_count: usize,
     pub(crate) layers_open: bool,
     pub(crate) measure_active: bool,
     pub(crate) recent_files: &'a [PathBuf],
@@ -220,6 +222,19 @@ pub(crate) fn show_top_toolbar(
                 .clicked()
             {
                 actions.push(ToolbarAction::ToggleLayersPanel);
+            }
+
+            if inputs.unavailable_layer_count > 0 {
+                let badge = format!("{} missing", inputs.unavailable_layer_count);
+                if ui
+                    .button(egui::RichText::new(badge).color(WARN_TEXT_COLOR).small())
+                    .on_hover_text(
+                        "Saved session layers could not be reopened (preserved in session.json). Click to view.",
+                    )
+                    .clicked()
+                {
+                    actions.push(ToolbarAction::ShowUnavailableSessionLayers);
+                }
             }
 
             if ui
