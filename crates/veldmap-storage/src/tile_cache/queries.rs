@@ -128,53 +128,48 @@ pub(super) fn select_tile_blob(
     .optional()
 }
 
-fn select_meta_byte_size(
-    tx: &Transaction<'_>,
-    enc: &EncodedKey<'_>,
-) -> Result<Option<i64>, rusqlite::Error> {
-    let mut stmt = tx.prepare(SELECT_META_BYTE_SIZE_SQL)?;
-    stmt.query_row(enc.key_params(), |r| r.get(0)).optional()
+/// Transaction-scoped prepared statements for upserting one or more tiles
+/// without re-preparing SQL on each entry.
+pub(super) struct TileUpserter<'tx> {
+    select_byte_size: Statement<'tx>,
+    upsert_meta: Statement<'tx>,
+    upsert_blob: Statement<'tx>,
 }
 
-fn upsert_tile_meta(
-    tx: &Transaction<'_>,
-    enc: &EncodedKey<'_>,
-    encoding_raw: i64,
-    byte_size: i64,
-    ts_ms: i64,
-) -> Result<i64, rusqlite::Error> {
-    let mut stmt = tx.prepare(UPSERT_META_SQL)?;
-    stmt.query_row(enc.upsert_params(&encoding_raw, &byte_size, &ts_ms), |r| {
-        r.get(0)
-    })
-}
+impl<'tx> TileUpserter<'tx> {
+    pub(super) fn new(tx: &'tx Transaction<'_>) -> Result<Self, rusqlite::Error> {
+        Ok(Self {
+            select_byte_size: tx.prepare(SELECT_META_BYTE_SIZE_SQL)?,
+            upsert_meta: tx.prepare(UPSERT_META_SQL)?,
+            upsert_blob: tx.prepare(UPSERT_BLOB_SQL)?,
+        })
+    }
 
-fn upsert_tile_blob(
-    tx: &Transaction<'_>,
-    tile_id: i64,
-    payload: &[u8],
-) -> Result<(), rusqlite::Error> {
-    let mut stmt = tx.prepare(UPSERT_BLOB_SQL)?;
-    stmt.execute(params![tile_id, payload])?;
-    Ok(())
-}
+    pub(super) fn upsert(
+        &mut self,
+        enc: &EncodedKey<'_>,
+        encoding: TileBlobEncoding,
+        payload: &[u8],
+        ts_ms: i64,
+    ) -> Result<(i64, u64, u64), rusqlite::Error> {
+        let new_bytes = payload.len() as u64;
+        let prev_bytes: Option<i64> = self
+            .select_byte_size
+            .query_row(enc.key_params(), |r| r.get(0))
+            .optional()?;
+        let encoding_raw = i64::from(encoding as u8);
+        let byte_size = new_bytes as i64;
+        let inserted_id: i64 = self
+            .upsert_meta
+            .query_row(enc.upsert_params(&encoding_raw, &byte_size, &ts_ms), |r| {
+                r.get(0)
+            })?;
+        self.upsert_blob.execute(params![inserted_id, payload])?;
 
-pub(super) fn upsert_tile_raw_in_tx(
-    tx: &Transaction<'_>,
-    enc: &EncodedKey<'_>,
-    encoding: TileBlobEncoding,
-    payload: &[u8],
-    ts_ms: i64,
-) -> Result<(i64, u64, u64), rusqlite::Error> {
-    let new_bytes = payload.len() as u64;
-    let prev_bytes = select_meta_byte_size(tx, enc)?;
-    let inserted_id =
-        upsert_tile_meta(tx, enc, i64::from(encoding as u8), new_bytes as i64, ts_ms)?;
-    upsert_tile_blob(tx, inserted_id, payload)?;
-
-    let old = prev_bytes.unwrap_or(0).max(0) as u64;
-    let count_delta = u64::from(prev_bytes.is_none());
-    Ok((inserted_id, old, count_delta))
+        let old = prev_bytes.unwrap_or(0).max(0) as u64;
+        let count_delta = u64::from(prev_bytes.is_none());
+        Ok((inserted_id, old, count_delta))
+    }
 }
 
 pub(super) fn flush_touches_in_tx(
@@ -239,29 +234,24 @@ pub(super) fn delete_meta_ids(
     Ok(())
 }
 
-fn delete_source_meta(
-    tx: &Transaction<'_>,
-    source_key: &str,
-) -> Result<(Vec<i64>, i64), rusqlite::Error> {
-    let mut stmt = tx.prepare(DELETE_SOURCE_META_SQL)?;
-    let rows = stmt.query_map(params![source_key], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-    })?;
-    let mut ids = Vec::new();
-    let mut removed_bytes = 0i64;
-    for row in rows {
-        let (tile_id, byte_size) = row?;
-        ids.push(tile_id);
-        removed_bytes = removed_bytes.saturating_add(byte_size.max(0));
-    }
-    Ok((ids, removed_bytes))
-}
-
 pub(super) fn clear_source_in_tx(
     tx: &Transaction<'_>,
     source_key: &str,
 ) -> Result<Vec<i64>, rusqlite::Error> {
-    let (ids, removed_bytes) = delete_source_meta(tx, source_key)?;
+    let (ids, removed_bytes) = {
+        let mut stmt = tx.prepare(DELETE_SOURCE_META_SQL)?;
+        let rows = stmt.query_map(params![source_key], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut ids = Vec::new();
+        let mut removed_bytes = 0i64;
+        for row in rows {
+            let (tile_id, byte_size) = row?;
+            ids.push(tile_id);
+            removed_bytes = removed_bytes.saturating_add(byte_size.max(0));
+        }
+        (ids, removed_bytes)
+    };
     if !ids.is_empty() {
         decrement_cache_meta(tx, removed_bytes, ids.len() as i64)?;
     }
@@ -273,7 +263,7 @@ pub(super) fn clear_all_in_tx(tx: &Transaction<'_>) -> Result<(), rusqlite::Erro
     // table-truncate optimization.
     tx.execute(CLEAR_BLOBS_SQL, [])?;
     tx.execute(CLEAR_META_SQL, [])?;
-    reset_cache_meta(tx)?;
+    tx.execute(RESET_CACHE_META_SQL, [])?;
     Ok(())
 }
 
@@ -337,12 +327,6 @@ fn decrement_cache_meta(
 ) -> Result<(), rusqlite::Error> {
     let mut stmt = tx.prepare(DECREMENT_CACHE_META_SQL)?;
     stmt.execute(params![removed_bytes, removed_count])?;
-    Ok(())
-}
-
-fn reset_cache_meta(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
-    let mut stmt = tx.prepare(RESET_CACHE_META_SQL)?;
-    stmt.execute([])?;
     Ok(())
 }
 

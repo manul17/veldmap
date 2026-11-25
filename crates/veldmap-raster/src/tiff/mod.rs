@@ -56,6 +56,7 @@ pub struct TiffSource {
     fingerprint: SourceFingerprint,
     source_id: SourceId,
     description: RasterDescription,
+    tiled: bool,
     grid: Grid,
     format: TiffFormat,
     ifd_ycbcr: Vec<(usize, ycbcr::YCbCrParams)>,
@@ -72,7 +73,7 @@ impl TiffSource {
 
     /// Return whether the base IFD uses tiled TIFF storage (`TileWidth`).
     pub const fn is_tiled(&self) -> bool {
-        self.grid.tiled
+        self.tiled
     }
 
     fn display_mapping(&self, ctx: &DecodeContext<'_>) -> Result<DisplayMapping, RasterError> {

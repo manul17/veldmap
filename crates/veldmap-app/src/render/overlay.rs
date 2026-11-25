@@ -8,25 +8,14 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::DVec3;
-use veldmap_core::tile::{MAX_WARP_SEGMENTS, PixelFormat, SourceId, build_warp_patch};
+use veldmap_core::tile::{MAX_WARP_SEGMENTS, PixelFormat, build_warp_patch};
 use wgpu::util::DeviceExt;
 
 use super::bind_groups::TileBindGroupCache;
 use super::mesh_cache::{DEFAULT_MESH_CACHE_BYTES, ElasticMeshCache, push_grid_quad_indices};
-use super::pipelines::GlobePipelines;
-use super::snapshot::DrawSnapshot;
+use super::snapshot::{DrawSnapshot, OverlayMeshKey};
 use super::uniforms::{DynamicUniformArena, OverlayPatchUniform};
 use crate::clamp_opacity;
-
-/// Cache identity for an uploaded overlay cell warp-mesh vertex buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OverlayMeshKey {
-    pub source: SourceId,
-    pub relaid: u64,
-    pub level: u8,
-    pub x: u32,
-    pub y: u32,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -101,7 +90,8 @@ impl OverlayRenderer {
     pub(super) fn prepare_resources(
         &mut self,
         device: &wgpu::Device,
-        pipelines: &GlobePipelines,
+        tile_texture_layout: &wgpu::BindGroupLayout,
+        tile_sampler: &wgpu::Sampler,
         bind_groups: &mut TileBindGroupCache,
         snapshot: &DrawSnapshot,
     ) {
@@ -132,7 +122,7 @@ impl OverlayRenderer {
         for layer in &snapshot.overlays {
             let segs = layer.segments.clamp(1, MAX_WARP_SEGMENTS);
             for patch in &layer.patches {
-                bind_groups.ensure(device, pipelines, &patch.texture);
+                bind_groups.ensure(device, tile_texture_layout, tile_sampler, &patch.texture);
 
                 if self
                     .meshes

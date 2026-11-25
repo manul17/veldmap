@@ -11,7 +11,7 @@ use crate::geo::{
 };
 
 use super::geometry::{
-    lat_lon_bounds, lerp_f64, sample_tile_surface, tile_lon_bounds, web_mercator_y_bounds,
+    geodetic_tile_bounds, lerp_f64, sample_tile_surface, tile_lon_bounds, web_mercator_y_bounds,
 };
 use super::key::QuadTileId;
 use super::scheme::{GlobeScheme, PlanetaryScheme};
@@ -157,6 +157,7 @@ struct DescribedTile {
 /// Compute tile metadata (`origin_ecef_m`, conservative `Ball`, cell-diagonal
 /// chord sagitta, and skirt depth) for `id`, returning `None` if `id` is out of
 /// domain (e.g. a `Geodetic` tile fully inside a polar cap).
+#[cfg(any(test, feature = "test-support"))]
 pub fn describe_tile(id: QuadTileId, config: &QuadtreeConfig) -> Option<VisibleTile> {
     describe_tile_with_samples(id, config).map(|described| described.tile)
 }
@@ -167,7 +168,7 @@ fn sample_geodetic_grid(
     samples: &mut [DVec3; 25],
     sample_units: &mut [DVec3; 25],
 ) -> Option<f64> {
-    let b = lat_lon_bounds(id)?;
+    let b = geodetic_tile_bounds(id)?;
     let lats = [0u32, 1, 2, 3, 4]
         .map(|row| lerp_f64(b.lat_north_deg, b.lat_south_deg, f64::from(row) * 0.25));
     let lons = [0u32, 1, 2, 3, 4]

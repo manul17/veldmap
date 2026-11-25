@@ -54,8 +54,8 @@ pub(super) fn resolve_geographic_crs(geo_params: &GeoKeyParams) -> Option<CrsSpe
 
     let code = non_wgs84_geographic_code(geo_params)?;
     let code_u32 = u32::from(code);
-    if let Ok(crs @ (CrsSpec::Geographic { .. } | CrsSpec::GeographicProj(_))) =
-        CrsSpec::from_epsg(code_u32)
+    if let Ok(crs) = CrsSpec::from_epsg(code_u32)
+        && crs.is_geographic()
     {
         return Some(crs);
     }

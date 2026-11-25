@@ -276,7 +276,6 @@ impl TiffSource {
         }
 
         let grid = Grid {
-            tiled,
             chunk,
             overviews,
             depth: format.depth,
@@ -323,6 +322,7 @@ impl TiffSource {
             fingerprint,
             source_id: SourceId::from_fingerprint(&fingerprint),
             description,
+            tiled,
             grid,
             format,
             ifd_ycbcr,

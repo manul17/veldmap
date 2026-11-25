@@ -51,14 +51,14 @@ fn keys(admitted: &[AdmittedTile]) -> Vec<TileKey> {
 }
 
 #[test]
-fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
+fn pointwise_runs_concurrently_while_pass_is_single_per_stream_key() {
     let mut sched = TileScheduler::new();
     let root_cancel = CancelToken::new();
     let src_a = SourceId::new(10);
     let src_b = SourceId::new(11);
     let meta_a = sample_meta(src_a, 2, 4);
     let meta_b = sample_meta(src_b, 2, 4);
-    let pass_a = meta_a.pass_key();
+    let pass_a = meta_a.stream_key();
 
     let k0 = meta_a.tile_key(0, 0, 0);
     let k1 = meta_a.tile_key(0, 1, 0);
@@ -89,7 +89,7 @@ fn pointwise_runs_concurrently_while_pass_is_single_per_pass_key() {
     );
     assert!(!sched.is_in_flight(&pass_tile));
 
-    // Only 1 active ServeMode::Pass per PassKey.
+    // Only 1 active ServeMode::Pass per StreamKey.
     let p1 = sched
         .admit_pass(&meta_a, 3, &[pass_tile], |_| false, &root_cancel)
         .expect("first pass succeeds");
@@ -216,8 +216,8 @@ fn multi_band_streams_under_same_source_schedule_and_forgive_independently() {
         .admit_pass(&scl, 1, &[p_scl], |_| false, &root_cancel)
         .expect("SCL pass starts concurrently");
 
-    sched.finish_pass(b04.pass_key(), pass_b04.pass_id, false);
-    sched.finish_pass(scl.pass_key(), pass_scl.pass_id, true);
+    sched.finish_pass(b04.stream_key(), pass_b04.pass_id, false);
+    sched.finish_pass(scl.stream_key(), pass_scl.pass_id, true);
     assert!(sched.is_terminal_failed(&p_b04));
 
     let pass_b04_2 = sched
@@ -244,7 +244,7 @@ fn terminal_failures_versioned_job_ids_and_non_penalizing_cancellations() {
     let mut sched = TileScheduler::new();
     let root_cancel = CancelToken::new();
     let meta = sample_meta(SourceId::new(22), 1, 3);
-    let pass_key = meta.pass_key();
+    let pass_key = meta.stream_key();
     let k_term = meta.tile_key(0, 0, 0);
     let k_retry = meta.tile_key(0, 1, 0);
 
@@ -381,13 +381,13 @@ fn ladder_unfitting_levels_and_pass_only_recovery_respect_budget_fits() {
     let p1 = sched
         .admit_pass(&pass_only, 2, &[k_apex], |_| false, &root_cancel)
         .expect("admit first pass");
-    sched.finish_pass(pass_only.pass_key(), p1.pass_id, false);
+    sched.finish_pass(pass_only.stream_key(), p1.pass_id, false);
     assert!(sched.is_terminal_failed(&k_apex));
     let p2 = sched
         .admit_pass(&pass_only, 2, &[k_apex], |_| false, &root_cancel)
         .expect("admit recovery pass");
     assert_eq!(p2.tiles, vec![k_apex]);
-    sched.finish_pass(pass_only.pass_key(), p2.pass_id, false);
+    sched.finish_pass(pass_only.stream_key(), p2.pass_id, false);
     assert!(
         sched
             .admit_pass(&pass_only, 2, &[k_apex], |_| false, &root_cancel)

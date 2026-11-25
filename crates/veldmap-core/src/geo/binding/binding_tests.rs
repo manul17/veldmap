@@ -300,7 +300,9 @@ fn foreign_datum_geographic_frame_shifts_to_wgs84_and_inverts_cleanly() {
         },
     ];
     let grid = TieGrid::new(&ties).expect("pulkovo geographic grid");
-    let frame = Frame::from_grid_with_datum(grid, PULKOVO_1942, "EPSG:4284");
+    let pulkovo = CrsSpec::from_epsg(4284).expect("EPSG:4284");
+    assert!(pulkovo.is_geographic());
+    let frame = Frame::from_grid_with_crs(grid, Some(&pulkovo));
     assert!(!frame.axial(), "datum-shifted grid is not WGS84-axial");
 
     let (wgs_lat, wgs_lon) = frame.geodetic(0.5, 0.5);

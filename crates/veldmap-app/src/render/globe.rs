@@ -18,7 +18,7 @@ use super::overlay::OverlayRenderer;
 use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
 use super::uniforms::{CameraUniform, TileUniform};
-use super::vector::VectorRenderer;
+use super::vector::{VectorPipelines, VectorRenderer};
 use super::viewport::{RenderParams, ViewportState};
 
 /// Standalone offscreen `wgpu` WGS84 quadtree globe renderer.
@@ -119,14 +119,19 @@ impl GlobeRenderer {
 
         for draw in &snapshot.tiles {
             if let Some(gpu_tile) = &draw.texture {
-                self.tile_bind_groups
-                    .ensure(device, &self.pipelines, gpu_tile);
+                self.tile_bind_groups.ensure(
+                    device,
+                    &self.pipelines.layouts.tile_texture_layout,
+                    &self.pipelines.tile_sampler,
+                    gpu_tile,
+                );
             }
         }
 
         self.overlay.prepare_resources(
             device,
-            &self.pipelines,
+            &self.pipelines.layouts.tile_texture_layout,
+            &self.pipelines.tile_sampler,
             &mut self.tile_bind_groups,
             snapshot,
         );
@@ -317,7 +322,11 @@ impl GlobeRenderer {
             );
             self.vector.record_pass(
                 &mut post_pass,
-                &self.pipelines,
+                VectorPipelines {
+                    fill: &self.pipelines.vector_fill_pipeline,
+                    line: &self.pipelines.vector_line_pipeline,
+                    point: &self.pipelines.vector_point_pipeline,
+                },
                 self.viewport.uniform_arena(),
                 snapshot,
             );

@@ -16,10 +16,10 @@ pub const ZOOM_PER_CLICK: f64 = 1.25;
 
 /// Altitude multiplier applied per wheel notch on the 3D globe (inverse of
 /// [`ZOOM_PER_CLICK`]).
-pub const ZOOM_PER_STEP: f64 = 1.0 / ZOOM_PER_CLICK;
+const ZOOM_PER_STEP: f64 = 1.0 / ZOOM_PER_CLICK;
 
 /// Vertical field of view in degrees.
-pub const FOV_Y_DEG: f64 = 50.0;
+const FOV_Y_DEG: f64 = 50.0;
 
 /// Minimum camera altitude above the WGS84 ellipsoid in metres.
 ///
@@ -28,10 +28,10 @@ pub const FOV_Y_DEG: f64 = 50.0;
 pub const MIN_HEIGHT_M: f64 = 2.0;
 
 /// Maximum camera altitude above the WGS84 ellipsoid in metres.
-pub const MAX_HEIGHT_M: f64 = 80_000_000.0;
+const MAX_HEIGHT_M: f64 = 80_000_000.0;
 
 /// Allowed camera altitude bounds `(min_m, max_m)`.
-pub const HEIGHT_RANGE_M: (f64, f64) = (MIN_HEIGHT_M, MAX_HEIGHT_M);
+const HEIGHT_RANGE_M: (f64, f64) = (MIN_HEIGHT_M, MAX_HEIGHT_M);
 
 /// Grazing magnification factor at which cursor zoom hold begins softening
 /// toward the center of the viewport.
@@ -515,7 +515,7 @@ fn orientation(at: DVec3, up: DVec3) -> DQuat {
 
 /// Ellipsoidal altitude in metres from which a circle of `radius_deg` fits
 /// vertically inside the viewport.
-pub fn height_for(radius_deg: f64) -> f64 {
+fn height_for(radius_deg: f64) -> f64 {
     let half = (FOV_Y_DEG * 0.5).to_radians();
     let arc = radius_deg
         .clamp(0.0, (std::f64::consts::FRAC_PI_2 - half).to_degrees())

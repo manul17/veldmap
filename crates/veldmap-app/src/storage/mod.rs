@@ -4,9 +4,11 @@
 //! [`worker::DiskCacheWorker`] (handling SQLite maintenance and durable
 //! `settings.json` / `session.json` saves off the UI thread).
 //!
-//! Stays completely decoupled from `veldmap-net` (using
+//! `AppStorage` and [`worker::DiskCacheWorker`] stay decoupled from
+//! `veldmap-net` and `LiveTilePipeline` (communicating through
 //! `veldmap_core::sync::Wakeup` and `TileDiskCache::write_generation()`) so
-//! local/offline storage never depends on HTTP streaming.
+//! local/offline storage never depends on HTTP streaming, while
+//! [`settings`] reuses `veldmap-net` config and validation helpers.
 
 pub(crate) mod session;
 pub(crate) mod settings;
@@ -157,7 +159,7 @@ impl AppStorage {
     /// Update and durably persist [`AppSettings`] asynchronously when changed,
     /// forwarding any disk-cache cap change to the off-UI-thread maintenance
     /// worker. Returns `true` if settings changed.
-    pub(crate) fn update_settings(&mut self, mut next: AppSettings) -> bool {
+    fn update_settings(&mut self, mut next: AppSettings) -> bool {
         next.normalize();
         let prev_cache_bytes = self.settings.disk_cache_max_bytes();
         let changed = next != self.settings;

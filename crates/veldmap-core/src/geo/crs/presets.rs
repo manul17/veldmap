@@ -36,75 +36,39 @@ struct PresetCatalog {
     search_keys: Vec<String>,
 }
 
+const STATIC_PRESETS: &[(u32, &str, &str)] = &[
+    (4326, "WGS 84 (Geographic lon/lat)", "Global"),
+    (3857, "WGS 84 / Pseudo-Mercator (Web Mercator)", "Global"),
+    (4284, "Pulkovo 1942 (Geographic lon/lat)", "Regional"),
+    (3035, "ETRS89-extended / LAEA Europe", "Regional"),
+    (27700, "OSGB36 / British National Grid", "Regional"),
+    (2154, "RGF93 / Lambert-93 (France)", "Regional"),
+    (25832, "ETRS89 / UTM zone 32N", "Regional"),
+    (25833, "ETRS89 / UTM zone 33N", "Regional"),
+    (
+        3413,
+        "WGS 84 / NSIDC Sea Ice Polar Stereographic North",
+        "Polar",
+    ),
+    (3031, "WGS 84 / Antarctic Polar Stereographic", "Polar"),
+    (26910, "NAD83 / UTM zone 10N", "North America"),
+    (26918, "NAD83 / UTM zone 18N", "North America"),
+    (2263, "NAD83 / New York Long Island (ftUS)", "North America"),
+];
+
 fn preset_catalog() -> &'static PresetCatalog {
     static CATALOG: OnceLock<PresetCatalog> = OnceLock::new();
     CATALOG.get_or_init(|| {
         let mut presets = Vec::with_capacity(170);
-        presets.push(CrsPreset {
-            epsg: 4326,
-            name: "WGS 84 (Geographic lon/lat)".to_string(),
-            category: "Global",
-        });
-        presets.push(CrsPreset {
-            epsg: 3857,
-            name: "WGS 84 / Pseudo-Mercator (Web Mercator)".to_string(),
-            category: "Global",
-        });
-        presets.push(CrsPreset {
-            epsg: 4284,
-            name: "Pulkovo 1942 (Geographic lon/lat)".to_string(),
-            category: "Regional",
-        });
-        presets.push(CrsPreset {
-            epsg: 3035,
-            name: "ETRS89-extended / LAEA Europe".to_string(),
-            category: "Regional",
-        });
-        presets.push(CrsPreset {
-            epsg: 27700,
-            name: "OSGB36 / British National Grid".to_string(),
-            category: "Regional",
-        });
-        presets.push(CrsPreset {
-            epsg: 2154,
-            name: "RGF93 / Lambert-93 (France)".to_string(),
-            category: "Regional",
-        });
-        presets.push(CrsPreset {
-            epsg: 25832,
-            name: "ETRS89 / UTM zone 32N".to_string(),
-            category: "Regional",
-        });
-        presets.push(CrsPreset {
-            epsg: 25833,
-            name: "ETRS89 / UTM zone 33N".to_string(),
-            category: "Regional",
-        });
-        presets.push(CrsPreset {
-            epsg: 3413,
-            name: "WGS 84 / NSIDC Sea Ice Polar Stereographic North".to_string(),
-            category: "Polar",
-        });
-        presets.push(CrsPreset {
-            epsg: 3031,
-            name: "WGS 84 / Antarctic Polar Stereographic".to_string(),
-            category: "Polar",
-        });
-        presets.push(CrsPreset {
-            epsg: 26910,
-            name: "NAD83 / UTM zone 10N".to_string(),
-            category: "North America",
-        });
-        presets.push(CrsPreset {
-            epsg: 26918,
-            name: "NAD83 / UTM zone 18N".to_string(),
-            category: "North America",
-        });
-        presets.push(CrsPreset {
-            epsg: 2263,
-            name: "NAD83 / New York Long Island (ftUS)".to_string(),
-            category: "North America",
-        });
+        presets.extend(
+            STATIC_PRESETS
+                .iter()
+                .map(|&(epsg, name, category)| CrsPreset {
+                    epsg,
+                    name: name.to_string(),
+                    category,
+                }),
+        );
         for zone in MSK61_ZONES {
             presets.push(CrsPreset {
                 epsg: MSK61_EPSG_BASE + zone,

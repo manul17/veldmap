@@ -1,5 +1,5 @@
 use super::*;
-use crate::geo::footprint::{Ring, covers_polygon, frame_polygons};
+use crate::geo::footprint::{Ring, covers_polygon};
 use crate::geo::geodesic::ring_signed_area_m2;
 use crate::geo::geodesy::WGS84;
 use glam::Vec3;
@@ -33,7 +33,7 @@ fn parses_feature_collection_with_holes_and_round_trips_rfc7946_winding() {
     };
     assert!(covers_polygon(poly, 47.1, 39.1));
     assert!(!covers_polygon(poly, 47.5, 39.5));
-    assert!(frame_polygons(std::slice::from_ref(poly)).is_some());
+    assert!(fc.bounds().is_some());
 
     let exported = export_geojson_feature_collection(&fc);
     let reparsed = parse_geojson(&exported).expect("reparse exported geojson");

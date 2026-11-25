@@ -1,5 +1,5 @@
 //! Bounded async disk-cache lookup, corrupt-entry deletion, and best-effort
-//! write persistence for [`super::LiveTilePipeline`].
+//! write persistence for [`crate::LiveTilePipeline`].
 
 use std::sync::Arc;
 
@@ -9,8 +9,6 @@ use veldmap_core::tile::{QuadTileId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
 use crate::{BlobStoreError, TileBlobStore};
-
-use super::guards::DiskSlotGuard;
 
 /// Maximum concurrent blocking disk-cache write/delete tasks (`cache.put()` /
 /// `cache.delete()`) so burst completions serialize cleanly without piling up
@@ -59,7 +57,7 @@ impl DiskCacheGate {
         spec: &Arc<LiveBasemapSpec>,
         id: QuadTileId,
         cancel: &CancelToken,
-        disk_slot: DiskSlotGuard,
+        disk_slot: impl Send + 'static,
     ) -> DiskReadOutcome {
         if cancel.is_cancelled() {
             return DiskReadOutcome::Cancelled;

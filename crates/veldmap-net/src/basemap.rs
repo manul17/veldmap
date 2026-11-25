@@ -4,13 +4,13 @@
 //! `PolarCap` keys.
 
 use std::fmt::{self, Write as _};
-use std::net::Ipv6Addr;
 
 use thiserror::Error;
 use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey, fnv1a_64};
 
 use crate::NetError;
 use crate::redact::{EncodedSecret, redact_secret_label, redact_text, sanitize_url_for_display};
+use crate::url::{extract_host, parse_http_authority, strip_http_scheme};
 
 /// Internal validation error returned when checking or resolving a tile key
 /// against a [`LiveBasemapSpec`].
@@ -34,78 +34,6 @@ pub(crate) enum TileValidationError {
         x: u32,
         y: u32,
     },
-}
-
-/// Parsed HTTP(S) authority components (`host_port` without `user:pass@`, and
-/// bare `host` preserving bracketed IPv6 literals like `[::1]`).
-struct ParsedAuthority<'a> {
-    host_port: &'a str,
-    host: &'a str,
-}
-
-/// Strip an ASCII case-insensitive `https://` or `http://` prefix without
-/// ever slicing across a multi-byte UTF-8 character boundary.
-fn strip_http_scheme(url: &str) -> Option<&str> {
-    let bytes = url.as_bytes();
-    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
-        Some(&url[8..])
-    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
-        Some(&url[7..])
-    } else {
-        None
-    }
-}
-
-fn valid_optional_port(port_suffix: &str) -> bool {
-    if port_suffix.is_empty() {
-        return true;
-    }
-    let Some(port_str) = port_suffix.strip_prefix(':') else {
-        return false;
-    };
-    !port_str.is_empty()
-        && port_str.bytes().all(|b| b.is_ascii_digit())
-        && port_str.parse::<u16>().is_ok()
-}
-
-/// Parse the authority section of an HTTP(S) URL or template, handling
-/// case-insensitive `http://`/`https://` schemes, `user:pass@` userinfo,
-/// numeric `:port` validation, and bracketed IPv6 literals
-/// (`http://[::1]:8080/...`).
-fn parse_url_authority(url: &str) -> Option<ParsedAuthority<'_>> {
-    let without_scheme = strip_http_scheme(url)?;
-    let authority = without_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
-    if host_port.is_empty() {
-        return None;
-    }
-    let host = if let Some(rest) = host_port.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let inner = &rest[..end];
-        inner.parse::<Ipv6Addr>().ok()?;
-        let after = &rest[end + 1..];
-        if !valid_optional_port(after) {
-            return None;
-        }
-        &host_port[..=end + 1]
-    } else {
-        let (h, port_suffix) = match host_port.find(':') {
-            Some(colon) => (&host_port[..colon], &host_port[colon..]),
-            None => (host_port, ""),
-        };
-        if h.is_empty() || !valid_optional_port(port_suffix) {
-            return None;
-        }
-        h
-    };
-    Some(ParsedAuthority { host_port, host })
-}
-
-/// Extract the lowercased `host[:port]` authority key from an HTTP(S) URL.
-fn extract_host(url: &str) -> String {
-    parse_url_authority(url)
-        .map(|auth| auth.host_port.to_ascii_lowercase())
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Minimum allowed custom XYZ/TMS maximum zoom level.
@@ -270,7 +198,7 @@ pub fn validate_custom_url_template(url_template: &str) -> Result<&str, NetError
             "URL template must start with https:// or http://".to_owned(),
         ));
     }
-    let authority = parse_url_authority(template).ok_or_else(|| {
+    let authority = parse_http_authority(template).ok_or_else(|| {
         NetError::InvalidUrlTemplate("URL template must include a valid hostname".to_owned())
     })?;
     let host = authority.host;
@@ -443,6 +371,16 @@ impl LiveBasemapSpec {
     /// Build the canonical display `TileKey` for `id` under this live source.
     pub const fn tile_key(&self, id: QuadTileId) -> TileKey {
         TileKey::display_quad(self.source_id, id)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn wm_key(&self, level: u8, x: u32, y: u32) -> TileKey {
+        self.tile_key(QuadTileId {
+            scheme: PlanetaryScheme::WebMercator,
+            level,
+            x,
+            y,
+        })
     }
 
     /// Validate that `id` is eligible for live fetching (never `PolarCap`,

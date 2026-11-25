@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use super::super::footprint::{GeoPoint, Polygon, Ring, dedup_geo_ring};
 use super::{
     GeoJsonError, GeoJsonFeature, GeoJsonFeatureCollection, GeoJsonGeometry, MAX_GEOJSON_BYTES,
+    extract_feature_name,
 };
 
 /// Hard safety cap on features per GeoJSON document to prevent OOM on
@@ -260,16 +261,4 @@ fn parse_polygon(val: &Value, vertex_count: &mut usize) -> Result<Polygon, GeoJs
         holes.push(Ring { points: hole_pts });
     }
     Ok(Polygon::with_holes(exterior, holes))
-}
-
-pub(super) fn extract_feature_name(props: &Map<String, Value>) -> Option<String> {
-    for key in ["name", "NAME", "Name", "title", "id", "label"] {
-        if let Some(s) = props.get(key).and_then(Value::as_str) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
 }

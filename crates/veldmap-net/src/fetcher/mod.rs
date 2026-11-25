@@ -3,6 +3,7 @@
 //! queues, end-to-end `CancelToken` abort through an injected
 //! [`TileDecodeExecutor`], and deterministic shutdown.
 
+mod context;
 mod disk;
 mod dispatch;
 mod failures;
@@ -24,8 +25,10 @@ use crate::basemap::LiveBasemapSpec;
 use crate::http::{HostLimiters, HttpClientConfig, build_http_client, default_user_agent};
 use crate::{NetError, TileBlobStore, TileDecodeExecutor};
 
+use self::context::{PipelineContext, PipelineShared};
 use self::disk::DiskCacheGate;
 use self::dispatch::dispatcher_loop;
+pub use self::state::NetworkStatus;
 use self::state::PipelineState;
 
 /// Default maximum concurrent HTTP requests per remote host.
@@ -60,45 +63,6 @@ impl Default for FetcherConfig {
             transient_retry_backoff: DEFAULT_TRANSIENT_RETRY_BACKOFF,
         }
     }
-}
-
-/// Observable status snapshot of the live tile pipeline for the GIS HUD / UI.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NetworkStatus {
-    pub in_flight: usize,
-    pub queued: usize,
-    pub completed_from_disk: u64,
-    pub completed_from_net: u64,
-    pub failed_count: u64,
-    pub offline: bool,
-    pub last_error: Option<String>,
-}
-
-/// Shared control-plane handles held by both [`LiveTilePipeline`] and
-/// [`PipelineContext`].
-///
-/// Kept distinct from [`PipelineContext`] so the frontend handle never extends
-/// the lifetimes of `reqwest::Client`, `DiskCacheGate`, `TileDecodeExecutor`,
-/// or `Wakeup` past `dispatcher_loop` exit.
-///
-/// Lock ordering: always acquire `state` BEFORE `host_limiters` (never
-/// reverse; `HostLimiters` is a leaf lock).
-struct PipelineShared {
-    shutdown: CancelToken,
-    state: Mutex<PipelineState>,
-    host_limiters: HostLimiters,
-    notify: Notify,
-}
-
-/// Shared immutable context passed across the dispatcher and per-tile tasks.
-struct PipelineContext {
-    shared: Arc<PipelineShared>,
-    client: reqwest::Client,
-    disk_cache: Option<DiskCacheGate>,
-    decoder: Arc<dyn TileDecodeExecutor>,
-    wakeup: Wakeup,
-    max_tile_bytes: usize,
-    transient_retry_backoff: Duration,
 }
 
 /// Complete live HTTP tile streaming pipeline owning:
@@ -254,14 +218,4 @@ impl Drop for LiveTilePipeline {
     fn drop(&mut self) {
         self.shutdown_inner();
     }
-}
-
-#[cfg(test)]
-pub(super) fn wm_key(spec: &LiveBasemapSpec, level: u8, x: u32, y: u32) -> TileKey {
-    spec.tile_key(veldmap_core::tile::QuadTileId {
-        scheme: veldmap_core::tile::PlanetaryScheme::WebMercator,
-        level,
-        x,
-        y,
-    })
 }

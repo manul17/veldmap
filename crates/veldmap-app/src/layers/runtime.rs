@@ -8,16 +8,14 @@ use std::time::{Duration, Instant};
 
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
-use veldmap_core::tile::{SourceId, TileKey};
+use veldmap_core::tile::{SourceId, StreamKey, TileKey};
 use veldmap_raster::{
-    AdmittedPass, AdmittedTile, DecodeContext, DecodeJob, DecodePoolHandle, PassKey, PyramidMeta,
+    AdmittedPass, AdmittedTile, DecodeContext, DecodeJob, DecodePoolHandle, PyramidMeta,
     SharedChunkCache, SubmitError, TileFailureOutcome, TileScheduler,
 };
 use veldmap_storage::{LocalFingerprintCache, TileDiskCache};
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadSender};
-
-use super::stack::OverlayLayer;
 
 /// Backoff window applied when a decode lane queue is saturated (`SubmitError::Full`)
 /// so the UI retries cleanly without spinning at 100% CPU.
@@ -140,16 +138,19 @@ impl OverlayRuntime {
         Some(deadline.saturating_duration_since(Instant::now()))
     }
 
-    /// Snapshot `(in_flight_count, pass_active)` for each layer in `layers`
-    /// under a single scheduler lock acquisition.
-    pub(super) fn layer_flight_stats(&self, layers: &[OverlayLayer]) -> Vec<(usize, bool)> {
+    /// Snapshot `(in_flight_count, pass_active)` for each `(source_id, stream_key)`
+    /// pair under a single scheduler lock acquisition.
+    pub(super) fn layer_flight_stats(
+        &self,
+        streams: impl IntoIterator<Item = (SourceId, StreamKey)>,
+    ) -> Vec<(usize, bool)> {
         let sched = lock_unpoisoned(&self.scheduler);
-        layers
-            .iter()
-            .map(|layer| {
+        streams
+            .into_iter()
+            .map(|(source_id, stream_key)| {
                 (
-                    sched.in_flight_count_for_source(layer.source_id()),
-                    sched.has_active_pass(layer.meta().pass_key()),
+                    sched.in_flight_count_for_source(source_id),
+                    sched.has_active_pass(stream_key),
                 )
             })
             .collect()
@@ -180,7 +181,7 @@ impl OverlayRuntime {
         (admitted, unfinished)
     }
 
-    /// Update the active pass target for `meta.pass_key()`, admit a sequential
+    /// Update the active pass target for `meta.stream_key()`, admit a sequential
     /// pass for `rung` if needed, and cancel any superseded pass token strictly
     /// outside the scheduler lock.
     pub(super) fn admit_pass_rung(
@@ -192,10 +193,10 @@ impl OverlayRuntime {
         gpu_cache: &GpuTileCache,
         pending: &PendingUploads,
     ) -> (Option<AdmittedPass>, bool) {
-        let pass_key = meta.pass_key();
+        let stream_key = meta.stream_key();
         let (cancelled_old, admitted, active) = {
             let mut sched = lock_unpoisoned(&self.scheduler);
-            let cancelled_old = sched.update_target(pass_key, rung, Some(from));
+            let cancelled_old = sched.update_target(stream_key, rung, Some(from));
             let admitted = sched.admit_pass(
                 meta,
                 rung,
@@ -203,7 +204,7 @@ impl OverlayRuntime {
                 |key| gpu_cache.contains(key) || pending.contains(key),
                 &self.shutdown,
             );
-            let active = admitted.is_some() || sched.has_active_pass(pass_key);
+            let active = admitted.is_some() || sched.has_active_pass(stream_key);
             (cancelled_old, admitted, active)
         };
         if let Some(tok) = cancelled_old {
@@ -229,19 +230,19 @@ impl OverlayRuntime {
         lock_unpoisoned(&self.scheduler).cancel_in_flight(key, job_id)
     }
 
-    pub(super) fn on_pass_tile_arrived(&self, pass_key: PassKey, pass_id: u64, key: &TileKey) {
-        lock_unpoisoned(&self.scheduler).on_pass_tile_arrived(pass_key, pass_id, key);
+    pub(super) fn on_pass_tile_arrived(&self, stream_key: StreamKey, pass_id: u64, key: &TileKey) {
+        lock_unpoisoned(&self.scheduler).on_pass_tile_arrived(stream_key, pass_id, key);
     }
 
-    pub(super) fn finish_pass(&self, pass_key: PassKey, pass_id: u64, succeeded: bool) -> bool {
-        lock_unpoisoned(&self.scheduler).finish_pass(pass_key, pass_id, succeeded)
+    pub(super) fn finish_pass(&self, stream_key: StreamKey, pass_id: u64, succeeded: bool) -> bool {
+        lock_unpoisoned(&self.scheduler).finish_pass(stream_key, pass_id, succeeded)
     }
 
     /// Abort an active sequential pass in the scheduler and cancel its token
     /// strictly outside the scheduler lock. Returns `true` if the pass was
     /// still active when aborted.
-    pub(super) fn abort_pass(&self, pass_key: PassKey, pass_id: u64) -> bool {
-        let token = lock_unpoisoned(&self.scheduler).abort_pass(pass_key, pass_id);
+    pub(super) fn abort_pass(&self, stream_key: StreamKey, pass_id: u64) -> bool {
+        let token = lock_unpoisoned(&self.scheduler).abort_pass(stream_key, pass_id);
         if let Some(tok) = token {
             tok.cancel();
             true
@@ -250,46 +251,22 @@ impl OverlayRuntime {
         }
     }
 
-    /// Reconcile in-flight pointwise jobs for a single `stream_key` against
-    /// `wanted` and current GPU/pending cache state, cancelling stale tokens
-    /// strictly outside the scheduler lock.
-    pub(super) fn reconcile_pointwise_stream(
+    /// Reconcile in-flight pointwise jobs across `streams` under a single
+    /// scheduler lock acquisition, cancelling stale tokens strictly outside
+    /// the lock.
+    pub(super) fn reconcile_pointwise_streams<'a>(
         &self,
-        stream_key: PassKey,
-        wanted: &HashSet<TileKey>,
-        gpu_cache: &GpuTileCache,
-        pending: &PendingUploads,
-    ) {
-        let stale_tokens =
-            lock_unpoisoned(&self.scheduler).reconcile_pointwise(stream_key, wanted, |k| {
-                gpu_cache.contains(k) || pending.contains(k)
-            });
-        for tok in stale_tokens {
-            tok.cancel();
-        }
-    }
-
-    /// Reconcile in-flight pointwise jobs across all active `layers` under a
-    /// single scheduler lock acquisition, cancelling stale tokens strictly
-    /// outside the lock.
-    pub(super) fn reconcile_pointwise_layers(
-        &self,
-        layers: &[OverlayLayer],
+        streams: impl IntoIterator<Item = (StreamKey, &'a HashSet<TileKey>)>,
         gpu_cache: &GpuTileCache,
         pending: &PendingUploads,
     ) {
         let mut to_cancel = Vec::new();
         {
             let mut sched = lock_unpoisoned(&self.scheduler);
-            for layer in layers {
-                if !layer.is_active() {
-                    continue;
-                }
-                to_cancel.extend(sched.reconcile_pointwise(
-                    layer.meta().pass_key(),
-                    layer.wanted(),
-                    |k| gpu_cache.contains(k) || pending.contains(k),
-                ));
+            for (stream_key, wanted) in streams {
+                to_cancel.extend(sched.reconcile_pointwise(stream_key, wanted, |k| {
+                    gpu_cache.contains(k) || pending.contains(k)
+                }));
             }
         }
         for tok in to_cancel {

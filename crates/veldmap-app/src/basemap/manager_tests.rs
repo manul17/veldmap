@@ -124,10 +124,11 @@ fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
         "EllipsoidOnly must not eagerly decode bundled JPEG"
     );
 
-    let mut bad_date = initial.clone();
-    bad_date.active_basemap = BasemapSelection::NasaGibsViirs;
-    bad_date.gibs_date = "2024-02-30".to_owned();
-    storage.update_settings(bad_date);
+    storage.mutate_settings(|s| {
+        *s = initial.clone();
+        s.active_basemap = BasemapSelection::NasaGibsViirs;
+        s.gibs_date = "2024-02-30".to_owned();
+    });
     let outcome = h.manager.sync_settings(storage.settings());
     assert!(outcome.changed);
     assert_eq!(outcome.evict_source, None);
@@ -135,10 +136,11 @@ fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
     assert_eq!(h.manager.active_source(), SourceId::BUNDLED_BASEMAP);
     assert_eq!(h.manager.attribution(), Some(BUNDLED_ATTRIBUTION));
 
-    let mut bad_custom = initial;
-    bad_custom.active_basemap = BasemapSelection::CustomXyz;
-    bad_custom.custom_xyz.url_template = "ftp://bad/{z}/{x}/{y}".to_owned();
-    storage.update_settings(bad_custom);
+    storage.mutate_settings(|s| {
+        *s = initial;
+        s.active_basemap = BasemapSelection::CustomXyz;
+        s.custom_xyz.url_template = "ftp://bad/{z}/{x}/{y}".to_owned();
+    });
     let outcome = h.manager.sync_settings(storage.settings());
     assert!(outcome.changed);
     assert!(h.manager.status_snapshot().config_error.is_some());

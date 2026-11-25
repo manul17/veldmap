@@ -5,9 +5,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{DecodedTile, PixelFormat, TileKey};
+use veldmap_core::tile::{DecodedTile, PixelFormat, StreamKey, TileKey};
 use veldmap_raster::{
-    AdmittedPass, DecodeJob, DecodeJobKey, PassKey, PyramidMeta, RasterError, RasterSource,
+    AdmittedPass, DecodeJob, DecodeJobKey, PyramidMeta, RasterError, RasterSource,
     generate_linear_mipmaps,
 };
 use veldmap_storage::DiskTileKey;
@@ -30,16 +30,16 @@ pub(super) struct PassJobSpec {
 /// `DecodeQueue` or unwound by a worker panic.
 struct PassFlightGuard {
     runtime: Arc<OverlayRuntime>,
-    pass_key: PassKey,
+    stream_key: StreamKey,
     pass_id: u64,
     finished: bool,
 }
 
 impl PassFlightGuard {
-    fn new(runtime: Arc<OverlayRuntime>, pass_key: PassKey, pass_id: u64) -> Self {
+    fn new(runtime: Arc<OverlayRuntime>, stream_key: StreamKey, pass_id: u64) -> Self {
         Self {
             runtime,
-            pass_key,
+            stream_key,
             pass_id,
             finished: false,
         }
@@ -49,7 +49,7 @@ impl PassFlightGuard {
         self.finished = true;
         if self
             .runtime
-            .finish_pass(self.pass_key, self.pass_id, succeeded)
+            .finish_pass(self.stream_key, self.pass_id, succeeded)
         {
             self.runtime.request_reschedule();
         }
@@ -61,7 +61,7 @@ impl PassFlightGuard {
     }
 
     fn cleanup_aborted(&self) {
-        if self.runtime.abort_pass(self.pass_key, self.pass_id) {
+        if self.runtime.abort_pass(self.stream_key, self.pass_id) {
             self.runtime.request_reschedule();
         }
     }
@@ -77,14 +77,14 @@ impl Drop for PassFlightGuard {
 
 fn deliver_pass_tile(
     rt: &OverlayRuntime,
-    pass_key: PassKey,
+    stream_key: StreamKey,
     pass_id: u64,
     tk: TileKey,
     tile: DecodedTile,
     cancel: &CancelToken,
 ) -> bool {
     if matches!(rt.done_tx.send_if_uncancelled((tk, tile), cancel), Ok(true)) {
-        rt.on_pass_tile_arrived(pass_key, pass_id, &tk);
+        rt.on_pass_tile_arrived(stream_key, pass_id, &tk);
         (rt.wakeup)();
         true
     } else {
@@ -107,7 +107,7 @@ fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
     let Some(&first_tk) = spec.admitted.tiles.first() else {
         return QoiDrainOutcome::AllHit;
     };
-    let pass_key = spec.admitted.key;
+    let stream_key = spec.admitted.key;
     let pass_id = spec.admitted.pass_id;
     let pass_cancel = &spec.admitted.cancel;
     let mut already_hit: HashSet<TileKey> = HashSet::new();
@@ -121,7 +121,7 @@ fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
         dk.x = tk.x;
         dk.y = tk.y;
         if let Some(tile) = load_qoi_display_tile(disk, &dk) {
-            if deliver_pass_tile(&spec.runtime, pass_key, pass_id, tk, tile, pass_cancel) {
+            if deliver_pass_tile(&spec.runtime, stream_key, pass_id, tk, tile, pass_cancel) {
                 already_hit.insert(tk);
             }
         } else {
@@ -138,7 +138,7 @@ fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
 /// Execute the source's sequential `produce_pass`, batch-writing newly produced
 /// display tiles to QOI disk cache and uploading wanted/apex tiles live.
 fn run_source_pass(spec: &PassJobSpec, already_hit: &HashSet<TileKey>) -> Result<(), RasterError> {
-    let pass_key = spec.admitted.key;
+    let stream_key = spec.admitted.key;
     let pass_id = spec.admitted.pass_id;
     let pass_cancel = &spec.admitted.cancel;
     let initial_missing: HashSet<TileKey> = spec
@@ -182,7 +182,8 @@ fn run_source_pass(spec: &PassJobSpec, already_hit: &HashSet<TileKey>) -> Result
                 let mut tile = DecodedTile::try_new(tw, th, PixelFormat::Rgba8UnormSrgb, rgba)
                     .map_err(|e| RasterError::Decode(e.to_string()))?;
                 generate_linear_mipmaps(&mut tile);
-                let _ = deliver_pass_tile(&spec.runtime, pass_key, pass_id, tk, tile, pass_cancel);
+                let _ =
+                    deliver_pass_tile(&spec.runtime, stream_key, pass_id, tk, tile, pass_cancel);
             }
             Ok(())
         });
@@ -226,7 +227,7 @@ fn run_pass_job(spec: PassJobSpec, guard: PassFlightGuard) {
 }
 
 pub(super) fn submit_pass_job(spec: PassJobSpec) {
-    let pass_key = spec.admitted.key;
+    let stream_key = spec.admitted.key;
     let pass_id = spec.admitted.pass_id;
     let pass_cancel = spec.admitted.cancel.clone();
     let runtime = Arc::clone(&spec.runtime);
@@ -234,16 +235,16 @@ pub(super) fn submit_pass_job(spec: PassJobSpec) {
         .source
         .pass_peak_bytes()
         .min(runtime.budget.bulk_lane_pending_bytes as u64) as usize;
-    let guard = PassFlightGuard::new(Arc::clone(&runtime), pass_key, pass_id);
+    let guard = PassFlightGuard::new(Arc::clone(&runtime), stream_key, pass_id);
 
     let job = DecodeJob {
-        key: DecodeJobKey::Pass(pass_key),
+        key: DecodeJobKey::Pass(stream_key),
         queued_bytes: queued_bytes.max(default_display_tile_bytes()),
         cancel: pass_cancel,
         work: Box::new(move || run_pass_job(spec, guard)),
     };
 
     runtime.try_submit_guarded(&runtime.bulk_pool, job, true, || {
-        let _ = runtime.abort_pass(pass_key, pass_id);
+        let _ = runtime.abort_pass(stream_key, pass_id);
     });
 }

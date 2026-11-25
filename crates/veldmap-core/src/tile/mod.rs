@@ -35,7 +35,9 @@ pub use pyramid::{
     CarrierLayout, RASTER_TILE_SIZE, cell_image_rect, cell_uv_rect, grid_dim, level_count,
     level_size, tile_extent,
 };
-pub use quadtree::{DEFAULT_GRID_CELLS, QuadtreeConfig, VisibleTile, describe_tile, traverse};
+#[cfg(any(test, feature = "test-support"))]
+pub use quadtree::describe_tile;
+pub use quadtree::{DEFAULT_GRID_CELLS, QuadtreeConfig, VisibleTile, traverse};
 pub use scheme::{GlobeScheme, PlanetaryScheme, TileScheme};
 
 #[cfg(test)]

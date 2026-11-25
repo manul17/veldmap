@@ -5,7 +5,6 @@
 //! GeoJSON [`VectorManager`], interactive geodesic [`MeasureSession`], cached
 //! immutable [`DrawSnapshot`], and monotonic `scene_generation`.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -257,18 +256,6 @@ impl SceneState {
         }
     }
 
-    /// Queue a non-blocking local read-only GeoJSON vector layer open onto the
-    /// dedicated vector background I/O worker.
-    pub(crate) fn begin_open_vector_file(
-        &self,
-        path: &Path,
-        fly_to: bool,
-        visible: bool,
-        opacity: f32,
-    ) -> Result<(), String> {
-        self.vectors.begin_open(path, fly_to, visible, opacity)
-    }
-
     pub(crate) fn set_vector_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
         let changed = self.vectors.set_visible(id, visible);
         self.mark_dirty_if(changed)
@@ -288,23 +275,12 @@ impl SceneState {
         for src in mutation.purge_sources {
             self.purge_source_caches(src);
         }
-        if mutation.changed {
+        if mutation.topology_changed {
             self.mark_topology_changed();
+        } else if mutation.changed {
+            self.mark_dirty();
         }
         mutation.changed
-    }
-
-    /// Queue a non-blocking local raster overlay open with explicit initial state.
-    pub(crate) fn begin_open_overlay_file_with_options(
-        &self,
-        path: &Path,
-        fly_to: bool,
-        visible: bool,
-        opacity: f32,
-        crs_override: Option<CrsOverride>,
-    ) -> Result<(), String> {
-        self.overlays
-            .begin_open_file_with_options(path, fly_to, visible, opacity, crs_override)
     }
 
     pub(crate) fn move_overlay_up(&mut self, id: LayerId) -> bool {
@@ -362,11 +338,8 @@ impl SceneState {
 
     /// Toggle visibility of an overlay layer.
     pub(crate) fn set_overlay_visible(&mut self, id: LayerId, visible: bool) -> bool {
-        let changed = self.overlays.set_visible(id, visible);
-        if changed {
-            self.mark_topology_changed();
-        }
-        changed
+        let mutation = self.overlays.set_visible(id, visible);
+        self.apply_overlay_mutation(mutation)
     }
 
     /// Set opacity (`0.0..=1.0`) of an overlay layer.

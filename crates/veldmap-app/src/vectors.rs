@@ -113,71 +113,35 @@ struct VectorIoResult {
     outcome: Result<LoadedVectorData, String>,
 }
 
-/// Dedicated single-thread background worker loading and tessellating local
-/// GeoJSON files strictly off the UI thread, independent of raster
-/// `OverlayManager` / `OverlayIoWorker`.
-struct VectorIoWorker {
-    worker: SingleThreadWorker<VectorIoCmd, VectorIoResult>,
-}
-
-impl VectorIoWorker {
-    fn spawn(wakeup: Wakeup, shutdown: CancelToken) -> Self {
-        let worker = SingleThreadWorker::<VectorIoCmd, VectorIoResult>::spawn(
-            "veldmap-vector-io",
-            move |cmd_rx, res_tx| {
-                while let Ok(cmd) = cmd_rx.recv() {
-                    if shutdown.is_cancelled() {
-                        break;
-                    }
-                    let outcome = load_vector_file(&cmd.path);
-                    if shutdown.is_cancelled() {
-                        break;
-                    }
-                    let _ = res_tx.send(VectorIoResult {
-                        path: cmd.path,
-                        fly_to: cmd.fly_to,
-                        visible: cmd.visible,
-                        opacity: cmd.opacity,
-                        outcome,
-                    });
-                    (wakeup)();
+/// Spawn the dedicated single-thread background worker loading and
+/// tessellating local GeoJSON files strictly off the UI thread, independent of
+/// raster `OverlayManager`.
+fn spawn_vector_io_worker(
+    wakeup: Wakeup,
+    shutdown: CancelToken,
+) -> SingleThreadWorker<VectorIoCmd, VectorIoResult> {
+    SingleThreadWorker::<VectorIoCmd, VectorIoResult>::spawn(
+        "veldmap-vector-io",
+        move |cmd_rx, res_tx| {
+            while let Ok(cmd) = cmd_rx.recv() {
+                if shutdown.is_cancelled() {
+                    break;
                 }
-            },
-        );
-        Self { worker }
-    }
-
-    fn begin_open(
-        &self,
-        path: &Path,
-        fly_to: bool,
-        visible: bool,
-        opacity: f32,
-    ) -> Result<(), String> {
-        let cmd = VectorIoCmd {
-            path: path.to_path_buf(),
-            fly_to,
-            visible,
-            opacity: clamp_opacity(opacity),
-        };
-        if self.worker.send(cmd) {
-            Ok(())
-        } else {
-            Err("vector I/O worker is unavailable".to_owned())
-        }
-    }
-
-    fn try_recv(&self) -> Option<VectorIoResult> {
-        self.worker.try_recv()
-    }
-
-    fn close_channel(&mut self) {
-        self.worker.close_channel();
-    }
-
-    fn join(&mut self) {
-        self.worker.join();
-    }
+                let outcome = load_vector_file(&cmd.path);
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                let _ = res_tx.send(VectorIoResult {
+                    path: cmd.path,
+                    fly_to: cmd.fly_to,
+                    visible: cmd.visible,
+                    opacity: cmd.opacity,
+                    outcome,
+                });
+                (wakeup)();
+            }
+        },
+    )
 }
 
 struct VectorLayer {
@@ -352,14 +316,14 @@ impl VectorLayerStack {
 /// off-UI-thread I/O worker.
 pub(crate) struct VectorManager {
     stack: VectorLayerStack,
-    io: VectorIoWorker,
+    io: SingleThreadWorker<VectorIoCmd, VectorIoResult>,
 }
 
 impl VectorManager {
     pub(crate) fn new(wakeup: Wakeup, shutdown: CancelToken) -> Self {
         Self {
             stack: VectorLayerStack::default(),
-            io: VectorIoWorker::spawn(wakeup, shutdown),
+            io: spawn_vector_io_worker(wakeup, shutdown),
         }
     }
 
@@ -371,7 +335,17 @@ impl VectorManager {
         visible: bool,
         opacity: f32,
     ) -> Result<(), String> {
-        self.io.begin_open(path, fly_to, visible, opacity)
+        let cmd = VectorIoCmd {
+            path: path.to_path_buf(),
+            fly_to,
+            visible,
+            opacity: clamp_opacity(opacity),
+        };
+        if self.io.send(cmd) {
+            Ok(())
+        } else {
+            Err("vector I/O worker is unavailable".to_owned())
+        }
     }
 
     /// Drain completed background GeoJSON open events into the vector stack.
@@ -436,13 +410,6 @@ impl VectorManager {
     /// Phase 3 shutdown: deterministically join the background worker thread.
     pub(crate) fn finish_shutdown(&mut self) {
         self.io.join();
-    }
-}
-
-impl Drop for VectorManager {
-    fn drop(&mut self) {
-        self.begin_shutdown();
-        self.finish_shutdown();
     }
 }
 

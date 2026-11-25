@@ -6,6 +6,9 @@
 //! session schemas live in `veldmap-app` and persist through
 //! [`read_json_or_default_with_backup`] / [`write_json_durable_private`].
 
+#![cfg_attr(not(target_os = "windows"), forbid(unsafe_code))]
+#![cfg_attr(target_os = "windows", deny(unsafe_code))]
+
 use thiserror::Error;
 use veldmap_core::io::IoError;
 
@@ -23,10 +26,7 @@ pub use file_source::{LocalFileSource, read_regular_file_utf8_limited};
 pub use fingerprint::{LocalFingerprintCache, fingerprint_byte_source};
 pub use host::detect_memory_budget;
 pub use paths::StoragePaths;
-pub use tile_cache::{
-    DiskCacheStats, DiskTileEntry, DiskTileKey, MAX_CACHED_TILE_BYTES, TileBlobEncoding,
-    TileDiskCache,
-};
+pub use tile_cache::{DiskCacheStats, DiskTileEntry, DiskTileKey, TileBlobEncoding, TileDiskCache};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

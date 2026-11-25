@@ -8,7 +8,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use veldmap_core::sync::lock_unpoisoned;
 use veldmap_core::tile::TileKey;
 
-use super::PipelineShared;
+use super::context::PipelineShared;
 use super::state::{PipelineState, Transition};
 
 /// Generation-checked RAII guard keeping `key` registered in `state.in_flight`
@@ -121,7 +121,6 @@ mod tests {
     use crate::basemap::LiveBasemapSpec;
     use crate::http::HostLimiters;
 
-    use super::super::wm_key;
     use super::*;
 
     #[test]
@@ -133,16 +132,16 @@ mod tests {
             notify: Notify::new(),
         });
         let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
-        let key = wm_key(&spec, 0, 0, 0);
+        let key = spec.wm_key(0, 0, 0);
 
         let (gen1, _) = {
             let mut st = lock_unpoisoned(&shared.state);
-            st.register_http_in_flight(key, &shared.shutdown)
+            st.register_in_flight_for_test(key, &shared.shutdown)
         };
         let guard1 = InFlightGuard::new(Arc::clone(&shared), key, gen1);
         let (gen2, _) = {
             let mut st = lock_unpoisoned(&shared.state);
-            st.register_http_in_flight(key, &shared.shutdown)
+            st.register_in_flight_for_test(key, &shared.shutdown)
         };
         drop(guard1);
 

@@ -12,36 +12,15 @@ use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{SourceFingerprint, SourceId, level_count};
 
+use crate::image_codec::{build_normalized_png_decoder, build_png_decoder, png_u8_to_rgba8};
 use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
 use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
 use crate::pipeline::plan::{LevelPlan, ServeMode, check_max_source_side};
-use crate::pipeline::radiometry::{PixelLayout, expand_u8_into_rgba, to_rgba8};
+use crate::pipeline::radiometry::{PixelLayout, expand_u8_into_rgba};
 use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
 
 use super::world_file_binding_trouble;
-
-const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-
-/// Return whether `head` begins with an 8-byte PNG file signature.
-pub fn has_png_magic(head: &[u8]) -> bool {
-    head.starts_with(&PNG_MAGIC)
-}
-
-fn build_png_decoder(
-    reader: BufferedByteReader,
-    budget: &MemoryBudget,
-) -> png::Decoder<BufferedByteReader> {
-    let limits = png::Limits {
-        bytes: budget.decode_working_bytes.min(usize::MAX as u64) as usize,
-    };
-    let mut decoder = png::Decoder::new_with_limits(reader, limits);
-    // Ignore ancillary text/iCCP chunks so adversarial metadata cannot exhaust
-    // decode working memory during header parsing.
-    decoder.set_ignore_text_chunk(true);
-    decoder.set_ignore_iccp_chunk(true);
-    decoder
-}
 
 /// Pure-`ByteSource` PNG source implementing [`RasterSource`].
 pub struct PngSource {
@@ -67,7 +46,7 @@ impl PngSource {
             return Err(RasterError::Cancelled);
         }
         let reader = BufferedByteReader::new(Arc::clone(&byte_source), cancel.clone());
-        let decoder = build_png_decoder(reader, budget);
+        let decoder = build_png_decoder(reader, budget.decode_working_bytes);
         let info_reader = decoder.read_info().map_err(|e| map_png_error(e, cancel))?;
         let info = info_reader.info();
         let (width, height, interlaced) = (info.width, info.height, info.interlaced);
@@ -146,8 +125,7 @@ impl PngSource {
         ctx: &DecodeContext<'_>,
     ) -> Result<(png::Reader<BufferedByteReader>, PixelLayout), RasterError> {
         let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
-        let mut decoder = build_png_decoder(reader, ctx.budget);
-        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let decoder = build_normalized_png_decoder(reader, ctx.budget.decode_working_bytes);
         let png_reader = decoder
             .read_info()
             .map_err(|e| map_png_error(e, ctx.cancel))?;
@@ -215,12 +193,9 @@ impl RasterSource for PngSource {
             if ctx.cancel.is_cancelled() {
                 return Err(RasterError::Cancelled);
             }
-            let rgba = to_rgba8(
-                &buf[..out.buffer_size()],
-                layout,
-                (w as usize).saturating_mul(h as usize),
-            );
-            drop(buf);
+            buf.truncate(out.buffer_size());
+            let rgba =
+                png_u8_to_rgba8(out.color_type, buf, (w as usize).saturating_mul(h as usize));
             cascade.push_rows(&rgba, h, &mut bled_emit)?;
             return cascade.finish(&mut bled_emit);
         }

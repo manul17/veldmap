@@ -5,8 +5,7 @@ use serde_json::{Value, json};
 
 use super::super::footprint::{GeoPoint, Polygon, dedup_geo_ring};
 use super::super::geodesic::ring_signed_area_m2;
-use super::parse::extract_feature_name;
-use super::{GeoJsonFeatureCollection, GeoJsonGeometry};
+use super::{GeoJsonFeatureCollection, GeoJsonGeometry, extract_feature_name};
 
 /// Export a [`GeoJsonFeatureCollection`] as pretty-printed RFC 7946 GeoJSON
 /// (`[lon, lat]` WGS84 coordinates, closed linear rings, exterior rings

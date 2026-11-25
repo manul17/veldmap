@@ -9,17 +9,25 @@ use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::{DVec3, Vec3};
 use wgpu::util::DeviceExt;
 
-use super::pipelines::GlobePipelines;
 use super::snapshot::{DrawSnapshot, DrawVectorId, DrawVectorLayer};
 use super::uniforms::{DynamicUniformArena, VectorUniform};
 use crate::clamp_opacity;
+
+/// Borrowed Pass-2 vector render pipelines passed into
+/// [`VectorRenderer::record_pass`].
+#[derive(Clone, Copy)]
+pub(super) struct VectorPipelines<'a> {
+    pub(super) fill: &'a wgpu::RenderPipeline,
+    pub(super) line: &'a wgpu::RenderPipeline,
+    pub(super) point: &'a wgpu::RenderPipeline,
+}
 
 /// Compact 24-byte GPU vertex matching `shaders/vector.wgsl` (`@location(0..1)`).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct GpuVectorVertex {
-    pub(super) rel_pos: [f32; 3],
-    pub(super) normal: [f32; 3],
+    rel_pos: [f32; 3],
+    normal: [f32; 3],
 }
 
 const _: () = {
@@ -359,7 +367,7 @@ impl VectorRenderer {
     pub(super) fn record_pass<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
-        pipelines: &'a GlobePipelines,
+        pipelines: VectorPipelines<'a>,
         arena: &'a DynamicUniformArena,
         snapshot: &'a DrawSnapshot,
     ) {
@@ -378,7 +386,7 @@ impl VectorRenderer {
                 record_cluster_draws(
                     pass,
                     ClusterDrawTarget {
-                        pipeline: &pipelines.vector_fill_pipeline,
+                        pipeline: pipelines.fill,
                         vb,
                         kind: VectorDrawKind::Fill { ib },
                     },
@@ -392,7 +400,7 @@ impl VectorRenderer {
                 record_cluster_draws(
                     pass,
                     ClusterDrawTarget {
-                        pipeline: &pipelines.vector_line_pipeline,
+                        pipeline: pipelines.line,
                         vb,
                         kind: VectorDrawKind::Line,
                     },
@@ -406,7 +414,7 @@ impl VectorRenderer {
                 record_cluster_draws(
                     pass,
                     ClusterDrawTarget {
-                        pipeline: &pipelines.vector_point_pipeline,
+                        pipeline: pipelines.point,
                         vb,
                         kind: VectorDrawKind::Point,
                     },

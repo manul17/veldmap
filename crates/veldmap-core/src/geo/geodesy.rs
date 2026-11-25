@@ -19,7 +19,7 @@ pub const SEMI_MAJOR_M: f64 = 6_378_137.0;
 pub(crate) const EQUATORIAL_CIRCUMFERENCE_M: f64 = 2.0 * std::f64::consts::PI * SEMI_MAJOR_M;
 
 /// WGS84 flattening (`1 / 298.257223563`).
-pub const FLATTENING: f64 = 1.0 / 298.257_223_563;
+pub(super) const FLATTENING: f64 = 1.0 / 298.257_223_563;
 
 /// Reference ellipsoid of revolution.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -245,7 +245,7 @@ pub(crate) fn world(point: Geodetic) -> DVec3 {
 /// ellipsoid (`height_m == 0.0`); for non-zero heights uses a proportionally
 /// scaled ellipsoid (`b * (1 + h / a)`). Returns `None` if `direction` is zero
 /// or the ray misses / hits behind `origin`.
-pub fn intersect_at(origin: DVec3, direction: DVec3, height_m: f64) -> Option<DVec3> {
+pub(super) fn intersect_at(origin: DVec3, direction: DVec3, height_m: f64) -> Option<DVec3> {
     let stretch = DVec3::new(1.0, 1.0, 1.0 / (1.0 - FLATTENING));
     let start = origin * stretch;
     let along = direction * stretch;
@@ -269,21 +269,21 @@ pub fn intersect_at(origin: DVec3, direction: DVec3, height_m: f64) -> Option<DV
 
 /// Convert a WGS84 ECEF point in **metres** back to geodetic
 /// `(lat_deg, lon_deg)`.
-pub fn surface_at(point: DVec3) -> (f64, f64) {
+pub(super) fn surface_at(point: DVec3) -> (f64, f64) {
     let geo = WGS84.from_ecef(point);
     (geo.lat_deg, geo.lon_deg)
 }
 
 /// Angular separation between two `(lat_deg, lon_deg)` points in degrees of
 /// arc (`1 deg ~ 111 km`).
-pub fn separation(from: (f64, f64), to: (f64, f64)) -> f64 {
+pub(super) fn separation(from: (f64, f64), to: (f64, f64)) -> f64 {
     let (a, b) = (unit(from.0, from.1), unit(to.0, to.1));
     a.cross(b).length().atan2(a.dot(b)).to_degrees()
 }
 
 /// Interpolate along the great-circle arc between two `(lat_deg, lon_deg)`
 /// points at fraction `t`, keeping longitude continuous with `from.1`.
-pub fn between(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
+pub(super) fn between(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
     if t <= 0.0 {
         return from;
     }
@@ -330,7 +330,7 @@ pub(crate) fn spherical_centroid(points: impl Iterator<Item = (f64, f64)>) -> Op
 
 /// Shift `lon_deg` by an integer multiple of 360 degrees so it lies within
 /// `[-180, +180]` of `base`.
-pub fn unwind(base: f64, lon_deg: f64) -> f64 {
+pub(crate) fn unwind(base: f64, lon_deg: f64) -> f64 {
     let apart = lon_deg - base;
     let turns = if apart > 180.0 {
         ((apart - 180.0) / TURN_DEG).ceil()
@@ -343,7 +343,7 @@ pub fn unwind(base: f64, lon_deg: f64) -> f64 {
 }
 
 /// Convert a unit ECEF direction vector back into `(lat_deg, lon_deg)`.
-pub fn angles(unit: DVec3) -> (f64, f64) {
+pub(super) fn angles(unit: DVec3) -> (f64, f64) {
     (
         unit.z.clamp(-1.0, 1.0).asin().to_degrees(),
         unit.y.atan2(unit.x).to_degrees(),
@@ -352,7 +352,7 @@ pub fn angles(unit: DVec3) -> (f64, f64) {
 
 /// Unit ECEF vector for a `(lat_deg, lon_deg)` direction (also the exact
 /// outward normal to the WGS84 ellipsoid when `lat_deg` is geodetic).
-pub fn unit(lat_deg: f64, lon_deg: f64) -> DVec3 {
+pub(super) fn unit(lat_deg: f64, lon_deg: f64) -> DVec3 {
     let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
     let (sin_lon, cos_lon) = lon_deg.to_radians().sin_cos();
     DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat)

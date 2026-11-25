@@ -49,6 +49,7 @@ struct MemoryStatusEx {
 
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
+#[expect(unsafe_code, reason = "INVARIANT: Windows GlobalMemoryStatusEx FFI")]
 unsafe extern "system" {
     fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
 }
@@ -69,6 +70,7 @@ fn detect_windows_ram_bytes() -> Option<u64> {
     // SAFETY: `status` is a properly initialized `MEMORYSTATUSEX` with
     // `dw_length` set to its exact byte size, and `GlobalMemoryStatusEx` only
     // writes into the provided buffer for the duration of the call.
+    #[expect(unsafe_code, reason = "INVARIANT: Windows GlobalMemoryStatusEx FFI")]
     let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
     (ok != 0 && status.ull_total_phys > 0).then_some(status.ull_total_phys)
 }

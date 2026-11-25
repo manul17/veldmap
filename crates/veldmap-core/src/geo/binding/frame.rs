@@ -148,19 +148,9 @@ impl Frame {
             CrsSpec::Projected(proj) => {
                 Self::from_pixel_affine(proj.clone(), pixel_affine, width, height)
             }
-            CrsSpec::Geographic {
-                datum,
-                label,
-                warning,
-            } => {
+            CrsSpec::Geographic { .. } | CrsSpec::GeographicProj(_) => {
                 let grid = TieGrid::from_geographic_affine(pixel_affine, width, height)?;
-                let frame = Self::from_grid_with_datum(grid, *datum, label.clone())
-                    .with_datum_warning(warning.clone());
-                frame.measurable().then_some(frame)
-            }
-            CrsSpec::GeographicProj(proj) => {
-                let grid = TieGrid::from_geographic_affine(pixel_affine, width, height)?;
-                let frame = Self::from_grid_with_proj(grid, Arc::clone(proj));
+                let frame = Self::from_grid_with_crs(grid, Some(crs));
                 frame.measurable().then_some(frame)
             }
         }
@@ -178,10 +168,28 @@ impl Frame {
         )
     }
 
+    /// Wrap a validated [`TieGrid`] using the horizontal datum or geographic
+    /// CRS described by `crs` (defaulting to WGS84 when `crs` is `None` or
+    /// projected).
+    pub fn from_grid_with_crs(grid: TieGrid, crs: Option<&CrsSpec>) -> Self {
+        match crs {
+            Some(CrsSpec::Geographic {
+                datum,
+                label,
+                warning,
+            }) => Self::from_grid_with_datum(grid, *datum, label.clone())
+                .with_datum_warning(warning.clone()),
+            Some(CrsSpec::GeographicProj(proj)) => {
+                Self::from_grid_with_proj(grid, Arc::clone(proj))
+            }
+            None | Some(CrsSpec::Projected(_)) => Self::from_grid(grid),
+        }
+    }
+
     /// Wrap a validated [`TieGrid`] on a specific horizontal [`Datum`],
     /// shifting coordinates to/from WGS84 via [`Datum::to_wgs84`] /
     /// [`Datum::from_wgs84`] (discarding phantom Helmert `Delta h`).
-    pub fn from_grid_with_datum(grid: TieGrid, datum: Datum, label: impl Into<String>) -> Self {
+    fn from_grid_with_datum(grid: TieGrid, datum: Datum, label: impl Into<String>) -> Self {
         Self::from_parts(
             FrameKind::Grid {
                 grid,
@@ -193,7 +201,7 @@ impl Frame {
     }
 
     /// Wrap a validated [`TieGrid`] on an arbitrary `proj4rs` geographic CRS.
-    pub fn from_grid_with_proj(grid: TieGrid, proj: Arc<Proj4Projection>) -> Self {
+    fn from_grid_with_proj(grid: TieGrid, proj: Arc<Proj4Projection>) -> Self {
         let datum_warning = proj.datum_warning().cloned();
         let label = proj.label().to_string();
         Self::from_parts(

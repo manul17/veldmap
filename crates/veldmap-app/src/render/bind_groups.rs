@@ -8,8 +8,6 @@ use veldmap_core::tile::PixelFormat;
 
 use crate::gpu_tiles::GpuTile;
 
-use super::pipelines::GlobePipelines;
-
 /// `Weak<GpuTile>`-guarded cache of `wgpu::BindGroup` entries for display
 /// textures, keyed by process-unique `GpuTile::tile_id` and guarded on
 /// [`PixelFormat`] so incompatible texture formats can never bind to the
@@ -25,7 +23,8 @@ impl TileBindGroupCache {
     pub(super) fn ensure(
         &mut self,
         device: &wgpu::Device,
-        pipelines: &GlobePipelines,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
         gpu_tile: &Arc<GpuTile>,
     ) {
         if gpu_tile.format != PixelFormat::Rgba8UnormSrgb {
@@ -42,7 +41,7 @@ impl TileBindGroupCache {
         }
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tile Rgba8UnormSrgb bind group"),
-            layout: &pipelines.layouts.tile_texture_layout,
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -50,7 +49,7 @@ impl TileBindGroupCache {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&pipelines.tile_sampler),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
         });

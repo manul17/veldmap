@@ -137,17 +137,17 @@ impl TileMeshCache {
 pub(super) struct TileVertex {
     /// Surface (or skirt) position relative to the tile's CPU `f64` RTC origin
     /// (`(P_ecef_m - origin_ecef_m) as f32`, in metres).
-    pub(super) rel_pos: [f32; 3],
+    rel_pos: [f32; 3],
     /// Outward unit WGS84 ellipsoidal normal.
-    pub(super) normal: [f32; 3],
+    normal: [f32; 3],
     /// Tile-local UV coordinates in `[0, 1]^2` (transformed by per-draw
     /// `uv_rect` when sampling a coarser ancestor texture).
-    pub(super) uv: [f32; 2],
+    uv: [f32; 2],
     /// Tile-relative graticule coordinates computed in `f64` before casting to
     /// `f32`:
     /// - `Geodetic` / `WebMercator`: `(lon_deg - anchor_lon, lat_deg - anchor_lat)`
     /// - `PolarCap`: `(dx - anchor_dx, dy - anchor_dy)` in unit-disk coordinates
-    pub(super) grid_rel: [f32; 2],
+    grid_rel: [f32; 2],
 }
 
 const _: () = {
@@ -171,21 +171,21 @@ impl TileVertex {
 /// quadtree tile (both main planetary tiles and adaptive Polar Stereographic
 /// cap tiles).
 #[derive(Clone, Debug)]
-pub(super) struct SharedTileIndices {
-    pub(super) indices: Vec<u32>,
+struct SharedTileIndices {
+    indices: Vec<u32>,
     /// Index range covering the `grid_cells x grid_cells` surface quads only
     /// (used by the post-overlay `grid_pipeline` so skirts never draw graticule
     /// artifacts).
-    pub(super) surface: Range<u32>,
+    surface: Range<u32>,
     /// Full index range covering the surface quads plus all four downward
     /// skirts (used by `body_ellipsoid_pipeline` and `body_textured_pipeline`).
-    pub(super) full: Range<u32>,
+    full: Range<u32>,
 }
 
 impl SharedTileIndices {
     /// Build the shared static index buffer for a `grid_cells x grid_cells`
     /// tile with four perimeter skirt strips.
-    pub(super) fn build(grid_cells: u32) -> Self {
+    fn build(grid_cells: u32) -> Self {
         let n = grid_cells.max(1);
         let stride = n + 1;
         let surface_verts = stride * stride;
@@ -236,10 +236,7 @@ impl SharedTileIndices {
 /// together with its cached `f64` [`TileGridAnchor`] so
 /// `GlobeRenderer::upload_uniforms` does not re-sample
 /// `sample_tile_surface(id, 0.5, 0.5)`.
-pub(super) fn build_tile_mesh_data(
-    tile: &VisibleTile,
-    grid_cells: u32,
-) -> (Vec<TileVertex>, TileGridAnchor) {
+fn build_tile_mesh_data(tile: &VisibleTile, grid_cells: u32) -> (Vec<TileVertex>, TileGridAnchor) {
     let n = grid_cells.max(1);
     let stride = (n + 1) as usize;
     let total_verts = stride * stride + 4 * stride;

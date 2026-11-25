@@ -18,6 +18,7 @@ mod basemap;
 mod fetcher;
 mod http;
 mod redact;
+mod url;
 
 pub use basemap::{
     CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, LiveBasemapSpec,

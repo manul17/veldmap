@@ -256,7 +256,7 @@ impl Default for AppSettings {
 
 impl AppSettings {
     /// Clamp numeric settings and sanitize fields loaded from disk.
-    pub(crate) fn normalize(&mut self) {
+    pub(super) fn normalize(&mut self) {
         self.version = SETTINGS_SCHEMA_VERSION;
         self.custom_xyz.max_level = self
             .custom_xyz
@@ -274,7 +274,7 @@ impl AppSettings {
     }
 
     /// Configured disk cache cap in bytes.
-    pub(crate) fn disk_cache_max_bytes(&self) -> u64 {
+    pub(super) fn disk_cache_max_bytes(&self) -> u64 {
         self.disk_cache_max_mb
             .clamp(MIN_DISK_CACHE_MAX_MB, MAX_DISK_CACHE_MAX_MB)
             .saturating_mul(1024 * 1024)
@@ -282,7 +282,7 @@ impl AppSettings {
 
     /// Load settings from `paths.settings_path()`, falling back to defaults if
     /// missing or malformed (backing up corrupt JSON to `settings.json.corrupt`).
-    pub(crate) fn load_or_default(paths: &StoragePaths) -> Self {
+    pub(super) fn load_or_default(paths: &StoragePaths) -> Self {
         let mut settings: Self = read_json_or_default_with_backup(&paths.settings_path());
         settings.normalize();
         settings
@@ -298,123 +298,5 @@ impl AppSettings {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use veldmap_storage::test_support::TestTempDir;
-
-    #[test]
-    fn settings_round_trip_and_redact_api_key_userinfo_and_query_in_debug() {
-        let dir = TestTempDir::new("settings-rt");
-        let paths = StoragePaths::with_root(dir.path());
-
-        let mut settings = AppSettings {
-            active_basemap: BasemapSelection::CustomXyz,
-            gibs_date: " 2024-08-15 ".to_owned(),
-            custom_xyz: CustomXyzSettings {
-                name: "My Tile Server".to_owned(),
-                url_template:
-                    "https://alice:pw@tiles.example.com/{z}/{x}/{y}.png?inline=leak-me&key={key}"
-                        .to_owned(),
-                api_key: "super-secret-token-123".to_owned(),
-                tms_flip_y: true,
-                max_level: 99, // clamped to CUSTOM_MAX_LEVEL_MAX (20)
-                attribution: "Example".to_owned(),
-            },
-            disk_cache_max_mb: 256,
-            show_graticule: false,
-            ..AppSettings::default()
-        };
-
-        let dbg = format!("{settings:?}");
-        assert!(!dbg.contains("super-secret-token-123"));
-        assert!(!dbg.contains("alice:pw"));
-        assert!(!dbg.contains("leak-me"));
-        assert!(dbg.contains("<redacted>"));
-
-        settings.save(&paths).expect("save settings");
-        let loaded = AppSettings::load_or_default(&paths);
-        settings.normalize();
-        assert_eq!(loaded, settings);
-        assert_eq!(loaded.gibs_date, "2024-08-15");
-        assert_eq!(loaded.custom_xyz.max_level, CUSTOM_MAX_LEVEL_MAX);
-    }
-
-    #[test]
-    fn corrupt_json_backs_up_file_and_unknown_basemap_variant_is_forward_compatible() {
-        let dir = TestTempDir::new("settings-recovery");
-        let paths = StoragePaths::with_root(dir.path());
-        let settings_path = paths.settings_path();
-        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
-
-        std::fs::write(&settings_path, b"{not valid json").expect("write corrupt");
-        let loaded = AppSettings::load_or_default(&paths);
-        assert_eq!(loaded, AppSettings::default());
-        let backup = settings_path.with_extension("json.corrupt");
-        assert_eq!(
-            std::fs::read(&backup).expect("backup preserved"),
-            b"{not valid json"
-        );
-
-        std::fs::write(
-            &settings_path,
-            br#"{"active_basemap":"future_provider_v9","disk_cache_max_mb":999999,"gibs_date":"   "}"#,
-        )
-        .expect("write forward-compat json");
-        let compat = AppSettings::load_or_default(&paths);
-        assert_eq!(compat.active_basemap, BasemapSelection::BundledBlueMarble);
-        assert_eq!(compat.disk_cache_max_mb, MAX_DISK_CACHE_MAX_MB);
-        assert_eq!(compat.gibs_date, DEFAULT_GIBS_DATE);
-        assert!(compat.show_graticule);
-    }
-
-    #[test]
-    fn basemap_draft_preserves_unrelated_app_settings_and_validates_partial_edits() {
-        let mut settings = AppSettings {
-            show_graticule: false,
-            ..AppSettings::default()
-        };
-        let mut draft = BasemapSettingsDraft::from_settings(&settings);
-        draft.active_basemap = BasemapSelection::EoxSentinel2Cloudless;
-        draft.disk_cache_max_mb = 1024;
-
-        // Applying basemap draft must leave unrelated `show_graticule` intact.
-        draft.apply_into(&mut settings);
-        assert!(!settings.show_graticule);
-        assert_eq!(
-            settings.active_basemap,
-            BasemapSelection::EoxSentinel2Cloudless
-        );
-        assert_eq!(settings.disk_cache_max_mb, 1024);
-
-        // Applying draft with an invalid GIBS date while GIBS VIIRS is inactive
-        // preserves the existing valid GIBS date instead of persisting a typo.
-        let prev_date = settings.gibs_date.clone();
-        draft.gibs_date = "not-a-date".to_owned();
-        draft.disk_cache_max_mb = 2048;
-        draft.apply_into(&mut settings);
-        assert_eq!(settings.gibs_date, prev_date);
-        assert_eq!(settings.disk_cache_max_mb, 2048);
-
-        // Saving a valid Custom XYZ URL while CustomXyz is inactive persists it.
-        draft.custom_xyz.url_template = "https://tiles.example.org/{z}/{x}/{y}.png".to_owned();
-        draft.apply_into(&mut settings);
-        assert_eq!(
-            settings.custom_xyz.url_template,
-            "https://tiles.example.org/{z}/{x}/{y}.png"
-        );
-
-        // A half-typed invalid URL while CustomXyz is inactive must preserve
-        // the existing saved Custom XYZ configuration.
-        let saved_custom = settings.custom_xyz.clone();
-        draft.custom_xyz.url_template = "https://incomplete-no-placeholders".to_owned();
-        draft.custom_xyz.name = "Half-typed".to_owned();
-        draft.apply_into(&mut settings);
-        assert_eq!(settings.custom_xyz, saved_custom);
-
-        // Intentionally clearing the URL to empty while CustomXyz is inactive
-        // IS applied so the user can clear a saved Custom XYZ source.
-        draft.custom_xyz.url_template = "   ".to_owned();
-        draft.apply_into(&mut settings);
-        assert_eq!(settings.custom_xyz.url_template, "   ");
-    }
-}
+#[path = "settings_tests.rs"]
+mod tests;

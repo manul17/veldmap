@@ -6,9 +6,8 @@ mod png;
 
 use crate::pipeline::metadata::GeoPlacement;
 
-pub use jpeg::{JpegSource, has_jpeg_magic};
-pub(crate) use jpeg::{decode_jpeg_pixels_to_rgb8, decode_jpeg_pixels_to_rgba8};
-pub use png::{PngSource, has_png_magic};
+pub use jpeg::JpegSource;
+pub use png::PngSource;
 
 pub(super) fn world_file_binding_trouble(
     format_name: &str,

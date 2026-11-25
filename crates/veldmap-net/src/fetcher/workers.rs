@@ -1,5 +1,5 @@
 //! Per-tile disk lookup, HTTP fetch, decode-submission backpressure, and
-//! failure-recording workers for [`super::LiveTilePipeline`].
+//! failure-recording workers for [`crate::LiveTilePipeline`].
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,18 +13,10 @@ use crate::http::{
 };
 use crate::{DecodeCompletion, DecodeFailure, DecodeRequest};
 
-use super::PipelineContext;
+use super::context::PipelineContext;
 use super::disk::{DiskCacheGate, DiskReadOutcome};
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
-use super::state::{PipelineState, Transition};
-
-/// Shared tile metadata passed from dispatch planning to disk/HTTP workers.
-pub(super) struct TileTarget {
-    pub(super) key: TileKey,
-    pub(super) id: QuadTileId,
-    pub(super) spec: Arc<LiveBasemapSpec>,
-    pub(super) cancel: CancelToken,
-}
+use super::state::{PipelineState, TileTarget, Transition};
 
 /// Guarded disk-cache lookup task handed from the dispatcher to
 /// [`run_disk_lookup`].

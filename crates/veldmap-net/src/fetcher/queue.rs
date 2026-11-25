@@ -172,7 +172,6 @@ impl PendingQueues {
 
 #[cfg(test)]
 mod tests {
-    use super::super::wm_key;
     use super::*;
     use crate::basemap::LiveBasemapSpec;
 
@@ -180,9 +179,9 @@ mod tests {
     fn insert_unique_and_retain_maintain_coarsest_first_order() {
         let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
         let mut queue = CoarsestTileQueue::default();
-        let k0 = wm_key(&spec, 0, 0, 0);
-        let k1 = wm_key(&spec, 2, 1, 1);
-        let k2 = wm_key(&spec, 1, 0, 0);
+        let k0 = spec.wm_key(0, 0, 0);
+        let k1 = spec.wm_key(2, 1, 1);
+        let k2 = spec.wm_key(1, 0, 0);
 
         assert!(queue.insert_unique(k1));
         assert!(queue.insert_unique(k0));
@@ -201,8 +200,8 @@ mod tests {
     fn pending_queues_enforces_disk_http_disjointness() {
         let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
         let mut pending = PendingQueues::default();
-        let k0 = wm_key(&spec, 1, 0, 0);
-        let k1 = wm_key(&spec, 1, 1, 0);
+        let k0 = spec.wm_key(1, 0, 0);
+        let k1 = spec.wm_key(1, 1, 0);
 
         assert!(pending.insert_disk(k0));
         assert!(pending.contains_disk(&k0));

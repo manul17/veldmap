@@ -1,7 +1,7 @@
 //! CPU `f64` RTC warp-mesh generation (`WarpPatch`, `build_warp_patch`,
 //! `level_segments`) for native-CRS raster overlays draped on WGS84.
 
-use glam::{DVec3, Vec3};
+use glam::DVec3;
 
 use crate::geo::{Frame, SEMI_MAJOR_M};
 
@@ -103,6 +103,7 @@ pub struct WarpPatch {
     pub normals: Vec<[f32; 3]>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl WarpPatch {
     /// Evaluate the exact triangulated `f64` ECEF position produced by this
     /// patch (including `f32` RTC vertex quantization) at cell-local
@@ -129,7 +130,7 @@ impl WarpPatch {
 
         let v_at = |r: usize, c: usize| {
             let p = self.rel_positions[r * side + c];
-            Vec3::from_array(p).as_dvec3()
+            glam::Vec3::from_array(p).as_dvec3()
         };
         let p00 = v_at(row, col);
         let p10 = v_at(row, col + 1);

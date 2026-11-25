@@ -19,23 +19,17 @@ use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{SourceFingerprint, SourceId, level_count, level_size};
 
-use crate::color::{cmyk_to_rgb8, cmyk_to_rgba8};
+use crate::image_codec::{
+    decode_jpeg_pixels_to_rgba8, jpeg_codec_working_bytes, jpeg_pixel_format_channels,
+};
 use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
 use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
 use crate::pipeline::plan::{LevelPlan, ServeMode};
-use crate::pipeline::radiometry::{PixelLayout, to_rgba8};
 use crate::pipeline::resample::{Window, resample_rgba8_window};
 use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
 
 use super::world_file_binding_trouble;
-
-const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
-
-/// Return whether `head` begins with a JPEG SOI + marker prefix (`FF D8 FF`).
-pub fn has_jpeg_magic(head: &[u8]) -> bool {
-    head.starts_with(&JPEG_MAGIC)
-}
 
 /// Pure-`ByteSource` JPEG source implementing [`RasterSource`].
 pub struct JpegSource {
@@ -77,11 +71,12 @@ impl JpegSource {
             return Err(RasterError::InvalidDimensions { width, height });
         }
 
-        let (channels, sample_type) = match info.pixel_format {
-            jpeg_decoder::PixelFormat::L8 => (1, SampleType::U8),
-            jpeg_decoder::PixelFormat::L16 => (1, SampleType::U16),
-            jpeg_decoder::PixelFormat::RGB24 => (3, SampleType::U8),
-            jpeg_decoder::PixelFormat::CMYK32 => (4, SampleType::U8),
+        let channels = jpeg_pixel_format_channels(info.pixel_format);
+        let sample_type = match info.pixel_format {
+            jpeg_decoder::PixelFormat::L16 => SampleType::U16,
+            jpeg_decoder::PixelFormat::L8
+            | jpeg_decoder::PixelFormat::RGB24
+            | jpeg_decoder::PixelFormat::CMYK32 => SampleType::U8,
         };
         let coding_process = info.coding_process;
 
@@ -273,78 +268,6 @@ impl RasterSource for JpegSource {
     }
 }
 
-fn l16_normalization_scale(pixels: &[u8], pixel_count: usize) -> f64 {
-    // Lossless JPEG L16 stores unshifted 9..=16-bit samples; scan native-endian
-    // pairs without allocating an intermediate `Vec<u16>` buffer.
-    let max_val = pixels
-        .chunks_exact(2)
-        .take(pixel_count)
-        .map(|p| u16::from_ne_bytes([p[0], p[1]]))
-        .max()
-        .unwrap_or(255);
-    let hi = if max_val <= 255 {
-        255.0_f64
-    } else if max_val <= 4095 {
-        4095.0_f64
-    } else {
-        65_535.0_f64
-    };
-    255.0 / hi
-}
-
-pub(crate) fn decode_jpeg_pixels_to_rgba8(
-    format: jpeg_decoder::PixelFormat,
-    pixels: &[u8],
-    pixel_count: usize,
-) -> Vec<u8> {
-    match format {
-        jpeg_decoder::PixelFormat::L8 => to_rgba8(pixels, PixelLayout::named(1), pixel_count),
-        jpeg_decoder::PixelFormat::RGB24 => to_rgba8(pixels, PixelLayout::named(3), pixel_count),
-        jpeg_decoder::PixelFormat::L16 => {
-            let scale = l16_normalization_scale(pixels, pixel_count);
-            let count = pixel_count.min(pixels.len() / 2);
-            let mut out = Vec::with_capacity(count.saturating_mul(4));
-            for p in pixels.chunks_exact(2).take(count) {
-                let v = f64::from(u16::from_ne_bytes([p[0], p[1]]));
-                let byte = (v * scale).round().clamp(0.0, 255.0) as u8;
-                out.extend_from_slice(&[byte, byte, byte, 255]);
-            }
-            out
-        }
-        jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_rgba8(pixels, pixel_count),
-    }
-}
-
-pub(crate) fn decode_jpeg_pixels_to_rgb8(
-    format: jpeg_decoder::PixelFormat,
-    pixels: Vec<u8>,
-    pixel_count: usize,
-) -> Vec<u8> {
-    match format {
-        jpeg_decoder::PixelFormat::RGB24 => pixels,
-        jpeg_decoder::PixelFormat::L8 => {
-            let count = pixel_count.min(pixels.len());
-            let mut out = Vec::with_capacity(count.saturating_mul(3));
-            for &g in pixels.iter().take(count) {
-                out.extend_from_slice(&[g, g, g]);
-            }
-            out
-        }
-        jpeg_decoder::PixelFormat::L16 => {
-            let scale = l16_normalization_scale(&pixels, pixel_count);
-            let count = pixel_count.min(pixels.len() / 2);
-            let mut out = Vec::with_capacity(count.saturating_mul(3));
-            for p in pixels.chunks_exact(2).take(count) {
-                let v = f64::from(u16::from_ne_bytes([p[0], p[1]]));
-                let byte = (v * scale).round().clamp(0.0, 255.0) as u8;
-                out.extend_from_slice(&[byte, byte, byte]);
-            }
-            out
-        }
-        jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_rgb8(&pixels, pixel_count),
-    }
-}
-
 fn clamp_u16(v: u32) -> u16 {
     v.min(u32::from(u16::MAX)) as u16
 }
@@ -376,21 +299,8 @@ fn jpeg_level_peak_bytes(inputs: JpegPeakInputs) -> u64 {
     let (full_w, full_h) = inputs.full;
     let (dw, dh) = inputs.decoded;
     let (lw, lh) = inputs.level;
-    let channels = inputs.channels;
-    let coding_process = inputs.coding_process;
-    let full_pixels = u64::from(full_w).saturating_mul(u64::from(full_h));
-    // Progressive JPEGs allocate full-resolution `i16` DCT coefficient buffers
-    // (~2 B/px/component) before IDCT scaling; lossless JPEGs allocate two
-    // full-resolution `u16` buffers (~4 B/px/component) and ignore `scale()`.
-    let codec_working = match coding_process {
-        jpeg_decoder::CodingProcess::DctProgressive => full_pixels
-            .saturating_mul(channels as u64)
-            .saturating_mul(2),
-        jpeg_decoder::CodingProcess::Lossless => full_pixels
-            .saturating_mul(channels as u64)
-            .saturating_mul(4),
-        jpeg_decoder::CodingProcess::DctSequential => 0,
-    };
+    let codec_working =
+        jpeg_codec_working_bytes(full_w, full_h, inputs.channels, inputs.coding_process);
     let raw_decoded = u64::from(dw)
         .saturating_mul(u64::from(dh))
         .saturating_mul(4);

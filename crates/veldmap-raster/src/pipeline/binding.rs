@@ -7,19 +7,6 @@ use crate::RasterError;
 
 use super::metadata::{PlacementCrs, RasterDescription};
 
-fn geographic_frame_from_grid(grid: TieGrid, geographic_crs: Option<&CrsSpec>) -> Frame {
-    match geographic_crs {
-        Some(CrsSpec::Geographic {
-            datum,
-            label,
-            warning,
-        }) => Frame::from_grid_with_datum(grid, *datum, label.clone())
-            .with_datum_warning(warning.clone()),
-        Some(CrsSpec::GeographicProj(proj)) => Frame::from_grid_with_proj(grid, proj.clone()),
-        Some(CrsSpec::Projected(_)) | None => Frame::from_grid(grid),
-    }
-}
-
 /// Derive a [`veldmap_core::geo::Frame`] georeference binding from a parsed
 /// [`RasterDescription`].
 ///
@@ -56,7 +43,7 @@ pub fn frame_from_description_with_override(
         })
         .collect();
     let grid = TieGrid::new(&ties);
-    let bind_grid = |g: TieGrid| geographic_frame_from_grid(g, desc.geographic_crs.as_ref());
+    let bind_grid = |g: TieGrid| Frame::from_grid_with_crs(g, desc.geographic_crs.as_ref());
 
     if let Some(crs) = crs_override {
         if let Some(ref placement) = desc.placement {
@@ -69,14 +56,13 @@ pub fn frame_from_description_with_override(
                 });
         }
         if let Some(g) = grid {
-            return match crs {
-                CrsSpec::Geographic { .. } | CrsSpec::GeographicProj(_) => {
-                    Ok(geographic_frame_from_grid(g, Some(crs)))
-                }
-                CrsSpec::Projected(_) => Err(RasterError::Binding(format!(
+            return if crs.is_geographic() {
+                Ok(Frame::from_grid_with_crs(g, Some(crs)))
+            } else {
+                Err(RasterError::Binding(format!(
                     "cannot apply projected CRS '{}' to a geographic tie-grid raster without a projected affine transform",
                     crs.label()
-                ))),
+                )))
             };
         }
     }

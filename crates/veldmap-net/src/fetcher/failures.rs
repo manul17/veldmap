@@ -9,6 +9,16 @@ use veldmap_core::tile::{SourceId, TileKey};
 /// unbounded memory growth on sparse 404/204 layers over long sessions.
 pub(super) const MAX_FAILURE_ENTRIES: usize = 4096;
 
+/// Returns `true` when `key` is currently requested in `wanted` or is a pinned
+/// coarsest root tile of `active_source`.
+pub(super) fn is_wanted_or_root(
+    wanted: &HashSet<TileKey>,
+    key: &TileKey,
+    active_source: SourceId,
+) -> bool {
+    wanted.contains(key) || key.is_root_of(active_source)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FailureMarker {
     Terminal,
@@ -122,7 +132,7 @@ impl FailureTracker {
         self.backoffs
             .iter()
             .filter_map(|(k, entry)| {
-                (entry.until > now && (last_wanted.contains(k) || k.is_root_of(active_source)))
+                (entry.until > now && is_wanted_or_root(last_wanted, k, active_source))
                     .then_some(entry.until)
             })
             .min()

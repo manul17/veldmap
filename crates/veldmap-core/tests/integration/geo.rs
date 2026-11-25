@@ -2,7 +2,8 @@
 
 use glam::DVec3;
 use veldmap_core::geo::{
-    Ball, Camera, GeoPoint, Geodetic, MIN_HEIGHT_M, Ring, SEMI_MAJOR_M, WGS84, covers_rings,
+    Ball, Camera, GeoPoint, Geodetic, MIN_HEIGHT_M, Polygon, Ring, SEMI_MAJOR_M, WGS84,
+    covers_polygon,
 };
 
 fn surface_world(lat: f64, lon: f64) -> DVec3 {
@@ -90,14 +91,14 @@ fn oblate_horizon_plane_separates_near_limb_points_at_mid_latitude() {
 }
 
 #[test]
-fn footprint_covers_geodesic_ring_cleanly() {
+fn footprint_covers_geodesic_polygon_cleanly() {
     let coords = [(72.0, 10.0), (72.0, 30.0), (73.0, 30.0), (73.0, 10.0)];
     let points: Vec<GeoPoint> = coords
         .iter()
         .map(|&(lat, lon)| GeoPoint::new(lat, lon))
         .collect();
-    let rings = [Ring { points }];
+    let poly = Polygon::new(Ring { points });
 
-    assert!(covers_rings(&rings, 72.5, 20.0));
-    assert!(!covers_rings(&rings, 73.1, 20.0));
+    assert!(covers_polygon(&poly, 72.5, 20.0));
+    assert!(!covers_polygon(&poly, 73.1, 20.0));
 }

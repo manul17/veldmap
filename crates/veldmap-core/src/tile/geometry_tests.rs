@@ -15,14 +15,14 @@ fn mercator_y_bounds_and_lat_conversion_cover_web_mercator_extent() {
 }
 
 #[test]
-fn lat_lon_bounds_handles_polar_clamping_cap_exclusion_and_out_of_range() {
+fn geodetic_tile_bounds_handles_polar_clamping_cap_exclusion_and_out_of_range() {
     let geo0 = QuadTileId {
         scheme: PlanetaryScheme::Geodetic,
         level: 0,
         x: 0,
         y: 0,
     };
-    let b = lat_lon_bounds(geo0).expect("geodetic z=0 valid");
+    let b = geodetic_tile_bounds(geo0).expect("geodetic z=0 valid");
     assert_eq!(b.lon_west_deg, -180.0);
     assert_eq!(b.lon_east_deg, 0.0);
     assert_eq!(b.raw_lat_north_deg, 90.0);
@@ -36,10 +36,19 @@ fn lat_lon_bounds_handles_polar_clamping_cap_exclusion_and_out_of_range() {
         x: 0,
         y: 0,
     };
-    assert!(lat_lon_bounds(inside_cap).is_none());
+    assert!(geodetic_tile_bounds(inside_cap).is_none());
 
     assert!(
-        lat_lon_bounds(QuadTileId {
+        geodetic_tile_bounds(QuadTileId {
+            scheme: PlanetaryScheme::Geodetic,
+            level: 0,
+            x: 2,
+            y: 0,
+        })
+        .is_none()
+    );
+    assert!(
+        geodetic_tile_bounds(QuadTileId {
             scheme: PlanetaryScheme::PolarCap { north: true },
             level: 0,
             x: 0,
@@ -48,10 +57,10 @@ fn lat_lon_bounds_handles_polar_clamping_cap_exclusion_and_out_of_range() {
         .is_none()
     );
     assert!(
-        lat_lon_bounds(QuadTileId {
+        geodetic_tile_bounds(QuadTileId {
             scheme: PlanetaryScheme::WebMercator,
             level: 0,
-            x: 1,
+            x: 0,
             y: 0,
         })
         .is_none()

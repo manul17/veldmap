@@ -1,5 +1,5 @@
 //! High-level [`OverlayManager`] facade coordinating [`LayerStack`],
-//! [`OverlayRuntime`], [`CursorProber`], and [`OverlayIoWorker`].
+//! [`OverlayRuntime`], [`CursorProber`], and the overlay I/O worker.
 //!
 //! Returns [`OverlayMutation`] records rather than mutating `GpuTileCache` /
 //! `PendingUploads` directly, matching `BasemapManager`'s clean boundary with
@@ -20,15 +20,19 @@ use veldmap_storage::TileDiskCache;
 use crate::clamp_opacity;
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSender};
 use crate::render::DrawOverlayLayer;
+use crate::worker::SingleThreadWorker;
 
 use super::cursor::CursorProber;
 use super::frame::{LayerFrameCtx, build_and_schedule_layer};
-use super::io_worker::{OverlayIoCmd, OverlayIoResult, OverlayIoWorker, ReloadedPayload};
+use super::io_worker::{
+    OverlayIoCmd, OverlayIoResult, ReloadRequest, ReloadedPayload, spawn_overlay_io_worker,
+};
 use super::opener::{OpenRasterError, bind_frame_with_override};
 use super::runtime::OverlayRuntime;
-use super::stack::{LayerInitOptions, LayerStack, OverlayLayer};
+use super::stack::{LayerStack, OverlayLayer};
 use super::{
-    CrsOverride, CursorReadout, LayerId, LayerSummary, OverlayIoEvent, OverlayPersistEntry,
+    CrsOverride, CursorReadout, LayerId, LayerInitOptions, LayerSummary, OverlayIoEvent,
+    OverlayPersistEntry,
 };
 
 fn alloc_seq(counter: &mut u64) -> u64 {
@@ -54,19 +58,20 @@ pub(crate) struct OverlayFrameCtx<'a> {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OverlayMutation {
     pub(crate) changed: bool,
+    pub(crate) topology_changed: bool,
     pub(crate) purge_sources: Vec<SourceId>,
 }
 
-/// Coordinates local raster overlays: non-blocking open/reload via
-/// [`OverlayIoWorker`], `PassKey`-scoped two-lane scheduling, lossless QOI
-/// disk caching, and zoom-invariant CPU cursor readouts.
+/// Coordinates local raster overlays: non-blocking open/reload via the overlay
+/// I/O worker, `StreamKey`-scoped two-lane scheduling, lossless QOI disk
+/// caching, and zoom-invariant CPU cursor readouts.
 pub(crate) struct OverlayManager {
     stack: LayerStack,
     next_layer_id: u64,
     next_relaid: u64,
     runtime: Arc<OverlayRuntime>,
     cursor: CursorProber,
-    io_worker: OverlayIoWorker,
+    io_worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
 }
 
 impl OverlayManager {
@@ -82,7 +87,7 @@ impl OverlayManager {
         let runtime = Arc::new(OverlayRuntime::new(
             budget, disk_cache, fast_pool, bulk_pool, done_tx, wakeup, shutdown,
         ));
-        let io_worker = OverlayIoWorker::spawn(Arc::clone(&runtime));
+        let io_worker = spawn_overlay_io_worker(Arc::clone(&runtime));
         Self {
             stack: LayerStack::default(),
             next_layer_id: 1,
@@ -117,7 +122,11 @@ impl OverlayManager {
     /// Return immutable UI summaries of all loaded overlay layers.
     pub(crate) fn layer_summaries(&self) -> Vec<LayerSummary> {
         let layers = self.stack.layers();
-        let stats = self.runtime.layer_flight_stats(layers);
+        let stats = self.runtime.layer_flight_stats(
+            layers
+                .iter()
+                .map(|l| (l.source_id(), l.meta().stream_key())),
+        );
         let len = layers.len();
         layers
             .iter()
@@ -145,7 +154,7 @@ impl OverlayManager {
         self.stack.layers().iter().map(OverlayLayer::persist_entry)
     }
 
-    /// Queue a non-blocking local raster open onto [`OverlayIoWorker`].
+    /// Queue a non-blocking local raster open onto the overlay I/O worker.
     #[cfg(test)]
     fn begin_open_file(&self, path: &Path, fly_to: bool) -> Result<(), String> {
         self.begin_open_file_with_options(path, fly_to, true, 1.0, None)
@@ -177,26 +186,37 @@ impl OverlayManager {
         }
     }
 
-    /// Queue a non-blocking reload of `id` onto [`OverlayIoWorker`], cancelling
-    /// active tile jobs for `old_src` immediately so stale tiles cannot race
-    /// the reload, while preserving the layer if reopen fails.
+    /// Queue a non-blocking reload of `id` onto the overlay I/O worker,
+    /// cancelling active tile jobs for `old_src` immediately so stale tiles
+    /// cannot race the reload, while preserving the layer if reopen fails.
     pub(crate) fn begin_reload_bypass_cache(
         &mut self,
         id: LayerId,
     ) -> Result<OverlayMutation, String> {
-        let (request, old_src, prev_cancel) = {
+        let cancel = self.runtime.shutdown.child_token();
+        let (request, prep) = {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
             };
-            layer.begin_reload(self.runtime.shutdown.child_token())
+            let prep = layer.begin_reload(cancel.clone());
+            let request = ReloadRequest {
+                id,
+                reload_seq: prep.reload_seq,
+                crs_override_epoch: layer.crs_override_epoch(),
+                path: layer.path().to_path_buf(),
+                old_fingerprint_hex: layer.fingerprint_hex().to_owned(),
+                crs_override: layer.crs_override().cloned(),
+                cancel,
+            };
+            (request, prep)
         };
-        if let Some(prev) = prev_cancel {
+        if let Some(prev) = prep.old_cancel {
             prev.cancel();
         }
 
-        // Cancel in-flight jobs and clear runtime caches for `old_src` immediately
+        // Cancel in-flight jobs and clear runtime caches for `old_source` immediately
         // so no worker can write stale pixels while reload runs.
-        self.purge_source(old_src);
+        self.purge_source(prep.old_source);
 
         if !self.io_worker.send(OverlayIoCmd::Reload(request)) {
             if let Some(layer) = self.stack.get_mut(id) {
@@ -208,12 +228,13 @@ impl OverlayManager {
 
         Ok(OverlayMutation {
             changed: true,
-            purge_sources: vec![old_src],
+            topology_changed: true,
+            purge_sources: vec![prep.old_source],
         })
     }
 
-    /// Drain completed background raster open/reload operations from
-    /// [`OverlayIoWorker`].
+    /// Drain completed background raster open/reload operations from the
+    /// overlay I/O worker.
     pub(crate) fn poll_io_events(&mut self) -> (Vec<OverlayIoEvent>, OverlayMutation) {
         let mut events = Vec::new();
         let mut mutation = OverlayMutation::default();
@@ -260,6 +281,7 @@ impl OverlayManager {
                 let bounds = layer.footprint();
                 self.stack.push(layer);
                 mutation.changed = true;
+                mutation.topology_changed = true;
                 events.push(OverlayIoEvent::Opened {
                     id,
                     path: event_path,
@@ -309,6 +331,7 @@ impl OverlayManager {
                             Err(error) => {
                                 slot.fail_reload(error.clone());
                                 mutation.changed = true;
+                                mutation.topology_changed = true;
                                 events.push(OverlayIoEvent::Failed {
                                     path,
                                     error,
@@ -328,6 +351,7 @@ impl OverlayManager {
                     // Reload failed: leave the existing layer intact and
                     // resume normal rendering on the next frame.
                     mutation.changed = true;
+                    mutation.topology_changed = true;
                     events.push(OverlayIoEvent::Failed {
                         path,
                         error: err.message,
@@ -347,6 +371,7 @@ impl OverlayManager {
             mutation.purge_sources.push(new_src);
         }
         mutation.changed = true;
+        mutation.topology_changed = true;
         events.push(OverlayIoEvent::Reloaded { id });
     }
 
@@ -390,6 +415,7 @@ impl OverlayManager {
         let src = removed.source_id();
         let mut mutation = OverlayMutation {
             changed: true,
+            topology_changed: true,
             purge_sources: Vec::new(),
         };
         if self.stack.count_sharing_source(src) == 0 {
@@ -401,20 +427,24 @@ impl OverlayManager {
         mutation
     }
 
-    pub(crate) fn set_visible(&mut self, id: LayerId, visible: bool) -> bool {
+    pub(crate) fn set_visible(&mut self, id: LayerId, visible: bool) -> OverlayMutation {
         let src = {
             let Some(layer) = self.stack.get_mut(id) else {
-                return false;
+                return OverlayMutation::default();
             };
             if !layer.set_visible(visible) {
-                return false;
+                return OverlayMutation::default();
             }
             layer.source_id()
         };
         if !visible && !self.stack.has_visible_source(src) {
             self.purge_source(src);
         }
-        true
+        OverlayMutation {
+            changed: true,
+            topology_changed: true,
+            purge_sources: Vec::new(),
+        }
     }
 
     pub(crate) fn set_opacity(&mut self, id: LayerId, opacity: f32) -> bool {
@@ -449,8 +479,15 @@ impl OverlayManager {
     /// cache state (called when `SceneState::reconcile_providers` runs outside a
     /// full snapshot rebuild).
     pub(crate) fn reconcile(&self, gpu_cache: &GpuTileCache, pending: &PendingUploads) {
-        self.runtime
-            .reconcile_pointwise_layers(self.stack.layers(), gpu_cache, pending);
+        self.runtime.reconcile_pointwise_streams(
+            self.stack
+                .layers()
+                .iter()
+                .filter(|l| l.is_active())
+                .map(|l| (l.meta().stream_key(), l.wanted())),
+            gpu_cache,
+            pending,
+        );
     }
 
     /// Build immutable [`DrawOverlayLayer`]s for the current frame, update
@@ -505,7 +542,7 @@ impl OverlayManager {
         self.io_worker.close_channel();
     }
 
-    /// Phase 3 shutdown: deterministically join [`OverlayIoWorker`].
+    /// Phase 3 shutdown: deterministically join the overlay I/O worker.
     pub(crate) fn finish_shutdown(&mut self) {
         self.io_worker.join();
     }

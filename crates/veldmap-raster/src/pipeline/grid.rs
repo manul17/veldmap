@@ -45,7 +45,6 @@ pub(crate) struct Overview {
 /// Chunk layout of a raster source (base image + overviews).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Grid {
-    pub(crate) tiled: bool,
     pub(crate) chunk: (u32, u32),
     pub(crate) overviews: Vec<Overview>,
     /// Bytes per pixel in raw encoded samples (`channels * sample_bytes`).
@@ -301,7 +300,6 @@ mod tests {
     fn source_for_and_region_of_align_npot_base_ceil_and_gdal_floor_overviews() {
         // Narrow 1x2048 raster: overview (1, 1024) has equal width to base, must still be picked.
         let narrow = Grid {
-            tiled: true,
             chunk: (1, 512),
             overviews: vec![Overview {
                 image: 1,
@@ -342,7 +340,6 @@ mod tests {
         budget.decoded_chunk_cache_bytes = 64 * 1024 * 1024;
         budget.decode_working_bytes = 32 * 1024 * 1024;
         let g = Grid {
-            tiled: true,
             chunk: (256, 256),
             overviews: Vec::new(),
             depth: 4,

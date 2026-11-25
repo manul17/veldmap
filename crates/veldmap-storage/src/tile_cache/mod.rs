@@ -22,4 +22,4 @@ mod touches;
 #[cfg(test)]
 pub(crate) use self::key::valid_source_key;
 pub use self::key::{DiskTileKey, TileBlobEncoding};
-pub use self::store::{DiskCacheStats, DiskTileEntry, MAX_CACHED_TILE_BYTES, TileDiskCache};
+pub use self::store::{DiskCacheStats, DiskTileEntry, TileDiskCache};

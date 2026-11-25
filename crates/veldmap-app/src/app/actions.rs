@@ -3,8 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-use veldmap_core::geo::FootprintBounds;
-
 use crate::layers::CrsOverride;
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::storage::session::{CameraBookmark, SavedCameraPose};
@@ -17,14 +15,9 @@ use crate::ui::toolbar::ToolbarAction;
 use crate::vectors::is_geojson_path;
 
 use super::VeldmapApp;
-use super::dialogs::FileDialogEvent;
+use super::dialogs::{DialogSpawnError, FileDialogEvent};
 
 impl VeldmapApp {
-    pub(super) fn focus_footprint(&mut self, bounds: FootprintBounds) {
-        self.camera
-            .focus(bounds.lat, bounds.lon, bounds.radius_deg.max(0.000_2));
-    }
-
     /// Open a user-initiated batch of local paths (drag-and-drop, native file
     /// dialog, CLI args, or path prompt), clearing previous layer errors once
     /// per batch so multi-file errors are preserved together.
@@ -44,24 +37,27 @@ impl VeldmapApp {
 
     fn open_local_path(&mut self, path: &Path, fly_to: bool, crs_override: Option<CrsOverride>) {
         if is_geojson_path(path) {
-            if let Err(err) = self.scene.begin_open_vector_file(path, fly_to, true, 1.0) {
+            if let Err(err) = self.scene.vectors().begin_open(path, fly_to, true, 1.0) {
                 tracing::warn!(path = %path.display(), error = %err, "Failed to queue GeoJSON open");
                 self.panels.layers.push_error(err);
             }
             return;
         }
 
-        if let Err(err) =
-            self.scene
-                .begin_open_overlay_file_with_options(path, fly_to, true, 1.0, crs_override)
-        {
+        if let Err(err) = self.scene.overlays().begin_open_file_with_options(
+            path,
+            fly_to,
+            true,
+            1.0,
+            crs_override,
+        ) {
             tracing::warn!(path = %path.display(), error = %err, "Failed to queue overlay open");
             self.panels.layers.push_error(err);
         }
     }
 
-    pub(super) fn trigger_native_open_dialog(&mut self, frame: &eframe::Frame) {
-        if !self.dialogs.spawn_open_files(frame) && !self.dialogs.is_busy() {
+    fn trigger_native_open_dialog(&mut self, frame: &eframe::Frame) {
+        if let Err(DialogSpawnError::SpawnFailed) = self.dialogs.spawn_open_files(frame) {
             // Fallback to inline path prompt if spawning the dialog thread failed.
             self.panels.layers.show_open_prompt();
         }
@@ -350,14 +346,15 @@ impl VeldmapApp {
             }
             MeasureAction::ExportGeoJson => {
                 if let Some(payload) = self.scene.measure().export_geojson_string()
-                    && !self
-                        .dialogs
-                        .spawn_save_geojson("measurement.geojson", payload, frame)
+                    && let Err(err) =
+                        self.dialogs
+                            .spawn_save_geojson("measurement.geojson", payload, frame)
                 {
-                    let msg = if self.dialogs.is_busy() {
-                        "Another file dialog is already open."
-                    } else {
-                        "Unable to open native save dialog on this system."
+                    let msg = match err {
+                        DialogSpawnError::Busy => "Another file dialog is already open.",
+                        DialogSpawnError::SpawnFailed => {
+                            "Unable to open native save dialog on this system."
+                        }
                     };
                     self.panels.measure.set_notice(msg.to_owned());
                 }

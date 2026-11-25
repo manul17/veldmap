@@ -113,6 +113,18 @@ fn collect_geometry_points(geom: &GeoJsonGeometry, out: &mut Vec<GeoPoint>) {
     }
 }
 
+fn extract_feature_name(props: &Map<String, Value>) -> Option<String> {
+    for key in ["name", "NAME", "Name", "title", "id", "label"] {
+        if let Some(s) = props.get(key).and_then(Value::as_str) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[path = "geojson_tests.rs"]
 mod tests;

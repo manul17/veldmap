@@ -28,6 +28,13 @@ pub(super) enum FileDialogEvent {
     },
 }
 
+/// Error returned when a native file dialog cannot be spawned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DialogSpawnError {
+    Busy,
+    SpawnFailed,
+}
+
 struct BusyResetGuard {
     busy: Arc<AtomicBool>,
     wakeup: Wakeup,
@@ -60,11 +67,7 @@ impl DialogHost {
         }
     }
 
-    pub(super) fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::Acquire)
-    }
-
-    fn spawn_dialog_future<F>(&self, thread_name: &str, fut: F) -> bool
+    fn spawn_dialog_future<F>(&self, thread_name: &str, fut: F) -> Result<(), DialogSpawnError>
     where
         F: Future<Output = Option<FileDialogEvent>> + Send + 'static,
     {
@@ -81,9 +84,9 @@ impl DialogHost {
             });
         if spawned.is_err() {
             self.busy.store(false, Ordering::Release);
-            return false;
+            return Err(DialogSpawnError::SpawnFailed);
         }
-        true
+        Ok(())
     }
 
     fn try_acquire_busy(&self) -> bool {
@@ -94,9 +97,9 @@ impl DialogHost {
 
     /// Spawn a non-blocking native multi-file open dialog for GeoTIFF, PNG,
     /// JPEG, and GeoJSON files, parented to `frame`.
-    pub(super) fn spawn_open_files(&self, frame: &eframe::Frame) -> bool {
+    pub(super) fn spawn_open_files(&self, frame: &eframe::Frame) -> Result<(), DialogSpawnError> {
         if !self.try_acquire_busy() {
-            return false;
+            return Err(DialogSpawnError::Busy);
         }
         // Construct the future on the UI thread so macOS begins a non-blocking
         // sheet on AppKit's main thread; Windows/Linux return a lazy future.
@@ -126,9 +129,9 @@ impl DialogHost {
         default_name: &str,
         geojson_payload: String,
         frame: &eframe::Frame,
-    ) -> bool {
+    ) -> Result<(), DialogSpawnError> {
         if !self.try_acquire_busy() {
-            return false;
+            return Err(DialogSpawnError::Busy);
         }
         let fut = rfd::AsyncFileDialog::new()
             .set_parent(frame)

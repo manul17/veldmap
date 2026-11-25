@@ -3,8 +3,8 @@
 //!
 //! Coordinates progressive coarsest-to-target tile fetching across both
 //! concurrent pointwise reads and single-active sequential passes per
-//! [`PassKey`] (`source`, `band`, `format`, `gutter`):
-//! - Only 1 active sequential pass per `PassKey` is allowed for
+//! [`StreamKey`] (`source`, `band`, `format`, `gutter`):
+//! - Only 1 active sequential pass per `StreamKey` is allowed for
 //!   `ServeMode::Pass` (so multi-band files sharing one `SourceId` schedule
 //!   independently per band).
 //! - `ServeMode::Pointwise` levels run concurrently with versioned
@@ -21,9 +21,9 @@
 use std::collections::{HashMap, HashSet};
 
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{SourceId, TileKey};
+use veldmap_core::tile::{SourceId, StreamKey, TileKey};
 
-use super::plan::{PassKey, PyramidMeta, ServeMode};
+use super::plan::{PyramidMeta, ServeMode};
 
 /// Pointwise tile admitted by [`TileScheduler::admit_pointwise`] with its
 /// versioned `job_id` and per-job [`CancelToken`].
@@ -39,7 +39,7 @@ pub struct AdmittedTile {
 /// missing `tiles`.
 #[derive(Clone, Debug)]
 pub struct AdmittedPass {
-    pub key: PassKey,
+    pub key: StreamKey,
     pub pass_id: u64,
     pub cancel: CancelToken,
     pub tiles: Vec<TileKey>,
@@ -117,12 +117,12 @@ impl TileFailureMap {
         self.states.insert(key, next);
     }
 
-    /// Forgive tiles of `pass_key` that only failed once in a prior broken pass
+    /// Forgive tiles of `stream_key` that only failed once in a prior broken pass
     /// (demoting them to `RetriedOnce` so a subsequent healthy pass allows one
     /// retry while a second failure becomes permanent).
-    fn forgive_single_pass(&mut self, pass_key: PassKey) {
+    fn forgive_single_pass(&mut self, stream_key: StreamKey) {
         for (key, state) in &mut self.states {
-            if key.stream_key() == pass_key && *state == FailureState::TransientPassSuppressed {
+            if key.stream_key() == stream_key && *state == FailureState::TransientPassSuppressed {
                 *state = FailureState::RetriedOnce;
             }
         }
@@ -151,12 +151,12 @@ struct ActivePass {
 }
 
 /// Coordinates concurrent pointwise tile requests, single-active sequential
-/// passes per [`PassKey`], non-cancellation of coarser passes, and
+/// passes per [`StreamKey`], non-cancellation of coarser passes, and
 /// terminal-failure suppression.
 pub struct TileScheduler {
     next_job_id: u64,
     next_pass_id: u64,
-    active_passes: HashMap<PassKey, ActivePass>,
+    active_passes: HashMap<StreamKey, ActivePass>,
     in_flight: HashMap<TileKey, FlightEntry>,
     failures: TileFailureMap,
 }
@@ -180,7 +180,7 @@ impl TileScheduler {
     }
 
     /// Return whether `key` currently has an active `ServeMode::Pass`.
-    pub fn has_active_pass(&self, key: PassKey) -> bool {
+    pub fn has_active_pass(&self, key: StreamKey) -> bool {
         self.active_passes.contains_key(&key)
     }
 
@@ -284,14 +284,14 @@ impl TileScheduler {
     /// Remove and collect [`CancelToken`]s for in-flight **pointwise** jobs of
     /// `stream_key` that are no longer in `wanted` or are already cached.
     ///
-    /// Scoped strictly to `stream_key` (`PassKey`: `source`, `band`, `format`,
+    /// Scoped strictly to `stream_key` (`StreamKey`: `source`, `band`, `format`,
     /// `gutter`) so multi-band datasets sharing a single [`SourceId`] never
     /// cancel sibling bands' pointwise jobs. Never touches `ServeMode::Pass`
     /// flight entries. Callers should invoke `token.cancel()` on every returned
     /// token after releasing any lock around `TileScheduler`.
     pub fn reconcile_pointwise(
         &mut self,
-        stream_key: PassKey,
+        stream_key: StreamKey,
         wanted: &HashSet<TileKey>,
         is_cached: impl Fn(&TileKey) -> bool,
     ) -> Vec<CancelToken> {
@@ -316,11 +316,11 @@ impl TileScheduler {
     }
 
     /// Atomically filter missing `ServeMode::Pass` candidates at `level` and
-    /// begin the single active sequential pass for `meta.pass_key()`,
+    /// begin the single active sequential pass for `meta.stream_key()`,
     /// deriving a child [`CancelToken`] from `parent_cancel`.
     ///
     /// Returns `None` if `level` does not exist, does not fit, is not
-    /// `ServeMode::Pass`, a pass is already active for `meta.pass_key()`, or
+    /// `ServeMode::Pass`, a pass is already active for `meta.stream_key()`, or
     /// every candidate is already cached, in-flight, or permanently suppressed.
     /// Permits first-time pass-failed tiles to trigger a recovery pass so
     /// pass-only sources never permanently starve.
@@ -336,7 +336,7 @@ impl TileScheduler {
         let ServeMode::Pass { from: pass_from } = plan.serve else {
             return None;
         };
-        let key = meta.pass_key();
+        let key = meta.stream_key();
         if !plan.fits || self.has_active_pass(key) {
             return None;
         }
@@ -369,7 +369,7 @@ impl TileScheduler {
         })
     }
 
-    fn take_active_pass(&mut self, key: PassKey, pass_id: u64) -> Option<ActivePass> {
+    fn take_active_pass(&mut self, key: StreamKey, pass_id: u64) -> Option<ActivePass> {
         let matches = self
             .active_passes
             .get(&key)
@@ -408,7 +408,7 @@ impl TileScheduler {
     /// caller can invoke `cancel()` outside any scheduler lock.
     pub fn update_target(
         &mut self,
-        key: PassKey,
+        key: StreamKey,
         target_level: u8,
         target_pass_from: Option<u8>,
     ) -> Option<CancelToken> {
@@ -428,7 +428,7 @@ impl TileScheduler {
     /// remaining in-flight keys; when `succeeded` is `false`, marks undelivered
     /// keys as transiently failed until a healthy pass forgives first-time
     /// failures (second failure becomes permanent).
-    pub fn finish_pass(&mut self, key: PassKey, pass_id: u64, succeeded: bool) -> bool {
+    pub fn finish_pass(&mut self, key: StreamKey, pass_id: u64, succeeded: bool) -> bool {
         let Some(pass) = self.take_active_pass(key, pass_id) else {
             return false;
         };
@@ -465,7 +465,7 @@ impl TileScheduler {
     ///
     /// Returns `Some(cancel_token)` iff `(key, pass_id)` matched the active
     /// pass so the caller can invoke `cancel()` outside any scheduler lock.
-    pub fn abort_pass(&mut self, key: PassKey, pass_id: u64) -> Option<CancelToken> {
+    pub fn abort_pass(&mut self, key: StreamKey, pass_id: u64) -> Option<CancelToken> {
         let pass = self.take_active_pass(key, pass_id)?;
         Some(self.teardown_pass(pass))
     }
@@ -482,12 +482,17 @@ impl TileScheduler {
     }
 
     /// Record successful arrival of `key` emitted by active pass
-    /// `(pass_key, pass_id)`, clearing its in-flight and failure flags only
+    /// `(stream_key, pass_id)`, clearing its in-flight and failure flags only
     /// while that pass remains active.
-    pub fn on_pass_tile_arrived(&mut self, pass_key: PassKey, pass_id: u64, key: &TileKey) -> bool {
+    pub fn on_pass_tile_arrived(
+        &mut self,
+        stream_key: StreamKey,
+        pass_id: u64,
+        key: &TileKey,
+    ) -> bool {
         let active = self
             .active_passes
-            .get(&pass_key)
+            .get(&stream_key)
             .is_some_and(|p| p.pass_id == pass_id);
         if !active {
             return false;

@@ -18,20 +18,22 @@ use veldmap_core::tile::TileScheme;
 mod adapters;
 mod color;
 mod display;
+mod image_codec;
 mod pipeline;
 mod pool;
 mod sidecar;
 mod tiff;
 
-pub use adapters::{JpegSource, PngSource, has_jpeg_magic, has_png_magic};
+pub use adapters::{JpegSource, PngSource};
 pub use display::{
     BundledBasemap, BundledBasemapConfig, MAX_QOI_DECODED_BYTES, decode_map_tile_with_mipmaps,
     decode_qoi_rgba8, encode_qoi_rgba8, generate_linear_mipmaps,
 };
+pub use image_codec::{has_jpeg_magic, has_png_magic};
 pub use pipeline::{
     AdmittedPass, AdmittedTile, BandInfo, DecodeContext, GeoPlacement, GeoTie, LevelPlan,
-    MAX_SOURCE_SIDE, PassKey, PlacementCrs, PyramidMeta, RasterDescription, RasterSource,
-    SampleType, ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
+    MAX_SOURCE_SIDE, PlacementCrs, PyramidMeta, RasterDescription, RasterSource, SampleType,
+    ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
     frame_from_description, frame_from_description_with_override,
 };
 pub use pool::{

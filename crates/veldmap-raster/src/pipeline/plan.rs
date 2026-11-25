@@ -1,6 +1,5 @@
-//! Static pyramid serving plans (`ServeMode`, `LevelPlan`, `PassKey`,
-//! `PyramidMeta`) and chunked level-table planning derived from [`Grid`] and
-//! [`MemoryBudget`].
+//! Static pyramid serving plans (`ServeMode`, `LevelPlan`, `PyramidMeta`)
+//! and chunked level-table planning derived from [`Grid`] and [`MemoryBudget`].
 
 use std::collections::HashSet;
 
@@ -69,11 +68,6 @@ pub struct LevelPlan {
     pub fits: bool,
 }
 
-/// Identifies one independent raster pyramid stream (`source`, `band`,
-/// `format`, `gutter`) so multi-band sources sharing a single [`SourceId`]
-/// schedule and forgive sequential passes independently per band.
-pub type PassKey = StreamKey;
-
 /// Scheduler-facing description of one raster pyramid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PyramidMeta {
@@ -85,9 +79,9 @@ pub struct PyramidMeta {
 }
 
 impl PyramidMeta {
-    /// Return the [`PassKey`] identifying this pyramid stream.
-    pub const fn pass_key(&self) -> PassKey {
-        PassKey::new(
+    /// Return the [`StreamKey`] identifying this pyramid stream.
+    pub const fn stream_key(&self) -> StreamKey {
+        StreamKey::new(
             self.source,
             self.spec.band,
             self.spec.format,
@@ -218,7 +212,6 @@ mod tests {
     fn level_table_assigns_pass_when_chunk_exceeds_decoded_chunk_cache_cap() {
         let tiny_budget = MemoryBudget::for_host_ram(1024 * 1024 * 1024);
         let grid = Grid {
-            tiled: false,
             chunk: (8192, 4096), // 33.5M px * 4 B = 134 MB > 64 MiB chunk cache
             overviews: Vec::new(),
             depth: 3,

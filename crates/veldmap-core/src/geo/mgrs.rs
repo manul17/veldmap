@@ -1,25 +1,13 @@
-//! MGRS grid indexing: Sentinel-2 tile codes and general MGRS grid references
-//! mapped to UTM frames and WGS84 coordinates.
+//! MGRS grid reference parsing into WGS84 coordinates for Go-To navigation.
 
 use thiserror::Error;
 
 use super::geodesy::unwind;
 use super::projection::System;
 
-/// Sentinel-2 granule frame in its UTM zone (`y1` is the northern edge).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MgrsGranuleFrame {
-    pub zone: u32,
-    pub south: bool,
-    pub x0: f64,
-    pub y0: f64,
-    pub x1: f64,
-    pub y1: f64,
-}
-
-/// Errors produced when parsing an MGRS tile code or grid reference.
+/// Errors produced when parsing an MGRS grid reference.
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum MgrsError {
+pub(super) enum MgrsError {
     #[error("MGRS code '{0}' has invalid length or format")]
     InvalidFormat(String),
     #[error("MGRS zone in '{0}' is not a valid integer")]
@@ -38,8 +26,6 @@ pub enum MgrsError {
     InvalidDigits(String),
 }
 
-/// Sentinel-2 granule side in metres (10,980 pixels at 10 m).
-const TILE_SIDE_M: f64 = 109_800.0;
 /// Side of an MGRS 100 km square in metres.
 const SQUARE_M: f64 = 100_000.0;
 /// Repetition period of a row letter in metres.
@@ -62,19 +48,6 @@ fn band_bounds_deg(band: usize) -> (f64, f64) {
         BAND_DEG
     };
     (south_edge, south_edge + height)
-}
-
-/// Extract a 5-character MGRS tile code (`_TxxABC_`) from a Sentinel-2 product
-/// name.
-pub fn tile_of(product_name: &str) -> Option<&str> {
-    product_name.split('_').find_map(|part| {
-        let tile = part.strip_prefix('T')?;
-        let bytes = tile.as_bytes();
-        let ok = bytes.len() == 5
-            && bytes[..2].iter().all(u8::is_ascii_digit)
-            && bytes[2..].iter().all(u8::is_ascii_uppercase);
-        ok.then_some(tile)
-    })
 }
 
 struct SquareOrigin {
@@ -219,33 +192,10 @@ fn square_geo_bounds(system: &System, easting: f64, northing: f64) -> (f64, f64,
     (min_lat, max_lat, min_lon, max_lon)
 }
 
-/// Compute the Sentinel-2 109.8 km granule frame in UTM metres for a
-/// 5-character tile code such as `"40WFC"`.
-pub fn frame(tile: &str) -> Result<MgrsGranuleFrame, MgrsError> {
-    let bytes = tile.as_bytes();
-    if !tile.is_ascii() || bytes.len() != 5 {
-        return Err(MgrsError::InvalidFormat(tile.to_owned()));
-    }
-    let zone: u32 = tile[..2]
-        .parse()
-        .map_err(|_| MgrsError::InvalidZoneNumber(tile.to_owned()))?;
-    let origin = square_origin(zone, bytes[2], bytes[3], bytes[4])?;
-
-    let y1 = origin.northing + SQUARE_M;
-    Ok(MgrsGranuleFrame {
-        zone: origin.zone,
-        south: origin.south,
-        x0: origin.easting,
-        y0: y1 - TILE_SIDE_M,
-        x1: origin.easting + TILE_SIDE_M,
-        y1,
-    })
-}
-
 /// Parse an MGRS grid reference (for example `"37UDQ"`, `"T40WFC"`,
 /// `"4Q FJ 12345 67890"`, or `"37UDQ5050"`) into WGS84
 /// `(lat_deg, lon_deg, suggested_radius_deg)` centered on the addressed cell.
-pub fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> {
+pub(super) fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> {
     let trimmed = input.trim();
     if trimmed.is_empty() || !trimmed.is_ascii() {
         return Err(MgrsError::InvalidFormat(input.to_owned()));

@@ -3,6 +3,8 @@
 
 use std::fmt::Write as _;
 
+use crate::url::split_authority_and_userinfo;
+
 /// Percent-encode a secret string into both uppercase and lowercase hex forms
 /// for URL substitution and redaction matching.
 fn percent_encode_variants(secret: &str) -> (String, String) {
@@ -101,22 +103,19 @@ pub(crate) fn sanitize_url_for_display(url: &str) -> String {
     };
 
     let scheme_prefix = &trimmed[..scheme_idx + 3];
-    let rest = &trimmed[scheme_idx + 3..];
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..auth_end];
-    let tail = &rest[auth_end..];
+    let parts = split_authority_and_userinfo(&trimmed[scheme_idx + 3..]);
 
-    let sanitized_authority = match authority.rsplit_once('@') {
-        Some((_, host_port)) => format!("<redacted>@{host_port}"),
-        None => authority.to_owned(),
+    let sanitized_authority = match parts.userinfo {
+        Some(_) => format!("<redacted>@{}", parts.host_port),
+        None => parts.host_port.to_owned(),
     };
 
-    let sanitized_tail = match tail.split_once('?') {
+    let sanitized_tail = match parts.tail.split_once('?') {
         Some((path, query_and_frag)) => match query_and_frag.split_once('#') {
             Some((_, frag)) => format!("{path}?<redacted>#{frag}"),
             None => format!("{path}?<redacted>"),
         },
-        None => tail.to_owned(),
+        None => parts.tail.to_owned(),
     };
 
     format!("{scheme_prefix}{sanitized_authority}{sanitized_tail}")

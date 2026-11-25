@@ -101,36 +101,6 @@ pub(crate) fn average_srgb_rgba8_block(
     out[3] = ((a_sum / count) * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-#[inline]
-fn cmyk_pixel_to_rgb(px: &[u8]) -> [u8; 3] {
-    let kf = 1.0 - f32::from(px[3]) / 255.0;
-    let r = ((255.0 - f32::from(px[0])) * kf).round().clamp(0.0, 255.0) as u8;
-    let g = ((255.0 - f32::from(px[1])) * kf).round().clamp(0.0, 255.0) as u8;
-    let b = ((255.0 - f32::from(px[2])) * kf).round().clamp(0.0, 255.0) as u8;
-    [r, g, b]
-}
-
-/// Convert `jpeg-decoder`'s un-inverted standard `[C, M, Y, K]` bytes (`0` = no
-/// ink / white, `255` = full ink / black) into opaque RGBA8.
-pub(crate) fn cmyk_to_rgba8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pixel_count.saturating_mul(4));
-    for px in cmyk.chunks_exact(4).take(pixel_count) {
-        let [r, g, b] = cmyk_pixel_to_rgb(px);
-        out.extend_from_slice(&[r, g, b, 255]);
-    }
-    out
-}
-
-/// Convert `jpeg-decoder`'s un-inverted standard `[C, M, Y, K]` bytes (`0` = no
-/// ink / white, `255` = full ink / black) into packed RGB8.
-pub(crate) fn cmyk_to_rgb8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pixel_count.saturating_mul(3));
-    for px in cmyk.chunks_exact(4).take(pixel_count) {
-        out.extend_from_slice(&cmyk_pixel_to_rgb(px));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,23 +112,5 @@ mod tests {
         for v in 0..=255u8 {
             assert_eq!(linear_to_srgb_u8(to_lin[usize::from(v)], to_srgb), v);
         }
-    }
-
-    #[test]
-    fn cmyk_conversions_handle_uninverted_standard_cmyk() {
-        // White (0,0,0,0), pure cyan (255,0,0,0), pure black (0,0,0,255), mid-gray (0,0,0,128).
-        let input = [0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 128];
-        let rgba = cmyk_to_rgba8(&input, 4);
-        assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
-        assert_eq!(&rgba[4..8], &[0, 255, 255, 255]);
-        assert_eq!(&rgba[8..12], &[0, 0, 0, 255]);
-        assert_eq!(rgba[12], 127);
-        assert_eq!(rgba[15], 255);
-
-        let rgb = cmyk_to_rgb8(&input, 4);
-        assert_eq!(&rgb[0..3], &[255, 255, 255]);
-        assert_eq!(&rgb[3..6], &[0, 255, 255]);
-        assert_eq!(&rgb[6..9], &[0, 0, 0]);
-        assert_eq!(&rgb[9..12], &[127, 127, 127]);
     }
 }

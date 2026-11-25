@@ -11,19 +11,19 @@ use super::scheme::PlanetaryScheme;
 /// (`tan((90° - 85.05112878°) / 2)`).
 pub const POLAR_R_CAP: f64 = 0.043_213_918_263_772_28;
 
-/// Latitude/longitude bounds and raw texture range for a non-polar tile.
+/// Latitude/longitude bounds and raw texture range for a `Geodetic` tile.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct LatLonTileBounds {
-    pub(crate) lon_west_deg: f64,
-    pub(crate) lon_east_deg: f64,
+pub(super) struct GeodeticTileBounds {
+    pub(super) lon_west_deg: f64,
+    pub(super) lon_east_deg: f64,
     /// Clamped mesh north latitude (`<= WEB_MERCATOR_LIMIT_DEG`).
-    pub(crate) lat_north_deg: f64,
+    pub(super) lat_north_deg: f64,
     /// Clamped mesh south latitude (`>= -WEB_MERCATOR_LIMIT_DEG`).
-    pub(crate) lat_south_deg: f64,
+    pub(super) lat_south_deg: f64,
     /// Unclamped tile north latitude (for exact `Geodetic` texture UV mapping).
-    pub(crate) raw_lat_north_deg: f64,
+    pub(super) raw_lat_north_deg: f64,
     /// Unclamped tile south latitude (for exact `Geodetic` texture UV mapping).
-    pub(crate) raw_lat_south_deg: f64,
+    pub(super) raw_lat_south_deg: f64,
 }
 
 /// Surface sample evaluated at mesh-local fractions `(s, t)` on a planetary tile.
@@ -71,7 +71,7 @@ pub fn polar_cap_uv_bounds(x: u32, y: u32, n: u32) -> (f64, f64, f64, f64) {
 
 /// Linearly interpolate along a 1D interval `[start, end]` at fraction `t`.
 #[inline]
-pub(crate) fn lerp_f64(start: f64, end: f64, t: f64) -> f64 {
+pub(super) fn lerp_f64(start: f64, end: f64, t: f64) -> f64 {
     start + (end - start) * t
 }
 
@@ -85,47 +85,29 @@ pub fn web_mercator_y_bounds(y: u32, rows: u32) -> (f64, f64) {
     (merc_n, merc_s)
 }
 
-/// Compute geographic bounds for a `Geodetic` or `WebMercator` tile, returning
-/// `None` if the tile is a `PolarCap`, out of bounds, or lies entirely inside
-/// the `|lat| >= WEB_MERCATOR_LIMIT_DEG` polar caps.
-pub(crate) fn lat_lon_bounds(id: QuadTileId) -> Option<LatLonTileBounds> {
+/// Compute geographic bounds for a `Geodetic` tile, returning `None` if the
+/// tile is not `Geodetic`, out of bounds, or lies entirely inside the
+/// `|lat| >= WEB_MERCATOR_LIMIT_DEG` polar caps.
+pub(super) fn geodetic_tile_bounds(id: QuadTileId) -> Option<GeodeticTileBounds> {
+    if id.scheme != PlanetaryScheme::Geodetic {
+        return None;
+    }
     let (cols, rows) = id.checked_grid_dims()?;
     let (lon_west_deg, lon_east_deg) = tile_lon_bounds(id.x, cols);
-
-    match id.scheme {
-        PlanetaryScheme::Geodetic => {
-            let (raw_lat_north_deg, raw_lat_south_deg) = geodetic_lat_bounds(id.y, rows);
-            if raw_lat_south_deg >= WEB_MERCATOR_LIMIT_DEG
-                || raw_lat_north_deg <= -WEB_MERCATOR_LIMIT_DEG
-            {
-                return None;
-            }
-            let lat_north_deg = raw_lat_north_deg.min(WEB_MERCATOR_LIMIT_DEG);
-            let lat_south_deg = raw_lat_south_deg.max(-WEB_MERCATOR_LIMIT_DEG);
-            Some(LatLonTileBounds {
-                lon_west_deg,
-                lon_east_deg,
-                lat_north_deg,
-                lat_south_deg,
-                raw_lat_north_deg,
-                raw_lat_south_deg,
-            })
-        }
-        PlanetaryScheme::WebMercator => {
-            let (merc_n, merc_s) = web_mercator_y_bounds(id.y, rows);
-            let lat_north_deg = web_mercator_lat_deg(merc_n);
-            let lat_south_deg = web_mercator_lat_deg(merc_s);
-            Some(LatLonTileBounds {
-                lon_west_deg,
-                lon_east_deg,
-                lat_north_deg,
-                lat_south_deg,
-                raw_lat_north_deg: lat_north_deg,
-                raw_lat_south_deg: lat_south_deg,
-            })
-        }
-        PlanetaryScheme::PolarCap { .. } => None,
+    let (raw_lat_north_deg, raw_lat_south_deg) = geodetic_lat_bounds(id.y, rows);
+    if raw_lat_south_deg >= WEB_MERCATOR_LIMIT_DEG || raw_lat_north_deg <= -WEB_MERCATOR_LIMIT_DEG {
+        return None;
     }
+    let lat_north_deg = raw_lat_north_deg.min(WEB_MERCATOR_LIMIT_DEG);
+    let lat_south_deg = raw_lat_south_deg.max(-WEB_MERCATOR_LIMIT_DEG);
+    Some(GeodeticTileBounds {
+        lon_west_deg,
+        lon_east_deg,
+        lat_north_deg,
+        lat_south_deg,
+        raw_lat_north_deg,
+        raw_lat_south_deg,
+    })
 }
 
 /// Evaluate a point on the adaptive Polar Stereographic cap at normalized cap
@@ -164,7 +146,7 @@ pub fn polar_cap_point(north: bool, u: f64, v: f64) -> (f64, f64, f64, f64) {
 pub fn sample_tile_surface(id: QuadTileId, s: f64, t: f64) -> Option<TileSurfaceSample> {
     match id.scheme {
         PlanetaryScheme::Geodetic => {
-            let b = lat_lon_bounds(id)?;
+            let b = geodetic_tile_bounds(id)?;
             let lon_deg = lerp_f64(b.lon_west_deg, b.lon_east_deg, s);
             let lat_deg = lerp_f64(b.lat_north_deg, b.lat_south_deg, t);
             let raw_span = (b.raw_lat_north_deg - b.raw_lat_south_deg).max(1e-12);

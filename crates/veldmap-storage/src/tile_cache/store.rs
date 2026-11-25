@@ -13,9 +13,8 @@ use crate::StorageError;
 use super::evict::{evict_in_tx, reclaim_space};
 use super::key::{DiskTileKey, EncodedKey, TileBlobEncoding, valid_source_key};
 use super::queries::{
-    clear_all_in_tx, clear_source_in_tx, delete_entry_in_tx, delete_tile_in_tx,
+    TileUpserter, clear_all_in_tx, clear_source_in_tx, delete_entry_in_tx, delete_tile_in_tx,
     flush_touches_in_tx, read_cache_meta_totals, select_tile_blob, set_cache_meta_totals,
-    upsert_tile_raw_in_tx,
 };
 use super::readers::ReaderPool;
 use super::schema::{
@@ -24,7 +23,7 @@ use super::schema::{
 use super::touches::{MonotonicClock, TouchBuffer};
 
 /// Maximum encoded payload size admitted for a single cached tile (`16 MiB`).
-pub const MAX_CACHED_TILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CACHED_TILE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Observable disk cache utilization metrics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -380,23 +379,26 @@ impl TileDiskCache {
             let mut batch_start_ts: Option<i64> = None;
             let mut last_id: Option<i64> = None;
 
-            for item in valid {
-                let new_bytes = item.payload.len() as u64;
-                if new_bytes > max_bytes {
-                    log_skipped_put(item.key, new_bytes, max_bytes);
-                    continue;
+            {
+                let mut upserter = TileUpserter::new(tx)?;
+                for item in valid {
+                    let new_bytes = item.payload.len() as u64;
+                    if new_bytes > max_bytes {
+                        log_skipped_put(item.key, new_bytes, max_bytes);
+                        continue;
+                    }
+                    let ts_ms = self.clock.next_ms();
+                    if is_multi_batch && batch_start_ts.is_none() {
+                        batch_start_ts = Some(ts_ms);
+                    }
+                    let (inserted_id, old_bytes, count_delta) =
+                        upserter.upsert(&item.enc, item.encoding, item.payload, ts_ms)?;
+                    total_bytes = total_bytes
+                        .saturating_sub(old_bytes)
+                        .saturating_add(new_bytes);
+                    tile_count = tile_count.saturating_add(count_delta);
+                    last_id = Some(inserted_id);
                 }
-                let ts_ms = self.clock.next_ms();
-                if is_multi_batch && batch_start_ts.is_none() {
-                    batch_start_ts = Some(ts_ms);
-                }
-                let (inserted_id, old_bytes, count_delta) =
-                    upsert_tile_raw_in_tx(tx, &item.enc, item.encoding, item.payload, ts_ms)?;
-                total_bytes = total_bytes
-                    .saturating_sub(old_bytes)
-                    .saturating_add(new_bytes);
-                tile_count = tile_count.saturating_add(count_delta);
-                last_id = Some(inserted_id);
             }
 
             let Some(last_inserted) = last_id else {

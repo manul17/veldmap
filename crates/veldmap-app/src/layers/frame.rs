@@ -164,7 +164,11 @@ fn update_wanted_and_reconcile(
     }
     layer.replace_wanted(next_wanted);
 
-    runtime.reconcile_pointwise_stream(layer.meta().pass_key(), layer.wanted(), gpu_cache, pending);
+    runtime.reconcile_pointwise_streams(
+        [(layer.meta().stream_key(), layer.wanted())],
+        gpu_cache,
+        pending,
+    );
 }
 
 fn build_draw_patches(

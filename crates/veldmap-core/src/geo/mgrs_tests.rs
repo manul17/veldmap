@@ -31,59 +31,12 @@ fn the_x_band_is_twelve_degrees_wide() {
 }
 
 #[test]
-fn tile_is_read_from_product_name() {
-    assert_eq!(
-        tile_of("S2C_MSIL2A_20260812T081601_N0512_R121_T40WFC_20260812T121315.SAFE"),
-        Some("40WFC")
-    );
-    assert_eq!(
-        tile_of("S1C_IW_GRDH_1SDV_20260810T031955_011C6E_EDC8.SAFE"),
-        None
-    );
-}
-
-#[test]
-fn short_and_odd_segments_are_refused_not_sliced() {
-    assert_eq!(tile_of("LC09_L2SP_02_T1"), None);
-    assert_eq!(tile_of("A_T_B"), None);
-    assert_eq!(tile_of("T"), None);
-    assert_eq!(tile_of("T40W\u{00E9}C"), None);
-    assert_eq!(tile_of("T40wfc"), None);
-}
-
-#[test]
-fn reference_granule_frame_matches_its_xml() {
-    let frame = frame("40WFC").unwrap();
-    assert_eq!((frame.zone, frame.south), (40, false));
-    assert_eq!((frame.x0, frame.y1), (600_000.0, 7_800_000.0));
-    assert_eq!(
-        (frame.x1 - frame.x0, frame.y1 - frame.y0),
-        (109_800.0, 109_800.0)
-    );
-}
-
-#[test]
-fn odd_zone_rows_start_at_a() {
-    let frame = frame("31NAA").unwrap();
-    assert_eq!((frame.x0, frame.y1), (100_000.0, 100_000.0));
-    assert!(!frame.south);
-}
-
-#[test]
-fn southern_band_stays_under_false_northing() {
-    let frame = frame("33HVB").unwrap();
-    assert!(frame.south);
-    assert!(frame.y1 < 10_000_000.0 && frame.y0 > 5_000_000.0);
-}
-
-#[test]
 fn garbage_codes_are_refused() {
-    assert!(frame("40WIC").is_err());
-    assert!(frame("00WFC").is_err());
-    assert!(frame("4WFC").is_err());
-    assert!(frame("40ZFC").is_err());
+    assert!(parse_to_wgs84("40WIC").is_err());
+    assert!(parse_to_wgs84("00WFC").is_err());
+    assert!(parse_to_wgs84("40ZFC").is_err());
     // Non-ASCII 5-byte and multi-byte UTF-8 inputs must error, never panic on char boundaries.
-    assert!(frame("a\u{00E9}bc").is_err());
+    assert!(parse_to_wgs84("a\u{00E9}bc").is_err());
     assert!(parse_to_wgs84("37UD\u{0419}").is_err());
     assert!(parse_to_wgs84("37UD\u{00E9}").is_err());
     // Out-of-band row letter wrapping into the wrong hemisphere, unequal digit halves,

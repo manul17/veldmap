@@ -6,21 +6,18 @@
 //! vector rendering on the smooth WGS84 ellipsoid.
 
 use geographiclib_rs::{
-    DirectGeodesic, Geodesic, GeodesicLine, InverseGeodesic, PolygonArea, Winding,
-    geodesic_capability as caps,
+    Geodesic, GeodesicLine, InverseGeodesic, PolygonArea, Winding, geodesic_capability as caps,
 };
 
 use super::footprint::{GeoPoint, dedup_geo_ring};
 
 /// Result of Karney's inverse geodesic problem between two WGS84 points.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub struct GeodesicInverse {
+struct GeodesicInverse {
     /// Shortest ellipsoidal distance along WGS84 in metres.
-    pub distance_m: f64,
+    distance_m: f64,
     /// Forward azimuth at the starting point in degrees (`[-180, 180]`, clockwise from North).
-    pub azimuth1_deg: f64,
-    /// Forward azimuth at the arrival point in degrees (`[-180, 180]`, clockwise from North).
-    pub azimuth2_deg: f64,
+    azimuth1_deg: f64,
 }
 
 /// Result of geodesic polygon measurement.
@@ -33,7 +30,7 @@ pub struct GeodesicPolygonMeasurement {
 }
 
 /// Shortest ellipsoidal distance between two WGS84 points in metres.
-pub fn geodesic_distance_m(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64) -> f64 {
+fn geodesic_distance_m(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64) -> f64 {
     if !(lat1_deg.is_finite()
         && lon1_deg.is_finite()
         && lat2_deg.is_finite()
@@ -47,14 +44,9 @@ pub fn geodesic_distance_m(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg
 }
 
 /// Solve Karney's inverse geodesic problem on WGS84.
-pub fn geodesic_inverse(
-    lat1_deg: f64,
-    lon1_deg: f64,
-    lat2_deg: f64,
-    lon2_deg: f64,
-) -> GeodesicInverse {
+fn geodesic_inverse(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64) -> GeodesicInverse {
     let g = Geodesic::wgs84();
-    let (distance_m, azimuth1_deg, azimuth2_deg, _arc_deg): (f64, f64, f64, f64) =
+    let (distance_m, azimuth1_deg, _azimuth2_deg, _arc_deg): (f64, f64, f64, f64) =
         g.inverse(lat1_deg, lon1_deg, lat2_deg, lon2_deg);
     GeodesicInverse {
         distance_m: if distance_m.is_finite() {
@@ -67,31 +59,7 @@ pub fn geodesic_inverse(
         } else {
             0.0
         },
-        azimuth2_deg: if azimuth2_deg.is_finite() {
-            azimuth2_deg
-        } else {
-            0.0
-        },
     }
-}
-
-/// Solve Karney's direct geodesic problem on WGS84, returning
-/// `(lat2_deg, lon2_deg, azimuth2_deg)`.
-pub fn geodesic_direct(
-    lat1_deg: f64,
-    lon1_deg: f64,
-    azimuth1_deg: f64,
-    distance_m: f64,
-) -> (f64, f64, f64) {
-    if !(lat1_deg.is_finite()
-        && lon1_deg.is_finite()
-        && azimuth1_deg.is_finite()
-        && distance_m.is_finite())
-    {
-        return (f64::NAN, f64::NAN, f64::NAN);
-    }
-    let g = Geodesic::wgs84();
-    g.direct(lat1_deg, lon1_deg, azimuth1_deg, distance_m)
 }
 
 /// Total WGS84 geodesic length in metres of an open polyline.
@@ -140,7 +108,7 @@ pub fn ring_perimeter_and_area(ring: &[GeoPoint]) -> GeodesicPolygonMeasurement 
 
 /// Signed ellipsoidal area (m²) of a ring with counter-clockwise = positive
 /// (folded into `(-A_earth/2, +A_earth/2]` by `PolygonArea::compute(true)`).
-pub fn ring_signed_area_m2(ring: &[GeoPoint]) -> f64 {
+pub(super) fn ring_signed_area_m2(ring: &[GeoPoint]) -> f64 {
     let pts = dedup_geo_ring(ring);
     if pts.len() < 3 {
         return 0.0;
@@ -153,30 +121,14 @@ pub fn ring_signed_area_m2(ring: &[GeoPoint]) -> f64 {
     }
 }
 
-/// Exact WGS84 ellipsoidal area (m²) and total boundary perimeter (m) of a
-/// polygon with optional interior holes.
-pub fn polygon_with_holes_measurement(
-    exterior: &[GeoPoint],
-    holes: &[Vec<GeoPoint>],
-) -> GeodesicPolygonMeasurement {
-    let outer = ring_perimeter_and_area(exterior);
-    let mut area = outer.area_m2;
-    let mut perimeter = outer.perimeter_m;
-    for hole in holes {
-        let h = ring_perimeter_and_area(hole);
-        area -= h.area_m2;
-        perimeter += h.perimeter_m;
-    }
-    GeodesicPolygonMeasurement {
-        perimeter_m: perimeter,
-        area_m2: area.max(0.0),
-    }
-}
-
 /// Sample points along the WGS84 geodesic connecting `from` to `to` so that
 /// consecutive samples are separated by at most `max_chord_deg` degrees of arc
 /// (clamped to `[0.05, 10.0]` degrees and capped at `256` segments).
-pub fn sample_geodesic_arc(from: GeoPoint, to: GeoPoint, max_chord_deg: f64) -> Vec<GeoPoint> {
+pub(super) fn sample_geodesic_arc(
+    from: GeoPoint,
+    to: GeoPoint,
+    max_chord_deg: f64,
+) -> Vec<GeoPoint> {
     if !(from.lat.is_finite() && from.lon.is_finite() && to.lat.is_finite() && to.lon.is_finite()) {
         return Vec::new();
     }
@@ -222,18 +174,12 @@ mod tests {
             (d - 9_094_718.727_5).abs() < 1e-2,
             "expected ~9,094,718.73 m, got {d}"
         );
+        let inv = geodesic_inverse(34.095_925, -118.288_423_7, 59.432_343_9, 24.734_164_9);
+        assert!((inv.distance_m - d).abs() < 1e-6);
     }
 
     #[test]
-    fn karney_direct_and_inverse_round_trip() {
-        let (lat2, lon2, _) = geodesic_direct(40.64, -73.78, 45.0, 1_000_000.0);
-        let inv = geodesic_inverse(40.64, -73.78, lat2, lon2);
-        assert!((inv.distance_m - 1_000_000.0).abs() < 1e-4);
-        assert!((inv.azimuth1_deg - 45.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn polygon_area_matches_unit_degree_square_and_subtracts_holes() {
+    fn polygon_area_matches_unit_degree_square() {
         let outer = vec![
             GeoPoint::new(0.0, 0.0),
             GeoPoint::new(0.0, 1.0),
@@ -249,17 +195,6 @@ mod tests {
         rev.reverse();
         let m_rev = ring_perimeter_and_area(&rev);
         assert!((m_rev.area_m2 - m.area_m2).abs() < 1e-3);
-
-        // Hole removes interior area cleanly.
-        let hole = vec![
-            GeoPoint::new(0.25, 0.25),
-            GeoPoint::new(0.75, 0.25),
-            GeoPoint::new(0.75, 0.75),
-            GeoPoint::new(0.25, 0.75),
-        ];
-        let hole_m = ring_perimeter_and_area(&hole);
-        let with_hole = polygon_with_holes_measurement(&outer, &[hole]);
-        assert!((with_hole.area_m2 - (m.area_m2 - hole_m.area_m2)).abs() < 1.0);
     }
 
     #[test]

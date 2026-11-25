@@ -1,4 +1,4 @@
-use super::{TileValidationError, extract_host, parse_url_authority, strip_http_scheme};
+use super::TileValidationError;
 use crate::redact::sanitize_url_for_display;
 use crate::{CustomBasemapConfig, LiveBasemapSpec, NetError, is_valid_gibs_date};
 use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId};
@@ -235,37 +235,4 @@ fn iso_date_validation_accepts_valid_and_rejects_malformed() {
         LiveBasemapSpec::nasa_gibs_viirs("bad-date"),
         Err(NetError::InvalidDate(_))
     ));
-}
-
-#[test]
-fn url_authority_parsing_and_host_extraction_handle_edge_cases() {
-    assert_eq!(
-        extract_host("HTTPS://GIBS.Earthdata.NASA.gov/wmts/1/2/3.jpg"),
-        "gibs.earthdata.nasa.gov"
-    );
-    // Multi-byte UTF-8 straddling byte offsets 7..8 must never panic.
-    assert_eq!(
-        strip_http_scheme("http://\u{00e9}/{z}/{x}/{y}.png"),
-        Some("\u{00e9}/{z}/{x}/{y}.png")
-    );
-    assert_eq!(
-        strip_http_scheme("\u{00e9}\u{00e9}\u{00e9}\u{00e9}://example.com"),
-        None
-    );
-    assert_eq!(extract_host("http://\u{00e9}/0/0/0.png"), "\u{00e9}");
-    assert_eq!(
-        extract_host("http://user:pass@127.0.0.1:8080/0/0/0.png?key=1"),
-        "127.0.0.1:8080"
-    );
-    assert_eq!(extract_host("http://[::1]:8080/0/0/0.png"), "[::1]:8080");
-    let ipv6 = parse_url_authority("http://user:pw@[::1]:8080/0/0/0.png").expect("ipv6");
-    assert_eq!(ipv6.host, "[::1]");
-    assert_eq!(ipv6.host_port, "[::1]:8080");
-
-    // Reject invalid ports and malformed IPv6 brackets.
-    assert!(parse_url_authority("http://example.com:notaport/0/0/0.png").is_none());
-    assert!(parse_url_authority("http://example.com:70000/0/0/0.png").is_none());
-    assert!(parse_url_authority("http://example.com:/0/0/0.png").is_none());
-    assert!(parse_url_authority("http://[invalid]/0/0/0.png").is_none());
-    assert!(parse_url_authority("http://[::1]:bad/0/0/0.png").is_none());
 }

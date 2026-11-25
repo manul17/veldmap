@@ -138,6 +138,11 @@ impl CrsSpec {
         }
     }
 
+    /// Whether this CRS is geographic (lon/lat degrees) rather than projected.
+    pub const fn is_geographic(&self) -> bool {
+        matches!(self, Self::Geographic { .. } | Self::GeographicProj(_))
+    }
+
     /// Human-readable CRS label.
     pub fn label(&self) -> String {
         match self {

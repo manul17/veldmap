@@ -5,12 +5,21 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use veldmap_core::geo::{Camera, Frame, VectorMesh};
-use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, traverse};
+use veldmap_core::tile::{QuadTileId, QuadtreeConfig, SourceId, TileKey, VisibleTile, traverse};
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
 
 use super::graticule::adaptive_grid_step_deg;
-use super::overlay::OverlayMeshKey;
+
+/// Cache identity for an uploaded overlay cell warp-mesh vertex buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OverlayMeshKey {
+    pub source: SourceId,
+    pub relaid: u64,
+    pub level: u8,
+    pub x: u32,
+    pub y: u32,
+}
 
 /// Strategy resolving the finest cached GPU carrier tile and composed UV
 /// sub-rectangle for a visible quadtree texture tile.

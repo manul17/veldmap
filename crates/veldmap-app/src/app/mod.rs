@@ -15,7 +15,7 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui_wgpu;
 use thiserror::Error;
-use veldmap_core::geo::Camera;
+use veldmap_core::geo::{Camera, FootprintBounds};
 use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
@@ -54,12 +54,12 @@ impl From<UploadChannelClosed> for AppError {
 }
 
 /// Transient UI state for all floating windows, panels, and toolbar inputs.
-pub(super) struct UiPanels {
-    pub(super) basemap: BasemapUiState,
-    pub(super) layers: LayersPanelState,
-    pub(super) crs_picker: CrsPickerState,
-    pub(super) measure: MeasureUiState,
-    pub(super) toolbar: ToolbarState,
+struct UiPanels {
+    basemap: BasemapUiState,
+    layers: LayersPanelState,
+    crs_picker: CrsPickerState,
+    measure: MeasureUiState,
+    toolbar: ToolbarState,
 }
 
 impl UiPanels {
@@ -177,6 +177,11 @@ impl VeldmapApp {
         app.open_user_paths(startup_files, None);
 
         Ok(app)
+    }
+
+    fn focus_footprint(&mut self, bounds: FootprintBounds) {
+        self.camera
+            .focus(bounds.lat, bounds.lon, bounds.radius_deg.max(0.000_2));
     }
 
     fn show_globe_viewport(

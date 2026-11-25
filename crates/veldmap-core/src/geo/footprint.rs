@@ -115,27 +115,6 @@ pub(crate) fn dedup_geo_ring(points: &[GeoPoint]) -> Vec<GeoPoint> {
     out
 }
 
-/// Compute the spherical framing circle enclosing `rings`, or `None` if empty.
-pub fn frame(rings: &[Ring]) -> Option<FootprintBounds> {
-    frame_coords(points(rings))
-}
-
-/// Compute the spherical framing circle enclosing `polygons` (their exterior
-/// boundaries), or `None` if empty.
-pub fn frame_polygons(polygons: &[Polygon]) -> Option<FootprintBounds> {
-    frame_coords(
-        polygons
-            .iter()
-            .flat_map(|p| &p.exterior.points)
-            .map(|p| (p.lat, p.lon)),
-    )
-}
-
-/// Return whether any ring in `rings` covers `(lat, lon)`.
-pub fn covers(rings: &[Ring], lat: f64, lon: f64) -> bool {
-    rings.iter().any(|ring| inside(&ring.points, lat, lon))
-}
-
 /// Return whether `polygon` covers `(lat, lon)` (inside its exterior ring and
 /// outside all of its interior holes).
 pub fn covers_polygon(polygon: &Polygon, lat: f64, lon: f64) -> bool {
@@ -151,13 +130,6 @@ pub fn covers_polygon(polygon: &Polygon, lat: f64, lon: f64) -> bool {
 /// Return whether any polygon in `polygons` covers `(lat, lon)`.
 pub fn covers_polygons(polygons: &[Polygon], lat: f64, lon: f64) -> bool {
     polygons.iter().any(|poly| covers_polygon(poly, lat, lon))
-}
-
-fn points(rings: &[Ring]) -> impl Iterator<Item = (f64, f64)> + Clone + '_ {
-    rings
-        .iter()
-        .flat_map(|ring| &ring.points)
-        .map(|point| (point.lat, point.lon))
 }
 
 /// Default chord sagitta tolerance used for geodesic ring densification.

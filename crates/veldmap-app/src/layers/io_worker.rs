@@ -1,4 +1,4 @@
-//! Dedicated off-UI-thread [`OverlayIoWorker`] for non-blocking local raster
+//! Dedicated off-UI-thread overlay I/O worker for non-blocking local raster
 //! fingerprinting, GeoTIFF/PNG/JPEG opening, and reload disk-cache invalidation.
 
 use std::path::PathBuf;
@@ -13,8 +13,7 @@ use crate::worker::SingleThreadWorker;
 
 use super::opener::{OpenRasterError, open_local_raster};
 use super::runtime::OverlayRuntime;
-use super::stack::LayerInitOptions;
-use super::{CrsOverride, LayerId};
+use super::{CrsOverride, LayerId, LayerInitOptions};
 
 /// Parameters describing a non-blocking reload of an existing overlay layer.
 pub(super) struct ReloadRequest {
@@ -36,7 +35,7 @@ pub(super) struct ReloadedPayload {
     pub(super) outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
 }
 
-/// Commands processed off the UI thread by [`OverlayIoWorker`].
+/// Commands processed off the UI thread by the overlay I/O worker.
 pub(super) enum OverlayIoCmd {
     Open {
         path: PathBuf,
@@ -46,7 +45,7 @@ pub(super) enum OverlayIoCmd {
     Reload(ReloadRequest),
 }
 
-/// Results posted back from [`OverlayIoWorker`] to `OverlayManager`.
+/// Results posted back from the overlay I/O worker to `OverlayManager`.
 pub(super) enum OverlayIoResult {
     Opened {
         path: PathBuf,
@@ -134,39 +133,18 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
     }
 }
 
-/// Dedicated single-thread background worker handling local GeoTIFF/COG and
-/// PNG/JPEG opening plus reload SQLite cache clearing strictly off the UI
-/// thread (joined deterministically on shutdown).
-pub(super) struct OverlayIoWorker {
-    worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
-}
-
-impl OverlayIoWorker {
-    pub(super) fn spawn(runtime: Arc<OverlayRuntime>) -> Self {
-        let worker = SingleThreadWorker::spawn("veldmap-overlay-io", move |cmd_rx, res_tx| {
-            while let Ok(cmd) = cmd_rx.recv() {
-                if runtime.shutdown.is_cancelled() {
-                    break;
-                }
-                handle_io_cmd(cmd, &runtime, &res_tx);
+/// Spawn the dedicated single-thread background worker handling local
+/// GeoTIFF/COG and PNG/JPEG opening plus reload SQLite cache clearing strictly
+/// off the UI thread (joined deterministically on shutdown).
+pub(super) fn spawn_overlay_io_worker(
+    runtime: Arc<OverlayRuntime>,
+) -> SingleThreadWorker<OverlayIoCmd, OverlayIoResult> {
+    SingleThreadWorker::spawn("veldmap-overlay-io", move |cmd_rx, res_tx| {
+        while let Ok(cmd) = cmd_rx.recv() {
+            if runtime.shutdown.is_cancelled() {
+                break;
             }
-        });
-        Self { worker }
-    }
-
-    pub(super) fn send(&self, cmd: OverlayIoCmd) -> bool {
-        self.worker.send(cmd)
-    }
-
-    pub(super) fn try_recv(&self) -> Option<OverlayIoResult> {
-        self.worker.try_recv()
-    }
-
-    pub(super) fn close_channel(&mut self) {
-        self.worker.close_channel();
-    }
-
-    pub(super) fn join(&mut self) {
-        self.worker.join();
-    }
+            handle_io_cmd(cmd, &runtime, &res_tx);
+        }
+    })
 }

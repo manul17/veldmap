@@ -1,5 +1,5 @@
 //! Raster overlay subsystem: ordered raster overlay stack, two-lane
-//! `PassKey`-scoped scheduling with QOI disk caching, non-blocking local file
+//! `StreamKey`-scoped scheduling with QOI disk caching, non-blocking local file
 //! open/reload I/O, and zoom-invariant CPU cursor readouts.
 //!
 //! Read-only GeoJSON vector layers live in [`crate::vectors`] and interactive
@@ -35,6 +35,15 @@ pub(super) fn default_display_tile_bytes() -> usize {
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct LayerId(u64);
+
+/// Initial display and georeference override options when inserting an opened
+/// raster layer into [`stack::LayerStack`].
+#[derive(Clone, Debug)]
+pub(super) struct LayerInitOptions {
+    pub(super) visible: bool,
+    pub(super) opacity: f32,
+    pub(super) crs_override: Option<CrsOverride>,
+}
 
 /// Read-only summary of an overlay layer rendered in the Layer List UI.
 #[derive(Clone, Debug)]

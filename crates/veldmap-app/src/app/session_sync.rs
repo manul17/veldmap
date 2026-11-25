@@ -45,19 +45,19 @@ pub(super) struct SessionRestoreTracker {
 }
 
 impl SessionRestoreTracker {
-    pub(super) fn push_layer(&mut self, entry: SavedLayerEntry) {
+    fn push_layer(&mut self, entry: SavedLayerEntry) {
         self.layers.push(entry);
     }
 
-    pub(super) fn push_vector(&mut self, entry: SavedVectorEntry) {
+    fn push_vector(&mut self, entry: SavedVectorEntry) {
         self.vectors.push(entry);
     }
 
-    pub(super) fn take_layer(&mut self, path: &Path) -> bool {
+    fn take_layer(&mut self, path: &Path) -> bool {
         take_by_path(&mut self.layers, path, |entry| &entry.path)
     }
 
-    pub(super) fn take_vector(&mut self, path: &Path) -> bool {
+    fn take_vector(&mut self, path: &Path) -> bool {
         take_by_path(&mut self.vectors, path, |entry| &entry.path)
     }
 
@@ -68,11 +68,11 @@ impl SessionRestoreTracker {
         }
     }
 
-    pub(super) fn pending_layers(&self) -> &[SavedLayerEntry] {
+    fn pending_layers(&self) -> &[SavedLayerEntry] {
         &self.layers
     }
 
-    pub(super) fn pending_vectors(&self) -> &[SavedVectorEntry] {
+    fn pending_vectors(&self) -> &[SavedVectorEntry] {
         &self.vectors
     }
 }
@@ -89,7 +89,8 @@ impl VeldmapApp {
         for saved in open_layers {
             if self
                 .scene
-                .begin_open_overlay_file_with_options(
+                .overlays()
+                .begin_open_file_with_options(
                     &saved.path,
                     false,
                     saved.visible,
@@ -104,12 +105,8 @@ impl VeldmapApp {
         for saved_vec in open_vectors {
             if self
                 .scene
-                .begin_open_vector_file(
-                    &saved_vec.path,
-                    false,
-                    saved_vec.visible,
-                    saved_vec.opacity,
-                )
+                .vectors()
+                .begin_open(&saved_vec.path, false, saved_vec.visible, saved_vec.opacity)
                 .is_ok()
             {
                 self.restore_tracker.push_vector(saved_vec);
