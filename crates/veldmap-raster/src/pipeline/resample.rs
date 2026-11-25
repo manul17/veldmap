@@ -215,6 +215,199 @@ pub(super) fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
     }
 }
 
+#[inline]
+fn read_f32_ne(buf: &[u8], pixel_index: usize) -> f32 {
+    let off = pixel_index * 4;
+    f32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+#[inline]
+fn write_f32_ne(buf: &mut [u8], pixel_index: usize, val: f32) {
+    let off = pixel_index * 4;
+    buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+}
+
+/// NaN-skipping 2x2 block average for `R32Float` (`w x h` -> `ceil(w/2) x ceil(h/2)`).
+///
+/// Finite samples are averaged in `f64`; all-non-finite blocks emit `f32::NAN`.
+pub(super) fn halve_f32(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    debug_assert_eq!(src.len(), (w as usize) * (h as usize) * 4);
+    let (dw, dh) = (w.div_ceil(2), h.div_ceil(2));
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    for dy in 0..dh {
+        let y0 = dy * 2;
+        let y1 = (y0 + 2).min(h);
+        for dx in 0..dw {
+            let x0 = dx * 2;
+            let x1 = (x0 + 2).min(w);
+            let mut sum = 0.0f64;
+            let mut count = 0u32;
+            for y in y0..y1 {
+                let row = (y as usize) * (w as usize);
+                for x in x0..x1 {
+                    let v = read_f32_ne(src, row + (x as usize));
+                    if v.is_finite() {
+                        sum += f64::from(v);
+                        count += 1;
+                    }
+                }
+            }
+            let val = if count > 0 {
+                (sum / f64::from(count)) as f32
+            } else {
+                f32::NAN
+            };
+            write_f32_ne(&mut out, (dy as usize) * (dw as usize) + (dx as usize), val);
+        }
+    }
+    out
+}
+
+/// Area-weighted NaN-skipping resampling of fractional `window` inside an
+/// `R32Float` buffer (`sw x sh`) to `dw x dh`.
+pub(crate) fn resample_f32_window(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    window: Window,
+    dw: u32,
+    dh: u32,
+) -> Vec<u8> {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return Vec::new();
+    }
+    debug_assert_eq!(src.len(), (sw as usize) * (sh as usize) * 4);
+    if sw == dw
+        && sh == dh
+        && window.x0 == 0.0
+        && window.y0 == 0.0
+        && window.x1 == f64::from(sw)
+        && window.y1 == f64::from(sh)
+    {
+        return src.to_vec();
+    }
+    let x_spans = spans(window.x0, window.x1, dw);
+    let y_spans = spans(window.y0, window.y1, dh);
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    for (dy, &(y0, y1)) in y_spans.iter().enumerate() {
+        for (dx, &(x0, x1)) in x_spans.iter().enumerate() {
+            let mut sum = 0.0f64;
+            let mut weight = 0.0f64;
+            let mut sy = y0.max(0.0).floor() as u32;
+            while f64::from(sy) < y1 && sy < sh {
+                let wy = overlap(sy, y0, y1);
+                let row = (sy as usize) * (sw as usize);
+                let mut sx = x0.max(0.0).floor() as u32;
+                while f64::from(sx) < x1 && sx < sw {
+                    let wx = overlap(sx, x0, x1);
+                    let v = read_f32_ne(src, row + (sx as usize));
+                    if v.is_finite() {
+                        let w = wx * wy;
+                        sum += f64::from(v) * w;
+                        weight += w;
+                    }
+                    sx += 1;
+                }
+                sy += 1;
+            }
+            let val = if weight > 0.0 {
+                (sum / weight) as f32
+            } else {
+                f32::NAN
+            };
+            write_f32_ne(&mut out, dy * (dw as usize) + dx, val);
+        }
+    }
+    out
+}
+
+/// Non-averaging nearest-neighbor 2x2 decimation for `R8Uint` categorical tiles.
+pub(super) fn halve_u8_nearest(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    debug_assert_eq!(src.len(), (w as usize) * (h as usize));
+    let (dw, dh) = (w.div_ceil(2), h.div_ceil(2));
+    let mut out = vec![0u8; (dw as usize) * (dh as usize)];
+    for dy in 0..dh {
+        let sy = (dy * 2).min(h - 1) as usize;
+        let src_row = sy * (w as usize);
+        let dst_row = (dy as usize) * (dw as usize);
+        for dx in 0..dw {
+            let sx = (dx * 2).min(w - 1) as usize;
+            out[dst_row + (dx as usize)] = src[src_row + sx];
+        }
+    }
+    out
+}
+
+/// Non-averaging nearest-neighbor 2x2 decimation for `R16Uint` categorical tiles.
+pub(super) fn halve_u16_nearest(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    debug_assert_eq!(src.len(), (w as usize) * (h as usize) * 2);
+    let (dw, dh) = (w.div_ceil(2), h.div_ceil(2));
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 2];
+    for dy in 0..dh {
+        let sy = (dy * 2).min(h - 1) as usize;
+        let src_row = sy * (w as usize);
+        let dst_row = (dy as usize) * (dw as usize);
+        for dx in 0..dw {
+            let sx = (dx * 2).min(w - 1) as usize;
+            let s_off = (src_row + sx) * 2;
+            let d_off = (dst_row + (dx as usize)) * 2;
+            out[d_off..d_off + 2].copy_from_slice(&src[s_off..s_off + 2]);
+        }
+    }
+    out
+}
+
+/// Nearest-neighbor resampling of fractional `window` for categorical `R8Uint` / `R16Uint`.
+pub(crate) fn resample_uint_nearest_window(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    window: Window,
+    dw: u32,
+    dh: u32,
+    bpp: usize,
+) -> Vec<u8> {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return Vec::new();
+    }
+    debug_assert_eq!(src.len(), (sw as usize) * (sh as usize) * bpp);
+    if sw == dw
+        && sh == dh
+        && window.x0 == 0.0
+        && window.y0 == 0.0
+        && window.x1 == f64::from(sw)
+        && window.y1 == f64::from(sh)
+    {
+        return src.to_vec();
+    }
+    let scale_x = (window.x1 - window.x0) / f64::from(dw);
+    let scale_y = (window.y1 - window.y0) / f64::from(dh);
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * bpp];
+    for dy in 0..dh {
+        let sy_f = window.y0 + (f64::from(dy) + 0.5) * scale_y;
+        let sy = (sy_f.floor().clamp(0.0, f64::from(sh - 1))) as usize;
+        let src_row = sy * (sw as usize);
+        let dst_row = (dy as usize) * (dw as usize);
+        for dx in 0..dw {
+            let sx_f = window.x0 + (f64::from(dx) + 0.5) * scale_x;
+            let sx = (sx_f.floor().clamp(0.0, f64::from(sw - 1))) as usize;
+            let s_off = (src_row + sx) * bpp;
+            let d_off = (dst_row + (dx as usize)) * bpp;
+            out[d_off..d_off + bpp].copy_from_slice(&src[s_off..s_off + bpp]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

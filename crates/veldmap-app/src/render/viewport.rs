@@ -91,6 +91,8 @@ impl ViewportState {
             device,
             &pipelines.layouts.tile_uniform_layout,
             &pipelines.layouts.overlay_uniform_layout,
+            &pipelines.layouts.scientific_uniform_layout,
+            &pipelines.layouts.categorical_uniform_layout,
             &pipelines.layouts.vector_uniform_layout,
         );
 

@@ -42,14 +42,41 @@ pub(crate) fn show_status_bar(
                             )
                         }
                     }
+                    CursorReadoutValue::Scalar { raw, physical } => {
+                        let unit = readout
+                            .units
+                            .as_deref()
+                            .map(|u| format!(" {u}"))
+                            .unwrap_or_default();
+                        let db_part = if readout.log10_db && physical > 0.0 {
+                            format!(" ({:.2} dB)", 10.0 * physical.log10())
+                        } else {
+                            String::new()
+                        };
+                        let raw_part = if readout.has_affine_scaling {
+                            format!(" [raw {raw:.4}]")
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "Val: {physical:.4}{unit}{db_part}{raw_part} @ ({},{})",
+                            readout.pixel.0, readout.pixel.1
+                        )
+                    }
+                    CursorReadoutValue::Categorical(class_id) => {
+                        format!(
+                            "Class {class_id} @ ({},{})",
+                            readout.pixel.0, readout.pixel.1
+                        )
+                    }
                     CursorReadoutValue::Pending => {
-                        format!("RGB(…) @ ({},{})", readout.pixel.0, readout.pixel.1)
+                        format!("… @ ({},{})", readout.pixel.0, readout.pixel.1)
                     }
                     CursorReadoutValue::Nodata => {
                         format!("nodata @ ({},{})", readout.pixel.0, readout.pixel.1)
                     }
                     CursorReadoutValue::Unavailable => {
-                        format!("RGB(n/a) @ ({},{})", readout.pixel.0, readout.pixel.1)
+                        format!("n/a @ ({},{})", readout.pixel.0, readout.pixel.1)
                     }
                 };
                 ui.monospace(val_text).on_hover_text(format!(

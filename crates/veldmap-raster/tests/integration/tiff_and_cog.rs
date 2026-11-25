@@ -12,10 +12,10 @@ use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::io::ByteSource;
 use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{RASTER_TILE_SIZE, tile_extent};
+use veldmap_core::tile::{BandKey, PixelFormat, RASTER_TILE_SIZE, tile_extent};
 use veldmap_raster::{
-    DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError, RasterSource, SharedChunkCache,
-    TiffSource,
+    BandSample, DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError, RasterSource,
+    SharedChunkCache, TiffSource, generate_scientific_mipmaps, stream_spec_for_band,
 };
 
 use crate::common::{
@@ -439,10 +439,11 @@ fn decodes_gray_alpha_preserving_transparency() {
 }
 
 #[test]
-fn rejects_planar_configuration_2_at_open() {
+fn rejects_malformed_planar_configuration_2_with_missing_plane_offsets() {
     let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
 
+    // PlanarConfiguration = 2 with 3 samples/pixel requires 3 strip offsets, not 1.
     let mut planar_buf = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut planar_buf).expect("enc");
@@ -578,4 +579,444 @@ fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected(
         (tile_extent(across - 1, wide), RASTER_TILE_SIZE)
     );
     assert_eq!(&tile.data()[..4], &[173, 173, 173, 255]);
+}
+
+#[test]
+fn decodes_planar2_npot_tiled_rgb_and_single_band_scientific_and_palette_and_rgbn() {
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
+    // 1. Tiled PlanarConfiguration = 2 with NPOT dimensions (20x18, tile 16x16):
+    //    2x2 = 4 tiles per plane * 3 planes = 12 tile offsets.
+    let (pw, ph) = (20u32, 18u32);
+    let (tw, th) = (16u32, 16u32);
+    let mut planar_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut planar_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                planar_configuration: 2,
+                ..TiffIfdHeader::rgb8(pw, ph)
+            },
+        );
+        dir.write_tag(Tag::TileWidth, tw).expect("tw");
+        dir.write_tag(Tag::TileLength, th).expect("th");
+        let plane_vals = [10u8, 120u8, 240u8];
+        let mut offsets = Vec::with_capacity(12);
+        let mut counts = Vec::with_capacity(12);
+        for &val in &plane_vals {
+            for tile_idx in 0..4u32 {
+                // Bottom-edge tiles intentionally truncated to only `dh = 2` stored rows
+                // (testing NPOT bottom-edge planar tolerance!).
+                let rows = if tile_idx >= 2 { 2usize } else { th as usize };
+                let payload = vec![val; (tw as usize) * rows];
+                let off = dir.write_data(&payload[..]).expect("tile data") as u32;
+                offsets.push(off);
+                counts.push(payload.len() as u32);
+            }
+        }
+        dir.write_tag(Tag::TileOffsets, &offsets[..]).expect("offs");
+        dir.write_tag(Tag::TileByteCounts, &counts[..])
+            .expect("cnts");
+        dir.finish().expect("finish");
+    }
+    let planar_bytes = planar_buf.into_inner();
+    let planar_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(planar_bytes.clone())),
+        fake_fingerprint(&planar_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open tiled Planar-2 NPOT TIFF");
+    let display_tile = planar_src
+        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .expect("decode Planar-2 Display");
+    assert_eq!((display_tile.width(), display_tile.height()), (pw, ph));
+    // Verify bottom-right NPOT corner pixel (19, 17).
+    let last_px = ((17 * pw + 19) * 4) as usize;
+    assert_eq!(
+        &display_tile.data()[last_px..last_px + 4],
+        &[10, 120, 240, 255]
+    );
+
+    // Single-band Scientific R32Float read of plane 2 (value 240.0).
+    let sci_spec = stream_spec_for_band(BandKey::Index(2), PixelFormat::R32Float);
+    let mut sci_tile = planar_src
+        .decode_pointwise_tile_stream(sci_spec, 0, 0, 0, &ctx)
+        .expect("decode Planar-2 Band 2 R32Float");
+    generate_scientific_mipmaps(&mut sci_tile);
+    assert!(sci_tile.mip_level_count() > 1);
+    let f0 = f32::from_ne_bytes(sci_tile.data()[0..4].try_into().expect("4B"));
+    assert_eq!(f0, 240.0);
+
+    // 2. Palette TIFF (Photometric = 3, ColorMap tag 320):
+    //    Expands via ColorMap on Display AND exposes raw R8Uint class indices on Categorical.
+    let mut pal_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut pal_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                photometric: 3,
+                ..TiffIfdHeader::gray8(4, 2)
+            },
+        );
+        let mut cmap = vec![0u16; 256 * 3];
+        // Class 1 -> pure red (255, 0, 0), Class 2 -> pure green (0, 255, 0).
+        cmap[1] = 65535;
+        cmap[256 + 2] = 65535;
+        dir.write_tag(Tag::ColorMap, &cmap[..]).expect("cmap");
+        dir.write_tag(Tag::GdalNodata, "0").expect("nodata");
+        write_single_strip_u32(&mut dir, 2, &[0, 1, 2, 1, 2, 1, 0, 2]);
+        dir.finish().expect("finish");
+    }
+    let pal_bytes = pal_buf.into_inner();
+    let pal_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(pal_bytes.clone())),
+        fake_fingerprint(&pal_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open Palette TIFF");
+    assert_eq!(pal_src.default_stream_spec().format, PixelFormat::R8Uint);
+    assert!(pal_src.color_map().is_some());
+    let pal_disp = pal_src
+        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .expect("decode Palette Display");
+    assert_eq!(
+        pal_disp.data()[3],
+        0,
+        "nodata 0 must stay transparent (alpha=0)"
+    );
+    assert_eq!(&pal_disp.data()[4..8], &[255, 0, 0, 255]); // class 1 red
+    assert_eq!(&pal_disp.data()[8..12], &[0, 255, 0, 255]); // class 2 green
+
+    let pal_cat = pal_src
+        .decode_pointwise_tile_stream(pal_src.default_stream_spec(), 0, 0, 0, &ctx)
+        .expect("decode Palette Categorical");
+    assert_eq!(pal_cat.format(), PixelFormat::R8Uint);
+    assert_eq!(pal_cat.data(), &[0, 1, 2, 1, 2, 1, 0, 2]);
+    assert_eq!(
+        pal_src
+            .sample_band(BandKey::Index(0), PixelFormat::R8Uint, 2, 0, &ctx)
+            .expect("sample palette"),
+        BandSample::Categorical(2)
+    );
+
+    // 3. 4-band RGB+NIR with ExtraSamples = [0] (Unspecified) + GDAL_METADATA scale/offset:
+    //    NIR band (band 3) must NOT be treated as alpha, Display RGB stays opaque,
+    //    and band 3 decodes cleanly as R32Float with physical stats and readout.
+    let mut rgbn_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut rgbn_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                photometric: 2,
+                samples_per_pixel: 4,
+                bits_per_sample: &[16, 16, 16, 16],
+                sample_format: Some(1),
+                ..TiffIfdHeader::gray8(2, 2)
+            },
+        );
+        dir.write_tag(Tag::ExtraSamples, &[0u16][..])
+            .expect("extra");
+        dir.write_tag(
+            Tag::Unknown(42112),
+            r#"<GDALMetadata><Item name="SCALE" sample="3">0.0001</Item><Item name="OFFSET" sample="3">-0.1</Item><Item name="UNITTYPE" sample="3">reflectance</Item></GDALMetadata>"#,
+        )
+        .expect("gdal meta");
+        // Band 3 (NIR) is 0 on pixel 0 — if wrongly treated as alpha, pixel 0 would vanish!
+        let pixels_u16: [u16; 16] = [
+            1000, 2000, 3000, 0, // px 0: NIR = 0
+            4000, 5000, 6000, 5000, // px 1: NIR = 5000 -> phys = 0.4
+            7000, 8000, 9000, 8000, // px 2: NIR = 8000 -> phys = 0.7
+            10000, 11000, 12000, 10000, // px 3: NIR = 10000 -> phys = 0.9
+        ];
+        let raw: Vec<u8> = pixels_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_single_strip_u32(&mut dir, 2, &raw);
+        dir.finish().expect("finish");
+    }
+    let rgbn_bytes = rgbn_buf.into_inner();
+    let rgbn_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(rgbn_bytes.clone())),
+        fake_fingerprint(&rgbn_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open 4-band RGBN TIFF");
+    assert!(!rgbn_src.description().bands[0].has_alpha);
+    assert_eq!(rgbn_src.description().indexed_bands().count(), 4);
+    let rgbn_disp = rgbn_src
+        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .expect("decode RGBN Display");
+    assert_eq!(
+        rgbn_disp.data()[3],
+        255,
+        "ExtraSamples=0 NIR=0 must stay opaque on Display"
+    );
+    let nir_spec = stream_spec_for_band(BandKey::Index(3), PixelFormat::R32Float);
+    let nir_tile = rgbn_src
+        .decode_pointwise_tile_stream(nir_spec, 0, 0, 0, &ctx)
+        .expect("decode NIR R32Float");
+    let nir_vals: Vec<f32> = nir_tile
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert_eq!(nir_vals, vec![0.0, 5000.0, 8000.0, 10000.0]);
+    let nir_sample = rgbn_src
+        .sample_band(BandKey::Index(3), PixelFormat::R32Float, 1, 0, &ctx)
+        .expect("sample NIR");
+    match nir_sample {
+        BandSample::Scalar { raw, physical } => {
+            assert_eq!(raw, 5000.0);
+            assert!((physical - 0.4).abs() < 1e-9);
+        }
+        other => panic!("expected Scalar, got {other:?}"),
+    }
+    let stats = rgbn_src
+        .band_stats(BandKey::Index(3), &ctx)
+        .expect("band stats")
+        .expect("non-empty stats");
+    assert!((stats.min - (-0.1)).abs() < 1e-9);
+    assert!((stats.max - 0.9).abs() < 1e-9);
+    assert_eq!(stats.sample_count, 4);
+}
+
+#[test]
+fn direct_raw_decoder_handles_deflate_lzw_packbits_predictor2_big_endian_and_scientific_pass() {
+    use std::io::Write;
+    use veldmap_raster::TileEmit;
+
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
+    // 1. Deflate + Horizontal Predictor (Predictor = 2) 16-bit single-band TIFF.
+    let src_u16: [u16; 8] = [100, 150, 225, 400, 1000, 900, 850, 1200];
+    let mut diff_u16 = Vec::with_capacity(16);
+    for row in src_u16.chunks_exact(4) {
+        let mut prev = 0u16;
+        for &v in row {
+            let d = v.wrapping_sub(prev);
+            prev = v;
+            diff_u16.extend_from_slice(&d.to_le_bytes());
+        }
+    }
+    let mut zenc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    zenc.write_all(&diff_u16).expect("zlib write");
+    let deflated = zenc.finish().expect("zlib finish");
+    let mut def_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut def_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                bits_per_sample: &[16],
+                sample_format: Some(1),
+                compression: 8,
+                ..TiffIfdHeader::gray8(4, 2)
+            },
+        );
+        dir.write_tag(Tag::Predictor, 2u16).expect("predictor");
+        write_single_strip_u32(&mut dir, 2, &deflated);
+        dir.finish().expect("finish");
+    }
+    let def_bytes = def_buf.into_inner();
+    let def_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(def_bytes.clone())),
+        fake_fingerprint(&def_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open Deflate+Predictor2 u16 TIFF");
+    let def_tile = def_src
+        .decode_pointwise_tile_stream(
+            stream_spec_for_band(BandKey::Index(0), PixelFormat::R32Float),
+            0,
+            0,
+            0,
+            &ctx,
+        )
+        .expect("decode Deflate+Predictor2");
+    let decoded_f32: Vec<f32> = def_tile
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let expected_f32: Vec<f32> = src_u16.iter().map(|&v| f32::from(v)).collect();
+    assert_eq!(decoded_f32, expected_f32);
+
+    // 2. LZW (compression = 5) + PackBits (compression = 32773) 8-bit grayscale TIFFs.
+    let raw_lzw = [10u8, 20, 30, 40, 40, 40, 50, 60];
+    let mut lzw_enc = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
+    let lzw_payload = lzw_enc.encode(&raw_lzw).expect("lzw encode");
+    let mut lzw_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut lzw_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                compression: 5,
+                ..TiffIfdHeader::gray8(4, 2)
+            },
+        );
+        write_single_strip_u32(&mut dir, 2, &lzw_payload);
+        dir.finish().expect("finish");
+    }
+    let lzw_bytes = lzw_buf.into_inner();
+    let lzw_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(lzw_bytes.clone())),
+        fake_fingerprint(&lzw_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open LZW TIFF");
+    let lzw_tile = lzw_src
+        .decode_pointwise_tile_stream(
+            stream_spec_for_band(BandKey::Index(0), PixelFormat::R8Uint),
+            0,
+            0,
+            0,
+            &ctx,
+        )
+        .expect("decode LZW");
+    assert_eq!(lzw_tile.data(), &raw_lzw);
+
+    // PackBits: literal run of 3 bytes (header=2: 10, 20, 30) + repeat 40 x 3 (header=-2 = 0xFE, 40)
+    //           + literal run of 2 bytes (header=1: 50, 60).
+    let packbits_payload = [2u8, 10, 20, 30, 0xFE, 40, 1, 50, 60];
+    let mut pb_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut pb_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                compression: 32773,
+                ..TiffIfdHeader::gray8(4, 2)
+            },
+        );
+        write_single_strip_u32(&mut dir, 2, &packbits_payload);
+        dir.finish().expect("finish");
+    }
+    let pb_bytes = pb_buf.into_inner();
+    let pb_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(pb_bytes.clone())),
+        fake_fingerprint(&pb_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open PackBits TIFF");
+    let pb_tile = pb_src
+        .decode_pointwise_tile_stream(
+            stream_spec_for_band(BandKey::Index(0), PixelFormat::R8Uint),
+            0,
+            0,
+            0,
+            &ctx,
+        )
+        .expect("decode PackBits");
+    assert_eq!(pb_tile.data(), &raw_lzw);
+
+    // 3. Big-Endian ("MM") multi-byte Float32 TIFF + `produce_pass_stream`
+    //    verifying exact `f32::NAN` preservation (confirming `bleed_alpha` never runs on Scientific).
+    let be_vals: [f32; 4] = [-9999.0, 12.5, 42.25, f32::NAN];
+    let mut be_raw = Vec::with_capacity(16);
+    for v in be_vals {
+        be_raw.extend_from_slice(&v.to_be_bytes());
+    }
+    // Hand-build a minimal Big-Endian classic TIFF ("MM", version 42) with 1 IFD & 10 tags.
+    let mut be_tiff = Vec::new();
+    be_tiff.extend_from_slice(b"MM");
+    be_tiff.extend_from_slice(&42u16.to_be_bytes());
+    be_tiff.extend_from_slice(&8u32.to_be_bytes()); // IFD at offset 8
+    let num_entries: u16 = 10;
+    be_tiff.extend_from_slice(&num_entries.to_be_bytes());
+    let data_offset: u32 = 8 + 2 + u32::from(num_entries) * 12 + 4;
+    let nodata_str = b"-9999\0";
+    let nodata_offset = data_offset + be_raw.len() as u32;
+    let push_be_short = |buf: &mut Vec<u8>, tag: u16, val: u16| {
+        buf.extend_from_slice(&tag.to_be_bytes());
+        buf.extend_from_slice(&3u16.to_be_bytes()); // SHORT
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&val.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+    };
+    let push_be_long = |buf: &mut Vec<u8>, tag: u16, val: u32| {
+        buf.extend_from_slice(&tag.to_be_bytes());
+        buf.extend_from_slice(&4u16.to_be_bytes()); // LONG
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&val.to_be_bytes());
+    };
+    push_be_long(&mut be_tiff, 256, 2); // ImageWidth
+    push_be_long(&mut be_tiff, 257, 2); // ImageLength
+    push_be_short(&mut be_tiff, 258, 32); // BitsPerSample
+    push_be_short(&mut be_tiff, 259, 1); // Compression = None
+    push_be_short(&mut be_tiff, 262, 1); // Photometric = BlackIsZero
+    push_be_long(&mut be_tiff, 273, data_offset); // StripOffsets
+    push_be_long(&mut be_tiff, 278, 2); // RowsPerStrip
+    push_be_long(&mut be_tiff, 279, be_raw.len() as u32); // StripByteCounts
+    push_be_short(&mut be_tiff, 339, 3); // SampleFormat = IEEEFP
+    // Tag 42113 (GDAL_NODATA), ASCII, len = 6
+    be_tiff.extend_from_slice(&42113u16.to_be_bytes());
+    be_tiff.extend_from_slice(&2u16.to_be_bytes());
+    be_tiff.extend_from_slice(&(nodata_str.len() as u32).to_be_bytes());
+    be_tiff.extend_from_slice(&nodata_offset.to_be_bytes());
+    be_tiff.extend_from_slice(&0u32.to_be_bytes()); // next IFD = 0
+    be_tiff.extend_from_slice(&be_raw);
+    be_tiff.extend_from_slice(nodata_str);
+
+    let be_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(be_tiff.clone())),
+        fake_fingerprint(&be_tiff),
+        &budget,
+        &cancel,
+    )
+    .expect("open Big-Endian Float32 TIFF");
+    let mut emitted = Vec::new();
+    let mut emit_fn = |level: u8, x: u32, y: u32, w: u32, h: u32, bytes: Vec<u8>| {
+        emitted.push((level, x, y, w, h, bytes));
+        Ok(())
+    };
+    be_src
+        .produce_pass_stream(
+            stream_spec_for_band(BandKey::Index(0), PixelFormat::R32Float),
+            &ctx,
+            &mut emit_fn as TileEmit<'_>,
+        )
+        .expect("produce_pass_stream R32Float");
+    assert_eq!(emitted.len(), 1);
+    assert_eq!((emitted[0].3, emitted[0].4), (2, 2));
+    let pass_vals: Vec<f32> = emitted[0]
+        .5
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert!(pass_vals[0].is_nan(), "nodata -9999 must become NaN");
+    assert_eq!(pass_vals[1], 12.5);
+    assert_eq!(pass_vals[2], 42.25);
+    assert!(pass_vals[3].is_nan(), "source NaN must remain NaN");
 }

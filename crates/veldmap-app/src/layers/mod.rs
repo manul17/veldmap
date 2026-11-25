@@ -1,9 +1,7 @@
-//! Raster overlay subsystem: ordered raster overlay stack, two-lane
-//! `StreamKey`-scoped scheduling with QOI disk caching, non-blocking local file
-//! open/reload I/O, and zoom-invariant CPU cursor readouts.
-//!
-//! Read-only GeoJSON vector layers live in [`crate::vectors`] and interactive
-//! geodesic measurement lives in [`crate::measure`].
+//! Raster overlay subsystem: ordered multi-stream raster overlay stack,
+//! two-lane `StreamKey`-scoped scheduling with QOI + byte-shuffled LZ4 disk
+//! caching, non-blocking local file open/reload I/O, background band statistics,
+//! and typed zoom-invariant CPU cursor readouts.
 
 mod crs_override;
 mod cursor;
@@ -15,34 +13,55 @@ mod opener;
 mod qoi_cache;
 mod runtime;
 mod stack;
+mod style;
 
 use std::path::{Path, PathBuf};
 
 use veldmap_core::geo::FootprintBounds;
-use veldmap_core::tile::RASTER_TILE_SIZE;
+use veldmap_core::tile::TileStreamSpec;
+use veldmap_raster::BandStats;
 
-use crate::gpu_tiles::display_tile_mip_bytes;
+use crate::render::{CategoricalPaletteId, ColormapId};
 
 pub(crate) use crs_override::CrsOverride;
 pub(crate) use manager::{OverlayFrameCtx, OverlayManager, OverlayMutation};
-
-/// Default unpacked VRAM byte weight for an 8-bit `512 x 512` display tile
-/// with full linear-light mip chain (`~1.33 MiB`), matching `BasemapManager`.
-pub(super) fn default_display_tile_bytes() -> usize {
-    display_tile_mip_bytes(RASTER_TILE_SIZE)
-}
+pub(crate) use style::{ColorbarInfo, LayerBandOption, SavedLayerStyle, StretchPreset};
 
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct LayerId(u64);
 
-/// Initial display and georeference override options when inserting an opened
-/// raster layer into [`stack::LayerStack`].
+/// Initial display, style, and georeference override options when inserting an
+/// opened raster layer into [`stack::LayerStack`].
 #[derive(Clone, Debug)]
 pub(super) struct LayerInitOptions {
     pub(super) visible: bool,
     pub(super) opacity: f32,
     pub(super) crs_override: Option<CrsOverride>,
+    pub(super) style: Option<SavedLayerStyle>,
+}
+
+/// Read-only scientific track summary projected into [`LayerSummary`].
+#[derive(Clone, Debug)]
+pub(crate) struct ScientificSummary {
+    pub(crate) preset: StretchPreset,
+    pub(crate) min: f64,
+    pub(crate) max: f64,
+    pub(crate) colormap: ColormapId,
+    pub(crate) invert_colormap: bool,
+    pub(crate) units: Option<String>,
+    pub(crate) scale: f64,
+    pub(crate) offset: f64,
+    pub(crate) stats: Option<BandStats>,
+    pub(crate) stats_loading: bool,
+}
+
+/// Read-only categorical track summary projected into [`LayerSummary`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CategoricalSummary {
+    pub(crate) palette: CategoricalPaletteId,
+    pub(crate) has_source_color_map: bool,
+    pub(crate) nodata_value: Option<u32>,
 }
 
 /// Read-only summary of an overlay layer rendered in the Layer List UI.
@@ -69,24 +88,30 @@ pub(crate) struct LayerSummary {
     pub(crate) last_error: Option<String>,
     pub(crate) can_move_up: bool,
     pub(crate) can_move_down: bool,
+    pub(crate) active_spec: TileStreamSpec,
+    pub(crate) band_options: Vec<LayerBandOption>,
+    pub(crate) scientific: Option<ScientificSummary>,
+    pub(crate) categorical: Option<CategoricalSummary>,
 }
 
 /// Borrowed persistence view of a loaded raster overlay layer for
 /// `session.json` serialization without coupling `layers` to
 /// `crate::storage::session`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct OverlayPersistEntry<'a> {
     pub(crate) path: &'a Path,
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
     pub(crate) crs_override: Option<&'a CrsOverride>,
+    pub(crate) style: SavedLayerStyle,
 }
 
-/// Classified value returned by a zoom-invariant CPU cursor probe so decode
-/// backpressure or giant-strip rejections are never misreported as `"nodata"`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Classified value returned by a zoom-invariant CPU cursor probe.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CursorReadoutValue {
     Rgba([u8; 4]),
+    Scalar { raw: f64, physical: f64 },
+    Categorical(u16),
     Nodata,
     Pending,
     Unavailable,
@@ -99,6 +124,9 @@ pub(crate) struct CursorReadout {
     pub(crate) layer_name: String,
     pub(crate) pixel: (u32, u32),
     pub(crate) source_pixel_size_m: Option<(f64, f64)>,
+    pub(crate) units: Option<String>,
+    pub(crate) has_affine_scaling: bool,
+    pub(crate) log10_db: bool,
     pub(crate) value: CursorReadoutValue,
 }
 

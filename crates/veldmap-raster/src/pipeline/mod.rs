@@ -22,8 +22,13 @@ mod source;
 pub use binding::{frame_from_description, frame_from_description_with_override};
 pub use cascade::TileEmit;
 pub use chunk_cache::SharedChunkCache;
-pub use metadata::{BandInfo, GeoPlacement, GeoTie, PlacementCrs, RasterDescription, SampleType};
-pub use plan::{LevelPlan, MAX_SOURCE_SIDE, PyramidMeta, ServeMode};
+pub use metadata::{
+    BandInfo, BandSample, BandStats, GeoPlacement, GeoTie, HISTOGRAM_BINS, PlacementCrs,
+    RasterDescription, SampleType,
+};
+pub use plan::{
+    DISPLAY_STREAM_SPEC, LevelPlan, MAX_SOURCE_SIDE, PyramidMeta, ServeMode, stream_spec_for_band,
+};
 pub use scheduler::{AdmittedPass, AdmittedTile, TileFailureOutcome, TileScheduler};
 pub use source::RasterSource;
 

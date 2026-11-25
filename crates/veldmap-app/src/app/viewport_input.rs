@@ -41,6 +41,7 @@ pub(super) struct ViewportInteraction {
     last_compass_rect: Option<egui::Rect>,
     last_scale_bar_rect: Option<egui::Rect>,
     last_attribution_rect: Option<egui::Rect>,
+    last_colorbar_rect: Option<egui::Rect>,
     last_viewport_height_px: f64,
     last_viewport_aspect: f64,
 }
@@ -53,6 +54,7 @@ impl Default for ViewportInteraction {
             last_compass_rect: None,
             last_scale_bar_rect: None,
             last_attribution_rect: None,
+            last_colorbar_rect: None,
             last_viewport_height_px: 800.0,
             last_viewport_aspect: 1.6,
         }
@@ -83,6 +85,7 @@ impl ViewportInteraction {
         self.last_compass_rect = None;
         self.last_scale_bar_rect = None;
         self.last_attribution_rect = None;
+        self.last_colorbar_rect = None;
     }
 
     pub(super) fn set_compass_rect(&mut self, rect: egui::Rect) {
@@ -93,15 +96,18 @@ impl ViewportInteraction {
         &mut self,
         scale_bar: Option<egui::Rect>,
         attribution: Option<egui::Rect>,
+        colorbar: Option<egui::Rect>,
     ) {
         self.last_scale_bar_rect = scale_bar;
         self.last_attribution_rect = attribution;
+        self.last_colorbar_rect = colorbar;
     }
 
     fn is_over_hud(&self, pos: egui::Pos2) -> bool {
         self.last_compass_rect.is_some_and(|r| r.contains(pos))
             || self.last_scale_bar_rect.is_some_and(|r| r.contains(pos))
             || self.last_attribution_rect.is_some_and(|r| r.contains(pos))
+            || self.last_colorbar_rect.is_some_and(|r| r.contains(pos))
     }
 
     fn probe_pointer(

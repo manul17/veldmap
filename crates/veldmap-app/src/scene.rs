@@ -11,7 +11,7 @@ use std::time::Duration;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::SourceId;
+use veldmap_core::tile::{SourceId, TileStreamSpec};
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
@@ -22,10 +22,12 @@ use crate::gpu_tiles::{
 };
 use crate::layers::{
     CrsOverride, CursorReadout, LayerId, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
-    OverlayMutation,
+    OverlayMutation, StretchPreset,
 };
 use crate::measure::MeasureSession;
-use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
+use crate::render::{
+    CategoricalPaletteId, ColormapId, DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy,
+};
 use crate::storage::settings::AppSettings;
 use crate::vectors::{VectorIoEvent, VectorLayerId, VectorManager};
 
@@ -95,6 +97,7 @@ struct FrameState {
 /// and cached frame snapshots.
 pub(crate) struct SceneState {
     gpu_tile_cache: GpuTileCache,
+    default_gpu_tile_cache_bytes: usize,
     pending_uploads: PendingUploads,
     decode_shutdown: CancelToken,
     decode_pool: Option<TwoLaneDecodePool>,
@@ -147,8 +150,10 @@ impl SceneState {
             decode_shutdown.clone(),
         );
 
+        let gpu_cap = settings.effective_gpu_tile_cache_bytes(budget.gpu_tile_cache_bytes);
         let scene = Self {
-            gpu_tile_cache: GpuTileCache::new(budget.gpu_tile_cache_bytes),
+            gpu_tile_cache: GpuTileCache::new(gpu_cap),
+            default_gpu_tile_cache_bytes: budget.gpu_tile_cache_bytes,
             pending_uploads,
             decode_shutdown,
             decode_pool: Some(decode_pool),
@@ -348,18 +353,69 @@ impl SceneState {
         self.mark_dirty_if(changed)
     }
 
-    /// Synchronize basemap providers with updated [`AppSettings`], purging any
-    /// superseded live source from VRAM / pending uploads and updating pinned
-    /// roots. Returns `true` if visible scene state changed.
+    pub(crate) fn set_overlay_stream(
+        &mut self,
+        id: LayerId,
+        spec: TileStreamSpec,
+    ) -> Result<bool, String> {
+        let mutation = self.overlays.set_layer_stream(id, spec)?;
+        Ok(self.apply_overlay_mutation(mutation))
+    }
+
+    pub(crate) fn set_overlay_stretch_preset(
+        &mut self,
+        id: LayerId,
+        preset: StretchPreset,
+    ) -> bool {
+        let changed = self.overlays.set_stretch_preset(id, preset);
+        self.mark_dirty_if(changed)
+    }
+
+    pub(crate) fn set_overlay_stretch_range(&mut self, id: LayerId, min: f64, max: f64) -> bool {
+        let changed = self.overlays.set_stretch_range(id, min, max);
+        self.mark_dirty_if(changed)
+    }
+
+    pub(crate) fn set_overlay_colormap(
+        &mut self,
+        id: LayerId,
+        colormap: ColormapId,
+        invert: bool,
+    ) -> bool {
+        let changed = self.overlays.set_colormap(id, colormap, invert);
+        self.mark_dirty_if(changed)
+    }
+
+    pub(crate) fn set_overlay_categorical_palette(
+        &mut self,
+        id: LayerId,
+        palette: CategoricalPaletteId,
+    ) -> bool {
+        let changed = self.overlays.set_categorical_palette(id, palette);
+        self.mark_dirty_if(changed)
+    }
+
+    /// Synchronize basemap providers and GPU tile cache cap with updated
+    /// [`AppSettings`], purging any superseded live source from VRAM / pending
+    /// uploads and updating pinned roots.
     pub(crate) fn sync_basemap_settings(&mut self, settings: &AppSettings) -> bool {
+        let next_gpu_cap =
+            settings.effective_gpu_tile_cache_bytes(self.default_gpu_tile_cache_bytes);
+        let mut gpu_changed = false;
+        if self.gpu_tile_cache.max_bytes() != next_gpu_cap {
+            self.gpu_tile_cache.set_max_bytes(next_gpu_cap);
+            gpu_changed = true;
+        }
         let outcome = self.basemap.sync_settings(settings);
         if let Some(evict) = outcome.evict_source {
             self.purge_source_caches(evict);
         }
         if outcome.changed {
             self.mark_topology_changed();
+        } else if gpu_changed {
+            self.mark_dirty();
         }
-        outcome.changed
+        outcome.changed || gpu_changed
     }
 
     /// Retry failed/offline live tile requests and reconcile providers.

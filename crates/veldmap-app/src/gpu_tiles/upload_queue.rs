@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{DecodedTile, SourceId, TileKey};
+use veldmap_core::tile::{DecodedTile, SourceId, StreamKey, TileKey};
 
 use super::gpu_cache::{GpuTileCache, UploadInsertOutcome};
 
@@ -66,29 +66,31 @@ pub struct UploadBatchReport {
     /// Tiles kept queued because active-frame protection blocked eviction (must
     /// NOT trigger an infinite idle repaint loop on its own).
     pub deferred_protected: usize,
-    /// Largest single uploaded tile byte size observed per source in this pass.
-    pub(crate) max_tile_bytes_by_source: Vec<(SourceId, usize)>,
+    /// Largest single uploaded tile byte size observed per [`StreamKey`] in
+    /// this pass so multi-band/multi-format streams sharing one `SourceId`
+    /// never mis-weight each other's VRAM appetite.
+    pub(crate) max_tile_bytes_by_stream: Vec<(StreamKey, usize)>,
 }
 
 impl UploadBatchReport {
-    /// Return the largest single tile byte size uploaded for `source` during
-    /// this pass (`0` if no tile of `source` was uploaded).
-    pub(crate) fn max_tile_bytes_for(&self, source: SourceId) -> usize {
-        self.max_tile_bytes_by_source
+    /// Return the largest single tile byte size uploaded for `stream` during
+    /// this pass (`0` if no tile of `stream` was uploaded).
+    pub(crate) fn max_tile_bytes_for_stream(&self, stream: StreamKey) -> usize {
+        self.max_tile_bytes_by_stream
             .iter()
-            .find_map(|&(src, bytes)| (src == source).then_some(bytes))
+            .find_map(|&(key, bytes)| (key == stream).then_some(bytes))
             .unwrap_or(0)
     }
 
-    fn record_source_tile_bytes(&mut self, source: SourceId, byte_size: usize) {
+    fn record_stream_tile_bytes(&mut self, stream: StreamKey, byte_size: usize) {
         if let Some((_, max_bytes)) = self
-            .max_tile_bytes_by_source
+            .max_tile_bytes_by_stream
             .iter_mut()
-            .find(|(src, _)| *src == source)
+            .find(|(key, _)| *key == stream)
         {
             *max_bytes = (*max_bytes).max(byte_size);
         } else {
-            self.max_tile_bytes_by_source.push((source, byte_size));
+            self.max_tile_bytes_by_stream.push((stream, byte_size));
         }
     }
 }
@@ -438,7 +440,7 @@ impl PendingUploads {
                     bytes_uploaded = bytes_uploaded.saturating_add(tile.byte_size);
                     report.evicted = report.evicted.saturating_add(ev_count);
                     report.uploaded += 1;
-                    report.record_source_tile_bytes(key.source, tile.byte_size);
+                    report.record_stream_tile_bytes(key.stream_key(), tile.byte_size);
                 }
                 UploadInsertOutcome::RefusedByProtection => {
                     let mut to_drop = Vec::new();

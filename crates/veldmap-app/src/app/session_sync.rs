@@ -96,6 +96,7 @@ impl VeldmapApp {
                     saved.visible,
                     saved.opacity,
                     saved.crs_override(),
+                    saved.style.clone(),
                 )
                 .is_ok()
             {
@@ -124,11 +125,12 @@ impl VeldmapApp {
             .overlays()
             .saved_entries_iter()
             .map(|entry| {
-                SavedLayerEntry::new(
+                SavedLayerEntry::with_style(
                     entry.path.to_path_buf(),
                     entry.visible,
                     entry.opacity,
                     entry.crs_override,
+                    Some(entry.style),
                 )
             })
             .collect();

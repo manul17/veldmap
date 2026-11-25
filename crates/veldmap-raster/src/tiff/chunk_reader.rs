@@ -1,246 +1,25 @@
-//! Pooled `tiff::decoder::Decoder` management and positioned chunk reader
-//! bridging `tiff` to [`Chunked`] and [`SharedChunkCache`].
+//! Stateless direct raw-chunk TIFF reader bridging [`ByteSource`] +
+//! [`CachedIfd`] to [`Chunked`] and [`SharedChunkCache`] across `Display`,
+//! `Scientific` (`R32Float`), and `Categorical` (`R8Uint`/`R16Uint`) streams.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use tiff::decoder::{Decoder, DecodingResult, Limits};
-use veldmap_core::budget::{BudgetLease, DecodeBudgetTracker};
-use veldmap_core::io::{BufferedByteReader, ByteSource};
-use veldmap_core::sync::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::SourceId;
+use veldmap_core::budget::DecodeBudgetTracker;
+use veldmap_core::io::ByteSource;
+use veldmap_core::sync::CancelToken;
+use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileStreamSpec};
 
 use crate::RasterError;
 use crate::pipeline::chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
 use crate::pipeline::driver::Chunked;
 use crate::pipeline::grid;
-use crate::pipeline::plan::DISPLAY_STREAM_SPEC;
-use crate::pipeline::radiometry::DisplayMapping;
+use crate::pipeline::metadata::SampleType;
+use crate::pipeline::radiometry::{
+    DisplayMapping, is_data_f64, raw_bytes_to_rgba, read_native_sample_f64,
+};
 
-use super::format::{TiffFormat, chunk_rgba};
-use super::tags::map_tiff_error;
-use super::ycbcr::YCbCrParams;
-
-/// Maximum idle `tiff::decoder::Decoder` handles retained per [`super::TiffSource`].
-const MAX_POOLED_DECODERS: usize = 8;
-
-/// Open a new `tiff::decoder::Decoder` backed by `byte_source` with explicit
-/// `limits` and cancellation token `cancel`.
-pub(super) fn open_decoder(
-    byte_source: &Arc<dyn ByteSource>,
-    limits: &Limits,
-    cancel: &CancelToken,
-) -> Result<Decoder<BufferedByteReader>, RasterError> {
-    let reader = BufferedByteReader::new(Arc::clone(byte_source), cancel.clone());
-    Ok(Decoder::new(reader)
-        .map_err(|e| map_tiff_error(e, cancel))?
-        .with_limits(limits.clone()))
-}
-
-struct DecoderEntry {
-    decoder: Decoder<BufferedByteReader>,
-    aimed_image: Option<usize>,
-    aimed_chunk_count: Option<u64>,
-}
-
-/// Bounded pool of initialized `Decoder<BufferedByteReader>` instances so
-/// pointwise tile cache misses reuse open decoders without re-reading the TIFF
-/// header and re-walking the IFD chain from byte 0 on every tile.
-pub(super) struct DecoderPool {
-    byte_source: Arc<dyn ByteSource>,
-    limits: Limits,
-    idle: Mutex<Vec<DecoderEntry>>,
-}
-
-impl DecoderPool {
-    pub(super) fn new(
-        byte_source: Arc<dyn ByteSource>,
-        limits: Limits,
-        initial: Option<(Decoder<BufferedByteReader>, usize)>,
-    ) -> Self {
-        let mut entries = Vec::with_capacity(MAX_POOLED_DECODERS);
-        if let Some((mut decoder, aimed_image)) = initial {
-            decoder.inner().set_cancel(CancelToken::new());
-            entries.push(DecoderEntry {
-                decoder,
-                aimed_image: Some(aimed_image),
-                aimed_chunk_count: None,
-            });
-        }
-        Self {
-            byte_source,
-            limits,
-            idle: Mutex::new(entries),
-        }
-    }
-
-    pub(super) fn checkout<'a>(
-        &'a self,
-        cancel: &CancelToken,
-    ) -> Result<PooledDecoder<'a>, RasterError> {
-        if cancel.is_cancelled() {
-            return Err(RasterError::Cancelled);
-        }
-        let entry = if let Some(mut cached) = lock_unpoisoned(&self.idle).pop() {
-            cached.decoder.inner().set_cancel(cancel.clone());
-            cached
-        } else {
-            let decoder = open_decoder(&self.byte_source, &self.limits, cancel)?;
-            DecoderEntry {
-                decoder,
-                aimed_image: Some(0),
-                aimed_chunk_count: None,
-            }
-        };
-        Ok(PooledDecoder {
-            pool: self,
-            entry: Some(entry),
-            clean: false,
-        })
-    }
-}
-
-/// Decoded raw TIFF chunk held together with its active memory-budget lease so
-/// callers keep working-memory reservation alive until post-processing finishes.
-pub(super) struct BudgetedChunk {
-    pub(super) raw: DecodingResult,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    _lease: Option<BudgetLease>,
-}
-
-/// RAII checkout guard returning a clean `Decoder` to [`DecoderPool`] on drop
-/// with its `CancelToken` reset so cancelled requests never poison reuse.
-///
-/// Any mutating operation (`decoder_mut`, `seek_to_image`,
-/// `read_budgeted_chunk`) automatically marks the checkout dirty until the
-/// caller confirms success via [`Self::mark_clean`].
-pub(super) struct PooledDecoder<'a> {
-    pool: &'a DecoderPool,
-    entry: Option<DecoderEntry>,
-    clean: bool,
-}
-
-impl PooledDecoder<'_> {
-    pub(super) fn mark_clean(&mut self) {
-        self.clean = true;
-    }
-
-    fn entry_mut(&mut self) -> &mut DecoderEntry {
-        #[expect(
-            clippy::expect_used,
-            reason = "INVARIANT: entry is only taken inside Drop"
-        )]
-        self.entry.as_mut().expect("pooled decoder present")
-    }
-
-    fn decoder_mut(&mut self) -> &mut Decoder<BufferedByteReader> {
-        self.clean = false;
-        &mut self.entry_mut().decoder
-    }
-
-    pub(super) fn seek_to_image(
-        &mut self,
-        image: usize,
-        cancel: &CancelToken,
-    ) -> Result<(), RasterError> {
-        self.clean = false;
-        let entry = self.entry_mut();
-        if entry.aimed_image == Some(image) {
-            return Ok(());
-        }
-        entry.aimed_image = None;
-        entry.aimed_chunk_count = None;
-        entry
-            .decoder
-            .seek_to_image(image)
-            .map_err(|e| map_tiff_error(e, cancel))?;
-        entry.aimed_image = Some(image);
-        Ok(())
-    }
-
-    /// Compute the total chunk count of the currently aimed IFD, caching it on
-    /// the active entry until the aimed IFD changes, and returning
-    /// [`RasterError::InvalidDimensions`] when either image or chunk
-    /// dimensions are zero.
-    pub(super) fn ifd_chunk_layout(&mut self, cancel: &CancelToken) -> Result<u64, RasterError> {
-        if let Some(count) = self.entry_mut().aimed_chunk_count {
-            return Ok(count);
-        }
-        let (img_w, img_h) = self
-            .decoder_mut()
-            .dimensions()
-            .map_err(|e| map_tiff_error(e, cancel))?;
-        if img_w == 0 || img_h == 0 {
-            return Err(RasterError::InvalidDimensions {
-                width: img_w,
-                height: img_h,
-            });
-        }
-        let (cw, ch) = self.decoder_mut().chunk_dimensions();
-        if cw == 0 || ch == 0 {
-            return Err(RasterError::InvalidDimensions {
-                width: cw,
-                height: ch,
-            });
-        }
-        let count = u64::from(img_w.div_ceil(cw)) * u64::from(img_h.div_ceil(ch));
-        self.entry_mut().aimed_chunk_count = Some(count);
-        Ok(count)
-    }
-
-    /// Read raw chunk `index` from the currently aimed IFD under optional
-    /// working-memory budget tracking.
-    ///
-    /// Returns [`RasterError::InvalidDimensions`] when the chunk reports zero
-    /// width or height so callers can either propagate the error (tile decode)
-    /// or skip empty edge chunks (stretch sampling).
-    pub(super) fn read_budgeted_chunk(
-        &mut self,
-        index: u32,
-        depth: u32,
-        includes_rgba8: bool,
-        budget_tracker: Option<&DecodeBudgetTracker>,
-        cancel: &CancelToken,
-    ) -> Result<BudgetedChunk, RasterError> {
-        let (dw, dh) = self.decoder_mut().chunk_data_dimensions(index);
-        if dw == 0 || dh == 0 {
-            return Err(RasterError::InvalidDimensions {
-                width: dw,
-                height: dh,
-            });
-        }
-        let est_bytes = grid::chunk_working_bytes(dw, dh, depth, includes_rgba8);
-        let lease = match budget_tracker {
-            Some(tracker) => Some(tracker.reserve_blocking(est_bytes, cancel)?),
-            None => None,
-        };
-        let raw = self
-            .decoder_mut()
-            .read_chunk(index)
-            .map_err(|e| map_tiff_error(e, cancel))?;
-        Ok(BudgetedChunk {
-            raw,
-            width: dw,
-            height: dh,
-            _lease: lease,
-        })
-    }
-}
-
-impl Drop for PooledDecoder<'_> {
-    fn drop(&mut self) {
-        if !self.clean {
-            return;
-        }
-        if let Some(mut entry) = self.entry.take() {
-            entry.decoder.inner().set_cancel(CancelToken::new());
-            let mut idle = lock_unpoisoned(&self.pool.idle);
-            if idle.len() < MAX_POOLED_DECODERS {
-                idle.push(entry);
-            }
-        }
-    }
-}
+use super::ifd::{CachedIfd, Photometric, PlanarConfig, TiffByteOrder};
+use super::raw_decode::{RawChunkPayload, decode_raw_chunk};
 
 /// Explicitly models the two chunk-reading modes of [`TiffChunkReader`].
 pub(super) enum ChunkReadMode<'a> {
@@ -255,77 +34,468 @@ pub(super) enum ChunkReadMode<'a> {
     SequentialPass,
 }
 
+/// Stateless raw-chunk reader producing typed [`DecodedChunk`]s for a specific
+/// [`TileStreamSpec`].
 pub(super) struct TiffChunkReader<'a> {
-    decoder_pool: &'a DecoderPool,
+    byte_source: &'a Arc<dyn ByteSource>,
+    byte_order: TiffByteOrder,
     source_id: SourceId,
-    format: TiffFormat,
-    ifd_ycbcr: &'a [(usize, YCbCrParams)],
-    mapping: DisplayMapping,
+    ifds: &'a [CachedIfd],
+    spec: TileStreamSpec,
+    nodata_f64: Option<f64>,
+    display_mapping: Option<DisplayMapping>,
+    max_chunk_bytes: usize,
     mode: ChunkReadMode<'a>,
-    pooled: Option<PooledDecoder<'a>>,
 }
 
 impl<'a> TiffChunkReader<'a> {
+    #[expect(clippy::too_many_arguments, reason = "internal reader constructor")]
     pub(super) fn new(
-        decoder_pool: &'a DecoderPool,
+        byte_source: &'a Arc<dyn ByteSource>,
+        byte_order: TiffByteOrder,
         source_id: SourceId,
-        format: TiffFormat,
-        ifd_ycbcr: &'a [(usize, YCbCrParams)],
-        mapping: DisplayMapping,
+        ifds: &'a [CachedIfd],
+        spec: TileStreamSpec,
+        nodata_f64: Option<f64>,
+        display_mapping: Option<DisplayMapping>,
+        max_chunk_bytes: usize,
         mode: ChunkReadMode<'a>,
     ) -> Self {
         Self {
-            decoder_pool,
+            byte_source,
+            byte_order,
             source_id,
-            format,
-            ifd_ycbcr,
-            mapping,
+            ifds,
+            spec,
+            nodata_f64,
+            display_mapping,
+            max_chunk_bytes,
             mode,
-            pooled: None,
         }
     }
 
-    fn ycbcr_for(&self, image: usize) -> Option<YCbCrParams> {
-        self.ifd_ycbcr
+    fn ifd_for(&self, image: usize) -> Result<&'a CachedIfd, RasterError> {
+        self.ifds
             .iter()
-            .find_map(|&(idx, params)| (idx == image).then_some(params))
+            .find(|i| i.image == image)
+            .ok_or_else(|| RasterError::Decode(format!("TIFF IFD {image} is not cached")))
     }
 
     fn decode_chunk_uncached(
-        &mut self,
+        &self,
         image: usize,
         index: u32,
         budget_tracker: Option<&DecodeBudgetTracker>,
         cancel: &CancelToken,
     ) -> Result<DecodedChunk, RasterError> {
-        let pooled = match self.pooled.as_mut() {
-            Some(pooled) => pooled,
-            None => self.pooled.insert(self.decoder_pool.checkout(cancel)?),
+        let ifd = self.ifd_for(image)?;
+        let (dw, dh) = ifd.chunk_data_dims(index).ok_or_else(|| {
+            RasterError::Decode(format!(
+                "chunk index {index} out of range for IFD {image} ({} chunks)",
+                ifd.chunks_per_plane
+            ))
+        })?;
+        let out_bpp = self.spec.format.bytes_per_pixel() as u32;
+        let raw_depth = match (self.spec.format, ifd.planar) {
+            (PixelFormat::Rgba8UnormSrgb, _) => ifd.raw_pixel_bytes(),
+            (_, PlanarConfig::Planar) => ifd.sample_type.byte_size() as u32,
+            (_, PlanarConfig::Chunky) => ifd.raw_pixel_bytes(),
         };
-        pooled.seek_to_image(image, cancel)?;
-        let total_chunks = pooled.ifd_chunk_layout(cancel)?;
-        if u64::from(index) >= total_chunks {
-            return Err(RasterError::Decode(format!(
-                "chunk index {index} out of range for IFD {image} ({total_chunks} chunks)"
-            )));
-        }
-        let chunk =
-            pooled.read_budgeted_chunk(index, self.format.depth, true, budget_tracker, cancel)?;
-        pooled.mark_clean();
-        let rgba = chunk_rgba(
-            &self.mapping,
-            &chunk.raw,
-            self.format.pixel_layout,
-            self.ycbcr_for(image),
-            chunk.width,
-            chunk.height,
-        )?;
+        let est_bytes = grid::chunk_working_bytes(dw, dh, raw_depth, out_bpp);
+        let _lease = match budget_tracker {
+            Some(tracker) => Some(tracker.reserve_blocking(est_bytes, cancel)?),
+            None => None,
+        };
+
+        let data = match self.spec.format {
+            PixelFormat::Rgba8UnormSrgb => self.decode_display_chunk(ifd, index, dw, dh, cancel)?,
+            PixelFormat::R32Float => self.decode_scientific_chunk(ifd, index, dw, dh, cancel)?,
+            PixelFormat::R8Uint | PixelFormat::R16Uint => {
+                self.decode_categorical_chunk(ifd, index, dw, dh, cancel)?
+            }
+        };
+
         Ok(DecodedChunk {
-            data: rgba,
-            width: chunk.width,
-            height: chunk.height,
+            data,
+            width: dw,
+            height: dh,
+            format: self.spec.format,
         })
     }
+
+    fn band_index(&self, ifd: &CachedIfd) -> Result<usize, RasterError> {
+        let idx = match self.spec.band {
+            BandKey::Display => 0usize,
+            BandKey::Index(i) => usize::from(i),
+            BandKey::NamedHash(_) => {
+                return Err(RasterError::Decode(
+                    "named band hash is not supported by TiffSource".to_owned(),
+                ));
+            }
+        };
+        if idx >= usize::from(ifd.samples_per_pixel) {
+            return Err(RasterError::Decode(format!(
+                "band index {idx} out of range for TIFF with {} samples/pixel",
+                ifd.samples_per_pixel
+            )));
+        }
+        Ok(idx)
+    }
+
+    fn decode_display_chunk(
+        &self,
+        ifd: &CachedIfd,
+        index: u32,
+        dw: u32,
+        dh: u32,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, RasterError> {
+        let pixels = (dw as usize) * (dh as usize);
+        let mapping = self
+            .display_mapping
+            .unwrap_or_else(|| DisplayMapping::identity(self.nodata_f64.map(|v| v as f32)));
+
+        // Palette TIFF: expand ColorMap indices to RGBA8.
+        if ifd.photometric == Photometric::Palette {
+            let color_map = ifd
+                .color_map
+                .as_deref()
+                .ok_or_else(|| RasterError::Decode("Palette TIFF missing ColorMap".to_owned()))?;
+            let (_, _, payload) = decode_raw_chunk(
+                self.byte_source.as_ref(),
+                ifd,
+                self.byte_order,
+                0,
+                index,
+                self.max_chunk_bytes,
+                cancel,
+            )?;
+            let RawChunkPayload::Bytes { data, .. } = payload else {
+                return Ok(vec![0u8; pixels * 4]);
+            };
+            let alpha_plane = if ifd.planar == PlanarConfig::Planar {
+                if let Some(a_ch) = ifd.alpha_channel {
+                    match decode_raw_chunk(
+                        self.byte_source.as_ref(),
+                        ifd,
+                        self.byte_order,
+                        a_ch,
+                        index,
+                        self.max_chunk_bytes,
+                        cancel,
+                    )?
+                    .2
+                    {
+                        RawChunkPayload::Bytes { data, .. } => Some(data),
+                        RawChunkPayload::Sparse => {
+                            // Sparse alpha plane means alpha == 0 across the chunk.
+                            return Ok(vec![0u8; pixels * 4]);
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let palette_alpha = match (ifd.planar, ifd.alpha_channel, alpha_plane.as_deref()) {
+                (PlanarConfig::Planar, Some(_), Some(ap)) => PaletteAlpha::Planar(ap),
+                (PlanarConfig::Chunky, Some(a_ch), _) => PaletteAlpha::Chunky(a_ch),
+                _ => PaletteAlpha::None,
+            };
+            return Ok(expand_palette_to_rgba(
+                &data,
+                palette_alpha,
+                ifd,
+                color_map,
+                self.nodata_f64,
+                pixels,
+            ));
+        }
+
+        // PlanarConfiguration = 2 display read: read needed planes and interleave.
+        if ifd.planar == PlanarConfig::Planar {
+            let need_planes: Vec<usize> = match (ifd.pixel_layout.colors(), ifd.alpha_channel) {
+                (1, None) => vec![0],
+                (1, Some(a)) => vec![0, a],
+                (_, None) => vec![0, 1, 2],
+                (_, Some(a)) => vec![0, 1, 2, a],
+            };
+            let sample_bytes = ifd.sample_type.byte_size();
+            let interleaved_spp = need_planes.len();
+            let mut interleaved = vec![0u8; pixels * interleaved_spp * sample_bytes];
+            let mut any_non_sparse = false;
+            let mut jpeg_already_rgb = false;
+
+            for (slot, &plane) in need_planes.iter().enumerate() {
+                let (_, _, payload) = decode_raw_chunk(
+                    self.byte_source.as_ref(),
+                    ifd,
+                    self.byte_order,
+                    plane,
+                    index,
+                    self.max_chunk_bytes,
+                    cancel,
+                )?;
+                if let RawChunkPayload::Bytes {
+                    data,
+                    jpeg_already_rgb: jrgb,
+                } = payload
+                {
+                    any_non_sparse = true;
+                    jpeg_already_rgb |= jrgb;
+                    for px in 0..pixels {
+                        let s = px * sample_bytes;
+                        let d = (px * interleaved_spp + slot) * sample_bytes;
+                        if s + sample_bytes <= data.len() && d + sample_bytes <= interleaved.len() {
+                            interleaved[d..d + sample_bytes]
+                                .copy_from_slice(&data[s..s + sample_bytes]);
+                        }
+                    }
+                }
+            }
+            if !any_non_sparse {
+                return Ok(vec![0u8; pixels * 4]);
+            }
+            if let Some(params) = ifd.ycbcr
+                && !jpeg_already_rgb
+                && ifd.sample_type == SampleType::U8
+            {
+                return Ok(params.convert_u8_to_rgba(&interleaved, pixels, mapping.nodata()));
+            }
+            let packed_layout = match (ifd.pixel_layout.colors(), ifd.alpha_channel.is_some()) {
+                (1, false) => crate::pipeline::radiometry::PixelLayout::named(1),
+                (1, true) => crate::pipeline::radiometry::PixelLayout::named(2),
+                (_, false) => crate::pipeline::radiometry::PixelLayout::named(3),
+                (_, true) => crate::pipeline::radiometry::PixelLayout::named(4),
+            };
+            return Ok(raw_bytes_to_rgba(
+                &mapping,
+                &interleaved,
+                ifd.sample_type,
+                packed_layout,
+                pixels,
+            ));
+        }
+
+        // Chunky display read.
+        let (_, _, payload) = decode_raw_chunk(
+            self.byte_source.as_ref(),
+            ifd,
+            self.byte_order,
+            0,
+            index,
+            self.max_chunk_bytes,
+            cancel,
+        )?;
+        let RawChunkPayload::Bytes {
+            data,
+            jpeg_already_rgb,
+        } = payload
+        else {
+            return Ok(vec![0u8; pixels * 4]);
+        };
+
+        if let Some(params) = ifd.ycbcr
+            && !jpeg_already_rgb
+            && ifd.sample_type == SampleType::U8
+        {
+            return Ok(params.convert_u8_to_rgba(&data, pixels, mapping.nodata()));
+        }
+
+        Ok(raw_bytes_to_rgba(
+            &mapping,
+            &data,
+            ifd.sample_type,
+            ifd.pixel_layout,
+            pixels,
+        ))
+    }
+
+    fn decode_scientific_chunk(
+        &self,
+        ifd: &CachedIfd,
+        index: u32,
+        dw: u32,
+        dh: u32,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, RasterError> {
+        let band = self.band_index(ifd)?;
+        let pixels = (dw as usize) * (dh as usize);
+        let plane = match ifd.planar {
+            PlanarConfig::Planar => band,
+            PlanarConfig::Chunky => 0,
+        };
+        let (_, _, payload) = decode_raw_chunk(
+            self.byte_source.as_ref(),
+            ifd,
+            self.byte_order,
+            plane,
+            index,
+            self.max_chunk_bytes,
+            cancel,
+        )?;
+        let RawChunkPayload::Bytes { data, .. } = payload else {
+            // Sparse chunk -> all NaN.
+            let nan = f32::NAN.to_ne_bytes();
+            let mut out = Vec::with_capacity(pixels * 4);
+            for _ in 0..pixels {
+                out.extend_from_slice(&nan);
+            }
+            return Ok(out);
+        };
+
+        let (stride, ch_offset) = match ifd.planar {
+            PlanarConfig::Planar => (1usize, 0usize),
+            PlanarConfig::Chunky => (usize::from(ifd.samples_per_pixel), band),
+        };
+        let mut out = Vec::with_capacity(pixels * 4);
+        for px in 0..pixels {
+            let sample_idx = px * stride + ch_offset;
+            let raw_f64 = read_native_sample_f64(&data, ifd.sample_type, sample_idx);
+            let out_val = match raw_f64 {
+                Some(v) if is_data_f64(v, self.nodata_f64) => {
+                    let f = v as f32;
+                    if f.is_finite() { f } else { f32::NAN }
+                }
+                _ => f32::NAN,
+            };
+            out.extend_from_slice(&out_val.to_ne_bytes());
+        }
+        Ok(out)
+    }
+
+    fn decode_categorical_chunk(
+        &self,
+        ifd: &CachedIfd,
+        index: u32,
+        dw: u32,
+        dh: u32,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, RasterError> {
+        let band = self.band_index(ifd)?;
+        let pixels = (dw as usize) * (dh as usize);
+        let bpp = self.spec.format.bytes_per_pixel();
+        let plane = match ifd.planar {
+            PlanarConfig::Planar => band,
+            PlanarConfig::Chunky => 0,
+        };
+        let (_, _, payload) = decode_raw_chunk(
+            self.byte_source.as_ref(),
+            ifd,
+            self.byte_order,
+            plane,
+            index,
+            self.max_chunk_bytes,
+            cancel,
+        )?;
+        let RawChunkPayload::Bytes { mut data, .. } = payload else {
+            // Sparse categorical chunk -> nodata value (if integer) or 0.
+            let fill_u16 = self
+                .nodata_f64
+                .filter(|v| v.is_finite() && *v >= 0.0 && *v <= f64::from(u16::MAX))
+                .map_or(0u16, |v| v.round() as u16);
+            return Ok(match self.spec.format {
+                PixelFormat::R8Uint => vec![fill_u16.min(255) as u8; pixels],
+                PixelFormat::R16Uint => {
+                    let b = fill_u16.to_ne_bytes();
+                    let mut out = Vec::with_capacity(pixels * 2);
+                    for _ in 0..pixels {
+                        out.extend_from_slice(&b);
+                    }
+                    out
+                }
+                _ => vec![0u8; pixels * bpp],
+            });
+        };
+
+        let (stride, ch_offset) = match ifd.planar {
+            PlanarConfig::Planar => (1usize, 0usize),
+            PlanarConfig::Chunky => (usize::from(ifd.samples_per_pixel), band),
+        };
+        match (self.spec.format, ifd.sample_type) {
+            (PixelFormat::R8Uint, SampleType::U8) if stride == 1 => {
+                data.truncate(pixels);
+                Ok(data)
+            }
+            (PixelFormat::R8Uint, SampleType::U8) => {
+                let mut out = Vec::with_capacity(pixels);
+                for px in 0..pixels {
+                    out.push(data[px * stride + ch_offset]);
+                }
+                Ok(out)
+            }
+            (PixelFormat::R16Uint, SampleType::U16) if stride == 1 => {
+                data.truncate(pixels * 2);
+                Ok(data)
+            }
+            (PixelFormat::R16Uint, SampleType::U16) => {
+                let mut out = Vec::with_capacity(pixels * 2);
+                for px in 0..pixels {
+                    let off = (px * stride + ch_offset) * 2;
+                    out.extend_from_slice(&data[off..off + 2]);
+                }
+                Ok(out)
+            }
+            (PixelFormat::R16Uint, SampleType::U8) => {
+                let mut out = Vec::with_capacity(pixels * 2);
+                for px in 0..pixels {
+                    let val = u16::from(data[px * stride + ch_offset]);
+                    out.extend_from_slice(&val.to_ne_bytes());
+                }
+                Ok(out)
+            }
+            (fmt, st) => Err(RasterError::Decode(format!(
+                "categorical format {fmt:?} is incompatible with source sample type {st:?}"
+            ))),
+        }
+    }
+}
+
+enum PaletteAlpha<'a> {
+    None,
+    Chunky(usize),
+    Planar(&'a [u8]),
+}
+
+fn expand_palette_to_rgba(
+    data: &[u8],
+    alpha_mode: PaletteAlpha<'_>,
+    ifd: &CachedIfd,
+    color_map: &[[u8; 4]],
+    nodata_f64: Option<f64>,
+    pixels: usize,
+) -> Vec<u8> {
+    let mut rgba = vec![0u8; pixels * 4];
+    let chunky_spp = match ifd.planar {
+        PlanarConfig::Chunky => usize::from(ifd.samples_per_pixel),
+        PlanarConfig::Planar => 1,
+    };
+    for (px, dst) in rgba.chunks_exact_mut(4).enumerate() {
+        let Some(raw_val) = read_native_sample_f64(data, ifd.sample_type, px * chunky_spp) else {
+            continue;
+        };
+        if !is_data_f64(raw_val, nodata_f64) {
+            continue;
+        }
+        let idx = raw_val.round().clamp(0.0, (color_map.len() - 1) as f64) as usize;
+        let mut color = color_map[idx];
+        let alpha_val = match alpha_mode {
+            PaletteAlpha::None => None,
+            PaletteAlpha::Planar(ap) => read_native_sample_f64(ap, ifd.sample_type, px),
+            PaletteAlpha::Chunky(a_ch) => {
+                read_native_sample_f64(data, ifd.sample_type, px * chunky_spp + a_ch)
+            }
+        };
+        if let Some(a) = alpha_val {
+            color[3] = match ifd.sample_type {
+                SampleType::U16 => ((a.clamp(0.0, 65535.0) as u16) >> 8) as u8,
+                _ => a.round().clamp(0.0, 255.0) as u8,
+            };
+        }
+        dst.copy_from_slice(&color);
+    }
+    rgba
 }
 
 impl Chunked for TiffChunkReader<'_> {
@@ -345,11 +515,10 @@ impl Chunked for TiffChunkReader<'_> {
             } => {
                 let key = ChunkKey {
                     source: self.source_id,
-                    spec: DISPLAY_STREAM_SPEC,
+                    spec: self.spec,
                     image,
                     chunk_index: index,
                 };
-
                 chunk_cache.get_or_decode(key, cancel, || {
                     self.decode_chunk_uncached(image, index, Some(budget_tracker), cancel)
                 })

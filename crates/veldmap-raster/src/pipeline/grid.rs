@@ -13,14 +13,10 @@ use super::resample::Window;
 const MIN_CHUNK_PIXELS: u64 = 32 * 32;
 
 /// Working memory in bytes for decoding a `dw x dh` chunk with `depth` raw
-/// bytes/pixel, optionally adding 4 bytes/pixel for RGBA8 display expansion.
-pub(crate) fn chunk_working_bytes(
-    dw: u32,
-    dh: u32,
-    depth: u32,
-    includes_rgba8_output: bool,
-) -> u64 {
-    let per_pixel = u64::from(depth).saturating_add(if includes_rgba8_output { 4 } else { 0 });
+/// bytes/pixel plus `output_bpp` converted output bytes/pixel (`0` for raw-only
+/// statistics sampling, `4` for RGBA8/R32Float, `2` for R16Uint, `1` for R8Uint).
+pub(crate) fn chunk_working_bytes(dw: u32, dh: u32, depth: u32, output_bpp: u32) -> u64 {
+    let per_pixel = u64::from(depth).saturating_add(u64::from(output_bpp));
     u64::from(dw)
         .saturating_mul(u64::from(dh))
         .saturating_mul(per_pixel)
@@ -85,12 +81,13 @@ impl Grid {
         best
     }
 
-    /// Compute the pointwise reading footprint for `level`, or `None` when the
-    /// level must be served via sequential pass.
+    /// Compute the pointwise reading footprint for `level` and `format`, or
+    /// `None` when the level must be served via sequential pass.
     pub(super) fn footprint(
         &self,
         base: (u32, u32),
         level: u8,
+        format: PixelFormat,
         budget: &MemoryBudget,
     ) -> Option<Footprint> {
         if base.0 == 0 || base.1 == 0 {
@@ -118,13 +115,14 @@ impl Grid {
         let rw = side(num_x, den_x, sw, aligned_x);
         let rh = side(num_y, den_y, sh, aligned_y);
         let region_pixels = rw.saturating_mul(rh);
-        if region_pixels > budget.region_cap_pixels_for(PixelFormat::Rgba8UnormSrgb) {
+        if region_pixels > budget.region_cap_pixels_for(format) {
             return None;
         }
 
+        let bpp = format.bytes_per_pixel() as u64;
         let held_pixels =
             spanned(rw, cw, sw, aligned_x).saturating_mul(spanned(rh, ch, sh, aligned_y));
-        if held_pixels.saturating_mul(4) > budget.decoded_chunk_cache_bytes as u64 {
+        if held_pixels.saturating_mul(bpp) > budget.decoded_chunk_cache_bytes as u64 {
             return None;
         }
         Some(Footprint {
@@ -133,19 +131,32 @@ impl Grid {
         })
     }
 
-    /// Peak memory of decoding one fresh chunk `(cw, ch)` before expansion.
-    fn chunk_bytes(&self, chunk: (u32, u32)) -> u64 {
-        chunk_working_bytes(chunk.0, chunk.1, self.depth, true)
+    /// Peak memory of decoding one fresh chunk `(cw, ch)` into `format`.
+    fn chunk_bytes(&self, chunk: (u32, u32), format: PixelFormat) -> u64 {
+        chunk_working_bytes(
+            chunk.0,
+            chunk.1,
+            self.depth,
+            format.bytes_per_pixel() as u32,
+        )
     }
 
     /// Estimated per-operation working memory peak for an already-computed
     /// pointwise [`Footprint`] (`region + fresh chunk + output tile`; excludes
     /// the independent fixed-cap global [`super::chunk_cache::SharedChunkCache`]).
-    pub(super) fn direct_peak_for_footprint(&self, fp: &Footprint) -> DecodePeak {
-        let tile = u64::from(RASTER_TILE_SIZE) * u64::from(RASTER_TILE_SIZE) * 4;
+    pub(super) fn direct_peak_for_footprint(
+        &self,
+        fp: &Footprint,
+        format: PixelFormat,
+    ) -> DecodePeak {
+        let bpp = format.bytes_per_pixel() as u64;
+        let tile = u64::from(RASTER_TILE_SIZE) * u64::from(RASTER_TILE_SIZE) * bpp;
         DecodePeak::new()
-            .with("region", fp.region_pixels.saturating_mul(4))
-            .with("fresh chunk", self.chunk_bytes(self.chunk_of(fp.image)))
+            .with("region", fp.region_pixels.saturating_mul(bpp))
+            .with(
+                "fresh chunk",
+                self.chunk_bytes(self.chunk_of(fp.image), format),
+            )
             .with("tile", tile)
     }
 
@@ -158,22 +169,24 @@ impl Grid {
         level: u8,
         budget: &MemoryBudget,
     ) -> Option<DecodePeak> {
-        let fp = self.footprint(base, level, budget)?;
-        Some(self.direct_peak_for_footprint(&fp))
+        let fp = self.footprint(base, level, PixelFormat::Rgba8UnormSrgb, budget)?;
+        Some(self.direct_peak_for_footprint(&fp, PixelFormat::Rgba8UnormSrgb))
     }
 
-    /// Estimated working memory peak for a full sequential pass over `base`.
-    pub(crate) fn pass_peak(&self, base: (u32, u32)) -> DecodePeak {
+    /// Estimated working memory peak for a full sequential pass over `base`
+    /// in `format`.
+    pub(crate) fn pass_peak(&self, base: (u32, u32), format: PixelFormat) -> DecodePeak {
         let (width, height) = base;
+        let bpp = format.bytes_per_pixel() as u64;
         DecodePeak::new()
             .with(
                 "band",
                 u64::from(width)
                     .saturating_mul(u64::from(self.chunk.1))
-                    .saturating_mul(4),
+                    .saturating_mul(bpp),
             )
-            .with("fresh chunk", self.chunk_bytes(self.chunk))
-            .with("cascade", cascade::bytes(width, height))
+            .with("fresh chunk", self.chunk_bytes(self.chunk, format))
+            .with("cascade", cascade::bytes_for_format(width, height, format))
     }
 }
 

@@ -269,7 +269,15 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_evict
     .expect("send stale");
     h.manager.record_upload_report(&UploadBatchReport {
         uploaded: 1,
-        max_tile_bytes_by_source: vec![(gibs_source, 2 * 1024 * 1024)],
+        max_tile_bytes_by_stream: vec![(
+            veldmap_core::tile::StreamKey::new(
+                gibs_source,
+                veldmap_core::tile::BandKey::Display,
+                PixelFormat::Rgba8UnormSrgb,
+                0,
+            ),
+            2 * 1024 * 1024,
+        )],
         ..UploadBatchReport::default()
     });
     assert_eq!(h.manager.observed_live_tile_bytes, 2 * 1024 * 1024);

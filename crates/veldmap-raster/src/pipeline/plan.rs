@@ -22,14 +22,26 @@ pub const MAX_SOURCE_SIDE: u32 = 65_536;
 /// Current display decode revision encoded into analytical display `TileKey`s.
 const DISPLAY_DECODE_REV: u32 = 1;
 
+/// Current scientific/categorical decode revision encoded into `TileKey`s.
+const TRACK_DECODE_REV: u32 = 1;
+
 /// Canonical display stream spec shared across analytical display decoders
 /// (`TiffSource`, `PngSource`, `JpegSource`).
-pub(crate) const DISPLAY_STREAM_SPEC: TileStreamSpec = TileStreamSpec::new(
+pub const DISPLAY_STREAM_SPEC: TileStreamSpec = TileStreamSpec::new(
     BandKey::Display,
     PixelFormat::Rgba8UnormSrgb,
     0,
     DISPLAY_DECODE_REV,
 );
+
+/// Construct the canonical [`TileStreamSpec`] for `(band, format)` (`gutter = 0`).
+pub const fn stream_spec_for_band(band: BandKey, format: PixelFormat) -> TileStreamSpec {
+    let rev = match format {
+        PixelFormat::Rgba8UnormSrgb => DISPLAY_DECODE_REV,
+        PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => TRACK_DECODE_REV,
+    };
+    TileStreamSpec::new(band, format, 0, rev)
+}
 
 /// Enforce [`MAX_SOURCE_SIDE`] on untiled/full-frame raster dimensions.
 pub(crate) fn check_max_source_side(width: u32, height: u32) -> Result<(), RasterError> {
@@ -169,11 +181,13 @@ impl PyramidMeta {
     }
 }
 
-/// Build the per-level serving plan (`0..level_count`) for a chunked raster.
-pub(crate) fn build_chunked_level_table(
+/// Build the per-level serving plan (`0..level_count`) for a chunked raster in
+/// `format`.
+pub(crate) fn build_chunked_level_table_for_format(
     grid: &Grid,
     width: u32,
     height: u32,
+    format: PixelFormat,
     budget: &MemoryBudget,
 ) -> Vec<LevelPlan> {
     let base = (width, height);
@@ -182,9 +196,9 @@ pub(crate) fn build_chunked_level_table(
     (0..count)
         .map(|lvl_u32| {
             let level = lvl_u32 as u8;
-            match grid.footprint(base, level, budget) {
+            match grid.footprint(base, level, format, budget) {
                 Some(fp) => {
-                    let peak = grid.direct_peak_for_footprint(&fp).total();
+                    let peak = grid.direct_peak_for_footprint(&fp, format).total();
                     LevelPlan {
                         serve: ServeMode::Pointwise,
                         estimated_peak_bytes: peak,
@@ -192,7 +206,7 @@ pub(crate) fn build_chunked_level_table(
                     }
                 }
                 None => {
-                    let peak = grid.pass_peak(base).total();
+                    let peak = grid.pass_peak(base, format).total();
                     LevelPlan {
                         serve: ServeMode::Pass { from: 0 },
                         estimated_peak_bytes: peak,
@@ -202,6 +216,16 @@ pub(crate) fn build_chunked_level_table(
             }
         })
         .collect()
+}
+
+/// Build the per-level serving plan (`0..level_count`) for an RGBA8 display raster.
+pub(crate) fn build_chunked_level_table(
+    grid: &Grid,
+    width: u32,
+    height: u32,
+    budget: &MemoryBudget,
+) -> Vec<LevelPlan> {
+    build_chunked_level_table_for_format(grid, width, height, PixelFormat::Rgba8UnormSrgb, budget)
 }
 
 #[cfg(test)]

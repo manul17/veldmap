@@ -1,12 +1,13 @@
 //! `egui_wgpu` viewport bridge ([`GlobePaintCallback`] and logical-to-physical
-//! viewport pixel mapping).
+//! viewport pixel mapping) using the hoisted [`TileBindGroupCache`] inside
+//! `egui_wgpu::CallbackResources`.
 
 use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor};
 
-use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams};
+use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams, TileBindGroupCache};
 
 /// Estimate physical viewport dimensions from `egui::Context` during `App::ui`
 /// (where `egui_wgpu::ScreenDescriptor::size_in_pixels` is not exposed yet;
@@ -30,7 +31,7 @@ pub(super) fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (u32, u3
 }
 
 /// `egui_wgpu` paint callback bridging an immutable `Arc<DrawSnapshot>` into
-/// the offscreen [`GlobeRenderer`].
+/// the offscreen [`GlobeRenderer`] and hoisted [`TileBindGroupCache`].
 pub(super) struct GlobePaintCallback {
     pub(super) rect: egui::Rect,
     pub(super) snapshot: Arc<DrawSnapshot>,
@@ -45,30 +46,50 @@ impl CallbackTrait for GlobePaintCallback {
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() else {
-            return Vec::new();
-        };
-
         let vp = egui::epaint::ViewportInPixels::from_points(
             &self.rect,
             screen_descriptor.pixels_per_point,
             screen_descriptor.size_in_pixels,
         );
         if vp.width_px <= 0 || vp.height_px <= 0 {
-            renderer.sweep_stale_bind_groups();
+            if let Some(bg) = callback_resources.get_mut::<TileBindGroupCache>() {
+                bg.sweep_stale();
+            }
             return Vec::new();
         }
 
-        renderer.render_if_dirty(
-            device,
-            queue,
-            egui_encoder,
-            RenderParams {
-                width: vp.width_px as u32,
-                height: vp.height_px as u32,
-                snapshot: &self.snapshot,
-            },
-        );
+        // Temporarily extract the hoisted `TileBindGroupCache` so both
+        // resources can be borrowed mutably without nested locks.
+        let Some(mut bind_groups) = callback_resources.remove::<TileBindGroupCache>() else {
+            if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
+                renderer.render_if_dirty(
+                    device,
+                    queue,
+                    egui_encoder,
+                    RenderParams {
+                        width: vp.width_px as u32,
+                        height: vp.height_px as u32,
+                        snapshot: &self.snapshot,
+                    },
+                );
+            }
+            return Vec::new();
+        };
+
+        if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
+            renderer.render_if_dirty_with_bind_groups(
+                device,
+                queue,
+                egui_encoder,
+                RenderParams {
+                    width: vp.width_px as u32,
+                    height: vp.height_px as u32,
+                    snapshot: &self.snapshot,
+                },
+                &mut bind_groups,
+            );
+        }
+        callback_resources.insert(bind_groups);
         Vec::new()
     }
 

@@ -50,6 +50,7 @@ impl VeldmapApp {
             true,
             1.0,
             crs_override,
+            None,
         ) {
             tracing::warn!(path = %path.display(), error = %err, "Failed to queue overlay open");
             self.panels.layers.push_error(err);
@@ -116,6 +117,38 @@ impl VeldmapApp {
                     let changed = self.scene.set_overlay_opacity(id, opacity);
                     needs_repaint |= changed;
                     session_dirty |= commit;
+                }
+                LayerUiAction::SetStream(id, spec) => {
+                    match self.scene.set_overlay_stream(id, spec) {
+                        Ok(changed) => {
+                            needs_repaint |= changed;
+                            session_dirty |= changed;
+                        }
+                        Err(err) => {
+                            self.panels.layers.push_error(err);
+                            needs_repaint = true;
+                        }
+                    }
+                }
+                LayerUiAction::SetStretchPreset(id, preset) => {
+                    let changed = self.scene.set_overlay_stretch_preset(id, preset);
+                    needs_repaint |= changed;
+                    session_dirty |= changed;
+                }
+                LayerUiAction::SetStretchRange(id, min, max, commit) => {
+                    let changed = self.scene.set_overlay_stretch_range(id, min, max);
+                    needs_repaint |= changed;
+                    session_dirty |= commit;
+                }
+                LayerUiAction::SetColormap(id, colormap, invert) => {
+                    let changed = self.scene.set_overlay_colormap(id, colormap, invert);
+                    needs_repaint |= changed;
+                    session_dirty |= changed;
+                }
+                LayerUiAction::SetCategoricalPalette(id, palette) => {
+                    let changed = self.scene.set_overlay_categorical_palette(id, palette);
+                    needs_repaint |= changed;
+                    session_dirty |= changed;
                 }
                 LayerUiAction::MoveUp(id) => {
                     let changed = self.scene.move_overlay_up(id);

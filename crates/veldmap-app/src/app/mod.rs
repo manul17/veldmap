@@ -20,7 +20,7 @@ use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
 use crate::gpu_tiles::UploadChannelClosed;
-use crate::render::GlobeRenderer;
+use crate::render::{GlobeRenderer, TileBindGroupCache};
 use crate::scene::{SceneRepaintHint, SceneState};
 use crate::storage::AppStorage;
 use crate::storage::session::SavedCameraPose;
@@ -134,12 +134,17 @@ impl VeldmapApp {
                 tracing::error!(?reason, %message, "wgpu device lost");
             });
 
-        let renderer = GlobeRenderer::new(&render_state.device, render_state.target_format);
-        render_state
-            .renderer
-            .write()
-            .callback_resources
-            .insert(renderer);
+        let bind_groups = TileBindGroupCache::new(&render_state.device);
+        let renderer = GlobeRenderer::new_with_shared_bind_groups(
+            &render_state.device,
+            render_state.target_format,
+            &bind_groups,
+        );
+        {
+            let mut wgpu_renderer = render_state.renderer.write();
+            wgpu_renderer.callback_resources.insert(bind_groups);
+            wgpu_renderer.callback_resources.insert(renderer);
+        }
 
         let device = render_state.device.clone();
         let queue = render_state.queue.clone();
@@ -231,7 +236,7 @@ impl VeldmapApp {
                         GlobePaintCallback { rect, snapshot },
                     ));
 
-                    // Floating dynamic metric scale bar & basemap attribution pill.
+                    // Floating dynamic metric scale bar, scientific colorbar, and basemap attribution pill.
                     let m_per_pt = self.camera.metres_per_pixel(height_pt);
                     let scale_rect = hud::paint_scale_bar(&painter, rect, m_per_pt);
                     let attr_rect = self
@@ -239,7 +244,13 @@ impl VeldmapApp {
                         .basemap()
                         .attribution()
                         .and_then(|attr| hud::paint_attribution_badge(&painter, rect, attr));
-                    self.viewport.set_hud_rects(scale_rect, attr_rect);
+                    let colorbar_rect = self
+                        .scene
+                        .overlays()
+                        .topmost_colorbar_info()
+                        .and_then(|cb| hud::paint_colorbar(&painter, rect, &cb));
+                    self.viewport
+                        .set_hud_rects(scale_rect, attr_rect, colorbar_rect);
                 } else {
                     self.scene.clear_cached_snapshot();
                     self.viewport.clear_viewport();

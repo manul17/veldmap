@@ -13,9 +13,70 @@ use super::plan::LevelPlan;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SampleType {
     U8,
+    I8,
     U16,
     I16,
+    U32,
+    I32,
+    F16,
     F32,
+    F64,
+}
+
+impl SampleType {
+    /// Storage width of one sample in bytes.
+    pub const fn byte_size(self) -> usize {
+        match self {
+            Self::U8 | Self::I8 => 1,
+            Self::U16 | Self::I16 | Self::F16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
+    }
+
+    /// Return whether this sample type maps losslessly into an unsigned 8- or
+    /// 16-bit categorical GPU track (`R8Uint` / `R16Uint`).
+    pub const fn categorical_pixel_format(self) -> Option<PixelFormat> {
+        match self {
+            Self::U8 => Some(PixelFormat::R8Uint),
+            Self::U16 => Some(PixelFormat::R16Uint),
+            _ => None,
+        }
+    }
+}
+
+/// Zoom-invariant native-resolution CPU sample readout for a raster band.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BandSample {
+    /// Display composite `RGBA8` pixel.
+    Rgba([u8; 4]),
+    /// Scientific scalar pixel with raw source value and physical `raw * scale + offset`.
+    Scalar { raw: f64, physical: f64 },
+    /// Categorical discrete class or QA bitmask value.
+    Categorical(u16),
+    /// Pixel lies inside raster bounds but carries declared nodata / NaN / alpha = 0.
+    Nodata,
+    /// Pixel lies outside raster bounds or source cannot sample pointwise.
+    Unavailable,
+}
+
+/// Number of histogram bins exposed in [`BandStats`].
+pub const HISTOGRAM_BINS: usize = 64;
+
+/// Sampled band statistics and histograms in physical value space (`val * scale + offset`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BandStats {
+    pub min: f64,
+    pub max: f64,
+    pub p2: f64,
+    pub p98: f64,
+    pub db_min: Option<f64>,
+    pub db_max: Option<f64>,
+    pub db_p2: Option<f64>,
+    pub db_p98: Option<f64>,
+    pub sample_count: u64,
+    pub histogram: [u32; HISTOGRAM_BINS],
+    pub db_histogram: [u32; HISTOGRAM_BINS],
 }
 
 /// Metadata for one display composite or scientific/categorical band in a
@@ -55,6 +116,33 @@ impl BandInfo {
             nodata,
             channels,
             has_alpha,
+        }
+    }
+
+    /// Construct a scientific or categorical single-band entry (`BandKey::Index(index)`).
+    #[expect(clippy::too_many_arguments, reason = "band metadata constructor")]
+    pub(crate) fn band(
+        index: u16,
+        name: Option<String>,
+        units: Option<String>,
+        pixel_format: PixelFormat,
+        sample_type: SampleType,
+        scale: f64,
+        offset: f64,
+        nodata: Option<f64>,
+    ) -> Self {
+        Self {
+            band_key: BandKey::Index(index),
+            index,
+            name,
+            units,
+            pixel_format,
+            sample_type,
+            scale,
+            offset,
+            nodata,
+            channels: 1,
+            has_alpha: false,
         }
     }
 }
@@ -127,5 +215,17 @@ impl RasterDescription {
     /// (an affine placement or tie-point grid) for a CRS override to bind it.
     pub fn can_override_crs(&self) -> bool {
         self.placement.is_some() || !self.ties.is_empty()
+    }
+
+    /// Look up band metadata by [`BandKey`].
+    pub fn band_info(&self, band: BandKey) -> Option<&BandInfo> {
+        self.bands.iter().find(|b| b.band_key == band)
+    }
+
+    /// Iterate over individual indexed bands (`BandKey::Index(_)`).
+    pub fn indexed_bands(&self) -> impl Iterator<Item = &BandInfo> {
+        self.bands
+            .iter()
+            .filter(|b| matches!(b.band_key, BandKey::Index(_)))
     }
 }

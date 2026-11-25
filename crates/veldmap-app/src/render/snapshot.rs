@@ -9,6 +9,7 @@ use veldmap_core::tile::{QuadTileId, QuadtreeConfig, SourceId, TileKey, VisibleT
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
 
+use super::colormap::{CategoricalPaletteId, ColormapId};
 use super::graticule::adaptive_grid_step_deg;
 
 /// Cache identity for an uploaded overlay cell warp-mesh vertex buffer.
@@ -71,10 +72,38 @@ pub struct DrawOverlayPatch {
     pub texture: Arc<GpuTile>,
 }
 
+/// Per-layer rendering track configuration for [`DrawOverlayLayer`].
+#[derive(Clone, Debug)]
+pub enum DrawOverlayTrack {
+    /// Pre-stretched 8-bit `Rgba8UnormSrgb` display composite.
+    Display,
+    /// Raw `R32Float` scientific data rendered with 8-tap nodata-aware
+    /// trilinear filtering, canonical `val * scale + offset` physical scaling,
+    /// live linear or `log10` dB stretch, and a 256-entry colormap LUT.
+    Scientific {
+        scale: f32,
+        offset: f32,
+        stretch_min: f32,
+        stretch_max: f32,
+        log10_db: bool,
+        colormap: ColormapId,
+        invert_colormap: bool,
+    },
+    /// Discrete `R8Uint` / `R16Uint` categorical class or QA bitmask layer
+    /// rendered with exact nearest-neighbor sampling and a class palette LUT.
+    Categorical {
+        source: SourceId,
+        palette: CategoricalPaletteId,
+        custom_color_map: Option<Arc<[[u8; 4]]>>,
+        nodata_value: Option<u32>,
+    },
+}
+
 /// Ordered draped raster overlay layer in painter's order (bottom-to-top).
 #[derive(Clone, Debug)]
 pub struct DrawOverlayLayer {
     pub opacity: f32,
+    pub track: DrawOverlayTrack,
     pub frame: Arc<Frame>,
     pub image_width: u32,
     pub image_height: u32,

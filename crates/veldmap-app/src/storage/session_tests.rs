@@ -161,6 +161,7 @@ fn session_normalize_rejects_out_of_range_poses_and_nan_opacity() {
         visible: true,
         opacity: f32::NAN,
         crs_override: None,
+        style: None,
     });
     session.bookmarks.push(CameraBookmark {
         name: "Invalid Lat".to_string(),

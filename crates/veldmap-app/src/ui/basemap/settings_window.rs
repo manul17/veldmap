@@ -9,7 +9,7 @@ use super::super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 use super::{BasemapUiAction, BasemapUiState};
 use crate::storage::settings::{
     AppSettings, BasemapSelection, CUSTOM_MAX_LEVEL_RANGE, DISK_CACHE_MAX_MB_RANGE,
-    validate_gibs_date,
+    GPU_CACHE_MAX_MB_RANGE, validate_gibs_date,
 };
 use crate::storage::{DiskCacheNotice, DiskCacheStatus};
 
@@ -126,9 +126,10 @@ fn show_disk_cache_section(
     ui: &mut egui::Ui,
     disk_status: &DiskCacheStatus,
     disk_cache_max_mb: &mut u64,
+    gpu_tile_cache_max_mb: &mut Option<u64>,
     actions: &mut Vec<BasemapUiAction>,
 ) {
-    ui.heading("Tile Disk Cache");
+    ui.heading("Tile Disk & GPU Cache");
     if disk_status.available {
         if let Some(stats) = disk_status.stats {
             let used_mb = (stats.payload_bytes as f64) / (1024.0 * 1024.0);
@@ -147,6 +148,21 @@ fn show_disk_cache_section(
     ui.horizontal(|ui| {
         ui.label("Disk cap (MiB):");
         ui.add(egui::Slider::new(disk_cache_max_mb, DISK_CACHE_MAX_MB_RANGE).logarithmic(true));
+    });
+
+    ui.horizontal(|ui| {
+        let mut custom_vram = gpu_tile_cache_max_mb.is_some();
+        if ui
+            .checkbox(&mut custom_vram, "Custom GPU VRAM cap (MiB):")
+            .changed()
+        {
+            *gpu_tile_cache_max_mb = if custom_vram { Some(512) } else { None };
+        }
+        if let Some(mb) = gpu_tile_cache_max_mb {
+            ui.add(egui::Slider::new(mb, GPU_CACHE_MAX_MB_RANGE).logarithmic(true));
+        } else {
+            ui.weak("Auto (host RAM scaled)");
+        }
     });
 
     ui.horizontal(|ui| {
@@ -204,6 +220,7 @@ pub(crate) fn show_settings_window(
                 ui,
                 disk_status,
                 &mut ui_state.draft.disk_cache_max_mb,
+                &mut ui_state.draft.gpu_tile_cache_max_mb,
                 &mut actions,
             );
 

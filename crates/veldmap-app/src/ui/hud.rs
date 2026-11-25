@@ -3,6 +3,9 @@
 
 use eframe::egui;
 
+use crate::layers::ColorbarInfo;
+use crate::render::sample_colormap_srgb;
+
 const HUD_PANEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(11, 19, 32, 196);
 const HUD_PANEL_BG_HOVER: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(26, 40, 62, 224);
@@ -272,6 +275,119 @@ pub(crate) fn paint_attribution_badge(
         egui::Color32::WHITE,
     );
     Some(badge_rect)
+}
+
+fn format_colorbar_tick(v: f64) -> String {
+    if !v.is_finite() {
+        return "—".to_owned();
+    }
+    let abs = v.abs();
+    if abs >= 10_000.0 || (abs > 0.0 && abs < 0.01) {
+        format!("{v:.2e}")
+    } else if abs >= 100.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.3}")
+    }
+}
+
+/// Paint a floating horizontal colorbar HUD above the bottom-left scale bar
+/// whenever the topmost active overlay is on a scientific (`R32Float`) track.
+pub(crate) fn paint_colorbar(
+    painter: &egui::Painter,
+    viewport_rect: egui::Rect,
+    info: &ColorbarInfo,
+) -> Option<egui::Rect> {
+    if viewport_rect.width() < 260.0 || viewport_rect.height() < 150.0 {
+        return None;
+    }
+    let box_w = (viewport_rect.width() * 0.28).clamp(180.0, 260.0);
+    let box_h = 54.0;
+    let margin_x = SCALE_BAR_MARGIN_PT;
+    // Sit cleanly above the bottom-left scale bar (`34 pt + 16 pt margin + 8 pt gap`).
+    let box_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            viewport_rect.left() + margin_x,
+            viewport_rect.bottom() - 58.0 - box_h,
+        ),
+        egui::vec2(box_w, box_h),
+    );
+
+    painter.rect_filled(box_rect, 6.0, HUD_PANEL_BG);
+    painter.rect_stroke(
+        box_rect,
+        6.0,
+        egui::Stroke::new(1.0, HUD_BORDER_SUBTLE),
+        egui::StrokeKind::Inside,
+    );
+
+    let pad_x = 8.0;
+    let unit_suffix = if info.log10_db {
+        " [dB]".to_owned()
+    } else if let Some(ref u) = info.units {
+        format!(" [{u}]")
+    } else {
+        String::new()
+    };
+    let header = format!("{}{unit_suffix}", info.title);
+    let galley = painter.layout_no_wrap(header, egui::FontId::proportional(10.5), HUD_INK_PRIMARY);
+    painter.with_clip_rect(box_rect.shrink(4.0)).galley(
+        egui::pos2(box_rect.left() + pad_x, box_rect.top() + 5.0),
+        galley,
+        egui::Color32::WHITE,
+    );
+
+    let bar_rect = egui::Rect::from_min_size(
+        egui::pos2(box_rect.left() + pad_x, box_rect.top() + 22.0),
+        egui::vec2(box_w - pad_x * 2.0, 12.0),
+    );
+    let steps = 64usize;
+    let seg_w = bar_rect.width() / (steps as f32);
+    for i in 0..steps {
+        let t = (i as f32) / ((steps - 1) as f32);
+        let [r, g, b, _] = sample_colormap_srgb(info.colormap, t, info.invert_colormap);
+        let seg = egui::Rect::from_min_max(
+            egui::pos2(bar_rect.left() + (i as f32) * seg_w, bar_rect.top()),
+            egui::pos2(
+                bar_rect.left() + ((i + 1) as f32) * seg_w + 0.5,
+                bar_rect.bottom(),
+            ),
+        );
+        painter.rect_filled(seg, 0.0, egui::Color32::from_rgb(r, g, b));
+    }
+    painter.rect_stroke(
+        bar_rect,
+        1.0,
+        egui::Stroke::new(0.8, HUD_BORDER_SUBTLE),
+        egui::StrokeKind::Inside,
+    );
+
+    let mid = 0.5 * (info.min + info.max);
+    let tick_y = bar_rect.bottom() + 9.0;
+    let tick_font = egui::FontId::monospace(10.0);
+    painter.text(
+        egui::pos2(bar_rect.left(), tick_y),
+        egui::Align2::LEFT_CENTER,
+        format_colorbar_tick(info.min),
+        tick_font.clone(),
+        HUD_INK_PRIMARY,
+    );
+    painter.text(
+        egui::pos2(bar_rect.center().x, tick_y),
+        egui::Align2::CENTER_CENTER,
+        format_colorbar_tick(mid),
+        tick_font.clone(),
+        HUD_INK_PRIMARY,
+    );
+    painter.text(
+        egui::pos2(bar_rect.right(), tick_y),
+        egui::Align2::RIGHT_CENTER,
+        format_colorbar_tick(info.max),
+        tick_font,
+        HUD_INK_PRIMARY,
+    );
+
+    Some(box_rect)
 }
 
 #[cfg(test)]

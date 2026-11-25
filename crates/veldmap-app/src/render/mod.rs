@@ -7,6 +7,7 @@
 //! `egui_wgpu`'s target format via `view_formats`.
 
 mod bind_groups;
+mod colormap;
 mod globe;
 mod graticule;
 mod mesh;
@@ -18,10 +19,12 @@ mod uniforms;
 mod vector;
 mod viewport;
 
+pub use bind_groups::TileBindGroupCache;
+pub use colormap::{CategoricalPaletteId, ColormapId, sample_colormap_srgb};
 pub use globe::GlobeRenderer;
 pub use snapshot::{
-    DrawOverlayLayer, DrawOverlayPatch, DrawSnapshot, DrawTile, DrawVectorId, DrawVectorLayer,
-    OverlayMeshKey, SnapshotBuildParams, TileCarrierPolicy,
+    DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack, DrawSnapshot, DrawTile, DrawVectorId,
+    DrawVectorLayer, OverlayMeshKey, SnapshotBuildParams, TileCarrierPolicy,
 };
 pub use viewport::RenderParams;
 
@@ -54,8 +57,12 @@ pub fn clamp_to_primary_backends(backends: wgpu::Backends) -> wgpu::Backends {
 
 /// Embedded WGSL source for the quadtree globe body and procedural graticule.
 pub const GLOBE_WGSL: &str = include_str!("../shaders/globe.wgsl");
-/// Embedded WGSL source for depth-less post-body raster overlay warp meshes.
+/// Embedded WGSL source for depth-less post-body display raster overlay warp meshes.
 pub const OVERLAY_WGSL: &str = include_str!("../shaders/overlay.wgsl");
+/// Embedded WGSL source for depth-less post-body scientific (`R32Float`) raster overlays.
+pub const OVERLAY_SCIENTIFIC_WGSL: &str = include_str!("../shaders/overlay_scientific.wgsl");
+/// Embedded WGSL source for depth-less post-body categorical (`R8Uint`/`R16Uint`) raster overlays.
+pub const OVERLAY_CATEGORICAL_WGSL: &str = include_str!("../shaders/overlay_categorical.wgsl");
 /// Embedded WGSL source for depth-less post-body draped vector geometry.
 pub const VECTOR_WGSL: &str = include_str!("../shaders/vector.wgsl");
 /// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.

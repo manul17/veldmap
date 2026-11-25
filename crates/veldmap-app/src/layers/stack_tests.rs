@@ -97,6 +97,7 @@ fn make_layer(id: u64, tag: u8, pixel_size_m: f64) -> OverlayLayer {
             visible: true,
             opacity: 1.0,
             crs_override: None,
+            style: None,
         },
         id,
     )
@@ -193,4 +194,56 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
     assert_eq!(l1.crs_override_epoch(), epoch_before + 1);
     assert_eq!(l1.crs_override(), Some(&CrsOverride::Epsg(32637)));
     assert_eq!(l1.relaid(), 100);
+}
+
+#[test]
+fn multi_stream_appetite_weight_and_opt_in_pin_root() {
+    let mut stack = LayerStack::default();
+    let mut layer = make_layer(10, 10, 10.0);
+    assert!(
+        layer.pin_root(),
+        "local raster layers opt into root pinning by default"
+    );
+    layer.pin_root = false;
+    assert!(!layer.pin_root());
+
+    let primary_key = layer.meta().stream_key();
+    let extra_spec = veldmap_core::tile::TileStreamSpec {
+        band: veldmap_core::tile::BandKey::Index(1),
+        format: veldmap_core::tile::PixelFormat::R8Uint,
+        gutter: 0,
+        decode_rev: 0,
+    };
+    let mut extra_meta = layer.meta().clone();
+    extra_meta.spec = extra_spec;
+    layer.streams.push(LayerStream::new(extra_meta));
+    let extra_key = layer.streams()[1].stream_key();
+
+    // Distinct streams sharing one SourceId track independent tile-byte weights
+    // and sum cleanly for multi-band VRAM appetite budgeting.
+    layer.observe_stream_tile_bytes(primary_key, 2_000_000);
+    layer.observe_stream_tile_bytes(extra_key, 262_144);
+    assert_eq!(layer.streams()[0].observed_tile_bytes(), 2_000_000);
+    assert_eq!(layer.streams()[1].observed_tile_bytes(), 262_144);
+    assert_eq!(layer.appetite_weight_bytes(), 2_000_000 + 262_144);
+
+    stack.push(layer);
+    let pinned: Vec<SourceId> = stack
+        .layers()
+        .iter()
+        .filter(|l| l.is_active() && l.pin_root())
+        .map(OverlayLayer::source_id)
+        .collect();
+    assert!(
+        pinned.is_empty(),
+        "unpinned layer must not opt into pinned root sources"
+    );
+    stack.get_mut(LayerId(10)).expect("layer").pin_root = true;
+    let pinned_after: Vec<SourceId> = stack
+        .layers()
+        .iter()
+        .filter(|l| l.is_active() && l.pin_root())
+        .map(OverlayLayer::source_id)
+        .collect();
+    assert_eq!(pinned_after.len(), 1);
 }

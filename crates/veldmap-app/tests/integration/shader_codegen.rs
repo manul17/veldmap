@@ -4,7 +4,10 @@
 use naga::back::{hlsl, msl, spv};
 use naga::proc::Layouter;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use veldmap_app::render::{COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_WGSL, VECTOR_WGSL};
+use veldmap_app::render::{
+    COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL, OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL,
+    VECTOR_WGSL,
+};
 
 fn parse_and_validate(name: &str, wgsl_source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
     let module = naga::front::wgsl::parse_str(wgsl_source).unwrap_or_else(|err| {
@@ -107,6 +110,10 @@ fn validate_and_compile_all_backends(name: &str, wgsl_source: &str) -> naga::Mod
 fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
     let globe = validate_and_compile_all_backends("globe.wgsl", GLOBE_WGSL);
     let overlay = validate_and_compile_all_backends("overlay.wgsl", OVERLAY_WGSL);
+    let overlay_sci =
+        validate_and_compile_all_backends("overlay_scientific.wgsl", OVERLAY_SCIENTIFIC_WGSL);
+    let overlay_cat =
+        validate_and_compile_all_backends("overlay_categorical.wgsl", OVERLAY_CATEGORICAL_WGSL);
     let vector = validate_and_compile_all_backends("vector.wgsl", VECTOR_WGSL);
     let _composite = validate_and_compile_all_backends("composite.wgsl", COMPOSITE_WGSL);
 
@@ -118,6 +125,8 @@ fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
     ];
     assert_struct_layout(&globe, "CameraUniform", 80, camera_members);
     assert_struct_layout(&overlay, "CameraUniform", 80, camera_members);
+    assert_struct_layout(&overlay_sci, "CameraUniform", 80, camera_members);
+    assert_struct_layout(&overlay_cat, "CameraUniform", 80, camera_members);
     assert_struct_layout(&vector, "CameraUniform", 80, camera_members);
     assert_struct_layout(
         &globe,
@@ -136,6 +145,37 @@ fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
         32,
         &[("offset_eye", 0), ("opacity", 12), ("uv_rect", 16)],
     );
+    assert_struct_layout(
+        &overlay_sci,
+        "ScientificPatchUniform",
+        64,
+        &[
+            ("offset_eye", 0),
+            ("opacity", 12),
+            ("uv_rect", 16),
+            ("scale", 32),
+            ("offset", 36),
+            ("stretch_min", 40),
+            ("stretch_inv_range", 44),
+            ("stretch_mode", 48),
+            ("invert_colormap", 52),
+            ("mip_count", 56),
+        ],
+    );
+    assert_struct_layout(&overlay_sci, "PaletteUniform", 4096, &[("entries", 0)]);
+    assert_struct_layout(
+        &overlay_cat,
+        "CategoricalPatchUniform",
+        48,
+        &[
+            ("offset_eye", 0),
+            ("opacity", 12),
+            ("uv_rect", 16),
+            ("has_nodata", 32),
+            ("nodata_value", 36),
+        ],
+    );
+    assert_struct_layout(&overlay_cat, "PaletteUniform", 4096, &[("entries", 0)]);
     assert_struct_layout(
         &vector,
         "VectorUniform",

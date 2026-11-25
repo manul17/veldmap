@@ -22,12 +22,14 @@ pub(crate) struct ChunkKey {
     pub(crate) chunk_index: u32,
 }
 
-/// Decoded RGBA8 chunk payload with its valid dimensions `(width, height)`.
+/// Decoded chunk payload with its pixel format and valid dimensions
+/// `(width, height)`.
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedChunk {
     pub(crate) data: Vec<u8>,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) format: veldmap_core::tile::PixelFormat,
 }
 
 impl DecodedChunk {

@@ -8,18 +8,19 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::{Camera, Frame};
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::{SourceId, TileKey};
-use veldmap_raster::{DecodePoolHandle, RasterSource};
+use veldmap_core::tile::{BandKey, SourceId, TileKey, TileStreamSpec};
+use veldmap_raster::{BandStats, DecodeJob, DecodeJobKey, DecodePoolHandle, RasterSource};
 use veldmap_storage::TileDiskCache;
 
 use crate::clamp_opacity;
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSender};
-use crate::render::DrawOverlayLayer;
+use crate::render::{CategoricalPaletteId, ColormapId, DrawOverlayLayer};
 use crate::worker::SingleThreadWorker;
 
 use super::cursor::CursorProber;
@@ -31,9 +32,16 @@ use super::opener::{OpenRasterError, bind_frame_with_override};
 use super::runtime::OverlayRuntime;
 use super::stack::{LayerStack, OverlayLayer};
 use super::{
-    CrsOverride, CursorReadout, LayerId, LayerInitOptions, LayerSummary, OverlayIoEvent,
-    OverlayPersistEntry,
+    ColorbarInfo, CrsOverride, CursorReadout, LayerId, LayerInitOptions, LayerSummary,
+    OverlayIoEvent, OverlayPersistEntry, SavedLayerStyle, StretchPreset,
 };
+
+struct BandStatsMsg {
+    layer_id: LayerId,
+    source_id: SourceId,
+    band: BandKey,
+    stats: Option<BandStats>,
+}
 
 fn alloc_seq(counter: &mut u64) -> u64 {
     let value = *counter;
@@ -72,6 +80,8 @@ pub(crate) struct OverlayManager {
     runtime: Arc<OverlayRuntime>,
     cursor: CursorProber,
     io_worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
+    stats_tx: Sender<BandStatsMsg>,
+    stats_rx: Receiver<BandStatsMsg>,
 }
 
 impl OverlayManager {
@@ -88,6 +98,7 @@ impl OverlayManager {
             budget, disk_cache, fast_pool, bulk_pool, done_tx, wakeup, shutdown,
         ));
         let io_worker = spawn_overlay_io_worker(Arc::clone(&runtime));
+        let (stats_tx, stats_rx) = mpsc::channel();
         Self {
             stack: LayerStack::default(),
             next_layer_id: 1,
@@ -95,6 +106,8 @@ impl OverlayManager {
             runtime,
             cursor: CursorProber::new(),
             io_worker,
+            stats_tx,
+            stats_rx,
         }
     }
 
@@ -112,6 +125,85 @@ impl OverlayManager {
 
     pub(crate) fn topmost_visible_source_pixel_size_m(&self) -> Option<(f64, f64)> {
         self.stack.topmost_visible_source_pixel_size_m()
+    }
+
+    pub(crate) fn topmost_colorbar_info(&self) -> Option<ColorbarInfo> {
+        self.stack.topmost_colorbar_info()
+    }
+
+    fn request_band_stats_if_needed(&mut self, id: LayerId) {
+        let Some((band, source, source_id)) = self.stack.get_mut(id).and_then(|layer| {
+            let band = layer.needs_band_stats()?;
+            Some((band, Arc::clone(layer.source()), layer.source_id()))
+        }) else {
+            return;
+        };
+        let cancel = self.runtime.shutdown.child_token();
+        if let Some(layer) = self.stack.get_mut(id) {
+            layer.set_stats_loading(cancel.clone());
+        }
+        let rt = Arc::clone(&self.runtime);
+        let tx = self.stats_tx.clone();
+        let band_tag = match band {
+            BandKey::Display => 0,
+            BandKey::Index(i) => u32::from(i) + 1,
+            BandKey::NamedHash(h) => (h as u32).max(1),
+        };
+        // Reserve high `x` namespace (`u32::MAX - 0xFFFF..=u32::MAX`) per layer
+        // so duplicate layers opening one `SourceId` never collide on queue keys
+        // while `TiffSource`'s singleflight deduplicates the underlying I/O.
+        let probe_x = u32::MAX.saturating_sub((id.0 as u32) & 0xFFFF);
+
+        struct StatsCompletionGuard {
+            tx: mpsc::Sender<BandStatsMsg>,
+            wakeup: Arc<dyn Fn() + Send + Sync>,
+            layer_id: LayerId,
+            source_id: SourceId,
+            band: BandKey,
+            stats: Option<BandStats>,
+        }
+        impl Drop for StatsCompletionGuard {
+            fn drop(&mut self) {
+                let _ = self.tx.send(BandStatsMsg {
+                    layer_id: self.layer_id,
+                    source_id: self.source_id,
+                    band: self.band,
+                    stats: self.stats.take(),
+                });
+                (self.wakeup)();
+            }
+        }
+
+        let guard = StatsCompletionGuard {
+            tx,
+            wakeup: Arc::clone(&rt.wakeup),
+            layer_id: id,
+            source_id,
+            band,
+            stats: None,
+        };
+        let job = DecodeJob {
+            key: DecodeJobKey::Probe {
+                source: source_id,
+                x: probe_x,
+                y: band_tag,
+            },
+            queued_bytes: 16 * 1024,
+            cancel: cancel.clone(),
+            work: Box::new(move || {
+                let mut guard = guard;
+                let ctx = rt.decode_context(&cancel);
+                if let Ok(Some(stats)) = source.band_stats(band, &ctx) {
+                    guard.stats = Some(stats);
+                }
+            }),
+        };
+        let submitted = self
+            .runtime
+            .try_submit_guarded(&self.runtime.fast_pool, job, false, || {});
+        if !submitted && let Some(layer) = self.stack.get_mut(id) {
+            layer.clear_stats_loading();
+        }
     }
 
     fn purge_source(&self, src: SourceId) {
@@ -157,12 +249,11 @@ impl OverlayManager {
     /// Queue a non-blocking local raster open onto the overlay I/O worker.
     #[cfg(test)]
     fn begin_open_file(&self, path: &Path, fly_to: bool) -> Result<(), String> {
-        self.begin_open_file_with_options(path, fly_to, true, 1.0, None)
+        self.begin_open_file_with_options(path, fly_to, true, 1.0, None, None)
     }
 
     /// Queue a non-blocking local raster open with explicit initial visibility,
-    /// opacity, and optional CRS override (used by session restore and CRS
-    /// picker re-open flows).
+    /// opacity, optional CRS override, and optional saved analytical style.
     pub(crate) fn begin_open_file_with_options(
         &self,
         path: &Path,
@@ -170,6 +261,7 @@ impl OverlayManager {
         visible: bool,
         opacity: f32,
         crs_override: Option<CrsOverride>,
+        style: Option<SavedLayerStyle>,
     ) -> Result<(), String> {
         if self.io_worker.send(OverlayIoCmd::Open {
             path: path.to_path_buf(),
@@ -178,6 +270,7 @@ impl OverlayManager {
                 visible,
                 opacity: clamp_opacity(opacity),
                 crs_override,
+                style,
             },
         }) {
             Ok(())
@@ -198,6 +291,7 @@ impl OverlayManager {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
             };
+            layer.cancel_stats_job();
             let prep = layer.begin_reload(cancel.clone());
             let request = ReloadRequest {
                 id,
@@ -260,6 +354,23 @@ impl OverlayManager {
             }
         }
 
+        while let Ok(msg) = self.stats_rx.try_recv() {
+            if let Some(stats) = msg.stats {
+                for layer in self.stack.layers_mut() {
+                    if layer.source_id() == msg.source_id
+                        && layer.apply_band_stats(msg.band, Some(stats.clone()))
+                    {
+                        mutation.changed = true;
+                    }
+                }
+            } else if let Some(layer) = self.stack.get_mut(msg.layer_id)
+                && layer.source_id() == msg.source_id
+                && layer.apply_band_stats(msg.band, None)
+            {
+                mutation.changed = true;
+            }
+        }
+
         (events, mutation)
     }
 
@@ -280,6 +391,7 @@ impl OverlayManager {
                 let layer = OverlayLayer::from_source(id, path, source, frame, options, relaid);
                 let bounds = layer.footprint();
                 self.stack.push(layer);
+                self.request_band_stats_if_needed(id);
                 mutation.changed = true;
                 mutation.topology_changed = true;
                 events.push(OverlayIoEvent::Opened {
@@ -372,6 +484,7 @@ impl OverlayManager {
         }
         mutation.changed = true;
         mutation.topology_changed = true;
+        self.request_band_stats_if_needed(id);
         events.push(OverlayIoEvent::Reloaded { id });
     }
 
@@ -409,6 +522,7 @@ impl OverlayManager {
         let Some(mut removed) = self.stack.remove(id) else {
             return OverlayMutation::default();
         };
+        removed.cancel_stats_job();
         if let Some(tok) = removed.take_reload_cancel() {
             tok.cancel();
         }
@@ -454,11 +568,79 @@ impl OverlayManager {
         layer.set_opacity(opacity)
     }
 
+    pub(crate) fn set_layer_stream(
+        &mut self,
+        id: LayerId,
+        spec: TileStreamSpec,
+    ) -> Result<OverlayMutation, String> {
+        let (changed, old_stream) = {
+            let Some(layer) = self.stack.get_mut(id) else {
+                return Err("layer no longer exists".to_owned());
+            };
+            let prev_stream = layer.meta().stream_key();
+            let changed = layer.set_active_stream(spec)?;
+            (changed, prev_stream)
+        };
+        if !changed {
+            return Ok(OverlayMutation::default());
+        }
+        let still_used = self
+            .stack
+            .layers()
+            .iter()
+            .any(|l| l.is_active() && l.streams().iter().any(|s| s.stream_key() == old_stream));
+        if !still_used {
+            self.runtime.cancel_stream(old_stream);
+        }
+        if let Some(layer) = self.stack.get(id) {
+            self.cursor.invalidate_source(layer.source_id());
+        }
+        self.request_band_stats_if_needed(id);
+        self.runtime.request_reschedule();
+        Ok(OverlayMutation {
+            changed: true,
+            topology_changed: true,
+            purge_sources: Vec::new(),
+        })
+    }
+
+    pub(crate) fn set_stretch_preset(&mut self, id: LayerId, preset: StretchPreset) -> bool {
+        let Some(layer) = self.stack.get_mut(id) else {
+            return false;
+        };
+        layer.set_stretch_preset(preset)
+    }
+
+    pub(crate) fn set_stretch_range(&mut self, id: LayerId, min: f64, max: f64) -> bool {
+        let Some(layer) = self.stack.get_mut(id) else {
+            return false;
+        };
+        layer.set_stretch_range(min, max)
+    }
+
+    pub(crate) fn set_colormap(&mut self, id: LayerId, colormap: ColormapId, invert: bool) -> bool {
+        let Some(layer) = self.stack.get_mut(id) else {
+            return false;
+        };
+        layer.set_colormap(colormap, invert)
+    }
+
+    pub(crate) fn set_categorical_palette(
+        &mut self,
+        id: LayerId,
+        palette: CategoricalPaletteId,
+    ) -> bool {
+        let Some(layer) = self.stack.get_mut(id) else {
+            return false;
+        };
+        layer.set_categorical_palette(palette)
+    }
+
     pub(crate) fn record_upload_report(&mut self, report: &UploadBatchReport) {
-        for &(src, max_bytes) in &report.max_tile_bytes_by_source {
+        for &(stream_key, max_bytes) in &report.max_tile_bytes_by_stream {
             for layer in self.stack.layers_mut() {
-                if layer.source_id() == src {
-                    layer.observe_tile_bytes(max_bytes);
+                if layer.source_id() == stream_key.source {
+                    layer.observe_stream_tile_bytes(stream_key, max_bytes);
                 }
             }
         }
@@ -534,6 +716,7 @@ impl OverlayManager {
         self.runtime
             .cancel_sources(self.stack.layers().iter().map(OverlayLayer::source_id));
         for layer in self.stack.layers_mut() {
+            layer.cancel_stats_job();
             if let Some(tok) = layer.take_reload_cancel() {
                 tok.cancel();
             }

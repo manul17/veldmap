@@ -4,6 +4,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use super::colormap::PALETTE_LUT_LEN;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct CameraUniform {
@@ -49,6 +51,40 @@ pub(super) struct OverlayPatchUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct ScientificPatchUniform {
+    pub(super) offset_eye: [f32; 3],
+    pub(super) opacity: f32,
+    pub(super) uv_rect: [f32; 4],
+    pub(super) scale: f32,
+    pub(super) offset: f32,
+    pub(super) stretch_min: f32,
+    pub(super) stretch_inv_range: f32,
+    pub(super) stretch_mode: u32,
+    pub(super) invert_colormap: u32,
+    pub(super) mip_count: u32,
+    pub(super) _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct CategoricalPatchUniform {
+    pub(super) offset_eye: [f32; 3],
+    pub(super) opacity: f32,
+    pub(super) uv_rect: [f32; 4],
+    pub(super) has_nodata: u32,
+    pub(super) nodata_value: u32,
+    pub(super) _pad0: u32,
+    pub(super) _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct PaletteUniform {
+    pub(super) entries: [[f32; 4]; PALETTE_LUT_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct VectorUniform {
     pub(super) offset_eye: [f32; 3],
     pub(super) point_radius_m: f32,
@@ -60,6 +96,28 @@ const _: () = {
     assert!(std::mem::offset_of!(OverlayPatchUniform, offset_eye) == 0);
     assert!(std::mem::offset_of!(OverlayPatchUniform, opacity) == 12);
     assert!(std::mem::offset_of!(OverlayPatchUniform, uv_rect) == 16);
+
+    assert!(std::mem::size_of::<ScientificPatchUniform>() == 64);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, offset_eye) == 0);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, opacity) == 12);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, uv_rect) == 16);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, scale) == 32);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, offset) == 36);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, stretch_min) == 40);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, stretch_inv_range) == 44);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, stretch_mode) == 48);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, invert_colormap) == 52);
+    assert!(std::mem::offset_of!(ScientificPatchUniform, mip_count) == 56);
+
+    assert!(std::mem::size_of::<CategoricalPatchUniform>() == 48);
+    assert!(std::mem::offset_of!(CategoricalPatchUniform, offset_eye) == 0);
+    assert!(std::mem::offset_of!(CategoricalPatchUniform, opacity) == 12);
+    assert!(std::mem::offset_of!(CategoricalPatchUniform, uv_rect) == 16);
+    assert!(std::mem::offset_of!(CategoricalPatchUniform, has_nodata) == 32);
+    assert!(std::mem::offset_of!(CategoricalPatchUniform, nodata_value) == 36);
+
+    assert!(std::mem::size_of::<PaletteUniform>() == 4096);
+
     assert!(std::mem::size_of::<VectorUniform>() == 32);
     assert!(std::mem::offset_of!(VectorUniform, offset_eye) == 0);
     assert!(std::mem::offset_of!(VectorUniform, point_radius_m) == 12);
@@ -71,7 +129,9 @@ const _: () = {
 enum UniformSlot {
     Tile = 0,
     Overlay = 1,
-    Vector = 2,
+    ScientificOverlay = 2,
+    CategoricalOverlay = 3,
+    Vector = 4,
 }
 
 struct UniformSlotEntry {
@@ -103,18 +163,15 @@ fn dynamic_uniform_bind_group(
 }
 
 /// Frame-wide dynamic uniform arena shared across globe body, post-body
-/// raster/vector overlays, and graticule passes.
-///
-/// Accumulates all aligned per-draw uniforms in a single CPU staging buffer and
-/// flushes them with one `queue.write_buffer` call per dirty frame, preventing
-/// `queue.write_buffer(..., 0, ...)` clobbering across multi-pass renders.
+/// display/scientific/categorical raster overlays, vector overlays, and
+/// graticule passes.
 pub(super) struct DynamicUniformArena {
     alignment: u32,
     staging: Vec<u8>,
     last_offset: usize,
     buffer: wgpu::Buffer,
     capacity_bytes: usize,
-    slots: [UniformSlotEntry; 3],
+    slots: [UniformSlotEntry; 5],
 }
 
 impl DynamicUniformArena {
@@ -122,6 +179,8 @@ impl DynamicUniformArena {
         device: &wgpu::Device,
         tile_layout: &wgpu::BindGroupLayout,
         overlay_layout: &wgpu::BindGroupLayout,
+        scientific_layout: &wgpu::BindGroupLayout,
+        categorical_layout: &wgpu::BindGroupLayout,
         vector_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let alignment = device.limits().min_uniform_buffer_offset_alignment.max(1);
@@ -149,6 +208,16 @@ impl DynamicUniformArena {
                 "arena overlay dynamic uniform bind group",
                 std::mem::size_of::<OverlayPatchUniform>(),
                 overlay_layout,
+            ),
+            make_slot(
+                "arena scientific overlay dynamic uniform bind group",
+                std::mem::size_of::<ScientificPatchUniform>(),
+                scientific_layout,
+            ),
+            make_slot(
+                "arena categorical overlay dynamic uniform bind group",
+                std::mem::size_of::<CategoricalPatchUniform>(),
+                categorical_layout,
             ),
             make_slot(
                 "arena vector dynamic uniform bind group",
@@ -239,6 +308,14 @@ impl DynamicUniformArena {
 
     pub(super) fn overlay_bind_group(&self) -> &wgpu::BindGroup {
         self.bind_group(UniformSlot::Overlay)
+    }
+
+    pub(super) fn scientific_overlay_bind_group(&self) -> &wgpu::BindGroup {
+        self.bind_group(UniformSlot::ScientificOverlay)
+    }
+
+    pub(super) fn categorical_overlay_bind_group(&self) -> &wgpu::BindGroup {
+        self.bind_group(UniformSlot::CategoricalOverlay)
     }
 
     pub(super) fn vector_bind_group(&self) -> &wgpu::BindGroup {

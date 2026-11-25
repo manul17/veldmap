@@ -274,6 +274,15 @@ impl OverlayRuntime {
         }
     }
 
+    /// Cancel all pointwise and pass jobs for a single [`StreamKey`] under one
+    /// scheduler lock acquisition, cancelling tokens strictly outside the lock.
+    pub(super) fn cancel_stream(&self, stream_key: StreamKey) {
+        let tokens = lock_unpoisoned(&self.scheduler).reset_stream(stream_key);
+        for tok in tokens {
+            tok.cancel();
+        }
+    }
+
     /// Cancel all pointwise and pass jobs for every source in `sources` under a
     /// single scheduler lock acquisition, cancelling tokens strictly outside
     /// the lock.

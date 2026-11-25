@@ -9,19 +9,22 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+flate2.workspace = true
+image-webp.workspace = true
 jpeg-decoder.workspace = true
+lz4_flex.workspace = true
 png.workspace = true
 qoi.workspace = true
 thiserror.workspace = true
 tiff.workspace = true
 tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
+weezl.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 image.workspace = true
-image-webp.workspace = true
 veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
-zstd.workspace = true
 
 [lints]
 workspace = true

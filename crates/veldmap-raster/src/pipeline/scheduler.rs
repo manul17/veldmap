@@ -132,6 +132,10 @@ impl TileFailureMap {
         self.states.remove(key);
     }
 
+    fn clear_stream(&mut self, stream: StreamKey) {
+        self.states.retain(|k, _| k.stream_key() != stream);
+    }
+
     fn clear_source(&mut self, source: SourceId) {
         self.states.retain(|k, _| k.source != source);
     }
@@ -519,6 +523,28 @@ impl TileScheduler {
             return None;
         }
         Some(self.failures.record_pointwise_failure(*key, terminal))
+    }
+
+    /// Drop all active passes, pointwise in-flight entries, and failure state
+    /// for a single [`StreamKey`], returning all [`CancelToken`]s so the caller
+    /// can cancel them outside any scheduler lock.
+    pub fn reset_stream(&mut self, stream: StreamKey) -> Vec<CancelToken> {
+        let mut tokens = Vec::new();
+        if let Some(pass) = self.active_passes.remove(&stream) {
+            tokens.push(pass.cancel);
+        }
+        self.in_flight.retain(|k, entry| {
+            if k.stream_key() == stream {
+                if let FlightEntry::Pointwise { cancel, .. } = entry {
+                    tokens.push(cancel.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.failures.clear_stream(stream);
+        tokens
     }
 
     /// Drop all active passes, pointwise in-flight entries, and failure state

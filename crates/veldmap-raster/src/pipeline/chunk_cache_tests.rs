@@ -37,6 +37,7 @@ fn singleflight_deduplicates_concurrent_callers_and_recovers_from_leader_panic()
                         data: vec![42u8; 64],
                         width: 4,
                         height: 4,
+                        format: veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
                     })
                 })
             })
@@ -83,6 +84,7 @@ fn singleflight_deduplicates_concurrent_callers_and_recovers_from_leader_panic()
                 data: vec![7u8; 16],
                 width: 2,
                 height: 2,
+                format: veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
             })
         })
         .expect("retry after panic succeeds");
@@ -109,6 +111,7 @@ fn follower_cancellation_returns_promptly_without_stalling() {
                     data: vec![9u8; 16],
                     width: 2,
                     height: 2,
+                    format: veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
                 })
             })
         })
@@ -168,6 +171,7 @@ fn follower_cancellation_returns_promptly_without_stalling() {
                     data: vec![55u8; 16],
                     width: 2,
                     height: 2,
+                    format: veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
                 })
             })
         })

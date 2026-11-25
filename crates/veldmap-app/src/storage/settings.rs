@@ -35,6 +35,16 @@ pub(crate) const CUSTOM_MAX_LEVEL_RANGE: RangeInclusive<u8> =
 pub(crate) const DISK_CACHE_MAX_MB_RANGE: RangeInclusive<u64> =
     MIN_DISK_CACHE_MAX_MB..=MAX_DISK_CACHE_MAX_MB;
 
+/// Minimum optional user override for the GPU tile cache cap (`128 MiB`).
+pub(crate) const MIN_GPU_CACHE_MAX_MB: u64 = 128;
+
+/// Maximum optional user override for the GPU tile cache cap (`4096 MiB`).
+pub(crate) const MAX_GPU_CACHE_MAX_MB: u64 = 4096;
+
+/// Allowed slider range for optional user GPU tile VRAM cap in MiB.
+pub(crate) const GPU_CACHE_MAX_MB_RANGE: RangeInclusive<u64> =
+    MIN_GPU_CACHE_MAX_MB..=MAX_GPU_CACHE_MAX_MB;
+
 /// Validate an explicit `YYYY-MM-DD` UTC date string for NASA GIBS daily layers.
 pub(crate) fn validate_gibs_date(date: &str) -> bool {
     is_valid_gibs_date(date.trim())
@@ -195,6 +205,7 @@ pub(crate) struct BasemapSettingsDraft {
     pub(crate) gibs_date: String,
     pub(crate) custom_xyz: CustomXyzSettings,
     pub(crate) disk_cache_max_mb: u64,
+    pub(crate) gpu_tile_cache_max_mb: Option<u64>,
 }
 
 impl BasemapSettingsDraft {
@@ -204,6 +215,7 @@ impl BasemapSettingsDraft {
             gibs_date: settings.gibs_date.clone(),
             custom_xyz: settings.custom_xyz.clone(),
             disk_cache_max_mb: settings.disk_cache_max_mb,
+            gpu_tile_cache_max_mb: settings.gpu_tile_cache_max_mb,
         }
     }
 
@@ -226,6 +238,7 @@ impl BasemapSettingsDraft {
             target.custom_xyz = self.custom_xyz.clone();
         }
         target.disk_cache_max_mb = self.disk_cache_max_mb;
+        target.gpu_tile_cache_max_mb = self.gpu_tile_cache_max_mb;
     }
 }
 
@@ -238,6 +251,8 @@ pub(crate) struct AppSettings {
     pub(crate) gibs_date: String,
     pub(crate) custom_xyz: CustomXyzSettings,
     pub(crate) disk_cache_max_mb: u64,
+    /// Optional user GPU tile cache cap in MiB (`None` = host-RAM-scaled auto cap).
+    pub(crate) gpu_tile_cache_max_mb: Option<u64>,
     pub(crate) show_graticule: bool,
 }
 
@@ -249,6 +264,7 @@ impl Default for AppSettings {
             gibs_date: DEFAULT_GIBS_DATE.to_owned(),
             custom_xyz: CustomXyzSettings::default(),
             disk_cache_max_mb: DEFAULT_DISK_CACHE_MAX_MB,
+            gpu_tile_cache_max_mb: None,
             show_graticule: true,
         }
     }
@@ -265,11 +281,25 @@ impl AppSettings {
         self.disk_cache_max_mb = self
             .disk_cache_max_mb
             .clamp(MIN_DISK_CACHE_MAX_MB, MAX_DISK_CACHE_MAX_MB);
+        self.gpu_tile_cache_max_mb = self
+            .gpu_tile_cache_max_mb
+            .map(|mb| mb.clamp(MIN_GPU_CACHE_MAX_MB, MAX_GPU_CACHE_MAX_MB));
         let trimmed = self.gibs_date.trim();
         if trimmed.is_empty() {
             self.gibs_date = DEFAULT_GIBS_DATE.to_owned();
         } else if trimmed.len() != self.gibs_date.len() {
             self.gibs_date = trimmed.to_owned();
+        }
+    }
+
+    /// Resolve effective GPU tile cache byte cap from user override or auto
+    /// host-RAM budget.
+    pub(crate) fn effective_gpu_tile_cache_bytes(&self, default_bytes: usize) -> usize {
+        match self.gpu_tile_cache_max_mb {
+            Some(mb) => mb
+                .clamp(MIN_GPU_CACHE_MAX_MB, MAX_GPU_CACHE_MAX_MB)
+                .saturating_mul(1024 * 1024) as usize,
+            None => default_bytes,
         }
     }
 

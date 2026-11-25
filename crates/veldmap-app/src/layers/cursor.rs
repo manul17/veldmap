@@ -1,30 +1,30 @@
-//! Non-blocking zoom-invariant CPU cursor pixel readout (`CursorProber`).
+//! Non-blocking zoom-invariant CPU cursor pixel readout (`CursorProber`)
+//! supporting Display RGBA8, Scientific raw+physical `f64` values with units,
+//! and Categorical discrete class IDs.
 
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
-use veldmap_core::tile::SourceId;
-use veldmap_raster::{DecodeJob, DecodeJobKey, RasterSource};
+use veldmap_core::tile::{BandKey, PixelFormat, SourceId};
+use veldmap_raster::{BandSample, DecodeJob, DecodeJobKey, RasterSource};
 
 use super::runtime::OverlayRuntime;
 use super::stack::{LayerStack, OverlayLayer};
 use super::{CursorReadout, CursorReadoutValue};
 
+type ProbeKey = (SourceId, BandKey, PixelFormat, u32, u32);
+
 /// RAII guard ensuring an evicted, cancelled, or panicked cursor readout job
 /// never leaves `CursorProbeCache` permanently stuck in `pending`.
 struct CursorProbeGuard {
     cache: Arc<Mutex<CursorProbeCache>>,
-    probe_key: (SourceId, u32, u32),
+    probe_key: ProbeKey,
     wakeup: Wakeup,
     settled: bool,
 }
 
 impl CursorProbeGuard {
-    fn new(
-        cache: Arc<Mutex<CursorProbeCache>>,
-        probe_key: (SourceId, u32, u32),
-        wakeup: Wakeup,
-    ) -> Self {
+    fn new(cache: Arc<Mutex<CursorProbeCache>>, probe_key: ProbeKey, wakeup: Wakeup) -> Self {
         Self {
             cache,
             probe_key,
@@ -83,9 +83,9 @@ impl Drop for CursorProbeGuard {
 }
 
 struct CursorProbeCache {
-    active_key: Option<(SourceId, u32, u32)>,
+    active_key: Option<ProbeKey>,
     active_cancel: Option<CancelToken>,
-    resolved_key: Option<(SourceId, u32, u32)>,
+    resolved_key: Option<ProbeKey>,
     resolved_value: CursorReadoutValue,
 }
 
@@ -124,10 +124,17 @@ fn build_readout(
     pixel: (u32, u32),
     value: CursorReadoutValue,
 ) -> CursorReadout {
+    let spec = layer.meta().spec;
+    let band_info = layer.source().description().band_info(spec.band);
     CursorReadout {
         layer_name: layer.name().to_owned(),
         pixel,
         source_pixel_size_m: layer.source_pixel_size_m(),
+        units: band_info.and_then(|b| b.units.clone()),
+        has_affine_scaling: band_info
+            .is_some_and(|b| (b.scale - 1.0).abs() > 1e-12 || b.offset.abs() > 1e-12),
+        log10_db: spec.format == PixelFormat::R32Float
+            && layer.scientific_style().preset.is_log10_db(),
         value,
     }
 }
@@ -135,14 +142,23 @@ fn build_readout(
 fn sample_cursor_pixel(
     rt: &OverlayRuntime,
     source: &dyn RasterSource,
+    band: BandKey,
+    format: PixelFormat,
     pixel: (u32, u32),
     cancel: &CancelToken,
     probe_guard: CursorProbeGuard,
 ) {
     let ctx = rt.decode_context(cancel);
-    match source.sample_display_rgba(pixel.0, pixel.1, &ctx) {
-        Ok(Some(rgba)) => probe_guard.resolve(CursorReadoutValue::Rgba(rgba)),
-        Ok(None) => probe_guard.resolve(CursorReadoutValue::Nodata),
+    match source.sample_band(band, format, pixel.0, pixel.1, &ctx) {
+        Ok(BandSample::Rgba(rgba)) => probe_guard.resolve(CursorReadoutValue::Rgba(rgba)),
+        Ok(BandSample::Scalar { raw, physical }) => {
+            probe_guard.resolve(CursorReadoutValue::Scalar { raw, physical })
+        }
+        Ok(BandSample::Categorical(class_id)) => {
+            probe_guard.resolve(CursorReadoutValue::Categorical(class_id))
+        }
+        Ok(BandSample::Nodata) => probe_guard.resolve(CursorReadoutValue::Nodata),
+        Ok(BandSample::Unavailable) => probe_guard.resolve(CursorReadoutValue::Unavailable),
         Err(err) if err.is_cancelled() => probe_guard.clear_transient(),
         Err(_) => probe_guard.resolve(CursorReadoutValue::Unavailable),
     }
@@ -161,8 +177,6 @@ impl CursorProber {
         }
     }
 
-    /// Cancel any in-flight cursor readout probe (e.g. pointer left globe or
-    /// shutdown).
     pub(super) fn cancel(&self) {
         let prev_cancel = {
             let mut state = lock_unpoisoned(&self.cache);
@@ -174,14 +188,15 @@ impl CursorProber {
         }
     }
 
-    /// Clear cached/in-flight cursor state referencing `source_id`.
     pub(super) fn invalidate_source(&self, source_id: SourceId) {
         let prev_cancel = {
             let mut state = lock_unpoisoned(&self.cache);
-            let matches = state.active_key.is_some_and(|(src, _, _)| src == source_id)
+            let matches = state
+                .active_key
+                .is_some_and(|(src, _, _, _, _)| src == source_id)
                 || state
                     .resolved_key
-                    .is_some_and(|(src, _, _)| src == source_id);
+                    .is_some_and(|(src, _, _, _, _)| src == source_id);
             if matches {
                 let tok = state.active_cancel.take();
                 *state = CursorProbeCache::default();
@@ -202,7 +217,8 @@ impl CursorProber {
         cancel: CancelToken,
         runtime: &Arc<OverlayRuntime>,
     ) -> bool {
-        let probe_key = (layer.source_id(), pixel.0, pixel.1);
+        let spec = layer.meta().spec;
+        let probe_key: ProbeKey = (layer.source_id(), spec.band, spec.format, pixel.0, pixel.1);
         let source = Arc::clone(layer.source());
         let rt = Arc::clone(runtime);
         let probe_guard = CursorProbeGuard::new(
@@ -219,7 +235,15 @@ impl CursorProber {
             queued_bytes: 4096,
             cancel: cancel.clone(),
             work: Box::new(move || {
-                sample_cursor_pixel(&rt, source.as_ref(), pixel, &cancel, probe_guard);
+                sample_cursor_pixel(
+                    &rt,
+                    source.as_ref(),
+                    spec.band,
+                    spec.format,
+                    pixel,
+                    &cancel,
+                    probe_guard,
+                );
             }),
         };
 
@@ -232,8 +256,6 @@ impl CursorProber {
         })
     }
 
-    /// Query the zoom-invariant native CPU display RGBA readout under
-    /// `(lat_deg, lon_deg)` on the topmost visible non-reloading overlay.
     pub(super) fn query(
         &self,
         stack: &LayerStack,
@@ -246,7 +268,8 @@ impl CursorProber {
             return None;
         };
 
-        let probe_key = (layer.source_id(), pixel.0, pixel.1);
+        let spec = layer.meta().spec;
+        let probe_key: ProbeKey = (layer.source_id(), spec.band, spec.format, pixel.0, pixel.1);
         let (submit_cancel, prev_cancel) = {
             let mut state = lock_unpoisoned(&self.cache);
             if state.resolved_key == Some(probe_key) {

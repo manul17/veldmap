@@ -3,15 +3,15 @@
 use std::sync::Arc;
 
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{DecodedTile, TileKey};
+use veldmap_core::tile::{DecodedTile, RASTER_TILE_SIZE, TileKey};
 use veldmap_raster::{
-    AdmittedTile, DecodeJob, DecodeJobKey, RasterSource, TileFailureOutcome,
-    generate_linear_mipmaps,
+    AdmittedTile, DecodeJob, DecodeJobKey, RasterSource, TileFailureOutcome, generate_tile_mipmaps,
 };
 use veldmap_storage::DiskTileKey;
 
-use super::super::default_display_tile_bytes;
-use super::super::qoi_cache::{load_qoi_display_tile, store_qoi_display_tile};
+use crate::gpu_tiles::tile_format_bytes;
+
+use super::super::qoi_cache::{load_cached_tile, store_cached_tile};
 use super::super::runtime::OverlayRuntime;
 
 /// RAII guard guaranteeing a pointwise tile never remains stuck in-flight in
@@ -114,30 +114,24 @@ fn run_pointwise_job(
     }
     let disk_key = DiskTileKey::from_tile_key(fp, &tile_key);
     if let Some(ref disk) = rt.disk_cache
-        && let Some(tile) = load_qoi_display_tile(disk, &disk_key)
+        && let Some(tile) = load_cached_tile(disk, &disk_key)
     {
         deliver_pointwise_tile(rt, tile_key, tile, cancel, guard);
         return;
     }
 
+    let spec = tile_key.stream_spec();
     let ctx = rt.decode_context(cancel);
-    match source.decode_pointwise_tile(tile_key.level, tile_key.x, tile_key.y, &ctx) {
+    match source.decode_pointwise_tile_stream(spec, tile_key.level, tile_key.x, tile_key.y, &ctx) {
         Ok(mut tile) => {
             if cancel.is_cancelled() {
                 guard.mark_cancelled();
                 return;
             }
             if let Some(ref disk) = rt.disk_cache {
-                store_qoi_display_tile(
-                    disk,
-                    &disk_key,
-                    tile.width(),
-                    tile.height(),
-                    tile.data(),
-                    cancel,
-                );
+                store_cached_tile(disk, &disk_key, &tile, cancel);
             }
-            generate_linear_mipmaps(&mut tile);
+            generate_tile_mipmaps(&mut tile);
             deliver_pointwise_tile(rt, tile_key, tile, cancel, guard);
         }
         Err(err) if err.is_cancelled() => {
@@ -176,7 +170,7 @@ pub(super) fn submit_pointwise_job(
 
     let job = DecodeJob {
         key: DecodeJobKey::Tile(tile_key),
-        queued_bytes: default_display_tile_bytes(),
+        queued_bytes: tile_format_bytes(RASTER_TILE_SIZE, tile_key.format),
         cancel: cancel.clone(),
         work: Box::new(move || {
             run_pointwise_job(&rt, source.as_ref(), fp, tile_key, &cancel, guard);

@@ -20,6 +20,16 @@ pub use upload_queue::{
 /// Estimated GPU byte footprint of one square `Rgba8UnormSrgb` display tile
 /// (`tile_px x tile_px`) including its complete CPU-generated mip chain.
 pub(crate) fn display_tile_mip_bytes(tile_px: u32) -> usize {
-    let mips = max_mip_levels(tile_px, tile_px);
-    mip_chain_byte_size(tile_px, tile_px, PixelFormat::Rgba8UnormSrgb, mips).max(1)
+    tile_format_bytes(tile_px, PixelFormat::Rgba8UnormSrgb)
+}
+
+/// Estimated GPU byte footprint of one square tile (`tile_px x tile_px`) for
+/// `format` (full mip chain for `Rgba8UnormSrgb` / `R32Float`; 1 mip for
+/// discrete categorical `R8Uint` / `R16Uint`).
+pub(crate) fn tile_format_bytes(tile_px: u32, format: PixelFormat) -> usize {
+    let mips = match format {
+        PixelFormat::Rgba8UnormSrgb | PixelFormat::R32Float => max_mip_levels(tile_px, tile_px),
+        PixelFormat::R8Uint | PixelFormat::R16Uint => 1,
+    };
+    mip_chain_byte_size(tile_px, tile_px, format, mips).max(1)
 }

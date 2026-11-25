@@ -216,7 +216,12 @@ impl BasemapManager {
     /// appetite budgeting accounts for 512 px / `@2x` Custom XYZ tiles cleanly.
     pub(crate) fn record_upload_report(&mut self, report: &UploadBatchReport) {
         if let Some(spec) = &self.active_live_spec {
-            let max_bytes = report.max_tile_bytes_for(spec.source_id());
+            let max_bytes = report.max_tile_bytes_for_stream(veldmap_core::tile::StreamKey::new(
+                spec.source_id(),
+                veldmap_core::tile::BandKey::Display,
+                veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
+                0,
+            ));
             if max_bytes > 0 {
                 self.observed_live_tile_bytes = self.observed_live_tile_bytes.max(max_bytes);
             }

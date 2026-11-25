@@ -134,6 +134,105 @@ pub fn generate_linear_mipmaps(tile: &mut DecodedTile) {
     let _ = tile.try_set_mips(mips);
 }
 
+fn downsample_r32f_nan_skipping_2x(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let dw = dst_w as usize;
+    let dh = dst_h as usize;
+    let mut dst = vec![0u8; dw * dh * 4];
+
+    for y in 0..dh {
+        let sy0 = y * 2;
+        let sy1 = if y + 1 == dh { sh } else { (sy0 + 2).min(sh) };
+        for x in 0..dw {
+            let sx0 = x * 2;
+            let sx1 = if x + 1 == dw { sw } else { (sx0 + 2).min(sw) };
+            let mut sum = 0.0f64;
+            let mut count = 0u32;
+            for sy in sy0..sy1 {
+                let row = sy * sw;
+                for sx in sx0..sx1 {
+                    let off = (row + sx) * 4;
+                    let v =
+                        f32::from_ne_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
+                    if v.is_finite() {
+                        sum += f64::from(v);
+                        count += 1;
+                    }
+                }
+            }
+            let out_val = if count > 0 {
+                (sum / f64::from(count)) as f32
+            } else {
+                f32::NAN
+            };
+            let out_off = (y * dw + x) * 4;
+            dst[out_off..out_off + 4].copy_from_slice(&out_val.to_ne_bytes());
+        }
+    }
+    dst
+}
+
+/// Populate the complete CPU NaN-skipping mipmap chain on an unguttered,
+/// unpadded `R32Float` scientific tile (`gutter == 0`, `valid_w == width`,
+/// `valid_h == height`, including NPOT clipped edge tiles).
+///
+/// Finite samples inside each downsample footprint are averaged in `f64`, while
+/// `NaN` / non-finite nodata samples are excluded; a footprint containing only
+/// non-finite samples produces `f32::NAN`.
+pub fn generate_scientific_mipmaps(tile: &mut DecodedTile) {
+    tile.clear_mips();
+    let width = tile.width();
+    let height = tile.height();
+    if tile.format() != PixelFormat::R32Float
+        || tile.gutter() != 0
+        || tile.valid_w() != width
+        || tile.valid_h() != height
+    {
+        return;
+    }
+
+    let total_levels = max_mip_levels(width, height);
+    if total_levels <= 1 {
+        return;
+    }
+
+    let mut mips: Vec<Vec<u8>> = Vec::with_capacity((total_levels - 1) as usize);
+    let mut prev_w = width;
+    let mut prev_h = height;
+    for level in 1..total_levels {
+        let (dst_w, dst_h) = mip_dimensions(width, height, level);
+        let src = if level == 1 {
+            tile.data()
+        } else {
+            mips[(level - 2) as usize].as_slice()
+        };
+        let next = downsample_r32f_nan_skipping_2x(src, prev_w, prev_h, dst_w, dst_h);
+        mips.push(next);
+        prev_w = dst_w;
+        prev_h = dst_h;
+    }
+    let _ = tile.try_set_mips(mips);
+}
+
+/// Generate format-appropriate CPU mipmaps on `tile`:
+/// - `Rgba8UnormSrgb`: linear-light alpha-weighted mip chain
+/// - `R32Float`: NaN-skipping numeric mip chain
+/// - `R8Uint` / `R16Uint`: 1 mip only (discrete class IDs are never averaged)
+pub fn generate_tile_mipmaps(tile: &mut DecodedTile) {
+    match tile.format() {
+        PixelFormat::Rgba8UnormSrgb => generate_linear_mipmaps(tile),
+        PixelFormat::R32Float => generate_scientific_mipmaps(tile),
+        PixelFormat::R8Uint | PixelFormat::R16Uint => tile.clear_mips(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

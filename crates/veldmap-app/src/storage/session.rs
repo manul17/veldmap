@@ -11,7 +11,7 @@ use veldmap_storage::{
 };
 
 use crate::clamp_opacity;
-use crate::layers::CrsOverride;
+use crate::layers::{CrsOverride, SavedLayerStyle};
 
 /// Current on-disk schema version for `session.json`.
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -93,20 +93,34 @@ pub(crate) struct SavedLayerEntry {
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
     crs_override: Option<SavedCrsOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) style: Option<SavedLayerStyle>,
 }
 
 impl SavedLayerEntry {
+    #[cfg(test)]
     pub(crate) fn new(
         path: PathBuf,
         visible: bool,
         opacity: f32,
         crs_override: Option<&CrsOverride>,
     ) -> Self {
+        Self::with_style(path, visible, opacity, crs_override, None)
+    }
+
+    pub(crate) fn with_style(
+        path: PathBuf,
+        visible: bool,
+        opacity: f32,
+        crs_override: Option<&CrsOverride>,
+        style: Option<SavedLayerStyle>,
+    ) -> Self {
         Self {
             path,
             visible,
             opacity,
             crs_override: crs_override.map(SavedCrsOverride::from),
+            style,
         }
     }
 
@@ -122,6 +136,7 @@ impl Default for SavedLayerEntry {
             visible: true,
             opacity: 1.0,
             crs_override: None,
+            style: None,
         }
     }
 }

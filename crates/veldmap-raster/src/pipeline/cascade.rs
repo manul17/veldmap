@@ -1,21 +1,22 @@
 //! Single-pass pyramid band cascade (`Cascade`): builds every coarser pyramid
-//! level from a top-to-bottom stream of base-level RGBA8 row bands with exact
-//! 2x2 block alignment and predictable working memory (`bytes`).
+//! level from a top-to-bottom stream of base-level row bands with exact 2x2
+//! block alignment and predictable working memory (`bytes_for_format`) across
+//! `Rgba8UnormSrgb`, `R32Float`, `R8Uint`, and `R16Uint` tracks.
 
-use veldmap_core::tile::{RASTER_TILE_SIZE, grid_dim, tile_extent};
+use veldmap_core::tile::{PixelFormat, RASTER_TILE_SIZE, grid_dim, tile_extent};
 
 use crate::RasterError;
 
-use super::resample::{bleed_alpha, halve_rgba8};
+use super::resample::{bleed_alpha, halve_f32, halve_rgba8, halve_u8_nearest, halve_u16_nearest};
 
-/// Callback invoked whenever a cascade tile `(level, tx, ty, w, h, rgba8)`
+/// Callback invoked whenever a cascade tile `(level, tx, ty, w, h, bytes)`
 /// is completed.
 pub type TileEmit<'a> =
     &'a mut dyn FnMut(u8, u32, u32, u32, u32, Vec<u8>) -> Result<(), RasterError>;
 
 /// Wrap a display-track [`TileEmit`] callback so every emitted RGBA8 tile runs
 /// [`bleed_alpha`] before delivery (kept composable outside [`Cascade`] so
-/// non-display scientific/categorical tracks can opt out cleanly).
+/// non-display scientific/categorical tracks never bleed alpha).
 pub(crate) fn bleed_display_emit<'a>(
     emit: TileEmit<'a>,
 ) -> impl FnMut(u8, u32, u32, u32, u32, Vec<u8>) -> Result<(), RasterError> + 'a {
@@ -35,7 +36,7 @@ struct CascadeBand {
 }
 
 impl CascadeBand {
-    fn new(level: u8, width: u32, height: u32) -> Self {
+    fn new(level: u8, width: u32, height: u32, bpp: usize) -> Self {
         let rows = height.min(RASTER_TILE_SIZE);
         Self {
             level,
@@ -43,7 +44,7 @@ impl CascadeBand {
             height,
             top: 0,
             filled: 0,
-            buf: vec![0; (width as usize) * (rows as usize) * 4],
+            buf: vec![0; (width as usize) * (rows as usize) * bpp],
         }
     }
 
@@ -52,28 +53,36 @@ impl CascadeBand {
     }
 }
 
-/// Exact working memory in bytes required by [`Cascade`] for `(base_w, base_h)`.
+/// Exact working memory in bytes required by [`Cascade`] for `(base_w, base_h)`
+/// in RGBA8 display format.
 pub(crate) fn bytes(base_w: u32, base_h: u32) -> u64 {
-    bands_bytes(base_w, base_h).saturating_add(flush_bytes(base_w, base_h))
+    bytes_for_format(base_w, base_h, PixelFormat::Rgba8UnormSrgb)
 }
 
-fn bands_bytes(base_w: u32, base_h: u32) -> u64 {
+/// Exact working memory in bytes required by [`Cascade`] for `(base_w, base_h)`
+/// in `format`.
+pub(crate) fn bytes_for_format(base_w: u32, base_h: u32, format: PixelFormat) -> u64 {
+    let bpp = format.bytes_per_pixel() as u64;
+    bands_bytes(base_w, base_h, bpp).saturating_add(flush_bytes(base_w, base_h, bpp))
+}
+
+fn bands_bytes(base_w: u32, base_h: u32, bpp: u64) -> u64 {
     levels(base_w, base_h)
-        .map(|(w, h, _)| u64::from(w) * u64::from(h.min(RASTER_TILE_SIZE)) * 4)
+        .map(|(w, h, _)| u64::from(w) * u64::from(h.min(RASTER_TILE_SIZE)) * bpp)
         .sum()
 }
 
-fn flush_bytes(base_w: u32, base_h: u32) -> u64 {
+fn flush_bytes(base_w: u32, base_h: u32, bpp: u64) -> u64 {
     let halves: u64 = levels(base_w, base_h)
         .filter(|(_, _, is_apex)| !is_apex)
         .map(|(w, h, _)| {
             let rows = u64::from(h.min(RASTER_TILE_SIZE));
-            u64::from(w.div_ceil(2)) * rows.div_ceil(2) * 4
+            u64::from(w.div_ceil(2)) * rows.div_ceil(2) * bpp
         })
         .sum();
     let tile = levels(base_w, base_h)
         .map(|(w, h, _)| {
-            u64::from(w.min(RASTER_TILE_SIZE)) * u64::from(h.min(RASTER_TILE_SIZE)) * 4
+            u64::from(w.min(RASTER_TILE_SIZE)) * u64::from(h.min(RASTER_TILE_SIZE)) * bpp
         })
         .max()
         .unwrap_or(0);
@@ -96,22 +105,38 @@ fn levels(base_w: u32, base_h: u32) -> impl Iterator<Item = (u32, u32, bool)> {
     })
 }
 
-/// Top-to-bottom streaming RGBA8 pyramid builder.
+/// Top-to-bottom streaming typed pyramid builder.
 pub(crate) struct Cascade {
+    format: PixelFormat,
     bands: Vec<CascadeBand>,
 }
 
 impl Cascade {
-    /// Allocate cascade bands from `base_level` up to the single-tile apex.
+    /// Allocate display (`Rgba8UnormSrgb`) cascade bands from `base_level` up
+    /// to the single-tile apex.
     pub(crate) fn new(base_level: u8, base_w: u32, base_h: u32) -> Self {
-        let bands = levels(base_w, base_h)
-            .enumerate()
-            .map(|(idx, (w, h, _))| CascadeBand::new(base_level.saturating_add(idx as u8), w, h))
-            .collect();
-        Self { bands }
+        Self::new_for_format(base_level, base_w, base_h, PixelFormat::Rgba8UnormSrgb)
     }
 
-    /// Feed `nrows` contiguous RGBA8 rows at `base_level`.
+    /// Allocate cascade bands for `format` from `base_level` up to the
+    /// single-tile apex.
+    pub(crate) fn new_for_format(
+        base_level: u8,
+        base_w: u32,
+        base_h: u32,
+        format: PixelFormat,
+    ) -> Self {
+        let bpp = format.bytes_per_pixel();
+        let bands = levels(base_w, base_h)
+            .enumerate()
+            .map(|(idx, (w, h, _))| {
+                CascadeBand::new(base_level.saturating_add(idx as u8), w, h, bpp)
+            })
+            .collect();
+        Self { format, bands }
+    }
+
+    /// Feed `nrows` contiguous rows at `base_level`.
     pub(crate) fn push_rows(
         &mut self,
         rows: &[u8],
@@ -139,10 +164,11 @@ impl Cascade {
         nrows: u32,
         emit: TileEmit<'_>,
     ) -> Result<(), RasterError> {
+        let bpp = self.format.bytes_per_pixel();
         let width = self.bands[i].width as usize;
         let expected_len = (nrows as usize)
             .checked_mul(width)
-            .and_then(|px| px.checked_mul(4))
+            .and_then(|px| px.checked_mul(bpp))
             .ok_or_else(|| RasterError::Decode("cascade row slice size overflow".into()))?;
         if data.len() < expected_len {
             return Err(RasterError::Decode(format!(
@@ -161,9 +187,9 @@ impl Cascade {
                     band.level, band.height
                 )));
             }
-            let src_start = (fed as usize) * width * 4;
-            let copy_len = (take as usize) * width * 4;
-            let dst_start = (band.filled as usize) * width * 4;
+            let src_start = (fed as usize) * width * bpp;
+            let copy_len = (take as usize) * width * bpp;
+            let dst_start = (band.filled as usize) * width * bpp;
             band.buf[dst_start..dst_start + copy_len]
                 .copy_from_slice(&data[src_start..src_start + copy_len]);
             band.filled += take;
@@ -176,6 +202,7 @@ impl Cascade {
     }
 
     fn flush(&mut self, i: usize, emit: TileEmit<'_>) -> Result<(), RasterError> {
+        let bpp = self.format.bytes_per_pixel();
         let (level, width, top, rows) = {
             let band = &self.bands[i];
             (band.level, band.width, band.top, band.filled)
@@ -187,20 +214,26 @@ impl Cascade {
         let ty = top / RASTER_TILE_SIZE;
         for tx in 0..grid_dim(width) {
             let tw = tile_extent(tx, width);
-            let mut tile = Vec::with_capacity((tw as usize) * (rows as usize) * 4);
+            let mut tile = Vec::with_capacity((tw as usize) * (rows as usize) * bpp);
             let buf = &self.bands[i].buf;
             for row in 0..rows as usize {
-                let from = (row * (width as usize) + (tx * RASTER_TILE_SIZE) as usize) * 4;
-                tile.extend_from_slice(&buf[from..from + (tw as usize) * 4]);
+                let from = (row * (width as usize) + (tx * RASTER_TILE_SIZE) as usize) * bpp;
+                tile.extend_from_slice(&buf[from..from + (tw as usize) * bpp]);
             }
             emit(level, tx, ty, tw, rows, tile)?;
         }
 
         let half = if i + 1 < self.bands.len() {
             let band = &self.bands[i];
-            let filled = &band.buf[..(width as usize) * (rows as usize) * 4];
+            let filled = &band.buf[..(width as usize) * (rows as usize) * bpp];
             debug_assert_eq!(width.div_ceil(2), self.bands[i + 1].width);
-            Some((halve_rgba8(filled, width, rows), rows.div_ceil(2)))
+            let halved = match self.format {
+                PixelFormat::Rgba8UnormSrgb => halve_rgba8(filled, width, rows),
+                PixelFormat::R32Float => halve_f32(filled, width, rows),
+                PixelFormat::R8Uint => halve_u8_nearest(filled, width, rows),
+                PixelFormat::R16Uint => halve_u16_nearest(filled, width, rows),
+            };
+            Some((halved, rows.div_ceil(2)))
         } else {
             None
         };
@@ -256,12 +289,38 @@ mod tests {
         // Level 0: 2x2 = 4 tiles; Level 1 (350x300 <= 512): 1 apex tile.
         assert_eq!(emitted.len(), 5);
         assert!(emitted.contains(&(1, 0, 0, 350, 300, 350 * 300 * 4)));
-        assert!(bytes(w, h) > bands_bytes(w, h));
+        assert!(bytes(w, h) > bands_bytes(w, h, 4));
         // Apex-only raster has zero halving buffer cost.
         assert_eq!(
-            flush_bytes(256, 256),
+            flush_bytes(256, 256, 4),
             256 * 256 * 4,
             "apex-only flush_bytes must not count halving"
         );
+    }
+
+    #[test]
+    fn cascade_supports_r32float_and_r8uint_with_format_semantics() {
+        // R8Uint 4x4 -> 2x2 nearest-neighbor (never averaging class 1 and class 9 into 5).
+        let mut cat = Cascade::new_for_format(0, 600, 4, PixelFormat::R8Uint);
+        let mut rows = vec![9u8; 600 * 4];
+        rows[0] = 1;
+        let mut apex_u8 = None;
+        cat.push_rows(&rows, 4, &mut |lvl, _tx, _ty, _tw, _th, bytes| {
+            if lvl == 1 {
+                apex_u8 = Some(bytes);
+            }
+            Ok(())
+        })
+        .expect("push");
+        cat.finish(&mut |lvl, _tx, _ty, _tw, _th, bytes| {
+            if lvl == 1 {
+                apex_u8 = Some(bytes);
+            }
+            Ok(())
+        })
+        .expect("finish");
+        let apex = apex_u8.expect("apex emitted");
+        assert_eq!(apex[0], 1, "categorical cascade must pick exact class id");
+        assert_eq!(apex[1], 9);
     }
 }

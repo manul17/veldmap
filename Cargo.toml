@@ -22,11 +22,13 @@ dejavu = "2.37.0"
 directories = "6.0.0"
 earcut = "0.4.12"
 eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "wgpu", "wayland", "x11"] }
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
 geographiclib-rs = "0.2.7"
 glam = "0.34.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 image-webp = "0.2.4"
 jpeg-decoder = { version = "0.3.2", default-features = false }
+lz4_flex = { version = "0.14.2", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 naga = { version = "30.0.2", features = ["wgsl-in", "spv-out", "hlsl-out", "msl-out"] }
 png = "0.18.1"
 pollster = "1.0.3"
@@ -44,6 +46,7 @@ tiff = { version = "0.11.3", features = ["zstd", "webp"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+weezl = "0.1.12"
 wgpu = "30.0.2"
 zstd = "0.13.5"
 

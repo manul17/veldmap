@@ -23,6 +23,8 @@ pub struct GpuTile {
     pub(crate) valid_h: u32,
     /// Border gutter width in texels (`0` for standard tiles, `1` for DEM tiles).
     pub(crate) gutter: u8,
+    /// Number of uploaded mip levels on `_texture` (`>= 1`).
+    pub(crate) mip_level_count: u32,
     pub(crate) byte_size: usize,
     pub(crate) tile_id: u64,
 }
@@ -92,6 +94,12 @@ impl GpuTileCache {
 
     pub fn max_bytes(&self) -> usize {
         self.cache.max_bytes()
+    }
+
+    /// Update the VRAM byte ceiling live, evicting oldest entries if needed.
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+        let evicted = self.cache.set_max_bytes(max_bytes);
+        drop(evicted);
     }
 
     pub fn contains(&self, key: &TileKey) -> bool {
@@ -224,6 +232,7 @@ impl GpuTileCache {
             valid_w: decoded.valid_w(),
             valid_h: decoded.valid_h(),
             gutter: decoded.gutter(),
+            mip_level_count: decoded.mip_level_count(),
             byte_size,
             tile_id,
         });

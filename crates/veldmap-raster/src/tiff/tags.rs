@@ -102,6 +102,54 @@ pub(super) fn read_tag_u16_vec_opt(
     Ok(opt_tag(decoder.get_tag_u16_vec(tag), cancel)?.unwrap_or_default())
 }
 
+fn value_to_u64(val: &tiff::decoder::ifd::Value) -> Option<u64> {
+    use tiff::decoder::ifd::Value;
+    match *val {
+        Value::Byte(v) => Some(u64::from(v)),
+        Value::Short(v) => Some(u64::from(v)),
+        Value::Unsigned(v) => Some(u64::from(v)),
+        Value::UnsignedBig(v) => Some(v),
+        _ => None,
+    }
+}
+
+pub(super) fn read_tag_u64_vec_opt(
+    decoder: &mut Decoder<BufferedByteReader>,
+    tag: Tag,
+    cancel: &CancelToken,
+) -> Result<Option<Vec<u64>>, RasterError> {
+    let Some(val) = opt_tag(decoder.get_tag(tag), cancel)? else {
+        return Ok(None);
+    };
+    let out = match val {
+        tiff::decoder::ifd::Value::List(items) => items.iter().filter_map(value_to_u64).collect(),
+        single => value_to_u64(&single).into_iter().collect(),
+    };
+    Ok(Some(out))
+}
+
+pub(super) fn read_tag_u8_vec_opt(
+    decoder: &mut Decoder<BufferedByteReader>,
+    tag: Tag,
+    cancel: &CancelToken,
+) -> Result<Option<Vec<u8>>, RasterError> {
+    let Some(val) = opt_tag(decoder.get_tag(tag), cancel)? else {
+        return Ok(None);
+    };
+    let out = match val {
+        tiff::decoder::ifd::Value::List(items) => items
+            .iter()
+            .filter_map(|v| match *v {
+                tiff::decoder::ifd::Value::Byte(b) => Some(b),
+                _ => None,
+            })
+            .collect(),
+        tiff::decoder::ifd::Value::Byte(b) => vec![b],
+        _ => return Ok(None),
+    };
+    Ok(Some(out))
+}
+
 pub(super) fn read_tag_f64_vec_opt(
     decoder: &mut Decoder<BufferedByteReader>,
     tag: Tag,

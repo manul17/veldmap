@@ -122,6 +122,7 @@ pub(super) fn build_and_schedule_layer(
 
     (!patches.is_empty()).then(|| DrawOverlayLayer {
         opacity: layer.opacity(),
+        track: layer.draw_track(),
         frame: Arc::clone(layer.frame()),
         image_width: img_w,
         image_height: img_h,

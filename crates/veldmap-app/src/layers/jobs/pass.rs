@@ -5,15 +5,16 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{DecodedTile, PixelFormat, StreamKey, TileKey};
+use veldmap_core::tile::{DecodedTile, RASTER_TILE_SIZE, StreamKey, TileKey};
 use veldmap_raster::{
     AdmittedPass, DecodeJob, DecodeJobKey, PyramidMeta, RasterError, RasterSource,
-    generate_linear_mipmaps,
+    generate_tile_mipmaps,
 };
 use veldmap_storage::DiskTileKey;
 
-use super::super::default_display_tile_bytes;
-use super::super::qoi_cache::{QoiWriteBatch, load_qoi_display_tile};
+use crate::gpu_tiles::tile_format_bytes;
+
+use super::super::qoi_cache::{TileWriteBatch, load_cached_tile};
 use super::super::runtime::OverlayRuntime;
 
 pub(super) struct PassJobSpec {
@@ -120,7 +121,7 @@ fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
         dk.level = tk.level;
         dk.x = tk.x;
         dk.y = tk.y;
-        if let Some(tile) = load_qoi_display_tile(disk, &dk) {
+        if let Some(tile) = load_cached_tile(disk, &dk) {
             if deliver_pass_tile(&spec.runtime, stream_key, pass_id, tk, tile, pass_cancel) {
                 already_hit.insert(tk);
             }
@@ -135,8 +136,9 @@ fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
     }
 }
 
-/// Execute the source's sequential `produce_pass`, batch-writing newly produced
-/// display tiles to QOI disk cache and uploading wanted/apex tiles live.
+/// Execute the source's sequential `produce_pass_stream`, batch-writing newly
+/// produced tiles (`Qoi` or `Lz4Raw`) to disk cache and uploading wanted/apex
+/// tiles live.
 fn run_source_pass(spec: &PassJobSpec, already_hit: &HashSet<TileKey>) -> Result<(), RasterError> {
     let stream_key = spec.admitted.key;
     let pass_id = spec.admitted.pass_id;
@@ -149,50 +151,55 @@ fn run_source_pass(spec: &PassJobSpec, already_hit: &HashSet<TileKey>) -> Result
         .filter(|tk| !already_hit.contains(tk))
         .collect();
     let max_level = spec.meta.max_level();
-    let mut qoi_batch = QoiWriteBatch::new();
+    let stream_spec = spec.meta.spec;
+    let mut write_batch = TileWriteBatch::new();
     let ctx = spec.runtime.decode_context(pass_cancel);
 
-    let result = spec
-        .source
-        .produce_pass(&ctx, &mut |level, tx, ty, tw, th, rgba| {
-            if pass_cancel.is_cancelled() {
-                return Err(RasterError::Cancelled);
-            }
-            let tk = spec.meta.tile_key(level, tx, ty);
-            if already_hit.contains(&tk) {
-                return Ok(());
-            }
-            if let Some(ref disk) = spec.runtime.disk_cache {
-                qoi_batch.push_and_maybe_flush(
-                    disk,
-                    DiskTileKey::from_tile_key(spec.fingerprint_hex.clone(), &tk),
-                    tw,
-                    th,
-                    &rgba,
-                    pass_cancel,
-                );
-            }
-
-            // Read live `wanted_shared` briefly (never nesting locks) so mid-pass
-            // zooms upload tiles matching the current viewport.
-            let should_upload = level == max_level
-                || initial_missing.contains(&tk)
-                || lock_unpoisoned(&spec.wanted_shared).contains(&tk);
-            if should_upload {
-                let mut tile = DecodedTile::try_new(tw, th, PixelFormat::Rgba8UnormSrgb, rgba)
+    let result =
+        spec.source
+            .produce_pass_stream(stream_spec, &ctx, &mut |level, tx, ty, tw, th, bytes| {
+                if pass_cancel.is_cancelled() {
+                    return Err(RasterError::Cancelled);
+                }
+                let tk = spec.meta.tile_key(level, tx, ty);
+                if already_hit.contains(&tk) {
+                    return Ok(());
+                }
+                let mut tile = DecodedTile::try_new(tw, th, stream_spec.format, bytes)
                     .map_err(|e| RasterError::Decode(e.to_string()))?;
-                generate_linear_mipmaps(&mut tile);
-                let _ =
-                    deliver_pass_tile(&spec.runtime, stream_key, pass_id, tk, tile, pass_cancel);
-            }
-            Ok(())
-        });
+                if let Some(ref disk) = spec.runtime.disk_cache {
+                    write_batch.push_and_maybe_flush(
+                        disk,
+                        DiskTileKey::from_tile_key(spec.fingerprint_hex.clone(), &tk),
+                        &tile,
+                        pass_cancel,
+                    );
+                }
+
+                // Read live `wanted_shared` briefly (never nesting locks) so mid-pass
+                // zooms upload tiles matching the current viewport.
+                let should_upload = level == max_level
+                    || initial_missing.contains(&tk)
+                    || lock_unpoisoned(&spec.wanted_shared).contains(&tk);
+                if should_upload {
+                    generate_tile_mipmaps(&mut tile);
+                    let _ = deliver_pass_tile(
+                        &spec.runtime,
+                        stream_key,
+                        pass_id,
+                        tk,
+                        tile,
+                        pass_cancel,
+                    );
+                }
+                Ok(())
+            });
 
     if let Some(ref disk) = spec.runtime.disk_cache {
         if result.is_ok() {
-            qoi_batch.flush(disk, pass_cancel);
+            write_batch.flush(disk, pass_cancel);
         } else {
-            qoi_batch.clear();
+            write_batch.clear();
         }
     }
 
@@ -233,13 +240,13 @@ pub(super) fn submit_pass_job(spec: PassJobSpec) {
     let runtime = Arc::clone(&spec.runtime);
     let queued_bytes = spec
         .source
-        .pass_peak_bytes()
+        .pass_peak_bytes_for(spec.meta.spec)
         .min(runtime.budget.bulk_lane_pending_bytes as u64) as usize;
     let guard = PassFlightGuard::new(Arc::clone(&runtime), stream_key, pass_id);
 
     let job = DecodeJob {
         key: DecodeJobKey::Pass(stream_key),
-        queued_bytes: queued_bytes.max(default_display_tile_bytes()),
+        queued_bytes: queued_bytes.max(tile_format_bytes(RASTER_TILE_SIZE, spec.meta.spec.format)),
         cancel: pass_cancel,
         work: Box::new(move || run_pass_job(spec, guard)),
     };

@@ -1,5 +1,5 @@
-//! Header/IFD discovery, decoder limits, and overview scanning for
-//! [`super::TiffSource::open`].
+//! Header/IFD discovery, cached chunk-table validation, `GDAL_METADATA`
+//! parsing, and overview scanning for [`super::TiffSource::open`].
 
 use std::sync::Arc;
 
@@ -8,7 +8,7 @@ use tiff::tags::Tag;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{SourceFingerprint, SourceId};
+use veldmap_core::tile::{PixelFormat, SourceFingerprint, SourceId};
 
 use crate::RasterError;
 use crate::pipeline::grid::{Grid, Overview};
@@ -16,13 +16,14 @@ use crate::pipeline::metadata::{BandInfo, GeoPlacement, PlacementCrs, RasterDesc
 use crate::pipeline::plan::{build_chunked_level_table, check_max_source_side};
 use crate::pipeline::radiometry::DisplayMapping;
 
-use super::chunk_reader::{DecoderPool, open_decoder};
-use super::format::{TiffFormat, chunk_grid, depth_of_layout, ensure_readable};
+use super::gdal_meta::{GdalMetadata, parse_gdal_metadata};
 use super::georef::{ParsedGeoref, georef};
-use super::stretch::StretchCache;
-use super::tags::{is_overview, map_tiff_error, opt_tag, parse_gdal_nodata};
-use super::ycbcr::YCbCrParams;
+use super::ifd::{CachedIfd, Photometric, TiffByteOrder, parse_cached_ifd};
+use super::stretch::{BandStatsCache, StretchCache};
+use super::tags::{is_overview, map_tiff_error, opt_tag, parse_gdal_nodata, read_tag_ascii_opt};
 use super::{MAX_IFDS, TiffSource};
+
+const TAG_GDAL_METADATA: u16 = 42112;
 
 fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
     let mut limits = Limits::default();
@@ -33,79 +34,42 @@ fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
     limits
 }
 
-struct BaseIfd {
-    width: u32,
-    height: u32,
-    tiled: bool,
-    chunk: (u32, u32),
-    format: TiffFormat,
-    nodata_f64: Option<f64>,
-    ycbcr: Option<YCbCrParams>,
-}
-
-fn parse_base_ifd(
-    decoder: &mut Decoder<BufferedByteReader>,
-    budget: &MemoryBudget,
+fn open_tag_decoder(
+    byte_source: &Arc<dyn ByteSource>,
+    limits: &Limits,
     cancel: &CancelToken,
-) -> Result<BaseIfd, RasterError> {
-    let (width, height) = decoder
-        .dimensions()
-        .map_err(|e| map_tiff_error(e, cancel))?;
-    if width == 0 || height == 0 {
-        return Err(RasterError::InvalidDimensions { width, height });
-    }
+) -> Result<(TiffByteOrder, Decoder<BufferedByteReader>), RasterError> {
+    use std::io::{Read, Seek, SeekFrom};
 
-    let (pixel_layout, sample_bits, sample_type, ycbcr) = ensure_readable(decoder, cancel)?;
-    let tiled = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::TileWidth), cancel)?.is_some();
-    if !tiled {
-        check_max_source_side(width, height)?;
-    }
-    let depth = depth_of_layout(pixel_layout, sample_bits);
-    let chunk = chunk_grid(decoder, budget, depth, cancel)?;
-
-    let nodata_f64 = parse_gdal_nodata(decoder, cancel)?;
-    let nodata = nodata_f64.and_then(|v| {
-        if !v.is_finite() || v < f64::from(f32::MIN) || v > f64::from(f32::MAX) {
-            None
-        } else {
-            Some(v as f32)
-        }
-    });
-
-    Ok(BaseIfd {
-        width,
-        height,
-        tiled,
-        chunk,
-        format: TiffFormat {
-            pixel_layout,
-            sample_bits,
-            sample_type,
-            depth,
-            nodata,
-        },
-        nodata_f64,
-        ycbcr,
-    })
-}
-
-struct ScannedOverviews {
-    overviews: Vec<Overview>,
-    overview_ycbcr: Vec<(usize, YCbCrParams)>,
-    ifd_index: usize,
-    decoder_clean: bool,
+    let mut reader = BufferedByteReader::new(Arc::clone(byte_source), cancel.clone());
+    let mut magic = [0u8; 2];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|e| crate::map_std_io_error(e, cancel))?;
+    let byte_order = match &magic {
+        b"II" => TiffByteOrder::Little,
+        b"MM" => TiffByteOrder::Big,
+        _ => return Err(RasterError::UnsupportedFormat),
+    };
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| crate::map_std_io_error(e, cancel))?;
+    let decoder = Decoder::new(reader)
+        .map_err(|e| map_tiff_error(e, cancel))?
+        .with_limits(limits.clone());
+    Ok((byte_order, decoder))
 }
 
 fn scan_overviews(
     decoder: &mut Decoder<BufferedByteReader>,
-    format: TiffFormat,
+    base_ifd: &CachedIfd,
     budget: &MemoryBudget,
+    mut table_bytes_used: u64,
     cancel: &CancelToken,
-) -> Result<ScannedOverviews, RasterError> {
+) -> Result<(Vec<Overview>, Vec<CachedIfd>), RasterError> {
     let mut overviews = Vec::new();
-    let mut overview_ycbcr = Vec::new();
+    let mut cached_overviews = Vec::new();
     let mut ifd_index = 0usize;
-    let mut decoder_clean = true;
     while ifd_index + 1 < MAX_IFDS && decoder.more_images() {
         if cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
@@ -115,7 +79,6 @@ fn scan_overviews(
                 return Err(RasterError::Cancelled);
             }
             tracing::debug!(error = %err, "Stopped scanning TIFF overviews");
-            decoder_clean = false;
             break;
         }
         ifd_index += 1;
@@ -127,50 +90,35 @@ fn scan_overviews(
         if !is_overview(subfile) {
             continue;
         }
-        let o_ycbcr = match ensure_readable(decoder, cancel) {
-            Ok((o_layout, o_bits, o_type, o_ycbcr)) => {
-                if o_layout != format.pixel_layout
-                    || o_bits != format.sample_bits
-                    || o_type != format.sample_type
-                {
-                    continue;
-                }
-                o_ycbcr
-            }
-            Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
-            Err(_) => continue,
-        };
-        let Ok((ow, oh)) = decoder.dimensions() else {
-            if cancel.is_cancelled() {
-                return Err(RasterError::Cancelled);
-            }
-            continue;
-        };
-        if ow == 0 || oh == 0 {
+        let overview_ifd =
+            match parse_cached_ifd(decoder, ifd_index, budget, table_bytes_used, cancel) {
+                Ok(ifd) => ifd,
+                Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
+                Err(_) => continue,
+            };
+        // Overviews must match base sample count, bits, sample type, and photometric
+        // compatibility (allowing YCbCr overviews on RGB base images).
+        let photo_compat = overview_ifd.photometric == base_ifd.photometric
+            || (base_ifd.photometric == Photometric::Rgb
+                && overview_ifd.photometric == Photometric::YCbCr);
+        if !photo_compat
+            || overview_ifd.samples_per_pixel != base_ifd.samples_per_pixel
+            || overview_ifd.sample_bits != base_ifd.sample_bits
+            || overview_ifd.sample_type != base_ifd.sample_type
+            || overview_ifd.alpha_channel != base_ifd.alpha_channel
+        {
             continue;
         }
-        // `chunk_grid` checks `ensure_chunky` once per overview.
-        let ochunk = match chunk_grid(decoder, budget, format.depth, cancel) {
-            Ok(c) => c,
-            Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
-            Err(_) => continue,
-        };
-        if let Some(params) = o_ycbcr {
-            overview_ycbcr.push((ifd_index, params));
-        }
+        table_bytes_used = table_bytes_used.saturating_add(overview_ifd.table_bytes());
         overviews.push(Overview {
             image: ifd_index,
-            width: ow,
-            height: oh,
-            chunk: ochunk,
+            width: overview_ifd.width,
+            height: overview_ifd.height,
+            chunk: (overview_ifd.chunk_w, overview_ifd.chunk_h),
         });
+        cached_overviews.push(overview_ifd);
     }
-    Ok(ScannedOverviews {
-        overviews,
-        overview_ycbcr,
-        ifd_index,
-        decoder_clean,
-    })
+    Ok((overviews, cached_overviews))
 }
 
 fn merge_georef_with_sidecar(
@@ -209,6 +157,60 @@ fn merge_georef_with_sidecar(
     (merged_placement, merged_trouble)
 }
 
+fn build_band_infos(
+    base_ifd: &CachedIfd,
+    nodata_f64: Option<f64>,
+    gdal_meta: &GdalMetadata,
+) -> Vec<BandInfo> {
+    let mut bands = Vec::with_capacity(1 + usize::from(base_ifd.data_bands));
+    bands.push(BandInfo::display(
+        base_ifd.sample_type,
+        usize::from(base_ifd.samples_per_pixel),
+        base_ifd.alpha_channel.is_some(),
+        nodata_f64,
+    ));
+
+    let is_palette = base_ifd.photometric == Photometric::Palette;
+    for b in 0..base_ifd.samples_per_pixel {
+        if base_ifd.alpha_channel == Some(usize::from(b)) {
+            continue;
+        }
+        let gmeta = gdal_meta.for_band(b);
+        let pixel_format = if is_palette {
+            base_ifd
+                .sample_type
+                .categorical_pixel_format()
+                .unwrap_or(PixelFormat::R8Uint)
+        } else {
+            PixelFormat::R32Float
+        };
+        let default_name = if base_ifd.photometric == Photometric::Rgb && b < 4 {
+            match b {
+                0 => Some("Red".to_owned()),
+                1 => Some("Green".to_owned()),
+                2 => Some("Blue".to_owned()),
+                3 => Some("NIR / Band 4".to_owned()),
+                _ => None,
+            }
+        } else if is_palette {
+            Some("Class Index".to_owned())
+        } else {
+            None
+        };
+        bands.push(BandInfo::band(
+            b,
+            gmeta.description.or(default_name),
+            gmeta.units,
+            pixel_format,
+            base_ifd.sample_type,
+            gmeta.scale.unwrap_or(1.0),
+            gmeta.offset.unwrap_or(0.0),
+            nodata_f64,
+        ));
+    }
+    bands
+}
+
 impl TiffSource {
     /// Open and describe a GeoTIFF/BigTIFF/COG from `byte_source` using
     /// `fingerprint`, `budget`, and `cancel` without reading base-level pixels.
@@ -223,10 +225,6 @@ impl TiffSource {
 
     /// Open a GeoTIFF/BigTIFF/COG with optional external [`crate::SidecarGeoref`]
     /// (`.tfw`/`.wld` and/or `.prj` sidecar).
-    ///
-    /// Embedded GeoTIFF georeferencing always takes precedence; when the TIFF
-    /// carries embedded pixel affine tags without a CRS, an external `.prj`
-    /// sidecar can supply the missing CRS without requiring a `.tfw`.
     pub fn open_with_sidecar(
         byte_source: Arc<dyn ByteSource>,
         fingerprint: SourceFingerprint,
@@ -238,16 +236,20 @@ impl TiffSource {
             return Err(RasterError::Cancelled);
         }
         let limits = build_tiff_limits(budget);
-        let mut decoder = open_decoder(&byte_source, &limits, cancel)?;
-        let BaseIfd {
-            width,
-            height,
-            tiled,
-            chunk,
-            format,
-            nodata_f64,
-            ycbcr,
-        } = parse_base_ifd(&mut decoder, budget, cancel)?;
+        let (byte_order, mut decoder) = open_tag_decoder(&byte_source, &limits, cancel)?;
+
+        let base_ifd = parse_cached_ifd(&mut decoder, 0, budget, 0, cancel)?;
+        if !base_ifd.tiled {
+            check_max_source_side(base_ifd.width, base_ifd.height)?;
+        }
+
+        let nodata_f64 = parse_gdal_nodata(&mut decoder, cancel)?;
+        let gdal_xml = read_tag_ascii_opt(&mut decoder, Tag::Unknown(TAG_GDAL_METADATA), cancel)?;
+        let gdal_meta = if gdal_xml.is_empty() {
+            GdalMetadata::default()
+        } else {
+            parse_gdal_metadata(&gdal_xml)
+        };
 
         let ParsedGeoref {
             ties,
@@ -255,7 +257,7 @@ impl TiffSource {
             embedded_affine,
             geographic_crs,
             trouble,
-        } = georef(&mut decoder, width, height, cancel)?;
+        } = georef(&mut decoder, base_ifd.width, base_ifd.height, cancel)?;
 
         let (placement, binding_trouble) = merge_georef_with_sidecar(
             placement,
@@ -265,20 +267,22 @@ impl TiffSource {
             sidecar,
         );
 
-        let ScannedOverviews {
-            overviews,
-            overview_ycbcr: mut ifd_ycbcr,
-            ifd_index,
-            decoder_clean,
-        } = scan_overviews(&mut decoder, format, budget, cancel)?;
-        if let Some(base_ycbcr) = ycbcr {
-            ifd_ycbcr.push((0, base_ycbcr));
-        }
+        let table_bytes_used = base_ifd.table_bytes();
+        let (overviews, cached_overviews) =
+            scan_overviews(&mut decoder, &base_ifd, budget, table_bytes_used, cancel)?;
 
+        // Drop `tiff::decoder::Decoder` immediately after open — all subsequent
+        // chunk reads execute directly via `raw_decode` over `byte_source`.
+        drop(decoder);
+
+        let width = base_ifd.width;
+        let height = base_ifd.height;
+        let tiled = base_ifd.tiled;
+        let depth = base_ifd.raw_pixel_bytes();
         let grid = Grid {
-            chunk,
+            chunk: (base_ifd.chunk_w, base_ifd.chunk_h),
             overviews,
-            depth: format.depth,
+            depth,
         };
         let levels = build_chunked_level_table(&grid, width, height, budget);
         if levels.is_empty() || levels.iter().all(|row| !row.fits) {
@@ -297,15 +301,22 @@ impl TiffSource {
             .min_by_key(|o| o.width)
             .map_or(0, |o| o.image);
 
+        let bands = build_band_infos(&base_ifd, nodata_f64, &gdal_meta);
+        let initial_nodata_f32 = nodata_f64.and_then(|v| {
+            (v.is_finite() && v >= f64::from(f32::MIN) && v <= f64::from(f32::MAX))
+                .then_some(v as f32)
+        });
+        let initial_mapping =
+            (base_ifd.sample_bits <= 8).then(|| DisplayMapping::identity(initial_nodata_f32));
+
+        let mut ifds = Vec::with_capacity(1 + cached_overviews.len());
+        ifds.push(base_ifd);
+        ifds.extend(cached_overviews);
+
         let description = RasterDescription {
             width,
             height,
-            bands: vec![BandInfo::display(
-                format.sample_type,
-                format.pixel_layout.channels,
-                format.pixel_layout.has_alpha(),
-                nodata_f64,
-            )],
+            bands,
             ties,
             placement,
             geographic_crs,
@@ -313,21 +324,23 @@ impl TiffSource {
             levels,
         };
 
-        let initial_mapping =
-            (format.sample_bits <= 8).then(|| DisplayMapping::identity(format.nodata));
-        let seed_decoder = decoder_clean.then_some((decoder, ifd_index));
-
         Ok(Self {
-            decoder_pool: DecoderPool::new(byte_source, limits, seed_decoder),
+            byte_source,
+            byte_order,
             fingerprint,
             source_id: SourceId::from_fingerprint(&fingerprint),
             description,
             tiled,
             grid,
-            format,
-            ifd_ycbcr,
+            ifds,
+            nodata_f64,
             stats_ifd,
+            max_chunk_bytes: budget
+                .decode_working_bytes
+                .min(super::ifd::MAX_SINGLE_CHUNK_BYTES) as usize,
+            budget_snapshot: *budget,
             stretch: StretchCache::new(initial_mapping),
+            band_stats: BandStatsCache::new(),
         })
     }
 }
@@ -361,7 +374,6 @@ mod tests {
         assert_eq!(placement.as_ref().map(|p| p.affine), Some(affine));
         assert_eq!(trouble.as_deref(), Some("embedded CRS error"));
 
-        // Without prior embedded trouble, missing `.prj` still reports guidance.
         let (_, fallback_trouble) =
             merge_georef_with_sidecar(None, true, None, None, Some(sidecar_no_crs));
         assert!(
@@ -370,7 +382,6 @@ mod tests {
                 .is_some_and(|msg| msg.contains(".prj"))
         );
 
-        // When sidecar supplies a CRS, trouble is cleared.
         let sidecar_with_crs = crate::sidecar::SidecarGeoref {
             affine: Some(affine),
             crs: Some(veldmap_core::geo::CrsSpec::from_epsg(4326).expect("EPSG:4326")),

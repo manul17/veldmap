@@ -135,3 +135,33 @@ fn dropping_pending_uploads_closes_channel_without_explicit_close() {
 
     assert_eq!(tx.send((key, tile)), Err(UploadChannelClosed));
 }
+
+#[test]
+fn upload_batch_report_isolates_stream_keys_and_tile_format_bytes() {
+    use crate::gpu_tiles::tile_format_bytes;
+    use veldmap_core::tile::StreamKey;
+
+    let display_bytes = tile_format_bytes(512, PixelFormat::Rgba8UnormSrgb);
+    let sci_bytes = tile_format_bytes(512, PixelFormat::R32Float);
+    let cat8_bytes = tile_format_bytes(512, PixelFormat::R8Uint);
+    let cat16_bytes = tile_format_bytes(512, PixelFormat::R16Uint);
+    assert_eq!(display_bytes, sci_bytes, "both 4 B/px with full mip chain");
+    assert!(sci_bytes > 512 * 512 * 4);
+    assert_eq!(cat8_bytes, 512 * 512, "R8Uint is 1-mip 1 B/px");
+    assert_eq!(cat16_bytes, 512 * 512 * 2, "R16Uint is 1-mip 2 B/px");
+
+    let shared_src = SourceId::from_stable_key("multi-band-sentinel");
+    let sci_stream = StreamKey::new(shared_src, BandKey::Index(0), PixelFormat::R32Float, 0);
+    let cat_stream = StreamKey::new(shared_src, BandKey::Index(1), PixelFormat::R8Uint, 0);
+    let mut report = UploadBatchReport::default();
+    report.record_stream_tile_bytes(sci_stream, sci_bytes);
+    report.record_stream_tile_bytes(cat_stream, cat8_bytes);
+    assert_eq!(report.max_tile_bytes_for_stream(sci_stream), sci_bytes);
+    assert_eq!(report.max_tile_bytes_for_stream(cat_stream), cat8_bytes);
+    assert_ne!(sci_bytes, cat8_bytes);
+
+    let mut cache = GpuTileCache::new(512 * 1024 * 1024);
+    assert_eq!(cache.max_bytes(), 512 * 1024 * 1024);
+    cache.set_max_bytes(256 * 1024 * 1024);
+    assert_eq!(cache.max_bytes(), 256 * 1024 * 1024);
+}

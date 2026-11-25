@@ -7,8 +7,10 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use veldmap_core::geo::FootprintBounds;
+use veldmap_core::tile::TileStreamSpec;
 
-use crate::layers::{LayerId, LayerSummary};
+use crate::layers::{CategoricalSummary, LayerId, LayerSummary, ScientificSummary, StretchPreset};
+use crate::render::{CategoricalPaletteId, ColormapId, sample_colormap_srgb};
 use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
 use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format, submitted_with_enter};
@@ -20,6 +22,11 @@ pub(crate) enum LayerUiAction {
     OpenPath(PathBuf),
     ToggleVisibility(LayerId, bool),
     SetOpacity(LayerId, f32, bool),
+    SetStream(LayerId, TileStreamSpec),
+    SetStretchPreset(LayerId, StretchPreset),
+    SetStretchRange(LayerId, f64, f64, bool),
+    SetColormap(LayerId, ColormapId, bool),
+    SetCategoricalPalette(LayerId, CategoricalPaletteId),
     MoveUp(LayerId),
     MoveDown(LayerId),
     OpenCrsPicker(LayerId, String),
@@ -215,9 +222,266 @@ fn show_layer_status_banners(ui: &mut egui::Ui, layer: &LayerSummary) {
     }
 }
 
+fn paint_interactive_histogram(
+    ui: &mut egui::Ui,
+    layer_id: LayerId,
+    sci: &ScientificSummary,
+    actions: &mut Vec<LayerUiAction>,
+) {
+    let Some(ref stats) = sci.stats else {
+        if sci.stats_loading {
+            ui.weak(egui::RichText::new("Sampling band statistics…").small());
+        }
+        return;
+    };
+
+    let (bins, data_min, data_max) = if sci.preset.is_log10_db() {
+        let (Some(lo), Some(hi)) = (stats.db_min, stats.db_max) else {
+            ui.weak(egui::RichText::new("No positive samples for dB histogram").small());
+            return;
+        };
+        (&stats.db_histogram, lo, hi)
+    } else {
+        (&stats.histogram, stats.min, stats.max)
+    };
+    let max_count = bins.iter().copied().max().unwrap_or(0);
+    if max_count == 0 {
+        return;
+    }
+
+    let width = ui.available_width().max(120.0);
+    let total_h = 54.0;
+    let ramp_h = 8.0;
+    let hist_h = total_h - ramp_h - 2.0;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, total_h), egui::Sense::click_and_drag());
+    let painter = ui.painter();
+
+    let hist_rect = egui::Rect::from_min_size(rect.min, egui::vec2(width, hist_h));
+    let ramp_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), hist_rect.bottom() + 2.0),
+        egui::vec2(width, ramp_h),
+    );
+    painter.rect_filled(hist_rect, 2.0, egui::Color32::from_gray(24));
+
+    let data_span = (data_max - data_min).max(1e-12);
+    let val_to_x = |v: f64| -> f32 {
+        let f = ((v - data_min) / data_span).clamp(0.0, 1.0) as f32;
+        hist_rect.left() + f * hist_rect.width()
+    };
+
+    // Draw 64 histogram bars.
+    let bin_w = hist_rect.width() / (bins.len() as f32);
+    for (i, &count) in bins.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let h_frac = (f64::from(count) / f64::from(max_count)).sqrt() as f32;
+        let bar_h = (h_frac * (hist_h - 2.0)).max(1.0);
+        let x0 = hist_rect.left() + (i as f32) * bin_w;
+        let x1 = (x0 + bin_w - 0.5).max(x0 + 1.0);
+        let bin_val = data_min + ((i as f64) + 0.5) / (bins.len() as f64) * data_span;
+        let stretch_span = (sci.max - sci.min).max(1e-12);
+        let t = ((bin_val - sci.min) / stretch_span).clamp(0.0, 1.0) as f32;
+        let [r, g, b, _] = sample_colormap_srgb(sci.colormap, t, sci.invert_colormap);
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(x0, hist_rect.bottom() - bar_h),
+            egui::pos2(x1, hist_rect.bottom()),
+        );
+        painter.rect_filled(bar_rect, 0.0, egui::Color32::from_rgb(r, g, b));
+    }
+
+    // Highlight active [min, max] stretch bounds.
+    let x_lo = val_to_x(sci.min);
+    let x_hi = val_to_x(sci.max);
+    let marker_stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(245, 245, 245));
+    painter.line_segment(
+        [
+            egui::pos2(x_lo, hist_rect.top()),
+            egui::pos2(x_lo, hist_rect.bottom()),
+        ],
+        marker_stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(x_hi, hist_rect.top()),
+            egui::pos2(x_hi, hist_rect.bottom()),
+        ],
+        marker_stroke,
+    );
+
+    // Draw colormap gradient strip underneath.
+    let steps = 48usize;
+    let step_w = ramp_rect.width() / (steps as f32);
+    for i in 0..steps {
+        let t = (i as f32) / ((steps - 1) as f32);
+        let [r, g, b, _] = sample_colormap_srgb(sci.colormap, t, sci.invert_colormap);
+        let seg = egui::Rect::from_min_max(
+            egui::pos2(ramp_rect.left() + (i as f32) * step_w, ramp_rect.top()),
+            egui::pos2(
+                ramp_rect.left() + ((i + 1) as f32) * step_w + 0.5,
+                ramp_rect.bottom(),
+            ),
+        );
+        painter.rect_filled(seg, 0.0, egui::Color32::from_rgb(r, g, b));
+    }
+    painter.rect_stroke(
+        hist_rect,
+        2.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+        egui::StrokeKind::Inside,
+    );
+
+    // Interactive click/drag moves whichever stretch handle (min or max) is closer.
+    if (response.dragged() || response.clicked())
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let f = f64::from(((pos.x - hist_rect.left()) / hist_rect.width()).clamp(0.0, 1.0));
+        let val = data_min + f * data_span;
+        let dist_lo = (val - sci.min).abs();
+        let dist_hi = (val - sci.max).abs();
+        let (next_lo, next_hi) = if dist_lo <= dist_hi {
+            (val.min(sci.max - data_span * 1e-4), sci.max)
+        } else {
+            (sci.min, val.max(sci.min + data_span * 1e-4))
+        };
+        let commit = response.clicked() || response.drag_stopped();
+        actions.push(LayerUiAction::SetStretchRange(
+            layer_id, next_lo, next_hi, commit,
+        ));
+    } else if response.drag_stopped() {
+        actions.push(LayerUiAction::SetStretchRange(
+            layer_id, sci.min, sci.max, true,
+        ));
+    }
+    response.on_hover_text("Click or drag to adjust stretch min/max");
+}
+
+fn show_scientific_controls(
+    ui: &mut egui::Ui,
+    layer_id: LayerId,
+    sci: &ScientificSummary,
+    actions: &mut Vec<LayerUiAction>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Stretch").small());
+        let mut preset = sci.preset;
+        egui::ComboBox::from_id_salt(("stretch_preset", layer_id))
+            .selected_text(egui::RichText::new(preset.label()).small())
+            .width(128.0)
+            .show_ui(ui, |ui| {
+                for opt in StretchPreset::ALL {
+                    if ui.selectable_value(&mut preset, opt, opt.label()).clicked() {
+                        actions.push(LayerUiAction::SetStretchPreset(layer_id, opt));
+                    }
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Ramp").small());
+        let mut cmap = sci.colormap;
+        egui::ComboBox::from_id_salt(("colormap", layer_id))
+            .selected_text(egui::RichText::new(cmap.label()).small())
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for opt in ColormapId::ALL {
+                    if ui.selectable_value(&mut cmap, opt, opt.label()).clicked() {
+                        actions.push(LayerUiAction::SetColormap(
+                            layer_id,
+                            opt,
+                            sci.invert_colormap,
+                        ));
+                    }
+                }
+            });
+        let mut invert = sci.invert_colormap;
+        if ui
+            .checkbox(&mut invert, egui::RichText::new("Inv").small())
+            .changed()
+        {
+            actions.push(LayerUiAction::SetColormap(layer_id, sci.colormap, invert));
+        }
+    });
+
+    let mut lo = sci.min;
+    let mut hi = sci.max;
+    let speed = ((sci.max - sci.min).abs() * 0.005).max(1e-4);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Min").small());
+        let r_lo = ui.add(egui::DragValue::new(&mut lo).speed(speed).max_decimals(4));
+        ui.label(egui::RichText::new("Max").small());
+        let r_hi = ui.add(egui::DragValue::new(&mut hi).speed(speed).max_decimals(4));
+        if r_lo.changed() || r_hi.changed() {
+            let commit = !r_lo.dragged() && !r_hi.dragged();
+            actions.push(LayerUiAction::SetStretchRange(layer_id, lo, hi, commit));
+        } else if r_lo.drag_stopped() || r_hi.drag_stopped() {
+            actions.push(LayerUiAction::SetStretchRange(layer_id, lo, hi, true));
+        }
+    });
+
+    paint_interactive_histogram(ui, layer_id, sci, actions);
+}
+
+fn show_categorical_controls(
+    ui: &mut egui::Ui,
+    layer_id: LayerId,
+    cat: CategoricalSummary,
+    actions: &mut Vec<LayerUiAction>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Palette").small());
+        let mut pal = cat.palette;
+        egui::ComboBox::from_id_salt(("cat_palette", layer_id))
+            .selected_text(egui::RichText::new(pal.label()).small())
+            .width(136.0)
+            .show_ui(ui, |ui| {
+                for opt in CategoricalPaletteId::ALL {
+                    if opt == CategoricalPaletteId::SourceColorMap && !cat.has_source_color_map {
+                        continue;
+                    }
+                    if ui.selectable_value(&mut pal, opt, opt.label()).clicked() {
+                        actions.push(LayerUiAction::SetCategoricalPalette(layer_id, opt));
+                    }
+                }
+            });
+    });
+    if let Some(nd) = cat.nodata_value {
+        ui.weak(egui::RichText::new(format!("Nodata class: {nd}")).small());
+    }
+}
+
 fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<LayerUiAction>) {
     if let Some((opacity, commit)) = show_opacity_slider(ui, layer.opacity) {
         actions.push(LayerUiAction::SetOpacity(layer.id, opacity, commit));
+    }
+
+    if layer.band_options.len() > 1 {
+        let current_label = layer
+            .band_options
+            .iter()
+            .find(|opt| opt.spec == layer.active_spec)
+            .map_or("Display (RGB)", |opt| opt.label.as_str());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Band").small());
+            egui::ComboBox::from_id_salt(("band_select", layer.id))
+                .selected_text(egui::RichText::new(current_label).small())
+                .width(172.0)
+                .show_ui(ui, |ui| {
+                    for opt in &layer.band_options {
+                        let selected = opt.spec == layer.active_spec;
+                        if ui.selectable_label(selected, &opt.label).clicked() && !selected {
+                            actions.push(LayerUiAction::SetStream(layer.id, opt.spec));
+                        }
+                    }
+                });
+        });
+    }
+
+    if let Some(ref sci) = layer.scientific {
+        show_scientific_controls(ui, layer.id, sci, actions);
+    } else if let Some(cat) = layer.categorical {
+        show_categorical_controls(ui, layer.id, cat, actions);
     }
 
     egui::CollapsingHeader::new(egui::RichText::new("CRS & Metadata").small())
@@ -231,6 +495,14 @@ fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Ve
             };
             ui.small(crs_tag);
             ui.small(format!("Radiometry: {}", layer.sample_info));
+            if let Some(ref sci) = layer.scientific {
+                if let Some(ref units) = sci.units {
+                    ui.small(format!("Units: {units}"));
+                }
+                if (sci.scale - 1.0).abs() > 1e-12 || sci.offset.abs() > 1e-12 {
+                    ui.small(format!("Scale: {} · Offset: {}", sci.scale, sci.offset));
+                }
+            }
             ui.small(format!("Path: {}", layer.path.display()));
         });
 }
