@@ -5,6 +5,7 @@
 //! Read-only GeoJSON vector layers live in [`crate::vectors`] and interactive
 //! geodesic measurement lives in [`crate::measure`].
 
+mod crs_override;
 mod cursor;
 mod frame;
 mod io_worker;
@@ -20,9 +21,9 @@ use std::path::{Path, PathBuf};
 use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::RASTER_TILE_SIZE;
 
-use crate::crs_override::CrsOverride;
 use crate::gpu_tiles::display_tile_mip_bytes;
 
+pub(crate) use crs_override::CrsOverride;
 pub(crate) use manager::{OverlayFrameCtx, OverlayManager, OverlayMutation};
 
 /// Default unpacked VRAM byte weight for an 8-bit `512 x 512` display tile
@@ -62,7 +63,8 @@ pub(crate) struct LayerSummary {
 }
 
 /// Borrowed persistence view of a loaded raster overlay layer for
-/// `session.json` serialization without coupling `layers` to `crate::session`.
+/// `session.json` serialization without coupling `layers` to
+/// `crate::storage::session`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OverlayPersistEntry<'a> {
     pub(crate) path: &'a Path,

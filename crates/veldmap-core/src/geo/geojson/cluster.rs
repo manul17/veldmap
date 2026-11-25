@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 
 use super::mesh::{RawPrimitives, VectorCluster, VectorVertex};
 
@@ -193,21 +193,9 @@ fn encode_cluster(bucket: RawPrimitives) -> VectorCluster {
         let v2 = encode(tri[2]);
         // Re-verify outward CCW winding in GPU-encoded `f32` RTC space so `f32`
         // quantization never flips a sliver triangle against backface culling.
-        let p0 = DVec3::new(
-            f64::from(v0.rel_pos[0]),
-            f64::from(v0.rel_pos[1]),
-            f64::from(v0.rel_pos[2]),
-        );
-        let p1 = DVec3::new(
-            f64::from(v1.rel_pos[0]),
-            f64::from(v1.rel_pos[1]),
-            f64::from(v1.rel_pos[2]),
-        );
-        let p2 = DVec3::new(
-            f64::from(v2.rel_pos[0]),
-            f64::from(v2.rel_pos[1]),
-            f64::from(v2.rel_pos[2]),
-        );
+        let p0 = Vec3::from_array(v0.rel_pos).as_dvec3();
+        let p1 = Vec3::from_array(v1.rel_pos).as_dvec3();
+        let p2 = Vec3::from_array(v2.rel_pos).as_dvec3();
         let avg_n = tri[0].1 + tri[1].1 + tri[2].1;
         let face_n = (p1 - p0).cross(p2 - p0);
         if face_n.length_squared() <= 1e-12 {

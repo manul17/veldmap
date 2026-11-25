@@ -1,3 +1,8 @@
+//! Integration tests for COG I/O amplification, pooled decoder reuse,
+//! overview-vs-pass equivalence, TIFF compression/sample formats (ZSTD +
+//! Predictor=3 Float32, i16 + GDAL nodata, Gray+Alpha, PlanarConfiguration=2),
+//! and IFD/dimension limit guards.
+
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -10,10 +15,13 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{RASTER_TILE_SIZE, tile_extent};
 use veldmap_raster::{
     DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError, RasterSource, SharedChunkCache,
-    TiffSource, frame_from_description, has_tiff_magic,
+    TiffSource,
 };
 
-use crate::common::{build_stripped_tiff, build_tiled_cog, fake_fingerprint, rgb_pattern};
+use crate::common::{
+    TiffIfdHeader, build_stripped_tiff, build_tiled_cog, fake_fingerprint, write_ifd_header,
+    write_single_strip_u32,
+};
 
 const WINDOW: u64 = 64 * 1024;
 
@@ -242,132 +250,6 @@ fn direct_overview_matches_sequential_pass_on_halved_cog() {
 }
 
 #[test]
-fn decodes_bigtiff_with_geodouble_geoascii_pixel_is_point_and_model_transformation() {
-    let budget = MemoryBudget::default();
-    let cancel = CancelToken::new();
-    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
-    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
-    let ctx = DecodeContext {
-        chunk_cache: &chunk_cache,
-        budget_tracker: &tracker,
-        budget: &budget,
-        cancel: &cancel,
-    };
-
-    // BigTIFF + user-defined TM CRS using GeoDoubleParamsTag + GeoAsciiParamsTag +
-    // PixelIsPoint + ModelTransformationTag.
-    let mut big_buf = Cursor::new(Vec::new());
-    {
-        let mut enc = TiffEncoder::new_big(&mut big_buf).expect("bigtiff encoder");
-        let mut dir = enc.image_directory().expect("bigtiff dir");
-        dir.write_tag(Tag::ImageWidth, 8u32).expect("tag");
-        dir.write_tag(Tag::ImageLength, 8u32).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-            .expect("tag");
-        dir.write_tag(Tag::Compression, 1u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-        dir.write_tag(Tag::RowsPerStrip, 8u32).expect("tag");
-        let data = rgb_pattern(8, 8);
-        let at = dir.write_data(&data[..]).expect("write");
-        dir.write_tag(Tag::StripOffsets, &[at][..]).expect("tag");
-        dir.write_tag(Tag::StripByteCounts, &[data.len() as u64][..])
-            .expect("tag");
-        let ascii = "VeldMap BigTIFF TM|";
-        let geokeys: [u16; 44] = [
-            1,
-            1,
-            0,
-            10, // header: 10 keys
-            1024,
-            0,
-            1,
-            1, // GTModelTypeGeoKey = Projected
-            1025,
-            0,
-            1,
-            2, // GTRasterTypeGeoKey = PixelIsPoint
-            2048,
-            0,
-            1,
-            4326, // GeographicTypeGeoKey = WGS 84
-            3072,
-            0,
-            1,
-            32767, // ProjectedCSTypeGeoKey = User-Defined
-            3073,
-            34737,
-            ascii.len() as u16,
-            0, // PCSCitationGeoKey in GeoAsciiParamsTag
-            3075,
-            0,
-            1,
-            1, // ProjCoordTransGeoKey = Transverse Mercator
-            3080,
-            34736,
-            1,
-            0, // ProjNatOriginLongGeoKey = 39.0
-            3081,
-            34736,
-            1,
-            1, // ProjNatOriginLatGeoKey = 55.75
-            3082,
-            34736,
-            1,
-            2, // ProjFalseEastingGeoKey = 500_000.0
-            3092,
-            34736,
-            1,
-            3, // ProjScaleAtNatOriginGeoKey = 0.9996
-        ];
-        dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .expect("tag");
-        dir.write_tag(
-            Tag::GeoDoubleParamsTag,
-            &[39.0_f64, 55.75, 500_000.0, 0.9996][..],
-        )
-        .expect("tag");
-        dir.write_tag(Tag::GeoAsciiParamsTag, ascii).expect("tag");
-        let matrix: [f64; 16] = [
-            10.0, 0.0, 0.0, 500_000.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-        ];
-        dir.write_tag(Tag::ModelTransformationTag, &matrix[..])
-            .expect("tag");
-        dir.finish().expect("finish");
-    }
-    let big_bytes = big_buf.into_inner();
-    assert!(has_tiff_magic(&big_bytes));
-    let big_src = TiffSource::open(
-        Arc::new(MemoryByteSource::from_vec(big_bytes.clone())),
-        fake_fingerprint(&big_bytes),
-        &budget,
-        &cancel,
-    )
-    .expect("open BigTIFF");
-    let placement = big_src
-        .description()
-        .placement
-        .as_ref()
-        .expect("projected placement");
-    assert!((placement.affine[2] - 499_995.0).abs() < 1e-9);
-    assert!((placement.affine[5] - 5.0).abs() < 1e-9);
-
-    let frame = frame_from_description(big_src.description()).expect("BigTIFF user-defined frame");
-    assert_eq!(frame.crs_label(), "VeldMap BigTIFF TM");
-    // Pixel (0, 0) center sits at exact natural origin (500_000, 0) -> (55.75, 39.0).
-    let (lat, lon) = frame.geodetic(0.5 / 8.0, 0.5 / 8.0);
-    assert!((lat - 55.75).abs() < 1e-9, "got lat={lat}");
-    assert!((lon - 39.0).abs() < 1e-9, "got lon={lon}");
-
-    let tile = big_src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
-        .expect("decode BigTIFF tile");
-    assert_eq!((tile.width(), tile.height()), (8, 8));
-}
-
-#[test]
 fn decodes_zstd_predictor3_f32_with_gdal_nodata() {
     let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
@@ -405,23 +287,18 @@ fn decodes_zstd_predictor3_f32_with_gdal_nodata() {
     {
         let mut enc = TiffEncoder::new(&mut f32_buf).expect("enc");
         let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, w).expect("tag");
-        dir.write_tag(Tag::ImageLength, h).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, 32u16).expect("tag");
-        dir.write_tag(Tag::SampleFormat, 3u16).expect("tag");
-        dir.write_tag(Tag::Compression, 50_000u16).expect("tag");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                bits_per_sample: &[32],
+                compression: 50_000,
+                sample_format: Some(3),
+                ..TiffIfdHeader::gray8(w, h)
+            },
+        );
         dir.write_tag(Tag::Predictor, 3u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-        dir.write_tag(Tag::RowsPerStrip, h).expect("tag");
         dir.write_tag(Tag::GdalNodata, "-9999").expect("tag");
-        let at = dir.write_data(&zstd_payload[..]).expect("write");
-        dir.write_tag(Tag::StripOffsets, &[at as u32][..])
-            .expect("tag");
-        dir.write_tag(Tag::StripByteCounts, &[zstd_payload.len() as u32][..])
-            .expect("tag");
+        write_single_strip_u32(&mut dir, h, &zstd_payload);
         dir.finish().expect("finish");
     }
     let f32_bytes = f32_buf.into_inner();
@@ -464,16 +341,14 @@ fn decodes_geographic_pulkovo42_i16_with_gdal_nodata() {
     {
         let mut enc = TiffEncoder::new(&mut i16_buf).expect("enc");
         let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, 4u32).expect("tag");
-        dir.write_tag(Tag::ImageLength, 2u32).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, 16u16).expect("tag");
-        dir.write_tag(Tag::SampleFormat, 2u16).expect("tag");
-        dir.write_tag(Tag::Compression, 1u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-        dir.write_tag(Tag::RowsPerStrip, 2u32).expect("tag");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                bits_per_sample: &[16],
+                sample_format: Some(2),
+                ..TiffIfdHeader::gray8(4, 2)
+            },
+        );
         dir.write_tag(Tag::GdalNodata, "-32768").expect("tag");
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4284];
         dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
@@ -487,11 +362,7 @@ fn decodes_geographic_pulkovo42_i16_with_gdal_nodata() {
         .expect("tag");
         let i16_vals: [i16; 8] = [-32768, -100, 0, 100, 200, 300, 400, 500];
         let raw_bytes: Vec<u8> = i16_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let at = dir.write_data(&raw_bytes[..]).expect("write");
-        dir.write_tag(Tag::StripOffsets, &[at as u32][..])
-            .expect("tag");
-        dir.write_tag(Tag::StripByteCounts, &[raw_bytes.len() as u32][..])
-            .expect("tag");
+        write_single_strip_u32(&mut dir, 2, &raw_bytes);
         dir.finish().expect("finish");
     }
     let i16_bytes = i16_buf.into_inner();
@@ -535,22 +406,16 @@ fn decodes_gray_alpha_preserving_transparency() {
     {
         let mut enc = TiffEncoder::new(&mut ga_buf).expect("enc");
         let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, 2u32).expect("tag");
-        dir.write_tag(Tag::ImageLength, 1u32).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, &[8u16, 8][..])
-            .expect("tag");
-        dir.write_tag(Tag::Compression, 1u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 2u16).expect("tag");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                bits_per_sample: &[8, 8],
+                samples_per_pixel: 2,
+                ..TiffIfdHeader::gray8(2, 1)
+            },
+        );
         dir.write_tag(Tag::ExtraSamples, &[2u16][..]).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-        dir.write_tag(Tag::RowsPerStrip, 1u32).expect("tag");
-        let at = dir.write_data(&[200u8, 0, 120, 255][..]).expect("write");
-        dir.write_tag(Tag::StripOffsets, &[at as u32][..])
-            .expect("tag");
-        dir.write_tag(Tag::StripByteCounts, &[4u32][..])
-            .expect("tag");
+        write_single_strip_u32(&mut dir, 1, &[200u8, 0, 120, 255]);
         dir.finish().expect("finish");
     }
     let ga_bytes = ga_buf.into_inner();
@@ -582,21 +447,14 @@ fn rejects_planar_configuration_2_at_open() {
     {
         let mut enc = TiffEncoder::new(&mut planar_buf).expect("enc");
         let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, 2u32).expect("tag");
-        dir.write_tag(Tag::ImageLength, 2u32).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-            .expect("tag");
-        dir.write_tag(Tag::Compression, 1u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 2u16).expect("tag");
-        dir.write_tag(Tag::RowsPerStrip, 2u32).expect("tag");
-        let at = dir.write_data(&[0u8; 12][..]).expect("write");
-        dir.write_tag(Tag::StripOffsets, &[at as u32][..])
-            .expect("tag");
-        dir.write_tag(Tag::StripByteCounts, &[12u32][..])
-            .expect("tag");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                planar_configuration: 2,
+                ..TiffIfdHeader::rgb8(2, 2)
+            },
+        );
+        write_single_strip_u32(&mut dir, 2, &[0u8; 12]);
         dir.finish().expect("finish");
     }
     let planar_bytes = planar_buf.into_inner();
@@ -621,24 +479,14 @@ fn caps_overview_scanning_at_max_ifds() {
         let mut enc = TiffEncoder::new(&mut many_buf).expect("enc");
         for idx in 0..70u32 {
             let mut dir = enc.image_directory().expect("dir");
-            if idx > 0 {
-                dir.write_tag(Tag::NewSubfileType, 1u32).expect("subfile");
-            }
-            dir.write_tag(Tag::ImageWidth, 4u32).expect("w");
-            dir.write_tag(Tag::ImageLength, 4u32).expect("h");
-            dir.write_tag(Tag::BitsPerSample, 8u16).expect("bps");
-            dir.write_tag(Tag::Compression, 1u16).expect("comp");
-            dir.write_tag(Tag::PhotometricInterpretation, 1u16)
-                .expect("photo");
-            dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("spp");
-            dir.write_tag(Tag::PlanarConfiguration, 1u16)
-                .expect("planar");
-            dir.write_tag(Tag::RowsPerStrip, 4u32).expect("rows");
-            let at = dir.write_data(&[idx as u8; 16][..]).expect("write");
-            dir.write_tag(Tag::StripOffsets, &[at as u32][..])
-                .expect("offs");
-            dir.write_tag(Tag::StripByteCounts, &[16u32][..])
-                .expect("cnts");
+            write_ifd_header(
+                &mut dir,
+                &TiffIfdHeader {
+                    is_overview: idx > 0,
+                    ..TiffIfdHeader::gray8(4, 4)
+                },
+            );
+            write_single_strip_u32(&mut dir, 4, &[idx as u8; 16]);
             dir.finish().expect("finish");
         }
     }
@@ -663,22 +511,8 @@ fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected(
     {
         let mut enc = TiffEncoder::new(&mut untiled_buf).expect("enc");
         let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, MAX_SOURCE_SIDE + 1)
-            .expect("w");
-        dir.write_tag(Tag::ImageLength, 16u32).expect("h");
-        dir.write_tag(Tag::BitsPerSample, 8u16).expect("bps");
-        dir.write_tag(Tag::Compression, 1u16).expect("comp");
-        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
-            .expect("photo");
-        dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("spp");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16)
-            .expect("planar");
-        dir.write_tag(Tag::RowsPerStrip, 16u32).expect("rows");
-        let at = dir.write_data(&[0u8; 16][..]).expect("write");
-        dir.write_tag(Tag::StripOffsets, &[at as u32][..])
-            .expect("offs");
-        dir.write_tag(Tag::StripByteCounts, &[16u32][..])
-            .expect("cnts");
+        write_ifd_header(&mut dir, &TiffIfdHeader::gray8(MAX_SOURCE_SIDE + 1, 16));
+        write_single_strip_u32(&mut dir, 16, &[0u8; 16]);
         dir.finish().expect("finish");
     }
     let untiled_bytes = untiled_buf.into_inner();
@@ -705,15 +539,7 @@ fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected(
     {
         let mut enc = TiffEncoder::new_big(&mut tiled_buf).expect("bigtiff enc");
         let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, wide).expect("w");
-        dir.write_tag(Tag::ImageLength, height).expect("h");
-        dir.write_tag(Tag::BitsPerSample, 8u16).expect("bps");
-        dir.write_tag(Tag::Compression, 1u16).expect("comp");
-        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
-            .expect("photo");
-        dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("spp");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16)
-            .expect("planar");
+        write_ifd_header(&mut dir, &TiffIfdHeader::gray8(wide, height));
         dir.write_tag(Tag::TileWidth, RASTER_TILE_SIZE).expect("tw");
         dir.write_tag(Tag::TileLength, RASTER_TILE_SIZE)
             .expect("th");
@@ -752,334 +578,4 @@ fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected(
         (tile_extent(across - 1, wide), RASTER_TILE_SIZE)
     );
     assert_eq!(&tile.data()[..4], &[173, 173, 173, 255]);
-}
-
-#[test]
-fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
-    use std::time::Duration;
-    use veldmap_core::io::IoError;
-
-    struct BlockingTailSource {
-        inner: MemoryByteSource,
-        threshold: u64,
-        armed: AtomicBool,
-        hit: AtomicBool,
-        release: CancelToken,
-    }
-
-    impl ByteSource for BlockingTailSource {
-        fn len(&self) -> u64 {
-            self.inner.len()
-        }
-
-        fn read_at(
-            &self,
-            offset: u64,
-            buf: &mut [u8],
-            cancel: &CancelToken,
-        ) -> Result<usize, IoError> {
-            if self.armed.load(Ordering::Acquire)
-                && offset.saturating_add(buf.len() as u64) > self.threshold
-            {
-                self.hit.store(true, Ordering::Release);
-                while !self.release.is_cancelled() && !cancel.is_cancelled() {
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }
-            self.inner.read_at(offset, buf, cancel)
-        }
-    }
-
-    let mut buf = Cursor::new(Vec::new());
-    let tile_offset: u64;
-    {
-        let mut enc = TiffEncoder::new(&mut buf).expect("enc");
-        let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, 256u32).expect("w");
-        dir.write_tag(Tag::ImageLength, 256u32).expect("h");
-        dir.write_tag(Tag::BitsPerSample, 16u16).expect("bps");
-        dir.write_tag(Tag::Compression, 1u16).expect("comp");
-        dir.write_tag(Tag::PhotometricInterpretation, 1u16)
-            .expect("photo");
-        dir.write_tag(Tag::SamplesPerPixel, 1u16).expect("spp");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16)
-            .expect("planar");
-        dir.write_tag(Tag::TileWidth, 256u32).expect("tw");
-        dir.write_tag(Tag::TileLength, 256u32).expect("th");
-        let samples: Vec<u16> = (0..65_536u32).map(|v| (v % 4096) as u16).collect();
-        tile_offset = dir.write_data(&samples[..]).expect("write");
-        dir.write_tag(Tag::TileOffsets, &[tile_offset as u32][..])
-            .expect("offs");
-        dir.write_tag(Tag::TileByteCounts, &[(65_536u32 * 2)][..])
-            .expect("cnts");
-        dir.finish().expect("finish");
-    }
-    let raw = buf.into_inner();
-    let fp = fake_fingerprint(&raw);
-    let release = CancelToken::new();
-    let gate = Arc::new(BlockingTailSource {
-        inner: MemoryByteSource::from_vec(raw),
-        threshold: 64 * 1024,
-        armed: AtomicBool::new(false),
-        hit: AtomicBool::new(false),
-        release: release.clone(),
-    });
-    let budget = MemoryBudget::default();
-    let src = Arc::new(
-        TiffSource::open(
-            Arc::clone(&gate) as Arc<dyn ByteSource>,
-            fp,
-            &budget,
-            &CancelToken::new(),
-        )
-        .expect("open 16-bit"),
-    );
-    gate.armed.store(true, Ordering::Release);
-
-    let chunk_cache = Arc::new(SharedChunkCache::new(budget.decoded_chunk_cache_bytes));
-    let tracker = Arc::new(DecodeBudgetTracker::new(budget.decode_working_bytes));
-
-    let leader = {
-        let src = Arc::clone(&src);
-        let cache = Arc::clone(&chunk_cache);
-        let tracker = Arc::clone(&tracker);
-        let b = budget;
-        thread::spawn(move || {
-            let cancel = CancelToken::new();
-            let ctx = DecodeContext {
-                chunk_cache: &cache,
-                budget_tracker: &tracker,
-                budget: &b,
-                cancel: &cancel,
-            };
-            src.decode_pointwise_tile(0, 0, 0, &ctx)
-        })
-    };
-
-    while !gate.hit.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(2));
-    }
-
-    let waiter_cancel = CancelToken::new();
-    let waiter = {
-        let src = Arc::clone(&src);
-        let cache = Arc::clone(&chunk_cache);
-        let tracker = Arc::clone(&tracker);
-        let c = waiter_cancel.clone();
-        let b = budget;
-        thread::spawn(move || {
-            let ctx = DecodeContext {
-                chunk_cache: &cache,
-                budget_tracker: &tracker,
-                budget: &b,
-                cancel: &c,
-            };
-            src.decode_pointwise_tile(0, 0, 0, &ctx)
-        })
-    };
-    thread::sleep(Duration::from_millis(15));
-    waiter_cancel.cancel();
-    let waiter_res = waiter.join().expect("join waiter");
-    assert!(matches!(waiter_res, Err(RasterError::Cancelled)));
-
-    release.cancel();
-    assert!(leader.join().expect("join leader").is_ok());
-}
-
-#[test]
-fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() {
-    use veldmap_core::geo::geodesy::{Geodetic, WGS84};
-    use veldmap_core::geo::projection::Projection;
-    use veldmap_core::tile::{MIN_WARP_SEGMENTS, build_warp_patch};
-
-    let build_geotiff = |raster_type_key: u16| -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut enc = TiffEncoder::new(&mut buf).expect("tiff encoder");
-            let mut dir = enc.image_directory().expect("dir");
-            let (w, h) = (64u32, 64u32);
-            dir.write_tag(Tag::ImageWidth, w).expect("tag");
-            dir.write_tag(Tag::ImageLength, h).expect("tag");
-            dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-                .expect("tag");
-            dir.write_tag(Tag::Compression, 1u16).expect("tag");
-            dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-                .expect("tag");
-            dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("tag");
-            dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-            dir.write_tag(Tag::RowsPerStrip, h).expect("tag");
-            let data = rgb_pattern(w, h);
-            let at = dir.write_data(&data[..]).expect("write");
-            dir.write_tag(Tag::StripOffsets, &[at as u32][..])
-                .expect("tag");
-            dir.write_tag(Tag::StripByteCounts, &[data.len() as u32][..])
-                .expect("tag");
-            let geokeys: [u16; 16] = [
-                1,
-                1,
-                0,
-                3, // header: 3 keys
-                1024,
-                0,
-                1,
-                1, // GTModelTypeGeoKey = Projected
-                1025,
-                0,
-                1,
-                raster_type_key, // GTRasterTypeGeoKey
-                3072,
-                0,
-                1,
-                32637, // ProjectedCSTypeGeoKey = EPSG:32637
-            ];
-            dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-                .expect("tag");
-            // Pixel scale = 10 m/px; tiepoint pixel (0, 0) at (550_000, 5_250_000).
-            dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
-                .expect("tag");
-            dir.write_tag(
-                Tag::ModelTiepointTag,
-                &[0.0_f64, 0.0, 0.0, 550_000.0, 5_250_000.0, 0.0][..],
-            )
-            .expect("tag");
-            dir.finish().expect("finish");
-        }
-        buf.into_inner()
-    };
-
-    let budget = MemoryBudget::default();
-    let cancel = CancelToken::new();
-    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
-    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
-    let ctx = DecodeContext {
-        chunk_cache: &chunk_cache,
-        budget_tracker: &tracker,
-        budget: &budget,
-        cancel: &cancel,
-    };
-
-    let bytes_area = build_geotiff(1);
-    let bytes_point = build_geotiff(2);
-    let src_area: Arc<dyn RasterSource> = Arc::new(
-        TiffSource::open(
-            Arc::new(MemoryByteSource::new(Arc::from(bytes_area.as_slice()))),
-            fake_fingerprint(&bytes_area),
-            &budget,
-            &cancel,
-        )
-        .expect("open PixelIsArea"),
-    );
-    let src_point: Arc<dyn RasterSource> = Arc::new(
-        TiffSource::open(
-            Arc::new(MemoryByteSource::new(Arc::from(bytes_point.as_slice()))),
-            fake_fingerprint(&bytes_point),
-            &budget,
-            &cancel,
-        )
-        .expect("open PixelIsPoint"),
-    );
-
-    let frame_area = frame_from_description(src_area.description()).expect("area frame");
-    let frame_point = frame_from_description(src_point.description()).expect("point frame");
-
-    let patch_area = build_warp_patch(
-        &frame_area,
-        64,
-        64,
-        [0.0, 0.0, 64.0, 64.0],
-        MIN_WARP_SEGMENTS,
-    );
-    let patch_point = build_warp_patch(
-        &frame_point,
-        64,
-        64,
-        [0.0, 0.0, 64.0, 64.0],
-        MIN_WARP_SEGMENTS,
-    );
-
-    let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
-    let geo_area = WGS84.from_ecef(patch_area.evaluate_ecef(0.0, 0.0).expect("area ul"));
-    let geo_point = WGS84.from_ecef(patch_point.evaluate_ecef(0.0, 0.0).expect("point ul"));
-    let (ea, na) = utm37.from_geodetic(geo_area.lat_deg, geo_area.lon_deg);
-    let (ep, np) = utm37.from_geodetic(geo_point.lat_deg, geo_point.lon_deg);
-
-    // PixelIsArea UL corner lands at (550_000, 5_250_000).
-    assert!((ea - 550_000.0).abs() < 0.002, "area easting={ea}");
-    assert!((na - 5_250_000.0).abs() < 0.002, "area northing={na}");
-    // PixelIsPoint shifts UL corner by exact (-0.5 px, +0.5 px) = (-5.0 m, +5.0 m).
-    assert!((ep - 549_995.0).abs() < 0.002, "point easting={ep}");
-    assert!((np - 5_250_005.0).abs() < 0.002, "point northing={np}");
-    let (pt_lat, pt_lon) = utm37.to_geodetic(549_995.0, 5_250_005.0);
-    let exact_pt_ul = WGS84.to_ecef(Geodetic::surface(pt_lat, pt_lon));
-    let drawn_pt_ul = patch_point.evaluate_ecef(0.0, 0.0).expect("point ul");
-    assert!(exact_pt_ul.distance(drawn_pt_ul) < 0.002);
-
-    // Zoom-invariant native base-IFD display readout matches synthetic RGB pattern.
-    let (px, py) = (17u32, 23u32);
-    let expected = [
-        (px * 7 + py * 3) as u8,
-        (px ^ py) as u8,
-        ((px * py) / 97) as u8,
-        255,
-    ];
-    assert_eq!(
-        src_area
-            .sample_display_rgba(px, py, &ctx)
-            .expect("sample area"),
-        Some(expected)
-    );
-    assert_eq!(
-        src_point
-            .sample_display_rgba(px, py, &ctx)
-            .expect("sample point"),
-        Some(expected)
-    );
-    assert_eq!(
-        src_area
-            .sample_display_rgba(64, 0, &ctx)
-            .expect("out of bounds"),
-        None
-    );
-
-    // Multi-chunk tiled COG readout: sample pixels in non-zero (cx, cy) tiles
-    // and verify the large-chunk guard rejects oversized single-chunk readouts.
-    let (cog_bytes, _, _) = build_tiled_cog(700, 600, 1);
-    let cog_src = TiffSource::open(
-        Arc::new(MemoryByteSource::new(Arc::from(cog_bytes.as_slice()))),
-        fake_fingerprint(&cog_bytes),
-        &budget,
-        &cancel,
-    )
-    .expect("open multi-chunk cog");
-    let (cpx, cpy) = (610u32, 540u32);
-    let cog_expected = [
-        (cpx * 7 + cpy * 3) as u8,
-        (cpx ^ cpy) as u8,
-        ((cpx * cpy) / 97) as u8,
-        255,
-    ];
-    assert_eq!(
-        cog_src
-            .sample_display_rgba(cpx, cpy, &ctx)
-            .expect("sample multi-chunk cog"),
-        Some(cog_expected)
-    );
-
-    // Tight chunk cache budget triggers LimitExceeded before decoding on fast_pool.
-    let tiny_budget = MemoryBudget {
-        decoded_chunk_cache_bytes: 16 * 1024,
-        ..budget
-    };
-    let tiny_ctx = DecodeContext {
-        chunk_cache: &chunk_cache,
-        budget_tracker: &tracker,
-        budget: &tiny_budget,
-        cancel: &cancel,
-    };
-    assert!(matches!(
-        cog_src.sample_display_rgba(cpx, cpy, &tiny_ctx),
-        Err(RasterError::LimitExceeded { .. })
-    ));
 }

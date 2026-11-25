@@ -124,7 +124,7 @@ pub enum TileScheme {
 
 impl TileScheme {
     /// Narrow to [`PlanetaryScheme`], returning `None` for `RasterPyramid`.
-    pub const fn as_planetary(self) -> Option<PlanetaryScheme> {
+    pub(super) const fn as_planetary(self) -> Option<PlanetaryScheme> {
         match self {
             Self::WebMercator => Some(PlanetaryScheme::WebMercator),
             Self::Geodetic => Some(PlanetaryScheme::Geodetic),
@@ -182,7 +182,7 @@ impl TileScheme {
     /// Return how many pyramid steps `finer_level` is below `coarser_level`,
     /// or `None` if `coarser_level` is strictly finer than `finer_level` or
     /// either level exceeds `RasterPyramid::max_level`.
-    pub const fn level_delta(self, finer_level: u8, coarser_level: u8) -> Option<u8> {
+    pub(super) const fn level_delta(self, finer_level: u8, coarser_level: u8) -> Option<u8> {
         match self {
             Self::RasterPyramid { max_level } => {
                 if finer_level > max_level || coarser_level > max_level {

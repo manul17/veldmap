@@ -1,9 +1,9 @@
 //! GeoTIFF / BigTIFF / Cloud-Optimized GeoTIFF (COG) reader built over
 //! positioned [`veldmap_core::io::ByteSource`] with explicit
 //! `tiff::decoder::Limits`, `MAX_IFDS` bounds,
-//! `GeoDoubleParamsTag`/`GeoAsciiParamsTag` parsing, ZSTD & `Predictor = 3`
-//! (via `tiff`) support, pooled `Decoder` handles, and singleflight chunk
-//! caching.
+//! `GeoDoubleParamsTag`/`GeoAsciiParamsTag` parsing, ZSTD, WebP (`0xC351`),
+//! direct `YCbCr -> RGBA8` conversion, and `Predictor = 3` (via `tiff`)
+//! support, pooled `Decoder` handles, and singleflight chunk caching.
 
 mod chunk_reader;
 mod format;

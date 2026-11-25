@@ -1,11 +1,9 @@
 //! Read-only GeoJSON vector overlay subsystem ([`VectorManager`]), off-UI-thread
 //! file loader, and dedicated background I/O worker decoupled from raster
-//! `OverlayManager` and `crate::session`.
+//! `OverlayManager` and `crate::storage::session`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
 
 use veldmap_core::geo::{
     DEFAULT_VECTOR_MAX_CHORD_DEG, FootprintBounds, MAX_GEOJSON_BYTES, VectorMesh, parse_geojson,
@@ -14,6 +12,7 @@ use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_storage::read_regular_file_utf8_limited;
 
 use crate::render::{DrawVectorId, DrawVectorLayer};
+use crate::worker::SingleThreadWorker;
 use crate::{clamp_opacity, display_name_from_path};
 
 /// Unique identifier for a loaded read-only GeoJSON vector layer.
@@ -37,7 +36,8 @@ pub(crate) struct VectorLayerSummary {
 }
 
 /// Borrowed persistence view of a loaded vector overlay layer for
-/// `session.json` serialization without coupling `vectors` to `crate::session`.
+/// `session.json` serialization without coupling `vectors` to
+/// `crate::storage::session`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VectorPersistEntry<'a> {
     pub(crate) path: &'a Path,
@@ -103,7 +103,6 @@ struct VectorIoCmd {
     fly_to: bool,
     visible: bool,
     opacity: f32,
-    cancel: CancelToken,
 }
 
 struct VectorIoResult {
@@ -118,30 +117,21 @@ struct VectorIoResult {
 /// GeoJSON files strictly off the UI thread, independent of raster
 /// `OverlayManager` / `OverlayIoWorker`.
 struct VectorIoWorker {
-    tx: Option<Sender<VectorIoCmd>>,
-    rx: Receiver<VectorIoResult>,
-    shutdown: CancelToken,
-    handle: Option<JoinHandle<()>>,
+    worker: SingleThreadWorker<VectorIoCmd, VectorIoResult>,
 }
 
 impl VectorIoWorker {
     fn spawn(wakeup: Wakeup, shutdown: CancelToken) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<VectorIoCmd>();
-        let (res_tx, res_rx) = mpsc::channel::<VectorIoResult>();
-        let worker_shutdown = shutdown.clone();
-        let handle = match thread::Builder::new()
-            .name("veldmap-vector-io".to_owned())
-            .spawn(move || {
+        let worker = SingleThreadWorker::<VectorIoCmd, VectorIoResult>::spawn(
+            "veldmap-vector-io",
+            move |cmd_rx, res_tx| {
                 while let Ok(cmd) = cmd_rx.recv() {
-                    if worker_shutdown.is_cancelled() {
+                    if shutdown.is_cancelled() {
                         break;
                     }
-                    if cmd.cancel.is_cancelled() {
-                        continue;
-                    }
                     let outcome = load_vector_file(&cmd.path);
-                    if cmd.cancel.is_cancelled() || worker_shutdown.is_cancelled() {
-                        continue;
+                    if shutdown.is_cancelled() {
+                        break;
                     }
                     let _ = res_tx.send(VectorIoResult {
                         path: cmd.path,
@@ -152,20 +142,9 @@ impl VectorIoWorker {
                     });
                     (wakeup)();
                 }
-            }) {
-            Ok(h) => Some(h),
-            Err(err) => {
-                tracing::error!(error = %err, "Failed to spawn vector I/O worker");
-                None
-            }
-        };
-
-        Self {
-            tx: handle.is_some().then_some(cmd_tx),
-            rx: res_rx,
-            shutdown,
-            handle,
-        }
+            },
+        );
+        Self { worker }
     }
 
     fn begin_open(
@@ -180,9 +159,8 @@ impl VectorIoWorker {
             fly_to,
             visible,
             opacity: clamp_opacity(opacity),
-            cancel: self.shutdown.child_token(),
         };
-        if self.tx.as_ref().is_some_and(|tx| tx.send(cmd).is_ok()) {
+        if self.worker.send(cmd) {
             Ok(())
         } else {
             Err("vector I/O worker is unavailable".to_owned())
@@ -190,24 +168,15 @@ impl VectorIoWorker {
     }
 
     fn try_recv(&self) -> Option<VectorIoResult> {
-        self.rx.try_recv().ok()
+        self.worker.try_recv()
     }
 
     fn close_channel(&mut self) {
-        self.tx = None;
+        self.worker.close_channel();
     }
 
     fn join(&mut self) {
-        self.tx = None;
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for VectorIoWorker {
-    fn drop(&mut self) {
-        self.join();
+        self.worker.join();
     }
 }
 
@@ -474,5 +443,84 @@ impl Drop for VectorManager {
     fn drop(&mut self) {
         self.begin_shutdown();
         self.finish_shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veldmap_core::geo::{GeoJsonFeature, GeoJsonFeatureCollection, GeoJsonGeometry, GeoPoint};
+
+    fn sample_loaded(name: &str) -> LoadedVectorData {
+        let fc = GeoJsonFeatureCollection {
+            features: vec![GeoJsonFeature::new(
+                Some(name.to_owned()),
+                GeoJsonGeometry::Point(GeoPoint::new(47.2, 39.7)),
+            )],
+        };
+        LoadedVectorData {
+            path: PathBuf::from(format!("/tmp/{name}.geojson")),
+            feature_count: 1,
+            mesh: Arc::new(VectorMesh::from_collection(
+                &fc,
+                DEFAULT_VECTOR_MAX_CHORD_DEG,
+            )),
+        }
+    }
+
+    #[test]
+    fn is_geojson_path_matches_case_insensitively() {
+        assert!(is_geojson_path(Path::new("parcels.geojson")));
+        assert!(is_geojson_path(Path::new("PARCELS.GEOJSON")));
+        assert!(is_geojson_path(Path::new("features.json")));
+        assert!(!is_geojson_path(Path::new("ortho.tif")));
+        assert!(!is_geojson_path(Path::new("no_extension")));
+    }
+
+    #[test]
+    fn vector_layer_stack_handles_ordering_visibility_opacity_palette_and_remove() {
+        let mut stack = VectorLayerStack::default();
+        assert_eq!(stack.len(), 0);
+
+        // Push enough layers to verify painter's order AND palette wrap-around.
+        let mut ids = Vec::new();
+        for idx in 0..=VECTOR_PALETTE.len() {
+            let (id, bounds) = stack.push_loaded(sample_loaded(&format!("layer_{idx}")), true, 1.0);
+            assert!(bounds.is_some());
+            ids.push(id);
+        }
+        assert_eq!(stack.len(), VECTOR_PALETTE.len() + 1);
+
+        let summaries = stack.summaries();
+        assert_eq!(summaries[0].name, "layer_0.geojson");
+        assert_eq!(summaries[0].color_rgb, VECTOR_PALETTE[0].2);
+        assert_eq!(summaries[1].color_rgb, VECTOR_PALETTE[1].2);
+        // Entry at `VECTOR_PALETTE.len()` wraps back to palette index 0.
+        assert_eq!(
+            summaries[VECTOR_PALETTE.len()].color_rgb,
+            VECTOR_PALETTE[0].2
+        );
+
+        // Visibility transitions are idempotent and filter `draw_layers`.
+        let first_id = ids[0];
+        assert!(!stack.set_visible(first_id, true));
+        assert!(stack.set_visible(first_id, false));
+        assert!(!stack.set_visible(first_id, false));
+        assert_eq!(stack.draw_layers().len(), VECTOR_PALETTE.len());
+
+        // Opacity clamping & NaN guard; opacity <= 0.001 is skipped from draw_layers.
+        let second_id = ids[1];
+        assert!(stack.set_opacity(second_id, -2.0));
+        assert!(!stack.set_opacity(second_id, 0.0));
+        assert_eq!(stack.draw_layers().len(), VECTOR_PALETTE.len() - 1);
+        assert!(stack.set_opacity(second_id, f32::NAN));
+        let persisted: Vec<_> = stack.saved_entries_iter().collect();
+        assert_eq!(persisted[1].opacity, 1.0);
+
+        // Remove returns true once, false for missing IDs, preserving order of remaining layers.
+        assert!(stack.remove(first_id));
+        assert!(!stack.remove(first_id));
+        assert_eq!(stack.len(), VECTOR_PALETTE.len());
+        assert_eq!(stack.summaries()[0].id, second_id);
     }
 }

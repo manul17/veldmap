@@ -11,10 +11,31 @@ use std::sync::Arc;
 use super::datum::{
     Datum, DatumWarning, LinearUnit, PULKOVO_1942, WGS84_DATUM, known_geographic_epsg,
 };
-use super::proj4::{CrsError, Proj4Projection, looks_like_wkt};
+use super::proj4::{CrsError, Proj4Projection};
 use super::projection::{Projection, System};
 
 pub use presets::{CrsPreset, builtin_crs_presets, search_crs_presets};
+
+/// Return whether `text` begins with a WKT1/WKT2 CRS root keyword (ignoring a
+/// leading UTF-8 BOM and ASCII whitespace).
+fn looks_like_wkt(text: &str) -> bool {
+    const WKT_PREFIXES: &[&str] = &[
+        "PROJCS[",
+        "GEOGCS[",
+        "PROJCRS[",
+        "GEOGCRS[",
+        "BOUNDCRS[",
+        "COMPOUNDCRS[",
+        "COMPD_CS[",
+        "LOCAL_CS[",
+    ];
+    let trimmed = text.trim_start_matches('\u{FEFF}').trim_start();
+    WKT_PREFIXES.iter().any(|prefix| {
+        trimmed
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
 
 /// Syntax kind detected by [`CrsSpec::parse_text`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,11 +65,6 @@ pub enum CrsSpec {
 }
 
 impl CrsSpec {
-    /// Return whether `text` begins with a WKT1/WKT2 CRS root keyword.
-    pub fn looks_like_wkt(text: &str) -> bool {
-        looks_like_wkt(text)
-    }
-
     /// Resolve any supported EPSG (or MSK-61 `633610x`) code into a [`CrsSpec`].
     pub fn from_epsg(code: u32) -> Result<Self, CrsError> {
         if let Some((datum, label, warning)) = known_geographic_epsg(code) {
@@ -69,6 +85,17 @@ impl CrsSpec {
         Ok(Self::from_proj4(Proj4Projection::from_wkt(wkt)?))
     }
 
+    /// Parse a PROJ.4 parameter string with an optional display label.
+    pub fn from_proj_string_labeled(
+        proj_string: &str,
+        label: Option<String>,
+    ) -> Result<Self, CrsError> {
+        Ok(Self::from_proj4(Proj4Projection::from_proj_string(
+            proj_string,
+            label,
+        )?))
+    }
+
     /// Parse a PROJ.4 string (or `EPSG:<code>` shorthand).
     pub fn from_user_string(input: &str) -> Result<Self, CrsError> {
         let trimmed = input.trim().trim_start_matches('\u{FEFF}').trim();
@@ -82,9 +109,7 @@ impl CrsSpec {
         if let Ok(code) = trimmed.parse::<u32>() {
             return Self::from_epsg(code);
         }
-        Ok(Self::from_proj4(Proj4Projection::from_proj_string(
-            trimmed, None,
-        )?))
+        Self::from_proj_string_labeled(trimmed, None)
     }
 
     /// Parse a CRS string that may be WKT1/WKT2, a PROJ.4 string, or an
@@ -141,7 +166,7 @@ pub enum DatumPreset {
 }
 
 impl DatumPreset {
-    pub const fn to_datum(self) -> Datum {
+    const fn to_datum(self) -> Datum {
         match self {
             Self::Wgs84 => WGS84_DATUM,
             Self::Pulkovo1942 => PULKOVO_1942,
@@ -187,7 +212,7 @@ impl Default for CustomTmParams {
 
 impl CustomTmParams {
     /// Validate and convert into an exact in-house [`System`].
-    pub fn to_system(&self) -> Result<System, CrsError> {
+    fn to_system(&self) -> Result<System, CrsError> {
         if !self.central_meridian_deg.is_finite()
             || !(-180.0..=180.0).contains(&self.central_meridian_deg)
         {

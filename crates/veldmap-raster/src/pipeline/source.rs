@@ -2,7 +2,7 @@
 //! decoders ([`crate::TiffSource`], [`crate::PngSource`], [`crate::JpegSource`],
 //! and future mission codecs).
 
-use veldmap_core::tile::{DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, SourceId};
+use veldmap_core::tile::{DecodedTile, PixelFormat, SourceFingerprint, SourceId};
 
 use crate::RasterError;
 
@@ -30,9 +30,6 @@ pub trait RasterSource: Send + Sync {
         PyramidMeta {
             source: self.source_id(),
             spec: DISPLAY_STREAM_SPEC,
-            width: desc.width,
-            height: desc.height,
-            tile_size: RASTER_TILE_SIZE,
             levels: desc.levels.clone(),
         }
     }
@@ -46,10 +43,14 @@ pub trait RasterSource: Send + Sync {
     fn produce_direct(
         &self,
         level: u8,
-        wants: &[(u32, u32)],
-        ctx: &DecodeContext<'_>,
-        emit: TileEmit<'_>,
-    ) -> Result<(), RasterError>;
+        _wants: &[(u32, u32)],
+        _ctx: &DecodeContext<'_>,
+        _emit: TileEmit<'_>,
+    ) -> Result<(), RasterError> {
+        Err(RasterError::Decode(format!(
+            "raster source does not support pointwise random access at level {level}; use sequential pass"
+        )))
+    }
 
     /// Run a sequential top-to-bottom pass over the base image, emitting every
     /// pyramid tile via `emit`.

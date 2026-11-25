@@ -109,8 +109,8 @@ fn find_topmost_pixel(
         if !layer.is_active() {
             return None;
         }
-        let (fx, fy) = layer.frame.fraction_at(lat_deg, lon_deg)?;
-        let desc = layer.source.description();
+        let (fx, fy) = layer.frame().fraction_at(lat_deg, lon_deg)?;
+        let desc = layer.source().description();
         let px = ((fx * f64::from(desc.width)).floor() as i64)
             .clamp(0, i64::from(desc.width.saturating_sub(1))) as u32;
         let py = ((fy * f64::from(desc.height)).floor() as i64)
@@ -125,9 +125,9 @@ fn build_readout(
     value: CursorReadoutValue,
 ) -> CursorReadout {
     CursorReadout {
-        layer_name: layer.name.clone(),
+        layer_name: layer.name().to_owned(),
         pixel,
-        source_pixel_size_m: layer.source_pixel_size_m,
+        source_pixel_size_m: layer.source_pixel_size_m(),
         value,
     }
 }
@@ -203,7 +203,7 @@ impl CursorProber {
         runtime: &Arc<OverlayRuntime>,
     ) -> bool {
         let probe_key = (layer.source_id(), pixel.0, pixel.1);
-        let source = Arc::clone(&layer.source);
+        let source = Arc::clone(layer.source());
         let rt = Arc::clone(runtime);
         let probe_guard = CursorProbeGuard::new(
             Arc::clone(&self.cache),

@@ -80,7 +80,7 @@ impl ViewportState {
         });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globe camera bind group"),
-            layout: &pipelines.camera_layout,
+            layout: &pipelines.layouts.camera_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: camera_buffer.as_entire_binding(),
@@ -89,9 +89,9 @@ impl ViewportState {
 
         let uniform_arena = DynamicUniformArena::new(
             device,
-            &pipelines.tile_uniform_layout,
-            &pipelines.overlay_uniform_layout,
-            &pipelines.vector_uniform_layout,
+            &pipelines.layouts.tile_uniform_layout,
+            &pipelines.layouts.overlay_uniform_layout,
+            &pipelines.layouts.vector_uniform_layout,
         );
 
         Self {

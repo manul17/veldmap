@@ -3,8 +3,7 @@
 
 use veldmap_app::BUNDLED_MAX_LEVEL;
 use veldmap_app::render::{GlobeRenderer, RenderParams};
-use veldmap_core::geo::Camera;
-use veldmap_core::geo::camera::MIN_HEIGHT_M;
+use veldmap_core::geo::{Camera, MIN_HEIGHT_M};
 use veldmap_core::tile::{QuadtreeConfig, SourceId};
 
 use crate::common::{

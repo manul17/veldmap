@@ -3,19 +3,18 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::Sender;
 
 use veldmap_core::geo::Frame;
 use veldmap_core::sync::CancelToken;
 use veldmap_raster::RasterSource;
 
-use crate::crs_override::CrsOverride;
+use crate::worker::SingleThreadWorker;
 
-use super::LayerId;
 use super::opener::{OpenRasterError, open_local_raster};
 use super::runtime::OverlayRuntime;
 use super::stack::LayerInitOptions;
+use super::{CrsOverride, LayerId};
 
 /// Parameters describing a non-blocking reload of an existing overlay layer.
 pub(super) struct ReloadRequest {
@@ -43,7 +42,6 @@ pub(super) enum OverlayIoCmd {
         path: PathBuf,
         fly_to: bool,
         options: LayerInitOptions,
-        cancel: CancelToken,
     },
     Reload(ReloadRequest),
 }
@@ -65,9 +63,8 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             path,
             fly_to,
             options,
-            cancel,
         } => {
-            if cancel.is_cancelled() {
+            if runtime.shutdown.is_cancelled() {
                 return;
             }
             let outcome = open_local_raster(
@@ -76,9 +73,9 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
                 &runtime.budget,
                 false,
                 options.crs_override.as_ref(),
-                &cancel,
+                &runtime.shutdown,
             );
-            if cancel.is_cancelled() {
+            if runtime.shutdown.is_cancelled() {
                 return;
             }
             let _ = res_tx.send(OverlayIoResult::Opened {
@@ -141,61 +138,35 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
 /// PNG/JPEG opening plus reload SQLite cache clearing strictly off the UI
 /// thread (joined deterministically on shutdown).
 pub(super) struct OverlayIoWorker {
-    tx: Option<Sender<OverlayIoCmd>>,
-    rx: Receiver<OverlayIoResult>,
-    handle: Option<JoinHandle<()>>,
+    worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
 }
 
 impl OverlayIoWorker {
     pub(super) fn spawn(runtime: Arc<OverlayRuntime>) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<OverlayIoCmd>();
-        let (res_tx, res_rx) = mpsc::channel::<OverlayIoResult>();
-        let handle = match thread::Builder::new()
-            .name("veldmap-overlay-io".to_owned())
-            .spawn(move || {
-                while let Ok(cmd) = cmd_rx.recv() {
-                    if runtime.shutdown.is_cancelled() {
-                        break;
-                    }
-                    handle_io_cmd(cmd, &runtime, &res_tx);
+        let worker = SingleThreadWorker::spawn("veldmap-overlay-io", move |cmd_rx, res_tx| {
+            while let Ok(cmd) = cmd_rx.recv() {
+                if runtime.shutdown.is_cancelled() {
+                    break;
                 }
-            }) {
-            Ok(h) => Some(h),
-            Err(err) => {
-                tracing::error!(error = %err, "Failed to spawn overlay I/O worker");
-                None
+                handle_io_cmd(cmd, &runtime, &res_tx);
             }
-        };
-
-        Self {
-            tx: handle.is_some().then_some(cmd_tx),
-            rx: res_rx,
-            handle,
-        }
+        });
+        Self { worker }
     }
 
     pub(super) fn send(&self, cmd: OverlayIoCmd) -> bool {
-        self.tx.as_ref().is_some_and(|tx| tx.send(cmd).is_ok())
+        self.worker.send(cmd)
     }
 
     pub(super) fn try_recv(&self) -> Option<OverlayIoResult> {
-        self.rx.try_recv().ok()
+        self.worker.try_recv()
     }
 
     pub(super) fn close_channel(&mut self) {
-        self.tx = None;
+        self.worker.close_channel();
     }
 
     pub(super) fn join(&mut self) {
-        self.tx = None;
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for OverlayIoWorker {
-    fn drop(&mut self) {
-        self.join();
+        self.worker.join();
     }
 }

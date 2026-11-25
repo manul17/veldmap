@@ -10,15 +10,15 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 /// Version 2 vertically partitions `tile_meta` and `tile_blobs`, sets
 /// `page_size = 16384`, adds `(band, format, gutter, decode_rev, encoding)`
 /// columns, and tracks O(1) `tile_count` in `cache_meta`.
-pub(super) const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 2;
 
 /// SQLite page size (`16 KiB`) reducing overflow-chain fragmentation for
 /// 256 KiB–1 MiB tile payloads.
-pub(super) const SQLITE_PAGE_SIZE: i64 = 16_384;
+const SQLITE_PAGE_SIZE: i64 = 16_384;
 
 /// SQLite busy timeout in milliseconds (`5 s`) applied immediately on open so
 /// multi-process WAL startups never fail prematurely with `SQLITE_BUSY`.
-pub(super) const SQLITE_BUSY_TIMEOUT_MS: i64 = 5000;
+const SQLITE_BUSY_TIMEOUT_MS: i64 = 5000;
 
 pub(super) fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();
@@ -162,4 +162,77 @@ pub(super) fn open_and_init_file_db(path: &Path) -> Result<(Connection, i64), ru
     }
     let max_ts = init_connection(&conn, page_count == 0)?;
     Ok((conn, max_ts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestTempDir;
+    use crate::tile_cache::queries::read_cache_meta_totals;
+
+    #[test]
+    fn pragmas_and_schema_version_are_configured_on_fresh_db() {
+        let dir = TestTempDir::new("schema-pragmas");
+        let db_path = dir.path().join("tiles.sqlite3");
+        let (conn, _) = open_and_init_file_db(&db_path).expect("open fresh db");
+
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size;", [], |r| r.get(0))
+            .expect("page_size");
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
+            .expect("foreign_keys");
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .expect("user_version");
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
+            .expect("busy_timeout");
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
+            .expect("journal_mode");
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum;", [], |r| r.get(0))
+            .expect("auto_vacuum");
+
+        assert_eq!(page_size, SQLITE_PAGE_SIZE);
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(user_version, SCHEMA_VERSION);
+        assert_eq!(busy_timeout, SQLITE_BUSY_TIMEOUT_MS);
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(auto_vacuum, 2);
+    }
+
+    #[test]
+    fn legacy_v1_database_upgrades_cleanly_to_current_schema() {
+        let dir = TestTempDir::new("schema-v1-upgrade");
+        let db_path = dir.path().join("tiles.sqlite3");
+
+        {
+            let legacy = Connection::open(&db_path).expect("open legacy");
+            legacy
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     CREATE TABLE tiles (
+                         source_key TEXT, scheme INTEGER, level INTEGER, x INTEGER, y INTEGER,
+                         payload BLOB, byte_size INTEGER, last_used_ms INTEGER
+                     );
+                     INSERT INTO tiles VALUES ('old', 1, 0, 0, 0, X'DEADBEEF', 4, 1);",
+                )
+                .expect("seed legacy");
+        }
+
+        let (conn, max_ts) = open_and_init_file_db(&db_path).expect("upgrade legacy db");
+        assert_eq!(max_ts, 0);
+        assert_eq!(read_cache_meta_totals(&conn).expect("totals"), (0, 0));
+
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size;", [], |r| r.get(0))
+            .expect("upgraded page_size");
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .expect("upgraded user_version");
+        assert_eq!(page_size, SQLITE_PAGE_SIZE);
+        assert_eq!(user_version, SCHEMA_VERSION);
+    }
 }

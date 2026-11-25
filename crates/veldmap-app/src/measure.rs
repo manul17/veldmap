@@ -85,6 +85,10 @@ impl MeasureSession {
         self.metrics
     }
 
+    pub(crate) const fn rev(&self) -> u64 {
+        self.rev
+    }
+
     pub(crate) fn toggle(&mut self) {
         if self.is_active() {
             self.last_active_mode = self.mode;

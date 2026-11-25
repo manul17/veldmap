@@ -2,13 +2,14 @@
 //! interactive geodesic measurement geometries with per-cluster CPU `f64` RTC
 //! offsets and GPU-instanced altitude-scaled point markers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::{DVec3, Vec3};
 use wgpu::util::DeviceExt;
 
+use super::pipelines::GlobePipelines;
 use super::snapshot::{DrawSnapshot, DrawVectorId, DrawVectorLayer};
 use super::uniforms::{DynamicUniformArena, VectorUniform};
 use crate::clamp_opacity;
@@ -64,6 +65,21 @@ struct CachedVectorBuffers {
 struct ClusterDrawOffsets {
     fill_offset: Option<u32>,
     line_offset: Option<u32>,
+}
+
+/// Exact IEC 61966-2-1 sRGB-to-linear transfer function for a normalized
+/// channel in `0.0..=1.0`.
+fn srgb_channel_to_linear(c: f32) -> f32 {
+    let s = if c.is_finite() {
+        c.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn point_marker_radius_m(camera_height_m: f64) -> f32 {
@@ -258,8 +274,8 @@ impl VectorRenderer {
             self.buffers.clear();
             return;
         }
-        let active_ids: HashSet<DrawVectorId> = snapshot.vectors.iter().map(|v| v.id).collect();
-        self.buffers.retain(|id, _| active_ids.contains(id));
+        self.buffers
+            .retain(|id, _| snapshot.vectors.iter().any(|v| v.id == *id));
 
         for layer in &snapshot.vectors {
             let needs_upload = self
@@ -278,10 +294,10 @@ impl VectorRenderer {
         &mut self,
         arena: &mut DynamicUniformArena,
         snapshot: &DrawSnapshot,
+        eye: DVec3,
     ) {
         self.draw_offsets.clear();
         self.layer_offset_ranges.clear();
-        let eye = snapshot.camera.eye_ecef();
         let marker_radius_m = point_marker_radius_m(snapshot.camera.height_m());
 
         for layer in &snapshot.vectors {
@@ -289,6 +305,18 @@ impl VectorRenderer {
             let opacity = clamp_opacity(layer.opacity);
             let fill_alpha = layer.fill_color[3] * opacity;
             let line_alpha = layer.line_color[3] * opacity;
+            let fill_linear = [
+                srgb_channel_to_linear(layer.fill_color[0]),
+                srgb_channel_to_linear(layer.fill_color[1]),
+                srgb_channel_to_linear(layer.fill_color[2]),
+                fill_alpha,
+            ];
+            let line_linear = [
+                srgb_channel_to_linear(layer.line_color[0]),
+                srgb_channel_to_linear(layer.line_color[1]),
+                srgb_channel_to_linear(layer.line_color[2]),
+                line_alpha,
+            ];
 
             let Some(bufs) = self.buffers.get(&layer.id) else {
                 self.layer_offset_ranges.push(start..start);
@@ -304,12 +332,7 @@ impl VectorRenderer {
                         arena.push(&VectorUniform {
                             offset_eye,
                             point_radius_m: 0.0,
-                            color: [
-                                layer.fill_color[0],
-                                layer.fill_color[1],
-                                layer.fill_color[2],
-                                fill_alpha,
-                            ],
+                            color: fill_linear,
                         })
                     });
 
@@ -319,12 +342,7 @@ impl VectorRenderer {
                     arena.push(&VectorUniform {
                         offset_eye,
                         point_radius_m: marker_radius_m,
-                        color: [
-                            layer.line_color[0],
-                            layer.line_color[1],
-                            layer.line_color[2],
-                            line_alpha,
-                        ],
+                        color: line_linear,
                     })
                 });
 
@@ -341,9 +359,7 @@ impl VectorRenderer {
     pub(super) fn record_pass<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
-        fill_pipeline: &'a wgpu::RenderPipeline,
-        line_pipeline: &'a wgpu::RenderPipeline,
-        point_pipeline: &'a wgpu::RenderPipeline,
+        pipelines: &'a GlobePipelines,
         arena: &'a DynamicUniformArena,
         snapshot: &'a DrawSnapshot,
     ) {
@@ -362,7 +378,7 @@ impl VectorRenderer {
                 record_cluster_draws(
                     pass,
                     ClusterDrawTarget {
-                        pipeline: fill_pipeline,
+                        pipeline: &pipelines.vector_fill_pipeline,
                         vb,
                         kind: VectorDrawKind::Fill { ib },
                     },
@@ -376,7 +392,7 @@ impl VectorRenderer {
                 record_cluster_draws(
                     pass,
                     ClusterDrawTarget {
-                        pipeline: line_pipeline,
+                        pipeline: &pipelines.vector_line_pipeline,
                         vb,
                         kind: VectorDrawKind::Line,
                     },
@@ -390,7 +406,7 @@ impl VectorRenderer {
                 record_cluster_draws(
                     pass,
                     ClusterDrawTarget {
-                        pipeline: point_pipeline,
+                        pipeline: &pipelines.vector_point_pipeline,
                         vb,
                         kind: VectorDrawKind::Point,
                     },

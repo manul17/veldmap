@@ -88,9 +88,10 @@ fn downsample_rgba8_srgb_2x(
 }
 
 /// Populate the complete CPU linear-light mipmap chain on `tile` when
-/// `tile.format == PixelFormat::Rgba8UnormSrgb`, `tile.gutter == 0`, the valid
-/// interior covers the full texture (`valid_w == width && valid_h == height`),
-/// and `tile.data` matches `width x height x 4`.
+/// `tile.format() == PixelFormat::Rgba8UnormSrgb`, `tile.gutter() == 0`, the
+/// valid interior covers the full texture (`tile.valid_w() == tile.width() &&
+/// tile.valid_h() == tile.height()`), and `tile.data()` matches
+/// `width x height x 4`.
 ///
 /// Non-display formats (`R32Float`, `R8Uint`, `R16Uint`), guttered tiles, and
 /// padded partial-edge tiles are left untouched with `mips` cleared so 2x box

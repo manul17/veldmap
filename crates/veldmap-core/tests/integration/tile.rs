@@ -1,8 +1,8 @@
 //! Cross-module integration tests exercising `veldmap-core::tile` together
-//! with `veldmap-core::geo::camera` (`quadtree::traverse` + `TileCache` carrier
+//! with `veldmap-core::geo::Camera` (`quadtree::traverse` + `TileCache` carrier
 //! resolution + `compose_uv_rect` + `DecodedTile`).
 
-use veldmap_core::geo::camera::Camera;
+use veldmap_core::geo::Camera;
 use veldmap_core::tile::{
     DecodedTile, GlobeScheme, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId,
     TileCache, TileKey, compose_uv_rect, traverse,

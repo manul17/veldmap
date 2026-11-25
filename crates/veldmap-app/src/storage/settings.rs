@@ -4,8 +4,8 @@
 //!
 //! Kept in `veldmap-app` rather than `veldmap-storage` so the low-level
 //! persistence crate stays free of UI and basemap domain schemas while
-//! settings normalization shares `veldmap-net`'s canonical constants and URL
-//! redaction helpers directly.
+//! settings normalization and redacted `Debug` formatting delegate directly to
+//! `veldmap-net`'s canonical constants and [`CustomBasemapConfig`].
 
 use std::fmt;
 use std::ops::RangeInclusive;
@@ -13,7 +13,6 @@ use std::ops::RangeInclusive;
 use serde::{Deserialize, Deserializer, Serialize};
 use veldmap_net::{
     CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, is_valid_gibs_date,
-    redact_secret_label, sanitize_url_for_display,
 };
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
@@ -179,20 +178,54 @@ impl CustomXyzSettings {
 
 impl fmt::Debug for CustomXyzSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CustomXyzSettings")
-            .field("name", &self.name)
-            .field(
-                "url_template",
-                &sanitize_url_for_display(&self.url_template),
-            )
-            .field(
-                "api_key",
-                &redact_secret_label(Some(&self.api_key), "<empty>"),
-            )
-            .field("tms_flip_y", &self.tms_flip_y)
-            .field("max_level", &self.max_level)
-            .field("attribution", &self.attribution)
-            .finish()
+        fmt::Debug::fmt(&self.as_net_config(), f)
+    }
+}
+
+/// Scoped editable slice of [`AppSettings`] for the Basemap & Tile Cache
+/// Settings window.
+///
+/// Keeping this slice and its merge/validation rules alongside [`AppSettings`]
+/// guarantees saving basemap settings can never silently clobber unrelated
+/// fields (such as `show_graticule`) or overwrite valid saved values with
+/// half-typed invalid inputs while keeping `ui/` free of persistence rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BasemapSettingsDraft {
+    pub(crate) active_basemap: BasemapSelection,
+    pub(crate) gibs_date: String,
+    pub(crate) custom_xyz: CustomXyzSettings,
+    pub(crate) disk_cache_max_mb: u64,
+}
+
+impl BasemapSettingsDraft {
+    pub(crate) fn from_settings(settings: &AppSettings) -> Self {
+        Self {
+            active_basemap: settings.active_basemap,
+            gibs_date: settings.gibs_date.clone(),
+            custom_xyz: settings.custom_xyz.clone(),
+            disk_cache_max_mb: settings.disk_cache_max_mb,
+        }
+    }
+
+    pub(crate) fn apply_into(&self, target: &mut AppSettings) {
+        target.active_basemap = self.active_basemap;
+        // Never overwrite a valid persisted GIBS date with a half-typed invalid
+        // string when saving unrelated settings (e.g. disk cache cap or Custom XYZ).
+        if validate_gibs_date(&self.gibs_date)
+            || self.active_basemap == BasemapSelection::NasaGibsViirs
+        {
+            target.gibs_date = self.gibs_date.clone();
+        }
+        // Never overwrite a valid persisted Custom XYZ configuration with a
+        // half-typed invalid URL when saving unrelated settings, while still
+        // allowing an intentionally cleared empty URL to be persisted.
+        if self.active_basemap == BasemapSelection::CustomXyz
+            || self.custom_xyz.url_template.trim().is_empty()
+            || validate_custom_url_template(&self.custom_xyz.url_template).is_ok()
+        {
+            target.custom_xyz = self.custom_xyz.clone();
+        }
+        target.disk_cache_max_mb = self.disk_cache_max_mb;
     }
 }
 
@@ -332,5 +365,56 @@ mod tests {
         assert_eq!(compat.disk_cache_max_mb, MAX_DISK_CACHE_MAX_MB);
         assert_eq!(compat.gibs_date, DEFAULT_GIBS_DATE);
         assert!(compat.show_graticule);
+    }
+
+    #[test]
+    fn basemap_draft_preserves_unrelated_app_settings_and_validates_partial_edits() {
+        let mut settings = AppSettings {
+            show_graticule: false,
+            ..AppSettings::default()
+        };
+        let mut draft = BasemapSettingsDraft::from_settings(&settings);
+        draft.active_basemap = BasemapSelection::EoxSentinel2Cloudless;
+        draft.disk_cache_max_mb = 1024;
+
+        // Applying basemap draft must leave unrelated `show_graticule` intact.
+        draft.apply_into(&mut settings);
+        assert!(!settings.show_graticule);
+        assert_eq!(
+            settings.active_basemap,
+            BasemapSelection::EoxSentinel2Cloudless
+        );
+        assert_eq!(settings.disk_cache_max_mb, 1024);
+
+        // Applying draft with an invalid GIBS date while GIBS VIIRS is inactive
+        // preserves the existing valid GIBS date instead of persisting a typo.
+        let prev_date = settings.gibs_date.clone();
+        draft.gibs_date = "not-a-date".to_owned();
+        draft.disk_cache_max_mb = 2048;
+        draft.apply_into(&mut settings);
+        assert_eq!(settings.gibs_date, prev_date);
+        assert_eq!(settings.disk_cache_max_mb, 2048);
+
+        // Saving a valid Custom XYZ URL while CustomXyz is inactive persists it.
+        draft.custom_xyz.url_template = "https://tiles.example.org/{z}/{x}/{y}.png".to_owned();
+        draft.apply_into(&mut settings);
+        assert_eq!(
+            settings.custom_xyz.url_template,
+            "https://tiles.example.org/{z}/{x}/{y}.png"
+        );
+
+        // A half-typed invalid URL while CustomXyz is inactive must preserve
+        // the existing saved Custom XYZ configuration.
+        let saved_custom = settings.custom_xyz.clone();
+        draft.custom_xyz.url_template = "https://incomplete-no-placeholders".to_owned();
+        draft.custom_xyz.name = "Half-typed".to_owned();
+        draft.apply_into(&mut settings);
+        assert_eq!(settings.custom_xyz, saved_custom);
+
+        // Intentionally clearing the URL to empty while CustomXyz is inactive
+        // IS applied so the user can clear a saved Custom XYZ source.
+        draft.custom_xyz.url_template = "   ".to_owned();
+        draft.apply_into(&mut settings);
+        assert_eq!(settings.custom_xyz.url_template, "   ");
     }
 }

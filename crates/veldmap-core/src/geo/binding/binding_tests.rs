@@ -1,5 +1,7 @@
 use super::*;
-use crate::geo::projection::System;
+use crate::geo::crs::CrsSpec;
+use crate::geo::geodesy;
+use crate::geo::projection::{Projection, System};
 
 #[test]
 fn projected_and_axial_tie_grid_fraction_inverse_round_trip() {
@@ -323,8 +325,6 @@ fn foreign_datum_geographic_frame_shifts_to_wgs84_and_inverts_cleanly() {
 
 #[test]
 fn crs_pixel_affine_geographic_handles_pole_touching_pixel_is_point_and_360_domain() {
-    use super::super::crs::CrsSpec;
-
     let wgs84 = CrsSpec::from_epsg(4326).expect("EPSG:4326");
 
     // 3601x1801 PixelIsPoint [-180, 180] x [-90, 90] (0.1 deg spacing):

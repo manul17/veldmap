@@ -201,10 +201,9 @@ fn merge_georef_with_sidecar(
         None
     } else {
         trouble.or_else(|| {
-            Some(
-                "TIFF has pixel affine / world file (.tfw/.wld) but no accompanying .prj CRS sidecar; assign a CRS to place it"
-                    .to_string(),
-            )
+            Some(crate::sidecar::missing_prj_trouble(
+                "TIFF has pixel affine / world file (.tfw/.wld)",
+            ))
         })
     };
     (merged_placement, merged_trouble)

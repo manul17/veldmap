@@ -78,3 +78,37 @@ fn sample_tile_surface_clamped_geodetic_v_tex_maps_unclamped_texture_range() {
     assert!((nw.v_tex - expected_v0).abs() < 1e-12);
     assert!((se.v_tex - (1.0 - expected_v0)).abs() < 1e-12);
 }
+
+#[test]
+fn polar_r_cap_constant_and_surface_bounds_guards_are_exact() {
+    let expected = ((90.0 - WEB_MERCATOR_LIMIT_DEG) * 0.5).to_radians().tan();
+    assert!((POLAR_R_CAP - expected).abs() < 1e-16);
+
+    // Out-of-bounds WebMercator and PolarCap tile coordinates return None.
+    assert!(
+        sample_tile_surface(
+            QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 1,
+                x: 2,
+                y: 0,
+            },
+            0.5,
+            0.5,
+        )
+        .is_none()
+    );
+    assert!(
+        sample_tile_surface(
+            QuadTileId {
+                scheme: PlanetaryScheme::PolarCap { north: true },
+                level: 0,
+                x: 1,
+                y: 0,
+            },
+            0.5,
+            0.5,
+        )
+        .is_none()
+    );
+}

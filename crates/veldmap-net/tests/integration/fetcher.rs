@@ -239,68 +239,136 @@ fn custom_spec(addr: std::net::SocketAddr, max_level: u8) -> LiveBasemapSpec {
     .expect("custom spec")
 }
 
+/// RAII harness owning a [`LiveTilePipeline`] and its loopback [`MockServer`],
+/// guaranteeing `pipeline` always shuts down before `server` even on panic.
+struct TestPipelineHarness {
+    pipeline: Option<LiveTilePipeline>,
+    server: Option<MockServer>,
+    spec: LiveBasemapSpec,
+    store: Option<Arc<MemBlobStore>>,
+    done_rx: mpsc::Receiver<(TileKey, DecodedTile)>,
+    wakes: Arc<AtomicUsize>,
+}
+
+impl TestPipelineHarness {
+    fn spawn<F>(cfg: FetcherConfig, with_disk_cache: bool, max_level: u8, handler: F) -> Self
+    where
+        F: Fn(&str, usize) -> MockResponse + Send + Sync + 'static,
+    {
+        Self::spawn_with_decoder(
+            cfg,
+            with_disk_cache,
+            max_level,
+            handler,
+            |done_tx, wakeup| Arc::new(TestDecodeExecutor { done_tx, wakeup }),
+        )
+    }
+
+    fn spawn_with_decoder<F, D>(
+        cfg: FetcherConfig,
+        with_disk_cache: bool,
+        max_level: u8,
+        handler: F,
+        make_decoder: D,
+    ) -> Self
+    where
+        F: Fn(&str, usize) -> MockResponse + Send + Sync + 'static,
+        D: FnOnce(mpsc::Sender<(TileKey, DecodedTile)>, Wakeup) -> Arc<dyn TileDecodeExecutor>,
+    {
+        let server = spawn_mock_server(handler);
+        let spec = custom_spec(server.addr, max_level);
+        let store = with_disk_cache.then(|| Arc::new(MemBlobStore::default()));
+        let disk_cache = store
+            .as_ref()
+            .map(|s| Arc::clone(s) as Arc<dyn TileBlobStore>);
+        let (done_tx, done_rx) = mpsc::channel();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_c = Arc::clone(&wakes);
+        let wakeup: Wakeup = Arc::new(move || {
+            wakes_c.fetch_add(1, Ordering::AcqRel);
+        });
+        let decoder = make_decoder(done_tx, Arc::clone(&wakeup));
+        let pipeline =
+            LiveTilePipeline::spawn(cfg, disk_cache, decoder, wakeup).expect("spawn pipeline");
+        pipeline.set_active_spec(Some(spec.clone()));
+
+        Self {
+            pipeline: Some(pipeline),
+            server: Some(server),
+            spec,
+            store,
+            done_rx,
+            wakes,
+        }
+    }
+
+    fn pipeline(&self) -> &LiveTilePipeline {
+        self.pipeline.as_ref().expect("pipeline active")
+    }
+
+    fn server(&self) -> &MockServer {
+        self.server.as_ref().expect("server active")
+    }
+
+    fn store(&self) -> &Arc<MemBlobStore> {
+        self.store.as_ref().expect("disk cache enabled")
+    }
+
+    fn wm_key(&self, level: u8, x: u32, y: u32) -> TileKey {
+        self.spec.tile_key(QuadTileId {
+            scheme: PlanetaryScheme::WebMercator,
+            level,
+            x,
+            y,
+        })
+    }
+
+    fn shutdown_pipeline(&mut self) {
+        if let Some(pipeline) = self.pipeline.take() {
+            pipeline.shutdown();
+        }
+    }
+}
+
+impl Drop for TestPipelineHarness {
+    fn drop(&mut self) {
+        self.shutdown_pipeline();
+        if let Some(server) = self.server.take() {
+            server.shutdown();
+        }
+    }
+}
+
 #[test]
 fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() {
     let payload = make_valid_tile_bytes(1);
     let payload_c = payload.clone();
-    let server = spawn_mock_server(move |_, _| {
-        MockResponse::ok_tile(payload_c.clone(), Duration::from_millis(25))
-    });
-
-    let disk_cache: Arc<dyn TileBlobStore> = Arc::new(MemBlobStore::default());
-    let (done_tx, done_rx) = mpsc::channel();
-    let wakes = Arc::new(AtomicUsize::new(0));
-    let wakes_c = Arc::clone(&wakes);
-    let wakeup: Wakeup = Arc::new(move || {
-        wakes_c.fetch_add(1, Ordering::AcqRel);
-    });
-    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(TestDecodeExecutor {
-        done_tx,
-        wakeup: Arc::clone(&wakeup),
-    });
-
     let cfg = FetcherConfig {
         max_concurrent_per_host: 2,
         ..FetcherConfig::default()
     };
-    let pipeline = LiveTilePipeline::spawn(cfg, Some(Arc::clone(&disk_cache)), decoder, wakeup)
-        .expect("spawn pipeline");
+    let h = TestPipelineHarness::spawn(cfg, true, 2, move |_, _| {
+        MockResponse::ok_tile(payload_c.clone(), Duration::from_millis(25))
+    });
 
-    let spec = custom_spec(server.addr, 2);
-    pipeline.set_active_spec(Some(spec.clone()));
-
-    let valid_keys: Vec<TileKey> = (0..4u32)
-        .map(|x| {
-            spec.tile_key(QuadTileId {
-                scheme: PlanetaryScheme::WebMercator,
-                level: 2,
-                x,
-                y: 0,
-            })
-        })
-        .collect();
-    let forbidden_polar = spec.tile_key(QuadTileId {
+    let valid_keys: Vec<TileKey> = (0..4u32).map(|x| h.wm_key(2, x, 0)).collect();
+    let forbidden_polar = h.spec.tile_key(QuadTileId {
         scheme: PlanetaryScheme::PolarCap { north: true },
         level: 0,
         x: 0,
         y: 0,
     });
-    let forbidden_above_max = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 3,
-        x: 0,
-        y: 0,
-    });
+    let forbidden_above_max = h.wm_key(3, 0, 0);
 
     let mut wanted: HashSet<TileKey> = valid_keys.iter().copied().collect();
     wanted.insert(forbidden_polar);
     wanted.insert(forbidden_above_max);
-    pipeline.reconcile_wanted(&wanted, |_| false);
+    h.pipeline().reconcile_wanted(&wanted, |_| false);
 
     let mut received = HashMap::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while received.len() < 4 && Instant::now() < deadline {
-        if let Ok((k, tile)) = done_rx.recv_timeout(Duration::from_millis(100)) {
+        if let Ok((k, tile)) = h.done_rx.recv_timeout(Duration::from_millis(100)) {
             received.insert(k, tile);
         }
     }
@@ -311,60 +379,62 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
     for tile in received.values() {
         assert_eq!(tile.mip_level_count(), 4);
     }
-    assert_eq!(server.hits.load(Ordering::Acquire), 4);
+    assert_eq!(h.server().hits.load(Ordering::Acquire), 4);
     assert!(
-        server.max_concurrent.load(Ordering::Acquire) <= 2,
+        h.server().max_concurrent.load(Ordering::Acquire) <= 2,
         "exceeded per-host limit: {}",
-        server.max_concurrent.load(Ordering::Acquire)
+        h.server().max_concurrent.load(Ordering::Acquire)
     );
     let settle_deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < settle_deadline {
         let all_cached = valid_keys.iter().all(|k| {
-            disk_cache
-                .get(spec.cache_key(), k.quad_id().expect("quad"))
+            h.store()
+                .get(h.spec.cache_key(), k.quad_id().expect("quad"))
                 .ok()
                 .flatten()
                 .is_some()
         });
-        if wakes.load(Ordering::Acquire) >= 4
-            && pipeline.status().completed_from_net == 4
+        if h.wakes.load(Ordering::Acquire) >= 4
+            && h.pipeline().status().completed_from_net == 4
             && all_cached
         {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(wakes.load(Ordering::Acquire) >= 4);
-    assert_eq!(pipeline.status().completed_from_net, 4);
+    assert!(h.wakes.load(Ordering::Acquire) >= 4);
+    assert_eq!(h.pipeline().status().completed_from_net, 4);
 
-    let hits_before_cache = server.hits.load(Ordering::Acquire);
+    let hits_before_cache = h.server().hits.load(Ordering::Acquire);
     let single_wanted = HashSet::from([valid_keys[0]]);
-    pipeline.reconcile_wanted(&single_wanted, |_| false);
-    let (cached_key, cached_tile) = done_rx
+    h.pipeline().reconcile_wanted(&single_wanted, |_| false);
+    let (cached_key, cached_tile) = h
+        .done_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("receive disk-cached tile");
     assert_eq!(cached_key, valid_keys[0]);
     assert_eq!(cached_tile.mip_level_count(), 4);
     assert_eq!(
-        server.hits.load(Ordering::Acquire),
+        h.server().hits.load(Ordering::Acquire),
         hits_before_cache,
         "disk cache hit must trigger 0 HTTP requests"
     );
     let disk_deadline = Instant::now() + Duration::from_secs(2);
-    while pipeline.status().completed_from_disk < 1 && Instant::now() < disk_deadline {
+    while h.pipeline().status().completed_from_disk < 1 && Instant::now() < disk_deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(pipeline.status().completed_from_disk >= 1);
-
-    pipeline.shutdown();
-    server.shutdown();
+    assert!(h.pipeline().status().completed_from_disk >= 1);
 }
 
 #[test]
 fn corrupt_disk_blob_self_heals_from_http_and_cached_tiles_do_not_starve_behind_slow_http() {
     let payload = make_valid_tile_bytes(2);
     let payload_c = payload.clone();
-    let server = spawn_mock_server(move |path, _| {
+    let cfg = FetcherConfig {
+        max_concurrent_per_host: 1,
+        ..FetcherConfig::default()
+    };
+    let h = TestPipelineHarness::spawn(cfg, true, 2, move |path, _| {
         if path.contains("/2/1/0") {
             MockResponse::ok_tile(payload_c.clone(), Duration::from_secs(5))
         } else {
@@ -372,84 +442,49 @@ fn corrupt_disk_blob_self_heals_from_http_and_cached_tiles_do_not_starve_behind_
         }
     });
 
-    let store = Arc::new(MemBlobStore::default());
-    let spec = custom_spec(server.addr, 2);
+    let k_corrupt = h.wm_key(2, 0, 0);
+    let k_slow = h.wm_key(2, 1, 0);
+    let k_cached = h.wm_key(2, 2, 0);
 
-    let k_corrupt = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 2,
-        x: 0,
-        y: 0,
-    });
-    let k_slow = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 2,
-        x: 1,
-        y: 0,
-    });
-    let k_cached = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 2,
-        x: 2,
-        y: 0,
-    });
-
-    store
+    h.store()
         .put(
-            spec.cache_key(),
+            h.spec.cache_key(),
             k_corrupt.quad_id().expect("quad"),
             b"not-a-valid-tile",
         )
         .expect("seed corrupt");
-    store
+    h.store()
         .put(
-            spec.cache_key(),
+            h.spec.cache_key(),
             k_cached.quad_id().expect("quad"),
             &payload,
         )
         .expect("seed valid");
 
-    let (done_tx, done_rx) = mpsc::channel();
-    let wakeup: Wakeup = Arc::new(|| {});
-    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(TestDecodeExecutor {
-        done_tx,
-        wakeup: Arc::clone(&wakeup),
-    });
-    let cfg = FetcherConfig {
-        max_concurrent_per_host: 1,
-        ..FetcherConfig::default()
-    };
-    let pipeline = LiveTilePipeline::spawn(
-        cfg,
-        Some(Arc::clone(&store) as Arc<dyn TileBlobStore>),
-        decoder,
-        wakeup,
-    )
-    .expect("spawn pipeline");
-    pipeline.set_active_spec(Some(spec));
-
-    pipeline.reconcile_wanted(&HashSet::from([k_corrupt]), |_| false);
-    let (healed_key, _) = done_rx
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k_corrupt]), |_| false);
+    let (healed_key, _) = h
+        .done_rx
         .recv_timeout(Duration::from_secs(3))
         .expect("corrupt disk tile should self-heal from HTTP");
     assert_eq!(healed_key, k_corrupt);
 
-    pipeline.reconcile_wanted(&HashSet::from([k_slow]), |_| false);
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k_slow]), |_| false);
     let wait_slow = Instant::now() + Duration::from_secs(2);
-    while server.hits.load(Ordering::Acquire) < 2 && Instant::now() < wait_slow {
+    while h.server().hits.load(Ordering::Acquire) < 2 && Instant::now() < wait_slow {
         std::thread::sleep(Duration::from_millis(5));
     }
 
     let start = Instant::now();
-    pipeline.reconcile_wanted(&HashSet::from([k_slow, k_cached]), |_| false);
-    let (fast_key, _) = done_rx
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k_slow, k_cached]), |_| false);
+    let (fast_key, _) = h
+        .done_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("disk hit must not starve behind slow HTTP");
     assert_eq!(fast_key, k_cached);
     assert!(start.elapsed() < Duration::from_secs(1));
-
-    pipeline.shutdown();
-    server.shutdown();
 }
 
 #[test]
@@ -458,7 +493,12 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
     let payload_c = payload.clone();
     let flaky_hits = Arc::new(AtomicUsize::new(0));
     let flaky_c = Arc::clone(&flaky_hits);
-    let server = spawn_mock_server(move |path, _| {
+    let cfg = FetcherConfig {
+        max_concurrent_per_host: 4,
+        transient_retry_backoff: Duration::from_millis(80),
+        ..FetcherConfig::default()
+    };
+    let h = TestPipelineHarness::spawn(cfg, true, 2, move |path, _| {
         if path.contains("/1/0/0") {
             MockResponse {
                 status: 204,
@@ -490,132 +530,80 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
         }
     });
 
-    let store = Arc::new(MemBlobStore::default());
-    let (done_tx, done_rx) = mpsc::channel();
-    let wakeup: Wakeup = Arc::new(|| {});
-    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(TestDecodeExecutor {
-        done_tx,
-        wakeup: Arc::clone(&wakeup),
-    });
-    let cfg = FetcherConfig {
-        max_concurrent_per_host: 4,
-        transient_retry_backoff: Duration::from_millis(80),
-        ..FetcherConfig::default()
-    };
-    let pipeline = LiveTilePipeline::spawn(
-        cfg,
-        Some(Arc::clone(&store) as Arc<dyn TileBlobStore>),
-        decoder,
-        wakeup,
-    )
-    .expect("spawn pipeline");
-    let spec = custom_spec(server.addr, 2);
-    pipeline.set_active_spec(Some(spec.clone()));
+    let k_204 = h.wm_key(1, 0, 0);
+    let k_corrupt = h.wm_key(1, 1, 0);
+    let k_flaky = h.wm_key(1, 0, 1);
 
-    let k_204 = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 1,
-        x: 0,
-        y: 0,
-    });
-    let k_corrupt = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 1,
-        x: 1,
-        y: 0,
-    });
-    let k_flaky = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 1,
-        x: 0,
-        y: 1,
-    });
-
-    pipeline.reconcile_wanted(&HashSet::from([k_204]), |_| false);
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k_204]), |_| false);
     let d1 = Instant::now() + Duration::from_secs(2);
     while {
-        let st = pipeline.status();
-        (st.in_flight + st.queued > 0 || server.hits.load(Ordering::Acquire) < 1)
+        let st = h.pipeline().status();
+        (st.in_flight + st.queued > 0 || h.server().hits.load(Ordering::Acquire) < 1)
             && Instant::now() < d1
     } {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(pipeline.status().failed_count, 0);
-    assert!(pipeline.status().last_error.is_none());
-    let hits_after_204 = server.hits.load(Ordering::Acquire);
-    pipeline.reconcile_wanted(&HashSet::from([k_204]), |_| false);
+    assert_eq!(h.pipeline().status().failed_count, 0);
+    assert!(h.pipeline().status().last_error.is_none());
+    let hits_after_204 = h.server().hits.load(Ordering::Acquire);
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k_204]), |_| false);
     std::thread::sleep(Duration::from_millis(40));
-    assert_eq!(server.hits.load(Ordering::Acquire), hits_after_204);
+    assert_eq!(h.server().hits.load(Ordering::Acquire), hits_after_204);
 
-    pipeline.reconcile_wanted(&HashSet::from([k_corrupt]), |_| false);
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k_corrupt]), |_| false);
     let d2 = Instant::now() + Duration::from_secs(2);
-    while pipeline.status().failed_count == 0 && Instant::now() < d2 {
+    while h.pipeline().status().failed_count == 0 && Instant::now() < d2 {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(pipeline.status().failed_count, 1);
+    assert_eq!(h.pipeline().status().failed_count, 1);
     assert!(
-        store
-            .get(spec.cache_key(), k_corrupt.quad_id().expect("quad"))
+        h.store()
+            .get(h.spec.cache_key(), k_corrupt.quad_id().expect("quad"))
             .expect("get")
             .is_none()
     );
 
-    pipeline.reconcile_wanted(&HashSet::from([k_flaky]), |_| false);
-    let (retried_key, _) = done_rx
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k_flaky]), |_| false);
+    let (retried_key, _) = h
+        .done_rx
         .recv_timeout(Duration::from_secs(3))
         .expect("flaky tile must succeed on automatic idle backoff retry");
     assert_eq!(retried_key, k_flaky);
     assert_eq!(flaky_hits.load(Ordering::Acquire), 2);
 
-    pipeline.retry_failed();
-    assert_eq!(pipeline.status().failed_count, 0);
-    assert!(pipeline.status().last_error.is_none());
-
-    pipeline.shutdown();
-    server.shutdown();
+    h.pipeline().retry_failed();
+    assert_eq!(h.pipeline().status().failed_count, 0);
+    assert!(h.pipeline().status().last_error.is_none());
 }
 
 #[test]
 fn cancel_token_aborts_slow_inflight_request_promptly_on_shutdown() {
     let payload = make_valid_tile_bytes(4);
-    let server = spawn_mock_server(move |_, _| {
+    let mut h = TestPipelineHarness::spawn(FetcherConfig::default(), false, 1, move |_, _| {
         MockResponse::ok_tile(payload.clone(), Duration::from_secs(10))
     });
 
-    let (done_tx, _done_rx) = mpsc::channel();
-    let wakeup: Wakeup = Arc::new(|| {});
-    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(TestDecodeExecutor {
-        done_tx,
-        wakeup: Arc::clone(&wakeup),
-    });
-    let pipeline = LiveTilePipeline::spawn(FetcherConfig::default(), None, decoder, wakeup)
-        .expect("spawn pipeline");
-    let spec = custom_spec(server.addr, 1);
-    pipeline.set_active_spec(Some(spec.clone()));
-
-    let k0 = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 0,
-        x: 0,
-        y: 0,
-    });
-    pipeline.reconcile_wanted(&HashSet::from([k0]), |_| false);
+    let k0 = h.wm_key(0, 0, 0);
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k0]), |_| false);
 
     let wait_hit = Instant::now() + Duration::from_secs(2);
-    while server.hits.load(Ordering::Acquire) == 0 && Instant::now() < wait_hit {
+    while h.server().hits.load(Ordering::Acquire) == 0 && Instant::now() < wait_hit {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(server.hits.load(Ordering::Acquire), 1);
+    assert_eq!(h.server().hits.load(Ordering::Acquire), 1);
 
     let start = Instant::now();
-    pipeline.shutdown();
+    h.shutdown_pipeline();
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_millis(800),
         "shutdown should abort slow HTTP promptly, took {elapsed:?}"
     );
-
-    server.shutdown();
 }
 
 struct DropFirstDecodeExecutor {
@@ -637,37 +625,27 @@ impl TileDecodeExecutor for DropFirstDecodeExecutor {
 #[test]
 fn dropped_or_evicted_decode_request_requeues_instead_of_orphaning() {
     let payload = make_valid_tile_bytes(5);
-    let server =
-        spawn_mock_server(move |_, _| MockResponse::ok_tile(payload.clone(), Duration::ZERO));
-
-    let (done_tx, done_rx) = mpsc::channel();
-    let wakeup: Wakeup = Arc::new(|| {});
-    let decoder: Arc<dyn TileDecodeExecutor> = Arc::new(DropFirstDecodeExecutor {
-        dropped_once: AtomicUsize::new(0),
-        inner: TestDecodeExecutor {
-            done_tx,
-            wakeup: Arc::clone(&wakeup),
+    let h = TestPipelineHarness::spawn_with_decoder(
+        FetcherConfig::default(),
+        false,
+        1,
+        move |_, _| MockResponse::ok_tile(payload.clone(), Duration::ZERO),
+        |done_tx, wakeup| {
+            Arc::new(DropFirstDecodeExecutor {
+                dropped_once: AtomicUsize::new(0),
+                inner: TestDecodeExecutor { done_tx, wakeup },
+            })
         },
-    });
-    let pipeline = LiveTilePipeline::spawn(FetcherConfig::default(), None, decoder, wakeup)
-        .expect("spawn pipeline");
-    let spec = custom_spec(server.addr, 1);
-    pipeline.set_active_spec(Some(spec.clone()));
+    );
 
-    let k0 = spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 0,
-        x: 0,
-        y: 0,
-    });
-    pipeline.reconcile_wanted(&HashSet::from([k0]), |_| false);
+    let k0 = h.wm_key(0, 0, 0);
+    h.pipeline()
+        .reconcile_wanted(&HashSet::from([k0]), |_| false);
 
-    let (got_key, _) = done_rx
+    let (got_key, _) = h
+        .done_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("evicted decode must re-queue via backoff and complete");
     assert_eq!(got_key, k0);
-    assert_eq!(pipeline.status().failed_count, 0);
-
-    pipeline.shutdown();
-    server.shutdown();
+    assert_eq!(h.pipeline().status().failed_count, 0);
 }

@@ -309,5 +309,5 @@ impl Drop for TwoLaneDecodePool {
 }
 
 #[cfg(test)]
-#[path = "decode_pool_tests.rs"]
+#[path = "pool_tests.rs"]
 mod tests;

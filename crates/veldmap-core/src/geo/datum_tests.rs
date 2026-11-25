@@ -2,13 +2,7 @@ use glam::DVec3;
 
 use super::*;
 use crate::geo::geodesy::{Geodetic, WGS84};
-
-fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {
-    let lat = ((first.0 + second.0) / 2.0).to_radians();
-    let per_lat = 111_132.92 - 559.82 * (2.0 * lat).cos();
-    let per_lon = 111_412.84 * lat.cos() - 93.5 * (3.0 * lat).cos();
-    ((first.0 - second.0) * per_lat).hypot((first.1 - second.1) * per_lon)
-}
+use crate::geo::ground_m;
 
 #[test]
 fn helmert_coordinate_frame_and_position_vector_conventions_agree() {
@@ -124,4 +118,15 @@ fn known_geographic_epsg_keeps_4xxx_crs_codes_distinct_from_6xxx_datum_codes() {
     assert!(known_geographic_epsg(6326).is_none());
     assert!(known_geographic_epsg(6284).is_none());
     assert!(known_datum_from_code(6326).is_some());
+}
+
+#[test]
+fn to_towgs84_and_ellipsoid_from_epsg_preserve_conventions() {
+    // Pulkovo 1942 uses CoordinateFrame; exporting to PositionVector negates rotations.
+    assert_eq!(PULKOVO_1942.convention, HelmertConvention::CoordinateFrame);
+    let pv_params = PULKOVO_1942.to_towgs84();
+    assert_eq!(pv_params, [23.57, -140.95, -79.8, -0.0, 0.35, 0.79, -0.22]);
+    let roundtrip = Datum::from_towgs84(PULKOVO_1942.ellipsoid, pv_params);
+    assert_eq!(roundtrip.to_towgs84(), pv_params);
+    assert_eq!(ellipsoid_from_epsg(7001), Some(AIRY_1830));
 }

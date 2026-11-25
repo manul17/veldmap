@@ -42,7 +42,7 @@ impl TileBindGroupCache {
         }
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tile Rgba8UnormSrgb bind group"),
-            layout: &pipelines.tile_texture_layout,
+            layout: &pipelines.layouts.tile_texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,

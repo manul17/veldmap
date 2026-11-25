@@ -28,10 +28,9 @@ pub(crate) fn chunk_working_bytes(
 
 /// Cost of reading one tile at a pointwise level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Footprint {
+pub(super) struct Footprint {
     image: usize,
     region_pixels: u64,
-    pub(crate) held_pixels: u64,
 }
 
 /// Reduced overview IFD inside a multi-resolution source.
@@ -55,7 +54,7 @@ pub(crate) struct Grid {
 
 impl Grid {
     /// Return the chunk grid `(cw, ch)` for `image` (`0` = base IFD).
-    pub(crate) fn chunk_of(&self, image: usize) -> (u32, u32) {
+    pub(super) fn chunk_of(&self, image: usize) -> (u32, u32) {
         self.overviews
             .iter()
             .find(|o| o.image == image)
@@ -65,7 +64,7 @@ impl Grid {
     /// Choose the smallest overview covering `(level_width, level_height)`
     /// within the 1-pixel rounding tolerance between `ceil(side / 2^k)` and
     /// GDAL's `floor(side / 2)`.
-    pub(crate) fn source_for(
+    pub(super) fn source_for(
         &self,
         base: (u32, u32),
         level_width: u32,
@@ -89,7 +88,7 @@ impl Grid {
 
     /// Compute the pointwise reading footprint for `level`, or `None` when the
     /// level must be served via sequential pass.
-    pub(crate) fn footprint(
+    pub(super) fn footprint(
         &self,
         base: (u32, u32),
         level: u8,
@@ -132,7 +131,6 @@ impl Grid {
         Some(Footprint {
             image,
             region_pixels,
-            held_pixels,
         })
     }
 
@@ -144,7 +142,7 @@ impl Grid {
     /// Estimated per-operation working memory peak for an already-computed
     /// pointwise [`Footprint`] (`region + fresh chunk + output tile`; excludes
     /// the independent fixed-cap global [`super::chunk_cache::SharedChunkCache`]).
-    pub(crate) fn direct_peak_for_footprint(&self, fp: &Footprint) -> DecodePeak {
+    pub(super) fn direct_peak_for_footprint(&self, fp: &Footprint) -> DecodePeak {
         let tile = u64::from(RASTER_TILE_SIZE) * u64::from(RASTER_TILE_SIZE) * 4;
         DecodePeak::new()
             .with("region", fp.region_pixels.saturating_mul(4))
@@ -224,15 +222,15 @@ fn source_scale(base: (u32, u32), source: (u32, u32), level: u8) -> ((u128, u128
     )
 }
 
-pub(crate) struct Region {
-    pub(crate) sx0: u64,
-    pub(crate) sx1: u64,
-    pub(crate) sy0: u64,
-    pub(crate) sy1: u64,
-    pub(crate) window: Window,
+pub(super) struct Region {
+    pub(super) sx0: u64,
+    pub(super) sx1: u64,
+    pub(super) sy0: u64,
+    pub(super) sy1: u64,
+    pub(super) window: Window,
 }
 
-pub(crate) fn region_of(
+pub(super) fn region_of(
     (tx, ty): (u32, u32),
     (tw, th): (u32, u32),
     base: (u32, u32),

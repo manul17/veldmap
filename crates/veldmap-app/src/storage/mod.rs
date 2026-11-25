@@ -8,17 +8,18 @@
 //! `veldmap_core::sync::Wakeup` and `TileDiskCache::write_generation()`) so
 //! local/offline storage never depends on HTTP streaming.
 
+pub(crate) mod session;
+pub(crate) mod settings;
 mod worker;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use veldmap_core::sync::Wakeup;
-use veldmap_storage::{StoragePaths, TileDiskCache};
+use veldmap_storage::{StorageError, StoragePaths, TileDiskCache};
 
-use crate::session::AppSession;
-use crate::settings::AppSettings;
-
+use self::session::AppSession;
+use self::settings::AppSettings;
 use self::worker::DiskCacheWorker;
 pub(crate) use self::worker::{DiskCacheNotice, DiskCacheStatus};
 
@@ -26,8 +27,9 @@ pub(crate) use self::worker::{DiskCacheNotice, DiskCacheStatus};
 /// Settings window is open and new tiles are being written.
 const DISK_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Top-level application owner for platform paths, persisted [`AppSettings`],
-/// shared SQLite WAL [`TileDiskCache`], and asynchronous cache/settings I/O.
+/// Top-level application owner for platform paths, persisted [`AppSettings`]
+/// and [`AppSession`], shared SQLite WAL [`TileDiskCache`], and asynchronous
+/// cache/settings/session I/O.
 pub(crate) struct AppStorage {
     paths: Option<StoragePaths>,
     settings: AppSettings,
@@ -40,8 +42,9 @@ pub(crate) struct AppStorage {
 }
 
 impl AppStorage {
-    /// Load persisted user settings and open the shared SQLite WAL tile disk
-    /// cache under `paths` (or platform defaults when `None`).
+    /// Load persisted user settings and session state and open the shared
+    /// SQLite WAL tile disk cache under `paths` (or platform defaults when
+    /// `None`).
     pub(crate) fn open(wakeup: Wakeup, paths: Option<StoragePaths>) -> Self {
         let resolved_paths = paths.or_else(|| match StoragePaths::system_default() {
             Ok(p) => Some(p),
@@ -104,7 +107,7 @@ impl AppStorage {
     }
 
     /// Update and durably persist [`AppSession`] asynchronously when changed.
-    pub(crate) fn update_session(&mut self, mut next: AppSession) -> bool {
+    fn update_session(&mut self, mut next: AppSession) -> bool {
         next.normalize();
         if next == self.session {
             return false;
@@ -121,17 +124,30 @@ impl AppStorage {
         self.update_session(next)
     }
 
-    fn save_session(&self) {
+    fn persist_with_fallback(
+        &self,
+        label: &str,
+        try_enqueue: impl FnOnce(&DiskCacheWorker) -> bool,
+        save_direct: impl FnOnce(&StoragePaths) -> Result<(), StorageError>,
+    ) {
         if let Some(worker) = &self.disk_worker
-            && worker.request_save_session(self.session.clone())
+            && try_enqueue(worker)
         {
             return;
         }
         if let Some(paths) = &self.paths
-            && let Err(err) = self.session.save(paths)
+            && let Err(err) = save_direct(paths)
         {
-            tracing::warn!(error = %err, "Failed to persist session");
+            tracing::warn!(error = %err, "Failed to persist {label}");
         }
+    }
+
+    fn save_session(&self) {
+        self.persist_with_fallback(
+            "session",
+            |worker| worker.request_save_session(self.session.clone()),
+            |paths| self.session.save(paths),
+        );
     }
 
     pub(crate) fn disk_cache(&self) -> Option<Arc<TileDiskCache>> {
@@ -172,16 +188,11 @@ impl AppStorage {
     /// [`worker::DiskCacheWorker`], falling back to direct write only if the
     /// worker is unavailable.
     fn save_settings(&self) {
-        if let Some(worker) = &self.disk_worker
-            && worker.request_save_settings(self.settings.clone())
-        {
-            return;
-        }
-        if let Some(paths) = &self.paths
-            && let Err(err) = self.settings.save(paths)
-        {
-            tracing::warn!(error = %err, "Failed to persist user settings");
-        }
+        self.persist_with_fallback(
+            "user settings",
+            |worker| worker.request_save_settings(self.settings.clone()),
+            |paths| self.settings.save(paths),
+        );
     }
 
     /// Cached off-UI-thread disk cache status & stats snapshot (zero SQLite
@@ -251,8 +262,8 @@ impl AppStorage {
     }
 
     /// Phase 2 of deterministic shutdown: join the maintenance worker thread
-    /// cleanly so pending `SaveSettings` writes flush and the final
-    /// `Arc<TileDiskCache>` flushes touches on drop.
+    /// cleanly so pending `SaveSettings` and `SaveSession` writes flush and
+    /// the final `Arc<TileDiskCache>` flushes touches on drop.
     pub(crate) fn finish_shutdown(&mut self) {
         if let Some(worker) = &mut self.disk_worker {
             worker.join();

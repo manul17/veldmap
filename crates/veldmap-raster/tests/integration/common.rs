@@ -1,13 +1,147 @@
 //! Shared synthetic TIFF/COG fixture builders for `veldmap-raster` integration tests.
 
-use std::io::Cursor;
+use std::io::{Cursor, Seek, Write};
 
-use ::tiff::encoder::{TiffEncoder, colortype};
+use ::tiff::encoder::{
+    DirectoryEncoder, TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard, colortype,
+};
 use ::tiff::tags::Tag;
 use veldmap_core::tile::{
     DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, level_size,
 };
 use veldmap_raster::generate_linear_mipmaps;
+
+/// Core TIFF IFD tags shared across synthetic test fixtures.
+pub struct TiffIfdHeader<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub bits_per_sample: &'a [u16],
+    pub compression: u16,
+    pub photometric: u16,
+    pub samples_per_pixel: u16,
+    pub planar_configuration: u16,
+    pub sample_format: Option<u16>,
+    pub is_overview: bool,
+}
+
+impl TiffIfdHeader<'static> {
+    pub const fn rgb8(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            bits_per_sample: &[8, 8, 8],
+            compression: 1,
+            photometric: 2,
+            samples_per_pixel: 3,
+            planar_configuration: 1,
+            sample_format: None,
+            is_overview: false,
+        }
+    }
+
+    pub const fn gray8(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            bits_per_sample: &[8],
+            compression: 1,
+            photometric: 1,
+            samples_per_pixel: 1,
+            planar_configuration: 1,
+            sample_format: None,
+            is_overview: false,
+        }
+    }
+}
+
+pub fn write_ifd_header<W: Write + Seek, K: TiffKind>(
+    dir: &mut DirectoryEncoder<'_, W, K>,
+    header: &TiffIfdHeader<'_>,
+) {
+    if header.is_overview {
+        dir.write_tag(Tag::NewSubfileType, 1u32).expect("subfile");
+    }
+    dir.write_tag(Tag::ImageWidth, header.width).expect("width");
+    dir.write_tag(Tag::ImageLength, header.height)
+        .expect("height");
+    if header.bits_per_sample.len() == 1 {
+        dir.write_tag(Tag::BitsPerSample, header.bits_per_sample[0])
+            .expect("bps");
+    } else {
+        dir.write_tag(Tag::BitsPerSample, header.bits_per_sample)
+            .expect("bps");
+    }
+    if let Some(fmt) = header.sample_format {
+        dir.write_tag(Tag::SampleFormat, fmt)
+            .expect("sample format");
+    }
+    dir.write_tag(Tag::Compression, header.compression)
+        .expect("compression");
+    dir.write_tag(Tag::PhotometricInterpretation, header.photometric)
+        .expect("photometric");
+    dir.write_tag(Tag::SamplesPerPixel, header.samples_per_pixel)
+        .expect("spp");
+    dir.write_tag(Tag::PlanarConfiguration, header.planar_configuration)
+        .expect("planar");
+}
+
+pub fn write_single_strip_u32<W: Write + Seek>(
+    dir: &mut DirectoryEncoder<'_, W, TiffKindStandard>,
+    rows_per_strip: u32,
+    payload: &[u8],
+) {
+    dir.write_tag(Tag::RowsPerStrip, rows_per_strip)
+        .expect("rows");
+    let at = dir.write_data(payload).expect("write strip");
+    dir.write_tag(Tag::StripOffsets, &[at as u32][..])
+        .expect("strip offsets");
+    dir.write_tag(Tag::StripByteCounts, &[payload.len() as u32][..])
+        .expect("strip counts");
+}
+
+pub fn write_single_strip_u64<W: Write + Seek>(
+    dir: &mut DirectoryEncoder<'_, W, TiffKindBig>,
+    rows_per_strip: u32,
+    payload: &[u8],
+) {
+    dir.write_tag(Tag::RowsPerStrip, rows_per_strip)
+        .expect("rows");
+    let at = dir.write_data(payload).expect("write strip");
+    dir.write_tag(Tag::StripOffsets, &[at][..])
+        .expect("strip offsets");
+    dir.write_tag(Tag::StripByteCounts, &[payload.len() as u64][..])
+        .expect("strip counts");
+}
+
+pub fn write_tile_grid_u32<W: Write + Seek>(
+    dir: &mut DirectoryEncoder<'_, W, TiffKindStandard>,
+    tile_w: u32,
+    tile_h: u32,
+    tiles_x: u32,
+    tiles_y: u32,
+    mut make_tile: impl FnMut(u32, u32) -> Vec<u8>,
+) -> Vec<(u64, u64)> {
+    dir.write_tag(Tag::TileWidth, tile_w).expect("tile width");
+    dir.write_tag(Tag::TileLength, tile_h).expect("tile height");
+    let total = (tiles_x * tiles_y) as usize;
+    let mut offsets = Vec::with_capacity(total);
+    let mut counts = Vec::with_capacity(total);
+    let mut ranges = Vec::with_capacity(total);
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
+            let tile = make_tile(tx, ty);
+            let at = dir.write_data(&tile[..]).expect("write tile");
+            offsets.push(at as u32);
+            counts.push(tile.len() as u32);
+            ranges.push((at, tile.len() as u64));
+        }
+    }
+    dir.write_tag(Tag::TileOffsets, &offsets[..])
+        .expect("tile offsets");
+    dir.write_tag(Tag::TileByteCounts, &counts[..])
+        .expect("tile counts");
+    ranges
+}
 
 pub fn fake_fingerprint(bytes: &[u8]) -> SourceFingerprint {
     let mut digest = [0u8; 32];
@@ -85,40 +219,22 @@ pub fn build_tiled_cog(
 
         for level in 0..=levels {
             let mut dir = encoder.image_directory().expect("image_directory");
-            if level > 0 {
-                dir.write_tag(Tag::NewSubfileType, 1u32).expect("subfile");
-            }
-            dir.write_tag(Tag::ImageWidth, w).expect("width");
-            dir.write_tag(Tag::ImageLength, h).expect("height");
-            dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-                .expect("bps");
-            dir.write_tag(Tag::Compression, 1u16).expect("compression");
-            dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-                .expect("photometric");
-            dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("spp");
-            dir.write_tag(Tag::PlanarConfiguration, 1u16)
-                .expect("planar");
-            dir.write_tag(Tag::TileWidth, RASTER_TILE_SIZE).expect("tw");
-            dir.write_tag(Tag::TileLength, RASTER_TILE_SIZE)
-                .expect("th");
+            let mut header = TiffIfdHeader::rgb8(w, h);
+            header.is_overview = level > 0;
+            write_ifd_header(&mut dir, &header);
 
             let (across, down) = (w.div_ceil(RASTER_TILE_SIZE), h.div_ceil(RASTER_TILE_SIZE));
-            let mut offsets = Vec::new();
-            let mut counts = Vec::new();
-            for ty in 0..down {
-                for tx in 0..across {
-                    let tile = tile_bytes(&rgb, w, h, tx, ty);
-                    let at = dir.write_data(&tile[..]).expect("write tile");
-                    offsets.push(at as u32);
-                    counts.push(tile.len() as u32);
-                    if level == 0 {
-                        base_tiles.push((at, tile.len() as u64));
-                    }
-                }
+            let ranges = write_tile_grid_u32(
+                &mut dir,
+                RASTER_TILE_SIZE,
+                RASTER_TILE_SIZE,
+                across,
+                down,
+                |tx, ty| tile_bytes(&rgb, w, h, tx, ty),
+            );
+            if level == 0 {
+                base_tiles = ranges;
             }
-            dir.write_tag(Tag::TileOffsets, &offsets[..]).expect("offs");
-            dir.write_tag(Tag::TileByteCounts, &counts[..])
-                .expect("cnts");
             let finish = dir.finish_with_offsets().expect("finish ifd");
             ifds.push(u64::from(finish.offset));
 
@@ -154,32 +270,17 @@ pub fn build_multi_tile_tiff(tiles_x: u32, tiles_y: u32, chunk_side: u32) -> Vec
     {
         let mut enc = TiffEncoder::new(&mut file).expect("enc");
         let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, width).expect("tag");
-        dir.write_tag(Tag::ImageLength, height).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-            .expect("tag");
-        dir.write_tag(Tag::Compression, 1u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-        dir.write_tag(Tag::TileWidth, chunk_side).expect("tag");
-        dir.write_tag(Tag::TileLength, chunk_side).expect("tag");
+        write_ifd_header(&mut dir, &TiffIfdHeader::rgb8(width, height));
 
         let chunk_bytes = (chunk_side * chunk_side * 3) as usize;
-        let mut offsets = Vec::new();
-        let mut counts = Vec::new();
-        for ty in 0..tiles_y {
-            for tx in 0..tiles_x {
-                let pattern = vec![((tx * 37 + ty * 17) & 0xFF) as u8; chunk_bytes];
-                let at = dir.write_data(&pattern[..]).expect("write");
-                offsets.push(at as u32);
-                counts.push(pattern.len() as u32);
-            }
-        }
-        dir.write_tag(Tag::TileOffsets, &offsets[..]).expect("tag");
-        dir.write_tag(Tag::TileByteCounts, &counts[..])
-            .expect("tag");
+        let _ = write_tile_grid_u32(
+            &mut dir,
+            chunk_side,
+            chunk_side,
+            tiles_x,
+            tiles_y,
+            |tx, ty| vec![((tx * 37 + ty * 17) & 0xFF) as u8; chunk_bytes],
+        );
         dir.finish().expect("finish");
     }
     file.into_inner()

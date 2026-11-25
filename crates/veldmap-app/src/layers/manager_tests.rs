@@ -1,14 +1,11 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use tiff::encoder::TiffEncoder;
-use tiff::tags::Tag;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{RASTER_TILE_SIZE, level_count};
+use veldmap_raster::test_support::write_tiled_geotiff_cog;
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 use veldmap_storage::test_support::TestTempDir;
@@ -17,75 +14,6 @@ use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 use crate::layers::{
     CursorReadout, CursorReadoutValue, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
 };
-
-/// Write a real multi-level tiled GeoTIFF COG (`width x height`, 512x512 tiles,
-/// `EPSG:32637`) to `path` filled with `rgb`.
-fn write_tiled_geotiff_cog(path: &Path, width: u32, height: u32, rgb: [u8; 3]) {
-    let tile = RASTER_TILE_SIZE;
-    let mut file = std::fs::File::create(path).expect("create geotiff");
-    let mut enc = TiffEncoder::new(&mut file).expect("tiff encoder");
-
-    let write_level = |enc: &mut TiffEncoder<&mut std::fs::File>, w: u32, h: u32, is_base: bool| {
-        let mut dir = enc.image_directory().expect("dir");
-        dir.write_tag(Tag::ImageWidth, w).expect("tag");
-        dir.write_tag(Tag::ImageLength, h).expect("tag");
-        dir.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-            .expect("tag");
-        dir.write_tag(Tag::Compression, 1u16).expect("tag");
-        dir.write_tag(Tag::PhotometricInterpretation, 2u16)
-            .expect("tag");
-        dir.write_tag(Tag::SamplesPerPixel, 3u16).expect("tag");
-        dir.write_tag(Tag::PlanarConfiguration, 1u16).expect("tag");
-        dir.write_tag(Tag::TileWidth, tile).expect("tag");
-        dir.write_tag(Tag::TileLength, tile).expect("tag");
-        if !is_base {
-            dir.write_tag(Tag::NewSubfileType, 1u32).expect("tag");
-        }
-        let cols = w.div_ceil(tile);
-        let rows = h.div_ceil(tile);
-        let mut tile_bytes = Vec::with_capacity((tile * tile * 3) as usize);
-        for _ in 0..(tile * tile) {
-            tile_bytes.extend_from_slice(&rgb);
-        }
-        let mut offsets = Vec::with_capacity((cols * rows) as usize);
-        let mut counts = Vec::with_capacity((cols * rows) as usize);
-        for _ in 0..(cols * rows) {
-            let at = dir.write_data(&tile_bytes[..]).expect("write tile");
-            offsets.push(at as u32);
-            counts.push(tile_bytes.len() as u32);
-        }
-        dir.write_tag(Tag::TileOffsets, &offsets[..]).expect("tag");
-        dir.write_tag(Tag::TileByteCounts, &counts[..])
-            .expect("tag");
-        if is_base {
-            let geokeys: [u16; 16] = [
-                1, 1, 0, 3, // header
-                1024, 0, 1, 1, // Projected
-                1025, 0, 1, 1, // PixelIsArea
-                3072, 0, 1, 32637, // EPSG:32637
-            ];
-            dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-                .expect("tag");
-            dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
-                .expect("tag");
-            dir.write_tag(
-                Tag::ModelTiepointTag,
-                &[0.0_f64, 0.0, 0.0, 500_000.0, 5_250_000.0, 0.0][..],
-            )
-            .expect("tag");
-        }
-        dir.finish().expect("finish dir");
-    };
-
-    let levels = level_count(width, height);
-    let mut cur_w = width;
-    let mut cur_h = height;
-    for idx in 0..levels {
-        write_level(&mut enc, cur_w, cur_h, idx == 0);
-        cur_w = cur_w.div_ceil(2);
-        cur_h = cur_h.div_ceil(2);
-    }
-}
 
 fn wait_for_io_event(mgr: &mut OverlayManager) -> OverlayIoEvent {
     let start = Instant::now();
@@ -118,7 +46,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
  {
     let dir = TestTempDir::new("cog-lifecycle");
     let tif_path = dir.path().join("scene_2048.tif");
-    write_tiled_geotiff_cog(&tif_path, 2048, 2048, [42, 128, 210]);
+    write_tiled_geotiff_cog(&tif_path, 2048, 2048, [42, 128, 210]).expect("write geotiff");
 
     let disk_cache = Arc::new(
         TileDiskCache::open(dir.path().join("tiles.sqlite"), 32 * 1024 * 1024).expect("disk cache"),
@@ -177,7 +105,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         carrier_keys: &mut carriers,
     });
     let layer = &mgr.stack.layers()[0];
-    assert_eq!(layer.meta.max_level(), 2);
+    assert_eq!(layer.meta().max_level(), 2);
     let has_lvl2 = layer.wanted().iter().any(|k| k.level == 2);
     let has_lvl1 = layer.wanted().iter().any(|k| k.level == 1);
     let has_lvl0 = layer.wanted().iter().any(|k| k.level == 0);
@@ -212,7 +140,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
 
     // 4. Reload bypass cache after modifying the TIFF on disk: clears old QOI
     //    cache off-UI-thread, switches to new RGB [200, 50, 10], and preserves visibility.
-    write_tiled_geotiff_cog(&tif_path, 2048, 2048, [200, 50, 10]);
+    write_tiled_geotiff_cog(&tif_path, 2048, 2048, [200, 50, 10]).expect("rewrite geotiff");
     let reload_mut = mgr
         .begin_reload_bypass_cache(layer_id)
         .expect("queue reload");

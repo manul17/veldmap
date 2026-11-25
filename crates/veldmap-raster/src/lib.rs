@@ -41,6 +41,9 @@ pub use pool::{
 pub use sidecar::{SidecarGeoref, load_sidecar_georef_with, parse_prj_text, parse_world_file};
 pub use tiff::{MAX_IFDS, TiffSource, has_tiff_magic};
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 /// Map a `std::io::Error` produced by a decoder reading from
 /// [`veldmap_core::io::BufferedByteReader`] back into [`RasterError::Cancelled`]
 /// or [`RasterError::Io`], preserving structured core I/O errors.

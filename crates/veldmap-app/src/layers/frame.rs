@@ -29,21 +29,21 @@ pub(super) struct LayerFrameCtx<'a> {
 
 /// Select the finest fitting pyramid rung whose visible cells fit within
 /// `cap_tiles`, returning `(target_level, visible_cells)`.
-pub(super) fn select_target_rung(
+fn select_target_rung(
     layer: &mut OverlayLayer,
     sharpest: u8,
     cap_tiles: usize,
     frustum: &CullFrustum,
 ) -> (u8, Vec<(u32, u32)>) {
-    let max_level = layer.meta.max_level();
+    let max_level = layer.meta().max_level();
     let finest = layer
-        .meta
+        .meta()
         .finest_fitting_level()
         .map_or(max_level, |fit| sharpest.max(fit));
 
     let mut level = finest.min(max_level);
     loop {
-        let cells = layer.cull.visible_cells(&layer.frame, level, frustum);
+        let cells = layer.visible_cells(level, frustum);
         if cells.len() <= cap_tiles || level >= max_level {
             return (level, cells);
         }
@@ -63,28 +63,28 @@ pub(super) fn build_and_schedule_layer(
         return None;
     }
 
-    let desc = layer.source.description();
+    let desc = layer.source().description();
     let (img_w, img_h) = (desc.width, desc.height);
-    let max_level = layer.meta.max_level();
+    let max_level = layer.meta().max_level();
 
     let weight = layer.appetite_weight_bytes();
     let appetite_bytes = ctx
         .gpu_cache
         .proportional_pyramid_byte_cap(weight, ctx.total_appetite_weight);
-    let cap_tiles = (appetite_bytes / layer.observed_tile_bytes.max(1)).max(1);
+    let cap_tiles = (appetite_bytes / layer.observed_tile_bytes().max(1)).max(1);
 
     let sharpest = layer
-        .frame
+        .frame()
         .sharpest_level(img_w, img_h, ctx.viewport_mpp, max_level);
     let (target_level, target_cells) = select_target_rung(layer, sharpest, cap_tiles, ctx.frustum);
 
-    let ladder = layer.meta.ladder(target_level);
+    let ladder = layer.meta().ladder(target_level);
     let mut ladder_cells: Vec<(u8, Vec<(u32, u32)>)> = Vec::with_capacity(ladder.len());
     for &rung in &ladder {
         let cells = if rung == target_level {
             target_cells.clone()
         } else {
-            layer.cull.visible_cells(&layer.frame, rung, ctx.frustum)
+            layer.visible_cells(rung, ctx.frustum)
         };
         ladder_cells.push((rung, cells));
     }
@@ -99,7 +99,7 @@ pub(super) fn build_and_schedule_layer(
         ctx.pending,
     );
 
-    let segments = level_segments(&layer.frame, img_w, img_h, target_level);
+    let segments = level_segments(layer.frame(), img_w, img_h, target_level);
     let patches = build_draw_patches(
         layer,
         img_w,
@@ -121,8 +121,8 @@ pub(super) fn build_and_schedule_layer(
     }
 
     (!patches.is_empty()).then(|| DrawOverlayLayer {
-        opacity: layer.opacity,
-        frame: Arc::clone(&layer.frame),
+        opacity: layer.opacity(),
+        frame: Arc::clone(layer.frame()),
         image_width: img_w,
         image_height: img_h,
         segments,
@@ -139,7 +139,7 @@ fn update_wanted_and_reconcile(
     gpu_cache: &GpuTileCache,
     pending: &PendingUploads,
 ) {
-    let max_level = layer.meta.max_level();
+    let max_level = layer.meta().max_level();
     // Populate `layer.wanted` with apex root tiles AND visible cells across ALL
     // ladder rungs so `PendingUploads` never prunes intermediate coarse rungs
     // during progressive refinement.
@@ -154,17 +154,17 @@ fn update_wanted_and_reconcile(
     );
     for ry in 0..top_h {
         for rx in 0..top_w {
-            next_wanted.push(layer.meta.tile_key(max_level, rx, ry));
+            next_wanted.push(layer.meta().tile_key(max_level, rx, ry));
         }
     }
     for (rung, cells) in ladder_cells {
         for &(x, y) in cells {
-            next_wanted.push(layer.meta.tile_key(*rung, x, y));
+            next_wanted.push(layer.meta().tile_key(*rung, x, y));
         }
     }
     layer.replace_wanted(next_wanted);
 
-    runtime.reconcile_pointwise_stream(layer.meta.pass_key(), layer.wanted(), gpu_cache, pending);
+    runtime.reconcile_pointwise_stream(layer.meta().pass_key(), layer.wanted(), gpu_cache, pending);
 }
 
 fn build_draw_patches(
@@ -178,7 +178,7 @@ fn build_draw_patches(
 ) -> Vec<DrawOverlayPatch> {
     let mut patches = Vec::with_capacity(target_cells.len());
     for &(x, y) in target_cells {
-        let want_key = layer.meta.tile_key(target_level, x, y);
+        let want_key = layer.meta().tile_key(target_level, x, y);
         let Some((carrier_key, gpu_tile)) = gpu_cache.find_carrier(&want_key) else {
             continue;
         };
@@ -199,7 +199,7 @@ fn build_draw_patches(
         patches.push(DrawOverlayPatch {
             mesh_key: OverlayMeshKey {
                 source: layer.source_id(),
-                relaid: layer.relaid,
+                relaid: layer.relaid(),
                 level: target_level,
                 x,
                 y,

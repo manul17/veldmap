@@ -12,19 +12,26 @@ static NEXT_TILE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Immutable GPU-resident tile resource.
 pub struct GpuTile {
-    pub texture: wgpu::Texture,
-    pub view: wgpu::TextureView,
-    pub format: PixelFormat,
-    pub width: u32,
-    pub height: u32,
+    _texture: wgpu::Texture,
+    pub(crate) view: wgpu::TextureView,
+    pub(crate) format: PixelFormat,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// Valid interior pixel width excluding gutters (`valid_w + 2*gutter <= width`).
-    pub valid_w: u32,
+    pub(crate) valid_w: u32,
     /// Valid interior pixel height excluding gutters (`valid_h + 2*gutter <= height`).
-    pub valid_h: u32,
+    pub(crate) valid_h: u32,
     /// Border gutter width in texels (`0` for standard tiles, `1` for DEM tiles).
-    pub gutter: u8,
-    pub byte_size: usize,
-    pub tile_id: u64,
+    pub(crate) gutter: u8,
+    pub(crate) byte_size: usize,
+    pub(crate) tile_id: u64,
+}
+
+impl GpuTile {
+    /// Pixel width of the uploaded GPU texture.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
 }
 
 impl std::fmt::Debug for GpuTile {
@@ -92,7 +99,7 @@ impl GpuTileCache {
     }
 
     /// Read-only check whether `key` or any coarser ancestor carrier is cached.
-    pub fn has_carrier(&self, key: &TileKey) -> bool {
+    pub(crate) fn has_carrier(&self, key: &TileKey) -> bool {
         self.cache.has_carrier(key)
     }
 
@@ -113,7 +120,11 @@ impl GpuTileCache {
 
     /// Proportional byte appetite cap for one weighted pyramid (`< 50%`
     /// combined ceiling across heterogeneous multi-band stacks).
-    pub fn proportional_pyramid_byte_cap(&self, pyramid_weight: u64, total_weight: u64) -> usize {
+    pub(crate) fn proportional_pyramid_byte_cap(
+        &self,
+        pyramid_weight: u64,
+        total_weight: u64,
+    ) -> usize {
         self.cache
             .proportional_pyramid_byte_cap(pyramid_weight, total_weight)
     }
@@ -129,7 +140,7 @@ impl GpuTileCache {
     /// Resolve the finest cached tile covering `key` (exact or nearest coarser
     /// ancestor) together with its unguttered power-of-two UV sub-rectangle,
     /// touching the carrier and all cached ancestors up to the root.
-    pub fn carrier(&mut self, key: &TileKey) -> Option<(TileKey, [f32; 4], Arc<GpuTile>)> {
+    pub(crate) fn carrier(&mut self, key: &TileKey) -> Option<(TileKey, [f32; 4], Arc<GpuTile>)> {
         let (carrier_key, uv, tile) = self.cache.carrier(key)?;
         Some((carrier_key, uv, Arc::clone(tile)))
     }
@@ -205,7 +216,7 @@ impl GpuTileCache {
         };
         let tile_id = NEXT_TILE_ID.fetch_add(1, Ordering::Relaxed);
         let tile = Arc::new(GpuTile {
-            texture,
+            _texture: texture,
             view,
             format: decoded.format(),
             width: decoded.width(),

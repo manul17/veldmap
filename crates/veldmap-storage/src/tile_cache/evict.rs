@@ -3,7 +3,6 @@
 
 use rusqlite::{Connection, Transaction};
 
-use super::EvictionReport;
 use super::queries::{delete_meta_ids, select_evict_batch, set_cache_meta_totals};
 
 /// Eviction headroom divisor (`10` => evict down to `90%` of budget so
@@ -27,11 +26,6 @@ pub(super) fn reclaim_space(conn: &Connection, full_vacuum: bool) {
     }
 }
 
-pub(super) struct EvictionOutcome {
-    pub(super) report: EvictionReport,
-    pub(super) evicted_ids: Vec<i64>,
-}
-
 pub(super) fn evict_in_tx(
     tx: &Transaction<'_>,
     mut total_bytes: u64,
@@ -39,17 +33,12 @@ pub(super) fn evict_in_tx(
     max_bytes: u64,
     protect_id: Option<i64>,
     batch_start_ts: Option<i64>,
-) -> Result<EvictionOutcome, rusqlite::Error> {
+) -> Result<Vec<i64>, rusqlite::Error> {
     if total_bytes <= max_bytes {
-        return Ok(EvictionOutcome {
-            report: EvictionReport::unchanged(total_bytes),
-            evicted_ids: Vec::new(),
-        });
+        return Ok(Vec::new());
     }
 
     let target = max_bytes.saturating_sub(max_bytes / EVICT_HEADROOM_DIVISOR);
-    let mut evicted_tiles = 0usize;
-    let mut evicted_bytes = 0u64;
     let mut evicted_ids = Vec::new();
 
     while total_bytes > target {
@@ -77,26 +66,17 @@ pub(super) fn evict_in_tx(
             evicted_ids.push(tile_id);
             total_bytes = total_bytes.saturating_sub(sz);
             tile_count = tile_count.saturating_sub(1);
-            evicted_bytes = evicted_bytes.saturating_add(sz);
-            evicted_tiles += 1;
         }
-        if to_delete.is_empty() || stopped_at_batch_boundary {
-            if !to_delete.is_empty() {
-                delete_meta_ids(tx, &to_delete)?;
-            }
+        if to_delete.is_empty() {
             break;
         }
         delete_meta_ids(tx, &to_delete)?;
+        if stopped_at_batch_boundary {
+            break;
+        }
     }
 
     set_cache_meta_totals(tx, total_bytes, tile_count)?;
 
-    Ok(EvictionOutcome {
-        report: EvictionReport {
-            evicted_tiles,
-            evicted_bytes,
-            total_bytes_after: total_bytes,
-        },
-        evicted_ids,
-    })
+    Ok(evicted_ids)
 }

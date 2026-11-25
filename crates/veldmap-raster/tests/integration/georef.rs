@@ -1,23 +1,32 @@
 //! Integration tests for GeoTIFF user-defined GeoKeys (`3072 == 32767`,
 //! `3076` feet, `3081` origin lat, `2062` TOWGS84, polar stereographic,
-//! spherical ellipsoids, LCC 1SP/2SP), foreign-datum geographic GeoTIFF datum
+//! spherical ellipsoids, LCC 1SP/2SP), BigTIFF `GeoDoubleParamsTag` /
+//! `GeoAsciiParamsTag` / `ModelTransformationTag`, `PixelIsArea` vs.
+//! `PixelIsPoint` warp-mesh placement, foreign-datum geographic GeoTIFF datum
 //! shifts, and `.prj`-only sidecar binding.
 
+use std::io::Cursor;
 use std::sync::Arc;
 
-use veldmap_core::budget::MemoryBudget;
+use ::tiff::encoder::TiffEncoder;
+use ::tiff::tags::Tag;
+use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::geo::{
-    CrsSpec, DatumWarning, KRASOVSKY, PULKOVO_1942, Projection, US_SURVEY_FOOT_M,
+    CrsSpec, DatumWarning, Geodetic, KRASOVSKY, PULKOVO_1942, Projection, US_SURVEY_FOOT_M, WGS84,
 };
 use veldmap_core::io::ByteSource;
 use veldmap_core::io::testing::MemoryByteSource;
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::SourceFingerprint;
+use veldmap_core::tile::{MIN_WARP_SEGMENTS, SourceFingerprint, build_warp_patch};
 use veldmap_raster::{
-    PlacementCrs, RasterSource, SidecarGeoref, TiffSource, frame_from_description,
+    DecodeContext, PlacementCrs, RasterError, RasterSource, SharedChunkCache, SidecarGeoref,
+    TiffSource, frame_from_description, has_tiff_magic,
 };
 
-use crate::common::{build_rgb_4x4_tiff, tag_f64_vec, tag_u16_vec};
+use crate::common::{
+    TiffIfdHeader, build_rgb_4x4_tiff, build_tiled_cog, fake_fingerprint, rgb_pattern, tag_f64_vec,
+    tag_u16_vec, write_ifd_header, write_single_strip_u32, write_single_strip_u64,
+};
 
 #[test]
 fn geotiff_user_defined_32767_tm_feet_origin_lat_and_foreign_datum_shift() {
@@ -396,4 +405,299 @@ fn user_defined_geotiff_handles_false_origin_lcc_1sp_2sp_and_2048_32767_datum_fa
     let frame_prj = frame_from_description(tiff_prj_only.description()).expect("binds via .prj");
     let (lat_p, lon_p) = frame_prj.geodetic(0.0, 0.0);
     assert!((lat_p - 47.22).abs() < 0.05 && (lon_p - 39.0).abs() < 0.05);
+}
+
+#[test]
+fn decodes_bigtiff_with_geodouble_geoascii_pixel_is_point_and_model_transformation() {
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
+    // BigTIFF + user-defined TM CRS using GeoDoubleParamsTag + GeoAsciiParamsTag +
+    // PixelIsPoint + ModelTransformationTag.
+    let mut big_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new_big(&mut big_buf).expect("bigtiff encoder");
+        let mut dir = enc.image_directory().expect("bigtiff dir");
+        write_ifd_header(&mut dir, &TiffIfdHeader::rgb8(8, 8));
+        let data = rgb_pattern(8, 8);
+        write_single_strip_u64(&mut dir, 8, &data);
+
+        let ascii = "VeldMap BigTIFF TM|";
+        let geokeys: [u16; 44] = [
+            1,
+            1,
+            0,
+            10, // header: 10 keys
+            1024,
+            0,
+            1,
+            1, // GTModelTypeGeoKey = Projected
+            1025,
+            0,
+            1,
+            2, // GTRasterTypeGeoKey = PixelIsPoint
+            2048,
+            0,
+            1,
+            4326, // GeographicTypeGeoKey = WGS 84
+            3072,
+            0,
+            1,
+            32767, // ProjectedCSTypeGeoKey = User-Defined
+            3073,
+            34737,
+            ascii.len() as u16,
+            0, // PCSCitationGeoKey in GeoAsciiParamsTag
+            3075,
+            0,
+            1,
+            1, // ProjCoordTransGeoKey = Transverse Mercator
+            3080,
+            34736,
+            1,
+            0, // ProjNatOriginLongGeoKey = 39.0
+            3081,
+            34736,
+            1,
+            1, // ProjNatOriginLatGeoKey = 55.75
+            3082,
+            34736,
+            1,
+            2, // ProjFalseEastingGeoKey = 500_000.0
+            3092,
+            34736,
+            1,
+            3, // ProjScaleAtNatOriginGeoKey = 0.9996
+        ];
+        dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .expect("tag");
+        dir.write_tag(
+            Tag::GeoDoubleParamsTag,
+            &[39.0_f64, 55.75, 500_000.0, 0.9996][..],
+        )
+        .expect("tag");
+        dir.write_tag(Tag::GeoAsciiParamsTag, ascii).expect("tag");
+        let matrix: [f64; 16] = [
+            10.0, 0.0, 0.0, 500_000.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        dir.write_tag(Tag::ModelTransformationTag, &matrix[..])
+            .expect("tag");
+        dir.finish().expect("finish");
+    }
+    let big_bytes = big_buf.into_inner();
+    assert!(has_tiff_magic(&big_bytes));
+    let big_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(big_bytes.clone())),
+        fake_fingerprint(&big_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open BigTIFF");
+    let placement = big_src
+        .description()
+        .placement
+        .as_ref()
+        .expect("projected placement");
+    assert!((placement.affine[2] - 499_995.0).abs() < 1e-9);
+    assert!((placement.affine[5] - 5.0).abs() < 1e-9);
+
+    let frame = frame_from_description(big_src.description()).expect("BigTIFF user-defined frame");
+    assert_eq!(frame.crs_label(), "VeldMap BigTIFF TM");
+    // Pixel (0, 0) center sits at exact natural origin (500_000, 0) -> (55.75, 39.0).
+    let (lat, lon) = frame.geodetic(0.5 / 8.0, 0.5 / 8.0);
+    assert!((lat - 55.75).abs() < 1e-9, "got lat={lat}");
+    assert!((lon - 39.0).abs() < 1e-9, "got lon={lon}");
+
+    let tile = big_src
+        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .expect("decode BigTIFF tile");
+    assert_eq!((tile.width(), tile.height()), (8, 8));
+}
+
+#[test]
+fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() {
+    let build_geotiff = |raster_type_key: u16| -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut enc = TiffEncoder::new(&mut buf).expect("tiff encoder");
+            let mut dir = enc.image_directory().expect("dir");
+            let (w, h) = (64u32, 64u32);
+            write_ifd_header(&mut dir, &TiffIfdHeader::rgb8(w, h));
+            let data = rgb_pattern(w, h);
+            write_single_strip_u32(&mut dir, h, &data);
+
+            let geokeys: [u16; 16] = [
+                1,
+                1,
+                0,
+                3, // header: 3 keys
+                1024,
+                0,
+                1,
+                1, // GTModelTypeGeoKey = Projected
+                1025,
+                0,
+                1,
+                raster_type_key, // GTRasterTypeGeoKey
+                3072,
+                0,
+                1,
+                32637, // ProjectedCSTypeGeoKey = EPSG:32637
+            ];
+            dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+                .expect("tag");
+            // Pixel scale = 10 m/px; tiepoint pixel (0, 0) at (550_000, 5_250_000).
+            dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
+                .expect("tag");
+            dir.write_tag(
+                Tag::ModelTiepointTag,
+                &[0.0_f64, 0.0, 0.0, 550_000.0, 5_250_000.0, 0.0][..],
+            )
+            .expect("tag");
+            dir.finish().expect("finish");
+        }
+        buf.into_inner()
+    };
+
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
+    let bytes_area = build_geotiff(1);
+    let bytes_point = build_geotiff(2);
+    let src_area: Arc<dyn RasterSource> = Arc::new(
+        TiffSource::open(
+            Arc::new(MemoryByteSource::new(Arc::from(bytes_area.as_slice()))),
+            fake_fingerprint(&bytes_area),
+            &budget,
+            &cancel,
+        )
+        .expect("open PixelIsArea"),
+    );
+    let src_point: Arc<dyn RasterSource> = Arc::new(
+        TiffSource::open(
+            Arc::new(MemoryByteSource::new(Arc::from(bytes_point.as_slice()))),
+            fake_fingerprint(&bytes_point),
+            &budget,
+            &cancel,
+        )
+        .expect("open PixelIsPoint"),
+    );
+
+    let frame_area = frame_from_description(src_area.description()).expect("area frame");
+    let frame_point = frame_from_description(src_point.description()).expect("point frame");
+
+    let patch_area = build_warp_patch(
+        &frame_area,
+        64,
+        64,
+        [0.0, 0.0, 64.0, 64.0],
+        MIN_WARP_SEGMENTS,
+    );
+    let patch_point = build_warp_patch(
+        &frame_point,
+        64,
+        64,
+        [0.0, 0.0, 64.0, 64.0],
+        MIN_WARP_SEGMENTS,
+    );
+
+    let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
+    let geo_area = WGS84.from_ecef(patch_area.evaluate_ecef(0.0, 0.0).expect("area ul"));
+    let geo_point = WGS84.from_ecef(patch_point.evaluate_ecef(0.0, 0.0).expect("point ul"));
+    let (ea, na) = utm37.from_geodetic(geo_area.lat_deg, geo_area.lon_deg);
+    let (ep, np) = utm37.from_geodetic(geo_point.lat_deg, geo_point.lon_deg);
+
+    // PixelIsArea UL corner lands at (550_000, 5_250_000).
+    assert!((ea - 550_000.0).abs() < 0.002, "area easting={ea}");
+    assert!((na - 5_250_000.0).abs() < 0.002, "area northing={na}");
+    // PixelIsPoint shifts UL corner by exact (-0.5 px, +0.5 px) = (-5.0 m, +5.0 m).
+    assert!((ep - 549_995.0).abs() < 0.002, "point easting={ep}");
+    assert!((np - 5_250_005.0).abs() < 0.002, "point northing={np}");
+    let (pt_lat, pt_lon) = utm37.to_geodetic(549_995.0, 5_250_005.0);
+    let exact_pt_ul = WGS84.to_ecef(Geodetic::surface(pt_lat, pt_lon));
+    let drawn_pt_ul = patch_point.evaluate_ecef(0.0, 0.0).expect("point ul");
+    assert!(exact_pt_ul.distance(drawn_pt_ul) < 0.002);
+
+    // Zoom-invariant native base-IFD display readout matches synthetic RGB pattern.
+    let (px, py) = (17u32, 23u32);
+    let expected = [
+        (px * 7 + py * 3) as u8,
+        (px ^ py) as u8,
+        ((px * py) / 97) as u8,
+        255,
+    ];
+    assert_eq!(
+        src_area
+            .sample_display_rgba(px, py, &ctx)
+            .expect("sample area"),
+        Some(expected)
+    );
+    assert_eq!(
+        src_point
+            .sample_display_rgba(px, py, &ctx)
+            .expect("sample point"),
+        Some(expected)
+    );
+    assert_eq!(
+        src_area
+            .sample_display_rgba(64, 0, &ctx)
+            .expect("out of bounds"),
+        None
+    );
+
+    // Multi-chunk tiled COG readout: sample pixels in non-zero (cx, cy) tiles
+    // and verify the large-chunk guard rejects oversized single-chunk readouts.
+    let (cog_bytes, _, _) = build_tiled_cog(700, 600, 1);
+    let cog_src = TiffSource::open(
+        Arc::new(MemoryByteSource::new(Arc::from(cog_bytes.as_slice()))),
+        fake_fingerprint(&cog_bytes),
+        &budget,
+        &cancel,
+    )
+    .expect("open multi-chunk cog");
+    let (cpx, cpy) = (610u32, 540u32);
+    let cog_expected = [
+        (cpx * 7 + cpy * 3) as u8,
+        (cpx ^ cpy) as u8,
+        ((cpx * cpy) / 97) as u8,
+        255,
+    ];
+    assert_eq!(
+        cog_src
+            .sample_display_rgba(cpx, cpy, &ctx)
+            .expect("sample multi-chunk cog"),
+        Some(cog_expected)
+    );
+
+    // Tight chunk cache budget triggers LimitExceeded before decoding on fast_pool.
+    let tiny_budget = MemoryBudget {
+        decoded_chunk_cache_bytes: 16 * 1024,
+        ..budget
+    };
+    let tiny_ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &tiny_budget,
+        cancel: &cancel,
+    };
+    assert!(matches!(
+        cog_src.sample_display_rgba(cpx, cpy, &tiny_ctx),
+        Err(RasterError::LimitExceeded { .. })
+    ));
 }

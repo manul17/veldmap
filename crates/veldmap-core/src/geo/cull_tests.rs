@@ -194,14 +194,14 @@ fn degenerate_zero_eye_produces_no_nan_in_horizon_plane() {
 }
 
 #[test]
-fn oblate_horizon_plane_separates_near_limb_points_at_mid_latitude() {
+fn oblate_horizon_margin_separates_near_limb_points_across_altitudes() {
     for height_m in [2.0, 500.0, 2_000_000.0] {
-        let cam = crate::geo::camera::Camera::at(45.0, 39.7, height_m);
-        let frustum = cam.frustum(16.0 / 9.0);
+        let (view_proj, eye) = view_proj_from(45.0, 39.7, height_m, 16.0 / 9.0);
+        let frustum = CullFrustum::new(&view_proj, eye);
         let nadir = at(45.0, 39.7, 0.0);
         assert!(frustum.horizon_margin(nadir) > 0.0);
 
-        // Compute exact east-west equatorial horizon arc at 45 deg lat via binary search
+        // Compute exact east-west horizon arc at 45 deg lat via binary search
         // and verify +/-0.05 deg separation on either side of the oblate tangent plane.
         let mut lo = 0.0_f64;
         let mut hi = 90.0_f64;

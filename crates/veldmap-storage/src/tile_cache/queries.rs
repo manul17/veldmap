@@ -6,26 +6,15 @@ use rusqlite::{Connection, OptionalExtension, Params, Statement, Transaction, pa
 
 use super::key::{EncodedKey, TileBlobEncoding};
 
-/// Truncate-friendly deletion of all cached blobs and metadata.
-const CLEAR_BLOBS_SQL: &str = "DELETE FROM tile_blobs";
-const CLEAR_META_SQL: &str = "DELETE FROM tile_meta";
+macro_rules! key_columns_sql {
+    () => {
+        "source_key, band_kind, band_id, scheme, format, gutter, decode_rev, level, x, y"
+    };
+}
 
-const SELECT_TILE_BLOB_SQL: &str = "SELECT m.tile_id, m.encoding, m.last_used_ms, b.payload
-     FROM tile_meta m
-     JOIN tile_blobs b ON b.tile_id = m.tile_id
-     WHERE m.source_key = ?1
-       AND m.band_kind = ?2
-       AND m.band_id = ?3
-       AND m.scheme = ?4
-       AND m.format = ?5
-       AND m.gutter = ?6
-       AND m.decode_rev = ?7
-       AND m.level = ?8
-       AND m.x = ?9
-       AND m.y = ?10";
-
-const SELECT_META_BYTE_SIZE_SQL: &str = "SELECT byte_size FROM tile_meta
-     WHERE source_key = ?1
+macro_rules! key_where_sql {
+    () => {
+        "source_key = ?1
        AND band_kind = ?2
        AND band_id = ?3
        AND scheme = ?4
@@ -34,21 +23,41 @@ const SELECT_META_BYTE_SIZE_SQL: &str = "SELECT byte_size FROM tile_meta
        AND decode_rev = ?7
        AND level = ?8
        AND x = ?9
-       AND y = ?10";
+       AND y = ?10"
+    };
+}
 
-const UPSERT_META_SQL: &str = "INSERT INTO tile_meta (
-         source_key, band_kind, band_id, scheme, format, gutter,
-         decode_rev, level, x, y, encoding, byte_size, last_used_ms
-     )
+/// Truncate-friendly deletion of all cached blobs and metadata.
+const CLEAR_BLOBS_SQL: &str = "DELETE FROM tile_blobs";
+const CLEAR_META_SQL: &str = "DELETE FROM tile_meta";
+
+const SELECT_TILE_BLOB_SQL: &str = concat!(
+    "SELECT m.tile_id, m.encoding, m.last_used_ms, b.payload
+     FROM tile_meta m
+     JOIN tile_blobs b ON b.tile_id = m.tile_id
+     WHERE ",
+    key_where_sql!()
+);
+
+const SELECT_META_BYTE_SIZE_SQL: &str = concat!(
+    "SELECT byte_size FROM tile_meta
+     WHERE ",
+    key_where_sql!()
+);
+
+const UPSERT_META_SQL: &str = concat!(
+    "INSERT INTO tile_meta (",
+    key_columns_sql!(),
+    ", encoding, byte_size, last_used_ms)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-     ON CONFLICT(
-         source_key, band_kind, band_id, scheme, format, gutter,
-         decode_rev, level, x, y
-     ) DO UPDATE SET
+     ON CONFLICT(",
+    key_columns_sql!(),
+    ") DO UPDATE SET
        encoding = excluded.encoding,
        byte_size = excluded.byte_size,
        last_used_ms = excluded.last_used_ms
-     RETURNING tile_id";
+     RETURNING tile_id"
+);
 
 const UPSERT_BLOB_SQL: &str = "INSERT INTO tile_blobs (tile_id, payload)
      VALUES (?1, ?2)
@@ -57,18 +66,13 @@ const UPSERT_BLOB_SQL: &str = "INSERT INTO tile_blobs (tile_id, payload)
 const TOUCH_META_SQL: &str =
     "UPDATE tile_meta SET last_used_ms = ?1 WHERE tile_id = ?2 AND last_used_ms < ?1";
 
-const DELETE_META_BY_KEY_SQL: &str = "DELETE FROM tile_meta
-     WHERE source_key = ?1
-       AND band_kind = ?2
-       AND band_id = ?3
-       AND scheme = ?4
-       AND format = ?5
-       AND gutter = ?6
-       AND decode_rev = ?7
-       AND level = ?8
-       AND x = ?9
-       AND y = ?10
-     RETURNING tile_id, byte_size";
+const DELETE_META_BY_KEY_SQL: &str = concat!(
+    "DELETE FROM tile_meta
+     WHERE ",
+    key_where_sql!(),
+    "
+     RETURNING tile_id, byte_size"
+);
 
 const DELETE_META_BY_ID_SQL: &str = "DELETE FROM tile_meta WHERE tile_id = ?1";
 
@@ -82,7 +86,7 @@ const SELECT_EVICT_BATCH_SQL: &str = "SELECT tile_id, byte_size, last_used_ms FR
      ORDER BY last_used_ms ASC
      LIMIT ?1";
 
-pub(super) const SELECT_EVICT_BATCH_PROTECTED_SQL: &str =
+const SELECT_EVICT_BATCH_PROTECTED_SQL: &str =
     "SELECT tile_id, byte_size, last_used_ms FROM tile_meta
      WHERE tile_id != ?1
      ORDER BY last_used_ms ASC
@@ -340,4 +344,39 @@ fn reset_cache_meta(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     let mut stmt = tx.prepare(RESET_CACHE_META_SQL)?;
     stmt.execute([])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestTempDir;
+    use crate::tile_cache::evict::EVICT_BATCH_ROWS;
+    use crate::tile_cache::schema::open_and_init_file_db;
+
+    #[test]
+    fn eviction_query_uses_covering_lru_index_without_temp_btree() {
+        let dir = TestTempDir::new("queries-covering-idx");
+        let db_path = dir.path().join("tiles.sqlite3");
+        let (conn, _) = open_and_init_file_db(&db_path).expect("open db");
+
+        let mut stmt = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {SELECT_EVICT_BATCH_PROTECTED_SQL}"
+            ))
+            .expect("explain");
+        let details: Vec<String> = stmt
+            .query_map(params![1i64, EVICT_BATCH_ROWS], |r| r.get::<_, String>(3))
+            .expect("query plan")
+            .map(|r| r.expect("plan row"))
+            .collect();
+        let joined = details.join(" | ");
+        assert!(
+            joined.contains("idx_tile_meta_lru") && joined.contains("COVERING"),
+            "expected covering idx_tile_meta_lru scan, got: {joined}"
+        );
+        assert!(
+            !joined.contains("TEMP B-TREE"),
+            "unexpected temp B-tree sort in eviction plan: {joined}"
+        );
+    }
 }

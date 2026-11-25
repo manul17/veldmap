@@ -86,14 +86,9 @@ impl ReaderPool {
             keep: false,
         };
 
-        if guard.conn.is_none() {
-            guard.conn = Some(open_read_only_connection(&self.db_path)?);
-        }
-
-        let Some(conn) = guard.conn.as_ref() else {
-            return Err(StorageError::Sqlite(
-                "reader pool connection missing".to_string(),
-            ));
+        let conn: &Connection = match &mut guard.conn {
+            Some(conn) => conn,
+            slot @ None => slot.insert(open_read_only_connection(&self.db_path)?),
         };
         let result = f(conn);
         if result.is_ok() {

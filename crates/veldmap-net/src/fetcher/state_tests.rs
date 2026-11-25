@@ -1,18 +1,8 @@
 use std::time::Duration;
 
-use veldmap_core::tile::{PlanetaryScheme, QuadTileId};
-
 use super::super::failures::MAX_FAILURE_ENTRIES;
+use super::super::wm_key;
 use super::*;
-
-fn wm_key(spec: &LiveBasemapSpec, level: u8, x: u32, y: u32) -> TileKey {
-    spec.tile_key(QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level,
-        x,
-        y,
-    })
-}
 
 fn active_state(spec: &Arc<LiveBasemapSpec>) -> PipelineState {
     PipelineState {
@@ -48,10 +38,10 @@ fn expired_backoffs_route_directly_to_http_or_disk_queues() {
     );
 
     st.prune_expired_backoffs(now);
-    assert!(st.pending.http.contains(&http_key));
-    assert!(!st.pending.disk.contains(&http_key));
-    assert!(st.pending.disk.contains(&disk_key));
-    assert!(!st.pending.http.contains(&disk_key));
+    assert!(st.pending.contains_http(&http_key));
+    assert!(!st.pending.contains_disk(&http_key));
+    assert!(st.pending.contains_disk(&disk_key));
+    assert!(!st.pending.contains_http(&disk_key));
 }
 
 #[test]
@@ -94,7 +84,7 @@ fn retry_failed_preserves_204_empty_and_ignores_stale_generations() {
         Some(FailureMarker::Empty)
     );
     assert!(!st.failures.has_failure(&terminal_key));
-    assert!(st.pending.disk.contains(&terminal_key));
+    assert!(st.pending.contains_disk(&terminal_key));
 }
 
 #[test]
@@ -107,12 +97,12 @@ fn active_root_stays_pinned_across_reconcile_and_backoff_expiry() {
     let mut initial_wanted = HashSet::new();
     initial_wanted.insert(root_key);
     st.reconcile_wanted(&initial_wanted, &|_| false, now);
-    assert!(st.pending.disk.contains(&root_key));
+    assert!(st.pending.contains_disk(&root_key));
 
     let empty_wanted = HashSet::new();
     st.reconcile_wanted(&empty_wanted, &|_| false, now);
     assert!(
-        st.pending.disk.contains(&root_key),
+        st.pending.contains_disk(&root_key),
         "active root must remain pinned in pending.disk until ready"
     );
 
@@ -127,10 +117,10 @@ fn active_root_stays_pinned_across_reconcile_and_backoff_expiry() {
         st.earliest_wanted_backoff(now),
         Some(now + Duration::from_secs(5))
     );
-    st.pending.disk.clear();
+    st.pending.clear();
     st.reconcile_wanted(&empty_wanted, &|_| false, now + Duration::from_secs(6));
     assert!(
-        st.pending.disk.contains(&root_key),
+        st.pending.contains_disk(&root_key),
         "expired retry_disk backoff for pinned active root must re-queue"
     );
 }
@@ -226,12 +216,12 @@ fn reconcile_wanted_routes_expired_backoffs_and_skips_ready_roots() {
     let wanted = HashSet::from([http_retry_key, disk_retry_key]);
     st.reconcile_wanted(&wanted, &|k| *k == root_key, now);
 
-    assert!(!st.pending.disk.contains(&root_key));
-    assert!(!st.pending.http.contains(&root_key));
-    assert!(st.pending.http.contains(&http_retry_key));
-    assert!(!st.pending.disk.contains(&http_retry_key));
-    assert!(st.pending.disk.contains(&disk_retry_key));
-    assert!(!st.pending.http.contains(&disk_retry_key));
+    assert!(!st.pending.contains_disk(&root_key));
+    assert!(!st.pending.contains_http(&root_key));
+    assert!(st.pending.contains_http(&http_retry_key));
+    assert!(!st.pending.contains_disk(&http_retry_key));
+    assert!(st.pending.contains_disk(&disk_retry_key));
+    assert!(!st.pending.contains_http(&disk_retry_key));
 }
 
 #[test]
@@ -245,13 +235,13 @@ fn drain_disk_to_http_streams_only_eligible_keys() {
     let wrong_source_key = wm_key(&other_spec, 2, 0, 0);
 
     st.insert_failure(suppressed_key, FailureMarker::Terminal);
-    st.pending
-        .disk
-        .push_unique([eligible_key, suppressed_key, wrong_source_key]);
+    for key in [eligible_key, suppressed_key, wrong_source_key] {
+        st.pending.insert_disk(key);
+    }
 
     st.drain_disk_to_http(spec.source_id());
-    assert!(st.pending.disk.is_empty());
-    assert!(st.pending.http.contains(&eligible_key));
-    assert!(!st.pending.http.contains(&suppressed_key));
-    assert!(!st.pending.http.contains(&wrong_source_key));
+    assert!(st.pending.is_disk_empty());
+    assert!(st.pending.contains_http(&eligible_key));
+    assert!(!st.pending.contains_http(&suppressed_key));
+    assert!(!st.pending.contains_http(&wrong_source_key));
 }

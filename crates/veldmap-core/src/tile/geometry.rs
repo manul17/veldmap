@@ -2,7 +2,7 @@
 //! `WebMercator`, and adaptive `PolarCap`), shared by quadtree traversal,
 //! offline equirectangular tile resampling, and GPU mesh generation.
 
-use crate::geo::projection::{WEB_MERCATOR_LIMIT_DEG, web_mercator_lat_deg};
+use crate::geo::{WEB_MERCATOR_LIMIT_DEG, web_mercator_lat_deg};
 
 use super::key::QuadTileId;
 use super::scheme::PlanetaryScheme;

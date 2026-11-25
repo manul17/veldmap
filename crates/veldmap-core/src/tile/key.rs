@@ -72,7 +72,7 @@ impl QuadTileId {
     }
 
     /// Return the 4 child tiles of this planetary node.
-    pub fn children(self) -> [Self; 4] {
+    pub(super) fn children(self) -> [Self; 4] {
         debug_assert!(self.level < u8::MAX, "QuadTileId level overflow");
         let next = self.level.saturating_add(1);
         let cx = self.x << 1;
@@ -266,7 +266,7 @@ impl TileKey {
     /// source/scheme/stream_spec, or if `gutter != 0` (guttered tiles and
     /// clipped `RasterPyramid` edge tiles should resolve carriers via
     /// `TileCache::find_carrier` and compute UVs via [`super::cell_uv_rect`]).
-    pub fn sub_rect_in_ancestor(&self, ancestor: &Self) -> Option<[f32; 4]> {
+    pub(super) fn sub_rect_in_ancestor(&self, ancestor: &Self) -> Option<[f32; 4]> {
         if self.source != ancestor.source
             || self.scheme != ancestor.scheme
             || self.stream_spec() != ancestor.stream_spec()

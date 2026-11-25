@@ -10,7 +10,7 @@ use crate::color::{
 /// (`w x h` -> `ceil(w/2) x ceil(h/2)`).
 ///
 /// Keeps fully transparent blocks deterministic `[0, 0, 0, 0]`.
-pub(crate) fn halve_rgba8(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+pub(super) fn halve_rgba8(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
@@ -148,7 +148,7 @@ fn overlap(s: u32, a: f64, b: f64) -> f64 {
 
 /// Spread valid RGB colors 2 rings outward into fully transparent (`alpha == 0`)
 /// nodata neighbors while keeping alpha at `0`, eliminating dark bilinear edges.
-pub(crate) fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
+pub(super) fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
     const BLEED_STEPS: u32 = 2;
     let (w, h) = (width as usize, height as usize);
     let Some(px_count) = w.checked_mul(h) else {

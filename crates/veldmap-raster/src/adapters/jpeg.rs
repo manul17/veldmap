@@ -19,10 +19,11 @@ use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{SourceFingerprint, SourceId, level_count, level_size};
 
+use crate::color::{cmyk_to_rgb8, cmyk_to_rgba8};
 use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
 use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
 use crate::pipeline::plan::{LevelPlan, ServeMode};
-use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples};
+use crate::pipeline::radiometry::{PixelLayout, to_rgba8};
 use crate::pipeline::resample::{Window, resample_rgba8_window};
 use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
@@ -144,7 +145,6 @@ fn plan_jpeg_levels(
         }
         levels.push(LevelPlan {
             serve: ServeMode::Pass { from: lvl },
-            source_pixels: u64::from(dw).saturating_mul(u64::from(dh)),
             estimated_peak_bytes: peak,
             fits,
         });
@@ -183,18 +183,6 @@ impl RasterSource for JpegSource {
 
     fn pass_peak_bytes(&self) -> u64 {
         self.pass_peak_bytes
-    }
-
-    fn produce_direct(
-        &self,
-        level: u8,
-        _wants: &[(u32, u32)],
-        _ctx: &DecodeContext<'_>,
-        _emit: TileEmit<'_>,
-    ) -> Result<(), RasterError> {
-        Err(RasterError::Decode(format!(
-            "JPEG does not support pointwise random access at level {level}; use sequential pass"
-        )))
     }
 
     fn produce_pass(&self, ctx: &DecodeContext<'_>, emit: TileEmit<'_>) -> Result<(), RasterError> {
@@ -245,7 +233,7 @@ impl RasterSource for JpegSource {
             .ok_or_else(|| RasterError::Decode("JPEG header missing after decode".to_string()))?;
 
         let pixel_count = (dw as usize).saturating_mul(dh as usize);
-        let rgba = decode_pixels_to_rgba8(dinfo.pixel_format, &pixels, pixel_count);
+        let rgba = decode_jpeg_pixels_to_rgba8(dinfo.pixel_format, &pixels, pixel_count);
         // Release raw JPEG buffer before resampling/cascading so we never hold 3 full frames.
         drop(pixels);
 
@@ -285,37 +273,35 @@ impl RasterSource for JpegSource {
     }
 }
 
-fn decode_pixels_to_rgba8(
+fn l16_normalization_scale(pixels: &[u8], pixel_count: usize) -> f64 {
+    // Lossless JPEG L16 stores unshifted 9..=16-bit samples; scan native-endian
+    // pairs without allocating an intermediate `Vec<u16>` buffer.
+    let max_val = pixels
+        .chunks_exact(2)
+        .take(pixel_count)
+        .map(|p| u16::from_ne_bytes([p[0], p[1]]))
+        .max()
+        .unwrap_or(255);
+    let hi = if max_val <= 255 {
+        255.0_f64
+    } else if max_val <= 4095 {
+        4095.0_f64
+    } else {
+        65_535.0_f64
+    };
+    255.0 / hi
+}
+
+pub(crate) fn decode_jpeg_pixels_to_rgba8(
     format: jpeg_decoder::PixelFormat,
     pixels: &[u8],
     pixel_count: usize,
 ) -> Vec<u8> {
-    let mapping = DisplayMapping::identity(None);
     match format {
-        jpeg_decoder::PixelFormat::L8 => {
-            mapping.rgba(&Samples::U8(pixels), PixelLayout::named(1), pixel_count)
-        }
-        jpeg_decoder::PixelFormat::RGB24 => {
-            mapping.rgba(&Samples::U8(pixels), PixelLayout::named(3), pixel_count)
-        }
+        jpeg_decoder::PixelFormat::L8 => to_rgba8(pixels, PixelLayout::named(1), pixel_count),
+        jpeg_decoder::PixelFormat::RGB24 => to_rgba8(pixels, PixelLayout::named(3), pixel_count),
         jpeg_decoder::PixelFormat::L16 => {
-            // Lossless JPEG L16 stores unshifted 9..=16-bit samples; stream
-            // directly from native-endian pairs without allocating an
-            // intermediate `Vec<u16>` buffer, normalizing to the observed bit range.
-            let max_val = pixels
-                .chunks_exact(2)
-                .take(pixel_count)
-                .map(|p| u16::from_ne_bytes([p[0], p[1]]))
-                .max()
-                .unwrap_or(255);
-            let hi = if max_val <= 255 {
-                255.0_f64
-            } else if max_val <= 4095 {
-                4095.0_f64
-            } else {
-                65_535.0_f64
-            };
-            let scale = 255.0 / hi;
+            let scale = l16_normalization_scale(pixels, pixel_count);
             let count = pixel_count.min(pixels.len() / 2);
             let mut out = Vec::with_capacity(count.saturating_mul(4));
             for p in pixels.chunks_exact(2).take(count) {
@@ -329,18 +315,34 @@ fn decode_pixels_to_rgba8(
     }
 }
 
-/// Convert `jpeg-decoder`'s un-inverted standard `[C, M, Y, K]` bytes (`0` = no
-/// ink / white, `255` = full ink / black) into opaque RGBA8.
-fn cmyk_to_rgba8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pixel_count.saturating_mul(4));
-    for px in cmyk.chunks_exact(4).take(pixel_count) {
-        let kf = 1.0 - f32::from(px[3]) / 255.0;
-        let r = ((255.0 - f32::from(px[0])) * kf).round().clamp(0.0, 255.0) as u8;
-        let g = ((255.0 - f32::from(px[1])) * kf).round().clamp(0.0, 255.0) as u8;
-        let b = ((255.0 - f32::from(px[2])) * kf).round().clamp(0.0, 255.0) as u8;
-        out.extend_from_slice(&[r, g, b, 255]);
+pub(crate) fn decode_jpeg_pixels_to_rgb8(
+    format: jpeg_decoder::PixelFormat,
+    pixels: Vec<u8>,
+    pixel_count: usize,
+) -> Vec<u8> {
+    match format {
+        jpeg_decoder::PixelFormat::RGB24 => pixels,
+        jpeg_decoder::PixelFormat::L8 => {
+            let count = pixel_count.min(pixels.len());
+            let mut out = Vec::with_capacity(count.saturating_mul(3));
+            for &g in pixels.iter().take(count) {
+                out.extend_from_slice(&[g, g, g]);
+            }
+            out
+        }
+        jpeg_decoder::PixelFormat::L16 => {
+            let scale = l16_normalization_scale(&pixels, pixel_count);
+            let count = pixel_count.min(pixels.len() / 2);
+            let mut out = Vec::with_capacity(count.saturating_mul(3));
+            for p in pixels.chunks_exact(2).take(count) {
+                let v = f64::from(u16::from_ne_bytes([p[0], p[1]]));
+                let byte = (v * scale).round().clamp(0.0, 255.0) as u8;
+                out.extend_from_slice(&[byte, byte, byte]);
+            }
+            out
+        }
+        jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_rgb8(&pixels, pixel_count),
     }
-    out
 }
 
 fn clamp_u16(v: u32) -> u16 {
@@ -423,18 +425,6 @@ fn map_jpeg_error(err: jpeg_decoder::Error, cancel: &CancelToken) -> RasterError
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cmyk_to_rgba8_handles_uninverted_standard_cmyk() {
-        // White (0,0,0,0), pure cyan (255,0,0,0), pure black (0,0,0,255), mid-gray (0,0,0,128).
-        let input = [0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 128];
-        let rgba = cmyk_to_rgba8(&input, 4);
-        assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
-        assert_eq!(&rgba[4..8], &[0, 255, 255, 255]);
-        assert_eq!(&rgba[8..12], &[0, 0, 0, 255]);
-        assert_eq!(rgba[12], 127);
-        assert_eq!(rgba[15], 255);
-    }
 
     #[test]
     fn progressive_and_lossless_peak_accounting_includes_full_resolution_buffers() {

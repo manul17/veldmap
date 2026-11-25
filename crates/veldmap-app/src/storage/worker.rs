@@ -10,8 +10,8 @@ use std::thread::{self, JoinHandle};
 use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 use veldmap_storage::{DiskCacheStats, StoragePaths, TileDiskCache};
 
-use crate::session::AppSession;
-use crate::settings::AppSettings;
+use super::session::AppSession;
+use super::settings::AppSettings;
 
 /// Typed asynchronous maintenance outcome reported by [`DiskCacheWorker`]
 /// (formatted into user-facing copy by the UI layer).

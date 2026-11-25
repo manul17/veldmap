@@ -83,6 +83,27 @@ fn request_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     Some((device, queue))
 }
 
+fn build_raw_snapshot(
+    camera: Camera,
+    width_px: u32,
+    height_px: u32,
+    show_graticule: bool,
+    config: &QuadtreeConfig,
+    carrier: Option<(&dyn TileCarrierPolicy, &mut GpuTileCache)>,
+) -> DrawSnapshot {
+    DrawSnapshot::build(
+        SnapshotBuildParams {
+            camera,
+            width_px,
+            height_px,
+            pixels_per_point: 1.0,
+            show_graticule,
+            config,
+        },
+        carrier,
+    )
+}
+
 pub(crate) fn build_snapshot(
     camera: Camera,
     width_px: u32,
@@ -94,17 +115,23 @@ pub(crate) fn build_snapshot(
 ) -> Arc<DrawSnapshot> {
     let policy = BasemapCarrierPolicy::new(active_source);
     let carrier = cache.map(|gpu_cache| (&policy as &dyn TileCarrierPolicy, gpu_cache));
-    Arc::new(DrawSnapshot::build(
-        SnapshotBuildParams {
-            camera,
-            width_px,
-            height_px,
-            pixels_per_point: 1.0,
-            show_graticule,
-            config,
-        },
+    Arc::new(build_raw_snapshot(
+        camera,
+        width_px,
+        height_px,
+        show_graticule,
+        config,
         carrier,
     ))
+}
+
+pub(crate) fn build_empty_snapshot(
+    camera: Camera,
+    width_px: u32,
+    height_px: u32,
+    config: &QuadtreeConfig,
+) -> DrawSnapshot {
+    build_raw_snapshot(camera, width_px, height_px, false, config, None)
 }
 
 pub(crate) fn readback_rgba8(

@@ -5,15 +5,13 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use veldmap_core::geo::CrsSpec;
 use veldmap_core::geo::{Camera, CustomTmParams, DatumPreset, LinearUnit};
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
 };
 
 use crate::clamp_opacity;
-use crate::crs_override::CrsOverride;
+use crate::layers::CrsOverride;
 
 /// Current on-disk schema version for `session.json`.
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -24,114 +22,45 @@ const MAX_RECENT_FILES: usize = 16;
 /// Maximum number of camera bookmarks kept in `session.json`.
 pub(crate) const MAX_BOOKMARKS: usize = 64;
 
-/// Serializable datum choice for custom Transverse Mercator overrides.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SavedCustomTmDatum {
-    #[default]
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "DatumPreset", rename_all = "snake_case")]
+enum DatumPresetDef {
     Wgs84,
     Pulkovo1942,
 }
 
-impl From<DatumPreset> for SavedCustomTmDatum {
-    fn from(d: DatumPreset) -> Self {
-        match d {
-            DatumPreset::Wgs84 => Self::Wgs84,
-            DatumPreset::Pulkovo1942 => Self::Pulkovo1942,
-        }
-    }
-}
-
-impl From<SavedCustomTmDatum> for DatumPreset {
-    fn from(d: SavedCustomTmDatum) -> Self {
-        match d {
-            SavedCustomTmDatum::Wgs84 => Self::Wgs84,
-            SavedCustomTmDatum::Pulkovo1942 => Self::Pulkovo1942,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SavedLinearUnit {
-    #[default]
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "LinearUnit", rename_all = "snake_case")]
+enum LinearUnitDef {
     Metre,
     InternationalFoot,
     UsSurveyFoot,
 }
 
-impl From<LinearUnit> for SavedLinearUnit {
-    fn from(u: LinearUnit) -> Self {
-        match u {
-            LinearUnit::Metre => Self::Metre,
-            LinearUnit::InternationalFoot => Self::InternationalFoot,
-            LinearUnit::UsSurveyFoot => Self::UsSurveyFoot,
-        }
-    }
-}
-
-impl From<SavedLinearUnit> for LinearUnit {
-    fn from(u: SavedLinearUnit) -> Self {
-        match u {
-            SavedLinearUnit::Metre => Self::Metre,
-            SavedLinearUnit::InternationalFoot => Self::InternationalFoot,
-            SavedLinearUnit::UsSurveyFoot => Self::UsSurveyFoot,
-        }
-    }
-}
-
-/// Serializable custom Transverse Mercator parameters matching [`CustomTmParams`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct SavedCustomTmParams {
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "CustomTmParams")]
+struct CustomTmParamsDef {
     name: String,
-    #[serde(default)]
-    datum: SavedCustomTmDatum,
+    #[serde(default, with = "DatumPresetDef")]
+    datum: DatumPreset,
     central_meridian_deg: f64,
     origin_lat_deg: f64,
     scale: f64,
     false_easting_m: f64,
     false_northing_m: f64,
-    unit: SavedLinearUnit,
+    #[serde(with = "LinearUnitDef")]
+    unit: LinearUnit,
 }
 
-impl From<&CustomTmParams> for SavedCustomTmParams {
-    fn from(p: &CustomTmParams) -> Self {
-        Self {
-            name: p.name.clone(),
-            datum: p.datum.into(),
-            central_meridian_deg: p.central_meridian_deg,
-            origin_lat_deg: p.origin_lat_deg,
-            scale: p.scale,
-            false_easting_m: p.false_easting_m,
-            false_northing_m: p.false_northing_m,
-            unit: p.unit.into(),
-        }
-    }
-}
-
-impl From<&SavedCustomTmParams> for CustomTmParams {
-    fn from(p: &SavedCustomTmParams) -> Self {
-        Self {
-            name: p.name.clone(),
-            datum: p.datum.into(),
-            central_meridian_deg: p.central_meridian_deg,
-            origin_lat_deg: p.origin_lat_deg,
-            scale: p.scale,
-            false_easting_m: p.false_easting_m,
-            false_northing_m: p.false_northing_m,
-            unit: p.unit.into(),
-        }
-    }
-}
-
-/// Serializable CRS override stored alongside a saved raster layer entry.
+/// Minimal serde proxy preserving the exact flat `session.json` wire format
+/// (`{"kind": "...", ...}`) for [`CrsOverride`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SavedCrsOverride {
     Epsg { code: u32 },
     Wkt { wkt: String },
     Proj { proj: String },
-    CustomTm(SavedCustomTmParams),
+    CustomTm(#[serde(with = "CustomTmParamsDef")] CustomTmParams),
 }
 
 impl From<&CrsOverride> for SavedCrsOverride {
@@ -140,18 +69,7 @@ impl From<&CrsOverride> for SavedCrsOverride {
             CrsOverride::Epsg(code) => Self::Epsg { code: *code },
             CrsOverride::Wkt(wkt) => Self::Wkt { wkt: wkt.clone() },
             CrsOverride::Proj(proj) => Self::Proj { proj: proj.clone() },
-            CrsOverride::CustomTm(params) => Self::CustomTm(SavedCustomTmParams::from(params)),
-        }
-    }
-}
-
-impl From<SavedCrsOverride> for CrsOverride {
-    fn from(saved: SavedCrsOverride) -> Self {
-        match saved {
-            SavedCrsOverride::Epsg { code } => Self::Epsg(code),
-            SavedCrsOverride::Wkt { wkt } => Self::Wkt(wkt),
-            SavedCrsOverride::Proj { proj } => Self::Proj(proj),
-            SavedCrsOverride::CustomTm(params) => Self::CustomTm(CustomTmParams::from(&params)),
+            CrsOverride::CustomTm(params) => Self::CustomTm(params.clone()),
         }
     }
 }
@@ -162,16 +80,8 @@ impl From<&SavedCrsOverride> for CrsOverride {
             SavedCrsOverride::Epsg { code } => Self::Epsg(*code),
             SavedCrsOverride::Wkt { wkt } => Self::Wkt(wkt.clone()),
             SavedCrsOverride::Proj { proj } => Self::Proj(proj.clone()),
-            SavedCrsOverride::CustomTm(params) => Self::CustomTm(CustomTmParams::from(params)),
+            SavedCrsOverride::CustomTm(params) => Self::CustomTm(params.clone()),
         }
-    }
-}
-
-#[cfg(test)]
-impl SavedCrsOverride {
-    /// Resolve back into a live [`CrsSpec`].
-    fn to_crs_spec(&self) -> Result<CrsSpec, String> {
-        CrsOverride::from(self).to_crs_spec()
     }
 }
 
@@ -371,26 +281,57 @@ mod tests {
     use veldmap_storage::test_support::TestTempDir;
 
     #[test]
-    fn session_persists_layers_crs_overrides_recent_files_and_bookmarks() {
+    fn session_persists_all_crs_override_variants_flat_json_recent_files_and_bookmarks() {
         let tmp = TestTempDir::new("session-roundtrip");
         let paths = StoragePaths::with_root(tmp.path());
 
-        let mut session = AppSession::default();
-        session.open_layers.push(SavedLayerEntry {
-            path: PathBuf::from("/tmp/ortho.tif"),
-            visible: true,
-            opacity: 0.75,
-            crs_override: Some(SavedCrsOverride::CustomTm(SavedCustomTmParams {
-                name: "MSK-61 Custom".to_string(),
-                datum: SavedCustomTmDatum::Pulkovo1942,
-                central_meridian_deg: 37.983_333_333_33,
-                origin_lat_deg: 0.0,
-                scale: 1.0,
-                false_easting_m: 1_300_000.0,
-                false_northing_m: -4_811_057.628,
-                unit: SavedLinearUnit::Metre,
-            })),
+        let epsg_ov = CrsOverride::Epsg(32637);
+        let wkt_ov = CrsOverride::Wkt(
+            concat!(
+                "GEOGCS[\"WGS 84\",",
+                "DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],",
+                "PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]"
+            )
+            .to_owned(),
+        );
+        let proj_ov =
+            CrsOverride::Proj("+proj=utm +zone=37 +datum=WGS84 +units=m +no_defs".to_owned());
+        let custom_tm_ov = CrsOverride::CustomTm(CustomTmParams {
+            name: "MSK-61 Custom".to_string(),
+            datum: DatumPreset::Pulkovo1942,
+            central_meridian_deg: 37.983_333_333_33,
+            origin_lat_deg: 0.0,
+            scale: 1.0,
+            false_easting_m: 1_300_000.0,
+            false_northing_m: -4_811_057.628,
+            unit: LinearUnit::Metre,
         });
+
+        let mut session = AppSession::default();
+        session.open_layers.push(SavedLayerEntry::new(
+            PathBuf::from("/tmp/epsg.tif"),
+            true,
+            1.0,
+            Some(&epsg_ov),
+        ));
+        session.open_layers.push(SavedLayerEntry::new(
+            PathBuf::from("/tmp/wkt.tif"),
+            false,
+            0.5,
+            Some(&wkt_ov),
+        ));
+        session.open_layers.push(SavedLayerEntry::new(
+            PathBuf::from("/tmp/proj.tif"),
+            true,
+            0.8,
+            Some(&proj_ov),
+        ));
+        session.open_layers.push(SavedLayerEntry::new(
+            PathBuf::from("/tmp/ortho.tif"),
+            true,
+            0.75,
+            Some(&custom_tm_ov),
+        ));
         session.open_vectors.push(SavedVectorEntry {
             path: PathBuf::from("/tmp/parcels.geojson"),
             visible: true,
@@ -412,10 +353,19 @@ mod tests {
         session.last_camera = Some(pose);
 
         session.save(&paths).expect("save session");
-        // Verify on-disk JSON stays flat for `custom_tm` and `CameraBookmark`.
+        // Verify on-disk JSON preserves the exact flat wire format for every
+        // `CrsOverride` variant and `CameraBookmark`.
         let raw = std::fs::read_to_string(paths.session_path()).expect("read raw json");
+        assert!(raw.contains(r#""kind": "epsg""#));
+        assert!(raw.contains(r#""code": 32637"#));
+        assert!(raw.contains(r#""kind": "wkt""#));
+        assert!(raw.contains(r#""wkt": "GEOGCS"#));
+        assert!(raw.contains(r#""kind": "proj""#));
+        assert!(raw.contains(r#""proj": "+proj=utm"#));
         assert!(raw.contains(r#""kind": "custom_tm""#));
+        assert!(raw.contains(r#""datum": "pulkovo1942""#));
         assert!(raw.contains(r#""central_meridian_deg""#));
+        assert!(raw.contains(r#""unit": "metre""#));
         assert!(raw.contains(r#""name": "Rostov""#));
         assert!(!raw.contains(r#""pose""#));
 
@@ -425,13 +375,61 @@ mod tests {
             loaded.recent_files,
             vec![PathBuf::from("/tmp/a.tif"), PathBuf::from("/tmp/b.tif")]
         );
-        let spec = loaded.open_layers[0]
-            .crs_override
-            .as_ref()
-            .expect("crs override")
-            .to_crs_spec()
-            .expect("valid custom TM");
-        assert_eq!(spec.label(), "MSK-61 Custom");
+
+        let expected = [&epsg_ov, &wkt_ov, &proj_ov, &custom_tm_ov];
+        for (entry, expected_ov) in loaded.open_layers.iter().zip(expected) {
+            let roundtripped = entry.crs_override().expect("crs override");
+            assert_eq!(&roundtripped, expected_ov);
+            assert!(roundtripped.to_crs_spec().is_ok());
+        }
+        assert_eq!(
+            loaded.open_layers[3]
+                .crs_override()
+                .expect("custom tm")
+                .to_crs_spec()
+                .expect("valid custom TM")
+                .label(),
+            "MSK-61 Custom"
+        );
+    }
+
+    #[test]
+    fn session_custom_tm_omitted_datum_defaults_to_wgs84() {
+        let tmp = TestTempDir::new("session-default-datum");
+        let paths = StoragePaths::with_root(tmp.path());
+        std::fs::create_dir_all(paths.session_path().parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            paths.session_path(),
+            r#"{
+              "version": 1,
+              "open_layers": [{
+                "path": "/tmp/legacy.tif",
+                "visible": true,
+                "opacity": 1.0,
+                "crs_override": {
+                  "kind": "custom_tm",
+                  "name": "Legacy TM",
+                  "central_meridian_deg": 39.0,
+                  "origin_lat_deg": 0.0,
+                  "scale": 1.0,
+                  "false_easting_m": 500000.0,
+                  "false_northing_m": 0.0,
+                  "unit": "us_survey_foot"
+                }
+              }]
+            }"#,
+        )
+        .expect("write legacy session");
+
+        let loaded = AppSession::load_or_default(&paths);
+        assert_eq!(loaded.open_layers.len(), 1);
+        match loaded.open_layers[0].crs_override() {
+            Some(CrsOverride::CustomTm(params)) => {
+                assert_eq!(params.datum, DatumPreset::Wgs84);
+                assert_eq!(params.unit, LinearUnit::UsSurveyFoot);
+            }
+            other => panic!("expected CustomTm, got {other:?}"),
+        }
     }
 
     #[test]

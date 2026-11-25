@@ -23,7 +23,7 @@ pub(crate) const DEFAULT_UPLOAD_TIME_BUDGET: Duration = Duration::from_millis(2)
 /// awaiting GPU upload (`64 MiB`).
 const DEFAULT_MAX_QUEUED_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
-/// Error returned by [`UploadSender::send`] after [`PendingUploads::close`]
+/// Error returned by [`UploadSender::send`] after `PendingUploads::close`
 /// shuts down the upload queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UploadChannelClosed;
@@ -67,13 +67,13 @@ pub struct UploadBatchReport {
     /// NOT trigger an infinite idle repaint loop on its own).
     pub deferred_protected: usize,
     /// Largest single uploaded tile byte size observed per source in this pass.
-    pub max_tile_bytes_by_source: Vec<(SourceId, usize)>,
+    pub(crate) max_tile_bytes_by_source: Vec<(SourceId, usize)>,
 }
 
 impl UploadBatchReport {
     /// Return the largest single tile byte size uploaded for `source` during
     /// this pass (`0` if no tile of `source` was uploaded).
-    pub fn max_tile_bytes_for(&self, source: SourceId) -> usize {
+    pub(crate) fn max_tile_bytes_for(&self, source: SourceId) -> usize {
         self.max_tile_bytes_by_source
             .iter()
             .find_map(|&(src, bytes)| (src == source).then_some(bytes))
@@ -226,7 +226,7 @@ impl UploadSender {
     ///
     /// Returns `Ok(true)` if admitted, `Ok(false)` if cancelled, or
     /// `Err(UploadChannelClosed)` once [`PendingUploads::close`] has run.
-    pub fn send_if_uncancelled(
+    pub(crate) fn send_if_uncancelled(
         &self,
         item: (TileKey, DecodedTile),
         cancel: &CancelToken,
@@ -236,7 +236,7 @@ impl UploadSender {
 
     /// Submit a decoded tile for GPU upload.
     ///
-    /// Returns `Err(UploadChannelClosed)` once [`PendingUploads::close`] has
+    /// Returns `Err(UploadChannelClosed)` once `PendingUploads::close` has
     /// been called; otherwise admits the tile under `max_queued_bytes`
     /// (evicting finest non-pinned tiles outside the lock if needed).
     pub fn send(&self, item: (TileKey, DecodedTile)) -> Result<(), UploadChannelClosed> {
@@ -271,14 +271,14 @@ impl PendingUploads {
 
     /// Create a new upload queue with an explicit CPU queued byte ceiling
     /// enforced immediately on producer enqueue.
-    pub fn with_max_queued_bytes(max_queued_bytes: usize) -> Self {
+    pub(crate) fn with_max_queued_bytes(max_queued_bytes: usize) -> Self {
         Self {
             shared: Arc::new(Mutex::new(SharedUploadQueue::new(max_queued_bytes))),
         }
     }
 
     /// Clone a producer sender for a background tile worker or decode pool.
-    /// Returns `None` once [`Self::close`] has been called.
+    /// Returns `None` once `Self::close` has been called.
     pub fn sender(&self) -> Option<UploadSender> {
         let state = lock_unpoisoned(&self.shared);
         (!state.closed).then(|| UploadSender {
@@ -303,7 +303,7 @@ impl PendingUploads {
 
     /// Close the upload queue and release all queued payloads during
     /// deterministic shutdown so background producers exit promptly on send.
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         let drained: Vec<DecodedTile> = {
             let mut state = lock_unpoisoned(&self.shared);
             state.closed = true;
@@ -314,7 +314,8 @@ impl PendingUploads {
     }
 
     /// Total CPU bytes currently buffered across queued decoded tiles.
-    pub fn queued_bytes(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> usize {
         lock_unpoisoned(&self.shared).queued_bytes
     }
 
@@ -324,7 +325,7 @@ impl PendingUploads {
     }
 
     /// Count queued decoded tiles belonging to `source`.
-    pub fn count_for_source(&self, source: SourceId) -> usize {
+    pub(crate) fn count_for_source(&self, source: SourceId) -> usize {
         lock_unpoisoned(&self.shared)
             .queued
             .keys()
@@ -333,12 +334,12 @@ impl PendingUploads {
     }
 
     /// Discard any queued decoded tiles belonging to `source`.
-    pub fn clear_source(&mut self, source: SourceId) {
+    pub(crate) fn clear_source(&mut self, source: SourceId) {
         self.clear_where(|key| key.source == source);
     }
 
     /// Discard any queued decoded tiles matching `predicate`.
-    pub fn clear_where<F>(&mut self, mut predicate: F)
+    pub(crate) fn clear_where<F>(&mut self, mut predicate: F)
     where
         F: FnMut(&TileKey) -> bool,
     {

@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use veldmap_core::geo::projection::web_mercator_lat_deg;
+use veldmap_core::geo::web_mercator_lat_deg;
 use veldmap_core::tile::{
     DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, geodetic_lat_bounds, polar_cap_point,
     polar_cap_uv_bounds, tile_lon_bounds, web_mercator_y_bounds,

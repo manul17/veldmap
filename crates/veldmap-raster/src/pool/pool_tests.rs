@@ -218,7 +218,7 @@ fn pass_job_keys_deduplicate_and_two_lane_threads_carry_distinct_names() {
         gutter: 0,
     };
     assert!(handle.submit(DecodeJob {
-        key: pass_key.into(),
+        key: DecodeJobKey::Pass(pass_key),
         queued_bytes: 0,
         cancel: tok.clone(),
         work: Box::new(|| {}),

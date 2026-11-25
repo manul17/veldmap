@@ -7,6 +7,7 @@ mod png;
 use crate::pipeline::metadata::GeoPlacement;
 
 pub use jpeg::{JpegSource, has_jpeg_magic};
+pub(crate) use jpeg::{decode_jpeg_pixels_to_rgb8, decode_jpeg_pixels_to_rgba8};
 pub use png::{PngSource, has_png_magic};
 
 pub(super) fn world_file_binding_trouble(
@@ -18,9 +19,9 @@ pub(super) fn world_file_binding_trouble(
         None => Some(format!(
             "{format_name} has no accompanying world file ({ext_hint}); add a world file + .prj or assign a CRS"
         )),
-        Some(p) if p.crs.is_none() => Some(format!(
-            "{format_name} has a world file ({ext_hint}) but no accompanying .prj CRS sidecar; assign a CRS to place it"
-        )),
+        Some(p) if p.crs.is_none() => Some(crate::sidecar::missing_prj_trouble(&format!(
+            "{format_name} has a world file ({ext_hint})"
+        ))),
         Some(_) => None,
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::geo::datum::{INTERNATIONAL_FOOT_M, KRASOVSKY, US_SURVEY_FOOT_M};
+use crate::geo::ground_m;
 
 #[test]
 fn web_mercator_world_is_square() {
@@ -67,6 +68,20 @@ fn web_mercator_and_expanded_epsg_recognized() {
         Some(Projection::Proj4(_))
     ));
     assert_eq!(Projection::from_epsg(999_999), None);
+
+    // In-house GK and MSK-61 labels are recognized without requiring a manual name.
+    assert!(
+        Projection::from_epsg(28407)
+            .expect("GK 7")
+            .label()
+            .contains("28407")
+    );
+    assert!(
+        Projection::from_epsg(6_336_101)
+            .expect("MSK-61 z1")
+            .label()
+            .contains("MSK-61")
+    );
 }
 
 #[test]
@@ -102,13 +117,6 @@ fn system_origin_latitude_and_linear_units_round_trip() {
     let (e_ft, n_ft) = sys_ft.from_geodetic(39.5, -74.2);
     let back_ft = sys_ft.to_geodetic(e_ft, n_ft);
     assert!(ground_m(back_ft, (39.5, -74.2)) < 1e-4);
-}
-
-fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {
-    let lat = ((first.0 + second.0) / 2.0).to_radians();
-    let per_lat = 111_132.92 - 559.82 * (2.0 * lat).cos();
-    let per_lon = 111_412.84 * lat.cos() - 93.5 * (3.0 * lat).cos();
-    ((first.0 - second.0) * per_lat).hypot((first.1 - second.1) * per_lon)
 }
 
 #[test]

@@ -6,11 +6,9 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 
-use crate::geo::camera::Camera;
-use crate::geo::geodesy;
-use crate::geo::projection::web_mercator_lat_deg;
-use crate::geo::sag;
-use crate::geo::{Ball, CullFrustum};
+use crate::geo::{
+    Ball, Camera, CullFrustum, EQUATORIAL_CIRCUMFERENCE_M, WGS84, sag, web_mercator_lat_deg,
+};
 
 use super::geometry::{
     lat_lon_bounds, lerp_f64, sample_tile_surface, tile_lon_bounds, web_mercator_y_bounds,
@@ -174,7 +172,7 @@ fn sample_geodetic_grid(
         .map(|row| lerp_f64(b.lat_north_deg, b.lat_south_deg, f64::from(row) * 0.25));
     let lons = [0u32, 1, 2, 3, 4]
         .map(|col| lerp_f64(b.lon_west_deg, b.lon_east_deg, f64::from(col) * 0.25));
-    geodesy::WGS84.fill_separable_surface_grid(&lats, &lons, samples, Some(sample_units));
+    WGS84.fill_separable_surface_grid(&lats, &lons, samples, sample_units);
 
     if b.lat_north_deg >= b.raw_lat_north_deg && b.lat_south_deg <= b.raw_lat_south_deg {
         return Some(0.0);
@@ -204,7 +202,7 @@ fn sample_web_mercator_grid(
         .map(|row| web_mercator_lat_deg(lerp_f64(merc_n, merc_s, f64::from(row) * 0.25)));
     let lons =
         [0u32, 1, 2, 3, 4].map(|col| lerp_f64(lon_west_deg, lon_east_deg, f64::from(col) * 0.25));
-    geodesy::WGS84.fill_separable_surface_grid(&lats, &lons, samples, Some(sample_units));
+    WGS84.fill_separable_surface_grid(&lats, &lons, samples, sample_units);
 
     // Evaluate the most equatorial mesh cell directly so non-linear
     // Mercator stretching at coarse z=0..1 does not underestimate sag.
@@ -235,7 +233,7 @@ fn sample_polar_cap_grid(
         for col in 0..5u32 {
             let s = f64::from(col) * 0.25;
             let sample = sample_tile_surface(id, s, t)?;
-            let (ecef, unit) = geodesy::surface_ecef_and_normal(sample.lat_deg, sample.lon_deg);
+            let (ecef, unit) = WGS84.surface_ecef_and_normal(sample.lat_deg, sample.lon_deg);
             sample_units[idx] = unit;
             samples[idx] = ecef;
             idx += 1;
@@ -330,7 +328,7 @@ fn approx_tile_width_m(tile: &VisibleTile) -> f64 {
             PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator
         )
     {
-        return geodesy::EQUATORIAL_CIRCUMFERENCE_M / f64::from(cols);
+        return EQUATORIAL_CIRCUMFERENCE_M / f64::from(cols);
     }
     // Bounding-sphere radius is ~half the tile diagonal (`sqrt(2)/2 * width`).
     (tile.ball.radius * std::f64::consts::SQRT_2).max(1.0)

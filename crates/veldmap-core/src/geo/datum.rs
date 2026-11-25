@@ -10,7 +10,7 @@ use glam::DVec3;
 use super::geodesy::{Ellipsoid, Geodetic, WGS84};
 
 /// International foot in metres (EPSG:9002).
-pub const INTERNATIONAL_FOOT_M: f64 = 0.3048;
+pub(crate) const INTERNATIONAL_FOOT_M: f64 = 0.3048;
 
 /// US Survey foot in metres (EPSG:9003, `1200 / 3937`).
 pub const US_SURVEY_FOOT_M: f64 = 1200.0 / 3937.0;
@@ -22,7 +22,7 @@ pub const KRASOVSKY: Ellipsoid = Ellipsoid {
 };
 
 /// Airy 1830 ellipsoid (OSGB36 / EPSG:7001).
-pub const AIRY_1830: Ellipsoid = Ellipsoid {
+pub(crate) const AIRY_1830: Ellipsoid = Ellipsoid {
     semi_major_m: 6_377_563.396,
     flattening: 1.0 / 299.324_964_6,
 };
@@ -248,50 +248,63 @@ impl LinearUnit {
     }
 }
 
+struct KnownDatumEntry {
+    datum: Datum,
+    name: &'static str,
+    is_geographic_crs: bool,
+    grid_shift_recommended: bool,
+}
+
+fn lookup_known_datum(code: u32) -> Option<KnownDatumEntry> {
+    const OSGB36: Datum = Datum::from_towgs84(
+        AIRY_1830,
+        [446.448, -125.157, 542.060, 0.1502, 0.2470, 0.8421, -20.4894],
+    );
+    let (datum, name, grid_shift_recommended) = match code {
+        4326 | 4979 | 6326 => (WGS84_DATUM, "WGS 84", false),
+        4284 | 6284 => (PULKOVO_1942, "Pulkovo 1942", false),
+        4269 | 6269 => (WGS84_DATUM, "NAD83", true),
+        4258 | 6258 => (WGS84_DATUM, "ETRS89", true),
+        4277 | 6277 => (OSGB36, "OSGB36", true),
+        _ => return None,
+    };
+    Some(KnownDatumEntry {
+        datum,
+        name,
+        is_geographic_crs: code < 6000,
+        grid_shift_recommended,
+    })
+}
+
 /// Resolve a known static [`Datum`] from a geographic CRS EPSG code (`2048`) or
 /// geodetic datum EPSG code (`2050`).
 pub fn known_datum_from_code(code: u32) -> Option<(Datum, Option<DatumWarning>)> {
-    match code {
-        4326 | 4979 | 6326 => Some((WGS84_DATUM, None)),
-        4284 | 6284 => Some((PULKOVO_1942, None)),
-        4269 | 6269 => Some((
-            WGS84_DATUM,
-            Some(DatumWarning::GridShiftRecommended {
-                label: format!("NAD83 (EPSG:{code})"),
-            }),
-        )),
-        4258 | 6258 => Some((
-            WGS84_DATUM,
-            Some(DatumWarning::GridShiftRecommended {
-                label: format!("ETRS89 (EPSG:{code})"),
-            }),
-        )),
-        4277 | 6277 => Some((
-            Datum::from_towgs84(
-                AIRY_1830,
-                [446.448, -125.157, 542.060, 0.1502, 0.2470, 0.8421, -20.4894],
-            ),
-            Some(DatumWarning::GridShiftRecommended {
-                label: format!("OSGB36 (EPSG:{code})"),
-            }),
-        )),
-        _ => None,
-    }
+    let entry = lookup_known_datum(code)?;
+    let warning = entry
+        .grid_shift_recommended
+        .then(|| DatumWarning::GridShiftRecommended {
+            label: format!("{} (EPSG:{code})", entry.name),
+        });
+    Some((entry.datum, warning))
 }
 
 /// Resolve a known static geographic CRS (4xxx EPSG code only, keeping 6xxx
 /// datum codes strictly distinct) into its `(Datum, label, Option<DatumWarning>)`.
 pub(crate) fn known_geographic_epsg(code: u32) -> Option<(Datum, String, Option<DatumWarning>)> {
-    let label = match code {
-        4326 | 4979 => format!("EPSG:{code} (WGS 84)"),
-        4284 => "EPSG:4284 (Pulkovo 1942)".to_string(),
-        4269 => "EPSG:4269 (NAD83)".to_string(),
-        4258 => "EPSG:4258 (ETRS89)".to_string(),
-        4277 => "EPSG:4277 (OSGB36)".to_string(),
-        _ => return None,
-    };
-    let (datum, warning) = known_datum_from_code(code)?;
-    Some((datum, label, warning))
+    let entry = lookup_known_datum(code)?;
+    if !entry.is_geographic_crs {
+        return None;
+    }
+    let warning = entry
+        .grid_shift_recommended
+        .then(|| DatumWarning::GridShiftRecommended {
+            label: format!("{} (EPSG:{code})", entry.name),
+        });
+    Some((
+        entry.datum,
+        format!("EPSG:{code} ({})", entry.name),
+        warning,
+    ))
 }
 
 /// Resolve an ellipsoid from common GeoTIFF `GeogEllipsoidGeoKey` (2056) codes.

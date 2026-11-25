@@ -91,7 +91,15 @@ pub struct DrawVectorLayer {
     pub id: DrawVectorId,
     pub rev: u64,
     pub opacity: f32,
+    /// Polygon fill color as **sRGB RGB (`0.0..=1.0`) + linear alpha (`0.0..=1.0`)**.
+    /// RGB channels are converted to linear light once per layer on CPU in
+    /// `VectorRenderer::push_uniforms` before writing to the `Rgba8UnormSrgb`
+    /// offscreen target.
     pub fill_color: [f32; 4],
+    /// Stroke / point-marker color as **sRGB RGB (`0.0..=1.0`) + linear alpha (`0.0..=1.0`)**.
+    /// RGB channels are converted to linear light once per layer on CPU in
+    /// `VectorRenderer::push_uniforms` before writing to the `Rgba8UnormSrgb`
+    /// offscreen target.
     pub line_color: [f32; 4],
     pub mesh: Arc<VectorMesh>,
 }

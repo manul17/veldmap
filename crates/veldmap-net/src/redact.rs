@@ -88,7 +88,7 @@ fn is_valid_url_scheme(scheme: &str) -> bool {
 /// Redact `user:pass@` authority credentials and `?query` strings from a URL
 /// or URL template so inline secrets never appear in `Debug` output, logs, or
 /// UI tooltips.
-pub fn sanitize_url_for_display(url: &str) -> String {
+pub(crate) fn sanitize_url_for_display(url: &str) -> String {
     let trimmed = url.trim();
     let scheme_end = trimmed
         .find("://")
@@ -186,7 +186,7 @@ fn trim_trailing_prose_punct(token: &str) -> usize {
 }
 
 /// Return `"<redacted>"` when `secret` is non-empty, or `empty_label` otherwise.
-pub fn redact_secret_label(secret: Option<&str>, empty_label: &'static str) -> &'static str {
+pub(crate) fn redact_secret_label(secret: Option<&str>, empty_label: &'static str) -> &'static str {
     if secret.is_some_and(|s| !s.is_empty()) {
         "<redacted>"
     } else {

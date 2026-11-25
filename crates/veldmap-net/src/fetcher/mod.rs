@@ -255,3 +255,13 @@ impl Drop for LiveTilePipeline {
         self.shutdown_inner();
     }
 }
+
+#[cfg(test)]
+pub(super) fn wm_key(spec: &LiveBasemapSpec, level: u8, x: u32, y: u32) -> TileKey {
+    spec.tile_key(veldmap_core::tile::QuadTileId {
+        scheme: veldmap_core::tile::PlanetaryScheme::WebMercator,
+        level,
+        x,
+        y,
+    })
+}

@@ -81,8 +81,8 @@ impl Ellipsoid {
     }
 
     /// Evaluate a separable `lats_deg.len() x lons_deg.len()` row-major grid of
-    /// surface (`height_m = 0.0`) ECEF points (and optional outward unit
-    /// normals), computing trigonometry once per row and once per column.
+    /// surface (`height_m = 0.0`) ECEF points and outward unit normals,
+    /// computing trigonometry once per row and once per column.
     ///
     /// Uses a 65-column stack cache (covering both `5 x 5` culling probes and
     /// `MAX_WARP_SEGMENTS + 1 = 65` warp patches) so hot per-frame callers
@@ -92,7 +92,7 @@ impl Ellipsoid {
         lats_deg: &[f64],
         lons_deg: &[f64],
         out_points: &mut [DVec3],
-        out_normals: Option<&mut [DVec3]>,
+        out_normals: &mut [DVec3],
     ) {
         const STACK_LON_CAP: usize = 65;
 
@@ -101,12 +101,10 @@ impl Ellipsoid {
             out_points.len() >= len,
             "separable surface grid point buffer must hold at least {len} entries"
         );
-        if let Some(normals) = out_normals.as_deref() {
-            assert!(
-                normals.len() >= len,
-                "separable surface grid normal buffer must hold at least {len} entries"
-            );
-        }
+        assert!(
+            out_normals.len() >= len,
+            "separable surface grid normal buffer must hold at least {len} entries"
+        );
 
         let mut stack_lons = [(0.0_f64, 0.0_f64); STACK_LON_CAP];
         let mut heap_lons = Vec::new();
@@ -127,34 +125,18 @@ impl Ellipsoid {
         let e2 = self.eccentricity_sq();
         let one_minus_e2 = 1.0 - e2;
         let out_points = &mut out_points[..len];
-        let out_normals = out_normals.map(|n| &mut n[..len]);
+        let out_normals = &mut out_normals[..len];
 
         let mut idx = 0usize;
-        match out_normals {
-            Some(normals) => {
-                for &lat_deg in lats_deg {
-                    let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
-                    let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-                    let eq = curvature * cos_lat;
-                    let z = curvature * one_minus_e2 * sin_lat;
-                    for &(sin_lon, cos_lon) in lon_cache {
-                        normals[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
-                        out_points[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
-                        idx += 1;
-                    }
-                }
-            }
-            None => {
-                for &lat_deg in lats_deg {
-                    let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
-                    let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-                    let eq = curvature * cos_lat;
-                    let z = curvature * one_minus_e2 * sin_lat;
-                    for &(sin_lon, cos_lon) in lon_cache {
-                        out_points[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
-                        idx += 1;
-                    }
-                }
+        for &lat_deg in lats_deg {
+            let (sin_lat, cos_lat) = lat_deg.to_radians().sin_cos();
+            let curvature = self.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+            let eq = curvature * cos_lat;
+            let z = curvature * one_minus_e2 * sin_lat;
+            for &(sin_lon, cos_lon) in lon_cache {
+                out_normals[idx] = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+                out_points[idx] = DVec3::new(eq * cos_lon, eq * sin_lon, z);
+                idx += 1;
             }
         }
     }
@@ -254,15 +236,8 @@ impl Geodetic {
 
 /// Convert WGS84 geodetic coordinates to `f64` ECEF Cartesian coordinates in
 /// **metres**.
-pub fn world(point: Geodetic) -> DVec3 {
+pub(crate) fn world(point: Geodetic) -> DVec3 {
     WGS84.to_ecef(point)
-}
-
-/// Compute both the WGS84 surface ECEF position in **metres** and outward unit
-/// geodetic normal for `(lat_deg, lon_deg)` in a single `sin_cos` pass.
-#[inline]
-pub fn surface_ecef_and_normal(lat_deg: f64, lon_deg: f64) -> (DVec3, DVec3) {
-    WGS84.surface_ecef_and_normal(lat_deg, lon_deg)
 }
 
 /// Intersect a ray `(origin, direction)` (with `origin` in ECEF metres) with

@@ -6,8 +6,8 @@ use veldmap_core::tile::TileScheme;
 use veldmap_storage::DiskTileKey;
 use veldmap_storage::test_support::TestTempDir;
 
+use super::settings::BasemapSelection;
 use super::*;
-use crate::settings::BasemapSelection;
 
 #[test]
 fn update_settings_skips_noop_writes_and_flushes_async_saves_on_shutdown() {

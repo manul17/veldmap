@@ -117,11 +117,11 @@ mod tests {
 
     use tokio::sync::Notify;
     use veldmap_core::sync::CancelToken;
-    use veldmap_core::tile::{PlanetaryScheme, QuadTileId};
 
     use crate::basemap::LiveBasemapSpec;
     use crate::http::HostLimiters;
 
+    use super::super::wm_key;
     use super::*;
 
     #[test]
@@ -133,12 +133,7 @@ mod tests {
             notify: Notify::new(),
         });
         let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
-        let key = spec.tile_key(QuadTileId {
-            scheme: PlanetaryScheme::WebMercator,
-            level: 0,
-            x: 0,
-            y: 0,
-        });
+        let key = wm_key(&spec, 0, 0, 0);
 
         let (gen1, _) = {
             let mut st = lock_unpoisoned(&shared.state);

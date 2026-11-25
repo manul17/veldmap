@@ -42,7 +42,7 @@ impl Ball {
     }
 
     /// Expand the bounding sphere radius by `by_m` metres.
-    pub fn widened(self, by_m: f64) -> Self {
+    pub(crate) fn widened(self, by_m: f64) -> Self {
         Self {
             radius: self.radius + by_m,
             ..self
@@ -111,7 +111,7 @@ impl CullFrustum {
 
     /// Signed distance in metres of `point` above (`>= 0`) or below (`< 0`)
     /// the exact WGS84 ellipsoidal tangent horizon plane.
-    pub fn horizon_margin(&self, point: DVec3) -> f64 {
+    pub(crate) fn horizon_margin(&self, point: DVec3) -> f64 {
         point.dot(self.towards) - self.horizon
     }
 

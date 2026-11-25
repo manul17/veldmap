@@ -6,11 +6,8 @@ pub(crate) mod format;
 pub(crate) mod hud;
 pub(crate) mod layers;
 pub(crate) mod measure;
-mod settings_window;
 pub(crate) mod status_bar;
 pub(crate) mod toolbar;
-
-pub(crate) use settings_window::show_settings_window;
 
 use eframe::egui;
 

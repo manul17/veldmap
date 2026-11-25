@@ -21,7 +21,7 @@ use super::{BasemapStatusSnapshot, BasemapSyncOutcome, LiveStreamStatus};
 use crate::gpu_tiles::{
     GpuTileCache, PendingUploads, UploadBatchReport, UploadSender, display_tile_mip_bytes,
 };
-use crate::settings::{AppSettings, BasemapSelection};
+use crate::storage::settings::{AppSettings, BasemapSelection};
 
 /// Attribution string displayed for the bundled public-domain Blue Marble
 /// offline basemap.
@@ -492,5 +492,5 @@ struct ScheduledCandidates {
 }
 
 #[cfg(test)]
-#[path = "basemap_tests.rs"]
+#[path = "manager_tests.rs"]
 mod tests;

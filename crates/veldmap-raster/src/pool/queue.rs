@@ -14,18 +14,6 @@ pub enum DecodeJobKey {
     Pass(StreamKey),
 }
 
-impl From<TileKey> for DecodeJobKey {
-    fn from(key: TileKey) -> Self {
-        Self::Tile(key)
-    }
-}
-
-impl From<StreamKey> for DecodeJobKey {
-    fn from(key: StreamKey) -> Self {
-        Self::Pass(key)
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct DecodeJobPriority(DecodeJobKey);
 

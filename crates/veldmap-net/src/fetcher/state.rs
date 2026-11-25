@@ -218,8 +218,8 @@ impl PipelineState {
         self.requeue_eligible_entries(active_source, expired, is_ready);
 
         for &key in &self.last_wanted {
-            if self.is_queue_eligible(&key, active_source) && !self.pending.http.contains(&key) {
-                self.pending.disk.insert_unique(key);
+            if self.is_queue_eligible(&key, active_source) {
+                self.pending.insert_disk(key);
             }
         }
 
@@ -268,14 +268,10 @@ impl PipelineState {
     }
 
     pub(super) fn drain_disk_to_http(&mut self, active_source: SourceId) {
-        if self.pending.disk.is_empty() {
-            return;
-        }
-        for key in self.pending.disk.drain() {
-            if self.is_queue_eligible(&key, active_source) {
-                self.pending.http.insert_unique(key);
-            }
-        }
+        let in_flight = &self.in_flight;
+        let failures = &self.failures;
+        self.pending
+            .drain_disk_to_http(|key| is_key_eligible(in_flight, failures, key, active_source));
     }
 
     pub(super) fn pop_next_disk(
@@ -287,7 +283,7 @@ impl PipelineState {
         if self.in_flight.disk_in_flight() >= max_concurrent_disk {
             return None;
         }
-        while let Some(key) = self.pending.disk.pop() {
+        while let Some(key) = self.pending.pop_disk() {
             if !self.is_queue_eligible(&key, active_source) {
                 continue;
             }
@@ -302,7 +298,7 @@ impl PipelineState {
     }
 
     pub(super) fn pop_next_http(&mut self, active_source: SourceId) -> Option<TileKey> {
-        while let Some(key) = self.pending.http.pop() {
+        while let Some(key) = self.pending.pop_http() {
             if self.is_queue_eligible(&key, active_source) {
                 return Some(key);
             }
@@ -319,12 +315,12 @@ impl PipelineState {
     }
 
     pub(super) fn push_deferred_http(&mut self, deferred: Vec<TileKey>) {
-        self.pending.http.push_unique(deferred);
+        self.pending.push_http(deferred);
     }
 
     #[cfg(test)]
     pub(super) fn is_http_pending(&self, key: &TileKey) -> bool {
-        self.pending.http.contains(key)
+        self.pending.contains_http(key)
     }
 
     pub(super) fn remove_in_flight_if_gen(&mut self, key: &TileKey, generation: u64) -> bool {
@@ -341,7 +337,7 @@ impl PipelineState {
             return Transition::Stale;
         }
         if can_requeue && !self.failures.is_suppressed(&key) {
-            self.pending.http.insert_unique(key);
+            self.pending.insert_http(key);
         }
         Transition::APPLIED_SILENT
     }

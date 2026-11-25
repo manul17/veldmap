@@ -91,7 +91,7 @@ pub fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageErro
 /// Atomically and durably write `bytes` to `path` with owner-only permissions
 /// (`0600` on Unix; on Windows, relies on parent user-profile directory ACLs)
 /// for configuration files that may store API keys.
-pub fn write_atomic_durable_private(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+fn write_atomic_durable_private(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     write_atomic_impl(path, bytes, true)
 }
 
@@ -155,8 +155,8 @@ fn write_atomic_impl(path: &Path, bytes: &[u8], private: bool) -> Result<(), Sto
     Ok(())
 }
 
-/// Serialize `value` as pretty JSON and persist it via
-/// [`write_atomic_durable_private`] (`0600` permissions on Unix).
+/// Serialize `value` as pretty JSON and persist it via private atomic durable
+/// write (`0600` permissions on Unix).
 pub fn write_json_durable_private<T: Serialize>(
     path: &Path,
     value: &T,

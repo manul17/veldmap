@@ -17,6 +17,12 @@ use crate::pipeline::metadata::{GeoPlacement, PlacementCrs};
 /// Maximum sidecar file size (1 MiB) to guard against reading huge accidental files.
 const MAX_SIDECAR_BYTES: u64 = 1024 * 1024;
 
+/// Format consistent user guidance when a raster has an affine/world-file
+/// transform but lacks an accompanying `.prj` CRS sidecar.
+pub(crate) fn missing_prj_trouble(subject: &str) -> String {
+    format!("{subject} but no accompanying .prj CRS sidecar; assign a CRS to place it")
+}
+
 /// Parsed external georeferencing sidecars accompanying a local raster file.
 ///
 /// Either or both fields may be present: a PNG/JPEG typically carries a world

@@ -14,8 +14,43 @@ use veldmap_core::tile::SourceFingerprint;
 
 use super::TiffSource;
 use crate::RasterError;
-use crate::pipeline::DecodeContext;
 use crate::pipeline::chunk_cache::SharedChunkCache;
+use crate::pipeline::{DecodeContext, RasterSource};
+
+struct ControlledTailSource {
+    inner: MemoryByteSource,
+    threshold: u64,
+    armed: AtomicBool,
+    hit: AtomicBool,
+    fail_tail: AtomicBool,
+    tail_reads: AtomicUsize,
+    release: CancelToken,
+}
+
+impl ByteSource for ControlledTailSource {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8], cancel: &CancelToken) -> Result<usize, IoError> {
+        if self.armed.load(Ordering::Acquire)
+            && offset.saturating_add(buf.len() as u64) > self.threshold
+        {
+            self.tail_reads.fetch_add(1, Ordering::AcqRel);
+            self.hit.store(true, Ordering::Release);
+            while !self.release.is_cancelled() && !cancel.is_cancelled() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            if cancel.is_cancelled() {
+                return Err(IoError::Cancelled);
+            }
+            if self.fail_tail.load(Ordering::Acquire) {
+                return Err(IoError::Io(std::io::Error::other("simulated disk fault")));
+            }
+        }
+        self.inner.read_at(offset, buf, cancel)
+    }
+}
 
 fn tiny_u16_tiff_bytes() -> Vec<u8> {
     let mut file = Cursor::new(Vec::new());
@@ -46,46 +81,6 @@ fn tiny_u16_tiff_bytes() -> Vec<u8> {
 
 #[test]
 fn display_mapping_distinguishes_leader_cancel_from_permanent_failure() {
-    struct ControlledTailSource {
-        inner: MemoryByteSource,
-        threshold: u64,
-        armed: AtomicBool,
-        hit: AtomicBool,
-        fail_tail: AtomicBool,
-        tail_reads: AtomicUsize,
-        release: CancelToken,
-    }
-
-    impl ByteSource for ControlledTailSource {
-        fn len(&self) -> u64 {
-            self.inner.len()
-        }
-
-        fn read_at(
-            &self,
-            offset: u64,
-            buf: &mut [u8],
-            cancel: &CancelToken,
-        ) -> Result<usize, IoError> {
-            if self.armed.load(Ordering::Acquire)
-                && offset.saturating_add(buf.len() as u64) > self.threshold
-            {
-                self.tail_reads.fetch_add(1, Ordering::AcqRel);
-                self.hit.store(true, Ordering::Release);
-                while !self.release.is_cancelled() && !cancel.is_cancelled() {
-                    thread::sleep(Duration::from_millis(2));
-                }
-                if cancel.is_cancelled() {
-                    return Err(IoError::Cancelled);
-                }
-                if self.fail_tail.load(Ordering::Acquire) {
-                    return Err(IoError::Io(std::io::Error::other("simulated disk fault")));
-                }
-            }
-            self.inner.read_at(offset, buf, cancel)
-        }
-    }
-
     let raw = tiny_u16_tiff_bytes();
     let budget = MemoryBudget::default();
     let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
@@ -249,4 +244,79 @@ fn display_mapping_distinguishes_leader_cancel_from_permanent_failure() {
         cancel: &CancelToken::new(),
     };
     assert_eq!(cancel_src.display_mapping(&ctx).expect("cached"), mapping);
+}
+
+#[test]
+fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
+    let raw = tiny_u16_tiff_bytes();
+    let release = CancelToken::new();
+    let gate = Arc::new(ControlledTailSource {
+        inner: MemoryByteSource::from_vec(raw),
+        threshold: 64 * 1024,
+        armed: AtomicBool::new(false),
+        hit: AtomicBool::new(false),
+        fail_tail: AtomicBool::new(false),
+        tail_reads: AtomicUsize::new(0),
+        release: release.clone(),
+    });
+    let budget = MemoryBudget::default();
+    let src = Arc::new(
+        TiffSource::open(
+            Arc::clone(&gate) as Arc<dyn ByteSource>,
+            SourceFingerprint::from_digest([9u8; 32]),
+            &budget,
+            &CancelToken::new(),
+        )
+        .expect("open 16-bit"),
+    );
+    gate.armed.store(true, Ordering::Release);
+
+    let chunk_cache = Arc::new(SharedChunkCache::new(budget.decoded_chunk_cache_bytes));
+    let tracker = Arc::new(DecodeBudgetTracker::new(budget.decode_working_bytes));
+
+    let leader = {
+        let src = Arc::clone(&src);
+        let cache = Arc::clone(&chunk_cache);
+        let tracker = Arc::clone(&tracker);
+        let b = budget;
+        thread::spawn(move || {
+            let cancel = CancelToken::new();
+            let ctx = DecodeContext {
+                chunk_cache: &cache,
+                budget_tracker: &tracker,
+                budget: &b,
+                cancel: &cancel,
+            };
+            src.decode_pointwise_tile(0, 0, 0, &ctx)
+        })
+    };
+
+    while !gate.hit.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let waiter_cancel = CancelToken::new();
+    let waiter = {
+        let src = Arc::clone(&src);
+        let cache = Arc::clone(&chunk_cache);
+        let tracker = Arc::clone(&tracker);
+        let c = waiter_cancel.clone();
+        let b = budget;
+        thread::spawn(move || {
+            let ctx = DecodeContext {
+                chunk_cache: &cache,
+                budget_tracker: &tracker,
+                budget: &b,
+                cancel: &c,
+            };
+            src.decode_pointwise_tile(0, 0, 0, &ctx)
+        })
+    };
+    thread::sleep(Duration::from_millis(15));
+    waiter_cancel.cancel();
+    let waiter_res = waiter.join().expect("join waiter");
+    assert!(matches!(waiter_res, Err(RasterError::Cancelled)));
+
+    release.cancel();
+    assert!(leader.join().expect("join leader").is_ok());
 }

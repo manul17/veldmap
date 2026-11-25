@@ -20,18 +20,18 @@ use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
 use crate::gpu_tiles::UploadChannelClosed;
-use crate::measure::MeasureSession;
 use crate::render::GlobeRenderer;
 use crate::scene::{SceneRepaintHint, SceneState};
-use crate::session::SavedCameraPose;
 use crate::storage::AppStorage;
+use crate::storage::session::SavedCameraPose;
+use crate::storage::settings::AppSettings;
 use crate::ui::basemap::BasemapUiState;
 use crate::ui::crs_picker::{CrsPickerState, show_crs_picker_window};
 use crate::ui::hud;
 use crate::ui::layers::{LayersPanelState, show_layers_panel};
 use crate::ui::measure::{MeasureUiState, show_measure_window};
 use crate::ui::toolbar::{self, ToolbarInputs, ToolbarState};
-use crate::ui::{show_settings_window, status_bar};
+use crate::ui::{self, status_bar};
 
 use dialogs::DialogHost;
 use fonts::build_font_definitions;
@@ -53,6 +53,27 @@ impl From<UploadChannelClosed> for AppError {
     }
 }
 
+/// Transient UI state for all floating windows, panels, and toolbar inputs.
+pub(super) struct UiPanels {
+    pub(super) basemap: BasemapUiState,
+    pub(super) layers: LayersPanelState,
+    pub(super) crs_picker: CrsPickerState,
+    pub(super) measure: MeasureUiState,
+    pub(super) toolbar: ToolbarState,
+}
+
+impl UiPanels {
+    fn new(settings: &AppSettings) -> Self {
+        Self {
+            basemap: BasemapUiState::new(settings),
+            layers: LayersPanelState::default(),
+            crs_picker: CrsPickerState::default(),
+            measure: MeasureUiState::default(),
+            toolbar: ToolbarState::default(),
+        }
+    }
+}
+
 pub struct VeldmapApp {
     adapter_label: String,
     device: wgpu::Device,
@@ -61,13 +82,8 @@ pub struct VeldmapApp {
     scene: SceneState,
     storage: AppStorage,
     dialogs: DialogHost,
-    measure: MeasureSession,
-    basemap_ui: BasemapUiState,
-    layers_ui: LayersPanelState,
-    crs_picker_ui: CrsPickerState,
-    measure_ui: MeasureUiState,
+    panels: UiPanels,
     viewport: ViewportInteraction,
-    toolbar_ui: ToolbarState,
     restore_tracker: SessionRestoreTracker,
 }
 
@@ -137,7 +153,7 @@ impl VeldmapApp {
         let storage = AppStorage::open(Arc::clone(&wakeup), None);
         let dialogs = DialogHost::new(Arc::clone(&wakeup));
         let scene = SceneState::new(storage.settings(), storage.disk_cache(), wakeup, &budget)?;
-        let basemap_ui = BasemapUiState::new(storage.settings());
+        let panels = UiPanels::new(storage.settings());
 
         let restored_session = storage.session().clone();
         let camera = restored_session
@@ -152,29 +168,15 @@ impl VeldmapApp {
             scene,
             storage,
             dialogs,
-            measure: MeasureSession::default(),
-            basemap_ui,
-            layers_ui: LayersPanelState::default(),
-            crs_picker_ui: CrsPickerState::default(),
-            measure_ui: MeasureUiState::default(),
+            panels,
             viewport: ViewportInteraction::default(),
-            toolbar_ui: ToolbarState::default(),
             restore_tracker: SessionRestoreTracker::default(),
         };
 
         app.queue_restored_session(restored_session.open_layers, restored_session.open_vectors);
-
-        for path in startup_files {
-            app.open_local_path(&path, true, None);
-        }
+        app.open_user_paths(startup_files, None);
 
         Ok(app)
-    }
-
-    /// Push the current measurement session's derived vector mesh into
-    /// [`SceneState`] whenever measurement state mutates.
-    pub(super) fn sync_measure_overlay(&mut self) {
-        self.scene.set_transient_vector(self.measure.draw_layer());
     }
 
     fn show_globe_viewport(
@@ -203,11 +205,10 @@ impl VeldmapApp {
                         &response,
                         rect,
                         height_pt,
-                        self.measure.is_active(),
+                        self.scene.measure().is_active(),
                     ) {
-                        self.measure.add_point(clicked_pt);
-                        self.measure_ui.clear_notice();
-                        self.sync_measure_overlay();
+                        self.scene.mutate_measure(|m| m.add_point(clicked_pt));
+                        self.panels.measure.clear_notice();
                     }
 
                     let show_graticule = self.storage.settings().show_graticule;
@@ -264,26 +265,23 @@ impl VeldmapApp {
                 .collect()
         });
         if !dropped_paths.is_empty() {
-            self.layers_ui.clear_error();
-            for path in dropped_paths {
-                self.open_local_path(&path, true, None);
-            }
+            self.open_user_paths(dropped_paths, None);
             active = true;
         }
         active
     }
 
     fn show_settings_if_open(&mut self, ctx: &egui::Context) -> bool {
-        if !self.basemap_ui.is_settings_open() {
+        if !self.panels.basemap.is_settings_open() {
             return false;
         }
         self.storage.maybe_refresh_disk_stats(false);
         let disk_status = self.storage.disk_cache_status();
-        let settings_actions = show_settings_window(
+        let settings_actions = ui::basemap::show_settings_window(
             ctx,
             self.storage.settings(),
             &disk_status,
-            &mut self.basemap_ui,
+            &mut self.panels.basemap,
         );
         let mut needs_repaint = false;
         for action in settings_actions {
@@ -336,22 +334,23 @@ impl eframe::App for VeldmapApp {
                 basemap_status: &basemap_status,
                 adapter_label: &self.adapter_label,
                 layer_count: self.scene.total_layer_count(),
-                layers_open: self.layers_ui.is_open(),
-                measure_active: self.measure.is_active(),
+                layers_open: self.panels.layers.is_open(),
+                measure_active: self.scene.measure().is_active(),
                 recent_files: &self.storage.session().recent_files,
                 bookmarks: &self.storage.session().bookmarks,
             },
-            &mut self.toolbar_ui,
-            &mut self.basemap_ui,
+            &mut self.panels.toolbar,
+            &mut self.panels.basemap,
         );
         needs_repaint |= self.apply_toolbar_actions(toolbar_actions, frame);
         needs_repaint |= self.show_settings_if_open(&ctx);
 
-        if let Some(crs_action) = show_crs_picker_window(&ctx, &mut self.crs_picker_ui) {
+        if let Some(crs_action) = show_crs_picker_window(&ctx, &mut self.panels.crs_picker) {
             needs_repaint |= self.apply_crs_picker_action(crs_action);
         }
 
-        if let Some(measure_action) = show_measure_window(&ctx, &self.measure, &mut self.measure_ui)
+        if let Some(measure_action) =
+            show_measure_window(&ctx, self.scene.measure(), &self.panels.measure)
         {
             needs_repaint |= self.handle_measure_action(measure_action, frame);
         }
@@ -372,11 +371,15 @@ impl eframe::App for VeldmapApp {
             self.viewport.viewport_height_px(),
         );
 
-        if self.layers_ui.is_open() {
+        if self.panels.layers.is_open() {
             let layer_summaries = self.scene.overlays().layer_summaries();
             let vector_summaries = self.scene.vectors().summaries();
-            let layer_actions =
-                show_layers_panel(ui, &layer_summaries, &vector_summaries, &mut self.layers_ui);
+            let layer_actions = show_layers_panel(
+                ui,
+                &layer_summaries,
+                &vector_summaries,
+                &mut self.panels.layers,
+            );
             needs_repaint |= self.apply_layer_actions(layer_actions, frame);
         }
 

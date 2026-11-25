@@ -10,7 +10,7 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
 use crate::StorageError;
 
-use super::evict::{EvictionOutcome, evict_in_tx, reclaim_space};
+use super::evict::{evict_in_tx, reclaim_space};
 use super::key::{DiskTileKey, EncodedKey, TileBlobEncoding, valid_source_key};
 use super::queries::{
     clear_all_in_tx, clear_source_in_tx, delete_entry_in_tx, delete_tile_in_tx,
@@ -25,24 +25,6 @@ use super::touches::{MonotonicClock, TouchBuffer};
 
 /// Maximum encoded payload size admitted for a single cached tile (`16 MiB`).
 pub const MAX_CACHED_TILE_BYTES: usize = 16 * 1024 * 1024;
-
-/// Summary returned by [`TileDiskCache::put`] and [`TileDiskCache::set_max_bytes`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EvictionReport {
-    pub evicted_tiles: usize,
-    pub evicted_bytes: u64,
-    pub total_bytes_after: u64,
-}
-
-impl EvictionReport {
-    pub(super) const fn unchanged(total_bytes_after: u64) -> Self {
-        Self {
-            evicted_tiles: 0,
-            evicted_bytes: 0,
-            total_bytes_after,
-        }
-    }
-}
 
 /// Observable disk cache utilization metrics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -178,15 +160,15 @@ impl TileDiskCache {
 
         let (total_bytes, _) = read_cache_meta_totals(&conn)?;
         if total_bytes > max_bytes {
-            let outcome = {
+            let evicted_ids = {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (current_bytes, current_count) = read_cache_meta_totals(&tx)?;
-                let outcome =
+                let evicted_ids =
                     evict_in_tx(&tx, current_bytes, current_count, max_bytes, None, None)?;
                 tx.commit()?;
-                outcome
+                evicted_ids
             };
-            if outcome.report.evicted_tiles > 0 {
+            if !evicted_ids.is_empty() {
                 reclaim_space(&conn, false);
             }
         }
@@ -319,34 +301,11 @@ impl TileDiskCache {
         Ok(Some(payload))
     }
 
-    /// Look up cached tile bytes and their [`TileBlobEncoding`] tag for `key`,
-    /// recording a debounced LRU touch on hit.
-    pub fn get_encoded(
-        &self,
-        key: &DiskTileKey,
-    ) -> Result<Option<(TileBlobEncoding, Vec<u8>)>, StorageError> {
-        let Some((entry, encoding, payload)) = self.get_encoded_entry(key, None)? else {
-            return Ok(None);
-        };
-        self.touch_entry(entry);
-        Ok(Some((encoding, payload)))
-    }
-
     /// Insert or replace encoded image tile bytes (`TileBlobEncoding::EncodedImage`)
     /// for `key`, enforcing `payload_bytes <= max_bytes` via O(log N) per-tile
     /// LRU eviction and `PRAGMA incremental_vacuum`.
-    pub fn put(&self, key: &DiskTileKey, payload: &[u8]) -> Result<EvictionReport, StorageError> {
-        self.put_encoded(key, TileBlobEncoding::EncodedImage, payload)
-    }
-
-    /// Insert or replace tile bytes with an explicit [`TileBlobEncoding`] tag.
-    pub fn put_encoded(
-        &self,
-        key: &DiskTileKey,
-        encoding: TileBlobEncoding,
-        payload: &[u8],
-    ) -> Result<EvictionReport, StorageError> {
-        self.put_encoded_batch_inner(&[(key, encoding, payload)], None)
+    pub fn put(&self, key: &DiskTileKey, payload: &[u8]) -> Result<(), StorageError> {
+        self.put_encoded_batch_inner(&[(key, TileBlobEncoding::EncodedImage, payload)], None)
     }
 
     /// Insert or replace tile bytes only if `cancel` has not been triggered.
@@ -360,7 +319,7 @@ impl TileDiskCache {
         encoding: TileBlobEncoding,
         payload: &[u8],
         cancel: &CancelToken,
-    ) -> Result<EvictionReport, StorageError> {
+    ) -> Result<(), StorageError> {
         self.put_encoded_batch_inner(&[(key, encoding, payload)], Some(cancel))
     }
 
@@ -375,7 +334,7 @@ impl TileDiskCache {
         &self,
         entries: &[(&DiskTileKey, TileBlobEncoding, &[u8])],
         cancel: &CancelToken,
-    ) -> Result<EvictionReport, StorageError> {
+    ) -> Result<(), StorageError> {
         self.put_encoded_batch_inner(entries, Some(cancel))
     }
 
@@ -383,22 +342,21 @@ impl TileDiskCache {
         &self,
         entries: &[(&DiskTileKey, TileBlobEncoding, &[u8])],
         cancel: Option<&CancelToken>,
-    ) -> Result<EvictionReport, StorageError> {
+    ) -> Result<(), StorageError> {
         if entries.is_empty() || cancel.is_some_and(CancelToken::is_cancelled) {
-            return Ok(EvictionReport::default());
+            return Ok(());
         }
 
         // Validate keys and filter empty/oversized payloads before locking `writer`.
         let pre_max_bytes = self.max_bytes.load(Ordering::Acquire);
         let valid = validate_put_batch(entries, pre_max_bytes)?;
         if valid.is_empty() {
-            let (total_bytes_after, _) = self.reader_pool.with_reader(read_cache_meta_totals)?;
-            return Ok(EvictionReport::unchanged(total_bytes_after));
+            return Ok(());
         }
 
         let mut conn = lock_unpoisoned(&self.writer);
         if cancel.is_some_and(CancelToken::is_cancelled) {
-            return Ok(EvictionReport::default());
+            return Ok(());
         }
         // Re-check under `self.writer` so a concurrent `set_max_bytes()` cannot
         // lower the cap between the lock-free pre-check and transaction commit.
@@ -412,13 +370,12 @@ impl TileDiskCache {
         valid: &[ValidatedPut<'_>],
         max_bytes: u64,
         is_multi_batch: bool,
-    ) -> Result<EvictionReport, StorageError> {
+    ) -> Result<(), StorageError> {
         if max_bytes == 0 {
-            let (total_bytes_after, _) = read_cache_meta_totals(conn)?;
-            return Ok(EvictionReport::unchanged(total_bytes_after));
+            return Ok(());
         }
 
-        let (outcome, wrote_any) = self.with_write_tx(conn, |tx| {
+        let (evicted_ids, wrote_any) = self.with_write_tx(conn, |tx| {
             let (mut total_bytes, mut tile_count) = read_cache_meta_totals(tx)?;
             let mut batch_start_ts: Option<i64> = None;
             let mut last_id: Option<i64> = None;
@@ -443,17 +400,11 @@ impl TileDiskCache {
             }
 
             let Some(last_inserted) = last_id else {
-                return Ok((
-                    EvictionOutcome {
-                        report: EvictionReport::unchanged(total_bytes),
-                        evicted_ids: Vec::new(),
-                    },
-                    false,
-                ));
+                return Ok((Vec::new(), false));
             };
 
             set_cache_meta_totals(tx, total_bytes, tile_count)?;
-            let outcome = evict_in_tx(
+            let evicted_ids = evict_in_tx(
                 tx,
                 total_bytes,
                 tile_count,
@@ -461,17 +412,17 @@ impl TileDiskCache {
                 Some(last_inserted),
                 batch_start_ts,
             )?;
-            Ok((outcome, true))
+            Ok((evicted_ids, true))
         })?;
-        self.touches.prune(&outcome.evicted_ids);
+        self.touches.prune(&evicted_ids);
 
         if wrote_any {
             self.write_generation.fetch_add(1, Ordering::AcqRel);
-            if outcome.report.evicted_tiles > 0 {
+            if !evicted_ids.is_empty() {
                 reclaim_space(conn, false);
             }
         }
-        Ok(outcome.report)
+        Ok(())
     }
 
     /// Delete one tile entry (e.g. if a cached payload fails decode validation).
@@ -490,19 +441,19 @@ impl TileDiskCache {
     /// Update the configured byte budget, immediately evicting oldest tiles,
     /// reclaiming freed pages, and truncating WAL when utilization exceeds the
     /// new cap.
-    pub fn set_max_bytes(&self, max_bytes: u64) -> Result<EvictionReport, StorageError> {
+    pub fn set_max_bytes(&self, max_bytes: u64) -> Result<(), StorageError> {
         let mut conn = lock_unpoisoned(&self.writer);
         self.max_bytes.store(max_bytes, Ordering::Release);
-        let outcome = self.with_write_tx(&mut conn, |tx| {
+        let evicted_ids = self.with_write_tx(&mut conn, |tx| {
             let (current_bytes, current_count) = read_cache_meta_totals(tx)?;
             evict_in_tx(tx, current_bytes, current_count, max_bytes, None, None)
         })?;
-        self.touches.prune(&outcome.evicted_ids);
-        if outcome.report.evicted_tiles > 0 {
+        self.touches.prune(&evicted_ids);
+        if !evicted_ids.is_empty() {
             reclaim_space(&conn, true);
         }
         self.write_generation.fetch_add(1, Ordering::AcqRel);
-        Ok(outcome.report)
+        Ok(())
     }
 
     /// Remove all cached tiles for a specific `source_key`, returning the

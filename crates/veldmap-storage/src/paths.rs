@@ -1,4 +1,4 @@
-//! Injectable application storage paths (`config_dir`, `cache_dir`, `data_dir`).
+//! Injectable application storage paths (`config_dir`, `cache_dir`).
 
 use std::path::PathBuf;
 
@@ -6,14 +6,13 @@ use directories::ProjectDirs;
 
 use crate::StorageError;
 
-/// Concrete filesystem roots for VeldMap configuration, ephemeral caches, and
-/// persistent user data. Always injected rather than queried via globals so
-/// tests and portable installations remain hermetic.
+/// Concrete filesystem roots for VeldMap configuration and ephemeral caches.
+/// Always injected rather than queried via globals so tests and portable
+/// installations remain hermetic.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoragePaths {
     pub config_dir: PathBuf,
     pub cache_dir: PathBuf,
-    pub data_dir: PathBuf,
 }
 
 impl StoragePaths {
@@ -25,7 +24,6 @@ impl StoragePaths {
         Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             cache_dir: dirs.cache_dir().to_path_buf(),
-            data_dir: dirs.data_dir().to_path_buf(),
         })
     }
 
@@ -35,7 +33,6 @@ impl StoragePaths {
         Self {
             config_dir: root.join("config"),
             cache_dir: root.join("cache"),
-            data_dir: root.join("data"),
         }
     }
 

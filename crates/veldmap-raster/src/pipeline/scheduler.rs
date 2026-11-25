@@ -12,8 +12,9 @@
 //!   never clobber fresh admissions or poison caches.
 //! - Coarser in-flight passes (`pass_level > target_level`) are never cancelled
 //!   on zoom-in because their output serves as valid ancestor carriers.
-//! - Terminal failures (`Reject` or 2nd consecutive transient failure) are
-//!   suppressed permanently until `reset_source`.
+//! - Terminal failures (terminal errors via [`crate::RasterError::is_terminal`]
+//!   or a 2nd consecutive transient failure) are suppressed permanently until
+//!   `reset_source`.
 //! - Cancellation-producing methods return [`CancelToken`]s rather than firing
 //!   cancel callbacks while the caller holds a `Mutex<TileScheduler>`.
 
@@ -34,14 +35,12 @@ pub struct AdmittedTile {
 }
 
 /// Sequential pass admitted atomically by [`TileScheduler::admit_pass`] with
-/// its versioned `pass_id`, shared cascade origin `pass_from`, per-pass child
-/// [`CancelToken`], and admitted missing `tiles`.
+/// its versioned `pass_id`, per-pass child [`CancelToken`], and admitted
+/// missing `tiles`.
 #[derive(Clone, Debug)]
 pub struct AdmittedPass {
     pub key: PassKey,
     pub pass_id: u64,
-    pub level: u8,
-    pub pass_from: u8,
     pub cancel: CancelToken,
     pub tiles: Vec<TileKey>,
 }
@@ -365,8 +364,6 @@ impl TileScheduler {
         Some(AdmittedPass {
             key,
             pass_id,
-            level,
-            pass_from,
             cancel,
             tiles,
         })

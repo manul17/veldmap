@@ -182,7 +182,7 @@ impl GlobeRenderer {
         }
 
         self.overlay.push_uniforms(arena, snapshot, eye);
-        self.vector.push_uniforms(arena, snapshot);
+        self.vector.push_uniforms(arena, snapshot, eye);
 
         arena.flush(device, queue);
     }
@@ -317,9 +317,7 @@ impl GlobeRenderer {
             );
             self.vector.record_pass(
                 &mut post_pass,
-                &self.pipelines.vector_fill_pipeline,
-                &self.pipelines.vector_line_pipeline,
-                &self.pipelines.vector_point_pipeline,
+                &self.pipelines,
                 self.viewport.uniform_arena(),
                 snapshot,
             );

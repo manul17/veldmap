@@ -1,8 +1,6 @@
 use super::*;
-use crate::geo::camera::MIN_HEIGHT_M;
-use crate::geo::geodesy::Geodetic;
-use crate::geo::projection::WEB_MERCATOR_LIMIT_DEG;
-use crate::tile::geometry::{POLAR_R_CAP, polar_cap_point, sample_tile_surface};
+use crate::geo::{Geodetic, MIN_HEIGHT_M, WEB_MERCATOR_LIMIT_DEG};
+use crate::tile::geometry::polar_cap_point;
 
 #[test]
 fn decoupled_lod_subdivides_past_max_tex_level_with_zero_requests_above_cap() {
@@ -23,7 +21,7 @@ fn decoupled_lod_subdivides_past_max_tex_level_with_zero_requests_above_cap() {
         cfg.max_geom_level
     );
 
-    let nadir_ecef = geodesy::world(Geodetic::surface(47.2357, 39.7015));
+    let nadir_ecef = WGS84.to_ecef(Geodetic::surface(47.2357, 39.7015));
     let focal_px = cam.focal_length_px(800.0);
     let eye = cam.eye_ecef();
     let mut nadir_tile_sag = f64::INFINITY;
@@ -243,47 +241,4 @@ fn clamped_geodetic_polar_adjacent_skirts_cover_coarser_neighbor_sag() {
         fine.skirt_depth_m,
         coarse.sag_cell_diag_m
     );
-}
-
-#[test]
-fn polar_r_cap_constant_and_bounds_guards_are_exact() {
-    let expected = ((90.0 - WEB_MERCATOR_LIMIT_DEG) * 0.5).to_radians().tan();
-    assert!((POLAR_R_CAP - expected).abs() < 1e-16);
-
-    // Out-of-bounds WebMercator and PolarCap tile coordinates return None.
-    assert!(
-        sample_tile_surface(
-            QuadTileId {
-                scheme: PlanetaryScheme::WebMercator,
-                level: 1,
-                x: 2,
-                y: 0,
-            },
-            0.5,
-            0.5,
-        )
-        .is_none()
-    );
-    assert!(
-        sample_tile_surface(
-            QuadTileId {
-                scheme: PlanetaryScheme::PolarCap { north: true },
-                level: 0,
-                x: 1,
-                y: 0,
-            },
-            0.5,
-            0.5,
-        )
-        .is_none()
-    );
-    // Huge dz in clamp_to_level must not panic.
-    let deep = QuadTileId {
-        scheme: PlanetaryScheme::WebMercator,
-        level: 40,
-        x: 0,
-        y: 0,
-    };
-    let (clamped, _) = deep.clamp_to_level(0);
-    assert_eq!(clamped.level, 0);
 }

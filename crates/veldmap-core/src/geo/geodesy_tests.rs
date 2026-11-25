@@ -155,7 +155,7 @@ fn surface_ecef_and_normal_matches_world_and_unit() {
         (-85.051_129, -179.5),
         (90.0, 0.0),
     ] {
-        let (ecef, normal) = surface_ecef_and_normal(lat, lon);
+        let (ecef, normal) = WGS84.surface_ecef_and_normal(lat, lon);
         assert!(ecef.distance(world(Geodetic::surface(lat, lon))) < 1e-9);
         assert!(normal.distance(unit(lat, lon)) < 1e-15);
     }

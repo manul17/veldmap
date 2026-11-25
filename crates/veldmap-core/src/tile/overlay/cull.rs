@@ -5,9 +5,7 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 
-use crate::geo::geodesy;
-use crate::geo::sag;
-use crate::geo::{Ball, CullFrustum, Frame};
+use crate::geo::{Ball, CullFrustum, Frame, SEMI_MAJOR_M, sag, unwind};
 
 use super::super::pyramid::{cell_image_rect, grid_dim, level_size};
 use super::{FrameGridSpec, sample_frame_grid};
@@ -178,9 +176,9 @@ pub(super) fn compute_cell_ball(
     let max_subcell_diag_deg = sag::max_subcell_arc_deg(&normals, CULL_PROBE_SIDE);
     let mut par_sag_m = 0.0_f64;
     let check_parallel_step = |p0: (f64, f64), p1: (f64, f64), acc: &mut f64| {
-        let dlon = (geodesy::unwind(p0.1, p1.1) - p0.1).abs().min(180.0);
+        let dlon = (unwind(p0.1, p1.1) - p0.1).abs().min(180.0);
         let max_lat = p0.0.abs().max(p1.0.abs()).min(90.0);
-        let r_par = geodesy::SEMI_MAJOR_M * max_lat.to_radians().cos();
+        let r_par = SEMI_MAJOR_M * max_lat.to_radians().cos();
         let sag = r_par * (1.0 - (dlon * 0.5).to_radians().cos());
         *acc = (*acc).max(sag);
     };

@@ -1,7 +1,6 @@
 use super::{TileValidationError, extract_host, parse_url_authority, strip_http_scheme};
-use crate::{
-    CustomBasemapConfig, LiveBasemapSpec, NetError, is_valid_gibs_date, sanitize_url_for_display,
-};
+use crate::redact::sanitize_url_for_display;
+use crate::{CustomBasemapConfig, LiveBasemapSpec, NetError, is_valid_gibs_date};
 use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId};
 
 #[test]

@@ -9,8 +9,7 @@ mod warp;
 
 use glam::DVec3;
 
-use crate::geo::Frame;
-use crate::geo::geodesy::WGS84;
+use crate::geo::{Frame, WGS84};
 
 pub use cull::OverlayCullTree;
 pub use warp::{MAX_WARP_SEGMENTS, MIN_WARP_SEGMENTS, WarpPatch, build_warp_patch, level_segments};
@@ -86,7 +85,7 @@ pub(super) fn sample_frame_grid(
                 }
             }
         }
-        WGS84.fill_separable_surface_grid(lats, lons, points, Some(normals));
+        WGS84.fill_separable_surface_grid(lats, lons, points, normals);
     } else {
         for row in 0..side {
             let py = along(cell[1], cell[3], row) / h;

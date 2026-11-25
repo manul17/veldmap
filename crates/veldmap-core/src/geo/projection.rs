@@ -158,7 +158,7 @@ impl Projection {
                 lat_deg.clamp(-WEB_MERCATOR_LIMIT_DEG, WEB_MERCATOR_LIMIT_DEG),
                 lon_deg,
             ),
-            Self::Proj4(proj) => proj.from_wgs84_geodetic(lat_deg, lon_deg),
+            Self::Proj4(proj) => proj.transform_from_wgs84_geodetic(lat_deg, lon_deg),
         }
     }
 
@@ -172,7 +172,7 @@ impl Projection {
         let (x, y) = match self {
             Self::WebMercator => web_mercator_from_geodetic_strict(lat_deg, lon_deg)?,
             Self::Transverse { system, .. } => system.from_geodetic(lat_deg, lon_deg),
-            Self::Proj4(proj) => proj.from_wgs84_geodetic(lat_deg, lon_deg),
+            Self::Proj4(proj) => proj.transform_from_wgs84_geodetic(lat_deg, lon_deg),
         };
         (x.is_finite() && y.is_finite()).then_some((x, y))
     }

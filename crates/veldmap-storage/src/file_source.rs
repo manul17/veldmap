@@ -22,7 +22,7 @@ use crate::StorageError;
 
 /// Verify that `meta` describes a regular file, rejecting directories, FIFOs,
 /// and device nodes with a consistent [`StorageError::InvalidPath`].
-pub(crate) fn ensure_regular_file(meta: &Metadata, path: &Path) -> Result<(), StorageError> {
+fn ensure_regular_file(meta: &Metadata, path: &Path) -> Result<(), StorageError> {
     if !meta.is_file() {
         return Err(StorageError::InvalidPath(format!(
             "'{}' is not a regular file",

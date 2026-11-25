@@ -66,7 +66,7 @@ impl DecodePeak {
     }
 
     /// Human-readable summary of terms (e.g. `"band 128 MiB, tile 256 KiB"`).
-    pub(crate) fn note(&self) -> String {
+    pub(super) fn note(&self) -> String {
         self.terms
             .iter()
             .map(|(what, bytes)| format!("{what} {}", format_bytes(*bytes)))

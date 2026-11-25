@@ -1,19 +1,5 @@
 use super::*;
-use crate::tile::SourceFingerprint;
-
-fn make_key(scheme: TileScheme, level: u8, x: u32, y: u32) -> TileKey {
-    TileKey {
-        source: SourceId::BUNDLED_BASEMAP,
-        band: BandKey::Display,
-        scheme,
-        format: PixelFormat::Rgba8UnormSrgb,
-        gutter: 0,
-        decode_rev: 0,
-        level,
-        x,
-        y,
-    }
-}
+use crate::tile::{SourceFingerprint, make_key};
 
 #[test]
 fn tile_scheme_parent_respects_level_direction_without_inverting() {
@@ -220,4 +206,17 @@ fn grid_dims_sub_rect_and_coarsest_first_tie_breaking_are_deterministic() {
     let fp_id = SourceId::from_fingerprint(&fp);
     assert_ne!(fp_id, SourceId::BUNDLED_BASEMAP);
     assert_eq!(SourceId::from(&fp), fp_id);
+}
+
+#[test]
+fn clamp_to_level_handles_large_level_delta_without_panicking() {
+    let deep = QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 40,
+        x: 0,
+        y: 0,
+    };
+    let (clamped, uv) = deep.clamp_to_level(0);
+    assert_eq!(clamped.level, 0);
+    assert_eq!(uv, [0.0, 0.0, 0.0, 0.0]);
 }

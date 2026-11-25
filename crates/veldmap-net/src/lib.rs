@@ -24,7 +24,6 @@ pub use basemap::{
     is_valid_gibs_date, validate_custom_url_template,
 };
 pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
-pub use redact::{redact_secret_label, sanitize_url_for_display};
 
 /// Structured error returned across the [`TileBlobStore`] seam.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]

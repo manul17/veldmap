@@ -37,3 +37,18 @@ pub use pyramid::{
 };
 pub use quadtree::{DEFAULT_GRID_CELLS, QuadtreeConfig, VisibleTile, describe_tile, traverse};
 pub use scheme::{GlobeScheme, PlanetaryScheme, TileScheme};
+
+#[cfg(test)]
+pub(super) fn make_key(scheme: TileScheme, level: u8, x: u32, y: u32) -> TileKey {
+    TileKey {
+        source: SourceId::BUNDLED_BASEMAP,
+        band: BandKey::Display,
+        scheme,
+        format: PixelFormat::Rgba8UnormSrgb,
+        gutter: 0,
+        decode_rev: 0,
+        level,
+        x,
+        y,
+    }
+}

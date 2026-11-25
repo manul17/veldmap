@@ -1,11 +1,9 @@
 //! User-defined GeoTIFF datum, linear-unit, geographic CRS, and projected CRS
 //! resolution.
 
-use std::sync::Arc;
-
 use veldmap_core::geo::{
-    CrsSpec, Datum, DatumWarning, Ellipsoid, LinearUnit, Proj4Projection, Projection, System,
-    WGS84, WGS84_DATUM, ellipsoid_from_epsg, known_datum_from_code,
+    CrsSpec, Datum, DatumWarning, Ellipsoid, LinearUnit, Projection, System, WGS84, WGS84_DATUM,
+    ellipsoid_from_epsg, known_datum_from_code,
 };
 
 use super::geokeys::{
@@ -169,7 +167,6 @@ fn resolve_user_datum(geo_params: &GeoKeyParams) -> (Datum, Option<DatumWarning>
     }
 
     if let Some(code) = datum_code
-        && !UNSAID_GEOKEY_CODES.contains(&code)
         && !WGS84_GEOGRAPHIC_CODES.contains(&code)
         && code != EPSG_WGS84_DATUM
     {
@@ -365,12 +362,9 @@ fn build_user_proj4_crs(
         .get_ascii(GEOKEY_PCS_CITATION)
         .map(str::to_owned)
         .unwrap_or_else(|| format!("User-Defined ({proj_name})"));
-    let p4 = Proj4Projection::from_proj_string(&proj_str, Some(label)).ok()?;
-    let final_warning = warning.or_else(|| p4.datum_warning().cloned());
-    Some((
-        CrsSpec::Projected(Projection::Proj4(Arc::new(p4))),
-        final_warning,
-    ))
+    let crs = CrsSpec::from_proj_string_labeled(&proj_str, Some(label)).ok()?;
+    let final_warning = warning.or_else(|| crs.datum_warning().cloned());
+    Some((crs, final_warning))
 }
 
 pub(super) fn build_user_defined_projected_crs(

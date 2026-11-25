@@ -121,3 +121,11 @@ pub struct RasterDescription {
     pub binding_trouble: Option<String>,
     pub levels: Vec<LevelPlan>,
 }
+
+impl RasterDescription {
+    /// Return whether this raster carries enough pixel-to-coordinate geometry
+    /// (an affine placement or tie-point grid) for a CRS override to bind it.
+    pub fn can_override_crs(&self) -> bool {
+        self.placement.is_some() || !self.ties.is_empty()
+    }
+}

@@ -2,7 +2,7 @@
 //!
 //! Owns the GPU tile cache, bounded upload queue, shared two-lane CPU decode
 //! pool (`TwoLaneDecodePool`), [`BasemapManager`], raster [`OverlayManager`],
-//! GeoJSON [`VectorManager`], transient measurement vector overlay, cached
+//! GeoJSON [`VectorManager`], interactive geodesic [`MeasureSession`], cached
 //! immutable [`DrawSnapshot`], and monotonic `scene_generation`.
 
 use std::path::Path;
@@ -17,16 +17,17 @@ use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
 use crate::basemap::BasemapManager;
-use crate::crs_override::CrsOverride;
 use crate::gpu_tiles::{
     DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::layers::{
-    CursorReadout, LayerId, OverlayFrameCtx, OverlayIoEvent, OverlayManager, OverlayMutation,
+    CrsOverride, CursorReadout, LayerId, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
+    OverlayMutation,
 };
-use crate::render::{DrawSnapshot, DrawVectorLayer, SnapshotBuildParams, TileCarrierPolicy};
-use crate::settings::AppSettings;
+use crate::measure::MeasureSession;
+use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
+use crate::storage::settings::AppSettings;
 use crate::vectors::{VectorIoEvent, VectorLayerId, VectorManager};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +102,7 @@ pub(crate) struct SceneState {
     basemap: BasemapManager,
     overlays: OverlayManager,
     vectors: VectorManager,
-    transient_vector: Option<DrawVectorLayer>,
+    measure: MeasureSession,
     cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
     scene_generation: u64,
     active_frame: Option<FrameState>,
@@ -155,7 +156,7 @@ impl SceneState {
             basemap,
             overlays,
             vectors,
-            transient_vector: None,
+            measure: MeasureSession::default(),
             cached_snapshot: None,
             scene_generation: 1,
             active_frame: None,
@@ -179,6 +180,13 @@ impl SceneState {
     /// changes.
     fn mark_dirty(&mut self) {
         self.scene_generation = self.scene_generation.wrapping_add(1);
+    }
+
+    fn mark_dirty_if(&mut self, changed: bool) -> bool {
+        if changed {
+            self.mark_dirty();
+        }
+        changed
     }
 
     /// Purge a superseded/removed source from both GPU VRAM and pending uploads.
@@ -216,6 +224,19 @@ impl SceneState {
         &self.vectors
     }
 
+    /// Read-only access to the interactive geodesic measurement session.
+    pub(crate) fn measure(&self) -> &MeasureSession {
+        &self.measure
+    }
+
+    /// Mutate the geodesic measurement session and mark the scene dirty
+    /// automatically whenever its revision advances.
+    pub(crate) fn mutate_measure(&mut self, f: impl FnOnce(&mut MeasureSession)) -> bool {
+        let rev_before = self.measure.rev();
+        f(&mut self.measure);
+        self.mark_dirty_if(self.measure.rev() != rev_before)
+    }
+
     /// Total count of loaded raster + vector layers (O(1), lock-free).
     pub(crate) fn total_layer_count(&self) -> usize {
         self.overlays.layer_count() + self.vectors.len()
@@ -250,40 +271,17 @@ impl SceneState {
 
     pub(crate) fn set_vector_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
         let changed = self.vectors.set_visible(id, visible);
-        if changed {
-            self.mark_dirty();
-        }
-        changed
+        self.mark_dirty_if(changed)
     }
 
     pub(crate) fn set_vector_opacity(&mut self, id: VectorLayerId, opacity: f32) -> bool {
         let changed = self.vectors.set_opacity(id, opacity);
-        if changed {
-            self.mark_dirty();
-        }
-        changed
+        self.mark_dirty_if(changed)
     }
 
     pub(crate) fn remove_vector(&mut self, id: VectorLayerId) -> bool {
         let changed = self.vectors.remove(id);
-        if changed {
-            self.mark_dirty();
-        }
-        changed
-    }
-
-    /// Update the transient measurement overlay vector mesh (rendered above
-    /// loaded GeoJSON layers in Pass 2).
-    pub(crate) fn set_transient_vector(&mut self, layer: Option<DrawVectorLayer>) {
-        let changed = match (&self.transient_vector, &layer) {
-            (None, None) => false,
-            (Some(a), Some(b)) => a.id != b.id || a.rev != b.rev,
-            _ => true,
-        };
-        if changed {
-            self.transient_vector = layer;
-            self.mark_dirty();
-        }
+        self.mark_dirty_if(changed)
     }
 
     fn apply_overlay_mutation(&mut self, mutation: OverlayMutation) -> bool {
@@ -311,18 +309,12 @@ impl SceneState {
 
     pub(crate) fn move_overlay_up(&mut self, id: LayerId) -> bool {
         let changed = self.overlays.move_layer_up(id);
-        if changed {
-            self.mark_dirty();
-        }
-        changed
+        self.mark_dirty_if(changed)
     }
 
     pub(crate) fn move_overlay_down(&mut self, id: LayerId) -> bool {
         let changed = self.overlays.move_layer_down(id);
-        if changed {
-            self.mark_dirty();
-        }
-        changed
+        self.mark_dirty_if(changed)
     }
 
     pub(crate) fn override_overlay_crs(
@@ -380,10 +372,7 @@ impl SceneState {
     /// Set opacity (`0.0..=1.0`) of an overlay layer.
     pub(crate) fn set_overlay_opacity(&mut self, id: LayerId, opacity: f32) -> bool {
         let changed = self.overlays.set_opacity(id, opacity);
-        if changed {
-            self.mark_dirty();
-        }
-        changed
+        self.mark_dirty_if(changed)
     }
 
     /// Synchronize basemap providers with updated [`AppSettings`], purging any
@@ -523,8 +512,8 @@ impl SceneState {
         });
         snapshot_inner.overlays = overlay_layers;
         let mut draw_vectors = self.vectors.draw_layers();
-        if let Some(ref transient) = self.transient_vector {
-            draw_vectors.push(transient.clone());
+        if let Some(measure_layer) = self.measure.draw_layer() {
+            draw_vectors.push(measure_layer);
         }
         snapshot_inner.vectors = draw_vectors;
 

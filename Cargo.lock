@@ -3571,7 +3571,6 @@ dependencies = [
  "rfd",
  "serde",
  "thiserror 2.0.21",
- "tiff",
  "tracing",
  "tracing-subscriber",
  "veldmap-core",

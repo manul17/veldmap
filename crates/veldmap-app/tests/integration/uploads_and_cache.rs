@@ -382,7 +382,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     );
     let (found_key, found_tile) = cache.find_carrier(&live_child).expect("ancestor carrier");
     assert_eq!(found_key, live_root);
-    assert_eq!(found_tile.width, 64);
+    assert_eq!(found_tile.width(), 64);
 
     // 5. Removing `live_source` clears only live tiles and preserves bundled fallback.
     assert_eq!(cache.remove_where(|k| k.source == live_source), 1);

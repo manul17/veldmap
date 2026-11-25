@@ -10,8 +10,8 @@ use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{SourceId, TileKey};
 use veldmap_raster::{
-    DecodeContext, DecodeJob, DecodePoolHandle, PassKey, SharedChunkCache, SubmitError,
-    TileScheduler,
+    AdmittedPass, AdmittedTile, DecodeContext, DecodeJob, DecodePoolHandle, PassKey, PyramidMeta,
+    SharedChunkCache, SubmitError, TileFailureOutcome, TileScheduler,
 };
 use veldmap_storage::{LocalFingerprintCache, TileDiskCache};
 
@@ -21,7 +21,7 @@ use super::stack::OverlayLayer;
 
 /// Backoff window applied when a decode lane queue is saturated (`SubmitError::Full`)
 /// so the UI retries cleanly without spinning at 100% CPU.
-pub(super) const SUBMIT_BACKOFF_DELAY: Duration = Duration::from_millis(50);
+const SUBMIT_BACKOFF_DELAY: Duration = Duration::from_millis(50);
 
 /// Shared runtime dependencies for overlay scheduling, decoding, caching, and
 /// wakeups. Held behind `Arc` so worker closures and helpers stay concise.
@@ -30,7 +30,7 @@ pub(super) struct OverlayRuntime {
     pub(super) chunk_cache: Arc<SharedChunkCache>,
     pub(super) budget_tracker: Arc<DecodeBudgetTracker>,
     pub(super) fingerprint_cache: Arc<LocalFingerprintCache>,
-    pub(super) scheduler: Arc<Mutex<TileScheduler>>,
+    scheduler: Mutex<TileScheduler>,
     pub(super) disk_cache: Option<Arc<TileDiskCache>>,
     pub(super) fast_pool: DecodePoolHandle,
     pub(super) bulk_pool: DecodePoolHandle,
@@ -56,7 +56,7 @@ impl OverlayRuntime {
             chunk_cache: Arc::new(SharedChunkCache::new(budget.decoded_chunk_cache_bytes)),
             budget_tracker: Arc::new(DecodeBudgetTracker::new(budget.decode_working_bytes)),
             fingerprint_cache: Arc::new(LocalFingerprintCache::new()),
-            scheduler: Arc::new(Mutex::new(TileScheduler::default())),
+            scheduler: Mutex::new(TileScheduler::default()),
             disk_cache,
             fast_pool,
             bulk_pool,
@@ -140,6 +140,116 @@ impl OverlayRuntime {
         Some(deadline.saturating_duration_since(Instant::now()))
     }
 
+    /// Snapshot `(in_flight_count, pass_active)` for each layer in `layers`
+    /// under a single scheduler lock acquisition.
+    pub(super) fn layer_flight_stats(&self, layers: &[OverlayLayer]) -> Vec<(usize, bool)> {
+        let sched = lock_unpoisoned(&self.scheduler);
+        layers
+            .iter()
+            .map(|layer| {
+                (
+                    sched.in_flight_count_for_source(layer.source_id()),
+                    sched.has_active_pass(layer.meta().pass_key()),
+                )
+            })
+            .collect()
+    }
+
+    /// Admit pointwise decode jobs for `rung` and report whether any candidate
+    /// on this rung is still unfinished (neither cached in VRAM nor terminally
+    /// failed).
+    pub(super) fn admit_pointwise_rung(
+        &self,
+        meta: &PyramidMeta,
+        rung: u8,
+        candidates: &[TileKey],
+        gpu_cache: &GpuTileCache,
+        pending: &PendingUploads,
+    ) -> (Vec<AdmittedTile>, bool) {
+        let mut sched = lock_unpoisoned(&self.scheduler);
+        let admitted = sched.admit_pointwise(
+            meta,
+            rung,
+            candidates,
+            |key| gpu_cache.contains(key) || pending.contains(key),
+            &self.shutdown,
+        );
+        let unfinished = candidates
+            .iter()
+            .any(|k| !gpu_cache.contains(k) && !sched.is_terminal_failed(k));
+        (admitted, unfinished)
+    }
+
+    /// Update the active pass target for `meta.pass_key()`, admit a sequential
+    /// pass for `rung` if needed, and cancel any superseded pass token strictly
+    /// outside the scheduler lock.
+    pub(super) fn admit_pass_rung(
+        &self,
+        meta: &PyramidMeta,
+        rung: u8,
+        from: u8,
+        candidates: &[TileKey],
+        gpu_cache: &GpuTileCache,
+        pending: &PendingUploads,
+    ) -> (Option<AdmittedPass>, bool) {
+        let pass_key = meta.pass_key();
+        let (cancelled_old, admitted, active) = {
+            let mut sched = lock_unpoisoned(&self.scheduler);
+            let cancelled_old = sched.update_target(pass_key, rung, Some(from));
+            let admitted = sched.admit_pass(
+                meta,
+                rung,
+                candidates,
+                |key| gpu_cache.contains(key) || pending.contains(key),
+                &self.shutdown,
+            );
+            let active = admitted.is_some() || sched.has_active_pass(pass_key);
+            (cancelled_old, admitted, active)
+        };
+        if let Some(tok) = cancelled_old {
+            tok.cancel();
+        }
+        (admitted, active)
+    }
+
+    pub(super) fn on_pointwise_arrived(&self, key: &TileKey, job_id: u64) -> bool {
+        lock_unpoisoned(&self.scheduler).on_pointwise_arrived(key, job_id)
+    }
+
+    pub(super) fn on_pointwise_failed(
+        &self,
+        key: &TileKey,
+        job_id: u64,
+        terminal: bool,
+    ) -> Option<TileFailureOutcome> {
+        lock_unpoisoned(&self.scheduler).on_pointwise_failed(key, job_id, terminal)
+    }
+
+    pub(super) fn cancel_pointwise_in_flight(&self, key: &TileKey, job_id: u64) -> bool {
+        lock_unpoisoned(&self.scheduler).cancel_in_flight(key, job_id)
+    }
+
+    pub(super) fn on_pass_tile_arrived(&self, pass_key: PassKey, pass_id: u64, key: &TileKey) {
+        lock_unpoisoned(&self.scheduler).on_pass_tile_arrived(pass_key, pass_id, key);
+    }
+
+    pub(super) fn finish_pass(&self, pass_key: PassKey, pass_id: u64, succeeded: bool) -> bool {
+        lock_unpoisoned(&self.scheduler).finish_pass(pass_key, pass_id, succeeded)
+    }
+
+    /// Abort an active sequential pass in the scheduler and cancel its token
+    /// strictly outside the scheduler lock. Returns `true` if the pass was
+    /// still active when aborted.
+    pub(super) fn abort_pass(&self, pass_key: PassKey, pass_id: u64) -> bool {
+        let token = lock_unpoisoned(&self.scheduler).abort_pass(pass_key, pass_id);
+        if let Some(tok) = token {
+            tok.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Reconcile in-flight pointwise jobs for a single `stream_key` against
     /// `wanted` and current GPU/pending cache state, cancelling stale tokens
     /// strictly outside the scheduler lock.
@@ -176,7 +286,7 @@ impl OverlayRuntime {
                     continue;
                 }
                 to_cancel.extend(sched.reconcile_pointwise(
-                    layer.meta.pass_key(),
+                    layer.meta().pass_key(),
                     layer.wanted(),
                     |k| gpu_cache.contains(k) || pending.contains(k),
                 ));

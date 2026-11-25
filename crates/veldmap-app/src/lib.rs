@@ -9,17 +9,15 @@ use std::path::Path;
 
 mod app;
 mod basemap;
-mod crs_override;
 pub mod gpu_tiles;
 mod layers;
 mod measure;
 pub mod render;
 mod scene;
-mod session;
-mod settings;
 mod storage;
 mod ui;
 mod vectors;
+mod worker;
 
 pub use app::{AppError, VeldmapApp};
 pub use basemap::policy as basemap_policy;

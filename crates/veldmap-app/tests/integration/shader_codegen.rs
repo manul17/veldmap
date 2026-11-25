@@ -104,7 +104,7 @@ fn validate_and_compile_all_backends(name: &str, wgsl_source: &str) -> naga::Mod
 }
 
 #[test]
-fn globe_overlay_and_composite_shaders_compile_and_match_rust_uniform_layouts() {
+fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
     let globe = validate_and_compile_all_backends("globe.wgsl", GLOBE_WGSL);
     let overlay = validate_and_compile_all_backends("overlay.wgsl", OVERLAY_WGSL);
     let vector = validate_and_compile_all_backends("vector.wgsl", VECTOR_WGSL);

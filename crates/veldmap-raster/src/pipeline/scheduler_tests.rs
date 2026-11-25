@@ -34,7 +34,6 @@ fn sample_band_meta(
             };
             LevelPlan {
                 serve,
-                source_pixels: 512 * 512,
                 estimated_peak_bytes: 4 * 1024 * 1024,
                 fits: true,
             }
@@ -43,9 +42,6 @@ fn sample_band_meta(
     PyramidMeta {
         source,
         spec: TileStreamSpec::new(band, format, gutter, 1),
-        width: 4096,
-        height: 4096,
-        tile_size: 512,
         levels,
     }
 }

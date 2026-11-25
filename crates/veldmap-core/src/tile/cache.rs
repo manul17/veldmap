@@ -434,8 +434,8 @@ impl<V> TileCache<TileKey, V> {
     }
 
     /// Planetary convenience wrapper around [`Self::find_carrier`] that also
-    /// computes the unguttered power-of-two UV sub-rectangle via
-    /// [`TileKey::sub_rect_in_ancestor`].
+    /// computes the unguttered power-of-two UV sub-rectangle mapping `key`
+    /// into its cached ancestor.
     pub fn carrier(&mut self, key: &TileKey) -> Option<(TileKey, [f32; 4], &V)> {
         let (carrier_key, carrier_slot) = self.find_carrier_slot(key)?;
         let uv_rect = key.sub_rect_in_ancestor(&carrier_key)?;

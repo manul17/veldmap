@@ -332,7 +332,7 @@ fn rejected_or_cancelled_decode_request_signals_aborted() {
 fn in_place_custom_xyz_spec_edit_marks_changed_without_evicting_source() {
     let mut settings = AppSettings {
         active_basemap: BasemapSelection::CustomXyz,
-        custom_xyz: crate::settings::CustomXyzSettings {
+        custom_xyz: crate::storage::settings::CustomXyzSettings {
             name: "Custom Test".to_string(),
             url_template: "https://tiles.example.test/{z}/{x}/{y}.png?key={key}".to_string(),
             max_level: 10,

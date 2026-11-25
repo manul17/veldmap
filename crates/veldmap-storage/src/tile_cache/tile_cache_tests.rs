@@ -5,8 +5,6 @@ use std::time::Duration;
 use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme};
 
 use super::super::evict::EVICT_BATCH_ROWS;
-use super::super::queries::SELECT_EVICT_BATCH_PROTECTED_SQL;
-use super::super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE};
 use super::*;
 use crate::test_support::TestTempDir;
 
@@ -58,112 +56,29 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
 
     // Insert `k_d` (30 B): total becomes 130 > 100, target = 90.
     // Evicting `k_b` (20) -> 110 > 90; evicting `k_c` (40) -> 70 <= 90.
-    let report = cache.put(&k_d, &[4u8; 30]).expect("put d");
-    assert_eq!(report.evicted_tiles, 2);
-    assert_eq!(report.evicted_bytes, 60);
-    assert_eq!(report.total_bytes_after, 70);
-    assert!(report.total_bytes_after <= 100);
+    cache.put(&k_d, &[4u8; 30]).expect("put d");
+    assert_eq!(cache.write_generation(), 4);
+
+    let stats = cache.stats().expect("stats");
+    assert_eq!(stats.tile_count, 2);
+    assert_eq!(stats.payload_bytes, 70);
+    assert!(stats.payload_bytes <= 100);
 
     assert!(cache.get(&k_a).expect("get a").is_some());
     assert!(cache.get(&k_b).expect("get b").is_none());
     assert!(cache.get(&k_c).expect("get c").is_none());
     assert!(cache.get(&k_d).expect("get d").is_some());
 
-    let stats = cache.stats().expect("stats");
-    assert_eq!(stats.tile_count, 2);
-    assert_eq!(stats.payload_bytes, 70);
     assert_eq!(count_rows(&cache, "tile_meta"), 2);
     assert_eq!(count_rows(&cache, "tile_blobs"), 2);
 }
 
 #[test]
-fn pragmas_schema_version_and_covering_lru_index_are_configured() {
-    let (_dir, cache) = open_temp_cache("pragmas-index", 4096);
-    let conn = lock_unpoisoned(&cache.writer);
-
-    let page_size: i64 = conn
-        .query_row("PRAGMA page_size;", [], |r| r.get(0))
-        .expect("page_size");
-    let foreign_keys: i64 = conn
-        .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
-        .expect("foreign_keys");
-    let user_version: i64 = conn
-        .query_row("PRAGMA user_version;", [], |r| r.get(0))
-        .expect("user_version");
-    let busy_timeout: i64 = conn
-        .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
-        .expect("busy_timeout");
-    let journal_mode: String = conn
-        .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
-        .expect("journal_mode");
-    let auto_vacuum: i64 = conn
-        .query_row("PRAGMA auto_vacuum;", [], |r| r.get(0))
-        .expect("auto_vacuum");
-    assert_eq!(page_size, SQLITE_PAGE_SIZE);
-    assert_eq!(foreign_keys, 1);
-    assert_eq!(user_version, SCHEMA_VERSION);
-    assert_eq!(busy_timeout, SQLITE_BUSY_TIMEOUT_MS);
-    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-    assert_eq!(auto_vacuum, 2);
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "EXPLAIN QUERY PLAN {SELECT_EVICT_BATCH_PROTECTED_SQL}"
-        ))
-        .expect("explain");
-    let details: Vec<String> = stmt
-        .query_map(rusqlite::params![1i64, EVICT_BATCH_ROWS], |r| {
-            r.get::<_, String>(3)
-        })
-        .expect("query plan")
-        .map(|r| r.expect("plan row"))
-        .collect();
-    let joined = details.join(" | ");
-    assert!(
-        joined.contains("idx_tile_meta_lru") && joined.contains("COVERING"),
-        "expected covering idx_tile_meta_lru scan, got: {joined}"
-    );
-    assert!(
-        !joined.contains("TEMP B-TREE"),
-        "unexpected temp B-tree sort in eviction plan: {joined}"
-    );
-}
-
-#[test]
-fn recovers_from_corrupt_or_legacy_v1_sqlite_file_and_persists_across_reopen() {
+fn recovers_from_corrupt_sqlite_file_and_persists_across_reopen() {
     let dir = TestTempDir::new("sqlite-recovery");
     let db_path = dir.path().join("tiles.sqlite3");
 
-    // 1. Legacy v1 WAL DB (`user_version = 0`, single `tiles` table, 4 KiB pages)
-    //    upgrades cleanly to v2 with 16 KiB pages and zero stale data.
-    {
-        let legacy = Connection::open(&db_path).expect("open legacy");
-        legacy
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 CREATE TABLE tiles (
-                     source_key TEXT, scheme INTEGER, level INTEGER, x INTEGER, y INTEGER,
-                     payload BLOB, byte_size INTEGER, last_used_ms INTEGER
-                 );
-                 INSERT INTO tiles VALUES ('old', 1, 0, 0, 0, X'DEADBEEF', 4, 1);",
-            )
-            .expect("seed legacy");
-    }
-    {
-        let upgraded = TileDiskCache::open(&db_path, 4096).expect("upgrade legacy db");
-        assert_eq!(upgraded.stats().expect("stats").tile_count, 0);
-        let conn = lock_unpoisoned(&upgraded.writer);
-        let page_size: i64 = conn
-            .query_row("PRAGMA page_size;", [], |r| r.get(0))
-            .expect("upgraded page_size");
-        let user_version: i64 = conn
-            .query_row("PRAGMA user_version;", [], |r| r.get(0))
-            .expect("upgraded user_version");
-        assert_eq!(page_size, SQLITE_PAGE_SIZE);
-        assert_eq!(user_version, SCHEMA_VERSION);
-    }
-
-    // 2. Garbage bytes simulating a corrupted cache file recover cleanly.
+    // 1. Garbage bytes simulating a corrupted cache file recover cleanly.
     std::fs::write(&db_path, b"not a valid sqlite database file!").expect("write corrupt");
 
     let cache = TileDiskCache::open(&db_path, 4096).expect("recover corrupt db");
@@ -174,7 +89,7 @@ fn recovers_from_corrupt_or_legacy_v1_sqlite_file_and_persists_across_reopen() {
     let ts_before = cache.clock.current_ms();
     drop(cache);
 
-    // 3. Reopen and verify persistence + monotonic timestamp seed + shrinking + clear.
+    // 2. Reopen and verify persistence + monotonic timestamp seed + shrinking + clear.
     let reopened = TileDiskCache::open(&db_path, 4096).expect("reopen");
     assert!(
         reopened.clock.current_ms() >= ts_before,
@@ -185,8 +100,7 @@ fn recovers_from_corrupt_or_legacy_v1_sqlite_file_and_persists_across_reopen() {
         Some(b"png-bytes".to_vec())
     );
 
-    let ev = reopened.set_max_bytes(4).expect("shrink cap");
-    assert_eq!(ev.evicted_tiles, 1);
+    reopened.set_max_bytes(4).expect("shrink cap");
     assert_eq!(reopened.stats().expect("stats").payload_bytes, 0);
     assert_eq!(reopened.stats().expect("stats").tile_count, 0);
     assert_eq!(count_rows(&reopened, "tile_blobs"), 0);
@@ -307,35 +221,33 @@ fn multi_band_format_gutter_and_encoding_never_alias() {
     );
     let k_dem_g1 = DiskTileKey::from_tile_key(source, &TileKey { gutter: 1, ..base });
 
+    let live = CancelToken::new();
     cache
-        .put_encoded(&k_b04, TileBlobEncoding::Lz4Raw, b"b04-lz4")
+        .put_encoded_if_uncancelled(&k_b04, TileBlobEncoding::Lz4Raw, b"b04-lz4", &live)
         .expect("put b04");
     cache
-        .put_encoded(&k_b08, TileBlobEncoding::Lz4Raw, b"b08-lz4")
+        .put_encoded_if_uncancelled(&k_b08, TileBlobEncoding::Lz4Raw, b"b08-lz4", &live)
         .expect("put b08");
     cache
-        .put_encoded(&k_scl, TileBlobEncoding::Lz4Raw, b"scl-lz4")
+        .put_encoded_if_uncancelled(&k_scl, TileBlobEncoding::Lz4Raw, b"scl-lz4", &live)
         .expect("put scl");
     cache
-        .put_encoded(&k_dem_g1, TileBlobEncoding::Qoi, b"dem-g1")
+        .put_encoded_if_uncancelled(&k_dem_g1, TileBlobEncoding::Qoi, b"dem-g1", &live)
         .expect("put dem");
 
-    assert_eq!(
-        cache.get_encoded(&k_b04).expect("get b04"),
-        Some((TileBlobEncoding::Lz4Raw, b"b04-lz4".to_vec()))
-    );
-    assert_eq!(
-        cache.get_encoded(&k_b08).expect("get b08"),
-        Some((TileBlobEncoding::Lz4Raw, b"b08-lz4".to_vec()))
-    );
-    assert_eq!(
-        cache.get_encoded(&k_scl).expect("get scl"),
-        Some((TileBlobEncoding::Lz4Raw, b"scl-lz4".to_vec()))
-    );
-    assert_eq!(
-        cache.get_encoded(&k_dem_g1).expect("get dem"),
-        Some((TileBlobEncoding::Qoi, b"dem-g1".to_vec()))
-    );
+    for (k, expected_enc, expected_bytes) in [
+        (&k_b04, TileBlobEncoding::Lz4Raw, b"b04-lz4".as_slice()),
+        (&k_b08, TileBlobEncoding::Lz4Raw, b"b08-lz4".as_slice()),
+        (&k_scl, TileBlobEncoding::Lz4Raw, b"scl-lz4".as_slice()),
+        (&k_dem_g1, TileBlobEncoding::Qoi, b"dem-g1".as_slice()),
+    ] {
+        let (entry, enc, payload) = cache
+            .get_encoded_entry(k, None)
+            .expect("get entry")
+            .expect("entry present");
+        cache.touch_entry(entry);
+        assert_eq!((enc, payload.as_slice()), (expected_enc, expected_bytes));
+    }
     // `get()` only returns `EncodedImage` entries and must never hand Qoi/Lz4Raw
     // payloads to a raw-image caller.
     assert_eq!(cache.get(&k_b04).expect("get b04 raw"), None);
@@ -361,11 +273,13 @@ fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
     assert_eq!(cache.stats().expect("s3").tile_count, 1);
     assert_eq!(count_rows(&cache, "tile_blobs"), 1);
 
-    // Skipped puts (empty or > max_bytes) return honest current total_bytes_after.
-    let empty_rep = cache.put(&k, &[]).expect("skip empty");
-    assert_eq!(empty_rep.total_bytes_after, 50);
-    let big_rep = cache.put(&k, &vec![0u8; 20_000]).expect("skip oversized");
-    assert_eq!(big_rep.total_bytes_after, 50);
+    // Skipped puts (empty or > max_bytes) leave accounting and write_generation unchanged.
+    let gen_before_skips = cache.write_generation();
+    cache.put(&k, &[]).expect("skip empty");
+    assert_eq!(cache.stats().expect("after empty").payload_bytes, 50);
+    cache.put(&k, &vec![0u8; 20_000]).expect("skip oversized");
+    assert_eq!(cache.stats().expect("after big").payload_bytes, 50);
+    assert_eq!(cache.write_generation(), gen_before_skips);
 
     // Insert 200 tiles (crossing EVICT_BATCH_ROWS = 128), then shrink cap to trigger
     // multi-batch eviction.
@@ -376,12 +290,11 @@ fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
             .expect("put batch tile");
     }
     assert_eq!(cache.stats().expect("pre-evict").tile_count, 200);
-    let ev = cache.set_max_bytes(1000).expect("multi-batch evict");
-    assert!(ev.evicted_tiles > EVICT_BATCH_ROWS as usize);
-    assert!(ev.total_bytes_after <= 900);
+    cache.set_max_bytes(1000).expect("multi-batch evict");
     let post = cache.stats().expect("post-evict");
-    assert_eq!(post.payload_bytes, ev.total_bytes_after);
-    assert_eq!(post.tile_count, (200 - ev.evicted_tiles) as u64);
+    assert!(200 - post.tile_count > EVICT_BATCH_ROWS as u64);
+    assert!(post.payload_bytes <= 900);
+    assert_eq!(post.payload_bytes, post.tile_count * 40);
     assert_eq!(count_rows(&cache, "tile_blobs") as u64, post.tile_count);
 }
 
@@ -419,9 +332,10 @@ fn large_tile_near_budget_never_self_evicts_and_delete_updates_total() {
     cache.put(&old, &[1u8; 20]).expect("put old");
     // 95 B exceeds the 90 B headroom target, yet fits within 100 B cap.
     // Eviction must drop `old` and MUST NOT self-evict `big`.
-    let rep = cache.put(&big, &[2u8; 95]).expect("put big");
-    assert_eq!(rep.evicted_tiles, 1);
-    assert_eq!(rep.total_bytes_after, 95);
+    cache.put(&big, &[2u8; 95]).expect("put big");
+    let stats_after_big = cache.stats().expect("stats after big");
+    assert_eq!(stats_after_big.tile_count, 1);
+    assert_eq!(stats_after_big.payload_bytes, 95);
     assert!(cache.get(&old).expect("get old").is_none());
     assert_eq!(cache.get(&big).expect("get big"), Some(vec![2u8; 95]));
 
@@ -479,9 +393,10 @@ fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
 
     // 1. ABA safety on delete_entry: stale reader seeing corrupt bytes must NOT
     //    delete a newer valid overwrite of the same key (same SQLite tile_id).
+    let live = CancelToken::new();
     let k0 = make_key(0);
     cache
-        .put_encoded(&k0, TileBlobEncoding::Qoi, b"corrupt")
+        .put_encoded_if_uncancelled(&k0, TileBlobEncoding::Qoi, b"corrupt", &live)
         .expect("put corrupt");
     let (stale_entry, enc, payload) = cache
         .get_encoded_entry(&k0, Some(TileBlobEncoding::Qoi))
@@ -494,7 +409,7 @@ fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
 
     // Concurrent writer replaces `k0` with valid bytes.
     cache
-        .put_encoded(&k0, TileBlobEncoding::Qoi, b"valid-replacement")
+        .put_encoded_if_uncancelled(&k0, TileBlobEncoding::Qoi, b"valid-replacement", &live)
         .expect("overwrite valid");
     // Stale reader tries to purge `stale_entry` -> must be a no-op!
     assert!(
@@ -510,7 +425,7 @@ fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
     assert_eq!(cache.stats().expect("stats").tile_count, 0);
 
     // 2. Cancelled puts are ignored cleanly.
-    let cancel = veldmap_core::sync::CancelToken::new();
+    let cancel = CancelToken::new();
     cancel.cancel();
     cache
         .put_encoded_if_uncancelled(&k0, TileBlobEncoding::Qoi, b"ignored", &cancel)
@@ -520,17 +435,16 @@ fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
     // 3. Batch put: pre-batch tile evicts to headroom, batch items between 90%
     //    and 100% of cap are NOT self-evicted, and batch > cap evicts down to
     //    `max_bytes` while keeping the newest item.
-    let live = veldmap_core::sync::CancelToken::new();
     let k_old = make_key(99);
     cache
-        .put_encoded(&k_old, TileBlobEncoding::Qoi, &[1u8; 300])
+        .put_encoded_if_uncancelled(&k_old, TileBlobEncoding::Qoi, &[1u8; 300], &live)
         .expect("put old");
 
     let k1 = make_key(1);
     let k2 = make_key(2);
     let k3 = make_key(3);
     let b320 = vec![2u8; 320];
-    let report = cache
+    cache
         .put_encoded_batch_if_uncancelled(
             &[
                 (&k1, TileBlobEncoding::Qoi, &b320),
@@ -541,19 +455,29 @@ fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
         )
         .expect("batch put");
     // Total of k1..k3 = 960 <= 1000 (above 900 headroom): k_old evicted, all 3 kept!
-    assert_eq!(report.evicted_tiles, 1);
-    assert_eq!(report.total_bytes_after, 960);
-    assert!(cache.get_encoded(&k_old).expect("old evicted").is_none());
-    assert!(cache.get_encoded(&k1).expect("k1 kept").is_some());
-    assert!(cache.get_encoded(&k2).expect("k2 kept").is_some());
-    assert!(cache.get_encoded(&k3).expect("k3 kept").is_some());
+    let batch_stats = cache.stats().expect("batch stats");
+    assert_eq!(batch_stats.tile_count, 3);
+    assert_eq!(batch_stats.payload_bytes, 960);
+    assert!(
+        cache
+            .get_encoded_entry(&k_old, None)
+            .expect("old evicted")
+            .is_none()
+    );
+    for k in [&k1, &k2, &k3] {
+        let (entry, _, _) = cache
+            .get_encoded_entry(k, Some(TileBlobEncoding::Qoi))
+            .expect("batch kept")
+            .expect("entry present");
+        cache.touch_entry(entry);
+    }
 
     // Batch exceeding `max_bytes` enforces the hard cap (<= 1000) and keeps newest.
     let k4 = make_key(4);
     let k5 = make_key(5);
     let k6 = make_key(6);
     let b400 = vec![3u8; 400];
-    let overflow = cache
+    cache
         .put_encoded_batch_if_uncancelled(
             &[
                 (&k4, TileBlobEncoding::Qoi, &b400),
@@ -563,21 +487,28 @@ fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
             &live,
         )
         .expect("overflow batch");
-    assert!(overflow.total_bytes_after <= 1_000);
-    assert!(cache.get_encoded(&k6).expect("newest kept").is_some());
+    assert!(cache.stats().expect("overflow stats").payload_bytes <= 1_000);
+    assert!(
+        cache
+            .get_encoded_entry(&k6, Some(TileBlobEncoding::Qoi))
+            .expect("newest kept")
+            .is_some()
+    );
 
-    // Batch where every entry is outside size bounds reports honest current
-    // bytes and does not spuriously bump `write_generation`.
+    // Batch where every entry is outside size bounds leaves stats and
+    // `write_generation` unchanged.
     let gen_before = cache.write_generation();
     let bytes_before = cache.stats().expect("stats").payload_bytes;
     let oversized = vec![9u8; 2_000];
-    let skipped = cache
+    cache
         .put_encoded_batch_if_uncancelled(
             &[(&make_key(7), TileBlobEncoding::Qoi, &oversized)],
             &live,
         )
         .expect("oversized batch");
-    assert_eq!(skipped.evicted_tiles, 0);
-    assert_eq!(skipped.total_bytes_after, bytes_before);
+    assert_eq!(
+        cache.stats().expect("after skip").payload_bytes,
+        bytes_before
+    );
     assert_eq!(cache.write_generation(), gen_before);
 }

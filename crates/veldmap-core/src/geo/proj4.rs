@@ -28,27 +28,6 @@ pub enum CrsError {
     InvalidCustomTm(String),
 }
 
-/// Return whether `text` begins with a WKT1/WKT2 CRS root keyword (ignoring a
-/// leading UTF-8 BOM and ASCII whitespace).
-pub(super) fn looks_like_wkt(text: &str) -> bool {
-    const WKT_PREFIXES: &[&str] = &[
-        "PROJCS[",
-        "GEOGCS[",
-        "PROJCRS[",
-        "GEOGCRS[",
-        "BOUNDCRS[",
-        "COMPOUNDCRS[",
-        "COMPD_CS[",
-        "LOCAL_CS[",
-    ];
-    let trimmed = text.trim_start_matches('\u{FEFF}').trim_start();
-    WKT_PREFIXES.iter().any(|prefix| {
-        trimmed
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-    })
-}
-
 /// Pure-Rust `proj4rs` coordinate system wrapper targeting WGS84 geodetic
 /// coordinates at the module boundary.
 #[derive(Debug)]
@@ -80,7 +59,10 @@ fn wgs84_proj() -> &'static Proj {
 
 impl Proj4Projection {
     /// Construct from a PROJ.4 parameter string.
-    pub fn from_proj_string(proj_string: &str, label: Option<String>) -> Result<Self, CrsError> {
+    pub(super) fn from_proj_string(
+        proj_string: &str,
+        label: Option<String>,
+    ) -> Result<Self, CrsError> {
         let trimmed = proj_string.trim();
         let (proj, fallback_grid_shift) = match Proj::from_proj_string(trimmed) {
             Ok(proj) => (proj, false),
@@ -117,7 +99,7 @@ impl Proj4Projection {
     }
 
     /// Construct from a WKT1 or WKT2 CRS string (such as a `.prj` sidecar).
-    pub fn from_wkt(wkt: &str) -> Result<Self, CrsError> {
+    pub(super) fn from_wkt(wkt: &str) -> Result<Self, CrsError> {
         let trimmed = wkt.trim().trim_start_matches('\u{FEFF}').trim();
         let proj_string = proj4wkt::wkt_to_projstring(trimmed)
             .map_err(|e| CrsError::InvalidWkt(e.to_string()))?;
@@ -130,7 +112,7 @@ impl Proj4Projection {
     }
 
     /// Construct from an EPSG code backed by `crs-definitions`.
-    pub fn from_epsg(code: u32) -> Result<Self, CrsError> {
+    pub(super) fn from_epsg(code: u32) -> Result<Self, CrsError> {
         let code16 = u16::try_from(code).map_err(|_| CrsError::UnsupportedEpsg(code))?;
         let def = crs_definitions::from_code(code16).ok_or(CrsError::UnsupportedEpsg(code))?;
         let label = format!("EPSG:{code}");
@@ -143,7 +125,7 @@ impl Proj4Projection {
 
     /// Whether this PROJ definition is geographic (longitude/latitude) rather
     /// than projected.
-    pub fn is_geographic(&self) -> bool {
+    pub(super) fn is_geographic(&self) -> bool {
         self.proj.is_latlong()
     }
 
@@ -152,14 +134,9 @@ impl Proj4Projection {
         &self.label
     }
 
-    /// Underlying normalized PROJ.4 string.
-    pub fn proj_string(&self) -> &str {
-        &self.proj_string
-    }
-
     /// Scale factor from this projection's linear units to metres (`1.0` for
     /// metres or geographic).
-    pub fn unit_to_metres(&self) -> f64 {
+    pub(super) fn unit_to_metres(&self) -> f64 {
         let m = self.proj.to_meter();
         if m.is_finite() && m > 0.0 { m } else { 1.0 }
     }
@@ -171,7 +148,7 @@ impl Proj4Projection {
 
     /// Convert projected `(x, y)` (or source-datum `(lon_deg, lat_deg)` when
     /// geographic) into WGS84 `(lat_deg, lon_deg)`.
-    pub fn to_wgs84_geodetic(&self, x: f64, y: f64) -> (f64, f64) {
+    pub(super) fn to_wgs84_geodetic(&self, x: f64, y: f64) -> (f64, f64) {
         if !(x.is_finite() && y.is_finite()) {
             return (f64::NAN, f64::NAN);
         }
@@ -194,7 +171,7 @@ impl Proj4Projection {
 
     /// Convert WGS84 `(lat_deg, lon_deg)` into projected `(x, y)` (or
     /// source-datum `(lon_deg, lat_deg)` when geographic).
-    pub fn from_wgs84_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
+    pub(super) fn transform_from_wgs84_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         if !(lat_deg.is_finite() && lon_deg.is_finite()) {
             return (f64::NAN, f64::NAN);
         }
@@ -344,4 +321,90 @@ fn detect_wkt_datum_warning(wkt: &str, proj_str: &str, label: &str) -> Option<Da
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geo::ground_m;
+
+    #[test]
+    fn rejects_geocentric_and_non_finite_coordinates() {
+        assert!(matches!(
+            Proj4Projection::from_proj_string("+proj=geocent +datum=WGS84", None),
+            Err(CrsError::InvalidProj(_))
+        ));
+        assert!(matches!(
+            Proj4Projection::from_epsg(4978),
+            Err(CrsError::InvalidProj(_))
+        ));
+
+        let proj = Proj4Projection::from_epsg(3035).expect("EPSG:3035");
+        let (lat, lon) = proj.to_wgs84_geodetic(f64::NAN, 0.0);
+        assert!(lat.is_nan() && lon.is_nan());
+        let (x, y) = proj.transform_from_wgs84_geodetic(f64::INFINITY, 10.0);
+        assert!(x.is_nan() && y.is_nan());
+    }
+
+    #[test]
+    fn nad27_rewrite_falls_back_with_grid_shift_warning_and_round_trips() {
+        let rewritten = rewrite_missing_nadgrid_proj(
+            "+proj=utm +zone=10 +datum=NAD27 +nadgrids=conus +no_defs",
+        );
+        assert!(rewritten.contains("+ellps=clrk66"));
+        assert!(rewritten.contains("+towgs84=-8,160,176"));
+        assert!(!rewritten.contains("+nadgrids=conus"));
+
+        // Preserves explicit +towgs84 and +nadgrids=@null.
+        let with_null =
+            rewrite_missing_nadgrid_proj("+proj=merc +datum=NAD27 +towgs84=1,2,3 +nadgrids=@null");
+        assert!(with_null.contains("+towgs84=1,2,3"));
+        assert!(!with_null.contains("+towgs84=-8,160,176"));
+        assert!(with_null.contains("+nadgrids=@null"));
+
+        let nad27 = Proj4Projection::from_epsg(26710).expect("NAD27 UTM 10N");
+        assert!(matches!(
+            nad27.datum_warning(),
+            Some(DatumWarning::GridShiftRecommended { .. })
+        ));
+        let (e, n) = nad27.transform_from_wgs84_geodetic(37.7749, -122.4194);
+        let back = nad27.to_wgs84_geodetic(e, n);
+        assert!(ground_m(back, (37.7749, -122.4194)) < 1.0);
+    }
+
+    #[test]
+    fn detects_unshifted_foreign_ellipsoid_and_wkt_datum_warnings() {
+        let bessel = Proj4Projection::from_proj_string("+proj=utm +zone=32 +ellps=bessel", None)
+            .expect("bessel UTM");
+        assert!(matches!(
+            bessel.datum_warning(),
+            Some(DatumWarning::UnshiftedForeignDatum { .. })
+        ));
+
+        let plate_fixed = Proj4Projection::from_epsg(3035).expect("EPSG:3035");
+        assert!(matches!(
+            plate_fixed.datum_warning(),
+            Some(DatumWarning::GridShiftRecommended { .. })
+        ));
+
+        // ITRF/WGS84 WKT stays warning-free; unshifted non-ITRF WKT warns.
+        let wgs84_wkt = concat!(
+            r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],"#,
+            r#"PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#,
+        );
+        let wgs = Proj4Projection::from_wkt(wgs84_wkt).expect("WGS84 WKT");
+        assert!(wgs.is_geographic());
+        assert_eq!(wgs.datum_warning(), None);
+
+        let foreign_wkt = concat!(
+            r#"GEOGCS["Pulkovo 1942",DATUM["Pulkovo_1942","#,
+            r#"SPHEROID["Krassowsky 1940",6378245,298.3]],"#,
+            r#"PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#,
+        );
+        let foreign = Proj4Projection::from_wkt(foreign_wkt).expect("foreign WKT");
+        assert!(matches!(
+            foreign.datum_warning(),
+            Some(DatumWarning::UnshiftedForeignDatum { .. })
+        ));
+    }
 }

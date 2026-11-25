@@ -32,7 +32,7 @@ wgpu.workspace = true
 
 [dev-dependencies]
 naga.workspace = true
-tiff.workspace = true
+veldmap-raster = { path = "../veldmap-raster", features = ["test-support"] }
 veldmap-storage = { path = "../veldmap-storage", features = ["test-support"] }
 
 [lints]

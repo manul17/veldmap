@@ -63,8 +63,6 @@ pub enum ServeMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LevelPlan {
     pub serve: ServeMode,
-    /// Estimated source pixels read for one tile (pointwise) or full pass.
-    pub source_pixels: u64,
     /// Estimated working memory peak in bytes.
     pub estimated_peak_bytes: u64,
     /// Whether this level fits inside the configured memory budget.
@@ -81,9 +79,6 @@ pub type PassKey = StreamKey;
 pub struct PyramidMeta {
     pub source: SourceId,
     pub spec: TileStreamSpec,
-    pub width: u32,
-    pub height: u32,
-    pub tile_size: u32,
     /// Level plans ordered from `0` (finest native) to `max_level` (coarsest
     /// single-tile apex).
     pub levels: Vec<LevelPlan>,
@@ -188,7 +183,6 @@ pub(crate) fn build_chunked_level_table(
     budget: &MemoryBudget,
 ) -> Vec<LevelPlan> {
     let base = (width, height);
-    let whole_pixels = u64::from(width) * u64::from(height);
     let count = level_count(width, height).min(u32::from(u8::MAX));
 
     (0..count)
@@ -199,7 +193,6 @@ pub(crate) fn build_chunked_level_table(
                     let peak = grid.direct_peak_for_footprint(&fp).total();
                     LevelPlan {
                         serve: ServeMode::Pointwise,
-                        source_pixels: fp.held_pixels,
                         estimated_peak_bytes: peak,
                         fits: peak <= budget.decode_working_bytes,
                     }
@@ -208,7 +201,6 @@ pub(crate) fn build_chunked_level_table(
                     let peak = grid.pass_peak(base).total();
                     LevelPlan {
                         serve: ServeMode::Pass { from: 0 },
-                        source_pixels: whole_pixels,
                         estimated_peak_bytes: peak,
                         fits: peak <= budget.decode_working_bytes,
                     }

@@ -32,7 +32,7 @@ pub(crate) struct DecodedChunk {
 
 impl DecodedChunk {
     /// Byte size accounted against [`SharedChunkCache`].
-    pub(crate) fn byte_size(&self) -> usize {
+    fn byte_size(&self) -> usize {
         self.data.len()
     }
 }

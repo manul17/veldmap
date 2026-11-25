@@ -5,12 +5,10 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use veldmap_core::geo::{
-    CrsPreset, CrsSpec, CrsTextKind, CustomTmParams, DatumPreset, LinearUnit, builtin_crs_presets,
-    search_crs_presets,
+    CrsPreset, CustomTmParams, DatumPreset, LinearUnit, builtin_crs_presets, search_crs_presets,
 };
 
-use crate::crs_override::CrsOverride;
-use crate::layers::LayerId;
+use crate::layers::{CrsOverride, LayerId};
 
 use super::ERROR_TEXT_COLOR;
 
@@ -278,23 +276,9 @@ fn show_wkt_proj_tab(ui: &mut egui::Ui, state: &mut CrsPickerState) -> Option<Cr
     );
     ui.add_space(6.0);
     if ui.button("Apply WKT / PROJ").clicked() {
-        let raw = state
-            .wkt_input
-            .trim()
-            .trim_start_matches('\u{FEFF}')
-            .trim()
-            .to_owned();
-        match CrsSpec::parse_text(&raw) {
-            Ok((_, kind)) => {
-                let sel = match kind {
-                    CrsTextKind::Wkt => CrsOverride::Wkt(raw),
-                    CrsTextKind::UserString => CrsOverride::Proj(raw),
-                };
-                return state.finish_selection(sel);
-            }
-            Err(err) => {
-                state.error = Some(err.to_string());
-            }
+        match CrsOverride::parse_text(&state.wkt_input) {
+            Ok(sel) => return state.finish_selection(sel),
+            Err(err) => state.error = Some(err),
         }
     }
     None
@@ -313,7 +297,7 @@ pub(crate) fn show_crs_picker_window(
     let title = match &state.target {
         Some(CrsPickerTarget::Layer { name, .. }) => format!("CRS Override — {name}"),
         Some(CrsPickerTarget::PendingPath(p)) => {
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("raster");
+            let fname = crate::display_name_from_path(p);
             format!("Assign CRS — {fname}")
         }
         None => "CRS Picker".to_owned(),

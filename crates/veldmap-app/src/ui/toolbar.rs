@@ -13,8 +13,8 @@ use veldmap_core::geo::{ParsedLocation, parse_location};
 
 use crate::basemap::BasemapStatusSnapshot;
 use crate::display_name_from_path;
-use crate::session::{CameraBookmark, MAX_BOOKMARKS};
-use crate::settings::AppSettings;
+use crate::storage::session::{CameraBookmark, MAX_BOOKMARKS};
+use crate::storage::settings::AppSettings;
 
 use super::basemap::{BasemapUiAction, BasemapUiState, show_toolbar_controls};
 use super::{ERROR_TEXT_COLOR, format, submitted_with_enter};

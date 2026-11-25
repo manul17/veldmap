@@ -1,10 +1,9 @@
 //! CPU `f64` RTC warp-mesh generation (`WarpPatch`, `build_warp_patch`,
 //! `level_segments`) for native-CRS raster overlays draped on WGS84.
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 
-use crate::geo::Frame;
-use crate::geo::geodesy;
+use crate::geo::{Frame, SEMI_MAJOR_M};
 
 use super::super::pyramid::{RASTER_TILE_SIZE, level_px};
 use super::{FrameGridSpec, sample_frame_grid};
@@ -57,7 +56,7 @@ pub fn level_segments(frame: &Frame, width: u32, height: u32, level: u8) -> u32 
         let frac_x = (tile_w / w).clamp(0.0, 1.0);
         let frac_y = (tile_h / h).clamp(0.0, 1.0);
         let grid_span_m = (widest_row_m * frac_x).max(widest_col_m * frac_y);
-        let grid_span_deg = (grid_span_m / geodesy::SEMI_MAJOR_M).to_degrees();
+        let grid_span_deg = (grid_span_m / SEMI_MAJOR_M).to_degrees();
         worst_span_deg = worst_span_deg.max(grid_span_deg);
     }
 
@@ -130,7 +129,7 @@ impl WarpPatch {
 
         let v_at = |r: usize, c: usize| {
             let p = self.rel_positions[r * side + c];
-            DVec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))
+            Vec3::from_array(p).as_dvec3()
         };
         let p00 = v_at(row, col);
         let p10 = v_at(row, col + 1);

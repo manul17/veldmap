@@ -1,64 +1,21 @@
-//! Basemap selector toolbar controls, draft settings slice, and action types
-//! for `VeldmapApp` (`app/mod.rs`).
+//! Basemap selector toolbar controls, settings window, and action types for
+//! `VeldmapApp` (`app/mod.rs`).
 //!
 //! Strictly action-only: emits [`BasemapUiAction`] values back to `VeldmapApp`
 //! without mutating managers, storage, GPU caches, or upload channels directly
-//! from UI layout code, and without importing `veldmap-net` or `crate::storage`.
+//! from UI layout code, and without importing `veldmap-net` or `AppStorage`.
+
+mod settings_window;
+
+pub(crate) use settings_window::show_settings_window;
 
 use eframe::egui;
 
 use super::{ERROR_TEXT_COLOR, TILE_ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 use crate::basemap::BasemapStatusSnapshot;
-use crate::settings::{
-    AppSettings, BasemapSelection, CustomXyzSettings, validate_custom_url_template,
-    validate_gibs_date,
+use crate::storage::settings::{
+    AppSettings, BasemapSelection, BasemapSettingsDraft, validate_custom_url_template,
 };
-
-/// Scoped editable slice of [`AppSettings`] owned by the Basemap & Tile Cache
-/// Settings window.
-///
-/// Keeping this slice separate from unrelated `AppSettings` fields (such as
-/// `show_graticule` or future workspace preferences) guarantees saving basemap
-/// settings can never silently clobber other user settings.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BasemapSettingsDraft {
-    pub(super) active_basemap: BasemapSelection,
-    pub(super) gibs_date: String,
-    pub(super) custom_xyz: CustomXyzSettings,
-    pub(super) disk_cache_max_mb: u64,
-}
-
-impl BasemapSettingsDraft {
-    fn from_settings(settings: &AppSettings) -> Self {
-        Self {
-            active_basemap: settings.active_basemap,
-            gibs_date: settings.gibs_date.clone(),
-            custom_xyz: settings.custom_xyz.clone(),
-            disk_cache_max_mb: settings.disk_cache_max_mb,
-        }
-    }
-
-    pub(crate) fn apply_into(&self, target: &mut AppSettings) {
-        target.active_basemap = self.active_basemap;
-        // Never overwrite a valid persisted GIBS date with a half-typed invalid
-        // string when saving unrelated settings (e.g. disk cache cap or Custom XYZ).
-        if validate_gibs_date(&self.gibs_date)
-            || self.active_basemap == BasemapSelection::NasaGibsViirs
-        {
-            target.gibs_date = self.gibs_date.clone();
-        }
-        // Never overwrite a valid persisted Custom XYZ configuration with a
-        // half-typed invalid URL when saving unrelated settings, while still
-        // allowing an intentionally cleared empty URL to be persisted.
-        if self.active_basemap == BasemapSelection::CustomXyz
-            || self.custom_xyz.url_template.trim().is_empty()
-            || validate_custom_url_template(&self.custom_xyz.url_template).is_ok()
-        {
-            target.custom_xyz = self.custom_xyz.clone();
-        }
-        target.disk_cache_max_mb = self.disk_cache_max_mb;
-    }
-}
 
 /// User intent emitted by basemap toolbar / settings widgets and applied by
 /// `VeldmapApp`.
@@ -82,8 +39,8 @@ pub(crate) enum BasemapUiAction {
 /// Transient UI editing state for the Basemap & Cache Settings window.
 #[derive(Clone, Debug)]
 pub(crate) struct BasemapUiState {
-    pub(super) settings_open: bool,
-    pub(super) draft: BasemapSettingsDraft,
+    settings_open: bool,
+    draft: BasemapSettingsDraft,
     cached_custom_validation: Option<(String, Result<(), String>)>,
 }
 
@@ -126,7 +83,7 @@ impl BasemapUiState {
 
     /// Return cached validation result for `draft.custom_xyz.url_template`,
     /// recomputing only when the URL template changes.
-    pub(super) fn custom_validation(&mut self) -> Result<(), &str> {
+    fn custom_validation(&mut self) -> Result<(), &str> {
         let needs_recompute = self
             .cached_custom_validation
             .as_ref()
@@ -257,58 +214,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basemap_draft_preserves_unrelated_app_settings_and_caches_validation() {
-        let mut settings = AppSettings {
-            show_graticule: false,
-            ..AppSettings::default()
-        };
+    fn custom_validation_caches_and_recomputes_on_url_change() {
+        let settings = AppSettings::default();
         let mut ui_state = BasemapUiState::new(&settings);
-        ui_state.draft.active_basemap = BasemapSelection::EoxSentinel2Cloudless;
-        ui_state.draft.disk_cache_max_mb = 1024;
 
-        // Applying basemap draft must leave unrelated `show_graticule` intact.
-        ui_state.draft.apply_into(&mut settings);
-        assert!(!settings.show_graticule);
-        assert_eq!(
-            settings.active_basemap,
-            BasemapSelection::EoxSentinel2Cloudless
-        );
-        assert_eq!(settings.disk_cache_max_mb, 1024);
-
-        // Applying draft with an invalid GIBS date while GIBS VIIRS is inactive
-        // preserves the existing valid GIBS date instead of persisting a typo.
-        let prev_date = settings.gibs_date.clone();
-        ui_state.draft.gibs_date = "not-a-date".to_owned();
-        ui_state.draft.disk_cache_max_mb = 2048;
-        ui_state.draft.apply_into(&mut settings);
-        assert_eq!(settings.gibs_date, prev_date);
-        assert_eq!(settings.disk_cache_max_mb, 2048);
-
-        // Cached custom validation fails on empty URL, then updates when edited.
         assert!(ui_state.custom_validation().is_err());
         ui_state.draft.custom_xyz.url_template =
             "https://tiles.example.org/{z}/{x}/{y}.png".to_owned();
         assert!(ui_state.custom_validation().is_ok());
-
-        // Saving a valid Custom XYZ URL while CustomXyz is inactive persists it.
-        ui_state.draft.apply_into(&mut settings);
-        assert_eq!(
-            settings.custom_xyz.url_template,
-            "https://tiles.example.org/{z}/{x}/{y}.png"
-        );
-
-        // A half-typed invalid URL while CustomXyz is inactive must preserve
-        // the existing saved Custom XYZ configuration.
-        let saved_custom = settings.custom_xyz.clone();
-        ui_state.draft.custom_xyz.url_template = "https://incomplete-no-placeholders".to_owned();
-        ui_state.draft.custom_xyz.name = "Half-typed".to_owned();
-        ui_state.draft.apply_into(&mut settings);
-        assert_eq!(settings.custom_xyz, saved_custom);
-
-        // Intentionally clearing the URL to empty while CustomXyz is inactive
-        // IS applied so the user can clear a saved Custom XYZ source.
-        ui_state.draft.custom_xyz.url_template = "   ".to_owned();
-        ui_state.draft.apply_into(&mut settings);
-        assert_eq!(settings.custom_xyz.url_template, "   ");
     }
 }

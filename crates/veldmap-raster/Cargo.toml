@@ -5,8 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
-image.workspace = true
 jpeg-decoder.workspace = true
 png.workspace = true
 qoi.workspace = true
@@ -16,6 +18,7 @@ tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 
 [dev-dependencies]
+image.workspace = true
 image-webp.workspace = true
 veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
 zstd.workspace = true

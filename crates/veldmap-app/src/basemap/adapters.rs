@@ -41,7 +41,7 @@ impl TileBlobStore for SqliteBlobStore {
 
     fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), BlobStoreError> {
         let key = Self::disk_key(source_key, id);
-        self.0.put(&key, payload).map(|_| ()).map_err(Self::map_err)
+        self.0.put(&key, payload).map_err(Self::map_err)
     }
 
     fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), BlobStoreError> {

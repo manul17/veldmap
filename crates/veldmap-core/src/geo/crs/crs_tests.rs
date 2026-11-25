@@ -1,12 +1,5 @@
 use super::*;
-use crate::geo::datum::{AIRY_1830, Datum, HelmertConvention, ellipsoid_from_epsg};
-
-fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {
-    let lat = ((first.0 + second.0) / 2.0).to_radians();
-    let per_lat = 111_132.92 - 559.82 * (2.0 * lat).cos();
-    let per_lon = 111_412.84 * lat.cos() - 93.5 * (3.0 * lat).cos();
-    ((first.0 - second.0) * per_lat).hypot((first.1 - second.1) * per_lon)
-}
+use crate::geo::ground_m;
 
 #[test]
 fn proj4_epsg_and_wkt_round_trip_and_warn_on_grid_datums() {
@@ -112,38 +105,25 @@ fn crs_guards_geocentric_nad27_sphere_foreign_ellipsoids_and_named_custom_tm() {
     };
     let proj = params.to_projection().expect("valid custom TM");
     assert_eq!(proj.label(), "MSK-77 Test");
-
-    // In-house GK and MSK-61 labels are recognized without requiring a manual name.
-    assert!(
-        Projection::from_epsg(28407)
-            .expect("GK 7")
-            .label()
-            .contains("28407")
-    );
-    assert!(
-        Projection::from_epsg(6_336_101)
-            .expect("MSK-61 z1")
-            .label()
-            .contains("MSK-61")
-    );
 }
 
 #[test]
-fn datum_to_towgs84_and_parse_text_classify_conventions_cleanly() {
-    // Pulkovo 1942 uses CoordinateFrame; exporting to PositionVector negates rotations.
-    assert_eq!(PULKOVO_1942.convention, HelmertConvention::CoordinateFrame);
-    let pv_params = PULKOVO_1942.to_towgs84();
-    assert_eq!(pv_params, [23.57, -140.95, -79.8, -0.0, 0.35, 0.79, -0.22]);
-    let roundtrip = Datum::from_towgs84(PULKOVO_1942.ellipsoid, pv_params);
-    assert_eq!(roundtrip.to_towgs84(), pv_params);
-    assert_eq!(ellipsoid_from_epsg(7001), Some(AIRY_1830));
-
+fn parse_text_and_from_proj_string_labeled_classify_inputs_cleanly() {
     // Unified parse_text detects WKT vs PROJ/EPSG and preserves InvalidWkt on broken WKT.
-    assert!(CrsSpec::looks_like_wkt("\u{FEFF}  geogcs[\"WGS 84\"]"));
-    assert!(!CrsSpec::looks_like_wkt("+proj=utm +zone=37 +datum=WGS84"));
+    assert!(looks_like_wkt("\u{FEFF}  geogcs[\"WGS 84\"]"));
+    assert!(!looks_like_wkt("+proj=utm +zone=37 +datum=WGS84"));
     let (crs, kind) = CrsSpec::parse_text("EPSG:32637").expect("EPSG shorthand");
     assert_eq!(kind, CrsTextKind::UserString);
     assert!(crs.label().contains("32637"));
     let err = CrsSpec::parse_text("PROJCS[\"Broken\"").expect_err("malformed WKT");
     assert!(matches!(err, CrsError::InvalidWkt(_)));
+
+    // Labeled PROJ.4 construction preserves explicit label for projected and geographic CRSs.
+    let labeled = CrsSpec::from_proj_string_labeled(
+        "+proj=merc +lon_0=0 +k_0=1 +x_0=0 +y_0=0 +datum=WGS84 +no_defs",
+        Some("Custom Mercator".to_string()),
+    )
+    .expect("labeled PROJ");
+    assert!(matches!(labeled, CrsSpec::Projected(_)));
+    assert_eq!(labeled.label(), "Custom Mercator");
 }

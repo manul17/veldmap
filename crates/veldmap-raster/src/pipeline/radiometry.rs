@@ -106,7 +106,7 @@ pub(crate) fn expand_u8_into_rgba(
 
 /// Expand raw 8-bit samples directly to RGBA8 without stretching or nodata
 /// keying.
-fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
+pub(crate) fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
     let mut rgba = Vec::new();
     expand_u8_into_rgba(samples, pixel, pixels, &mut rgba);
     rgba

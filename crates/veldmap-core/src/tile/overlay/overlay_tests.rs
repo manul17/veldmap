@@ -1,4 +1,4 @@
-use glam::DVec3;
+use glam::Vec3;
 
 use super::*;
 use crate::geo::{Camera, Frame, Geodetic, Projection, WGS84};
@@ -262,7 +262,7 @@ fn negative_determinant_and_south_up_affines_wind_outward_and_emit_outward_norma
         assert_eq!(patch.normals.len(), side * side);
         let v = |r: usize, c: usize| {
             let p = patch.rel_positions[r * side + c];
-            patch.origin_ecef_m + DVec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))
+            patch.origin_ecef_m + Vec3::from_array(p).as_dvec3()
         };
         let p0 = v(0, 0);
         let p1 = v(1, 0);
@@ -274,9 +274,8 @@ fn negative_determinant_and_south_up_affines_wind_outward_and_emit_outward_norma
         };
         assert!(tri_n.dot(p0) > 0.0);
         for (&rel, &n) in patch.rel_positions.iter().zip(&patch.normals) {
-            let n_vec = DVec3::new(f64::from(n[0]), f64::from(n[1]), f64::from(n[2]));
-            let p_vec = patch.origin_ecef_m
-                + DVec3::new(f64::from(rel[0]), f64::from(rel[1]), f64::from(rel[2]));
+            let n_vec = Vec3::from_array(n).as_dvec3();
+            let p_vec = patch.origin_ecef_m + Vec3::from_array(rel).as_dvec3();
             assert!((n_vec.length() - 1.0).abs() < 1e-5);
             assert!(n_vec.dot(p_vec) > 0.0);
         }

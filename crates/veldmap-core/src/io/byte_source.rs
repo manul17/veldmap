@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::sync::CancelToken;
 
 /// Default internal buffer size for [`BufferedByteReader`] (`64 KiB`).
-pub const DEFAULT_READER_BUFFER_BYTES: usize = 64 * 1024;
+const DEFAULT_READER_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Errors returned by synchronous positioned [`ByteSource`] operations.
 #[derive(Debug, Error)]
@@ -127,11 +127,7 @@ impl BufferedByteReader {
     }
 
     /// Create a buffered reader with an explicit window size in bytes.
-    pub fn with_capacity(
-        source: Arc<dyn ByteSource>,
-        cancel: CancelToken,
-        capacity: usize,
-    ) -> Self {
+    fn with_capacity(source: Arc<dyn ByteSource>, cancel: CancelToken, capacity: usize) -> Self {
         let len = source.len();
         Self {
             source,

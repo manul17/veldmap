@@ -1,19 +1,5 @@
 use super::*;
-use crate::tile::{BandKey, PixelFormat, SourceId, TileScheme};
-
-fn make_key(scheme: TileScheme, level: u8, x: u32, y: u32) -> TileKey {
-    TileKey {
-        source: SourceId::BUNDLED_BASEMAP,
-        band: BandKey::Display,
-        scheme,
-        format: PixelFormat::Rgba8UnormSrgb,
-        gutter: 0,
-        decode_rev: 0,
-        level,
-        x,
-        y,
-    }
-}
+use crate::tile::{SourceId, TileScheme, make_key};
 
 #[test]
 fn byte_cap_evicts_lru_and_preserves_total_bytes_invariant() {

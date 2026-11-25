@@ -5,9 +5,9 @@
 
 use eframe::egui;
 
-use super::basemap::{BasemapUiAction, BasemapUiState};
-use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
-use crate::settings::{
+use super::super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
+use super::{BasemapUiAction, BasemapUiState};
+use crate::storage::settings::{
     AppSettings, BasemapSelection, CUSTOM_MAX_LEVEL_RANGE, DISK_CACHE_MAX_MB_RANGE,
     validate_gibs_date,
 };

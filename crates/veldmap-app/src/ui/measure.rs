@@ -40,7 +40,7 @@ impl MeasureUiState {
 pub(crate) fn show_measure_window(
     ctx: &egui::Context,
     session: &MeasureSession,
-    state: &mut MeasureUiState,
+    state: &MeasureUiState,
 ) -> Option<MeasureAction> {
     if !session.is_active() {
         return None;
@@ -109,14 +109,12 @@ pub(crate) fn show_measure_window(
                     .add_enabled(point_count > 0, egui::Button::new("Undo"))
                     .clicked()
                 {
-                    state.clear_notice();
                     action = Some(MeasureAction::Undo);
                 }
                 if ui
                     .add_enabled(point_count > 0, egui::Button::new("Clear"))
                     .clicked()
                 {
-                    state.clear_notice();
                     action = Some(MeasureAction::Clear);
                 }
                 if ui

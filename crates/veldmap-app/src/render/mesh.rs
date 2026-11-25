@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
-use veldmap_core::geo::geodesy;
+use veldmap_core::geo::WGS84;
 use veldmap_core::glam::Vec3;
 use veldmap_core::tile::{
     DEFAULT_GRID_CELLS, PlanetaryScheme, QuadTileId, TileSurfaceSample, VisibleTile,
@@ -36,15 +36,19 @@ pub(super) struct TileMeshCache {
     meshes: ElasticMeshCache<QuadTileId, CachedTileMesh>,
 }
 
+fn create_shared_index_buffer(device: &wgpu::Device, indices: &[u32]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("quadtree shared index buffer"),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    })
+}
+
 impl TileMeshCache {
     pub(super) fn new(device: &wgpu::Device) -> Self {
         let grid_cells = DEFAULT_GRID_CELLS;
         let shared = SharedTileIndices::build(grid_cells);
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("quadtree shared index buffer"),
-            contents: bytemuck::cast_slice(&shared.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let index_buffer = create_shared_index_buffer(device, &shared.indices);
         Self {
             grid_cells,
             surface_indices: shared.surface,
@@ -79,11 +83,7 @@ impl TileMeshCache {
         self.grid_cells = cells;
         self.surface_indices = shared.surface;
         self.full_indices = shared.full;
-        self.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("quadtree shared index buffer"),
-            contents: bytemuck::cast_slice(&shared.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        self.index_buffer = create_shared_index_buffer(device, &shared.indices);
         self.meshes.clear_and_reset_cap();
     }
 
@@ -270,7 +270,7 @@ pub(super) fn build_tile_mesh_data(
                 polar_dx: 0.0,
                 polar_dy: 0.0,
             });
-            let (pos_ecef, unit_normal) = geodesy::surface_ecef_and_normal(lat, lon);
+            let (pos_ecef, unit_normal) = WGS84.surface_ecef_and_normal(lat, lon);
             let rel_pos = (pos_ecef - origin).as_vec3().to_array();
             let normal = unit_normal.as_vec3().to_array();
             let grid_rel = if is_polar {

@@ -11,7 +11,7 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::SourceFingerprint;
 
 use crate::StorageError;
-use crate::file_source::{LocalFileSource, ensure_regular_file, metadata_mtime_ns};
+use crate::file_source::{LocalFileSource, metadata_mtime_ns};
 
 /// Edge/midpoint sample window size (`64 KiB`).
 const FINGERPRINT_SAMPLE_BYTES: u64 = 64 * 1024;
@@ -98,16 +98,6 @@ impl LocalFingerprintCache {
         Self::default()
     }
 
-    /// Return the cached [`SourceFingerprint`] for `path` if `(len, mtime_ns)`
-    /// still match, or recompute from disk and cache the result.
-    pub fn get_or_compute(
-        &self,
-        path: &Path,
-        cancel: &CancelToken,
-    ) -> Result<SourceFingerprint, StorageError> {
-        self.get_or_compute_with_bypass(path, false, cancel)
-    }
-
     /// Open `path` once as a [`LocalFileSource`] and return both the opened
     /// handle and its [`SourceFingerprint`], avoiding a second `File::open` and
     /// closing the TOCTOU window between fingerprinting and decoding.
@@ -138,36 +128,6 @@ impl LocalFingerprintCache {
         }
         let fingerprint = self.compute_and_cache(&key, &source, cancel)?;
         Ok((source, fingerprint))
-    }
-
-    /// Return the [`SourceFingerprint`] for `path`, bypassing the in-memory stat
-    /// cache when `bypass_cache` is `true` ("Reload / bypass cache").
-    pub fn get_or_compute_with_bypass(
-        &self,
-        path: &Path,
-        bypass_cache: bool,
-        cancel: &CancelToken,
-    ) -> Result<SourceFingerprint, StorageError> {
-        if cancel.is_cancelled() {
-            return Err(StorageError::Cancelled);
-        }
-        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-
-        if !bypass_cache {
-            let meta = std::fs::metadata(&key)?;
-            ensure_regular_file(&meta, path)?;
-            if let Some(fingerprint) =
-                self.lookup_cached(&key, meta.len(), metadata_mtime_ns(&meta))
-            {
-                return Ok(fingerprint);
-            }
-        }
-
-        if cancel.is_cancelled() {
-            return Err(StorageError::Cancelled);
-        }
-        let source = LocalFileSource::open(&key)?;
-        self.compute_and_cache(&key, &source, cancel)
     }
 
     fn lookup_cached(
@@ -305,19 +265,17 @@ mod tests {
             .expect("open_and_fingerprint hit");
         assert_eq!(hit_fp, fp2);
         assert_eq!(hit_src.len(), data.len() as u64);
-        let cached1 = cache.get_or_compute(&path, &cancel).expect("initial");
-        assert_eq!(cached1, fp2);
-        let cached2 = cache
-            .get_or_compute_with_bypass(&path, true, &cancel)
+        let (_, bypassed_fp) = cache
+            .open_and_fingerprint(&path, true, &cancel)
             .expect("bypass");
-        assert_eq!(cached2, fp2);
+        assert_eq!(bypassed_fp, fp2);
 
         // Pre-cancelled token returns typed `StorageError::Cancelled` without I/O.
         let cancelled = CancelToken::new();
         cancelled.cancel();
         assert!(
             cache
-                .get_or_compute(&path, &cancelled)
+                .open_and_fingerprint(&path, false, &cancelled)
                 .is_err_and(|e| e.is_cancelled())
         );
 
@@ -327,10 +285,11 @@ mod tests {
             let mut f = File::create(&path).expect("overwrite");
             f.write_all(&data).expect("write2");
         }
-        let recomputed = cache
-            .get_or_compute_with_bypass(&path, true, &cancel)
+        let (recomputed_src, recomputed) = cache
+            .open_and_fingerprint(&path, true, &cancel)
             .expect("recomputed");
         assert_ne!(recomputed, fp2);
+        assert_eq!(recomputed_src.len(), data.len() as u64);
 
         // Deleting the file before `invalidate` still removes the canonicalized cache entry.
         std::fs::remove_file(&path).expect("remove");

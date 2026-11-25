@@ -15,3 +15,4 @@ mod overlays;
 mod precision_and_seams;
 mod shader_codegen;
 mod uploads_and_cache;
+mod vectors;

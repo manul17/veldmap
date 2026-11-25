@@ -3,8 +3,7 @@
 //! (`ViewportInteraction`).
 
 use eframe::egui;
-use veldmap_core::geo::camera::ZOOM_PER_CLICK;
-use veldmap_core::geo::{Camera, GeoPoint};
+use veldmap_core::geo::{Camera, GeoPoint, ZOOM_PER_CLICK};
 
 /// Logical scroll points mapped to one discrete globe zoom notch.
 const SCROLL_PT_PER_STEP: f64 = 48.0;

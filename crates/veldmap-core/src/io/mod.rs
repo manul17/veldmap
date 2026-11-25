@@ -6,4 +6,4 @@ mod byte_source;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
-pub use byte_source::{BufferedByteReader, ByteSource, DEFAULT_READER_BUFFER_BYTES, IoError};
+pub use byte_source::{BufferedByteReader, ByteSource, IoError};

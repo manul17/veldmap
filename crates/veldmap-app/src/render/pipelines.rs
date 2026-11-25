@@ -58,11 +58,7 @@ fn create_globe_pipeline(
 }
 
 pub(super) struct GlobePipelines {
-    pub(super) camera_layout: wgpu::BindGroupLayout,
-    pub(super) tile_uniform_layout: wgpu::BindGroupLayout,
-    pub(super) overlay_uniform_layout: wgpu::BindGroupLayout,
-    pub(super) vector_uniform_layout: wgpu::BindGroupLayout,
-    pub(super) tile_texture_layout: wgpu::BindGroupLayout,
+    pub(super) layouts: SharedLayouts,
     pub(super) tile_sampler: wgpu::Sampler,
     pub(super) body_ellipsoid_pipeline: wgpu::RenderPipeline,
     pub(super) body_textured_pipeline: wgpu::RenderPipeline,
@@ -76,12 +72,12 @@ pub(super) struct GlobePipelines {
     pub(super) composite_pipeline: wgpu::RenderPipeline,
 }
 
-struct SharedLayouts {
-    camera_layout: wgpu::BindGroupLayout,
-    tile_uniform_layout: wgpu::BindGroupLayout,
-    overlay_uniform_layout: wgpu::BindGroupLayout,
-    vector_uniform_layout: wgpu::BindGroupLayout,
-    tile_texture_layout: wgpu::BindGroupLayout,
+pub(super) struct SharedLayouts {
+    pub(super) camera_layout: wgpu::BindGroupLayout,
+    pub(super) tile_uniform_layout: wgpu::BindGroupLayout,
+    pub(super) overlay_uniform_layout: wgpu::BindGroupLayout,
+    pub(super) vector_uniform_layout: wgpu::BindGroupLayout,
+    pub(super) tile_texture_layout: wgpu::BindGroupLayout,
 }
 
 fn uniform_buffer_layout<T>(
@@ -445,11 +441,7 @@ impl GlobePipelines {
             create_composite_resources(device, target_format);
 
         Self {
-            camera_layout: layouts.camera_layout,
-            tile_uniform_layout: layouts.tile_uniform_layout,
-            overlay_uniform_layout: layouts.overlay_uniform_layout,
-            vector_uniform_layout: layouts.vector_uniform_layout,
-            tile_texture_layout: layouts.tile_texture_layout,
+            layouts,
             tile_sampler,
             body_ellipsoid_pipeline,
             body_textured_pipeline,

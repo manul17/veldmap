@@ -15,7 +15,7 @@ use veldmap_core::tile::{SourceFingerprint, SourceId, level_count};
 use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
 use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
 use crate::pipeline::plan::{LevelPlan, ServeMode, check_max_source_side};
-use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples, expand_u8_into_rgba};
+use crate::pipeline::radiometry::{PixelLayout, expand_u8_into_rgba, to_rgba8};
 use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
 
@@ -111,11 +111,9 @@ impl PngSource {
         }
 
         let n_levels = level_count(width, height);
-        let full_pixels = u64::from(width).saturating_mul(u64::from(height));
         let levels: Vec<LevelPlan> = (0..n_levels)
             .map(|_| LevelPlan {
                 serve: ServeMode::Pass { from: 0 },
-                source_pixels: full_pixels,
                 estimated_peak_bytes: pass_peak_bytes,
                 fits: true,
             })
@@ -175,18 +173,6 @@ impl RasterSource for PngSource {
         self.pass_peak_bytes
     }
 
-    fn produce_direct(
-        &self,
-        level: u8,
-        _wants: &[(u32, u32)],
-        _ctx: &DecodeContext<'_>,
-        _emit: TileEmit<'_>,
-    ) -> Result<(), RasterError> {
-        Err(RasterError::Decode(format!(
-            "PNG does not support pointwise random access at level {level}; use sequential pass"
-        )))
-    }
-
     fn produce_pass(&self, ctx: &DecodeContext<'_>, emit: TileEmit<'_>) -> Result<(), RasterError> {
         if ctx.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
@@ -203,7 +189,6 @@ impl RasterSource for PngSource {
             ));
         }
 
-        let mapping = DisplayMapping::identity(None);
         let mut cascade = Cascade::new(0, w, h);
         let mut bled_emit = bleed_display_emit(emit);
 
@@ -230,10 +215,9 @@ impl RasterSource for PngSource {
             if ctx.cancel.is_cancelled() {
                 return Err(RasterError::Cancelled);
             }
-            let channels = out.color_type.samples();
-            let rgba = mapping.rgba(
-                &Samples::U8(&buf[..out.buffer_size()]),
-                PixelLayout::named(channels),
+            let rgba = to_rgba8(
+                &buf[..out.buffer_size()],
+                layout,
                 (w as usize).saturating_mul(h as usize),
             );
             drop(buf);

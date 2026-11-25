@@ -10,7 +10,7 @@ use super::CrsSpec;
 pub struct CrsPreset {
     pub epsg: u32,
     pub name: String,
-    pub category: &'static str,
+    pub(super) category: &'static str,
 }
 
 impl CrsPreset {

@@ -1,15 +1,39 @@
 //! Session restoration tracking, unified `session.json` snapshot persistence,
-//! and asynchronous file-dialog / scene-I/O event draining for [`VeldmapApp`].
+//! and asynchronous scene-I/O event draining for [`VeldmapApp`].
 
 use std::path::{Path, PathBuf};
 
+use veldmap_core::geo::FootprintBounds;
+
 use crate::layers::OverlayIoEvent;
 use crate::scene::SceneIoEvent;
-use crate::session::{SavedCameraPose, SavedLayerEntry, SavedVectorEntry};
+use crate::storage::session::{SavedCameraPose, SavedLayerEntry, SavedVectorEntry};
 use crate::vectors::VectorIoEvent;
 
 use super::VeldmapApp;
-use super::dialogs::FileDialogEvent;
+
+#[derive(Clone, Copy)]
+enum LayerKind {
+    Raster,
+    Vector,
+}
+
+impl LayerKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Raster => "local overlay",
+            Self::Vector => "GeoJSON vector",
+        }
+    }
+}
+
+fn take_by_path<T>(entries: &mut Vec<T>, path: &Path, entry_path: impl Fn(&T) -> &Path) -> bool {
+    entries
+        .iter()
+        .position(|entry| entry_path(entry) == path)
+        .map(|pos| entries.remove(pos))
+        .is_some()
+}
 
 /// Tracks layers and vectors queued from `session.json` at startup whose
 /// background open events have not yet drained, so quitting early never wipes
@@ -30,19 +54,18 @@ impl SessionRestoreTracker {
     }
 
     pub(super) fn take_layer(&mut self, path: &Path) -> bool {
-        self.layers
-            .iter()
-            .position(|entry| entry.path == path)
-            .map(|pos| self.layers.remove(pos))
-            .is_some()
+        take_by_path(&mut self.layers, path, |entry| &entry.path)
     }
 
     pub(super) fn take_vector(&mut self, path: &Path) -> bool {
-        self.vectors
-            .iter()
-            .position(|entry| entry.path == path)
-            .map(|pos| self.vectors.remove(pos))
-            .is_some()
+        take_by_path(&mut self.vectors, path, |entry| &entry.path)
+    }
+
+    fn take(&mut self, kind: LayerKind, path: &Path) -> bool {
+        match kind {
+            LayerKind::Raster => self.take_layer(path),
+            LayerKind::Vector => self.take_vector(path),
+        }
     }
 
     pub(super) fn pending_layers(&self) -> &[SavedLayerEntry] {
@@ -141,31 +164,51 @@ impl VeldmapApp {
         });
     }
 
-    pub(super) fn drain_file_dialog_events(&mut self) -> bool {
-        let events = self.dialogs.poll();
-        if events.is_empty() {
-            return false;
+    fn handle_layer_opened(
+        &mut self,
+        kind: LayerKind,
+        path: PathBuf,
+        bounds: Option<FootprintBounds>,
+        fly_to: bool,
+        newly_opened_paths: &mut Vec<PathBuf>,
+        session_changed: &mut bool,
+    ) {
+        self.panels.layers.on_layer_opened();
+        let _ = self.restore_tracker.take(kind, &path);
+        newly_opened_paths.push(path);
+        *session_changed = true;
+        if fly_to && let Some(b) = bounds {
+            self.focus_footprint(b);
         }
-        for ev in events {
-            match ev {
-                FileDialogEvent::OpenFiles(paths) => {
-                    self.layers_ui.clear_error();
-                    for path in paths {
-                        self.open_local_path(&path, true, None);
-                    }
-                }
-                FileDialogEvent::GeoJsonSaved { path, result } => match result {
-                    Ok(()) => {
-                        self.measure_ui
-                            .set_notice(format!("Exported to {}", path.display()));
-                    }
-                    Err(err) => {
-                        self.measure_ui.set_notice(format!("Export failed: {err}"));
-                    }
-                },
-            }
+    }
+
+    fn handle_layer_failed(
+        &mut self,
+        kind: LayerKind,
+        path: PathBuf,
+        error: String,
+        can_assign_crs: bool,
+        session_changed: &mut bool,
+    ) {
+        if self.restore_tracker.take(kind, &path) {
+            tracing::info!(
+                kind = kind.label(),
+                path = %path.display(),
+                error = %error,
+                "Skipped unavailable layer from previous session"
+            );
+            *session_changed = true;
+        } else {
+            tracing::warn!(
+                kind = kind.label(),
+                path = %path.display(),
+                error = %error,
+                "Failed to open layer"
+            );
+            self.panels
+                .layers
+                .note_failed_path(path, error, can_assign_crs);
         }
-        true
     }
 
     pub(super) fn drain_scene_io_events(&mut self) -> bool {
@@ -184,34 +227,31 @@ impl VeldmapApp {
                     fly_to,
                 }) => {
                     tracing::info!(?id, path = %path.display(), "Opened local overlay layer");
-                    self.layers_ui.on_layer_opened();
-                    let _ = self.restore_tracker.take_layer(&path);
-                    newly_opened_paths.push(path);
-                    session_changed = true;
-                    if fly_to && let Some(b) = bounds {
-                        self.focus_footprint(b);
-                    }
+                    self.handle_layer_opened(
+                        LayerKind::Raster,
+                        path,
+                        bounds,
+                        fly_to,
+                        &mut newly_opened_paths,
+                        &mut session_changed,
+                    );
                 }
                 SceneIoEvent::Raster(OverlayIoEvent::Reloaded { id }) => {
                     tracing::info!(?id, "Reloaded local overlay layer");
-                    self.layers_ui.clear_error();
+                    self.panels.layers.clear_error();
                 }
                 SceneIoEvent::Raster(OverlayIoEvent::Failed {
                     path,
                     error,
                     can_assign_crs,
                 }) => {
-                    if self.restore_tracker.take_layer(&path) {
-                        tracing::info!(
-                            path = %path.display(),
-                            error = %error,
-                            "Skipped unavailable layer from previous session"
-                        );
-                        session_changed = true;
-                    } else {
-                        tracing::warn!(path = %path.display(), error = %error, "Overlay I/O failed");
-                        self.layers_ui.note_failed_path(path, error, can_assign_crs);
-                    }
+                    self.handle_layer_failed(
+                        LayerKind::Raster,
+                        path,
+                        error,
+                        can_assign_crs,
+                        &mut session_changed,
+                    );
                 }
                 SceneIoEvent::Vector(VectorIoEvent::Opened {
                     id,
@@ -220,26 +260,23 @@ impl VeldmapApp {
                     fly_to,
                 }) => {
                     tracing::info!(?id, path = %path.display(), "Opened GeoJSON vector layer");
-                    self.layers_ui.on_layer_opened();
-                    let _ = self.restore_tracker.take_vector(&path);
-                    newly_opened_paths.push(path);
-                    session_changed = true;
-                    if fly_to && let Some(b) = bounds {
-                        self.focus_footprint(b);
-                    }
+                    self.handle_layer_opened(
+                        LayerKind::Vector,
+                        path,
+                        bounds,
+                        fly_to,
+                        &mut newly_opened_paths,
+                        &mut session_changed,
+                    );
                 }
                 SceneIoEvent::Vector(VectorIoEvent::Failed { path, error }) => {
-                    if self.restore_tracker.take_vector(&path) {
-                        tracing::info!(
-                            path = %path.display(),
-                            error = %error,
-                            "Skipped unavailable GeoJSON layer from previous session"
-                        );
-                        session_changed = true;
-                    } else {
-                        tracing::warn!(path = %path.display(), error = %error, "Failed to open GeoJSON");
-                        self.layers_ui.push_error(error);
-                    }
+                    self.handle_layer_failed(
+                        LayerKind::Vector,
+                        path,
+                        error,
+                        false,
+                        &mut session_changed,
+                    );
                 }
             }
         }
@@ -247,5 +284,49 @@ impl VeldmapApp {
             self.persist_session_snapshot(false, &newly_opened_paths);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_restore_tracker_tracks_and_consumes_layers_and_vectors_independently() {
+        let mut tracker = SessionRestoreTracker::default();
+        let raster_a = PathBuf::from("/tmp/a.tif");
+        let raster_b = PathBuf::from("/tmp/b.tif");
+        let vector_a = PathBuf::from("/tmp/a.geojson");
+
+        tracker.push_layer(SavedLayerEntry::new(raster_a.clone(), true, 1.0, None));
+        tracker.push_layer(SavedLayerEntry::new(raster_a.clone(), false, 0.5, None));
+        tracker.push_layer(SavedLayerEntry::new(raster_b.clone(), true, 0.8, None));
+        tracker.push_vector(SavedVectorEntry {
+            path: vector_a.clone(),
+            visible: true,
+            opacity: 0.7,
+        });
+
+        assert_eq!(tracker.pending_layers().len(), 3);
+        assert_eq!(tracker.pending_vectors().len(), 1);
+
+        // Taking a non-existent path returns false and leaves queues untouched.
+        assert!(!tracker.take_layer(Path::new("/tmp/missing.tif")));
+        assert!(!tracker.take_vector(&raster_a));
+
+        // Duplicate paths are consumed FIFO one at a time.
+        assert!(tracker.take_layer(&raster_a));
+        assert_eq!(tracker.pending_layers().len(), 2);
+        assert!(!tracker.pending_layers()[0].visible);
+        assert!(tracker.take_layer(&raster_a));
+        assert!(!tracker.take_layer(&raster_a));
+        assert_eq!(tracker.pending_layers().len(), 1);
+        assert_eq!(tracker.pending_layers()[0].path, raster_b);
+
+        // Vector entries are tracked independently of raster entries.
+        assert!(tracker.take_vector(&vector_a));
+        assert!(!tracker.take_vector(&vector_a));
+        assert!(tracker.pending_vectors().is_empty());
+        assert_eq!(tracker.pending_layers().len(), 1);
     }
 }

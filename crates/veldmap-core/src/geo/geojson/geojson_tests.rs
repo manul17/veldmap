@@ -1,7 +1,8 @@
 use super::*;
-use crate::geo::footprint::{covers_polygon, frame_polygons};
+use crate::geo::footprint::{Ring, covers_polygon, frame_polygons};
+use crate::geo::geodesic::ring_signed_area_m2;
 use crate::geo::geodesy::WGS84;
-use glam::DVec3;
+use glam::Vec3;
 
 #[test]
 fn parses_feature_collection_with_holes_and_round_trips_rfc7946_winding() {
@@ -97,11 +98,10 @@ fn tessellates_holed_concave_and_continental_polygons_with_subdivision_and_rtc_c
     );
 
     let fc = GeoJsonFeatureCollection {
-        features: vec![GeoJsonFeature {
-            name: Some("Continental".to_string()),
-            properties: Map::new(),
-            geometry: GeoJsonGeometry::Polygon(continental),
-        }],
+        features: vec![GeoJsonFeature::new(
+            Some("Continental".to_string()),
+            GeoJsonGeometry::Polygon(continental),
+        )],
     };
 
     let max_chord = 4.0;
@@ -114,36 +114,12 @@ fn tessellates_holed_concave_and_continental_polygons_with_subdivision_and_rtc_c
             let v0 = cluster.fill_vertices[tri[0] as usize];
             let v1 = cluster.fill_vertices[tri[1] as usize];
             let v2 = cluster.fill_vertices[tri[2] as usize];
-            let p0 = DVec3::new(
-                f64::from(v0.rel_pos[0]),
-                f64::from(v0.rel_pos[1]),
-                f64::from(v0.rel_pos[2]),
-            );
-            let p1 = DVec3::new(
-                f64::from(v1.rel_pos[0]),
-                f64::from(v1.rel_pos[1]),
-                f64::from(v1.rel_pos[2]),
-            );
-            let p2 = DVec3::new(
-                f64::from(v2.rel_pos[0]),
-                f64::from(v2.rel_pos[1]),
-                f64::from(v2.rel_pos[2]),
-            );
-            let n0 = DVec3::new(
-                f64::from(v0.normal[0]),
-                f64::from(v0.normal[1]),
-                f64::from(v0.normal[2]),
-            );
-            let n1 = DVec3::new(
-                f64::from(v1.normal[0]),
-                f64::from(v1.normal[1]),
-                f64::from(v1.normal[2]),
-            );
-            let n2 = DVec3::new(
-                f64::from(v2.normal[0]),
-                f64::from(v2.normal[1]),
-                f64::from(v2.normal[2]),
-            );
+            let p0 = Vec3::from_array(v0.rel_pos).as_dvec3();
+            let p1 = Vec3::from_array(v1.rel_pos).as_dvec3();
+            let p2 = Vec3::from_array(v2.rel_pos).as_dvec3();
+            let n0 = Vec3::from_array(v0.normal).as_dvec3();
+            let n1 = Vec3::from_array(v1.normal).as_dvec3();
+            let n2 = Vec3::from_array(v2.normal).as_dvec3();
             assert!((n0.length() - 1.0).abs() < 1e-4);
             let face = (p1 - p0).cross(p2 - p0);
             assert!(face.dot(n0 + n1 + n2) >= 0.0, "inward triangle winding");
@@ -193,11 +169,10 @@ fn tessellates_polar_antimeridian_and_over_hemisphere_polygons_accurately() {
         ],
     });
     let fc = GeoJsonFeatureCollection {
-        features: vec![GeoJsonFeature {
-            name: Some("Over-hemisphere cap".to_string()),
-            properties: Map::new(),
-            geometry: GeoJsonGeometry::Polygon(over_hemisphere),
-        }],
+        features: vec![GeoJsonFeature::new(
+            Some("Over-hemisphere cap".to_string()),
+            GeoJsonGeometry::Polygon(over_hemisphere),
+        )],
     };
     let mesh = VectorMesh::from_collection(&fc, 10.0);
     assert!(mesh.fill_triangle_count() > 50);
@@ -229,17 +204,18 @@ fn tessellates_polar_antimeridian_and_over_hemisphere_polygons_accurately() {
 fn per_cluster_rtc_preserves_submillimetre_precision_across_continents_and_tiny_drone_polygons() {
     // Two tiny ~5 cm x 5 cm survey markers placed 6,400 km apart (Moscow & Vladivostok).
     let d_deg = 5e-7; // ~5.5 cm
-    let marker = |lat: f64, lon: f64| GeoJsonFeature {
-        name: None,
-        properties: Map::new(),
-        geometry: GeoJsonGeometry::Polygon(Polygon::new(Ring {
-            points: vec![
-                GeoPoint::new(lat, lon),
-                GeoPoint::new(lat, lon + d_deg),
-                GeoPoint::new(lat + d_deg, lon + d_deg),
-                GeoPoint::new(lat + d_deg, lon),
-            ],
-        })),
+    let marker = |lat: f64, lon: f64| {
+        GeoJsonFeature::new(
+            None,
+            GeoJsonGeometry::Polygon(Polygon::new(Ring {
+                points: vec![
+                    GeoPoint::new(lat, lon),
+                    GeoPoint::new(lat, lon + d_deg),
+                    GeoPoint::new(lat + d_deg, lon + d_deg),
+                    GeoPoint::new(lat + d_deg, lon),
+                ],
+            })),
+        )
     };
     let fc = GeoJsonFeatureCollection {
         features: vec![marker(55.75, 37.62), marker(43.115, 131.885)],
@@ -253,24 +229,14 @@ fn per_cluster_rtc_preserves_submillimetre_precision_across_continents_and_tiny_
         assert_eq!(c.fill_indices.len(), 6);
         assert_eq!(c.fill_vertices.len(), 4);
         for v in &c.fill_vertices {
-            let offset_m = DVec3::new(
-                f64::from(v.rel_pos[0]),
-                f64::from(v.rel_pos[1]),
-                f64::from(v.rel_pos[2]),
-            )
-            .length();
+            let offset_m = Vec3::from_array(v.rel_pos).as_dvec3().length();
             assert!(
                 offset_m < 10.0,
                 "expected localized RTC offset < 10 m, got {offset_m} m"
             );
         }
         // Verify reconstructed f64 ECEF stays on WGS84 within < 1 mm.
-        let p0 = c.origin_ecef_m
-            + DVec3::new(
-                f64::from(c.fill_vertices[0].rel_pos[0]),
-                f64::from(c.fill_vertices[0].rel_pos[1]),
-                f64::from(c.fill_vertices[0].rel_pos[2]),
-            );
+        let p0 = c.origin_ecef_m + Vec3::from_array(c.fill_vertices[0].rel_pos).as_dvec3();
         let geo = WGS84.from_ecef(p0);
         assert!(
             geo.height_m.abs() < 1e-3,
