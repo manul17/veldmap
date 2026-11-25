@@ -370,7 +370,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     assert!(cache.contains(&south_polar_root));
     assert!(cache.contains(&live_root));
 
-    // Verify pre-3A `find_carrier` and `remove_where` hooks on real GpuTileCache.
+    // Verify `find_carrier` and `remove_where` on real GpuTileCache.
     let live_child = source_tile_key(
         live_source,
         QuadTileId {

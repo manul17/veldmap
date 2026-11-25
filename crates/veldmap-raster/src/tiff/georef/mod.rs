@@ -7,21 +7,19 @@ mod geokeys;
 
 use tiff::decoder::Decoder;
 use tiff::tags::Tag;
-use veldmap_core::geo::{Datum, DatumWarning};
+use veldmap_core::geo::CrsSpec;
 use veldmap_core::io::BufferedByteReader;
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
-use crate::pipeline::metadata::{GeoKeyParams, GeoPlacement, GeoTie, is_valid_lat_lon};
+use crate::pipeline::metadata::{GeoPlacement, GeoTie, PlacementCrs, is_valid_lat_lon};
 
 use super::tags::{read_tag_ascii_opt, read_tag_f64_vec_opt, read_tag_u16_vec_opt};
 
-use crs::{
-    build_user_defined_projected_crs, foreign_datum, has_user_geographic_datum, resolve_user_datum,
-};
+use crs::{build_user_defined_projected_crs, resolve_geographic_crs};
 use geokeys::{
-    GEOKEY_UNDEFINED, GEOKEY_USER_DEFINED, MODEL_TYPE_GEOGRAPHIC, MODEL_TYPE_PROJECTED,
-    parse_geokeys,
+    GEOKEY_UNDEFINED, GEOKEY_USER_DEFINED, GeoKeyParams, MODEL_TYPE_GEOGRAPHIC,
+    MODEL_TYPE_PROJECTED, parse_geokeys,
 };
 
 pub(super) struct ParsedGeoref {
@@ -30,8 +28,7 @@ pub(super) struct ParsedGeoref {
     /// Embedded pixel affine from `ModelTiepoint`/`ModelPixelScale`/`ModelTransformation`
     /// even when no CRS GeoKeys were present (enabling `.prj`-only sidecars).
     pub(super) embedded_affine: Option<[f64; 6]>,
-    pub(super) foreign_datum_epsg: Option<u16>,
-    pub(super) geographic_datum: Option<(Datum, Option<DatumWarning>)>,
+    pub(super) geographic_crs: Option<CrsSpec>,
     pub(super) trouble: Option<String>,
 }
 
@@ -50,7 +47,6 @@ pub(super) fn georef(
     let scale = read_tag_f64_vec_opt(decoder, Tag::ModelPixelScaleTag, cancel)?;
     let matrix = read_tag_f64_vec_opt(decoder, Tag::ModelTransformationTag, cancel)?;
 
-    let foreign_datum_epsg = foreign_datum(&geo_params);
     let placement = geo_placement(&geo_params, &points, &scale, &matrix, width, height);
     let ties = geo_ties(&geo_params, &points, &scale, &matrix, width, height);
     let embedded_affine = if placement.is_none() && points.len() <= 6 {
@@ -63,8 +59,8 @@ pub(super) fn georef(
     } else {
         None
     };
-    let geographic_datum = if !ties.is_empty() && has_user_geographic_datum(&geo_params) {
-        Some(resolve_user_datum(&geo_params))
+    let geographic_crs = if !ties.is_empty() {
+        resolve_geographic_crs(&geo_params)
     } else {
         None
     };
@@ -85,8 +81,7 @@ pub(super) fn georef(
         ties,
         placement,
         embedded_affine,
-        foreign_datum_epsg,
-        geographic_datum,
+        geographic_crs,
         trouble,
     })
 }
@@ -148,12 +143,12 @@ fn geo_placement(
     if geo_params.model_type != Some(MODEL_TYPE_PROJECTED) || points.len() > 6 {
         return None;
     }
-    let (epsg, custom_crs, datum_warning) = match geo_params.projected_crs {
+    let crs = match geo_params.projected_crs {
         Some(GEOKEY_USER_DEFINED | GEOKEY_UNDEFINED) | None => {
-            let (custom, warning) = build_user_defined_projected_crs(geo_params)?;
-            (None, Some(custom), warning)
+            let (crs, warning) = build_user_defined_projected_crs(geo_params)?;
+            PlacementCrs::Resolved { crs, warning }
         }
-        Some(code) => (Some(u32::from(code)), None, None),
+        Some(code) => PlacementCrs::Epsg(u32::from(code)),
     };
 
     let half = geo_params.raster_type.half_pixel_shift();
@@ -169,11 +164,8 @@ fn geo_placement(
     }
 
     Some(GeoPlacement {
-        epsg,
-        custom_crs,
-        datum_warning,
+        crs: Some(crs),
         affine,
-        geo_params: Some(geo_params.clone()),
     })
 }
 

@@ -244,33 +244,28 @@ fn pass_job_keys_deduplicate_and_two_lane_threads_carry_distinct_names() {
         },
         shutdown.clone(),
     );
-    let two_handle = pool.handle();
+    let fast_handle = pool.fast_handle();
+    let bulk_handle = pool.bulk_handle();
     let (fast_tx, fast_rx) = mpsc::channel();
     let (bulk_tx, bulk_rx) = mpsc::channel();
-    assert!(two_handle.submit(
-        DecodeLane::Fast,
-        DecodeJob {
-            key: tile_key(0, 0, 0),
-            queued_bytes: 0,
-            cancel: shutdown.child_token(),
-            work: Box::new(move || {
-                let name = thread::current().name().unwrap_or("").to_string();
-                let _ = fast_tx.send(name);
-            }),
-        }
-    ));
-    assert!(two_handle.submit(
-        DecodeLane::Bulk,
-        DecodeJob {
-            key: DecodeJobKey::Pass(pass_key),
-            queued_bytes: 0,
-            cancel: shutdown.child_token(),
-            work: Box::new(move || {
-                let name = thread::current().name().unwrap_or("").to_string();
-                let _ = bulk_tx.send(name);
-            }),
-        }
-    ));
+    assert!(fast_handle.submit(DecodeJob {
+        key: tile_key(0, 0, 0),
+        queued_bytes: 0,
+        cancel: shutdown.child_token(),
+        work: Box::new(move || {
+            let name = thread::current().name().unwrap_or("").to_string();
+            let _ = fast_tx.send(name);
+        }),
+    }));
+    assert!(bulk_handle.submit(DecodeJob {
+        key: DecodeJobKey::Pass(pass_key),
+        queued_bytes: 0,
+        cancel: shutdown.child_token(),
+        work: Box::new(move || {
+            let name = thread::current().name().unwrap_or("").to_string();
+            let _ = bulk_tx.send(name);
+        }),
+    }));
     let fast_name = fast_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("fast thread name");

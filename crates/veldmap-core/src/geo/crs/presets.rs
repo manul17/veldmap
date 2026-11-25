@@ -2,6 +2,7 @@
 
 use std::sync::OnceLock;
 
+use super::super::projection::{MSK61_EPSG_BASE, MSK61_ZONES};
 use super::CrsSpec;
 
 /// Searchable CRS preset entry for the UI CRS picker.
@@ -16,8 +17,12 @@ impl CrsPreset {
     /// Display code label (`EPSG:<code>` for standard registry codes, or
     /// `MSK-61:z<n>` for non-standard regional pseudo-codes).
     pub fn code_label(&self) -> String {
-        if (6_336_101..=6_336_103).contains(&self.epsg) {
-            format!("MSK-61:z{}", self.epsg - 6_336_100)
+        if let Some(zone) = self
+            .epsg
+            .checked_sub(MSK61_EPSG_BASE)
+            .filter(|z| MSK61_ZONES.contains(z))
+        {
+            format!("MSK-61:z{zone}")
         } else {
             format!("EPSG:{}", self.epsg)
         }
@@ -100,9 +105,9 @@ fn preset_catalog() -> &'static PresetCatalog {
             name: "NAD83 / New York Long Island (ftUS)".to_string(),
             category: "North America",
         });
-        for zone in 1..=3 {
+        for zone in MSK61_ZONES {
             presets.push(CrsPreset {
-                epsg: 6_336_100 + zone,
+                epsg: MSK61_EPSG_BASE + zone,
                 name: format!("MSK-61 / Pulkovo 1942 zone {zone}"),
                 category: "MSK / Pulkovo",
             });
@@ -150,7 +155,7 @@ fn preset_catalog() -> &'static PresetCatalog {
 }
 
 /// Curated searchable CRS preset catalog (WGS84, Web Mercator, UTM 1–60 N/S,
-/// Pulkovo 1942 GK 1–32, MSK-61 1–3, and major international projected CRSs).
+/// Pulkovo 1942 GK 2–32, MSK-61 1–3, and major international projected CRSs).
 pub fn builtin_crs_presets() -> &'static [CrsPreset] {
     &preset_catalog().presets
 }

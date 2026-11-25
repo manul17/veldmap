@@ -1,80 +1,7 @@
-//! Canonical HTTP(S) URL authority parsing, percent-encoding, and credential /
-//! query-string redaction helpers shared across live basemaps and future
-//! authenticated cloud archive streams.
+//! Secret percent-encoding and credential / query-string URL redaction helpers
+//! shared across live basemaps and future authenticated cloud archive streams.
 
-use std::net::Ipv6Addr;
-
-/// Parsed HTTP(S) authority components (`host_port` without `user:pass@`, and
-/// bare `host` preserving bracketed IPv6 literals like `[::1]`).
-pub(crate) struct ParsedAuthority<'a> {
-    pub host_port: &'a str,
-    pub host: &'a str,
-}
-
-/// Strip an ASCII case-insensitive `https://` or `http://` prefix without
-/// ever slicing across a multi-byte UTF-8 character boundary.
-pub(crate) fn strip_http_scheme(url: &str) -> Option<&str> {
-    let bytes = url.as_bytes();
-    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
-        Some(&url[8..])
-    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
-        Some(&url[7..])
-    } else {
-        None
-    }
-}
-
-fn valid_optional_port(port_suffix: &str) -> bool {
-    if port_suffix.is_empty() {
-        return true;
-    }
-    let Some(port_str) = port_suffix.strip_prefix(':') else {
-        return false;
-    };
-    !port_str.is_empty()
-        && port_str.bytes().all(|b| b.is_ascii_digit())
-        && port_str.parse::<u16>().is_ok()
-}
-
-/// Parse the authority section of an HTTP(S) URL or template, handling
-/// case-insensitive `http://`/`https://` schemes, `user:pass@` userinfo,
-/// numeric `:port` validation, and bracketed IPv6 literals
-/// (`http://[::1]:8080/...`).
-pub(crate) fn parse_url_authority(url: &str) -> Option<ParsedAuthority<'_>> {
-    let without_scheme = strip_http_scheme(url)?;
-    let authority = without_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
-    if host_port.is_empty() {
-        return None;
-    }
-    let host = if let Some(rest) = host_port.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let inner = &rest[..end];
-        inner.parse::<Ipv6Addr>().ok()?;
-        let after = &rest[end + 1..];
-        if !valid_optional_port(after) {
-            return None;
-        }
-        &host_port[..=end + 1]
-    } else {
-        let (h, port_suffix) = match host_port.find(':') {
-            Some(colon) => (&host_port[..colon], &host_port[colon..]),
-            None => (host_port, ""),
-        };
-        if h.is_empty() || !valid_optional_port(port_suffix) {
-            return None;
-        }
-        h
-    };
-    Some(ParsedAuthority { host_port, host })
-}
-
-/// Extract the lowercased `host[:port]` authority key from an HTTP(S) URL.
-pub(crate) fn extract_host(url: &str) -> String {
-    parse_url_authority(url)
-        .map(|auth| auth.host_port.to_ascii_lowercase())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
+use std::fmt::Write as _;
 
 /// Percent-encode a secret string into both uppercase and lowercase hex forms
 /// for URL substitution and redaction matching.
@@ -86,8 +13,8 @@ fn percent_encode_variants(secret: &str) -> (String, String) {
             upper.push(char::from(b));
             lower.push(char::from(b));
         } else {
-            upper.push_str(&format!("%{b:02X}"));
-            lower.push_str(&format!("%{b:02x}"));
+            let _ = write!(upper, "%{b:02X}");
+            let _ = write!(lower, "%{b:02x}");
         }
     }
     (upper, lower)
@@ -272,37 +199,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_host_ipv6_and_url_sanitization_handle_edge_cases() {
-        assert_eq!(
-            extract_host("HTTPS://GIBS.Earthdata.NASA.gov/wmts/1/2/3.jpg"),
-            "gibs.earthdata.nasa.gov"
-        );
-        // Multi-byte UTF-8 straddling byte offsets 7..8 must never panic.
-        assert_eq!(
-            strip_http_scheme("http://\u{00e9}/{z}/{x}/{y}.png"),
-            Some("\u{00e9}/{z}/{x}/{y}.png")
-        );
-        assert_eq!(
-            strip_http_scheme("\u{00e9}\u{00e9}\u{00e9}\u{00e9}://example.com"),
-            None
-        );
-        assert_eq!(extract_host("http://\u{00e9}/0/0/0.png"), "\u{00e9}");
-        assert_eq!(
-            extract_host("http://user:pass@127.0.0.1:8080/0/0/0.png?key=1"),
-            "127.0.0.1:8080"
-        );
-        assert_eq!(extract_host("http://[::1]:8080/0/0/0.png"), "[::1]:8080");
-        let ipv6 = parse_url_authority("http://user:pw@[::1]:8080/0/0/0.png").expect("ipv6");
-        assert_eq!(ipv6.host, "[::1]");
-        assert_eq!(ipv6.host_port, "[::1]:8080");
-
-        // Reject invalid ports and malformed IPv6 brackets.
-        assert!(parse_url_authority("http://example.com:notaport/0/0/0.png").is_none());
-        assert!(parse_url_authority("http://example.com:70000/0/0/0.png").is_none());
-        assert!(parse_url_authority("http://example.com:/0/0/0.png").is_none());
-        assert!(parse_url_authority("http://[invalid]/0/0/0.png").is_none());
-        assert!(parse_url_authority("http://[::1]:bad/0/0/0.png").is_none());
-
+    fn url_sanitization_handles_credentials_queries_ipv6_and_unicode_punctuation() {
         assert_eq!(
             sanitize_url_for_display("https://alice:secret@tiles.example.com/1/2/3.png?token=xyz"),
             "https://<redacted>@tiles.example.com/1/2/3.png?<redacted>"

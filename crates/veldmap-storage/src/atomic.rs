@@ -163,7 +163,7 @@ pub fn write_json_durable_private<T: Serialize>(
 ) -> Result<(), StorageError> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
-    write_atomic_impl(path, &bytes, true)
+    write_atomic_durable_private(path, &bytes)
 }
 
 /// Read JSON from `path`, returning `T::default()` if the file does not exist.

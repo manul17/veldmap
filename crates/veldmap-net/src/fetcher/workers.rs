@@ -15,10 +15,32 @@ use crate::{DecodeCompletion, DecodeFailure, DecodeRequest};
 
 use super::PipelineContext;
 use super::disk::{DiskCacheGate, DiskReadOutcome};
-use super::dispatch::{DiskTask, HttpTask};
-use super::guards::InFlightGuard;
-use super::state::TileTarget;
+use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
 use super::state::{PipelineState, Transition};
+
+/// Shared tile metadata passed from dispatch planning to disk/HTTP workers.
+pub(super) struct TileTarget {
+    pub(super) key: TileKey,
+    pub(super) id: QuadTileId,
+    pub(super) spec: Arc<LiveBasemapSpec>,
+    pub(super) cancel: CancelToken,
+}
+
+/// Guarded disk-cache lookup task handed from the dispatcher to
+/// [`run_disk_lookup`].
+pub(super) struct DiskTask {
+    pub(super) target: TileTarget,
+    pub(super) guard: InFlightGuard,
+    pub(super) disk_slot: DiskSlotGuard,
+}
+
+/// Guarded HTTP fetch task handed from the dispatcher to [`run_http_fetch`].
+pub(super) struct HttpTask {
+    pub(super) target: TileTarget,
+    pub(super) host: String,
+    pub(super) guard: InFlightGuard,
+    pub(super) permit_guard: PermitGuard,
+}
 
 /// Short silent cooldown before re-attempting a tile whose decode submission
 /// was rejected or evicted under CPU decode-pool backpressure.

@@ -178,14 +178,14 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     });
     let layer = &mgr.stack.layers()[0];
     assert_eq!(layer.meta.max_level(), 2);
-    let has_lvl2 = layer.wanted.iter().any(|k| k.level == 2);
-    let has_lvl1 = layer.wanted.iter().any(|k| k.level == 1);
-    let has_lvl0 = layer.wanted.iter().any(|k| k.level == 0);
+    let has_lvl2 = layer.wanted().iter().any(|k| k.level == 2);
+    let has_lvl1 = layer.wanted().iter().any(|k| k.level == 1);
+    let has_lvl0 = layer.wanted().iter().any(|k| k.level == 0);
     assert!(
         has_lvl2 && has_lvl1 && has_lvl0,
         "wanted must cover all ladder rungs [2, 1, 0], got levels: {:?}",
         layer
-            .wanted
+            .wanted()
             .iter()
             .map(|k| k.level)
             .collect::<std::collections::HashSet<_>>()

@@ -17,11 +17,11 @@ use std::sync::Arc;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{RASTER_TILE_SIZE, SourceFingerprint, SourceId, level_count, level_size};
+use veldmap_core::tile::{SourceFingerprint, SourceId, level_count, level_size};
 
 use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
 use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
-use crate::pipeline::plan::{DISPLAY_STREAM_SPEC, LevelPlan, PyramidMeta, ServeMode};
+use crate::pipeline::plan::{LevelPlan, ServeMode};
 use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples};
 use crate::pipeline::resample::{Window, resample_rgba8_window};
 use crate::pipeline::{DecodeContext, RasterSource};
@@ -63,7 +63,9 @@ impl JpegSource {
         }
         let reader = BufferedByteReader::new(Arc::clone(&byte_source), cancel.clone());
         let mut decoder = jpeg_decoder::Decoder::new(reader);
-        decoder.set_max_decoding_buffer_size(budget.decode_working_bytes as usize);
+        decoder.set_max_decoding_buffer_size(
+            budget.decode_working_bytes.min(usize::MAX as u64) as usize
+        );
         decoder.read_info().map_err(|e| map_jpeg_error(e, cancel))?;
         let info = decoder
             .info()
@@ -74,68 +76,26 @@ impl JpegSource {
             return Err(RasterError::InvalidDimensions { width, height });
         }
 
-        let channels = match info.pixel_format {
-            jpeg_decoder::PixelFormat::L8 | jpeg_decoder::PixelFormat::L16 => 1,
-            jpeg_decoder::PixelFormat::RGB24 => 3,
-            jpeg_decoder::PixelFormat::CMYK32 => 4,
+        let (channels, sample_type) = match info.pixel_format {
+            jpeg_decoder::PixelFormat::L8 => (1, SampleType::U8),
+            jpeg_decoder::PixelFormat::L16 => (1, SampleType::U16),
+            jpeg_decoder::PixelFormat::RGB24 => (3, SampleType::U8),
+            jpeg_decoder::PixelFormat::CMYK32 => (4, SampleType::U8),
         };
         let coding_process = info.coding_process;
 
-        let n_levels = level_count(width, height).min(u32::from(u8::MAX)) as u8;
-        let mut levels = Vec::with_capacity(usize::from(n_levels));
-        let mut finest_fitting: Option<(u8, u64)> = None;
-
-        for lvl in 0..n_levels {
-            let lw = level_size(width, u32::from(lvl));
-            let lh = level_size(height, u32::from(lvl));
-            let (dw, dh) = match coding_process {
-                jpeg_decoder::CodingProcess::Lossless => (width, height),
-                _ => dct_decoded_size(width, height, lvl),
-            };
-            let peak = jpeg_level_peak_bytes(JpegPeakInputs {
-                full: (width, height),
-                decoded: (dw, dh),
-                level: (lw, lh),
-                channels,
-                coding_process,
-            });
-            let fits = peak <= budget.decode_working_bytes;
-            if fits && finest_fitting.is_none() {
-                finest_fitting = Some((lvl, peak));
-            }
-            levels.push(LevelPlan {
-                serve: ServeMode::Pass { from: lvl },
-                source_pixels: u64::from(dw).saturating_mul(u64::from(dh)),
-                estimated_peak_bytes: peak,
-                fits,
-            });
-        }
-
-        let Some((pass_level, pass_peak_bytes)) = finest_fitting else {
-            let smallest = levels.last().map_or(0, |l| l.estimated_peak_bytes);
-            return Err(RasterError::LimitExceeded {
-                width,
-                height,
-                estimated_bytes: smallest,
-                limit_bytes: budget.decode_working_bytes,
-            });
-        };
-
-        // Mark all coarser levels >= pass_level as emitted by the single `pass_level` cascade.
-        for row in levels.iter_mut().skip(usize::from(pass_level)) {
-            row.serve = ServeMode::Pass { from: pass_level };
-        }
+        let (levels, pass_level, pass_peak_bytes) =
+            plan_jpeg_levels(width, height, channels, coding_process, budget)?;
 
         let binding_trouble = world_file_binding_trouble("JPEG", ".jgw/.wld", placement.as_ref());
 
         let description = RasterDescription {
             width,
             height,
-            bands: vec![BandInfo::display(SampleType::U8, channels, false, None)],
+            bands: vec![BandInfo::display(sample_type, channels, false, None)],
             ties: Vec::new(),
             placement,
-            foreign_datum_epsg: None,
-            geographic_datum: None,
+            geographic_crs: None,
             binding_trouble,
             levels,
         };
@@ -153,6 +113,61 @@ impl JpegSource {
     }
 }
 
+fn plan_jpeg_levels(
+    width: u32,
+    height: u32,
+    channels: usize,
+    coding_process: jpeg_decoder::CodingProcess,
+    budget: &MemoryBudget,
+) -> Result<(Vec<LevelPlan>, u8, u64), RasterError> {
+    let n_levels = level_count(width, height).min(u32::from(u8::MAX)) as u8;
+    let mut levels = Vec::with_capacity(usize::from(n_levels));
+    let mut finest_fitting: Option<(u8, u64)> = None;
+
+    for lvl in 0..n_levels {
+        let lw = level_size(width, u32::from(lvl));
+        let lh = level_size(height, u32::from(lvl));
+        let (dw, dh) = match coding_process {
+            jpeg_decoder::CodingProcess::Lossless => (width, height),
+            _ => dct_decoded_size(width, height, lvl),
+        };
+        let peak = jpeg_level_peak_bytes(JpegPeakInputs {
+            full: (width, height),
+            decoded: (dw, dh),
+            level: (lw, lh),
+            channels,
+            coding_process,
+        });
+        let fits = peak <= budget.decode_working_bytes;
+        if fits && finest_fitting.is_none() {
+            finest_fitting = Some((lvl, peak));
+        }
+        levels.push(LevelPlan {
+            serve: ServeMode::Pass { from: lvl },
+            source_pixels: u64::from(dw).saturating_mul(u64::from(dh)),
+            estimated_peak_bytes: peak,
+            fits,
+        });
+    }
+
+    let Some((pass_level, pass_peak_bytes)) = finest_fitting else {
+        let smallest = levels.last().map_or(0, |l| l.estimated_peak_bytes);
+        return Err(RasterError::LimitExceeded {
+            width,
+            height,
+            estimated_bytes: smallest,
+            limit_bytes: budget.decode_working_bytes,
+        });
+    };
+
+    // Mark all coarser levels >= pass_level as emitted by the single `pass_level` cascade.
+    for row in levels.iter_mut().skip(usize::from(pass_level)) {
+        row.serve = ServeMode::Pass { from: pass_level };
+    }
+
+    Ok((levels, pass_level, pass_peak_bytes))
+}
+
 impl RasterSource for JpegSource {
     fn fingerprint(&self) -> SourceFingerprint {
         self.fingerprint
@@ -164,17 +179,6 @@ impl RasterSource for JpegSource {
 
     fn description(&self) -> &RasterDescription {
         &self.description
-    }
-
-    fn pyramid_meta(&self) -> PyramidMeta {
-        PyramidMeta {
-            source: self.source_id,
-            spec: DISPLAY_STREAM_SPEC,
-            width: self.description.width,
-            height: self.description.height,
-            tile_size: RASTER_TILE_SIZE,
-            levels: self.description.levels.clone(),
-        }
     }
 
     fn pass_peak_bytes(&self) -> u64 {
@@ -202,7 +206,9 @@ impl RasterSource for JpegSource {
 
         let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
         let mut decoder = jpeg_decoder::Decoder::new(reader);
-        decoder.set_max_decoding_buffer_size(ctx.budget.decode_working_bytes as usize);
+        decoder.set_max_decoding_buffer_size(
+            ctx.budget.decode_working_bytes.min(usize::MAX as u64) as usize,
+        );
 
         // `scale()` internally calls `read_info()` and computes the scaled output
         // dimensions BEFORE allocating the decoded frame buffer.
@@ -293,26 +299,31 @@ fn decode_pixels_to_rgba8(
             mapping.rgba(&Samples::U8(pixels), PixelLayout::named(3), pixel_count)
         }
         jpeg_decoder::PixelFormat::L16 => {
-            // Lossless JPEG L16 stores unshifted 9..=16-bit samples; normalize
-            // to the observed peak bit range so 12-bit frames don't render black.
-            let samples: Vec<u16> = pixels
+            // Lossless JPEG L16 stores unshifted 9..=16-bit samples; stream
+            // directly from native-endian pairs without allocating an
+            // intermediate `Vec<u16>` buffer, normalizing to the observed bit range.
+            let max_val = pixels
                 .chunks_exact(2)
                 .take(pixel_count)
                 .map(|p| u16::from_ne_bytes([p[0], p[1]]))
-                .collect();
-            let max_val = samples.iter().copied().max().unwrap_or(255);
+                .max()
+                .unwrap_or(255);
             let hi = if max_val <= 255 {
-                255.0
+                255.0_f64
             } else if max_val <= 4095 {
-                4095.0
+                4095.0_f64
             } else {
-                65_535.0
+                65_535.0_f64
             };
-            DisplayMapping::stretched(0.0, hi, None).rgba(
-                &Samples::U16(&samples),
-                PixelLayout::named(1),
-                pixel_count,
-            )
+            let scale = 255.0 / hi;
+            let count = pixel_count.min(pixels.len() / 2);
+            let mut out = Vec::with_capacity(count.saturating_mul(4));
+            for p in pixels.chunks_exact(2).take(count) {
+                let v = f64::from(u16::from_ne_bytes([p[0], p[1]]));
+                let byte = (v * scale).round().clamp(0.0, 255.0) as u8;
+                out.extend_from_slice(&[byte, byte, byte, 255]);
+            }
+            out
         }
         jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_rgba8(pixels, pixel_count),
     }

@@ -5,16 +5,21 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use veldmap_core::geo::{CrsSpec, CustomTmParams, DatumPreset, LinearUnit};
+#[cfg(test)]
+use veldmap_core::geo::CrsSpec;
+use veldmap_core::geo::{Camera, CustomTmParams, DatumPreset, LinearUnit};
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
 };
 
+use crate::clamp_opacity;
+use crate::crs_override::CrsOverride;
+
 /// Current on-disk schema version for `session.json`.
-pub(crate) const SESSION_SCHEMA_VERSION: u32 = 1;
+const SESSION_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum number of recent files kept in `session.json`.
-pub(crate) const MAX_RECENT_FILES: usize = 16;
+const MAX_RECENT_FILES: usize = 16;
 
 /// Maximum number of camera bookmarks kept in `session.json`.
 pub(crate) const MAX_BOOKMARKS: usize = 64;
@@ -22,7 +27,7 @@ pub(crate) const MAX_BOOKMARKS: usize = 64;
 /// Serializable datum choice for custom Transverse Mercator overrides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum SavedCustomTmDatum {
+enum SavedCustomTmDatum {
     #[default]
     Wgs84,
     Pulkovo1942,
@@ -48,7 +53,7 @@ impl From<SavedCustomTmDatum> for DatumPreset {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum SavedLinearUnit {
+enum SavedLinearUnit {
     #[default]
     Metre,
     InternationalFoot,
@@ -77,16 +82,16 @@ impl From<SavedLinearUnit> for LinearUnit {
 
 /// Serializable custom Transverse Mercator parameters matching [`CustomTmParams`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SavedCustomTmParams {
-    pub(crate) name: String,
+struct SavedCustomTmParams {
+    name: String,
     #[serde(default)]
-    pub(crate) datum: SavedCustomTmDatum,
-    pub(crate) central_meridian_deg: f64,
-    pub(crate) origin_lat_deg: f64,
-    pub(crate) scale: f64,
-    pub(crate) false_easting_m: f64,
-    pub(crate) false_northing_m: f64,
-    pub(crate) unit: SavedLinearUnit,
+    datum: SavedCustomTmDatum,
+    central_meridian_deg: f64,
+    origin_lat_deg: f64,
+    scale: f64,
+    false_easting_m: f64,
+    false_northing_m: f64,
+    unit: SavedLinearUnit,
 }
 
 impl From<&CustomTmParams> for SavedCustomTmParams {
@@ -122,26 +127,51 @@ impl From<&SavedCustomTmParams> for CustomTmParams {
 /// Serializable CRS override stored alongside a saved raster layer entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum SavedCrsOverride {
+enum SavedCrsOverride {
     Epsg { code: u32 },
     Wkt { wkt: String },
     Proj { proj: String },
     CustomTm(SavedCustomTmParams),
 }
 
+impl From<&CrsOverride> for SavedCrsOverride {
+    fn from(ov: &CrsOverride) -> Self {
+        match ov {
+            CrsOverride::Epsg(code) => Self::Epsg { code: *code },
+            CrsOverride::Wkt(wkt) => Self::Wkt { wkt: wkt.clone() },
+            CrsOverride::Proj(proj) => Self::Proj { proj: proj.clone() },
+            CrsOverride::CustomTm(params) => Self::CustomTm(SavedCustomTmParams::from(params)),
+        }
+    }
+}
+
+impl From<SavedCrsOverride> for CrsOverride {
+    fn from(saved: SavedCrsOverride) -> Self {
+        match saved {
+            SavedCrsOverride::Epsg { code } => Self::Epsg(code),
+            SavedCrsOverride::Wkt { wkt } => Self::Wkt(wkt),
+            SavedCrsOverride::Proj { proj } => Self::Proj(proj),
+            SavedCrsOverride::CustomTm(params) => Self::CustomTm(CustomTmParams::from(&params)),
+        }
+    }
+}
+
+impl From<&SavedCrsOverride> for CrsOverride {
+    fn from(saved: &SavedCrsOverride) -> Self {
+        match saved {
+            SavedCrsOverride::Epsg { code } => Self::Epsg(*code),
+            SavedCrsOverride::Wkt { wkt } => Self::Wkt(wkt.clone()),
+            SavedCrsOverride::Proj { proj } => Self::Proj(proj.clone()),
+            SavedCrsOverride::CustomTm(params) => Self::CustomTm(CustomTmParams::from(params)),
+        }
+    }
+}
+
+#[cfg(test)]
 impl SavedCrsOverride {
     /// Resolve back into a live [`CrsSpec`].
-    pub(crate) fn to_crs_spec(&self) -> Result<CrsSpec, String> {
-        match self {
-            Self::Epsg { code } => CrsSpec::from_epsg(*code).map_err(|e| e.to_string()),
-            Self::Wkt { wkt } => CrsSpec::from_wkt(wkt).map_err(|e| e.to_string()),
-            Self::Proj { proj } => CrsSpec::from_user_string(proj).map_err(|e| e.to_string()),
-            Self::CustomTm(saved) => {
-                let params = CustomTmParams::from(saved);
-                let proj = params.to_projection().map_err(|e| e.to_string())?;
-                Ok(CrsSpec::Projected(proj))
-            }
-        }
+    fn to_crs_spec(&self) -> Result<CrsSpec, String> {
+        CrsOverride::from(self).to_crs_spec()
     }
 }
 
@@ -152,7 +182,27 @@ pub(crate) struct SavedLayerEntry {
     pub(crate) path: PathBuf,
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
-    pub(crate) crs_override: Option<SavedCrsOverride>,
+    crs_override: Option<SavedCrsOverride>,
+}
+
+impl SavedLayerEntry {
+    pub(crate) fn new(
+        path: PathBuf,
+        visible: bool,
+        opacity: f32,
+        crs_override: Option<&CrsOverride>,
+    ) -> Self {
+        Self {
+            path,
+            visible,
+            opacity,
+            crs_override: crs_override.map(SavedCrsOverride::from),
+        }
+    }
+
+    pub(crate) fn crs_override(&self) -> Option<CrsOverride> {
+        self.crs_override.as_ref().map(CrsOverride::from)
+    }
 }
 
 impl Default for SavedLayerEntry {
@@ -196,6 +246,24 @@ pub(crate) struct SavedCameraPose {
 }
 
 impl SavedCameraPose {
+    pub(crate) fn from_camera(camera: &Camera) -> Self {
+        let (lat_deg, lon_deg) = camera.center();
+        Self {
+            lat_deg,
+            lon_deg,
+            height_m: camera.height_m(),
+            heading_deg: camera.heading_deg(),
+        }
+    }
+
+    pub(crate) fn to_camera(self) -> Camera {
+        let mut camera = Camera::at(self.lat_deg, self.lon_deg, self.height_m);
+        if self.heading_deg.abs() > 1e-6 {
+            camera.rotate_heading(self.heading_deg.to_radians());
+        }
+        camera
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
         self.lat_deg.is_finite()
             && (-90.0..=90.0).contains(&self.lat_deg)
@@ -240,25 +308,17 @@ impl Default for AppSession {
     }
 }
 
-fn normalize_opacity(opacity: f32) -> f32 {
-    if opacity.is_finite() {
-        opacity.clamp(0.0, 1.0)
-    } else {
-        1.0
-    }
-}
-
 impl AppSession {
     /// Normalize bounds, deduplicate recent files, and drop invalid entries.
     pub(crate) fn normalize(&mut self) {
         self.version = SESSION_SCHEMA_VERSION;
         self.open_layers.retain(|l| !l.path.as_os_str().is_empty());
         for layer in &mut self.open_layers {
-            layer.opacity = normalize_opacity(layer.opacity);
+            layer.opacity = clamp_opacity(layer.opacity);
         }
         self.open_vectors.retain(|v| !v.path.as_os_str().is_empty());
         for vec_layer in &mut self.open_vectors {
-            vec_layer.opacity = normalize_opacity(vec_layer.opacity);
+            vec_layer.opacity = clamp_opacity(vec_layer.opacity);
         }
         let mut deduped = Vec::with_capacity(self.recent_files.len().min(MAX_RECENT_FILES));
         for p in self.recent_files.drain(..) {

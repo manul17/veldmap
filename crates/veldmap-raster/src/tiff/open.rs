@@ -12,19 +12,17 @@ use veldmap_core::tile::{SourceFingerprint, SourceId};
 
 use crate::RasterError;
 use crate::pipeline::grid::{Grid, Overview};
-use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription};
+use crate::pipeline::metadata::{BandInfo, GeoPlacement, PlacementCrs, RasterDescription};
 use crate::pipeline::plan::{build_chunked_level_table, check_max_source_side};
 use crate::pipeline::radiometry::DisplayMapping;
 
 use super::chunk_reader::{DecoderPool, open_decoder};
+use super::format::{TiffFormat, chunk_grid, depth_of_layout, ensure_readable};
 use super::georef::{ParsedGeoref, georef};
 use super::stretch::StretchCache;
-use super::tags::{
-    chunk_grid, depth_of_layout, ensure_readable, is_overview, map_tiff_error, opt_tag,
-    parse_gdal_nodata,
-};
+use super::tags::{is_overview, map_tiff_error, opt_tag, parse_gdal_nodata};
 use super::ycbcr::YCbCrParams;
-use super::{MAX_IFDS, TiffFormat, TiffSource};
+use super::{MAX_IFDS, TiffSource};
 
 fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
     let mut limits = Limits::default();
@@ -33,6 +31,62 @@ fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
         .decode_working_bytes
         .clamp(4 * 1024 * 1024, 128 * 1024 * 1024) as usize;
     limits
+}
+
+struct BaseIfd {
+    width: u32,
+    height: u32,
+    tiled: bool,
+    chunk: (u32, u32),
+    format: TiffFormat,
+    nodata_f64: Option<f64>,
+    ycbcr: Option<YCbCrParams>,
+}
+
+fn parse_base_ifd(
+    decoder: &mut Decoder<BufferedByteReader>,
+    budget: &MemoryBudget,
+    cancel: &CancelToken,
+) -> Result<BaseIfd, RasterError> {
+    let (width, height) = decoder
+        .dimensions()
+        .map_err(|e| map_tiff_error(e, cancel))?;
+    if width == 0 || height == 0 {
+        return Err(RasterError::InvalidDimensions { width, height });
+    }
+
+    let (pixel_layout, sample_bits, sample_type, ycbcr) = ensure_readable(decoder, cancel)?;
+    let tiled = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::TileWidth), cancel)?.is_some();
+    if !tiled {
+        check_max_source_side(width, height)?;
+    }
+    let depth = depth_of_layout(pixel_layout, sample_bits);
+    let chunk = chunk_grid(decoder, budget, depth, cancel)?;
+
+    let nodata_f64 = parse_gdal_nodata(decoder, cancel)?;
+    let nodata = nodata_f64.and_then(|v| {
+        if !v.is_finite() || v < f64::from(f32::MIN) || v > f64::from(f32::MAX) {
+            None
+        } else {
+            Some(v as f32)
+        }
+    });
+
+    Ok(BaseIfd {
+        width,
+        height,
+        tiled,
+        chunk,
+        format: TiffFormat {
+            pixel_layout,
+            sample_bits,
+            sample_type,
+            depth,
+            nodata,
+        },
+        nodata_f64,
+        ycbcr,
+    })
 }
 
 struct ScannedOverviews {
@@ -130,13 +184,7 @@ fn merge_georef_with_sidecar(
         return (placement, trouble);
     }
     let Some(sc) = sidecar else {
-        let fallback_placement = embedded_affine.map(|affine| GeoPlacement {
-            epsg: None,
-            custom_crs: None,
-            datum_warning: None,
-            affine,
-            geo_params: None,
-        });
+        let fallback_placement = embedded_affine.map(|affine| GeoPlacement { crs: None, affine });
         return (fallback_placement, trouble);
     };
     let Some(affine) = sc.affine.or(embedded_affine) else {
@@ -144,11 +192,10 @@ fn merge_georef_with_sidecar(
     };
     let has_crs = sc.crs.is_some();
     let merged_placement = Some(GeoPlacement {
-        epsg: None,
-        custom_crs: sc.crs,
-        datum_warning: None,
+        crs: sc
+            .crs
+            .map(|crs| PlacementCrs::Resolved { crs, warning: None }),
         affine,
-        geo_params: None,
     });
     let merged_trouble = if has_crs {
         None
@@ -193,38 +240,21 @@ impl TiffSource {
         }
         let limits = build_tiff_limits(budget);
         let mut decoder = open_decoder(&byte_source, &limits, cancel)?;
-
-        let (width, height) = decoder
-            .dimensions()
-            .map_err(|e| map_tiff_error(e, cancel))?;
-        if width == 0 || height == 0 {
-            return Err(RasterError::InvalidDimensions { width, height });
-        }
-
-        let (pixel_layout, sample_bits, sample_type, ycbcr) =
-            ensure_readable(&mut decoder, cancel)?;
-        let tiled = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::TileWidth), cancel)?.is_some();
-        if !tiled {
-            check_max_source_side(width, height)?;
-        }
-        let depth = depth_of_layout(pixel_layout, sample_bits);
-        let chunk = chunk_grid(&mut decoder, budget, depth, cancel)?;
-
-        let nodata_f64 = parse_gdal_nodata(&mut decoder, cancel)?;
-        let nodata = nodata_f64.and_then(|v| {
-            if !v.is_finite() || v < f64::from(f32::MIN) || v > f64::from(f32::MAX) {
-                None
-            } else {
-                Some(v as f32)
-            }
-        });
+        let BaseIfd {
+            width,
+            height,
+            tiled,
+            chunk,
+            format,
+            nodata_f64,
+            ycbcr,
+        } = parse_base_ifd(&mut decoder, budget, cancel)?;
 
         let ParsedGeoref {
             ties,
             placement,
             embedded_affine,
-            foreign_datum_epsg,
-            geographic_datum,
+            geographic_crs,
             trouble,
         } = georef(&mut decoder, width, height, cancel)?;
 
@@ -236,13 +266,6 @@ impl TiffSource {
             sidecar,
         );
 
-        let format = TiffFormat {
-            pixel_layout,
-            sample_bits,
-            sample_type,
-            depth,
-            nodata,
-        };
         let ScannedOverviews {
             overviews,
             overview_ycbcr: mut ifd_ycbcr,
@@ -257,7 +280,7 @@ impl TiffSource {
             tiled,
             chunk,
             overviews,
-            depth,
+            depth: format.depth,
         };
         let levels = build_chunked_level_table(&grid, width, height, budget);
         if levels.is_empty() || levels.iter().all(|row| !row.fits) {
@@ -287,8 +310,7 @@ impl TiffSource {
             )],
             ties,
             placement,
-            foreign_datum_epsg,
-            geographic_datum,
+            geographic_crs,
             binding_trouble,
             levels,
         };
@@ -361,12 +383,10 @@ mod tests {
             Some("embedded CRS error".to_owned()),
             Some(sidecar_with_crs),
         );
-        assert!(
-            placement_ok
-                .as_ref()
-                .and_then(|p| p.custom_crs.as_ref())
-                .is_some()
-        );
+        assert!(matches!(
+            placement_ok.as_ref().and_then(|p| p.crs.as_ref()),
+            Some(PlacementCrs::Resolved { .. })
+        ));
         assert!(trouble_ok.is_none());
     }
 }

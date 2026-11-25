@@ -143,22 +143,28 @@ fn update_wanted_and_reconcile(
     // Populate `layer.wanted` with apex root tiles AND visible cells across ALL
     // ladder rungs so `PendingUploads` never prunes intermediate coarse rungs
     // during progressive refinement.
-    layer.wanted.clear();
     let top_w = grid_dim(level_size(img_w, u32::from(max_level)));
     let top_h = grid_dim(level_size(img_h, u32::from(max_level)));
+    let mut next_wanted = Vec::with_capacity(
+        (top_w as usize) * (top_h as usize)
+            + ladder_cells
+                .iter()
+                .map(|(_, cells)| cells.len())
+                .sum::<usize>(),
+    );
     for ry in 0..top_h {
         for rx in 0..top_w {
-            layer.wanted.insert(layer.meta.tile_key(max_level, rx, ry));
+            next_wanted.push(layer.meta.tile_key(max_level, rx, ry));
         }
     }
     for (rung, cells) in ladder_cells {
         for &(x, y) in cells {
-            layer.wanted.insert(layer.meta.tile_key(*rung, x, y));
+            next_wanted.push(layer.meta.tile_key(*rung, x, y));
         }
     }
-    layer.sync_wanted_shared();
+    layer.replace_wanted(next_wanted);
 
-    runtime.reconcile_pointwise_stream(layer.meta.pass_key(), &layer.wanted, gpu_cache, pending);
+    runtime.reconcile_pointwise_stream(layer.meta.pass_key(), layer.wanted(), gpu_cache, pending);
 }
 
 fn build_draw_patches(

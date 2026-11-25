@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{PlanetaryScheme, QuadTileId, TileKey};
+use veldmap_core::tile::{QuadTileId, TileKey};
 
 mod basemap;
 mod fetcher;
@@ -119,27 +119,10 @@ pub trait TileDecodeExecutor: Send + Sync + 'static {
     fn submit(&self, request: DecodeRequest) -> bool;
 }
 
-/// Errors produced by live basemap URL resolution and HTTP streaming setup.
+/// Errors produced by live basemap configuration and HTTP streaming pipeline
+/// setup.
 #[derive(Debug, Error)]
 pub enum NetError {
-    #[error(
-        "live HTTP requests for PolarCap tiles are forbidden (route to offline polar fallback)"
-    )]
-    PolarCapForbidden,
-    #[error("tile scheme mismatch: requested {requested:?}, expected {expected:?}")]
-    SchemeMismatch {
-        requested: PlanetaryScheme,
-        expected: PlanetaryScheme,
-    },
-    #[error("tile level {level} exceeds source max_level {max_level}")]
-    LevelAboveMax { level: u8, max_level: u8 },
-    #[error("tile coordinates ({x}, {y}) out of range for {scheme:?} z={level}")]
-    TileOutOfRange {
-        scheme: PlanetaryScheme,
-        level: u8,
-        x: u32,
-        y: u32,
-    },
     #[error("invalid custom tile URL template: {0}")]
     InvalidUrlTemplate(String),
     #[error("invalid UTC date '{0}' (expected YYYY-MM-DD)")]

@@ -1,7 +1,5 @@
-//! GeoTIFF GeoKey constants and binary `GeoKeyDirectoryTag` (`34735`–`34737`)
-//! decoder.
-
-use crate::pipeline::metadata::{GeoKeyParams, GeoKeyValue, GeoRasterType};
+//! GeoTIFF GeoKey types, constants, and binary `GeoKeyDirectoryTag`
+//! (`34735`–`34737`) decoder.
 
 const GEOKEY_LOCATION_SHORT: u16 = 0;
 const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
@@ -60,9 +58,78 @@ pub(super) const UNSAID_GEOKEY_CODES: [u16; 2] = [GEOKEY_UNDEFINED, GEOKEY_USER_
 pub(super) const WGS84_GEOGRAPHIC_CODES: [u16; 2] = [4326, 4979];
 pub(super) const EPSG_UNIT_KILOMETRE: u16 = 9036;
 pub(super) const EPSG_WGS84_DATUM: u16 = 6326;
-pub(super) const EPSG_PULKOVO_1942: u16 = 4284;
-pub(super) const PULKOVO_42_GK_START: u16 = 28400;
-pub(super) const PULKOVO_42_GK_END: u16 = 28499;
+
+/// Pixel coordinate reference convention (`GTRasterTypeGeoKey = 1025`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(super) enum GeoRasterType {
+    /// Pixel coordinates denote the top-left corner of the pixel cell (`1`).
+    #[default]
+    PixelIsArea,
+    /// Pixel coordinates denote the center of the pixel cell (`2`).
+    PixelIsPoint,
+}
+
+impl GeoRasterType {
+    /// Half-pixel shift added when converting `(px, py)` into top-left cell
+    /// corner coordinates (`0.0` for `PixelIsArea`, `0.5` for `PixelIsPoint`).
+    pub(super) const fn half_pixel_shift(self) -> f64 {
+        match self {
+            Self::PixelIsArea => 0.0,
+            Self::PixelIsPoint => 0.5,
+        }
+    }
+}
+
+/// Parsed raw GeoTIFF key directory entry value.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum GeoKeyValue {
+    Short(u16),
+    Double(Vec<f64>),
+    Ascii(String),
+}
+
+/// Parsed GeoTIFF key directory preserving resolved double/ASCII parameters
+/// for downstream CRS resolution.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct GeoKeyParams {
+    pub(super) model_type: Option<u16>,
+    pub(super) raster_type: GeoRasterType,
+    pub(super) geographic_crs: Option<u16>,
+    pub(super) projected_crs: Option<u16>,
+    pub(super) keys: Vec<(u16, GeoKeyValue)>,
+}
+
+impl GeoKeyParams {
+    /// Look up a short (`u16`) GeoKey value by numeric ID.
+    pub(super) fn get_u16(&self, id: u16) -> Option<u16> {
+        self.keys.iter().find_map(|(k, v)| match (k, v) {
+            (key, GeoKeyValue::Short(val)) if *key == id => Some(*val),
+            _ => None,
+        })
+    }
+
+    /// Look up a `f64` scalar GeoKey value.
+    pub(super) fn get_f64(&self, id: u16) -> Option<f64> {
+        self.get_f64_slice(id)
+            .and_then(|vals| vals.first().copied())
+    }
+
+    /// Look up a slice of `f64` GeoKey values (e.g. `GeogTOWGS84GeoKey`).
+    pub(super) fn get_f64_slice(&self, id: u16) -> Option<&[f64]> {
+        self.keys.iter().find_map(|(k, v)| match (k, v) {
+            (key, GeoKeyValue::Double(vals)) if *key == id => Some(vals.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// Look up an ASCII GeoKey string.
+    pub(super) fn get_ascii(&self, id: u16) -> Option<&str> {
+        self.keys.iter().find_map(|(k, v)| match (k, v) {
+            (key, GeoKeyValue::Ascii(s)) if *key == id => Some(s.as_str()),
+            _ => None,
+        })
+    }
+}
 
 /// Parse raw `GeoKeyDirectoryTag` (`34735`), `GeoDoubleParamsTag` (`34736`),
 /// and `GeoAsciiParamsTag` (`34737`) payloads.

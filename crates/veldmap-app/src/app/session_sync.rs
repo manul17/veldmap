@@ -1,13 +1,15 @@
 //! Session restoration tracking, unified `session.json` snapshot persistence,
-//! and asynchronous file-dialog / overlay-I/O event draining for [`VeldmapApp`].
+//! and asynchronous file-dialog / scene-I/O event draining for [`VeldmapApp`].
 
 use std::path::{Path, PathBuf};
 
-use crate::dialogs::FileDialogEvent;
 use crate::layers::OverlayIoEvent;
+use crate::scene::SceneIoEvent;
 use crate::session::{SavedCameraPose, SavedLayerEntry, SavedVectorEntry};
+use crate::vectors::VectorIoEvent;
 
 use super::VeldmapApp;
+use super::dialogs::FileDialogEvent;
 
 /// Tracks layers and vectors queued from `session.json` at startup whose
 /// background open events have not yet drained, so quitting early never wipes
@@ -69,7 +71,7 @@ impl VeldmapApp {
                     false,
                     saved.visible,
                     saved.opacity,
-                    saved.crs_override.clone(),
+                    saved.crs_override(),
                 )
                 .is_ok()
             {
@@ -97,18 +99,35 @@ impl VeldmapApp {
         include_camera: bool,
         newly_opened: &[PathBuf],
     ) {
-        let mut open_layers = self.scene.overlays().saved_layer_entries();
-        open_layers.extend(self.restore_tracker.pending_layers().iter().cloned());
-        let mut open_vectors = self.scene.vectors().saved_entries();
-        open_vectors.extend(self.restore_tracker.pending_vectors().iter().cloned());
-        let cam_pose = if include_camera {
-            let (lat_deg, lon_deg) = self.camera.center();
-            Some(SavedCameraPose {
-                lat_deg,
-                lon_deg,
-                height_m: self.camera.height_m(),
-                heading_deg: self.camera.heading_deg(),
+        let mut open_layers: Vec<SavedLayerEntry> = self
+            .scene
+            .overlays()
+            .saved_entries_iter()
+            .map(|entry| {
+                SavedLayerEntry::new(
+                    entry.path.to_path_buf(),
+                    entry.visible,
+                    entry.opacity,
+                    entry.crs_override,
+                )
             })
+            .collect();
+        open_layers.extend(self.restore_tracker.pending_layers().iter().cloned());
+
+        let mut open_vectors: Vec<SavedVectorEntry> = self
+            .scene
+            .vectors()
+            .saved_entries_iter()
+            .map(|entry| SavedVectorEntry {
+                path: entry.path.to_path_buf(),
+                visible: entry.visible,
+                opacity: entry.opacity,
+            })
+            .collect();
+        open_vectors.extend(self.restore_tracker.pending_vectors().iter().cloned());
+
+        let cam_pose = if include_camera {
+            Some(SavedCameraPose::from_camera(&self.camera))
         } else {
             self.storage.session().last_camera
         };
@@ -149,8 +168,8 @@ impl VeldmapApp {
         true
     }
 
-    pub(super) fn drain_overlay_io_events(&mut self) -> bool {
-        let events = self.scene.poll_overlay_io_events();
+    pub(super) fn drain_scene_io_events(&mut self) -> bool {
+        let events = self.scene.poll_io_events();
         if events.is_empty() {
             return false;
         }
@@ -158,12 +177,12 @@ impl VeldmapApp {
         let mut newly_opened_paths: Vec<PathBuf> = Vec::new();
         for event in events {
             match event {
-                OverlayIoEvent::Opened {
+                SceneIoEvent::Raster(OverlayIoEvent::Opened {
                     id,
                     path,
                     bounds,
                     fly_to,
-                } => {
+                }) => {
                     tracing::info!(?id, path = %path.display(), "Opened local overlay layer");
                     self.layers_ui.on_layer_opened();
                     let _ = self.restore_tracker.take_layer(&path);
@@ -173,15 +192,15 @@ impl VeldmapApp {
                         self.focus_footprint(b);
                     }
                 }
-                OverlayIoEvent::Reloaded { id } => {
+                SceneIoEvent::Raster(OverlayIoEvent::Reloaded { id }) => {
                     tracing::info!(?id, "Reloaded local overlay layer");
                     self.layers_ui.clear_error();
                 }
-                OverlayIoEvent::Failed {
+                SceneIoEvent::Raster(OverlayIoEvent::Failed {
                     path,
                     error,
                     can_assign_crs,
-                } => {
+                }) => {
                     if self.restore_tracker.take_layer(&path) {
                         tracing::info!(
                             path = %path.display(),
@@ -194,12 +213,12 @@ impl VeldmapApp {
                         self.layers_ui.note_failed_path(path, error, can_assign_crs);
                     }
                 }
-                OverlayIoEvent::VectorOpened {
+                SceneIoEvent::Vector(VectorIoEvent::Opened {
                     id,
                     path,
                     bounds,
                     fly_to,
-                } => {
+                }) => {
                     tracing::info!(?id, path = %path.display(), "Opened GeoJSON vector layer");
                     self.layers_ui.on_layer_opened();
                     let _ = self.restore_tracker.take_vector(&path);
@@ -209,7 +228,7 @@ impl VeldmapApp {
                         self.focus_footprint(b);
                     }
                 }
-                OverlayIoEvent::VectorFailed { path, error } => {
+                SceneIoEvent::Vector(VectorIoEvent::Failed { path, error }) => {
                     if self.restore_tracker.take_vector(&path) {
                         tracing::info!(
                             path = %path.display(),

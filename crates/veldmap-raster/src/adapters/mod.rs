@@ -18,7 +18,7 @@ pub(super) fn world_file_binding_trouble(
         None => Some(format!(
             "{format_name} has no accompanying world file ({ext_hint}); add a world file + .prj or assign a CRS"
         )),
-        Some(p) if p.epsg.is_none() && p.custom_crs.is_none() => Some(format!(
+        Some(p) if p.crs.is_none() => Some(format!(
             "{format_name} has a world file ({ext_hint}) but no accompanying .prj CRS sidecar; assign a CRS to place it"
         )),
         Some(_) => None,

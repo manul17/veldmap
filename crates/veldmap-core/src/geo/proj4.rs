@@ -30,7 +30,7 @@ pub enum CrsError {
 
 /// Return whether `text` begins with a WKT1/WKT2 CRS root keyword (ignoring a
 /// leading UTF-8 BOM and ASCII whitespace).
-pub fn looks_like_wkt(text: &str) -> bool {
+pub(super) fn looks_like_wkt(text: &str) -> bool {
     const WKT_PREFIXES: &[&str] = &[
         "PROJCS[",
         "GEOGCS[",

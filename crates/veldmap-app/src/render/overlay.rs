@@ -16,6 +16,7 @@ use super::mesh_cache::{DEFAULT_MESH_CACHE_BYTES, ElasticMeshCache, push_grid_qu
 use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
 use super::uniforms::{DynamicUniformArena, OverlayPatchUniform};
+use crate::clamp_opacity;
 
 /// Cache identity for an uploaded overlay cell warp-mesh vertex buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -64,13 +65,7 @@ struct CachedOverlayMesh {
 pub(super) struct OverlayRenderer {
     index_buffers: HashMap<(u32, bool), (wgpu::Buffer, u32)>,
     meshes: ElasticMeshCache<OverlayMeshKey, CachedOverlayMesh>,
-    uniform_offsets: Vec<u32>,
-}
-
-impl Default for OverlayRenderer {
-    fn default() -> Self {
-        Self::new()
-    }
+    uniform_offsets: Vec<Option<u32>>,
 }
 
 impl OverlayRenderer {
@@ -139,11 +134,11 @@ impl OverlayRenderer {
             for patch in &layer.patches {
                 bind_groups.ensure(device, pipelines, &patch.texture);
 
-                if let Some(existing) = self.meshes.peek(&patch.mesh_key)
-                    && existing.segments == segs
+                if self
+                    .meshes
+                    .peek(&patch.mesh_key)
+                    .is_some_and(|existing| existing.segments == segs)
                 {
-                    let flip = existing.flip_winding;
-                    self.ensure_index_buffer(device, segs, flip);
                     continue;
                 }
 
@@ -182,8 +177,9 @@ impl OverlayRenderer {
         self.meshes.end_frame(needed_bytes);
     }
 
-    /// Push per-patch uniforms for every overlay patch into the frame-wide
-    /// `arena`, recording their aligned dynamic byte offsets in draw order.
+    /// Push per-patch uniforms for every overlay patch with a cached mesh into
+    /// the frame-wide `arena`, recording aligned dynamic byte offsets in draw
+    /// order.
     pub(super) fn push_uniforms(
         &mut self,
         arena: &mut DynamicUniformArena,
@@ -192,19 +188,18 @@ impl OverlayRenderer {
     ) {
         self.uniform_offsets.clear();
         for layer in &snapshot.overlays {
-            let opacity = layer.opacity.clamp(0.0, 1.0);
+            let opacity = clamp_opacity(layer.opacity);
             for patch in &layer.patches {
-                let origin = self
-                    .meshes
-                    .peek(&patch.mesh_key)
-                    .map_or(DVec3::ZERO, |m| m.origin_ecef_m);
-                let offset_eye = (origin - eye).as_vec3().to_array();
-                let u = OverlayPatchUniform {
-                    offset_eye,
-                    opacity,
-                    uv_rect: patch.uv_rect,
-                };
-                self.uniform_offsets.push(arena.push(&u));
+                let offset = self.meshes.peek(&patch.mesh_key).map(|mesh| {
+                    let offset_eye = (mesh.origin_ecef_m - eye).as_vec3().to_array();
+                    let u = OverlayPatchUniform {
+                        offset_eye,
+                        opacity,
+                        uv_rect: patch.uv_rect,
+                    };
+                    arena.push(&u)
+                });
+                self.uniform_offsets.push(offset);
             }
         }
     }
@@ -225,36 +220,36 @@ impl OverlayRenderer {
         pass.set_pipeline(pipeline);
         let mut last_index_key: Option<(u32, bool)> = None;
         let mut last_tex_id: Option<u64> = None;
-        let mut offset_idx = 0usize;
 
-        for layer in &snapshot.overlays {
-            for patch in &layer.patches {
-                let dyn_offset = self.uniform_offsets[offset_idx];
-                offset_idx += 1;
-
-                let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {
-                    continue;
-                };
-                let Some(tex_bg) = bind_groups.get(&patch.texture, PixelFormat::Rgba8UnormSrgb)
-                else {
-                    continue;
-                };
-                let idx_key = (mesh.segments, mesh.flip_winding);
-                let Some((idx_buf, idx_count)) = self.index_buffers.get(&idx_key) else {
-                    continue;
-                };
-                if last_index_key != Some(idx_key) {
-                    pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
-                    last_index_key = Some(idx_key);
-                }
-                if last_tex_id != Some(patch.texture.tile_id) {
-                    pass.set_bind_group(2, tex_bg, &[]);
-                    last_tex_id = Some(patch.texture.tile_id);
-                }
-                pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-                pass.set_bind_group(1, arena.overlay_bind_group(), &[dyn_offset]);
-                pass.draw_indexed(0..*idx_count, 0, 0..1);
+        let patches = snapshot
+            .overlays
+            .iter()
+            .flat_map(|layer| layer.patches.iter());
+        for (patch, dyn_offset) in patches.zip(self.uniform_offsets.iter().copied()) {
+            let Some(dyn_offset) = dyn_offset else {
+                continue;
+            };
+            let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {
+                continue;
+            };
+            let Some(tex_bg) = bind_groups.get(&patch.texture, PixelFormat::Rgba8UnormSrgb) else {
+                continue;
+            };
+            let idx_key = (mesh.segments, mesh.flip_winding);
+            let Some((idx_buf, idx_count)) = self.index_buffers.get(&idx_key) else {
+                continue;
+            };
+            if last_index_key != Some(idx_key) {
+                pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
+                last_index_key = Some(idx_key);
             }
+            if last_tex_id != Some(patch.texture.tile_id) {
+                pass.set_bind_group(2, tex_bg, &[]);
+                last_tex_id = Some(patch.texture.tile_id);
+            }
+            pass.set_vertex_buffer(0, mesh.buffer.slice(..));
+            pass.set_bind_group(1, arena.overlay_bind_group(), &[dyn_offset]);
+            pass.draw_indexed(0..*idx_count, 0, 0..1);
         }
     }
 }

@@ -1,5 +1,8 @@
+use veldmap_core::geo::{DatumWarning, PULKOVO_1942};
+
+use super::geokeys::{GeoKeyValue, GeoRasterType};
 use super::*;
-use crate::pipeline::{GeoRasterType, RasterDescription, frame_from_description};
+use crate::pipeline::{RasterDescription, frame_from_description};
 
 #[test]
 fn geokey_parse_respects_count_and_nul_stripped_ascii_tail() {
@@ -20,17 +23,58 @@ fn geokey_parse_respects_count_and_nul_stripped_ascii_tail() {
 }
 
 #[test]
-fn foreign_datum_placement_and_basic_geo_ties_work_consistently() {
-    // Foreign datum detection from geographic CRS, datum key, or Pulkovo-42 zone.
+fn geographic_crs_resolution_placement_and_basic_geo_ties_work_consistently() {
+    // Projected Pulkovo-42 GK zone does NOT populate geographic_crs, nor does default WGS84.
     let mut keys = GeoKeyParams {
         projected_crs: Some(28407),
         ..Default::default()
     };
-    assert_eq!(foreign_datum(&keys), Some(4284));
+    assert_eq!(resolve_geographic_crs(&keys), None);
     keys.geographic_crs = Some(4326);
-    assert_eq!(foreign_datum(&keys), Some(4284));
+    assert_eq!(resolve_geographic_crs(&keys), None);
+
+    // Non-WGS84 geographic CRSs resolve to typed CrsSpec variants (or UnshiftedForeignDatum).
+    keys.geographic_crs = Some(4284);
+    assert!(matches!(
+        resolve_geographic_crs(&keys),
+        Some(CrsSpec::Geographic { datum, .. }) if datum == PULKOVO_1942
+    ));
     keys.geographic_crs = Some(4267);
-    assert_eq!(foreign_datum(&keys), Some(4267));
+    assert!(matches!(
+        resolve_geographic_crs(&keys),
+        Some(CrsSpec::GeographicProj(_))
+    ));
+    keys.geographic_crs = Some(9999);
+    assert!(matches!(
+        resolve_geographic_crs(&keys),
+        Some(CrsSpec::Geographic {
+            warning: Some(DatumWarning::UnshiftedForeignDatum { .. }),
+            ..
+        })
+    ));
+
+    // User-defined projected CRS rejects non-positive scale or non-finite parameters before dispatch.
+    let bad_scale = GeoKeyParams {
+        model_type: Some(1),
+        projected_crs: Some(32767),
+        keys: vec![
+            (3075, GeoKeyValue::Short(1)),
+            (3092, GeoKeyValue::Double(vec![0.0])),
+        ],
+        ..Default::default()
+    };
+    assert!(build_user_defined_projected_crs(&bad_scale).is_none());
+
+    let bad_merc_scale = GeoKeyParams {
+        model_type: Some(1),
+        projected_crs: Some(32767),
+        keys: vec![
+            (3075, GeoKeyValue::Short(7)),
+            (3092, GeoKeyValue::Double(vec![-1.0])),
+        ],
+        ..Default::default()
+    };
+    assert!(build_user_defined_projected_crs(&bad_merc_scale).is_none());
 
     // PixelIsArea vs PixelIsPoint shifts affine origin by half a pixel.
     let area_keys = GeoKeyParams {
@@ -42,6 +86,7 @@ fn foreign_datum_placement_and_basic_geo_ties_work_consistently() {
     let tie = [0.0, 0.0, 0.0, 500_000.0, 6_000_000.0, 0.0];
     let scale = [10.0, 10.0, 0.0];
     let p_area = geo_placement(&area_keys, &tie, &scale, &[], 100, 100).expect("area placement");
+    assert_eq!(p_area.crs, Some(PlacementCrs::Epsg(32637)));
     assert_eq!(
         p_area.affine,
         [10.0, 0.0, 500_000.0, 0.0, -10.0, 6_000_000.0]
@@ -84,8 +129,7 @@ fn wide_and_global_pixel_is_point_geographic_geotiffs_bind_without_wrapping_or_r
         bands: Vec::new(),
         placement: None,
         ties,
-        foreign_datum_epsg: None,
-        geographic_datum: None,
+        geographic_crs: None,
         binding_trouble: None,
         levels: Vec::new(),
     };

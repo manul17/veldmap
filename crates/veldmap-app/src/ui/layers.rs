@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use eframe::egui;
 use veldmap_core::geo::FootprintBounds;
 
-use crate::layers::{LayerId, LayerSummary, VectorLayerId, VectorLayerSummary};
+use crate::layers::{LayerId, LayerSummary};
+use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
-use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format};
+use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format, submitted_with_enter};
 
 /// User intent emitted by the Layer List panel, applied by `VeldmapApp`.
 #[derive(Clone, Debug)]
@@ -144,7 +145,7 @@ fn show_open_prompt(
         if resp.changed() {
             state.clear_error();
         }
-        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let enter = submitted_with_enter(ui, &resp);
         if ui.button("Load").clicked() || enter {
             let trimmed = state.path_input.trim().trim_matches(['"', '\'']);
             if !trimmed.is_empty() {
@@ -188,6 +189,85 @@ fn show_opacity_slider(ui: &mut egui::Ui, current: f32) -> Option<(f32, bool)> {
         ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
     });
     update
+}
+
+fn show_layer_status_banners(ui: &mut egui::Ui, layer: &LayerSummary) {
+    if layer.detail_limit_level > 0 {
+        ui.colored_label(
+            WARN_TEXT_COLOR,
+            egui::RichText::new(format!(
+                "Detail limited to level {} (memory budget)",
+                layer.detail_limit_level
+            ))
+            .small(),
+        );
+    }
+
+    if let Some(warn) = &layer.datum_warning {
+        ui.colored_label(WARN_TEXT_COLOR, egui::RichText::new(warn).small());
+    }
+
+    if let Some(err) = &layer.last_error {
+        ui.colored_label(
+            ERROR_TEXT_COLOR,
+            egui::RichText::new(format!("Partial/reload error: {err}")).small(),
+        );
+    }
+}
+
+fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<LayerUiAction>) {
+    if let Some((opacity, commit)) = show_opacity_slider(ui, layer.opacity) {
+        actions.push(LayerUiAction::SetOpacity(layer.id, opacity, commit));
+    }
+
+    egui::CollapsingHeader::new(egui::RichText::new("CRS & Metadata").small())
+        .id_salt(("meta", layer.id))
+        .default_open(false)
+        .show(ui, |ui| {
+            let crs_tag = if layer.has_crs_override {
+                format!("CRS: {} (override)", layer.crs_label)
+            } else {
+                format!("CRS: {}", layer.crs_label)
+            };
+            ui.small(crs_tag);
+            ui.small(format!("Radiometry: {}", layer.sample_info));
+            ui.small(format!("Path: {}", layer.path.display()));
+        });
+}
+
+fn show_layer_actions(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<LayerUiAction>) {
+    ui.horizontal_wrapped(|ui| {
+        if let Some(bounds) = layer.footprint
+            && ui
+                .small_button("Zoom")
+                .on_hover_text("Fly camera to layer extent")
+                .clicked()
+        {
+            actions.push(LayerUiAction::ZoomToExtent(bounds));
+        }
+        if layer.can_override_crs
+            && ui
+                .small_button("CRS…")
+                .on_hover_text("Override CRS or custom Transverse Mercator parameters")
+                .clicked()
+        {
+            actions.push(LayerUiAction::OpenCrsPicker(layer.id, layer.name.clone()));
+        }
+        if ui
+            .add_enabled(!layer.reloading, egui::Button::new("Reload").small())
+            .on_hover_text("Reload from disk (bypass fingerprint & tile cache)")
+            .clicked()
+        {
+            actions.push(LayerUiAction::ReloadBypassCache(layer.id));
+        }
+        if ui
+            .small_button("Remove")
+            .on_hover_text("Remove layer and free VRAM")
+            .clicked()
+        {
+            actions.push(LayerUiAction::Remove(layer.id));
+        }
+    });
 }
 
 fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<LayerUiAction>) {
@@ -242,78 +322,9 @@ fn show_layer_card(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<La
                 paint_loading_shimmer(ui);
             }
 
-            if layer.detail_limit_level > 0 {
-                ui.colored_label(
-                    WARN_TEXT_COLOR,
-                    egui::RichText::new(format!(
-                        "Detail limited to level {} (memory budget)",
-                        layer.detail_limit_level
-                    ))
-                    .small(),
-                );
-            }
-
-            if let Some(warn) = &layer.datum_warning {
-                ui.colored_label(WARN_TEXT_COLOR, egui::RichText::new(warn).small());
-            }
-
-            if let Some(err) = &layer.last_error {
-                ui.colored_label(
-                    ERROR_TEXT_COLOR,
-                    egui::RichText::new(format!("Partial/reload error: {err}")).small(),
-                );
-            }
-
-            if let Some((opacity, commit)) = show_opacity_slider(ui, layer.opacity) {
-                actions.push(LayerUiAction::SetOpacity(layer.id, opacity, commit));
-            }
-
-            egui::CollapsingHeader::new(egui::RichText::new("CRS & Metadata").small())
-                .id_salt(("meta", layer.id))
-                .default_open(false)
-                .show(ui, |ui| {
-                    let crs_tag = if layer.has_crs_override {
-                        format!("CRS: {} (override)", layer.crs_label)
-                    } else {
-                        format!("CRS: {}", layer.crs_label)
-                    };
-                    ui.small(crs_tag);
-                    ui.small(format!("Radiometry: {}", layer.sample_info));
-                    ui.small(format!("Path: {}", layer.path.display()));
-                });
-
-            ui.horizontal_wrapped(|ui| {
-                if let Some(bounds) = layer.footprint
-                    && ui
-                        .small_button("Zoom")
-                        .on_hover_text("Fly camera to layer extent")
-                        .clicked()
-                {
-                    actions.push(LayerUiAction::ZoomToExtent(bounds));
-                }
-                if layer.can_override_crs
-                    && ui
-                        .small_button("CRS…")
-                        .on_hover_text("Override CRS or custom Transverse Mercator parameters")
-                        .clicked()
-                {
-                    actions.push(LayerUiAction::OpenCrsPicker(layer.id, layer.name.clone()));
-                }
-                if ui
-                    .add_enabled(!layer.reloading, egui::Button::new("Reload").small())
-                    .on_hover_text("Reload from disk (bypass fingerprint & tile cache)")
-                    .clicked()
-                {
-                    actions.push(LayerUiAction::ReloadBypassCache(layer.id));
-                }
-                if ui
-                    .small_button("Remove")
-                    .on_hover_text("Remove layer and free VRAM")
-                    .clicked()
-                {
-                    actions.push(LayerUiAction::Remove(layer.id));
-                }
-            });
+            show_layer_status_banners(ui, layer);
+            show_layer_controls(ui, layer, actions);
+            show_layer_actions(ui, layer, actions);
         });
     });
     ui.add_space(4.0);

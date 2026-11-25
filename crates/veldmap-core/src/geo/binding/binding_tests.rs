@@ -269,7 +269,7 @@ fn pole_touching_pixel_is_point_tie_grid_is_measurable_and_clamps_outer_half_pix
 
 #[test]
 fn foreign_datum_geographic_frame_shifts_to_wgs84_and_inverts_cleanly() {
-    use super::super::projection::PULKOVO_1942;
+    use super::super::datum::PULKOVO_1942;
 
     let ties = [
         Tie {

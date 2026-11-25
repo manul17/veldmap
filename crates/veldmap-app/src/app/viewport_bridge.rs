@@ -12,7 +12,7 @@ use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams};
 /// (where `egui_wgpu::ScreenDescriptor::size_in_pixels` is not exposed yet;
 /// `GlobePaintCallback::prepare` uses the exact framebuffer size during
 /// rendering).
-pub(crate) fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (u32, u32, f64) {
+pub(super) fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (u32, u32, f64) {
     let ppp = ctx.pixels_per_point();
     let screen_rect = ctx.content_rect();
     let screen_px = [
@@ -31,9 +31,9 @@ pub(crate) fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (u32, u3
 
 /// `egui_wgpu` paint callback bridging an immutable `Arc<DrawSnapshot>` into
 /// the offscreen [`GlobeRenderer`].
-pub(crate) struct GlobePaintCallback {
-    pub(crate) rect: egui::Rect,
-    pub(crate) snapshot: Arc<DrawSnapshot>,
+pub(super) struct GlobePaintCallback {
+    pub(super) rect: egui::Rect,
+    pub(super) snapshot: Arc<DrawSnapshot>,
 }
 
 impl CallbackTrait for GlobePaintCallback {

@@ -142,7 +142,7 @@ impl HostLimiters {
     }
 }
 
-pub(crate) fn parse_retry_after_seconds(header: Option<&str>) -> Option<Duration> {
+fn parse_retry_after_seconds(header: Option<&str>) -> Option<Duration> {
     let raw = header?.trim();
     let secs = raw.parse::<u64>().ok()?;
     Some(Duration::from_secs(secs).clamp(MIN_RETRY_AFTER, MAX_RETRY_AFTER))

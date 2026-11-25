@@ -20,7 +20,7 @@ use veldmap_raster::{
 };
 use veldmap_storage::{LocalFingerprintCache, StorageError, read_regular_file_utf8_limited};
 
-use crate::session::SavedCrsOverride;
+use crate::crs_override::CrsOverride;
 
 /// Structured open failure distinguishing missing/invalid georeferencing (where
 /// offering `"Assign CRS…"` in the UI makes sense) from I/O or format errors.
@@ -46,13 +46,13 @@ impl OpenRasterError {
     }
 }
 
-/// Resolve an optional [`SavedCrsOverride`] and bind `desc` into a [`Frame`].
-pub(super) fn bind_frame_with_saved_override(
+/// Resolve an optional [`CrsOverride`] and bind `desc` into a [`Frame`].
+pub(super) fn bind_frame_with_override(
     desc: &RasterDescription,
-    crs_override: Option<&SavedCrsOverride>,
+    crs_override: Option<&CrsOverride>,
 ) -> Result<Frame, String> {
     let resolved = match crs_override {
-        Some(saved) => Some(saved.to_crs_spec()?),
+        Some(ov) => Some(ov.to_crs_spec()?),
         None => None,
     };
     frame_from_description_with_override(desc, resolved.as_ref()).map_err(|e| e.to_string())
@@ -82,7 +82,7 @@ pub(super) fn open_local_raster(
     fingerprint_cache: &LocalFingerprintCache,
     budget: &MemoryBudget,
     bypass_cache: bool,
-    crs_override: Option<&SavedCrsOverride>,
+    crs_override: Option<&CrsOverride>,
     cancel: &CancelToken,
 ) -> Result<(Arc<dyn RasterSource>, Frame), OpenRasterError> {
     let (local_source, fingerprint) = fingerprint_cache

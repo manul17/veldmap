@@ -5,6 +5,7 @@ use std::time::Duration;
 use veldmap_core::tile::{BandKey, PixelFormat, TileKey, TileScheme};
 
 use super::super::evict::EVICT_BATCH_ROWS;
+use super::super::queries::SELECT_EVICT_BATCH_PROTECTED_SQL;
 use super::super::schema::{SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_PAGE_SIZE};
 use super::*;
 use crate::test_support::TestTempDir;
@@ -106,13 +107,9 @@ fn pragmas_schema_version_and_covering_lru_index_are_configured() {
     assert_eq!(auto_vacuum, 2);
 
     let mut stmt = conn
-        .prepare(
-            "EXPLAIN QUERY PLAN
-             SELECT tile_id, byte_size FROM tile_meta
-             WHERE tile_id != ?1
-             ORDER BY last_used_ms ASC
-             LIMIT ?2",
-        )
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {SELECT_EVICT_BATCH_PROTECTED_SQL}"
+        ))
         .expect("explain");
     let details: Vec<String> = stmt
         .query_map(rusqlite::params![1i64, EVICT_BATCH_ROWS], |r| {

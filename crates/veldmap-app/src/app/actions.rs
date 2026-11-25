@@ -1,18 +1,20 @@
 //! UI action dispatch (layers, CRS picker, basemap settings, toolbar, and
-//! geodesic measurement export) for [`VeldmapApp`].
+//! geodesic measurement) for [`VeldmapApp`].
 
 use std::path::Path;
 
 use veldmap_core::geo::FootprintBounds;
 
-use crate::layers::is_geojson_path;
-use crate::session::{CameraBookmark, SavedCameraPose, SavedCrsOverride};
+use crate::crs_override::CrsOverride;
+use crate::measure::MeasureMode;
+use crate::session::{CameraBookmark, SavedCameraPose};
 use crate::ui::basemap::BasemapUiAction;
 use crate::ui::crs_picker::CrsPickerAction;
 use crate::ui::format;
 use crate::ui::layers::LayerUiAction;
 use crate::ui::measure::MeasureAction;
 use crate::ui::toolbar::ToolbarAction;
+use crate::vectors::is_geojson_path;
 
 use super::VeldmapApp;
 
@@ -26,7 +28,7 @@ impl VeldmapApp {
         &mut self,
         path: &Path,
         fly_to: bool,
-        crs_override: Option<SavedCrsOverride>,
+        crs_override: Option<CrsOverride>,
     ) {
         if is_geojson_path(path) {
             if let Err(err) = self.scene.begin_open_vector_file(path, fly_to, true, 1.0) {
@@ -227,25 +229,18 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 ToolbarAction::ToggleMeasureTool => {
-                    self.measure_ui.session.toggle();
+                    self.measure.toggle();
+                    self.sync_measure_overlay();
                     needs_repaint = true;
                 }
                 ToolbarAction::SaveBookmark(raw_name) => {
-                    let (lat_deg, lon_deg) = self.camera.center();
+                    let pose = SavedCameraPose::from_camera(&self.camera);
                     let name = if raw_name.is_empty() {
-                        format::format_lat_lon(lat_deg, lon_deg)
+                        format::format_lat_lon(pose.lat_deg, pose.lon_deg)
                     } else {
                         raw_name
                     };
-                    let bm = CameraBookmark {
-                        name,
-                        pose: SavedCameraPose {
-                            lat_deg,
-                            lon_deg,
-                            height_m: self.camera.height_m(),
-                            heading_deg: self.camera.heading_deg(),
-                        },
-                    };
+                    let bm = CameraBookmark { name, pose };
                     let _ = self.storage.mutate_session(|s| s.bookmarks.push(bm));
                     needs_repaint = true;
                 }
@@ -296,8 +291,30 @@ impl VeldmapApp {
         frame: &eframe::Frame,
     ) -> bool {
         match action {
+            MeasureAction::SetMode(mode) => {
+                self.measure.set_mode(mode);
+                self.sync_measure_overlay();
+                true
+            }
+            MeasureAction::Undo => {
+                self.measure.undo();
+                self.measure_ui.clear_notice();
+                self.sync_measure_overlay();
+                true
+            }
+            MeasureAction::Clear => {
+                self.measure.clear();
+                self.measure_ui.clear_notice();
+                self.sync_measure_overlay();
+                true
+            }
+            MeasureAction::Close => {
+                self.measure.set_mode(MeasureMode::Off);
+                self.sync_measure_overlay();
+                true
+            }
             MeasureAction::ExportGeoJson => {
-                if let Some(payload) = self.measure_ui.session.export_geojson_string()
+                if let Some(payload) = self.measure.export_geojson_string()
                     && !self
                         .dialogs
                         .spawn_save_geojson("measurement.geojson", payload, frame)

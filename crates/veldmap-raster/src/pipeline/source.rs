@@ -2,14 +2,14 @@
 //! decoders ([`crate::TiffSource`], [`crate::PngSource`], [`crate::JpegSource`],
 //! and future mission codecs).
 
-use veldmap_core::tile::{DecodedTile, PixelFormat, SourceFingerprint, SourceId};
+use veldmap_core::tile::{DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, SourceId};
 
 use crate::RasterError;
 
 use super::DecodeContext;
 use super::cascade::TileEmit;
 use super::metadata::RasterDescription;
-use super::plan::PyramidMeta;
+use super::plan::{DISPLAY_STREAM_SPEC, PyramidMeta};
 
 /// Format-agnostic opened analytical raster source capable of describing its
 /// pyramid, producing pointwise or sequential-pass tiles, and answering
@@ -25,7 +25,17 @@ pub trait RasterSource: Send + Sync {
     fn description(&self) -> &RasterDescription;
 
     /// Scheduler-facing [`PyramidMeta`] for the display band.
-    fn pyramid_meta(&self) -> PyramidMeta;
+    fn pyramid_meta(&self) -> PyramidMeta {
+        let desc = self.description();
+        PyramidMeta {
+            source: self.source_id(),
+            spec: DISPLAY_STREAM_SPEC,
+            width: desc.width,
+            height: desc.height,
+            tile_size: RASTER_TILE_SIZE,
+            levels: desc.levels.clone(),
+        }
+    }
 
     /// Estimated peak working bytes required by [`Self::produce_pass`].
     fn pass_peak_bytes(&self) -> u64;

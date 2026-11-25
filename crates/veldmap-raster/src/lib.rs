@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use veldmap_core::budget::BudgetError;
-use veldmap_core::geo::BindingError;
 use veldmap_core::io::IoError;
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::TileScheme;
@@ -30,19 +29,16 @@ pub use display::{
     decode_qoi_rgba8, encode_qoi_rgba8, generate_linear_mipmaps,
 };
 pub use pipeline::{
-    AdmittedPass, AdmittedTile, BandInfo, DecodeContext, GeoKeyParams, GeoKeyValue, GeoPlacement,
-    GeoRasterType, GeoTie, LevelPlan, MAX_SOURCE_SIDE, PassKey, PyramidMeta, RasterDescription,
-    RasterSource, SampleType, ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome,
-    TileScheduler, frame_from_description, frame_from_description_with_override,
+    AdmittedPass, AdmittedTile, BandInfo, DecodeContext, GeoPlacement, GeoTie, LevelPlan,
+    MAX_SOURCE_SIDE, PassKey, PlacementCrs, PyramidMeta, RasterDescription, RasterSource,
+    SampleType, ServeMode, SharedChunkCache, TileEmit, TileFailureOutcome, TileScheduler,
+    frame_from_description, frame_from_description_with_override,
 };
 pub use pool::{
-    DecodeJob, DecodeJobKey, DecodeLane, DecodePool, DecodePoolConfig, DecodePoolHandle,
-    SubmitError, TwoLaneDecodePool, TwoLaneDecodePoolConfig, TwoLaneDecodePoolHandle,
+    DecodeJob, DecodeJobKey, DecodePool, DecodePoolConfig, DecodePoolHandle, SubmitError,
+    TwoLaneDecodePool, TwoLaneDecodePoolConfig,
 };
-pub use sidecar::{
-    MAX_SIDECAR_BYTES, SidecarGeoref, load_sidecar_georef_with, parse_prj_text, parse_world_file,
-    prj_file_candidates, world_file_candidates,
-};
+pub use sidecar::{SidecarGeoref, load_sidecar_georef_with, parse_prj_text, parse_world_file};
 pub use tiff::{MAX_IFDS, TiffSource, has_tiff_magic};
 
 /// Map a `std::io::Error` produced by a decoder reading from
@@ -142,12 +138,6 @@ impl From<BudgetError> for RasterError {
             BudgetError::Cancelled => Self::Cancelled,
             other => Self::Budget(other),
         }
-    }
-}
-
-impl From<BindingError> for RasterError {
-    fn from(err: BindingError) -> Self {
-        Self::Binding(err.to_string())
     }
 }
 

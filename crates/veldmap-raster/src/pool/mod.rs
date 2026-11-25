@@ -216,17 +216,6 @@ impl Drop for DecodePool {
     }
 }
 
-/// Execution lane for [`TwoLaneDecodePool`], isolating small pointwise tiled
-/// reads from slow sequential passes and full-image decodes so neither starves
-/// or head-of-line blocks the other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DecodeLane {
-    /// Pointwise COG/basemap tile decodes (fast, small bounded chunks).
-    Fast,
-    /// Sequential raster passes and full-image decodes (bulk, long-running).
-    Bulk,
-}
-
 /// Configuration for [`TwoLaneDecodePool::spawn`], nesting per-lane
 /// [`DecodePoolConfig`] settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,34 +256,6 @@ impl TwoLaneDecodePoolConfig {
     }
 }
 
-/// Cloneable producer handle for submitting work to either [`DecodeLane`] of a
-/// [`TwoLaneDecodePool`].
-#[derive(Clone)]
-pub struct TwoLaneDecodePoolHandle {
-    fast: DecodePoolHandle,
-    bulk: DecodePoolHandle,
-}
-
-impl TwoLaneDecodePoolHandle {
-    /// Submit `job` onto `lane`.
-    pub fn submit(&self, lane: DecodeLane, job: DecodeJob) -> bool {
-        match lane {
-            DecodeLane::Fast => self.fast.submit(job),
-            DecodeLane::Bulk => self.bulk.submit(job),
-        }
-    }
-
-    /// Borrow the fast/pointwise lane handle directly.
-    pub fn fast(&self) -> &DecodePoolHandle {
-        &self.fast
-    }
-
-    /// Borrow the bulk/pass/full-image lane handle directly.
-    pub fn bulk(&self) -> &DecodePoolHandle {
-        &self.bulk
-    }
-}
-
 /// Owned two-lane bounded CPU decode pool preventing bulk passes and
 /// full-image decodes from head-of-line blocking fast pointwise tile reads.
 pub struct TwoLaneDecodePool {
@@ -316,14 +277,6 @@ impl TwoLaneDecodePool {
             shutdown,
         );
         Self { fast, bulk }
-    }
-
-    /// Return a cloneable handle targeting both lanes.
-    pub fn handle(&self) -> TwoLaneDecodePoolHandle {
-        TwoLaneDecodePoolHandle {
-            fast: self.fast.handle(),
-            bulk: self.bulk.handle(),
-        }
     }
 
     /// Return a cloneable handle targeting the fast/pointwise decode lane.

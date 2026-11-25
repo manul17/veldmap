@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use veldmap_core::geo::CrsSpec;
 
 use crate::RasterError;
-use crate::pipeline::metadata::GeoPlacement;
+use crate::pipeline::metadata::{GeoPlacement, PlacementCrs};
 
 /// Maximum sidecar file size (1 MiB) to guard against reading huge accidental files.
-pub const MAX_SIDECAR_BYTES: u64 = 1024 * 1024;
+const MAX_SIDECAR_BYTES: u64 = 1024 * 1024;
 
 /// Parsed external georeferencing sidecars accompanying a local raster file.
 ///
@@ -34,11 +34,10 @@ impl SidecarGeoref {
     pub fn into_placement(self) -> Option<GeoPlacement> {
         let affine = self.affine?;
         Some(GeoPlacement {
-            epsg: None,
-            custom_crs: self.crs,
-            datum_warning: None,
+            crs: self
+                .crs
+                .map(|crs| PlacementCrs::Resolved { crs, warning: None }),
             affine,
-            geo_params: None,
         })
     }
 
@@ -118,7 +117,7 @@ pub fn parse_prj_text(text: &str) -> Result<CrsSpec, RasterError> {
 /// Return ordered candidate paths for an ESRI world file accompanying
 /// `raster_path` (e.g., `photo.jpg` -> `photo.jgw`, `photo.jpgw`, `photo.wld`
 /// plus uppercase variants on case-sensitive filesystems).
-pub fn world_file_candidates(raster_path: &Path) -> Vec<PathBuf> {
+fn world_file_candidates(raster_path: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Some(ext) = raster_path.extension().and_then(|e| e.to_str()) else {
         return out;
@@ -156,7 +155,7 @@ pub fn world_file_candidates(raster_path: &Path) -> Vec<PathBuf> {
 /// Raster-specific `<filename>.prj` / `<filename>.PRJ` take precedence over
 /// stem-shared `<stem>.prj` / `<stem>.PRJ` so sibling shapefiles in the same
 /// folder never shadow a raster's own `.tif.prj`.
-pub fn prj_file_candidates(raster_path: &Path) -> Vec<PathBuf> {
+fn prj_file_candidates(raster_path: &Path) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(4);
     if let Some(name) = raster_path.file_name().and_then(|n| n.to_str()) {
         out.push(raster_path.with_file_name(format!("{name}.prj")));

@@ -10,26 +10,15 @@ pub use tie_grid::{Tie, TieGrid};
 
 use std::sync::Arc;
 
-use thiserror::Error;
-
 use super::crs::CrsSpec;
 use super::datum::{Datum, DatumWarning, WGS84_DATUM};
 use super::footprint::FootprintBounds;
 use super::geodesy;
 use super::proj4::Proj4Projection;
-use super::projection::{self, Projection};
+use super::projection::Projection;
 
 /// Web Mercator equatorial circumference in metres (`2 * pi * a`).
 const WEB_MERCATOR_WORLD_M: f64 = geodesy::EQUATORIAL_CIRCUMFERENCE_M;
-
-/// Errors returned when constructing a georeference [`Frame`].
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum BindingError {
-    #[error("unsupported projected CRS EPSG:{0}")]
-    UnsupportedEpsg(u32),
-    #[error("EPSG:{0} georeference transform has no valid ground extent")]
-    InvalidExtent(u32),
-}
 
 #[derive(Clone, Debug, PartialEq)]
 enum GeographicShift {
@@ -304,16 +293,7 @@ impl Frame {
         }
         match &self.kind {
             FrameKind::Projected { system, affine } => {
-                let (x_base, y) = match system {
-                    Projection::WebMercator => {
-                        projection::web_mercator_from_geodetic_strict(lat_deg, lon_deg)?
-                    }
-                    Projection::Transverse { system: tm, .. } => tm.from_geodetic(lat_deg, lon_deg),
-                    Projection::Proj4(proj) => proj.from_wgs84_geodetic(lat_deg, lon_deg),
-                };
-                if !(x_base.is_finite() && y.is_finite()) {
-                    return None;
-                }
+                let (x_base, y) = system.project_geodetic_strict(lat_deg, lon_deg)?;
                 let det = affine[0] * affine[4] - affine[1] * affine[3];
                 if !det.is_finite() || det.abs() < 1e-18 {
                     return None;
@@ -421,10 +401,10 @@ impl Frame {
                 )
             }
             FrameKind::Projected {
-                system: Projection::Transverse { system: sys, .. },
+                system: sys @ Projection::Transverse { .. },
                 affine,
             } => {
-                let unit = sys.safe_unit_to_metres();
+                let unit = sys.unit_to_metres();
                 (
                     affine[0].hypot(affine[3]) * unit,
                     affine[1].hypot(affine[4]) * unit,

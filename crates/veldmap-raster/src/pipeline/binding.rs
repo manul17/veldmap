@@ -1,38 +1,23 @@
 //! Format-agnostic georeference [`Frame`] resolution from [`RasterDescription`]
 //! with optional user CRS overrides.
 
-use veldmap_core::geo::{CrsSpec, Datum, DatumWarning, Frame, Tie, TieGrid, known_datum_from_code};
+use veldmap_core::geo::{CrsSpec, Frame, Tie, TieGrid};
 
 use crate::RasterError;
 
-use super::metadata::RasterDescription;
+use super::metadata::{PlacementCrs, RasterDescription};
 
-fn geographic_frame_from_grid(
-    grid: TieGrid,
-    foreign_datum_epsg: Option<u16>,
-    geographic_datum: Option<&(Datum, Option<DatumWarning>)>,
-) -> Frame {
-    if let Some((datum, warning)) = geographic_datum {
-        return Frame::from_grid_with_datum(grid, *datum, "User-defined geographic CRS")
-            .with_datum_warning(warning.clone());
+fn geographic_frame_from_grid(grid: TieGrid, geographic_crs: Option<&CrsSpec>) -> Frame {
+    match geographic_crs {
+        Some(CrsSpec::Geographic {
+            datum,
+            label,
+            warning,
+        }) => Frame::from_grid_with_datum(grid, *datum, label.clone())
+            .with_datum_warning(warning.clone()),
+        Some(CrsSpec::GeographicProj(proj)) => Frame::from_grid_with_proj(grid, proj.clone()),
+        Some(CrsSpec::Projected(_)) | None => Frame::from_grid(grid),
     }
-    let Some(code) = foreign_datum_epsg else {
-        return Frame::from_grid(grid);
-    };
-    if let Some((datum, warning)) = known_datum_from_code(u32::from(code)) {
-        return Frame::from_grid_with_datum(grid, datum, format!("EPSG:{code}"))
-            .with_datum_warning(warning);
-    }
-    if let Ok(CrsSpec::GeographicProj(proj)) = CrsSpec::from_epsg(u32::from(code)) {
-        return Frame::from_grid_with_proj(grid, proj);
-    }
-    tracing::warn!(
-        foreign_datum_epsg = code,
-        "Geographic raster uses foreign datum EPSG:{code} without a bundled shift; binding unshifted on WGS84"
-    );
-    Frame::from_grid(grid).with_datum_warning(Some(DatumWarning::UnshiftedForeignDatum {
-        label: format!("EPSG:{code}"),
-    }))
 }
 
 /// Derive a [`veldmap_core::geo::Frame`] georeference binding from a parsed
@@ -71,9 +56,7 @@ pub fn frame_from_description_with_override(
         })
         .collect();
     let grid = TieGrid::new(&ties);
-    let bind_grid = |g: TieGrid| {
-        geographic_frame_from_grid(g, desc.foreign_datum_epsg, desc.geographic_datum.as_ref())
-    };
+    let bind_grid = |g: TieGrid| geographic_frame_from_grid(g, desc.geographic_crs.as_ref());
 
     if let Some(crs) = crs_override {
         if let Some(ref placement) = desc.placement {
@@ -87,13 +70,9 @@ pub fn frame_from_description_with_override(
         }
         if let Some(g) = grid {
             return match crs {
-                CrsSpec::Geographic {
-                    datum,
-                    label,
-                    warning,
-                } => Ok(Frame::from_grid_with_datum(g, *datum, label.clone())
-                    .with_datum_warning(warning.clone())),
-                CrsSpec::GeographicProj(proj) => Ok(Frame::from_grid_with_proj(g, proj.clone())),
+                CrsSpec::Geographic { .. } | CrsSpec::GeographicProj(_) => {
+                    Ok(geographic_frame_from_grid(g, Some(crs)))
+                }
                 CrsSpec::Projected(_) => Err(RasterError::Binding(format!(
                     "cannot apply projected CRS '{}' to a geographic tie-grid raster without a projected affine transform",
                     crs.label()
@@ -110,18 +89,22 @@ pub fn frame_from_description_with_override(
 
     let mut placement_err: Option<RasterError> = None;
     if let Some(ref placement) = desc.placement {
-        if let Some(ref custom) = placement.custom_crs {
-            if let Some(frame) =
-                Frame::from_crs_pixel_affine(custom, placement.affine, desc.width, desc.height)
-            {
-                return Ok(frame.with_datum_warning(placement.datum_warning.clone()));
+        match placement.crs {
+            Some(PlacementCrs::Resolved {
+                ref crs,
+                ref warning,
+            }) => {
+                if let Some(frame) =
+                    Frame::from_crs_pixel_affine(crs, placement.affine, desc.width, desc.height)
+                {
+                    return Ok(frame.with_datum_warning(warning.clone()));
+                }
+                placement_err = Some(RasterError::Binding(format!(
+                    "CRS '{}' produced no valid ground extent for this raster's affine transform",
+                    crs.label()
+                )));
             }
-            placement_err = Some(RasterError::Binding(format!(
-                "CRS '{}' produced no valid ground extent for this raster's affine transform",
-                custom.label()
-            )));
-        } else if let Some(epsg) = placement.epsg {
-            match CrsSpec::from_epsg(epsg) {
+            Some(PlacementCrs::Epsg(epsg)) => match CrsSpec::from_epsg(epsg) {
                 Ok(crs) => {
                     if let Some(frame) = Frame::from_crs_pixel_affine(
                         &crs,
@@ -131,14 +114,16 @@ pub fn frame_from_description_with_override(
                     ) {
                         return Ok(frame);
                     }
-                    placement_err =
-                        Some(veldmap_core::geo::BindingError::InvalidExtent(epsg).into());
+                    placement_err = Some(RasterError::Binding(format!(
+                        "EPSG:{epsg} georeference transform has no valid ground extent"
+                    )));
                 }
                 Err(_) => {
                     placement_err =
-                        Some(veldmap_core::geo::BindingError::UnsupportedEpsg(epsg).into());
+                        Some(RasterError::Binding(format!("unsupported CRS EPSG:{epsg}")));
                 }
-            }
+            },
+            None => {}
         }
     }
 

@@ -10,13 +10,11 @@ use std::sync::Arc;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{RASTER_TILE_SIZE, SourceFingerprint, SourceId, level_count};
+use veldmap_core::tile::{SourceFingerprint, SourceId, level_count};
 
 use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
 use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
-use crate::pipeline::plan::{
-    DISPLAY_STREAM_SPEC, LevelPlan, PyramidMeta, ServeMode, check_max_source_side,
-};
+use crate::pipeline::plan::{LevelPlan, ServeMode, check_max_source_side};
 use crate::pipeline::radiometry::{DisplayMapping, PixelLayout, Samples, expand_u8_into_rgba};
 use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
@@ -131,8 +129,7 @@ impl PngSource {
             bands: vec![BandInfo::display(SampleType::U8, channels, has_alpha, None)],
             ties: Vec::new(),
             placement,
-            foreign_datum_epsg: None,
-            geographic_datum: None,
+            geographic_crs: None,
             binding_trouble,
             levels,
         };
@@ -172,17 +169,6 @@ impl RasterSource for PngSource {
 
     fn description(&self) -> &RasterDescription {
         &self.description
-    }
-
-    fn pyramid_meta(&self) -> PyramidMeta {
-        PyramidMeta {
-            source: self.source_id,
-            spec: DISPLAY_STREAM_SPEC,
-            width: self.description.width,
-            height: self.description.height,
-            tile_size: RASTER_TILE_SIZE,
-            levels: self.description.levels.clone(),
-        }
     }
 
     fn pass_peak_bytes(&self) -> u64 {

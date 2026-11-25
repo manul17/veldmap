@@ -1,23 +1,28 @@
 //! Presentation-only floating Geodesic Measure window bound to
-//! [`crate::layers::MeasureSession`].
+//! [`crate::measure::MeasureSession`].
+//!
+//! Strictly action-only: emits [`MeasureAction`] values back to `VeldmapApp`
+//! without mutating [`MeasureSession`] directly from UI layout code.
 
 use eframe::egui;
 
-use crate::layers::{MeasureMode, MeasureSession};
+use crate::measure::{MeasureMode, MeasureSession};
 
 use super::format;
 
-/// Action emitted by the Measure tool window.
-#[derive(Clone, Debug)]
+/// Action emitted by the Measure tool window and applied by `VeldmapApp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MeasureAction {
+    SetMode(MeasureMode),
+    Undo,
+    Clear,
+    Close,
     ExportGeoJson,
 }
 
-/// UI wrapper pairing the domain [`MeasureSession`] with transient export
-/// status copy.
+/// Transient UI state for the Geodesic Measure window (export status notice).
 #[derive(Default)]
 pub(crate) struct MeasureUiState {
-    pub(crate) session: MeasureSession,
     notice: Option<String>,
 }
 
@@ -31,12 +36,13 @@ impl MeasureUiState {
     }
 }
 
-/// Render the floating Geodesic Measure window when active.
+/// Render the floating Geodesic Measure window when `session` is active.
 pub(crate) fn show_measure_window(
     ctx: &egui::Context,
+    session: &MeasureSession,
     state: &mut MeasureUiState,
 ) -> Option<MeasureAction> {
-    if !state.session.is_active() {
+    if !session.is_active() {
         return None;
     }
     let mut action = None;
@@ -46,28 +52,30 @@ pub(crate) fn show_measure_window(
         .resizable(false)
         .default_width(300.0)
         .show(ctx, |ui| {
-            let mode = state.session.mode();
+            let mode = session.mode();
             ui.horizontal(|ui| {
                 if ui
                     .selectable_label(mode == MeasureMode::Distance, "Distance")
                     .clicked()
+                    && mode != MeasureMode::Distance
                 {
-                    state.session.set_mode(MeasureMode::Distance);
+                    action = Some(MeasureAction::SetMode(MeasureMode::Distance));
                 }
                 if ui
                     .selectable_label(mode == MeasureMode::Area, "Area")
                     .clicked()
+                    && mode != MeasureMode::Area
                 {
-                    state.session.set_mode(MeasureMode::Area);
+                    action = Some(MeasureAction::SetMode(MeasureMode::Area));
                 }
             });
             ui.separator();
             ui.weak("Click on the globe to place vertices.");
-            let point_count = state.session.points().len();
+            let point_count = session.points().len();
             ui.monospace(format!("Vertices: {point_count}"));
 
-            let metrics = state.session.metrics();
-            match state.session.mode() {
+            let metrics = session.metrics();
+            match mode {
                 MeasureMode::Distance => {
                     ui.strong(format!(
                         "Length: {}",
@@ -101,15 +109,15 @@ pub(crate) fn show_measure_window(
                     .add_enabled(point_count > 0, egui::Button::new("Undo"))
                     .clicked()
                 {
-                    state.session.undo();
                     state.clear_notice();
+                    action = Some(MeasureAction::Undo);
                 }
                 if ui
                     .add_enabled(point_count > 0, egui::Button::new("Clear"))
                     .clicked()
                 {
-                    state.session.clear();
                     state.clear_notice();
+                    action = Some(MeasureAction::Clear);
                 }
                 if ui
                     .add_enabled(point_count > 0, egui::Button::new("Export GeoJSON…"))
@@ -126,7 +134,7 @@ pub(crate) fn show_measure_window(
         });
 
     if !open {
-        state.session.set_mode(MeasureMode::Off);
+        action = Some(MeasureAction::Close);
     }
     action
 }

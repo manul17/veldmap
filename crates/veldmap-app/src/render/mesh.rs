@@ -10,12 +10,14 @@ use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::geo::geodesy;
+use veldmap_core::glam::Vec3;
 use veldmap_core::tile::{
     DEFAULT_GRID_CELLS, PlanetaryScheme, QuadTileId, TileSurfaceSample, VisibleTile,
     sample_tile_surface,
 };
 use wgpu::util::DeviceExt;
 
+use super::graticule::TileGridAnchor;
 use super::mesh_cache::{DEFAULT_MESH_CACHE_BYTES, ElasticMeshCache, push_grid_quad_indices};
 use super::snapshot::DrawTile;
 
@@ -125,114 +127,6 @@ impl TileMeshCache {
         }
 
         self.meshes.end_frame(needed_bytes);
-    }
-}
-
-/// `TileUniform::tile_kind` tag for `Geodetic` / `WebMercator` tiles.
-pub(super) const TILE_KIND_GEO: f32 = 0.0;
-/// `TileUniform::tile_kind` tag for North PolarCap tiles near the pole.
-const TILE_KIND_POLAR_NORTH: f32 = 1.0;
-/// `TileUniform::tile_kind` tag for South PolarCap tiles near the pole.
-const TILE_KIND_POLAR_SOUTH: f32 = -1.0;
-/// Scale multiplier applied to `TILE_KIND_POLAR_*` (`±2.0`) when a PolarCap
-/// tile is strictly clear of the pole and uses cancellation-free relative
-/// longitude deltas in `shaders/globe.wgsl` (`abs(tile.tile_kind) > 1.5`).
-const TILE_KIND_POLAR_CLEAR_SCALE: f32 = 2.0;
-
-/// Cached tile-center `f64` graticule anchor sampled once during mesh build.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct TileGridAnchor {
-    pub(super) lat0: f64,
-    pub(super) lon0: f64,
-    pub(super) dx0: f64,
-    pub(super) dy0: f64,
-}
-
-impl TileGridAnchor {
-    pub(super) fn for_tile(id: QuadTileId) -> Self {
-        match sample_tile_surface(id, 0.5, 0.5) {
-            Some(TileSurfaceSample {
-                lat_deg,
-                lon_deg,
-                polar_dx,
-                polar_dy,
-                ..
-            }) => Self {
-                lat0: lat_deg,
-                lon0: lon_deg,
-                dx0: polar_dx,
-                dy0: polar_dy,
-            },
-            None => Self {
-                lat0: match id.scheme {
-                    PlanetaryScheme::PolarCap { north } => {
-                        if north {
-                            90.0
-                        } else {
-                            -90.0
-                        }
-                    }
-                    PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => 0.0,
-                },
-                lon0: 0.0,
-                dx0: 0.0,
-                dy0: 0.0,
-            },
-        }
-    }
-}
-
-/// Compute per-tile `(tile_kind, grid_anchor)` uniform values from a cached
-/// [`TileGridAnchor`] so `GlobeRenderer` never re-samples `sample_tile_surface`
-/// on every dirty frame.
-pub(super) fn tile_graticule_uniform(
-    id: QuadTileId,
-    cached_anchor: Option<TileGridAnchor>,
-    step_deg: f64,
-) -> (f32, [f32; 4]) {
-    let anchor = cached_anchor.unwrap_or_else(|| TileGridAnchor::for_tile(id));
-    match id.scheme {
-        PlanetaryScheme::PolarCap { north } => {
-            let colat_phase = (90.0 - anchor.lat0.abs()).rem_euclid(step_deg);
-            let lon_phase = anchor.lon0.rem_euclid(step_deg);
-
-            // Use cancellation-free relative longitude deltas when the tile's
-            // disk center is strictly clear of the pole (`rho0 > 4 * tile_half_diag`).
-            let rho0 = anchor.dx0.hypot(anchor.dy0);
-            let n = f64::from(1u32 << id.level.min(30));
-            let tile_half_diag = std::f64::consts::SQRT_2 / n;
-            let clear_of_pole = id.level >= 2 && rho0 > 4.0 * tile_half_diag;
-            let sign = if north {
-                TILE_KIND_POLAR_NORTH
-            } else {
-                TILE_KIND_POLAR_SOUTH
-            };
-            let kind = if clear_of_pole {
-                sign * TILE_KIND_POLAR_CLEAR_SCALE
-            } else {
-                sign
-            };
-            (
-                kind,
-                [
-                    anchor.dx0 as f32,
-                    anchor.dy0 as f32,
-                    colat_phase as f32,
-                    lon_phase as f32,
-                ],
-            )
-        }
-        PlanetaryScheme::Geodetic | PlanetaryScheme::WebMercator => {
-            // Wrap tile anchor phase modulo `grid_step_deg` in f64 on CPU so
-            // `f32` fragment arithmetic preserves sub-millimetre accuracy even
-            // at `2 m` altitude.
-            let lon_phase = anchor.lon0.rem_euclid(step_deg);
-            let lat_phase = anchor.lat0.rem_euclid(step_deg);
-            (
-                TILE_KIND_GEO,
-                [lon_phase as f32, lat_phase as f32, 0.0, 0.0],
-            )
-        }
     }
 }
 
@@ -401,27 +295,18 @@ pub(super) fn build_tile_mesh_data(
     let flare_m = (0.05 * drop_m).max(0.002);
     let push_skirt = |out: &mut Vec<TileVertex>, src_idx: usize, inner_idx: usize| {
         let v = out[src_idx];
-        let inner = out[inner_idx];
-        let raw_x = v.rel_pos[0] - inner.rel_pos[0];
-        let raw_y = v.rel_pos[1] - inner.rel_pos[1];
-        let raw_z = v.rel_pos[2] - inner.rel_pos[2];
-        let dot_n = raw_x * v.normal[0] + raw_y * v.normal[1] + raw_z * v.normal[2];
-        let tx = raw_x - v.normal[0] * dot_n;
-        let ty = raw_y - v.normal[1] * dot_n;
-        let tz = raw_z - v.normal[2] * dot_n;
-        let t_len = (tx * tx + ty * ty + tz * tz).sqrt();
-        let (fx, fy, fz) = if t_len > 1e-9 {
-            let s = flare_m / t_len;
-            (tx * s, ty * s, tz * s)
+        let pos = Vec3::from_array(v.rel_pos);
+        let normal = Vec3::from_array(v.normal);
+        let raw = pos - Vec3::from_array(out[inner_idx].rel_pos);
+        let tangent = raw - normal * raw.dot(normal);
+        let t_len = tangent.length();
+        let flare = if t_len > 1e-9 {
+            tangent * (flare_m / t_len)
         } else {
-            (0.0, 0.0, 0.0)
+            Vec3::ZERO
         };
         out.push(TileVertex {
-            rel_pos: [
-                v.rel_pos[0] - v.normal[0] * drop_m + fx,
-                v.rel_pos[1] - v.normal[1] * drop_m + fy,
-                v.rel_pos[2] - v.normal[2] * drop_m + fz,
-            ],
+            rel_pos: (pos - normal * drop_m + flare).to_array(),
             ..v
         });
     };

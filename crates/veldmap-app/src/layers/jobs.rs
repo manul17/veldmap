@@ -8,7 +8,7 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::{DecodedTile, PixelFormat, TileKey};
 use veldmap_raster::{
     AdmittedPass, AdmittedTile, DecodeJob, DecodeJobKey, PassKey, PyramidMeta, RasterError,
-    RasterSource, ServeMode, SubmitError, TileFailureOutcome, generate_linear_mipmaps,
+    RasterSource, ServeMode, TileFailureOutcome, generate_linear_mipmaps,
 };
 use veldmap_storage::DiskTileKey;
 
@@ -221,7 +221,7 @@ pub(super) fn schedule_layer_rungs(
                 if let Some(admitted) = admitted_pass {
                     submit_pass_job(PassJobSpec {
                         admitted,
-                        wanted_shared: Arc::clone(&layer.wanted_shared),
+                        wanted_shared: layer.wanted_shared(),
                         source: Arc::clone(&layer.source),
                         meta: layer.meta.clone(),
                         fingerprint_hex: layer.fingerprint_hex.clone(),
@@ -336,20 +336,9 @@ fn submit_pointwise_job(
         }),
     };
 
-    match runtime.fast_pool.try_submit(job) {
-        Ok(()) => true,
-        Err(err) => {
-            // Unregister BEFORE dropping the rejected job so `PointwiseFlightGuard::drop`
-            // does not trigger an immediate 100% CPU repaint loop.
-            let _ = lock_unpoisoned(&runtime.scheduler).cancel_in_flight(&tile_key, job_id);
-            let is_full = matches!(err, SubmitError::Full(_));
-            drop(err);
-            if is_full {
-                runtime.note_submit_backoff();
-            }
-            false
-        }
-    }
+    runtime.try_submit_guarded(&runtime.fast_pool, job, true, || {
+        let _ = lock_unpoisoned(&runtime.scheduler).cancel_in_flight(&tile_key, job_id);
+    })
 }
 
 fn deliver_pass_tile(
@@ -369,104 +358,125 @@ fn deliver_pass_tile(
     }
 }
 
-fn run_pass_job(spec: PassJobSpec, guard: PassFlightGuard) {
-    let PassJobSpec {
-        admitted:
-            AdmittedPass {
-                key: pass_key,
-                pass_id,
-                cancel: pass_cancel,
-                tiles: missing,
-                ..
-            },
-        wanted_shared,
-        source,
-        meta,
-        fingerprint_hex: fp,
-        runtime: rt,
-    } = spec;
+enum QoiDrainOutcome {
+    Cancelled,
+    AllHit,
+    NeedsPass(HashSet<TileKey>),
+}
 
-    // Stream any QOI disk-cache hits immediately (never buffering an entire
-    // rung in RAM or discarding partial hits on 1 miss).
+/// Stream any QOI disk-cache hits for `spec.admitted.tiles` immediately
+/// (never buffering an entire rung in RAM or discarding partial hits on 1 miss).
+fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
+    let Some(ref disk) = spec.runtime.disk_cache else {
+        return QoiDrainOutcome::NeedsPass(HashSet::new());
+    };
+    let pass_key = spec.admitted.key;
+    let pass_id = spec.admitted.pass_id;
+    let pass_cancel = &spec.admitted.cancel;
     let mut already_hit: HashSet<TileKey> = HashSet::new();
     let mut any_miss = false;
-    if let Some(ref disk) = rt.disk_cache {
-        for &tk in &missing {
-            if pass_cancel.is_cancelled() {
-                guard.abort();
-                return;
-            }
-            let dk = DiskTileKey::from_tile_key(fp.clone(), &tk);
-            if let Some(tile) = load_qoi_display_tile(disk, &dk) {
-                if deliver_pass_tile(&rt, pass_key, pass_id, tk, tile, &pass_cancel) {
-                    already_hit.insert(tk);
-                }
-            } else {
-                any_miss = true;
-            }
+    for &tk in &spec.admitted.tiles {
+        if pass_cancel.is_cancelled() {
+            return QoiDrainOutcome::Cancelled;
         }
-        if !any_miss {
-            guard.finish(true);
-            return;
+        let dk = DiskTileKey::from_tile_key(spec.fingerprint_hex.clone(), &tk);
+        if let Some(tile) = load_qoi_display_tile(disk, &dk) {
+            if deliver_pass_tile(&spec.runtime, pass_key, pass_id, tk, tile, pass_cancel) {
+                already_hit.insert(tk);
+            }
+        } else {
+            any_miss = true;
         }
     }
+    if any_miss {
+        QoiDrainOutcome::NeedsPass(already_hit)
+    } else {
+        QoiDrainOutcome::AllHit
+    }
+}
 
-    let initial_missing: HashSet<TileKey> = missing
-        .into_iter()
+/// Execute the source's sequential `produce_pass`, batch-writing newly produced
+/// display tiles to QOI disk cache and uploading wanted/apex tiles live.
+fn run_source_pass(spec: &PassJobSpec, already_hit: &HashSet<TileKey>) -> Result<(), RasterError> {
+    let pass_key = spec.admitted.key;
+    let pass_id = spec.admitted.pass_id;
+    let pass_cancel = &spec.admitted.cancel;
+    let initial_missing: HashSet<TileKey> = spec
+        .admitted
+        .tiles
+        .iter()
+        .copied()
         .filter(|tk| !already_hit.contains(tk))
         .collect();
-    let max_level = meta.max_level();
+    let max_level = spec.meta.max_level();
     let mut qoi_batch = QoiWriteBatch::new();
+    let ctx = spec.runtime.decode_context(pass_cancel);
 
-    let ctx = rt.decode_context(&pass_cancel);
+    let result = spec
+        .source
+        .produce_pass(&ctx, &mut |level, tx, ty, tw, th, rgba| {
+            if pass_cancel.is_cancelled() {
+                return Err(RasterError::Cancelled);
+            }
+            let tk = spec.meta.tile_key(level, tx, ty);
+            if already_hit.contains(&tk) {
+                return Ok(());
+            }
+            if let Some(ref disk) = spec.runtime.disk_cache {
+                qoi_batch.push_and_maybe_flush(
+                    disk,
+                    DiskTileKey::from_tile_key(spec.fingerprint_hex.clone(), &tk),
+                    tw,
+                    th,
+                    &rgba,
+                    pass_cancel,
+                );
+            }
 
-    let result = source.produce_pass(&ctx, &mut |level, tx, ty, tw, th, rgba| {
-        if pass_cancel.is_cancelled() {
-            return Err(RasterError::Cancelled);
-        }
-        let tk = meta.tile_key(level, tx, ty);
-        if already_hit.contains(&tk) {
-            return Ok(());
-        }
-        if let Some(ref disk) = rt.disk_cache {
-            qoi_batch.push_and_maybe_flush(
-                disk,
-                DiskTileKey::from_tile_key(fp.clone(), &tk),
-                tw,
-                th,
-                &rgba,
-                &pass_cancel,
-            );
-        }
+            // Read live `wanted_shared` briefly (never nesting locks) so mid-pass
+            // zooms upload tiles matching the current viewport.
+            let should_upload = level == max_level
+                || initial_missing.contains(&tk)
+                || lock_unpoisoned(&spec.wanted_shared).contains(&tk);
+            if should_upload {
+                let mut tile = DecodedTile::try_new(tw, th, PixelFormat::Rgba8UnormSrgb, rgba)
+                    .map_err(|e| RasterError::Decode(e.to_string()))?;
+                generate_linear_mipmaps(&mut tile);
+                let _ = deliver_pass_tile(&spec.runtime, pass_key, pass_id, tk, tile, pass_cancel);
+            }
+            Ok(())
+        });
 
-        // Read live `wanted_shared` briefly (never nesting locks) so mid-pass
-        // zooms upload tiles matching the current viewport.
-        let should_upload = level == max_level
-            || initial_missing.contains(&tk)
-            || lock_unpoisoned(&wanted_shared).contains(&tk);
-        if should_upload {
-            let mut tile = DecodedTile::try_new(tw, th, PixelFormat::Rgba8UnormSrgb, rgba)
-                .map_err(|e| RasterError::Decode(e.to_string()))?;
-            generate_linear_mipmaps(&mut tile);
-            let _ = deliver_pass_tile(&rt, pass_key, pass_id, tk, tile, &pass_cancel);
-        }
-        Ok(())
-    });
-
-    if let Some(ref disk) = rt.disk_cache {
+    if let Some(ref disk) = spec.runtime.disk_cache {
         if result.is_ok() {
-            qoi_batch.flush(disk, &pass_cancel);
+            qoi_batch.flush(disk, pass_cancel);
         } else {
             qoi_batch.clear();
         }
     }
 
-    match result {
+    result
+}
+
+fn run_pass_job(spec: PassJobSpec, guard: PassFlightGuard) {
+    let already_hit = match drain_pass_qoi_hits(&spec) {
+        QoiDrainOutcome::Cancelled => {
+            guard.abort();
+            return;
+        }
+        QoiDrainOutcome::AllHit => {
+            guard.finish(true);
+            return;
+        }
+        QoiDrainOutcome::NeedsPass(hits) => hits,
+    };
+
+    match run_source_pass(&spec, &already_hit) {
         Ok(()) => guard.finish(true),
         Err(err) if err.is_cancelled() => guard.abort(),
         Err(err) => {
             tracing::warn!(
-                source = ?meta.source,
+                source = ?spec.meta.source,
                 error = %err,
                 "Sequential overlay pass failed"
             );
@@ -493,15 +503,11 @@ fn submit_pass_job(spec: PassJobSpec) {
         work: Box::new(move || run_pass_job(spec, guard)),
     };
 
-    if let Err(err) = runtime.bulk_pool.try_submit(job) {
-        let token = lock_unpoisoned(&runtime.scheduler).abort_pass(pass_key, pass_id);
-        let is_full = matches!(err, SubmitError::Full(_));
-        drop(err);
-        if let Some(tok) = token {
-            tok.cancel();
-        }
-        if is_full {
-            runtime.note_submit_backoff();
-        }
+    let mut cancelled_token = None;
+    runtime.try_submit_guarded(&runtime.bulk_pool, job, true, || {
+        cancelled_token = lock_unpoisoned(&runtime.scheduler).abort_pass(pass_key, pass_id);
+    });
+    if let Some(tok) = cancelled_token {
+        tok.cancel();
     }
 }

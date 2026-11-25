@@ -2,8 +2,8 @@
 //! and debounced LRU touch flushing.
 
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, TryLockError};
 
 use rusqlite::{Connection, TransactionBehavior};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
@@ -140,7 +140,7 @@ impl Drop for TileDiskCache {
             return;
         }
         let mut conn = lock_unpoisoned(&self.writer);
-        self.touches.flush_pending_best_effort(&mut conn);
+        self.flush_touches_best_effort(&mut conn);
     }
 }
 
@@ -213,6 +213,18 @@ impl TileDiskCache {
         self.write_generation.load(Ordering::Acquire)
     }
 
+    fn flush_touches_best_effort(&self, conn: &mut Connection) {
+        let touches = self.touches.take_all();
+        if touches.is_empty() {
+            return;
+        }
+        if let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            && flush_touches_in_tx(&tx, &touches).is_ok()
+        {
+            let _ = tx.commit();
+        }
+    }
+
     fn with_write_tx<T>(
         &self,
         conn: &mut Connection,
@@ -264,8 +276,19 @@ impl TileDiskCache {
 
     /// Record a debounced LRU touch for a previously validated [`DiskTileEntry`].
     pub fn touch_entry(&self, entry: DiskTileEntry) {
-        self.touches
-            .record_and_maybe_flush(entry.tile_id, entry.read_ts, &self.writer);
+        if self.touches.record(entry.tile_id, entry.read_ts) {
+            // Non-blocking opportunistic flush: if the writer is busy (e.g.
+            // vacuum or put), the writer will pick up pending touches on its
+            // next pass so concurrent WAL readers never stall.
+            let maybe_conn = match self.writer.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(mut conn) = maybe_conn {
+                self.flush_touches_best_effort(&mut conn);
+            }
+        }
     }
 
     /// Delete the exact row version represented by `entry` (matching both

@@ -8,6 +8,7 @@
 
 mod bind_groups;
 mod globe;
+mod graticule;
 mod mesh;
 mod mesh_cache;
 mod overlay;
@@ -52,24 +53,6 @@ pub fn clamp_to_primary_backends(backends: wgpu::Backends) -> wgpu::Backends {
     }
 }
 
-/// Choose a clean graticule step in degrees (dividing `90°` evenly) such that
-/// lines stay roughly `~85 pt` apart on screen across orbital-to-2 m zoom.
-fn adaptive_grid_step_deg(metres_per_pt: f64) -> f64 {
-    const STEPS_DEG: [f64; 13] = [
-        0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0,
-    ];
-    if !metres_per_pt.is_finite() || metres_per_pt <= 0.0 {
-        return 15.0;
-    }
-    let target_deg = (metres_per_pt * 85.0) / 111_320.0;
-    for &step in &STEPS_DEG {
-        if step >= target_deg {
-            return step;
-        }
-    }
-    15.0
-}
-
 /// Embedded WGSL source for the quadtree globe body and procedural graticule.
 pub const GLOBE_WGSL: &str = include_str!("../shaders/globe.wgsl");
 /// Embedded WGSL source for depth-less post-body raster overlay warp meshes.
@@ -89,7 +72,7 @@ const CLEAR_COLOR_LINEAR: wgpu::Color = wgpu::Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{NATIVE_PRIMARY_BACKENDS, adaptive_grid_step_deg, clamp_to_primary_backends};
+    use super::{NATIVE_PRIMARY_BACKENDS, clamp_to_primary_backends};
 
     #[test]
     fn clamps_backends_to_primary_and_falls_back_when_empty() {
@@ -109,19 +92,5 @@ mod tests {
             clamp_to_primary_backends(wgpu::Backends::empty()),
             NATIVE_PRIMARY_BACKENDS
         );
-    }
-
-    #[test]
-    fn adaptive_grid_step_divides_ninety_degrees_cleanly() {
-        for m_per_pt in [1e-4, 0.002, 0.5, 10.0, 500.0, 16_000.0, 100_000.0] {
-            let step = adaptive_grid_step_deg(m_per_pt);
-            let ratio = 90.0 / step;
-            assert!(
-                (ratio - ratio.round()).abs() < 1e-6,
-                "step {step} does not cleanly divide 90 deg (ratio={ratio})"
-            );
-        }
-        assert_eq!(adaptive_grid_step_deg(16_320.0), 15.0);
-        assert_eq!(adaptive_grid_step_deg(0.002), 0.000_01);
     }
 }

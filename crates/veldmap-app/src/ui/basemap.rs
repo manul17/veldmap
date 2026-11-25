@@ -1,5 +1,5 @@
 //! Basemap selector toolbar controls, draft settings slice, and action types
-//! extracted out of `app.rs`.
+//! for `VeldmapApp` (`app/mod.rs`).
 //!
 //! Strictly action-only: emits [`BasemapUiAction`] values back to `VeldmapApp`
 //! without mutating managers, storage, GPU caches, or upload channels directly

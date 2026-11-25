@@ -2,14 +2,11 @@
 //! [`super::TileDiskCache`].
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, TransactionBehavior};
 use veldmap_core::sync::lock_unpoisoned;
-
-use super::queries::flush_touches_in_tx;
 
 /// Number of buffered `get()` LRU hits before attempting a best-effort batched
 /// flush (avoids a WAL write transaction on every cache read).
@@ -74,44 +71,23 @@ impl TouchBuffer {
         }
     }
 
-    pub(super) fn record_and_maybe_flush(&self, tile_id: i64, ts: i64, writer: &Mutex<Connection>) {
-        let should_try_flush = {
-            let mut touches = lock_unpoisoned(&self.pending);
-            touches
-                .entry(tile_id)
-                .and_modify(|prev| *prev = (*prev).max(ts))
-                .or_insert(ts);
-            touches.len() >= TOUCH_FLUSH_THRESHOLD
-        };
-        // Non-blocking opportunistic flush: if the writer is busy (e.g. vacuum
-        // or put), the writer will pick up pending touches on its next pass so
-        // concurrent WAL readers never stall.
-        if should_try_flush {
-            let maybe_conn = match writer.try_lock() {
-                Ok(guard) => Some(guard),
-                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-                Err(TryLockError::WouldBlock) => None,
-            };
-            if let Some(mut conn) = maybe_conn {
-                self.flush_pending_best_effort(&mut conn);
-            }
-        }
+    /// Record an LRU read hit for `tile_id` at `ts`, returning `true` when the
+    /// buffered entry count has reached [`TOUCH_FLUSH_THRESHOLD`].
+    ///
+    /// Releases `pending`'s mutex before returning so callers may follow up
+    /// with a non-blocking `writer.try_lock()` without violating
+    /// `writer -> pending_touches` lock ordering.
+    pub(super) fn record(&self, tile_id: i64, ts: i64) -> bool {
+        let mut touches = lock_unpoisoned(&self.pending);
+        touches
+            .entry(tile_id)
+            .and_modify(|prev| *prev = (*prev).max(ts))
+            .or_insert(ts);
+        touches.len() >= TOUCH_FLUSH_THRESHOLD
     }
 
     pub(super) fn take_all(&self) -> HashMap<i64, i64> {
         std::mem::take(&mut *lock_unpoisoned(&self.pending))
-    }
-
-    pub(super) fn flush_pending_best_effort(&self, conn: &mut Connection) {
-        let touches = self.take_all();
-        if touches.is_empty() {
-            return;
-        }
-        if let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            && flush_touches_in_tx(&tx, &touches).is_ok()
-        {
-            let _ = tx.commit();
-        }
     }
 
     pub(super) fn prune(&self, tile_ids: &[i64]) {

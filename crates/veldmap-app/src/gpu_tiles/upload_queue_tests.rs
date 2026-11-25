@@ -105,7 +105,7 @@ fn pinned_root_check_handles_planetary_and_raster_pyramid() {
 }
 
 #[test]
-fn clear_where_and_proportional_budget_cover_pre_3a_hooks() {
+fn clear_where_and_proportional_budget_filter_and_cap_correctly() {
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
     let tile_4b = tile_1x1();

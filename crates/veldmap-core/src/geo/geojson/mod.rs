@@ -2,7 +2,9 @@
 //! winding), and WGS84 globe vector mesh tessellation ([`VectorMesh`]).
 
 mod cluster;
+mod mesh;
 mod tessellate;
+mod triangulate;
 
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -10,7 +12,7 @@ use thiserror::Error;
 use super::footprint::{FootprintBounds, GeoPoint, Polygon, Ring, dedup_geo_ring, frame_coords};
 use super::geodesic::ring_signed_area_m2;
 
-pub use tessellate::{DEFAULT_VECTOR_MAX_CHORD_DEG, VectorCluster, VectorMesh, VectorVertex};
+pub use mesh::{DEFAULT_VECTOR_MAX_CHORD_DEG, VectorCluster, VectorMesh, VectorVertex};
 
 /// Hard safety cap on input GeoJSON byte length (`64 MiB`) enforced before
 /// JSON DOM allocation.
@@ -18,10 +20,10 @@ pub const MAX_GEOJSON_BYTES: usize = 64 * 1024 * 1024;
 
 /// Hard safety cap on features per GeoJSON document to prevent OOM on
 /// malformed or pathological inputs.
-pub const MAX_GEOJSON_FEATURES: usize = 100_000;
+const MAX_GEOJSON_FEATURES: usize = 100_000;
 
 /// Hard safety cap on parsed vertices per GeoJSON document.
-pub const MAX_GEOJSON_VERTICES: usize = 2_000_000;
+const MAX_GEOJSON_VERTICES: usize = 2_000_000;
 
 /// Maximum nesting depth for `GeometryCollection` containers.
 const MAX_GEOMETRY_COLLECTION_DEPTH: usize = 8;

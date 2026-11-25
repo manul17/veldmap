@@ -4,14 +4,109 @@
 //! `PolarCap` keys.
 
 use std::fmt::{self, Write as _};
+use std::net::Ipv6Addr;
 
+use thiserror::Error;
 use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey, fnv1a_64};
 
 use crate::NetError;
-use crate::redact::{
-    EncodedSecret, extract_host, parse_url_authority, redact_secret_label, redact_text,
-    sanitize_url_for_display, strip_http_scheme,
-};
+use crate::redact::{EncodedSecret, redact_secret_label, redact_text, sanitize_url_for_display};
+
+/// Internal validation error returned when checking or resolving a tile key
+/// against a [`LiveBasemapSpec`].
+#[derive(Debug, Error)]
+pub(crate) enum TileValidationError {
+    #[error(
+        "live HTTP requests for PolarCap tiles are forbidden (route to offline polar fallback)"
+    )]
+    PolarCapForbidden,
+    #[error("tile scheme mismatch: requested {requested:?}, expected {expected:?}")]
+    SchemeMismatch {
+        requested: PlanetaryScheme,
+        expected: PlanetaryScheme,
+    },
+    #[error("tile level {level} exceeds source max_level {max_level}")]
+    LevelAboveMax { level: u8, max_level: u8 },
+    #[error("tile coordinates ({x}, {y}) out of range for {scheme:?} z={level}")]
+    TileOutOfRange {
+        scheme: PlanetaryScheme,
+        level: u8,
+        x: u32,
+        y: u32,
+    },
+}
+
+/// Parsed HTTP(S) authority components (`host_port` without `user:pass@`, and
+/// bare `host` preserving bracketed IPv6 literals like `[::1]`).
+struct ParsedAuthority<'a> {
+    host_port: &'a str,
+    host: &'a str,
+}
+
+/// Strip an ASCII case-insensitive `https://` or `http://` prefix without
+/// ever slicing across a multi-byte UTF-8 character boundary.
+fn strip_http_scheme(url: &str) -> Option<&str> {
+    let bytes = url.as_bytes();
+    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        Some(&url[8..])
+    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+        Some(&url[7..])
+    } else {
+        None
+    }
+}
+
+fn valid_optional_port(port_suffix: &str) -> bool {
+    if port_suffix.is_empty() {
+        return true;
+    }
+    let Some(port_str) = port_suffix.strip_prefix(':') else {
+        return false;
+    };
+    !port_str.is_empty()
+        && port_str.bytes().all(|b| b.is_ascii_digit())
+        && port_str.parse::<u16>().is_ok()
+}
+
+/// Parse the authority section of an HTTP(S) URL or template, handling
+/// case-insensitive `http://`/`https://` schemes, `user:pass@` userinfo,
+/// numeric `:port` validation, and bracketed IPv6 literals
+/// (`http://[::1]:8080/...`).
+fn parse_url_authority(url: &str) -> Option<ParsedAuthority<'_>> {
+    let without_scheme = strip_http_scheme(url)?;
+    let authority = without_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    if host_port.is_empty() {
+        return None;
+    }
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let inner = &rest[..end];
+        inner.parse::<Ipv6Addr>().ok()?;
+        let after = &rest[end + 1..];
+        if !valid_optional_port(after) {
+            return None;
+        }
+        &host_port[..=end + 1]
+    } else {
+        let (h, port_suffix) = match host_port.find(':') {
+            Some(colon) => (&host_port[..colon], &host_port[colon..]),
+            None => (host_port, ""),
+        };
+        if h.is_empty() || !valid_optional_port(port_suffix) {
+            return None;
+        }
+        h
+    };
+    Some(ParsedAuthority { host_port, host })
+}
+
+/// Extract the lowercased `host[:port]` authority key from an HTTP(S) URL.
+fn extract_host(url: &str) -> String {
+    parse_url_authority(url)
+        .map(|auth| auth.host_port.to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
 
 /// Minimum allowed custom XYZ/TMS maximum zoom level.
 pub const CUSTOM_MAX_LEVEL_MIN: u8 = 1;
@@ -352,35 +447,37 @@ impl LiveBasemapSpec {
 
     /// Validate that `id` is eligible for live fetching (never `PolarCap`,
     /// matches `self.scheme`, `level <= self.max_level`, valid `(x, y)`).
-    pub(crate) fn validate_tile(&self, id: QuadTileId) -> Result<(u32, u32), NetError> {
+    pub(crate) fn validate_tile(&self, id: QuadTileId) -> Result<(u32, u32), TileValidationError> {
         if matches!(id.scheme, PlanetaryScheme::PolarCap { .. }) {
-            return Err(NetError::PolarCapForbidden);
+            return Err(TileValidationError::PolarCapForbidden);
         }
         let expected = self.scheme.into_planetary();
         if id.scheme != expected {
-            return Err(NetError::SchemeMismatch {
+            return Err(TileValidationError::SchemeMismatch {
                 requested: id.scheme,
                 expected,
             });
         }
         if id.level > self.max_level {
-            return Err(NetError::LevelAboveMax {
+            return Err(TileValidationError::LevelAboveMax {
                 level: id.level,
                 max_level: self.max_level,
             });
         }
-        let (cols, rows) = id.checked_grid_dims().ok_or(NetError::TileOutOfRange {
-            scheme: id.scheme,
-            level: id.level,
-            x: id.x,
-            y: id.y,
-        })?;
+        let (cols, rows) = id
+            .checked_grid_dims()
+            .ok_or(TileValidationError::TileOutOfRange {
+                scheme: id.scheme,
+                level: id.level,
+                x: id.x,
+                y: id.y,
+            })?;
         Ok((cols, rows))
     }
 
     /// Resolve the concrete HTTP(S) tile URL for `id`, rejecting `PolarCap`
     /// keys and any `level > self.max_level`.
-    pub(crate) fn resolve_url(&self, id: QuadTileId) -> Result<String, NetError> {
+    pub(crate) fn resolve_url(&self, id: QuadTileId) -> Result<String, TileValidationError> {
         let (_cols, rows) = self.validate_tile(id)?;
         let tms_y = rows - 1 - id.y;
         let effective_y = if self.tms_flip_y { tms_y } else { id.y };

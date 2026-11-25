@@ -3,7 +3,11 @@
 //! CRS overrides, and [`SceneState`] frame updates.
 
 mod actions;
+mod dialogs;
+mod fonts;
 mod session_sync;
+mod viewport_bridge;
+mod viewport_input;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,23 +19,25 @@ use veldmap_core::geo::Camera;
 use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
-use crate::dialogs::DialogHost;
-use crate::fonts::build_font_definitions;
 use crate::gpu_tiles::UploadChannelClosed;
+use crate::measure::MeasureSession;
 use crate::render::GlobeRenderer;
 use crate::scene::{SceneRepaintHint, SceneState};
+use crate::session::SavedCameraPose;
 use crate::storage::AppStorage;
 use crate::ui::basemap::BasemapUiState;
 use crate::ui::crs_picker::{CrsPickerState, show_crs_picker_window};
 use crate::ui::hud;
 use crate::ui::layers::{LayersPanelState, show_layers_panel};
 use crate::ui::measure::{MeasureUiState, show_measure_window};
-use crate::ui::toolbar::{self, GoToBarState, ToolbarInputs};
+use crate::ui::toolbar::{self, ToolbarInputs, ToolbarState};
 use crate::ui::{show_settings_window, status_bar};
-use crate::viewport_bridge::{GlobePaintCallback, viewport_pixels};
-use crate::viewport_input::ViewportInteraction;
 
+use dialogs::DialogHost;
+use fonts::build_font_definitions;
 use session_sync::SessionRestoreTracker;
+use viewport_bridge::{GlobePaintCallback, viewport_pixels};
+use viewport_input::ViewportInteraction;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -55,12 +61,13 @@ pub struct VeldmapApp {
     scene: SceneState,
     storage: AppStorage,
     dialogs: DialogHost,
+    measure: MeasureSession,
     basemap_ui: BasemapUiState,
     layers_ui: LayersPanelState,
     crs_picker_ui: CrsPickerState,
     measure_ui: MeasureUiState,
     viewport: ViewportInteraction,
-    goto_bar: GoToBarState,
+    toolbar_ui: ToolbarState,
     restore_tracker: SessionRestoreTracker,
 }
 
@@ -133,13 +140,9 @@ impl VeldmapApp {
         let basemap_ui = BasemapUiState::new(storage.settings());
 
         let restored_session = storage.session().clone();
-        let mut camera = Camera::default();
-        if let Some(pose) = restored_session.last_camera {
-            camera = Camera::at(pose.lat_deg, pose.lon_deg, pose.height_m);
-            if pose.heading_deg.abs() > 1e-6 {
-                camera.rotate_heading(pose.heading_deg.to_radians());
-            }
-        }
+        let camera = restored_session
+            .last_camera
+            .map_or_else(Camera::default, SavedCameraPose::to_camera);
 
         let mut app = Self {
             adapter_label,
@@ -149,12 +152,13 @@ impl VeldmapApp {
             scene,
             storage,
             dialogs,
+            measure: MeasureSession::default(),
             basemap_ui,
             layers_ui: LayersPanelState::default(),
             crs_picker_ui: CrsPickerState::default(),
             measure_ui: MeasureUiState::default(),
             viewport: ViewportInteraction::default(),
-            goto_bar: GoToBarState::default(),
+            toolbar_ui: ToolbarState::default(),
             restore_tracker: SessionRestoreTracker::default(),
         };
 
@@ -165,6 +169,12 @@ impl VeldmapApp {
         }
 
         Ok(app)
+    }
+
+    /// Push the current measurement session's derived vector mesh into
+    /// [`SceneState`] whenever measurement state mutates.
+    pub(super) fn sync_measure_overlay(&mut self) {
+        self.scene.set_transient_vector(self.measure.draw_layer());
     }
 
     fn show_globe_viewport(
@@ -193,14 +203,12 @@ impl VeldmapApp {
                         &response,
                         rect,
                         height_pt,
-                        self.measure_ui.session.is_active(),
+                        self.measure.is_active(),
                     ) {
-                        self.measure_ui.session.add_point(clicked_pt);
+                        self.measure.add_point(clicked_pt);
                         self.measure_ui.clear_notice();
+                        self.sync_measure_overlay();
                     }
-
-                    self.scene
-                        .set_transient_vector(self.measure_ui.session.draw_layer());
 
                     let show_graticule = self.storage.settings().show_graticule;
                     let snapshot = self.scene.snapshot_for_frame(
@@ -308,9 +316,9 @@ impl VeldmapApp {
 impl eframe::App for VeldmapApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // Drain native file dialogs & overlay I/O events BEFORE `begin_frame`.
+        // Drain native file dialogs & scene I/O events BEFORE `begin_frame`.
         let mut needs_repaint = self.drain_file_dialog_events();
-        needs_repaint |= self.drain_overlay_io_events();
+        needs_repaint |= self.drain_scene_io_events();
         self.scene.begin_frame(&self.device, &self.queue);
 
         if self.storage.poll_clear_completed() {
@@ -329,11 +337,11 @@ impl eframe::App for VeldmapApp {
                 adapter_label: &self.adapter_label,
                 layer_count: self.scene.total_layer_count(),
                 layers_open: self.layers_ui.is_open(),
-                measure_active: self.measure_ui.session.is_active(),
+                measure_active: self.measure.is_active(),
                 recent_files: &self.storage.session().recent_files,
                 bookmarks: &self.storage.session().bookmarks,
             },
-            &mut self.goto_bar,
+            &mut self.toolbar_ui,
             &mut self.basemap_ui,
         );
         needs_repaint |= self.apply_toolbar_actions(toolbar_actions, frame);
@@ -343,19 +351,14 @@ impl eframe::App for VeldmapApp {
             needs_repaint |= self.apply_crs_picker_action(crs_action);
         }
 
-        if let Some(measure_action) = show_measure_window(&ctx, &mut self.measure_ui) {
+        if let Some(measure_action) = show_measure_window(&ctx, &self.measure, &mut self.measure_ui)
+        {
             needs_repaint |= self.handle_measure_action(measure_action, frame);
         }
 
         self.viewport.update_cursor_probe(&ctx, &self.camera);
         let cursor_geo = self.viewport.cursor_geo();
-        let cursor_readout = match cursor_geo {
-            Some((lat, lon)) => self.scene.overlays().query_cursor_readout(lat, lon),
-            None => {
-                self.scene.overlays().cancel_cursor_readout();
-                None
-            }
-        };
+        let cursor_readout = self.scene.update_cursor_readout(cursor_geo);
         let topmost_source_px = self.scene.overlays().topmost_visible_source_pixel_size_m();
         let camera_before = self.camera;
         let rect_before = self.viewport.viewport_rect();

@@ -24,7 +24,7 @@ const SELECT_TILE_BLOB_SQL: &str = "SELECT m.tile_id, m.encoding, m.last_used_ms
        AND m.x = ?9
        AND m.y = ?10";
 
-const SELECT_META_ID_BYTES_SQL: &str = "SELECT tile_id, byte_size FROM tile_meta
+const SELECT_META_BYTE_SIZE_SQL: &str = "SELECT byte_size FROM tile_meta
      WHERE source_key = ?1
        AND band_kind = ?2
        AND band_id = ?3
@@ -82,7 +82,7 @@ const SELECT_EVICT_BATCH_SQL: &str = "SELECT tile_id, byte_size, last_used_ms FR
      ORDER BY last_used_ms ASC
      LIMIT ?1";
 
-const SELECT_EVICT_BATCH_PROTECTED_SQL: &str =
+pub(super) const SELECT_EVICT_BATCH_PROTECTED_SQL: &str =
     "SELECT tile_id, byte_size, last_used_ms FROM tile_meta
      WHERE tile_id != ?1
      ORDER BY last_used_ms ASC
@@ -124,13 +124,12 @@ pub(super) fn select_tile_blob(
     .optional()
 }
 
-fn select_meta_id_bytes(
+fn select_meta_byte_size(
     tx: &Transaction<'_>,
     enc: &EncodedKey<'_>,
-) -> Result<Option<(i64, i64)>, rusqlite::Error> {
-    let mut stmt = tx.prepare(SELECT_META_ID_BYTES_SQL)?;
-    stmt.query_row(enc.key_params(), |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()
+) -> Result<Option<i64>, rusqlite::Error> {
+    let mut stmt = tx.prepare(SELECT_META_BYTE_SIZE_SQL)?;
+    stmt.query_row(enc.key_params(), |r| r.get(0)).optional()
 }
 
 fn upsert_tile_meta(
@@ -164,7 +163,7 @@ pub(super) fn upsert_tile_raw_in_tx(
     ts_ms: i64,
 ) -> Result<(i64, u64, u64), rusqlite::Error> {
     let new_bytes = payload.len() as u64;
-    let prev_bytes = select_meta_id_bytes(tx, enc)?.map(|(_, sz)| sz);
+    let prev_bytes = select_meta_byte_size(tx, enc)?;
     let inserted_id =
         upsert_tile_meta(tx, enc, i64::from(encoding as u8), new_bytes as i64, ts_ms)?;
     upsert_tile_blob(tx, inserted_id, payload)?;

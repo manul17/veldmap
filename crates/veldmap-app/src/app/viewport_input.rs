@@ -36,7 +36,7 @@ fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
 
 /// Tracks globe viewport geometry, HUD overlay bounds, hovered geodetic
 /// cursor coordinates, and pointer/keyboard navigation gestures.
-pub(crate) struct ViewportInteraction {
+pub(super) struct ViewportInteraction {
     cursor_geo: Option<(f64, f64)>,
     last_viewport_rect: Option<egui::Rect>,
     last_compass_rect: Option<egui::Rect>,
@@ -61,36 +61,36 @@ impl Default for ViewportInteraction {
 }
 
 impl ViewportInteraction {
-    pub(crate) fn cursor_geo(&self) -> Option<(f64, f64)> {
+    pub(super) fn cursor_geo(&self) -> Option<(f64, f64)> {
         self.cursor_geo
     }
 
-    pub(crate) fn viewport_rect(&self) -> Option<egui::Rect> {
+    pub(super) fn viewport_rect(&self) -> Option<egui::Rect> {
         self.last_viewport_rect
     }
 
-    pub(crate) fn viewport_height_px(&self) -> f64 {
+    pub(super) fn viewport_height_px(&self) -> f64 {
         self.last_viewport_height_px
     }
 
-    pub(crate) fn record_viewport(&mut self, rect: egui::Rect, height_px: u32, aspect: f64) {
+    pub(super) fn record_viewport(&mut self, rect: egui::Rect, height_px: u32, aspect: f64) {
         self.last_viewport_rect = Some(rect);
         self.last_viewport_height_px = f64::from(height_px);
         self.last_viewport_aspect = aspect;
     }
 
-    pub(crate) fn clear_viewport(&mut self) {
+    pub(super) fn clear_viewport(&mut self) {
         self.last_viewport_rect = None;
         self.last_compass_rect = None;
         self.last_scale_bar_rect = None;
         self.last_attribution_rect = None;
     }
 
-    pub(crate) fn set_compass_rect(&mut self, rect: egui::Rect) {
+    pub(super) fn set_compass_rect(&mut self, rect: egui::Rect) {
         self.last_compass_rect = Some(rect);
     }
 
-    pub(crate) fn set_hud_rects(
+    pub(super) fn set_hud_rects(
         &mut self,
         scale_bar: Option<egui::Rect>,
         attribution: Option<egui::Rect>,
@@ -121,7 +121,7 @@ impl ViewportInteraction {
     /// Probe the current pointer against the previous frame's viewport rect
     /// before laying out the bottom status bar so hover readouts stay in sync
     /// without scheduling a duplicate repaint on every mouse move.
-    pub(crate) fn update_cursor_probe(&mut self, ctx: &egui::Context, camera: &Camera) {
+    pub(super) fn update_cursor_probe(&mut self, ctx: &egui::Context, camera: &Camera) {
         if let Some(rect) = self.last_viewport_rect.filter(|r| r.is_positive()) {
             let hover_pos = ctx.input(|i| i.pointer.hover_pos());
             self.cursor_geo = hover_pos.and_then(|pos| {
@@ -143,7 +143,7 @@ impl ViewportInteraction {
     /// heading rotation, `N` reset North) when no text field holds focus.
     /// Returns `true` if any continuous navigation key is held so the app can
     /// schedule another frame.
-    pub(crate) fn handle_keyboard_navigation(
+    pub(super) fn handle_keyboard_navigation(
         &self,
         ctx: &egui::Context,
         camera: &mut Camera,
@@ -215,7 +215,7 @@ impl ViewportInteraction {
     ///
     /// Returns `Some(GeoPoint)` if `measure_active` is `true` and the user
     /// clicked a point on the globe without dragging.
-    pub(crate) fn handle_viewport_input(
+    pub(super) fn handle_viewport_input(
         &self,
         ctx: &egui::Context,
         camera: &mut Camera,

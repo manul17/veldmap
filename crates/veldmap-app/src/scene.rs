@@ -1,9 +1,9 @@
 //! Scene, tile-upload, and two-lane decode-pool orchestration (`SceneState`).
 //!
 //! Owns the GPU tile cache, bounded upload queue, shared two-lane CPU decode
-//! pool (`TwoLaneDecodePool`), basemap coordinator, ordered raster overlay
-//! `LayerStack` / `OverlayManager`, cached immutable `DrawSnapshot`, and
-//! monotonic `scene_generation`.
+//! pool (`TwoLaneDecodePool`), [`BasemapManager`], raster [`OverlayManager`],
+//! GeoJSON [`VectorManager`], transient measurement vector overlay, cached
+//! immutable [`DrawSnapshot`], and monotonic `scene_generation`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,17 +17,17 @@ use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
 use crate::basemap::BasemapManager;
+use crate::crs_override::CrsOverride;
 use crate::gpu_tiles::{
     DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::layers::{
-    LayerId, OverlayFrameCtx, OverlayIoEvent, OverlayManager, OverlayMutation, VectorIoWorker,
-    VectorLayerId, VectorLayerStack,
+    CursorReadout, LayerId, OverlayFrameCtx, OverlayIoEvent, OverlayManager, OverlayMutation,
 };
 use crate::render::{DrawSnapshot, DrawVectorLayer, SnapshotBuildParams, TileCarrierPolicy};
-use crate::session::SavedCrsOverride;
 use crate::settings::AppSettings;
+use crate::vectors::{VectorIoEvent, VectorLayerId, VectorManager};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SnapshotKey {
@@ -74,6 +74,14 @@ pub(crate) enum SceneRepaintHint {
     Immediate,
 }
 
+/// Unified background I/O event drained from both raster and vector managers at
+/// the start of each frame.
+#[derive(Clone, Debug)]
+pub(crate) enum SceneIoEvent {
+    Raster(OverlayIoEvent),
+    Vector(VectorIoEvent),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct FrameState {
     reconciled: bool,
@@ -83,8 +91,8 @@ struct FrameState {
 }
 
 /// Coordinates tile caches, bounded GPU uploads, shared two-lane CPU decode
-/// threads, active basemap + raster overlay scheduling, and cached frame
-/// snapshots.
+/// threads, active basemap + raster/vector overlay scheduling, cursor probes,
+/// and cached frame snapshots.
 pub(crate) struct SceneState {
     gpu_tile_cache: GpuTileCache,
     pending_uploads: PendingUploads,
@@ -92,8 +100,7 @@ pub(crate) struct SceneState {
     decode_pool: Option<TwoLaneDecodePool>,
     basemap: BasemapManager,
     overlays: OverlayManager,
-    vector_io: VectorIoWorker,
-    vectors: VectorLayerStack,
+    vectors: VectorManager,
     transient_vector: Option<DrawVectorLayer>,
     cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
     scene_generation: u64,
@@ -102,8 +109,8 @@ pub(crate) struct SceneState {
 
 impl SceneState {
     /// Initialize GPU/upload caches, the shared two-lane CPU decode pool,
-    /// basemap streaming, local raster overlay management, and the dedicated
-    /// vector I/O worker from startup `budget` and persisted `settings`.
+    /// basemap streaming, local raster overlay management, and the GeoJSON
+    /// vector manager from startup `budget` and persisted `settings`.
     pub(crate) fn new(
         settings: &AppSettings,
         disk_cache: Option<Arc<TileDiskCache>>,
@@ -129,7 +136,7 @@ impl SceneState {
             decode_pool.fast_handle(),
             decode_shutdown.clone(),
         );
-        let vector_io = VectorIoWorker::spawn(Arc::clone(&wakeup), decode_shutdown.clone());
+        let vectors = VectorManager::new(Arc::clone(&wakeup), decode_shutdown.clone());
         let overlays = OverlayManager::new(
             budget,
             disk_cache,
@@ -147,8 +154,7 @@ impl SceneState {
             decode_pool: Some(decode_pool),
             basemap,
             overlays,
-            vector_io,
-            vectors: VectorLayerStack::default(),
+            vectors,
             transient_vector: None,
             cached_snapshot: None,
             scene_generation: 1,
@@ -205,14 +211,29 @@ impl SceneState {
         &self.overlays
     }
 
-    /// Read-only access to the GeoJSON vector overlay stack.
-    pub(crate) fn vectors(&self) -> &VectorLayerStack {
+    /// Read-only access to the GeoJSON vector overlay manager.
+    pub(crate) fn vectors(&self) -> &VectorManager {
         &self.vectors
     }
 
     /// Total count of loaded raster + vector layers (O(1), lock-free).
     pub(crate) fn total_layer_count(&self) -> usize {
         self.overlays.layer_count() + self.vectors.len()
+    }
+
+    /// Update the zoom-invariant CPU cursor readout for `cursor_geo`, cancelling
+    /// any in-flight probe when the cursor leaves the globe.
+    pub(crate) fn update_cursor_readout(
+        &self,
+        cursor_geo: Option<(f64, f64)>,
+    ) -> Option<CursorReadout> {
+        match cursor_geo {
+            Some((lat, lon)) => self.overlays.query_cursor_readout(lat, lon),
+            None => {
+                self.overlays.cancel_cursor_readout();
+                None
+            }
+        }
     }
 
     /// Queue a non-blocking local read-only GeoJSON vector layer open onto the
@@ -224,7 +245,7 @@ impl SceneState {
         visible: bool,
         opacity: f32,
     ) -> Result<(), String> {
-        self.vector_io.begin_open(path, fly_to, visible, opacity)
+        self.vectors.begin_open(path, fly_to, visible, opacity)
     }
 
     pub(crate) fn set_vector_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
@@ -282,7 +303,7 @@ impl SceneState {
         fly_to: bool,
         visible: bool,
         opacity: f32,
-        crs_override: Option<SavedCrsOverride>,
+        crs_override: Option<CrsOverride>,
     ) -> Result<(), String> {
         self.overlays
             .begin_open_file_with_options(path, fly_to, visible, opacity, crs_override)
@@ -307,7 +328,7 @@ impl SceneState {
     pub(crate) fn override_overlay_crs(
         &mut self,
         id: LayerId,
-        crs_override: Option<SavedCrsOverride>,
+        crs_override: Option<CrsOverride>,
     ) -> Result<Option<veldmap_core::geo::FootprintBounds>, String> {
         let bounds = self.overlays.override_layer_crs(id, crs_override)?;
         self.mark_dirty();
@@ -322,35 +343,22 @@ impl SceneState {
         Ok(())
     }
 
-    /// Drain completed background overlay and vector open/reload events.
-    pub(crate) fn poll_overlay_io_events(&mut self) -> Vec<OverlayIoEvent> {
-        let (mut events, mutation) = self.overlays.poll_io_events();
+    /// Drain completed background raster and vector I/O events in a single batch.
+    pub(crate) fn poll_io_events(&mut self) -> Vec<SceneIoEvent> {
+        let (raster_events, mutation) = self.overlays.poll_io_events();
         let _ = self.apply_overlay_mutation(mutation);
-        let mut vectors_changed = false;
-        while let Some(res) = self.vector_io.try_recv() {
-            match res.outcome {
-                Ok(data) => {
-                    let path = data.path.clone();
-                    let (id, bounds) = self.vectors.push_loaded(data, res.visible, res.opacity);
-                    events.push(OverlayIoEvent::VectorOpened {
-                        id,
-                        path,
-                        bounds,
-                        fly_to: res.fly_to,
-                    });
-                    vectors_changed = true;
-                }
-                Err(error) => {
-                    events.push(OverlayIoEvent::VectorFailed {
-                        path: res.path,
-                        error,
-                    });
-                }
-            }
-        }
-        if vectors_changed {
+
+        let vector_events = self.vectors.poll_events();
+        if vector_events
+            .iter()
+            .any(|ev| matches!(ev, VectorIoEvent::Opened { .. }))
+        {
             self.mark_dirty();
         }
+
+        let mut events = Vec::with_capacity(raster_events.len() + vector_events.len());
+        events.extend(raster_events.into_iter().map(SceneIoEvent::Raster));
+        events.extend(vector_events.into_iter().map(SceneIoEvent::Vector));
         events
     }
 
@@ -563,7 +571,7 @@ impl SceneState {
     /// live/bundled/overlay/vector pipelines BEFORE closing `PendingUploads`.
     pub(crate) fn begin_shutdown(&mut self) {
         self.overlays.begin_shutdown();
-        self.vector_io.close_channel();
+        self.vectors.begin_shutdown();
         self.basemap.begin_shutdown();
         self.decode_shutdown.cancel();
     }
@@ -582,7 +590,7 @@ impl SceneState {
             pool.shutdown();
         }
         self.overlays.finish_shutdown();
-        self.vector_io.join();
+        self.vectors.finish_shutdown();
         self.basemap.finish_shutdown();
     }
 }

@@ -1,10 +1,10 @@
 //! Unified raster band metadata (`BandInfo`), sample types, and georeference
-//! models (`GeoTie`, `GeoPlacement`, `GeoKeyParams`, `RasterDescription`).
+//! models (`GeoTie`, `PlacementCrs`, `GeoPlacement`, `RasterDescription`).
 //!
 //! Raw GeoTIFF binary tag parsing (`GeoKeyDirectoryTag` / `34735`–`34737`)
 //! lives in `crate::tiff::georef`.
 
-use veldmap_core::geo::{CrsSpec, Datum, DatumWarning};
+use veldmap_core::geo::{CrsSpec, DatumWarning};
 use veldmap_core::tile::{BandKey, PixelFormat};
 
 use super::plan::LevelPlan;
@@ -59,8 +59,8 @@ impl BandInfo {
     }
 }
 
-/// Single WGS84 georeference tie point mapping raster pixel `(px, py)` to
-/// geographic `(lat, lon)` degrees.
+/// Single georeference tie point mapping raster pixel `(px, py)` to geographic
+/// `(lat, lon)` degrees.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GeoTie {
     pub px: f64,
@@ -79,95 +79,32 @@ pub(crate) fn is_valid_lat_lon(lat: f64, lon: f64) -> bool {
         && (-360.0..=360.0).contains(&lon)
 }
 
-/// Pixel coordinate reference convention (`GTRasterTypeGeoKey = 1025`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum GeoRasterType {
-    /// Pixel coordinates denote the top-left corner of the pixel cell (`1`).
-    #[default]
-    PixelIsArea,
-    /// Pixel coordinates denote the center of the pixel cell (`2`).
-    PixelIsPoint,
-}
-
-impl GeoRasterType {
-    /// Half-pixel shift added when converting `(px, py)` into top-left cell
-    /// corner coordinates (`0.0` for `PixelIsArea`, `0.5` for `PixelIsPoint`).
-    pub(crate) const fn half_pixel_shift(self) -> f64 {
-        match self {
-            Self::PixelIsArea => 0.0,
-            Self::PixelIsPoint => 0.5,
-        }
-    }
-}
-
-/// Parsed raw GeoTIFF key directory entry value.
+/// Coordinate reference system associated with a [`GeoPlacement`].
 #[derive(Clone, Debug, PartialEq)]
-pub enum GeoKeyValue {
-    Short(u16),
-    Double(Vec<f64>),
-    Ascii(String),
+pub enum PlacementCrs {
+    /// Standard EPSG (or MSK-61 regional pseudo-EPSG) code resolved via
+    /// [`CrsSpec::from_epsg`].
+    Epsg(u32),
+    /// Pre-resolved CRS specification (from user-defined GeoTIFF GeoKeys,
+    /// `.prj` WKT1/WKT2 sidecars, or an explicit user override) paired with an
+    /// optional datum diagnostic warning.
+    Resolved {
+        crs: CrsSpec,
+        warning: Option<DatumWarning>,
+    },
 }
 
-/// Parsed GeoTIFF key directory preserving resolved double/ASCII parameters
-/// for downstream CRS resolution.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct GeoKeyParams {
-    pub model_type: Option<u16>,
-    pub raster_type: GeoRasterType,
-    pub geographic_crs: Option<u16>,
-    pub projected_crs: Option<u16>,
-    pub keys: Vec<(u16, GeoKeyValue)>,
-}
-
-impl GeoKeyParams {
-    /// Look up a short (`u16`) GeoKey value by numeric ID.
-    pub fn get_u16(&self, id: u16) -> Option<u16> {
-        self.keys.iter().find_map(|(k, v)| match (k, v) {
-            (key, GeoKeyValue::Short(val)) if *key == id => Some(*val),
-            _ => None,
-        })
-    }
-
-    /// Look up a `f64` scalar GeoKey value.
-    pub fn get_f64(&self, id: u16) -> Option<f64> {
-        self.get_f64_slice(id)
-            .and_then(|vals| vals.first().copied())
-    }
-
-    /// Look up a slice of `f64` GeoKey values (e.g. `GeogTOWGS84GeoKey`).
-    pub fn get_f64_slice(&self, id: u16) -> Option<&[f64]> {
-        self.keys.iter().find_map(|(k, v)| match (k, v) {
-            (key, GeoKeyValue::Double(vals)) if *key == id => Some(vals.as_slice()),
-            _ => None,
-        })
-    }
-
-    /// Look up an ASCII GeoKey string.
-    pub fn get_ascii(&self, id: u16) -> Option<&str> {
-        self.keys.iter().find_map(|(k, v)| match (k, v) {
-            (key, GeoKeyValue::Ascii(s)) if *key == id => Some(s.as_str()),
-            _ => None,
-        })
-    }
-}
-
-/// Projected or affine-georeferenced raster binding: optional EPSG code,
-/// optional custom/WKT CRS specification, pixel-to-CRS affine transform, and
-/// optional parsed GeoKey parameters (present for GeoTIFF sources).
+/// Projected or affine-georeferenced raster binding: optional CRS and
+/// pixel-to-CRS affine transform.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GeoPlacement {
-    pub epsg: Option<u32>,
-    /// Resolved CRS from user-defined GeoTIFF GeoKeys (`3072 == 32767`),
-    /// `.prj` WKT1/WKT2 sidecars, or an explicit user override.
-    pub custom_crs: Option<CrsSpec>,
-    /// Optional datum warning attached to a user-defined projected CRS (e.g.
-    /// grid-shifted NAD83/OSGB36 on a user-defined TM GeoTIFF).
-    pub datum_warning: Option<DatumWarning>,
+    /// Optional CRS associated with [`Self::affine`]. `None` when a world file
+    /// or embedded pixel affine lacks a CRS specification.
+    pub crs: Option<PlacementCrs>,
     /// `x = a[0] * i + a[1] * j + a[2]`, `y = a[3] * i + a[4] * j + a[5]`,
     /// where `(i, j)` are pixel top-left corner coordinates (`j` increasing
     /// southward, with `PixelIsPoint` half-pixel shift already removed).
     pub affine: [f64; 6],
-    pub geo_params: Option<GeoKeyParams>,
 }
 
 /// Header-derived description of an opened raster source.
@@ -178,12 +115,9 @@ pub struct RasterDescription {
     pub bands: Vec<BandInfo>,
     pub ties: Vec<GeoTie>,
     pub placement: Option<GeoPlacement>,
-    /// Non-WGS84 geographic datum EPSG code if declared on either a projected
-    /// or geographic binding (e.g. Pulkovo-42 `4284`).
-    pub foreign_datum_epsg: Option<u16>,
-    /// User-defined geographic datum + warning parsed from GeoTIFF GeoKeys
-    /// (`2048 == 32767` with `2062` `TOWGS84` or `2056`–`2059` ellipsoid keys).
-    pub geographic_datum: Option<(Datum, Option<DatumWarning>)>,
+    /// Resolved geographic CRS for tie-point grid bindings (`None` implies
+    /// default WGS 84 / EPSG:4326).
+    pub geographic_crs: Option<CrsSpec>,
     pub binding_trouble: Option<String>,
     pub levels: Vec<LevelPlan>,
 }

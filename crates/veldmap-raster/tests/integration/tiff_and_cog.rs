@@ -10,7 +10,7 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{RASTER_TILE_SIZE, tile_extent};
 use veldmap_raster::{
     DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError, RasterSource, SharedChunkCache,
-    TiffSource, has_tiff_magic,
+    TiffSource, frame_from_description, has_tiff_magic,
 };
 
 use crate::common::{build_stripped_tiff, build_tiled_cog, fake_fingerprint, rgb_pattern};
@@ -242,7 +242,7 @@ fn direct_overview_matches_sequential_pass_on_halved_cog() {
 }
 
 #[test]
-fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
+fn decodes_bigtiff_with_geodouble_geoascii_pixel_is_point_and_model_transformation() {
     let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
     let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
@@ -254,7 +254,8 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         cancel: &cancel,
     };
 
-    // 1. BigTIFF + GeoDoubleParamsTag + GeoAsciiParamsTag + PixelIsPoint + ModelTransformationTag.
+    // BigTIFF + user-defined TM CRS using GeoDoubleParamsTag + GeoAsciiParamsTag +
+    // PixelIsPoint + ModelTransformationTag.
     let mut big_buf = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new_big(&mut big_buf).expect("bigtiff encoder");
@@ -274,37 +275,63 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         dir.write_tag(Tag::StripOffsets, &[at][..]).expect("tag");
         dir.write_tag(Tag::StripByteCounts, &[data.len() as u64][..])
             .expect("tag");
-        let geokeys: [u16; 24] = [
-            1, 1, 0, 5, // header: 5 keys
-            1024, 0, 1, 1, // GTModelTypeGeoKey = Projected
-            1025, 0, 1, 2, // GTRasterTypeGeoKey = PixelIsPoint
-            1026, 34737, 7, 0, // GTCitationGeoKey in GeoAsciiParamsTag
-            3072, 0, 1, 32637, // ProjectedCSTypeGeoKey = EPSG:32637
-            3081, 34736, 1, 0, // ProjNatOriginLatGeoKey in GeoDoubleParamsTag
+        let ascii = "VeldMap BigTIFF TM|";
+        let geokeys: [u16; 44] = [
+            1,
+            1,
+            0,
+            10, // header: 10 keys
+            1024,
+            0,
+            1,
+            1, // GTModelTypeGeoKey = Projected
+            1025,
+            0,
+            1,
+            2, // GTRasterTypeGeoKey = PixelIsPoint
+            2048,
+            0,
+            1,
+            4326, // GeographicTypeGeoKey = WGS 84
+            3072,
+            0,
+            1,
+            32767, // ProjectedCSTypeGeoKey = User-Defined
+            3073,
+            34737,
+            ascii.len() as u16,
+            0, // PCSCitationGeoKey in GeoAsciiParamsTag
+            3075,
+            0,
+            1,
+            1, // ProjCoordTransGeoKey = Transverse Mercator
+            3080,
+            34736,
+            1,
+            0, // ProjNatOriginLongGeoKey = 39.0
+            3081,
+            34736,
+            1,
+            1, // ProjNatOriginLatGeoKey = 55.75
+            3082,
+            34736,
+            1,
+            2, // ProjFalseEastingGeoKey = 500_000.0
+            3092,
+            34736,
+            1,
+            3, // ProjScaleAtNatOriginGeoKey = 0.9996
         ];
         dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
             .expect("tag");
-        dir.write_tag(Tag::GeoDoubleParamsTag, &[55.75_f64][..])
-            .expect("tag");
-        dir.write_tag(Tag::GeoAsciiParamsTag, "VeldMap|")
-            .expect("tag");
+        dir.write_tag(
+            Tag::GeoDoubleParamsTag,
+            &[39.0_f64, 55.75, 500_000.0, 0.9996][..],
+        )
+        .expect("tag");
+        dir.write_tag(Tag::GeoAsciiParamsTag, ascii).expect("tag");
         let matrix: [f64; 16] = [
-            10.0,
-            0.0,
-            0.0,
-            500_000.0,
-            0.0,
-            -10.0,
-            0.0,
-            6_000_000.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
+            10.0, 0.0, 0.0, 500_000.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
         dir.write_tag(Tag::ModelTransformationTag, &matrix[..])
             .expect("tag");
@@ -324,18 +351,35 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         .placement
         .as_ref()
         .expect("projected placement");
-    assert_eq!(placement.epsg, Some(32637));
-    let geo_params = placement.geo_params.as_ref().expect("GeoTIFF params");
-    assert_eq!(geo_params.get_f64(3081), Some(55.75));
-    assert_eq!(geo_params.get_ascii(1026), Some("VeldMap"));
     assert!((placement.affine[2] - 499_995.0).abs() < 1e-9);
-    assert!((placement.affine[5] - 6_000_005.0).abs() < 1e-9);
+    assert!((placement.affine[5] - 5.0).abs() < 1e-9);
+
+    let frame = frame_from_description(big_src.description()).expect("BigTIFF user-defined frame");
+    assert_eq!(frame.crs_label(), "VeldMap BigTIFF TM");
+    // Pixel (0, 0) center sits at exact natural origin (500_000, 0) -> (55.75, 39.0).
+    let (lat, lon) = frame.geodetic(0.5 / 8.0, 0.5 / 8.0);
+    assert!((lat - 55.75).abs() < 1e-9, "got lat={lat}");
+    assert!((lon - 39.0).abs() < 1e-9, "got lon={lon}");
+
     let tile = big_src
         .decode_pointwise_tile(0, 0, 0, &ctx)
         .expect("decode BigTIFF tile");
     assert_eq!((tile.width(), tile.height()), (8, 8));
+}
 
-    // 2. Float32 + Predictor = 3 (FloatingPoint) + ZSTD compression + GDAL_NODATA.
+#[test]
+fn decodes_zstd_predictor3_f32_with_gdal_nodata() {
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
     let mut f32_buf = Cursor::new(Vec::new());
     let (w, h) = (4u32, 4u32);
     let floats: Vec<f32> = vec![
@@ -399,8 +443,23 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         f32_tile.data()[15 * 4] >= 245,
         "max 150.0 should stretch near white"
     );
+}
 
-    // 3. Geographic (GTModelTypeGeoKey=2, foreign datum Pulkovo-42 4284) + i16 samples.
+#[test]
+fn decodes_geographic_pulkovo42_i16_with_gdal_nodata() {
+    use veldmap_core::geo::{CrsSpec, PULKOVO_1942};
+
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
     let mut i16_buf = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut i16_buf).expect("enc");
@@ -443,7 +502,10 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         &cancel,
     )
     .expect("open geographic i16 TIFF");
-    assert_eq!(i16_src.description().foreign_datum_epsg, Some(4284));
+    assert!(matches!(
+        i16_src.description().geographic_crs,
+        Some(CrsSpec::Geographic { datum, .. }) if datum == PULKOVO_1942
+    ));
     assert_eq!(i16_src.description().ties.len(), 4);
     assert!((i16_src.description().ties[3].lon - 12.0).abs() < 1e-9);
     assert!((i16_src.description().ties[3].lat - 49.5).abs() < 1e-9);
@@ -454,8 +516,21 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
     assert_eq!(i16_tile.data()[7], 255);
     assert!(i16_tile.data()[4] < i16_tile.data()[12]);
     assert!(i16_tile.data()[12] < i16_tile.data()[7 * 4]);
+}
 
-    // 3b. Gray + Alpha (BlackIsZero, SamplesPerPixel=2, ExtraSamples=2) preserves alpha channel.
+#[test]
+fn decodes_gray_alpha_preserving_transparency() {
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
     let mut ga_buf = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut ga_buf).expect("enc");
@@ -496,8 +571,13 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         "transparent Gray+Alpha pixel keeps alpha 0"
     );
     assert_eq!(&ga_tile.data()[4..], &[120, 120, 120, 255]);
+}
 
-    // 4. PlanarConfiguration = 2 is rejected cleanly at open time.
+#[test]
+fn rejects_planar_configuration_2_at_open() {
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+
     let mut planar_buf = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut planar_buf).expect("enc");
@@ -529,8 +609,13 @@ fn decodes_bigtiff_zstd_predictor3_f32_and_geotiff_params() {
         )
         .is_err()
     );
+}
 
-    // 5. MAX_IFDS cap bounds scanning of multi-IFD TIFFs (> 64 IFDs).
+#[test]
+fn caps_overview_scanning_at_max_ifds() {
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+
     let mut many_buf = Cursor::new(Vec::new());
     {
         let mut enc = TiffEncoder::new(&mut many_buf).expect("enc");
@@ -808,7 +893,6 @@ fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() 
     use veldmap_core::geo::geodesy::{Geodetic, WGS84};
     use veldmap_core::geo::projection::Projection;
     use veldmap_core::tile::{MIN_WARP_SEGMENTS, build_warp_patch};
-    use veldmap_raster::{RasterSource, frame_from_description};
 
     let build_geotiff = |raster_type_key: u16| -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());

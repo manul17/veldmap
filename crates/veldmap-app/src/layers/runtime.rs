@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{SourceId, TileKey};
-use veldmap_raster::{DecodeContext, DecodePoolHandle, PassKey, SharedChunkCache, TileScheduler};
+use veldmap_raster::{
+    DecodeContext, DecodeJob, DecodePoolHandle, PassKey, SharedChunkCache, SubmitError,
+    TileScheduler,
+};
 use veldmap_storage::{LocalFingerprintCache, TileDiskCache};
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadSender};
@@ -81,10 +84,38 @@ impl OverlayRuntime {
         (self.wakeup)();
     }
 
-    pub(super) fn note_submit_backoff(&self) {
+    fn note_submit_backoff(&self) {
         let mut until = lock_unpoisoned(&self.submit_backoff_until);
         let next = Instant::now() + SUBMIT_BACKOFF_DELAY;
         *until = Some(until.map_or(next, |prev| prev.min(next)));
+    }
+
+    /// Submit `job` to `pool`, guaranteeing that on rejection `on_reject` runs
+    /// strictly **before** the rejected [`DecodeJob`] (and any RAII flight
+    /// guard inside its closure) is dropped so `Drop` cannot trigger a 100% CPU
+    /// repaint spin loop.
+    ///
+    /// When `backoff_on_full` is `true` and `pool` rejects with
+    /// [`SubmitError::Full`], records a short retry backoff window.
+    pub(super) fn try_submit_guarded(
+        &self,
+        pool: &DecodePoolHandle,
+        job: DecodeJob,
+        backoff_on_full: bool,
+        on_reject: impl FnOnce(),
+    ) -> bool {
+        match pool.try_submit(job) {
+            Ok(()) => true,
+            Err(err) => {
+                let is_full = matches!(err, SubmitError::Full(_));
+                on_reject();
+                drop(err);
+                if backoff_on_full && is_full {
+                    self.note_submit_backoff();
+                }
+                false
+            }
+        }
     }
 
     /// Return `true` if a background overlay event requires re-running
@@ -146,7 +177,7 @@ impl OverlayRuntime {
                 }
                 to_cancel.extend(sched.reconcile_pointwise(
                     layer.meta.pass_key(),
-                    &layer.wanted,
+                    layer.wanted(),
                     |k| gpu_cache.contains(k) || pending.contains(k),
                 ));
             }

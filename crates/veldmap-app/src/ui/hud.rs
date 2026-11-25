@@ -3,6 +3,21 @@
 
 use eframe::egui;
 
+const HUD_PANEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(11, 19, 32, 196);
+const HUD_PANEL_BG_HOVER: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(26, 40, 62, 224);
+const HUD_ATTRIBUTION_BG: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(10, 16, 26, 175);
+const HUD_BORDER_SUBTLE: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(168, 185, 155, 110);
+const HUD_BORDER_STRONG: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(168, 185, 155, 140);
+const HUD_INK_PRIMARY: egui::Color32 = egui::Color32::from_rgb(245, 242, 232);
+const HUD_ATTRIBUTION_TEXT: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(235, 240, 246, 235);
+const COMPASS_NEEDLE_NORTH: egui::Color32 = egui::Color32::from_rgb(220, 78, 66);
+const COMPASS_NEEDLE_SOUTH: egui::Color32 = egui::Color32::from_rgb(210, 215, 220);
+
 /// Choose a clean `1–2–5` metric scale-bar distance and its exact screen width
 /// in logical points for `m_per_pt` ground metres per logical point.
 ///
@@ -100,25 +115,18 @@ pub(crate) fn paint_scale_bar(
         egui::vec2(box_w, box_h),
     );
 
-    painter.rect_filled(
-        box_rect,
-        6.0,
-        egui::Color32::from_rgba_unmultiplied(11, 19, 32, 196),
-    );
+    painter.rect_filled(box_rect, 6.0, HUD_PANEL_BG);
     painter.rect_stroke(
         box_rect,
         6.0,
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(168, 185, 155, 110),
-        ),
+        egui::Stroke::new(1.0, HUD_BORDER_SUBTLE),
         egui::StrokeKind::Inside,
     );
 
     let y_bar = box_rect.bottom() - pad_y - 3.0;
     let x0 = box_rect.left() + pad_x;
     let x1 = x0 + bar_w;
-    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(245, 242, 232));
+    let stroke = egui::Stroke::new(2.0, HUD_INK_PRIMARY);
 
     painter.line_segment([egui::pos2(x0, y_bar), egui::pos2(x1, y_bar)], stroke);
     painter.line_segment(
@@ -135,7 +143,7 @@ pub(crate) fn paint_scale_bar(
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::monospace(12.0),
-        egui::Color32::from_rgb(245, 242, 232),
+        HUD_INK_PRIMARY,
     );
     Some(box_rect)
 }
@@ -168,19 +176,12 @@ pub(crate) fn show_north_compass(
             let center = compass_rect.center();
             let radius = size * 0.5;
             let bg = if response.hovered() {
-                egui::Color32::from_rgba_unmultiplied(26, 40, 62, 224)
+                HUD_PANEL_BG_HOVER
             } else {
-                egui::Color32::from_rgba_unmultiplied(11, 19, 32, 196)
+                HUD_PANEL_BG
             };
             painter.circle_filled(center, radius, bg);
-            painter.circle_stroke(
-                center,
-                radius,
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(168, 185, 155, 140),
-                ),
-            );
+            painter.circle_stroke(center, radius, egui::Stroke::new(1.0, HUD_BORDER_STRONG));
 
             // Needle points toward geographic North (rotated counter-clockwise by heading).
             let angle = -(heading_deg as f32).to_radians();
@@ -199,12 +200,12 @@ pub(crate) fn show_north_compass(
 
             painter.add(egui::Shape::convex_polygon(
                 vec![tip_n, right, left],
-                egui::Color32::from_rgb(220, 78, 66),
+                COMPASS_NEEDLE_NORTH,
                 egui::Stroke::NONE,
             ));
             painter.add(egui::Shape::convex_polygon(
                 vec![tip_s, left, right],
-                egui::Color32::from_rgb(210, 215, 220),
+                COMPASS_NEEDLE_SOUTH,
                 egui::Stroke::NONE,
             ));
             painter.text(
@@ -251,7 +252,7 @@ pub(crate) fn paint_attribution_badge(
     let galley = painter.layout(
         attribution.to_owned(),
         font,
-        egui::Color32::from_rgba_unmultiplied(235, 240, 246, 235),
+        HUD_ATTRIBUTION_TEXT,
         max_width,
     );
 
@@ -264,11 +265,7 @@ pub(crate) fn paint_attribution_badge(
         size,
     );
 
-    painter.rect_filled(
-        badge_rect,
-        4.0,
-        egui::Color32::from_rgba_unmultiplied(10, 16, 26, 175),
-    );
+    painter.rect_filled(badge_rect, 4.0, HUD_ATTRIBUTION_BG);
     painter.galley(
         badge_rect.min + egui::vec2(pad_x, pad_y),
         galley,

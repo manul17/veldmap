@@ -9,7 +9,7 @@ use veldmap_core::tile::{QuadTileId, QuadtreeConfig, TileKey, VisibleTile, trave
 
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
 
-use super::adaptive_grid_step_deg;
+use super::graticule::adaptive_grid_step_deg;
 use super::overlay::OverlayMeshKey;
 
 /// Strategy resolving the finest cached GPU carrier tile and composed UV

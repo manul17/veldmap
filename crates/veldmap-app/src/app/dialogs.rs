@@ -20,7 +20,7 @@ use veldmap_core::sync::Wakeup;
 
 /// Completed result from a background native file dialog.
 #[derive(Clone, Debug)]
-pub(crate) enum FileDialogEvent {
+pub(super) enum FileDialogEvent {
     OpenFiles(Vec<PathBuf>),
     GeoJsonSaved {
         path: PathBuf,
@@ -42,7 +42,7 @@ impl Drop for BusyResetGuard {
 
 /// Manages off-UI-thread native `rfd` open/save dialogs so modal OS pickers
 /// never freeze the `eframe` render loop.
-pub(crate) struct DialogHost {
+pub(super) struct DialogHost {
     tx: Sender<FileDialogEvent>,
     rx: Receiver<FileDialogEvent>,
     busy: Arc<AtomicBool>,
@@ -50,7 +50,7 @@ pub(crate) struct DialogHost {
 }
 
 impl DialogHost {
-    pub(crate) fn new(wakeup: Wakeup) -> Self {
+    pub(super) fn new(wakeup: Wakeup) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             tx,
@@ -60,7 +60,7 @@ impl DialogHost {
         }
     }
 
-    pub(crate) fn is_busy(&self) -> bool {
+    pub(super) fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Acquire)
     }
 
@@ -94,7 +94,7 @@ impl DialogHost {
 
     /// Spawn a non-blocking native multi-file open dialog for GeoTIFF, PNG,
     /// JPEG, and GeoJSON files, parented to `frame`.
-    pub(crate) fn spawn_open_files(&self, frame: &eframe::Frame) -> bool {
+    pub(super) fn spawn_open_files(&self, frame: &eframe::Frame) -> bool {
         if !self.try_acquire_busy() {
             return false;
         }
@@ -121,7 +121,7 @@ impl DialogHost {
     /// Spawn a non-blocking native save dialog for RFC 7946 GeoJSON export,
     /// capturing `geojson_payload` at click time and writing the file off the
     /// UI thread once the user selects a destination.
-    pub(crate) fn spawn_save_geojson(
+    pub(super) fn spawn_save_geojson(
         &self,
         default_name: &str,
         geojson_payload: String,
@@ -146,7 +146,7 @@ impl DialogHost {
     }
 
     /// Drain any completed file dialog events without blocking.
-    pub(crate) fn poll(&self) -> Vec<FileDialogEvent> {
+    pub(super) fn poll(&self) -> Vec<FileDialogEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = self.rx.try_recv() {
             out.push(ev);

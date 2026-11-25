@@ -47,11 +47,11 @@ impl BasemapCarrierPolicy {
             Some(bundled_tile_key(tex_id))
         }
     }
+}
 
-    /// Resolve the finest cached GPU carrier tile and composed UV sub-rectangle
-    /// for `(tex_id, uv_rect)`.
-    pub fn resolve_carrier(
-        self,
+impl TileCarrierPolicy for BasemapCarrierPolicy {
+    fn resolve_carrier(
+        &self,
         tex_id: QuadTileId,
         uv_rect: [f32; 4],
         gpu_cache: &mut GpuTileCache,
@@ -64,17 +64,6 @@ impl BasemapCarrierPolicy {
         gpu_cache
             .carrier(&fallback)
             .map(|(ck, c_uv, tile)| (ck, compose_uv_rect(c_uv, uv_rect), tile))
-    }
-}
-
-impl TileCarrierPolicy for BasemapCarrierPolicy {
-    fn resolve_carrier(
-        &self,
-        tex_id: QuadTileId,
-        uv_rect: [f32; 4],
-        gpu_cache: &mut GpuTileCache,
-    ) -> Option<(TileKey, [f32; 4], Arc<GpuTile>)> {
-        BasemapCarrierPolicy::resolve_carrier(*self, tex_id, uv_rect, gpu_cache)
     }
 }
 

@@ -9,8 +9,8 @@ use veldmap_core::geo::{
     search_crs_presets,
 };
 
+use crate::crs_override::CrsOverride;
 use crate::layers::LayerId;
-use crate::session::{SavedCrsOverride, SavedCustomTmParams};
 
 use super::ERROR_TEXT_COLOR;
 
@@ -29,8 +29,8 @@ enum CrsPickerTarget {
 /// Action emitted by the CRS Picker window and applied by `VeldmapApp`.
 #[derive(Clone, Debug)]
 pub(crate) enum CrsPickerAction {
-    ApplyToLayer(LayerId, Option<SavedCrsOverride>),
-    OpenPathWithCrs(PathBuf, SavedCrsOverride),
+    ApplyToLayer(LayerId, Option<CrsOverride>),
+    OpenPathWithCrs(PathBuf, CrsOverride),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -56,7 +56,7 @@ pub(crate) struct CrsPickerState {
 }
 
 impl CrsPickerState {
-    fn reset_form_from(&mut self, existing: Option<&SavedCrsOverride>) {
+    fn reset_form_from(&mut self, existing: Option<&CrsOverride>) {
         self.error = None;
         self.search_query.clear();
         self.cached_query = None;
@@ -66,20 +66,20 @@ impl CrsPickerState {
 
         if let Some(ov) = existing {
             match ov {
-                SavedCrsOverride::Epsg { code } => {
+                CrsOverride::Epsg(code) => {
                     self.search_query = code.to_string();
                     self.tab = CrsTab::Presets;
                 }
-                SavedCrsOverride::Wkt { wkt } => {
+                CrsOverride::Wkt(wkt) => {
                     self.wkt_input = wkt.clone();
                     self.tab = CrsTab::WktProj;
                 }
-                SavedCrsOverride::Proj { proj } => {
+                CrsOverride::Proj(proj) => {
                     self.wkt_input = proj.clone();
                     self.tab = CrsTab::WktProj;
                 }
-                SavedCrsOverride::CustomTm(saved) => {
-                    self.custom_tm = CustomTmParams::from(saved);
+                CrsOverride::CustomTm(params) => {
+                    self.custom_tm = params.clone();
                     self.tab = CrsTab::CustomTm;
                 }
             }
@@ -90,7 +90,7 @@ impl CrsPickerState {
         &mut self,
         id: LayerId,
         name: String,
-        existing: Option<SavedCrsOverride>,
+        existing: Option<CrsOverride>,
     ) {
         self.target = Some(CrsPickerTarget::Layer { id, name });
         self.reset_form_from(existing.as_ref());
@@ -110,7 +110,7 @@ impl CrsPickerState {
         }
     }
 
-    fn finish_selection(&mut self, selection: SavedCrsOverride) -> Option<CrsPickerAction> {
+    fn finish_selection(&mut self, selection: CrsOverride) -> Option<CrsPickerAction> {
         self.error = None;
         let target = self.target.clone()?;
         self.open = false;
@@ -124,7 +124,7 @@ impl CrsPickerState {
         }
     }
 
-    fn emit_selection(&mut self, selection: SavedCrsOverride) -> Option<CrsPickerAction> {
+    fn emit_selection(&mut self, selection: CrsOverride) -> Option<CrsPickerAction> {
         if let Err(err) = selection.to_crs_spec() {
             self.error = Some(err);
             return None;
@@ -170,7 +170,7 @@ fn show_presets_tab(ui: &mut egui::Ui, state: &mut CrsPickerState) -> Option<Crs
                 });
             }
         });
-    picked_epsg.and_then(|code| state.emit_selection(SavedCrsOverride::Epsg { code }))
+    picked_epsg.and_then(|code| state.emit_selection(CrsOverride::Epsg(code)))
 }
 
 fn show_custom_tm_tab(ui: &mut egui::Ui, state: &mut CrsPickerState) -> Option<CrsPickerAction> {
@@ -260,7 +260,7 @@ fn show_custom_tm_tab(ui: &mut egui::Ui, state: &mut CrsPickerState) -> Option<C
         });
     ui.add_space(8.0);
     if ui.button("Apply Custom TM").clicked() {
-        let sel = SavedCrsOverride::CustomTm(SavedCustomTmParams::from(&state.custom_tm));
+        let sel = CrsOverride::CustomTm(state.custom_tm.clone());
         return state.emit_selection(sel);
     }
     None
@@ -287,8 +287,8 @@ fn show_wkt_proj_tab(ui: &mut egui::Ui, state: &mut CrsPickerState) -> Option<Cr
         match CrsSpec::parse_text(&raw) {
             Ok((_, kind)) => {
                 let sel = match kind {
-                    CrsTextKind::Wkt => SavedCrsOverride::Wkt { wkt: raw },
-                    CrsTextKind::UserString => SavedCrsOverride::Proj { proj: raw },
+                    CrsTextKind::Wkt => CrsOverride::Wkt(raw),
+                    CrsTextKind::UserString => CrsOverride::Proj(raw),
                 };
                 return state.finish_selection(sel);
             }
@@ -361,37 +361,34 @@ pub(crate) fn show_crs_picker_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SavedCustomTmDatum, SavedLinearUnit};
 
     #[test]
     fn reset_form_from_selects_matching_tab_and_populates_fields() {
         let mut state = CrsPickerState::default();
 
-        state.reset_form_from(Some(&SavedCrsOverride::Epsg { code: 32637 }));
+        state.reset_form_from(Some(&CrsOverride::Epsg(32637)));
         assert_eq!(state.tab, CrsTab::Presets);
         assert_eq!(state.search_query, "32637");
 
-        state.reset_form_from(Some(&SavedCrsOverride::Wkt {
-            wkt: "GEOGCS[\"WGS 84\"]".to_owned(),
-        }));
+        state.reset_form_from(Some(&CrsOverride::Wkt("GEOGCS[\"WGS 84\"]".to_owned())));
         assert_eq!(state.tab, CrsTab::WktProj);
         assert_eq!(state.wkt_input, "GEOGCS[\"WGS 84\"]");
 
-        state.reset_form_from(Some(&SavedCrsOverride::Proj {
-            proj: "+proj=utm +zone=37 +datum=WGS84".to_owned(),
-        }));
+        state.reset_form_from(Some(&CrsOverride::Proj(
+            "+proj=utm +zone=37 +datum=WGS84".to_owned(),
+        )));
         assert_eq!(state.tab, CrsTab::WktProj);
         assert_eq!(state.wkt_input, "+proj=utm +zone=37 +datum=WGS84");
 
-        state.reset_form_from(Some(&SavedCrsOverride::CustomTm(SavedCustomTmParams {
+        state.reset_form_from(Some(&CrsOverride::CustomTm(CustomTmParams {
             name: "MSK-61 Z1".to_owned(),
-            datum: SavedCustomTmDatum::Pulkovo1942,
+            datum: DatumPreset::Pulkovo1942,
             central_meridian_deg: 39.0,
             origin_lat_deg: 0.0,
             scale: 1.0,
             false_easting_m: 1_300_000.0,
             false_northing_m: 0.0,
-            unit: SavedLinearUnit::Metre,
+            unit: LinearUnit::Metre,
         })));
         assert_eq!(state.tab, CrsTab::CustomTm);
         assert_eq!(state.custom_tm.name, "MSK-61 Z1");

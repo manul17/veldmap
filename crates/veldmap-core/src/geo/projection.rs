@@ -8,14 +8,15 @@
 
 use std::sync::Arc;
 
-use super::datum::DatumWarning;
+use super::datum::{Datum, DatumWarning, PULKOVO_1942, WGS84_DATUM};
 use super::geodesy::{Ellipsoid, SEMI_MAJOR_M, unwind};
 use super::proj4::Proj4Projection;
 
-pub use super::datum::{
-    Datum, HelmertConvention, INTERNATIONAL_FOOT_M, KRASOVSKY, PULKOVO_1942, US_SURVEY_FOOT_M,
-    WGS84_DATUM,
-};
+/// Base regional pseudo-EPSG code for MSK-61 zones (`MSK61_EPSG_BASE + zone`).
+pub(crate) const MSK61_EPSG_BASE: u32 = 6_336_100;
+
+/// Valid MSK-61 3-degree zone numbers (`1..=3`).
+pub(crate) const MSK61_ZONES: std::ops::RangeInclusive<u32> = 1..=3;
 
 fn rectifying_radius(ellipsoid: Ellipsoid) -> f64 {
     let n = ellipsoid.third_flattening();
@@ -161,6 +162,21 @@ impl Projection {
         }
     }
 
+    /// Strict forward projection returning `None` when inputs or projected
+    /// outputs are non-finite, or when a Web Mercator latitude hits `±90°`
+    /// (never clamping polar latitudes onto `±WEB_MERCATOR_LIMIT_DEG`).
+    pub(crate) fn project_geodetic_strict(&self, lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
+        if !(lat_deg.is_finite() && lon_deg.is_finite()) {
+            return None;
+        }
+        let (x, y) = match self {
+            Self::WebMercator => web_mercator_from_geodetic_strict(lat_deg, lon_deg)?,
+            Self::Transverse { system, .. } => system.from_geodetic(lat_deg, lon_deg),
+            Self::Proj4(proj) => proj.from_wgs84_geodetic(lat_deg, lon_deg),
+        };
+        (x.is_finite() && y.is_finite()).then_some((x, y))
+    }
+
     /// Convert projected `(easting, northing)` in the projection's native
     /// linear units to WGS84 `(lat_deg, lon_deg)`.
     pub fn to_geodetic(&self, easting: f64, northing: f64) -> (f64, f64) {
@@ -220,7 +236,7 @@ fn web_mercator_xy_unchecked(lat_deg: f64, lon_deg: f64) -> (f64, f64) {
 /// `±WEB_MERCATOR_LIMIT_DEG`, preventing phantom cursor hits over polar caps
 /// while remaining an exact inverse of [`Projection::to_geodetic`] across
 /// `(-90°, +90°)`.
-pub(crate) fn web_mercator_from_geodetic_strict(lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
+fn web_mercator_from_geodetic_strict(lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
     if !(lat_deg.is_finite() && lon_deg.is_finite()) || lat_deg.abs() >= 90.0 {
         return None;
     }
@@ -300,12 +316,17 @@ impl System {
             32601..=32660 => Some(Self::utm(code - 32600, false)),
             32701..=32760 => Some(Self::utm(code - 32700, true)),
             28402..=28432 => Some(Self::gauss_kruger(code - 28400)),
-            6_336_101..=6_336_103 => Self::msk61(code - 6_336_100),
+            code if code
+                .checked_sub(MSK61_EPSG_BASE)
+                .is_some_and(|zone| MSK61_ZONES.contains(&zone)) =>
+            {
+                Self::msk61(code - MSK61_EPSG_BASE)
+            }
             _ => None,
         }
     }
 
-    pub(crate) fn safe_unit_to_metres(&self) -> f64 {
+    fn safe_unit_to_metres(&self) -> f64 {
         if self.unit_to_metres.is_finite() && self.unit_to_metres > 0.0 {
             self.unit_to_metres
         } else {
@@ -346,7 +367,7 @@ impl System {
             {
                 return format!("EPSG:{} (Pulkovo 1942 / GK zone {zone})", 28_400 + zone);
             }
-            for zone in 1..=3 {
+            for zone in MSK61_ZONES {
                 if let Some(msk) = Self::msk61(zone)
                     && (self.central_meridian_deg - msk.central_meridian_deg).abs() < 1e-8
                     && (self.false_easting_m - msk.false_easting_m).abs() < 1e-3

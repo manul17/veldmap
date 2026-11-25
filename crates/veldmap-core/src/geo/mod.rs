@@ -17,7 +17,7 @@ mod proj4;
 pub mod projection;
 pub(crate) mod sag;
 
-pub use binding::{BindingError, Frame, Tie, TieGrid};
+pub use binding::{Frame, Tie, TieGrid};
 pub use camera::Camera;
 pub use coords::{LocationKind, ParseLocationError, ParsedLocation, parse_location};
 pub use crs::{

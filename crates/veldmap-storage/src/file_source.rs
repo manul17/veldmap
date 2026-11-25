@@ -1,6 +1,8 @@
-//! Safe positioned local-file [`ByteSource`] implementation using lock-free
-//! POSIX `pread` on a single immutable file descriptor on Unix, and pooled
-//! `std::fs::File` handles with `seek_read` on Windows (avoiding `memmap2`).
+//! Safe regular-file helpers and positioned local-file [`ByteSource`]
+//! implementation ([`LocalFileSource`] and [`read_regular_file_utf8_limited`]):
+//! lock-free POSIX `pread` on a single immutable file descriptor on Unix,
+//! pooled `std::fs::File` handles with `seek_read` on Windows (avoiding
+//! `memmap2`), and size-bounded UTF-8 file reading without TOCTOU races.
 
 use std::fs::{File, Metadata};
 use std::io;
@@ -30,6 +32,22 @@ pub(crate) fn ensure_regular_file(meta: &Metadata, path: &Path) -> Result<(), St
     Ok(())
 }
 
+/// Open `path` after verifying regular-file status both before and after
+/// `File::open`, returning the open handle and its handle-level [`Metadata`].
+///
+/// Checking before `File::open` ensures Windows directories report
+/// [`StorageError::InvalidPath`] (rather than `PermissionDenied`) and Unix
+/// FIFOs do not block; re-checking on the opened handle closes the TOCTOU
+/// window against path replacement.
+fn open_regular_file(path: &Path) -> Result<(File, Metadata), StorageError> {
+    let path_meta = std::fs::metadata(path)?;
+    ensure_regular_file(&path_meta, path)?;
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    ensure_regular_file(&meta, path)?;
+    Ok((file, meta))
+}
+
 /// Safely read a regular UTF-8 text file up to `max_bytes` without a TOCTOU
 /// window between metadata size checking and reading.
 ///
@@ -39,11 +57,7 @@ pub(crate) fn ensure_regular_file(meta: &Metadata, path: &Path) -> Result<(), St
 pub fn read_regular_file_utf8_limited(path: &Path, max_bytes: u64) -> Result<String, StorageError> {
     use std::io::Read;
 
-    let path_meta = std::fs::metadata(path)?;
-    ensure_regular_file(&path_meta, path)?;
-    let file = File::open(path)?;
-    let meta = file.metadata()?;
-    ensure_regular_file(&meta, path)?;
+    let (file, meta) = open_regular_file(path)?;
     if meta.len() > max_bytes {
         return Err(StorageError::FileTooLarge {
             path: path.display().to_string(),
@@ -92,13 +106,7 @@ impl LocalFileSource {
     /// Open `path` for safe positioned reading and capture its `(len, mtime_ns)`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path_ref = path.as_ref();
-        // Check regular-file status before `File::open` so Windows directories
-        // report `InvalidPath` (not `PermissionDenied`) and Unix FIFOs do not block.
-        let path_meta = std::fs::metadata(path_ref)?;
-        ensure_regular_file(&path_meta, path_ref)?;
-        let file = File::open(path_ref)?;
-        let meta = file.metadata()?;
-        ensure_regular_file(&meta, path_ref)?;
+        let (file, meta) = open_regular_file(path_ref)?;
         let len = meta.len();
         let mtime_ns = metadata_mtime_ns(&meta);
         Ok(Self {

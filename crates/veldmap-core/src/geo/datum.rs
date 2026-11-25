@@ -132,7 +132,7 @@ impl Datum {
         )
     }
 
-    pub(super) fn helmert(&self, point: DVec3) -> DVec3 {
+    fn helmert(&self, point: DVec3) -> DVec3 {
         let ([wx, wy, wz], scale) = self.turn();
         let [dx, dy, dz] = self.shift_m;
         DVec3::new(
@@ -143,7 +143,7 @@ impl Datum {
     }
 
     /// Exact closed-form inverse of `I + W`: `(I - W + w w^T) / (1 + |w|^2)`.
-    pub(super) fn helmert_back(&self, point: DVec3) -> DVec3 {
+    fn helmert_back(&self, point: DVec3) -> DVec3 {
         let ([wx, wy, wz], scale) = self.turn();
         let x = (point.x - self.shift_m[0]) / scale;
         let y = (point.y - self.shift_m[1]) / scale;
@@ -279,6 +279,21 @@ pub fn known_datum_from_code(code: u32) -> Option<(Datum, Option<DatumWarning>)>
     }
 }
 
+/// Resolve a known static geographic CRS (4xxx EPSG code only, keeping 6xxx
+/// datum codes strictly distinct) into its `(Datum, label, Option<DatumWarning>)`.
+pub(crate) fn known_geographic_epsg(code: u32) -> Option<(Datum, String, Option<DatumWarning>)> {
+    let label = match code {
+        4326 | 4979 => format!("EPSG:{code} (WGS 84)"),
+        4284 => "EPSG:4284 (Pulkovo 1942)".to_string(),
+        4269 => "EPSG:4269 (NAD83)".to_string(),
+        4258 => "EPSG:4258 (ETRS89)".to_string(),
+        4277 => "EPSG:4277 (OSGB36)".to_string(),
+        _ => return None,
+    };
+    let (datum, warning) = known_datum_from_code(code)?;
+    Some((datum, label, warning))
+}
+
 /// Resolve an ellipsoid from common GeoTIFF `GeogEllipsoidGeoKey` (2056) codes.
 pub const fn ellipsoid_from_epsg(code: u16) -> Option<Ellipsoid> {
     match code {
@@ -296,3 +311,7 @@ pub const fn ellipsoid_from_epsg(code: u16) -> Option<Ellipsoid> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "datum_tests.rs"]
+mod tests;

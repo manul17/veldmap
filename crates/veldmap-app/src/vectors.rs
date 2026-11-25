@@ -1,6 +1,6 @@
-//! Read-only GeoJSON vector overlay layer stack (`VectorLayerStack`),
-//! off-UI-thread GeoJSON file loader (`load_vector_file`), and dedicated
-//! [`VectorIoWorker`] keeping vector I/O decoupled from raster `OverlayManager`.
+//! Read-only GeoJSON vector overlay subsystem ([`VectorManager`]), off-UI-thread
+//! file loader, and dedicated background I/O worker decoupled from raster
+//! `OverlayManager` and `crate::session`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,11 +14,11 @@ use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_storage::read_regular_file_utf8_limited;
 
 use crate::render::{DrawVectorId, DrawVectorLayer};
-use crate::session::SavedVectorEntry;
+use crate::{clamp_opacity, display_name_from_path};
 
 /// Unique identifier for a loaded read-only GeoJSON vector layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct VectorLayerId(pub(crate) u64);
+pub(crate) struct VectorLayerId(u64);
 
 /// Read-only summary of a vector layer rendered in the Layer List UI.
 #[derive(Clone, Debug)]
@@ -36,11 +36,28 @@ pub(crate) struct VectorLayerSummary {
     pub(crate) color_rgb: [u8; 3],
 }
 
-/// Pre-parsed and CPU-tessellated GeoJSON payload produced off the UI thread.
-pub(crate) struct LoadedVectorData {
-    pub(crate) path: PathBuf,
-    pub(crate) feature_count: usize,
-    pub(crate) mesh: Arc<VectorMesh>,
+/// Borrowed persistence view of a loaded vector overlay layer for
+/// `session.json` serialization without coupling `vectors` to `crate::session`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VectorPersistEntry<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
+}
+
+/// Asynchronous result of a background local GeoJSON open operation.
+#[derive(Clone, Debug)]
+pub(crate) enum VectorIoEvent {
+    Opened {
+        id: VectorLayerId,
+        path: PathBuf,
+        bounds: Option<FootprintBounds>,
+        fly_to: bool,
+    },
+    Failed {
+        path: PathBuf,
+        error: String,
+    },
 }
 
 /// Check whether `path` has a GeoJSON extension (`.geojson` or `.json`).
@@ -48,6 +65,13 @@ pub(crate) fn is_geojson_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("geojson") || e.eq_ignore_ascii_case("json"))
+}
+
+/// Pre-parsed and CPU-tessellated GeoJSON payload produced off the UI thread.
+struct LoadedVectorData {
+    path: PathBuf,
+    feature_count: usize,
+    mesh: Arc<VectorMesh>,
 }
 
 /// Read, validate, parse, and tessellate a local GeoJSON file off the UI thread.
@@ -82,18 +106,18 @@ struct VectorIoCmd {
     cancel: CancelToken,
 }
 
-pub(crate) struct VectorIoResult {
-    pub(crate) path: PathBuf,
-    pub(crate) fly_to: bool,
-    pub(crate) visible: bool,
-    pub(crate) opacity: f32,
-    pub(crate) outcome: Result<LoadedVectorData, String>,
+struct VectorIoResult {
+    path: PathBuf,
+    fly_to: bool,
+    visible: bool,
+    opacity: f32,
+    outcome: Result<LoadedVectorData, String>,
 }
 
 /// Dedicated single-thread background worker loading and tessellating local
 /// GeoJSON files strictly off the UI thread, independent of raster
 /// `OverlayManager` / `OverlayIoWorker`.
-pub(crate) struct VectorIoWorker {
+struct VectorIoWorker {
     tx: Option<Sender<VectorIoCmd>>,
     rx: Receiver<VectorIoResult>,
     shutdown: CancelToken,
@@ -101,7 +125,7 @@ pub(crate) struct VectorIoWorker {
 }
 
 impl VectorIoWorker {
-    pub(crate) fn spawn(wakeup: Wakeup, shutdown: CancelToken) -> Self {
+    fn spawn(wakeup: Wakeup, shutdown: CancelToken) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<VectorIoCmd>();
         let (res_tx, res_rx) = mpsc::channel::<VectorIoResult>();
         let worker_shutdown = shutdown.clone();
@@ -144,7 +168,7 @@ impl VectorIoWorker {
         }
     }
 
-    pub(crate) fn begin_open(
+    fn begin_open(
         &self,
         path: &Path,
         fly_to: bool,
@@ -155,7 +179,7 @@ impl VectorIoWorker {
             path: path.to_path_buf(),
             fly_to,
             visible,
-            opacity: opacity.clamp(0.0, 1.0),
+            opacity: clamp_opacity(opacity),
             cancel: self.shutdown.child_token(),
         };
         if self.tx.as_ref().is_some_and(|tx| tx.send(cmd).is_ok()) {
@@ -165,15 +189,15 @@ impl VectorIoWorker {
         }
     }
 
-    pub(crate) fn try_recv(&self) -> Option<VectorIoResult> {
+    fn try_recv(&self) -> Option<VectorIoResult> {
         self.rx.try_recv().ok()
     }
 
-    pub(crate) fn close_channel(&mut self) {
+    fn close_channel(&mut self) {
         self.tx = None;
     }
 
-    pub(crate) fn join(&mut self) {
+    fn join(&mut self) {
         self.tx = None;
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -234,7 +258,7 @@ const VECTOR_PALETTE: [([f32; 4], [f32; 4], [u8; 3]); 6] = [
 ];
 
 /// Ordered stack of read-only GeoJSON vector overlays.
-pub(crate) struct VectorLayerStack {
+struct VectorLayerStack {
     next_id: u64,
     layers: Vec<VectorLayer>,
 }
@@ -249,9 +273,7 @@ impl Default for VectorLayerStack {
 }
 
 impl VectorLayerStack {
-    /// Insert a pre-parsed [`LoadedVectorData`] produced by [`VectorIoWorker`]
-    /// into the stack.
-    pub(crate) fn push_loaded(
+    fn push_loaded(
         &mut self,
         data: LoadedVectorData,
         visible: bool,
@@ -262,18 +284,14 @@ impl VectorLayerStack {
         self.next_id = self.next_id.saturating_add(1);
         let palette_idx = id.0.saturating_sub(1) as usize % VECTOR_PALETTE.len();
         let (fill_color, line_color, color_rgb) = VECTOR_PALETTE[palette_idx];
-        let name = data
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map_or_else(|| data.path.display().to_string(), str::to_owned);
+        let name = display_name_from_path(&data.path);
 
         self.layers.push(VectorLayer {
             id,
             name,
             path: data.path,
             visible,
-            opacity: opacity.clamp(0.0, 1.0),
+            opacity: clamp_opacity(opacity),
             fill_color,
             line_color,
             color_rgb,
@@ -283,7 +301,7 @@ impl VectorLayerStack {
         (id, bounds)
     }
 
-    pub(crate) fn set_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
+    fn set_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
         let Some(layer) = self.layers.iter_mut().find(|l| l.id == id) else {
             return false;
         };
@@ -294,8 +312,8 @@ impl VectorLayerStack {
         true
     }
 
-    pub(crate) fn set_opacity(&mut self, id: VectorLayerId, opacity: f32) -> bool {
-        let clamped = opacity.clamp(0.0, 1.0);
+    fn set_opacity(&mut self, id: VectorLayerId, opacity: f32) -> bool {
+        let clamped = clamp_opacity(opacity);
         let Some(layer) = self.layers.iter_mut().find(|l| l.id == id) else {
             return false;
         };
@@ -306,7 +324,7 @@ impl VectorLayerStack {
         true
     }
 
-    pub(crate) fn remove(&mut self, id: VectorLayerId) -> bool {
+    fn remove(&mut self, id: VectorLayerId) -> bool {
         let Some(idx) = self.layers.iter().position(|l| l.id == id) else {
             return false;
         };
@@ -314,11 +332,11 @@ impl VectorLayerStack {
         true
     }
 
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.layers.len()
     }
 
-    pub(crate) fn summaries(&self) -> Vec<VectorLayerSummary> {
+    fn summaries(&self) -> Vec<VectorLayerSummary> {
         self.layers
             .iter()
             .map(|l| VectorLayerSummary {
@@ -337,7 +355,7 @@ impl VectorLayerStack {
             .collect()
     }
 
-    pub(crate) fn draw_layers(&self) -> Vec<DrawVectorLayer> {
+    fn draw_layers(&self) -> Vec<DrawVectorLayer> {
         self.layers
             .iter()
             .filter(|l| l.visible && l.opacity > 0.001)
@@ -352,14 +370,109 @@ impl VectorLayerStack {
             .collect()
     }
 
-    pub(crate) fn saved_entries(&self) -> Vec<SavedVectorEntry> {
-        self.layers
-            .iter()
-            .map(|l| SavedVectorEntry {
-                path: l.path.clone(),
-                visible: l.visible,
-                opacity: l.opacity,
-            })
-            .collect()
+    fn saved_entries_iter(&self) -> impl Iterator<Item = VectorPersistEntry<'_>> {
+        self.layers.iter().map(|l| VectorPersistEntry {
+            path: &l.path,
+            visible: l.visible,
+            opacity: l.opacity,
+        })
+    }
+}
+
+/// Facade coordinating read-only GeoJSON vector overlays and their dedicated
+/// off-UI-thread I/O worker.
+pub(crate) struct VectorManager {
+    stack: VectorLayerStack,
+    io: VectorIoWorker,
+}
+
+impl VectorManager {
+    pub(crate) fn new(wakeup: Wakeup, shutdown: CancelToken) -> Self {
+        Self {
+            stack: VectorLayerStack::default(),
+            io: VectorIoWorker::spawn(wakeup, shutdown),
+        }
+    }
+
+    /// Queue a non-blocking local GeoJSON file open onto the background worker.
+    pub(crate) fn begin_open(
+        &self,
+        path: &Path,
+        fly_to: bool,
+        visible: bool,
+        opacity: f32,
+    ) -> Result<(), String> {
+        self.io.begin_open(path, fly_to, visible, opacity)
+    }
+
+    /// Drain completed background GeoJSON open events into the vector stack.
+    pub(crate) fn poll_events(&mut self) -> Vec<VectorIoEvent> {
+        let mut events = Vec::new();
+        while let Some(res) = self.io.try_recv() {
+            match res.outcome {
+                Ok(data) => {
+                    let path = data.path.clone();
+                    let (id, bounds) = self.stack.push_loaded(data, res.visible, res.opacity);
+                    events.push(VectorIoEvent::Opened {
+                        id,
+                        path,
+                        bounds,
+                        fly_to: res.fly_to,
+                    });
+                }
+                Err(error) => {
+                    events.push(VectorIoEvent::Failed {
+                        path: res.path,
+                        error,
+                    });
+                }
+            }
+        }
+        events
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    pub(crate) fn summaries(&self) -> Vec<VectorLayerSummary> {
+        self.stack.summaries()
+    }
+
+    pub(crate) fn saved_entries_iter(&self) -> impl Iterator<Item = VectorPersistEntry<'_>> {
+        self.stack.saved_entries_iter()
+    }
+
+    pub(crate) fn set_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
+        self.stack.set_visible(id, visible)
+    }
+
+    pub(crate) fn set_opacity(&mut self, id: VectorLayerId, opacity: f32) -> bool {
+        self.stack.set_opacity(id, opacity)
+    }
+
+    pub(crate) fn remove(&mut self, id: VectorLayerId) -> bool {
+        self.stack.remove(id)
+    }
+
+    pub(crate) fn draw_layers(&self) -> Vec<DrawVectorLayer> {
+        self.stack.draw_layers()
+    }
+
+    /// Phase 1 shutdown: close the background worker command channel.
+    pub(crate) fn begin_shutdown(&mut self) {
+        self.io.close_channel();
+    }
+
+    /// Phase 3 shutdown: deterministically join the background worker thread.
+    pub(crate) fn finish_shutdown(&mut self) {
+        self.io.join();
+    }
+}
+
+impl Drop for VectorManager {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+        self.finish_shutdown();
     }
 }

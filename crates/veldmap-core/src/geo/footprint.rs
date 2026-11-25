@@ -70,9 +70,38 @@ pub(crate) fn frame_coords(
 
     Some(FootprintBounds {
         lat,
-        lon: wrap(lon),
+        lon: geodesy::unwind(0.0, lon),
         radius_deg,
     })
+}
+
+/// Tolerance in degrees for collapsing coincident consecutive ring vertices.
+const RING_DEDUP_EPS_DEG: f64 = 1e-12;
+
+/// Append `point` to a ring accumulator if it is finite and distinct from the
+/// previous vertex.
+pub(crate) fn push_dedup_geo_point(out: &mut Vec<GeoPoint>, point: GeoPoint) {
+    if !(point.lat.is_finite() && point.lon.is_finite()) {
+        return;
+    }
+    if out.last().is_none_or(|prev| {
+        (prev.lat - point.lat).abs() > RING_DEDUP_EPS_DEG
+            || (prev.lon - point.lon).abs() > RING_DEDUP_EPS_DEG
+    }) {
+        out.push(point);
+    }
+}
+
+/// Drop a trailing closing vertex when it duplicates the first vertex of a
+/// closed ring.
+pub(crate) fn trim_closing_geo_point(out: &mut Vec<GeoPoint>) {
+    if out.len() > 1
+        && let (Some(first), Some(last)) = (out.first(), out.last())
+        && (first.lat - last.lat).abs() <= RING_DEDUP_EPS_DEG
+        && (first.lon - last.lon).abs() <= RING_DEDUP_EPS_DEG
+    {
+        out.pop();
+    }
 }
 
 /// Remove consecutive duplicate points (including wrap-around `last == first`)
@@ -80,23 +109,9 @@ pub(crate) fn frame_coords(
 pub(crate) fn dedup_geo_ring(points: &[GeoPoint]) -> Vec<GeoPoint> {
     let mut out: Vec<GeoPoint> = Vec::with_capacity(points.len());
     for &p in points {
-        if !(p.lat.is_finite() && p.lon.is_finite()) {
-            continue;
-        }
-        if out
-            .last()
-            .is_none_or(|prev| (prev.lat - p.lat).abs() > 1e-12 || (prev.lon - p.lon).abs() > 1e-12)
-        {
-            out.push(p);
-        }
+        push_dedup_geo_point(&mut out, p);
     }
-    if out.len() > 1
-        && let (Some(first), Some(last)) = (out.first(), out.last())
-        && (first.lat - last.lat).abs() <= 1e-12
-        && (first.lon - last.lon).abs() <= 1e-12
-    {
-        out.pop();
-    }
+    trim_closing_geo_point(&mut out);
     out
 }
 
@@ -118,19 +133,19 @@ pub fn frame_polygons(polygons: &[Polygon]) -> Option<FootprintBounds> {
 
 /// Return whether any ring in `rings` covers `(lat, lon)`.
 pub fn covers(rings: &[Ring], lat: f64, lon: f64) -> bool {
-    rings.iter().any(|ring| inside(&angles(ring), lat, lon))
+    rings.iter().any(|ring| inside(&ring.points, lat, lon))
 }
 
 /// Return whether `polygon` covers `(lat, lon)` (inside its exterior ring and
 /// outside all of its interior holes).
 pub fn covers_polygon(polygon: &Polygon, lat: f64, lon: f64) -> bool {
-    if !inside(&angles(&polygon.exterior), lat, lon) {
+    if !inside(&polygon.exterior.points, lat, lon) {
         return false;
     }
     !polygon
         .holes
         .iter()
-        .any(|hole| inside(&angles(hole), lat, lon))
+        .any(|hole| inside(&hole.points, lat, lon))
 }
 
 /// Return whether any polygon in `polygons` covers `(lat, lon)`.
@@ -143,10 +158,6 @@ fn points(rings: &[Ring]) -> impl Iterator<Item = (f64, f64)> + Clone + '_ {
         .iter()
         .flat_map(|ring| &ring.points)
         .map(|point| (point.lat, point.lon))
-}
-
-fn angles(ring: &Ring) -> Vec<(f64, f64)> {
-    ring.points.iter().map(|p| (p.lat, p.lon)).collect()
 }
 
 /// Default chord sagitta tolerance used for geodesic ring densification.
@@ -163,8 +174,11 @@ fn traced(ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
     out
 }
 
-fn inside(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
-    let ring = dedup_ring(ring);
+fn inside(points: &[GeoPoint], lat: f64, lon: f64) -> bool {
+    let ring: Vec<(f64, f64)> = dedup_geo_ring(points)
+        .into_iter()
+        .map(|p| (p.lat, p.lon))
+        .collect();
     if ring.len() < 3 {
         return false;
     }
@@ -262,21 +276,6 @@ fn trace_edge(
     }
 }
 
-/// Remove consecutive duplicate points (including wrap-around `last == first`)
-/// from a closed `(lat_deg, lon_deg)` ring.
-fn dedup_ring(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let mut out: Vec<(f64, f64)> = Vec::with_capacity(points.len());
-    for &p in points {
-        if out.last() != Some(&p) {
-            out.push(p);
-        }
-    }
-    if out.len() > 1 && out.first() == out.last() {
-        out.pop();
-    }
-    out
-}
-
 /// Identify meridian seam cuts of a closed whole-Earth band (constant-latitude
 /// parallels wrapping `>= FULL_CIRCLE_DEG` connected by zero-sweep meridians).
 /// Returns an empty vector if `places` is not a closed whole-Earth band.
@@ -337,10 +336,6 @@ fn turn(ring: &[(f64, f64)], lat: f64, lon: f64) -> f64 {
         turned += sin_term.atan2(cos_term).to_degrees();
     }
     turned
-}
-
-fn wrap(degrees: f64) -> f64 {
-    geodesy::unwind(0.0, degrees)
 }
 
 #[cfg(test)]

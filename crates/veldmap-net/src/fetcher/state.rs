@@ -5,12 +5,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::OwnedSemaphorePermit;
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{QuadTileId, SourceId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
-use crate::http::{HostLimiters, PermitDenied};
 
 use super::NetworkStatus;
 use super::failures::{BackoffEntry, FailureMarker, FailureTracker};
@@ -71,43 +69,26 @@ impl StatusCounters {
     }
 }
 
-/// Shared tile metadata passed from dispatch planning to disk/HTTP workers.
-pub(super) struct TileTarget {
-    pub(super) key: TileKey,
-    pub(super) id: QuadTileId,
-    pub(super) spec: Arc<LiveBasemapSpec>,
-    pub(super) cancel: CancelToken,
+fn is_key_eligible(
+    in_flight: &InFlightTable,
+    failures: &FailureTracker,
+    key: &TileKey,
+    active_source: SourceId,
+) -> bool {
+    key.source == active_source && !in_flight.contains(key) && !failures.is_suppressed(key)
 }
 
-/// Raw disk-lookup task planned under `PipelineState`'s mutex, to be wrapped
-/// in RAII guards immediately upon unlocking `state`.
-pub(super) struct PlannedDiskTask {
-    pub(super) target: TileTarget,
-    pub(super) generation: u64,
-}
-
-/// Raw HTTP fetch task planned under `PipelineState`'s mutex, to be wrapped
-/// in RAII guards immediately upon unlocking `state`.
-pub(super) struct PlannedHttpTask {
-    pub(super) target: TileTarget,
-    pub(super) generation: u64,
-    pub(super) host: String,
-    pub(super) permit: OwnedSemaphorePermit,
-}
-
-/// Dispatch batch planned under `PipelineState`'s mutex in `state -> host_limiters`
-/// lock order.
-pub(super) struct PlannedDispatch {
-    pub(super) disk_tasks: Vec<PlannedDiskTask>,
-    pub(super) http_tasks: Vec<PlannedHttpTask>,
-    pub(super) earliest_wakeup: Option<Instant>,
-}
-
-fn min_instant(current: Option<Instant>, candidate: Instant) -> Option<Instant> {
-    Some(match current {
-        Some(cur) if cur < candidate => cur,
-        _ => candidate,
-    })
+fn is_pending_eligible(
+    in_flight: &InFlightTable,
+    failures: &FailureTracker,
+    last_wanted: &HashSet<TileKey>,
+    key: &TileKey,
+    active_source: SourceId,
+    is_ready: &impl Fn(&TileKey) -> bool,
+) -> bool {
+    is_key_eligible(in_flight, failures, key, active_source)
+        && (last_wanted.contains(key) || key.is_root_of(active_source))
+        && !is_ready(key)
 }
 
 #[derive(Default)]
@@ -134,20 +115,7 @@ impl PipelineState {
     }
 
     fn is_queue_eligible(&self, key: &TileKey, active_source: SourceId) -> bool {
-        key.source == active_source
-            && !self.in_flight.contains(key)
-            && !self.failures.is_suppressed(key)
-    }
-
-    fn is_pending_eligible(
-        &self,
-        key: &TileKey,
-        active_source: SourceId,
-        is_ready: impl Fn(&TileKey) -> bool,
-    ) -> bool {
-        self.is_queue_eligible(key, active_source)
-            && self.is_wanted_or_root(key, active_source)
-            && !is_ready(key)
+        is_key_eligible(&self.in_flight, &self.failures, key, active_source)
     }
 
     fn finish_in_flight(&mut self, key: &TileKey, expected_gen: u64) -> bool {
@@ -165,8 +133,14 @@ impl PipelineState {
         is_ready: impl Fn(&TileKey) -> bool,
     ) {
         for (key, retry_disk) in entries {
-            if self.is_pending_eligible(&key, active_source, &is_ready)
-                && !self.pending.contains(&key)
+            if is_pending_eligible(
+                &self.in_flight,
+                &self.failures,
+                &self.last_wanted,
+                &key,
+                active_source,
+                &is_ready,
+            ) && !self.pending.contains(&key)
             {
                 self.pending.insert_unique(key, retry_disk);
             }
@@ -182,7 +156,7 @@ impl PipelineState {
         }
         self.active_spec = spec.map(Arc::new);
         self.last_wanted.clear();
-        self.clear_pending_queues();
+        self.pending.clear();
         self.failures.clear();
         self.counters.reset_errors();
         Some(self.in_flight.drain_tokens())
@@ -199,7 +173,7 @@ impl PipelineState {
     {
         let Some(spec) = self.active_spec.clone() else {
             self.last_wanted.clear();
-            self.clear_pending_queues();
+            self.pending.clear();
             return None;
         };
         let active_source = spec.source_id();
@@ -224,9 +198,19 @@ impl PipelineState {
 
         // Retain still-wanted / active-root entries in place: keep `http`
         // entries out of `disk` so disk misses never bounce back.
-        let mut pending = std::mem::take(&mut self.pending);
-        pending.retain(|key| self.is_pending_eligible(key, active_source, is_ready));
-        self.pending = pending;
+        let in_flight = &self.in_flight;
+        let failures = &self.failures;
+        let last_wanted = &self.last_wanted;
+        self.pending.retain(|key| {
+            is_pending_eligible(
+                in_flight,
+                failures,
+                last_wanted,
+                key,
+                active_source,
+                is_ready,
+            )
+        });
 
         // Drain expired backoffs (`until <= now`), routing `retry_disk: false`
         // directly to `pending.http` while keeping `retry_disk: true` on disk.
@@ -267,15 +251,23 @@ impl PipelineState {
 
     pub(super) fn signal_shutdown(&mut self) -> Vec<CancelToken> {
         self.last_wanted.clear();
-        self.clear_pending_queues();
+        self.pending.clear();
         self.in_flight.drain_tokens()
     }
 
-    fn clear_pending_queues(&mut self) {
-        self.pending.clear();
+    /// Prune expired backoff entries and return the active basemap spec for
+    /// dispatch planning, clearing any stale pending queues if no source is
+    /// active.
+    pub(super) fn prepare_dispatch(&mut self, now: Instant) -> Option<Arc<LiveBasemapSpec>> {
+        self.prune_expired_backoffs(now);
+        let Some(spec) = self.active_spec.clone() else {
+            self.pending.clear();
+            return None;
+        };
+        Some(spec)
     }
 
-    fn drain_disk_to_http(&mut self, active_source: SourceId) {
+    pub(super) fn drain_disk_to_http(&mut self, active_source: SourceId) {
         if self.pending.disk.is_empty() {
             return;
         }
@@ -286,7 +278,7 @@ impl PipelineState {
         }
     }
 
-    fn pop_next_disk(
+    pub(super) fn pop_next_disk(
         &mut self,
         active_source: SourceId,
         max_concurrent_disk: usize,
@@ -309,7 +301,7 @@ impl PipelineState {
         None
     }
 
-    fn pop_next_http(&mut self, active_source: SourceId) -> Option<TileKey> {
+    pub(super) fn pop_next_http(&mut self, active_source: SourceId) -> Option<TileKey> {
         while let Some(key) = self.pending.http.pop() {
             if self.is_queue_eligible(&key, active_source) {
                 return Some(key);
@@ -318,7 +310,6 @@ impl PipelineState {
         None
     }
 
-    #[cfg(test)]
     pub(super) fn register_http_in_flight(
         &mut self,
         key: TileKey,
@@ -327,128 +318,13 @@ impl PipelineState {
         self.in_flight.register(key, shutdown)
     }
 
-    fn push_deferred_http(&mut self, deferred: Vec<TileKey>) {
+    pub(super) fn push_deferred_http(&mut self, deferred: Vec<TileKey>) {
         self.pending.http.push_unique(deferred);
     }
 
-    fn plan_disk_tasks(
-        &mut self,
-        spec: &Arc<LiveBasemapSpec>,
-        has_disk_cache: bool,
-        max_concurrent_disk: usize,
-        shutdown: &CancelToken,
-    ) -> Vec<PlannedDiskTask> {
-        let active_source = spec.source_id();
-        if !has_disk_cache {
-            self.drain_disk_to_http(active_source);
-            return Vec::new();
-        }
-
-        let mut tasks = Vec::new();
-        while let Some((key, id, generation, cancel)) =
-            self.pop_next_disk(active_source, max_concurrent_disk, shutdown)
-        {
-            tasks.push(PlannedDiskTask {
-                target: TileTarget {
-                    key,
-                    id,
-                    spec: Arc::clone(spec),
-                    cancel,
-                },
-                generation,
-            });
-        }
-        tasks
-    }
-
-    fn plan_http_tasks(
-        &mut self,
-        spec: &Arc<LiveBasemapSpec>,
-        host_limiters: &HostLimiters,
-        shutdown: &CancelToken,
-        now: Instant,
-        earliest_wakeup: &mut Option<Instant>,
-    ) -> Vec<PlannedHttpTask> {
-        let active_source = spec.source_id();
-        let total_hosts = spec.host_count();
-        let mut denied_hosts: HashSet<&str> = HashSet::with_capacity(total_hosts);
-        let mut deferred_http = Vec::new();
-        let mut tasks = Vec::new();
-
-        while let Some(key) = self.pop_next_http(active_source) {
-            let Some(id) = key.quad_id() else {
-                continue;
-            };
-            let host = spec.host_for(id);
-            if denied_hosts.contains(host) {
-                deferred_http.push(key);
-                continue;
-            }
-            match host_limiters.try_acquire_permit(host, now) {
-                Ok(permit) => {
-                    let (generation, cancel) = self.in_flight.register(key, shutdown);
-                    tasks.push(PlannedHttpTask {
-                        target: TileTarget {
-                            key,
-                            id,
-                            spec: Arc::clone(spec),
-                            cancel,
-                        },
-                        generation,
-                        host: host.to_owned(),
-                        permit,
-                    });
-                }
-                Err(denied) => {
-                    if let PermitDenied::Cooldown(until) = denied {
-                        *earliest_wakeup = min_instant(*earliest_wakeup, until);
-                    }
-                    deferred_http.push(key);
-                    denied_hosts.insert(host);
-                    if denied_hosts.len() >= total_hosts {
-                        break;
-                    }
-                }
-            }
-        }
-
-        self.push_deferred_http(deferred_http);
-        tasks
-    }
-
-    /// Prune expired backoffs and plan the next disk + HTTP dispatch batch
-    /// while preserving `state -> host_limiters` lock order.
-    pub(super) fn plan_dispatch(
-        &mut self,
-        has_disk_cache: bool,
-        max_concurrent_disk: usize,
-        host_limiters: &HostLimiters,
-        shutdown: &CancelToken,
-        now: Instant,
-    ) -> PlannedDispatch {
-        self.prune_expired_backoffs(now);
-
-        let mut earliest_wakeup: Option<Instant> = None;
-        let (disk_tasks, http_tasks) = if let Some(spec) = self.active_spec.clone() {
-            let disk_tasks =
-                self.plan_disk_tasks(&spec, has_disk_cache, max_concurrent_disk, shutdown);
-            let http_tasks =
-                self.plan_http_tasks(&spec, host_limiters, shutdown, now, &mut earliest_wakeup);
-            (disk_tasks, http_tasks)
-        } else {
-            self.clear_pending_queues();
-            (Vec::new(), Vec::new())
-        };
-
-        if let Some(backoff_at) = self.earliest_wanted_backoff(now) {
-            earliest_wakeup = min_instant(earliest_wakeup, backoff_at);
-        }
-
-        PlannedDispatch {
-            disk_tasks,
-            http_tasks,
-            earliest_wakeup,
-        }
+    #[cfg(test)]
+    pub(super) fn is_http_pending(&self, key: &TileKey) -> bool {
+        self.pending.http.contains(key)
     }
 
     pub(super) fn remove_in_flight_if_gen(&mut self, key: &TileKey, generation: u64) -> bool {
@@ -589,7 +465,7 @@ impl PipelineState {
     /// Earliest backoff timestamp among currently wanted tiles and pinned
     /// active-source roots (used by `dispatcher_loop` to self-wake for idle
     /// retries without busy-spinning).
-    fn earliest_wanted_backoff(&self, now: Instant) -> Option<Instant> {
+    pub(super) fn earliest_wanted_backoff(&self, now: Instant) -> Option<Instant> {
         let active_source = self.active_spec.as_ref()?.source_id();
         self.failures
             .earliest_wanted_backoff(now, active_source, &self.last_wanted)

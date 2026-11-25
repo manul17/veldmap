@@ -12,7 +12,8 @@ use veldmap_core::tile::{POLAR_R_CAP, PixelFormat};
 
 use super::CLEAR_COLOR_LINEAR;
 use super::bind_groups::TileBindGroupCache;
-use super::mesh::{TILE_KIND_GEO, TileMeshCache, tile_graticule_uniform};
+use super::graticule::{TILE_KIND_GEO, tile_graticule_uniform};
+use super::mesh::TileMeshCache;
 use super::overlay::OverlayRenderer;
 use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
@@ -192,11 +193,10 @@ impl GlobeRenderer {
         let full_indices = self.meshes.full_indices();
         let arena = self.viewport.uniform_arena();
 
-        for (i, draw) in snapshot.tiles.iter().enumerate() {
+        for (draw, &dyn_offset) in snapshot.tiles.iter().zip(self.tile_uniform_offsets.iter()) {
             let Some(mesh) = self.meshes.peek(&draw.visible.id) else {
                 continue;
             };
-            let dyn_offset = self.tile_uniform_offsets[i];
             pass.set_vertex_buffer(0, mesh.buffer.slice(..));
             pass.set_bind_group(1, arena.tile_bind_group(), &[dyn_offset]);
 
@@ -235,11 +235,10 @@ impl GlobeRenderer {
         let surface_indices = self.meshes.surface_indices();
         let arena = self.viewport.uniform_arena();
 
-        for (i, draw) in snapshot.tiles.iter().enumerate() {
+        for (draw, &dyn_offset) in snapshot.tiles.iter().zip(self.tile_uniform_offsets.iter()) {
             let Some(mesh) = self.meshes.peek(&draw.visible.id) else {
                 continue;
             };
-            let dyn_offset = self.tile_uniform_offsets[i];
             pass.set_vertex_buffer(0, mesh.buffer.slice(..));
             pass.set_bind_group(1, arena.tile_bind_group(), &[dyn_offset]);
             pass.draw_indexed(surface_indices.clone(), 0, 0..1);

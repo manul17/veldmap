@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use glam::DVec3;
 
-use super::tessellate::{RawPrimitives, VectorCluster, VectorVertex};
+use super::mesh::{RawPrimitives, VectorCluster, VectorVertex};
 
 /// Maximum Euclidean radius (metres) for greedy spatial clustering of local
 /// features (`<= 16 km` guarantees `< 1 mm` `f32` RTC quantization error).

@@ -66,11 +66,27 @@ const _: () = {
     assert!(std::mem::offset_of!(VectorUniform, color) == 16);
 };
 
-fn dynamic_uniform_bind_group<T>(
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum UniformSlot {
+    Tile = 0,
+    Overlay = 1,
+    Vector = 2,
+}
+
+struct UniformSlotEntry {
+    label: &'static str,
+    binding_size: usize,
+    layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+}
+
+fn dynamic_uniform_bind_group(
     device: &wgpu::Device,
     label: &str,
     layout: &wgpu::BindGroupLayout,
     buffer: &wgpu::Buffer,
+    binding_size: usize,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
@@ -80,7 +96,7 @@ fn dynamic_uniform_bind_group<T>(
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer,
                 offset: 0,
-                size: wgpu::BufferSize::new(std::mem::size_of::<T>() as u64),
+                size: wgpu::BufferSize::new(binding_size as u64),
             }),
         }],
     })
@@ -98,12 +114,7 @@ pub(super) struct DynamicUniformArena {
     last_offset: usize,
     buffer: wgpu::Buffer,
     capacity_bytes: usize,
-    tile_layout: wgpu::BindGroupLayout,
-    overlay_layout: wgpu::BindGroupLayout,
-    vector_layout: wgpu::BindGroupLayout,
-    tile_bind_group: wgpu::BindGroup,
-    overlay_bind_group: wgpu::BindGroup,
-    vector_bind_group: wgpu::BindGroup,
+    slots: [UniformSlotEntry; 3],
 }
 
 impl DynamicUniformArena {
@@ -116,70 +127,52 @@ impl DynamicUniformArena {
         let alignment = device.limits().min_uniform_buffer_offset_alignment.max(1);
         let min_slot = alignment as usize;
         let initial_bytes = (128 * min_slot).max(4096);
-        let (buffer, tile_bind_group, overlay_bind_group, vector_bind_group) = Self::alloc(
-            device,
-            tile_layout,
-            overlay_layout,
-            vector_layout,
-            initial_bytes,
-        );
+        let buffer = Self::create_buffer(device, initial_bytes);
+        let make_slot =
+            |label: &'static str, binding_size: usize, layout: &wgpu::BindGroupLayout| {
+                let bind_group =
+                    dynamic_uniform_bind_group(device, label, layout, &buffer, binding_size);
+                UniformSlotEntry {
+                    label,
+                    binding_size,
+                    layout: layout.clone(),
+                    bind_group,
+                }
+            };
+        let slots = [
+            make_slot(
+                "arena tile dynamic uniform bind group",
+                std::mem::size_of::<TileUniform>(),
+                tile_layout,
+            ),
+            make_slot(
+                "arena overlay dynamic uniform bind group",
+                std::mem::size_of::<OverlayPatchUniform>(),
+                overlay_layout,
+            ),
+            make_slot(
+                "arena vector dynamic uniform bind group",
+                std::mem::size_of::<VectorUniform>(),
+                vector_layout,
+            ),
+        ];
         Self {
             alignment,
             staging: Vec::with_capacity(initial_bytes),
             last_offset: 0,
             buffer,
             capacity_bytes: initial_bytes,
-            tile_layout: tile_layout.clone(),
-            overlay_layout: overlay_layout.clone(),
-            vector_layout: vector_layout.clone(),
-            tile_bind_group,
-            overlay_bind_group,
-            vector_bind_group,
+            slots,
         }
     }
 
-    fn alloc(
-        device: &wgpu::Device,
-        tile_layout: &wgpu::BindGroupLayout,
-        overlay_layout: &wgpu::BindGroupLayout,
-        vector_layout: &wgpu::BindGroupLayout,
-        size_bytes: usize,
-    ) -> (
-        wgpu::Buffer,
-        wgpu::BindGroup,
-        wgpu::BindGroup,
-        wgpu::BindGroup,
-    ) {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    fn create_buffer(device: &wgpu::Device, size_bytes: usize) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame dynamic uniform arena"),
             size: size_bytes.max(256) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let tile_bind_group = dynamic_uniform_bind_group::<TileUniform>(
-            device,
-            "arena tile dynamic uniform bind group",
-            tile_layout,
-            &buffer,
-        );
-        let overlay_bind_group = dynamic_uniform_bind_group::<OverlayPatchUniform>(
-            device,
-            "arena overlay dynamic uniform bind group",
-            overlay_layout,
-            &buffer,
-        );
-        let vector_bind_group = dynamic_uniform_bind_group::<VectorUniform>(
-            device,
-            "arena vector dynamic uniform bind group",
-            vector_layout,
-            &buffer,
-        );
-        (
-            buffer,
-            tile_bind_group,
-            overlay_bind_group,
-            vector_bind_group,
-        )
+        })
     }
 
     pub(super) fn reset(&mut self) {
@@ -208,24 +201,26 @@ impl DynamicUniformArena {
         if self.staging.is_empty() {
             return;
         }
-        let max_binding = std::mem::size_of::<TileUniform>()
-            .max(std::mem::size_of::<OverlayPatchUniform>())
-            .max(std::mem::size_of::<VectorUniform>());
+        let max_binding = self
+            .slots
+            .iter()
+            .map(|slot| slot.binding_size)
+            .max()
+            .unwrap_or(0);
         let copy_len = self.staging.len().div_ceil(4) * 4;
         let required_bytes = copy_len.max(self.last_offset.saturating_add(max_binding));
         if required_bytes > self.capacity_bytes {
             let next_cap = required_bytes.next_power_of_two().max(4096);
-            let (buf, tile_bg, overlay_bg, vector_bg) = Self::alloc(
-                device,
-                &self.tile_layout,
-                &self.overlay_layout,
-                &self.vector_layout,
-                next_cap,
-            );
-            self.buffer = buf;
-            self.tile_bind_group = tile_bg;
-            self.overlay_bind_group = overlay_bg;
-            self.vector_bind_group = vector_bg;
+            self.buffer = Self::create_buffer(device, next_cap);
+            for slot in &mut self.slots {
+                slot.bind_group = dynamic_uniform_bind_group(
+                    device,
+                    slot.label,
+                    &slot.layout,
+                    &self.buffer,
+                    slot.binding_size,
+                );
+            }
             self.capacity_bytes = next_cap;
         }
         if copy_len > self.staging.len() {
@@ -234,15 +229,19 @@ impl DynamicUniformArena {
         queue.write_buffer(&self.buffer, 0, &self.staging[..copy_len]);
     }
 
+    fn bind_group(&self, slot: UniformSlot) -> &wgpu::BindGroup {
+        &self.slots[slot as usize].bind_group
+    }
+
     pub(super) fn tile_bind_group(&self) -> &wgpu::BindGroup {
-        &self.tile_bind_group
+        self.bind_group(UniformSlot::Tile)
     }
 
     pub(super) fn overlay_bind_group(&self) -> &wgpu::BindGroup {
-        &self.overlay_bind_group
+        self.bind_group(UniformSlot::Overlay)
     }
 
     pub(super) fn vector_bind_group(&self) -> &wgpu::BindGroup {
-        &self.vector_bind_group
+        self.bind_group(UniformSlot::Vector)
     }
 }

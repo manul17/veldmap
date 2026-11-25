@@ -134,7 +134,7 @@ impl MeasureSession {
 
     /// Build an RFC 7946 [`GeoJsonFeatureCollection`] representing the active
     /// measurement feature along with exact Karney metric properties.
-    pub(crate) fn to_geojson_collection(&self) -> Option<GeoJsonFeatureCollection> {
+    fn to_geojson_collection(&self) -> Option<GeoJsonFeatureCollection> {
         if self.points.is_empty() {
             return None;
         }

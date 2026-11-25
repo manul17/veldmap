@@ -127,15 +127,10 @@ impl LocalFingerprintCache {
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let source = LocalFileSource::open(&key)?;
 
-        if !bypass_cache {
-            let guard = lock_unpoisoned(&self.entries);
-            if let Some(entry) = guard.get(&key)
-                && entry.len == source.len()
-                && entry.mtime_ns.is_some()
-                && entry.mtime_ns == source.mtime_ns()
-            {
-                return Ok((source, entry.fingerprint));
-            }
+        if !bypass_cache
+            && let Some(fingerprint) = self.lookup_cached(&key, source.len(), source.mtime_ns())
+        {
+            return Ok((source, fingerprint));
         }
 
         if cancel.is_cancelled() {
@@ -161,15 +156,10 @@ impl LocalFingerprintCache {
         if !bypass_cache {
             let meta = std::fs::metadata(&key)?;
             ensure_regular_file(&meta, path)?;
-            let len = meta.len();
-            let mtime_ns = metadata_mtime_ns(&meta);
-            let guard = lock_unpoisoned(&self.entries);
-            if let Some(entry) = guard.get(&key)
-                && entry.len == len
-                && entry.mtime_ns.is_some()
-                && entry.mtime_ns == mtime_ns
+            if let Some(fingerprint) =
+                self.lookup_cached(&key, meta.len(), metadata_mtime_ns(&meta))
             {
-                return Ok(entry.fingerprint);
+                return Ok(fingerprint);
             }
         }
 
@@ -178,6 +168,20 @@ impl LocalFingerprintCache {
         }
         let source = LocalFileSource::open(&key)?;
         self.compute_and_cache(&key, &source, cancel)
+    }
+
+    fn lookup_cached(
+        &self,
+        key: &Path,
+        len: u64,
+        mtime_ns: Option<i128>,
+    ) -> Option<SourceFingerprint> {
+        let mtime_ns = mtime_ns?;
+        let guard = lock_unpoisoned(&self.entries);
+        guard
+            .get(key)
+            .filter(|entry| entry.len == len && entry.mtime_ns == Some(mtime_ns))
+            .map(|entry| entry.fingerprint)
     }
 
     fn compute_and_cache(

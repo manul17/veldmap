@@ -9,8 +9,10 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::{OverlayCullTree, SourceId, TileKey};
 use veldmap_raster::{PyramidMeta, RasterSource};
 
-use crate::session::SavedCrsOverride;
+use crate::crs_override::CrsOverride;
+use crate::{clamp_opacity, display_name_from_path};
 
+use super::io_worker::ReloadRequest;
 use super::{LayerId, LayerSummary, default_display_tile_bytes};
 
 /// Initial display and georeference override options when inserting an opened
@@ -19,7 +21,15 @@ use super::{LayerId, LayerSummary, default_display_tile_bytes};
 pub(super) struct LayerInitOptions {
     pub(super) visible: bool,
     pub(super) opacity: f32,
-    pub(super) crs_override: Option<SavedCrsOverride>,
+    pub(super) crs_override: Option<CrsOverride>,
+}
+
+/// Cohesive per-layer reload lifecycle state.
+#[derive(Default)]
+struct ReloadState {
+    in_progress: bool,
+    seq: u64,
+    cancel: Option<CancelToken>,
 }
 
 /// Single georeferenced raster overlay inside [`LayerStack`].
@@ -31,7 +41,7 @@ pub(super) struct OverlayLayer {
     pub(super) meta: PyramidMeta,
     pub(super) fingerprint_hex: String,
     pub(super) frame: Arc<Frame>,
-    pub(super) crs_override: Option<SavedCrsOverride>,
+    pub(super) crs_override: Option<CrsOverride>,
     pub(super) crs_override_epoch: u64,
     pub(super) last_error: Option<String>,
     pub(super) relaid: u64,
@@ -42,14 +52,12 @@ pub(super) struct OverlayLayer {
     pub(super) footprint: Option<FootprintBounds>,
     /// Current wanted tile set (shared with active `ServeMode::Pass` jobs so
     /// mid-pass zooms deliver tiles matching the live viewport).
-    pub(super) wanted_shared: Arc<Mutex<HashSet<TileKey>>>,
+    wanted_shared: Arc<Mutex<HashSet<TileKey>>>,
     /// Snapshot of `wanted_shared` retained on the UI thread for
     /// `PendingUploads` retention without acquiring a lock inside upload drain.
-    pub(super) wanted: HashSet<TileKey>,
+    wanted: HashSet<TileKey>,
     pub(super) observed_tile_bytes: usize,
-    reloading: bool,
-    reload_seq: u64,
-    reload_cancel: Option<CancelToken>,
+    reload: ReloadState,
 }
 
 impl OverlayLayer {
@@ -61,10 +69,7 @@ impl OverlayLayer {
         options: LayerInitOptions,
         relaid: u64,
     ) -> Self {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map_or_else(|| path.display().to_string(), str::to_owned);
+        let name = display_name_from_path(&path);
         let meta = source.pyramid_meta();
         let fingerprint_hex = source.fingerprint().to_hex();
         let desc = source.description();
@@ -85,15 +90,13 @@ impl OverlayLayer {
             relaid,
             cull,
             visible: options.visible,
-            opacity: options.opacity.clamp(0.0, 1.0),
+            opacity: clamp_opacity(options.opacity),
             source_pixel_size_m,
             footprint,
             wanted_shared: Arc::new(Mutex::new(HashSet::new())),
             wanted: HashSet::new(),
             observed_tile_bytes: default_display_tile_bytes(),
-            reloading: false,
-            reload_seq: 0,
-            reload_cancel: None,
+            reload: ReloadState::default(),
         }
     }
 
@@ -146,7 +149,7 @@ impl OverlayLayer {
     pub(super) fn apply_rebound_frame(
         &mut self,
         frame: Frame,
-        crs_override: Option<SavedCrsOverride>,
+        crs_override: Option<CrsOverride>,
         relaid: u64,
     ) {
         let desc = self.source.description();
@@ -165,36 +168,48 @@ impl OverlayLayer {
     }
 
     pub(super) fn is_active(&self) -> bool {
-        self.visible && !self.reloading
+        self.visible && !self.reload.in_progress
     }
 
     pub(super) fn is_reloading(&self) -> bool {
-        self.reloading
+        self.reload.in_progress
     }
 
-    pub(super) fn begin_reload(&mut self, cancel: CancelToken) -> (u64, Option<CancelToken>) {
-        let prev = self.reload_cancel.replace(cancel);
-        self.reload_seq = self.reload_seq.saturating_add(1);
-        self.reloading = true;
+    pub(super) fn begin_reload(
+        &mut self,
+        cancel: CancelToken,
+    ) -> (ReloadRequest, SourceId, Option<CancelToken>) {
+        let prev = self.reload.cancel.replace(cancel.clone());
+        self.reload.seq = self.reload.seq.saturating_add(1);
+        self.reload.in_progress = true;
         self.clear_wanted();
-        (self.reload_seq, prev)
+        let request = ReloadRequest {
+            id: self.id,
+            reload_seq: self.reload.seq,
+            crs_override_epoch: self.crs_override_epoch,
+            path: self.path.clone(),
+            old_fingerprint_hex: self.fingerprint_hex.clone(),
+            crs_override: self.crs_override.clone(),
+            cancel,
+        };
+        (request, self.source_id(), prev)
     }
 
     pub(super) fn abort_reload(&mut self) {
-        self.reloading = false;
-        self.reload_cancel = None;
+        self.reload.in_progress = false;
+        self.reload.cancel = None;
     }
 
     pub(super) fn matches_reload_seq(&self, seq: u64) -> bool {
-        self.reload_seq == seq
+        self.reload.seq == seq
     }
 
     pub(super) fn finish_reload_err(&mut self, seq: u64) -> bool {
-        if self.reload_seq != seq {
+        if self.reload.seq != seq {
             return false;
         }
-        self.reloading = false;
-        self.reload_cancel = None;
+        self.reload.in_progress = false;
+        self.reload.cancel = None;
         true
     }
 
@@ -206,7 +221,7 @@ impl OverlayLayer {
         frame: Frame,
         relaid: u64,
     ) -> Option<SourceId> {
-        if self.reload_seq != seq {
+        if self.reload.seq != seq {
             return None;
         }
         let old_src = self.source_id();
@@ -222,14 +237,14 @@ impl OverlayLayer {
             },
             relaid,
         );
-        replacement.reload_seq = seq;
+        replacement.reload.seq = seq;
         replacement.crs_override_epoch = self.crs_override_epoch;
         *self = replacement;
         Some(old_src)
     }
 
     pub(super) fn take_reload_cancel(&mut self) -> Option<CancelToken> {
-        self.reload_cancel.take()
+        self.reload.cancel.take()
     }
 
     pub(super) fn appetite_weight_bytes(&self) -> u64 {
@@ -240,9 +255,22 @@ impl OverlayLayer {
         }
     }
 
-    pub(super) fn sync_wanted_shared(&self) {
-        let mut shared = lock_unpoisoned(&self.wanted_shared);
-        shared.clone_from(&self.wanted);
+    /// Borrow the UI-thread snapshot of this layer's currently wanted tiles.
+    pub(super) fn wanted(&self) -> &HashSet<TileKey> {
+        &self.wanted
+    }
+
+    /// Clone the shared wanted-tile handle passed to sequential `ServeMode::Pass` jobs.
+    pub(super) fn wanted_shared(&self) -> Arc<Mutex<HashSet<TileKey>>> {
+        Arc::clone(&self.wanted_shared)
+    }
+
+    /// Atomically replace this layer's wanted tile set and synchronize its
+    /// worker-shared mirror so the two can never drift out of sync.
+    pub(super) fn replace_wanted(&mut self, tiles: impl IntoIterator<Item = TileKey>) {
+        self.wanted.clear();
+        self.wanted.extend(tiles);
+        lock_unpoisoned(&self.wanted_shared).clone_from(&self.wanted);
     }
 
     pub(super) fn clear_wanted(&mut self) {
@@ -349,8 +377,8 @@ impl LayerStack {
 
     pub(super) fn extend_wanted_tile_sets<'a>(&'a self, out: &mut Vec<&'a HashSet<TileKey>>) {
         for layer in &self.layers {
-            if layer.is_active() && !layer.wanted.is_empty() {
-                out.push(&layer.wanted);
+            if layer.is_active() && !layer.wanted().is_empty() {
+                out.push(layer.wanted());
             }
         }
     }

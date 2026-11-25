@@ -16,8 +16,8 @@ use crate::pipeline::grid;
 use crate::pipeline::plan::DISPLAY_STREAM_SPEC;
 use crate::pipeline::radiometry::DisplayMapping;
 
-use super::TiffFormat;
-use super::tags::{chunk_rgba, map_tiff_error};
+use super::format::{TiffFormat, chunk_rgba};
+use super::tags::map_tiff_error;
 use super::ycbcr::YCbCrParams;
 
 /// Maximum idle `tiff::decoder::Decoder` handles retained per [`super::TiffSource`].

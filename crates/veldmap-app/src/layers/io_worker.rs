@@ -10,12 +10,32 @@ use veldmap_core::geo::Frame;
 use veldmap_core::sync::CancelToken;
 use veldmap_raster::RasterSource;
 
-use crate::session::SavedCrsOverride;
+use crate::crs_override::CrsOverride;
 
 use super::LayerId;
 use super::opener::{OpenRasterError, open_local_raster};
 use super::runtime::OverlayRuntime;
 use super::stack::LayerInitOptions;
+
+/// Parameters describing a non-blocking reload of an existing overlay layer.
+pub(super) struct ReloadRequest {
+    pub(super) id: LayerId,
+    pub(super) reload_seq: u64,
+    pub(super) crs_override_epoch: u64,
+    pub(super) path: PathBuf,
+    pub(super) old_fingerprint_hex: String,
+    pub(super) crs_override: Option<CrsOverride>,
+    pub(super) cancel: CancelToken,
+}
+
+/// Completed outcome of a background overlay reload.
+pub(super) struct ReloadedPayload {
+    pub(super) id: LayerId,
+    pub(super) reload_seq: u64,
+    pub(super) crs_override_epoch: u64,
+    pub(super) path: PathBuf,
+    pub(super) outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
+}
 
 /// Commands processed off the UI thread by [`OverlayIoWorker`].
 pub(super) enum OverlayIoCmd {
@@ -25,15 +45,7 @@ pub(super) enum OverlayIoCmd {
         options: LayerInitOptions,
         cancel: CancelToken,
     },
-    Reload {
-        id: LayerId,
-        reload_seq: u64,
-        crs_override_epoch: u64,
-        path: PathBuf,
-        old_fingerprint_hex: String,
-        crs_override: Option<SavedCrsOverride>,
-        cancel: CancelToken,
-    },
+    Reload(ReloadRequest),
 }
 
 /// Results posted back from [`OverlayIoWorker`] to `OverlayManager`.
@@ -44,13 +56,7 @@ pub(super) enum OverlayIoResult {
         options: LayerInitOptions,
         outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
     },
-    Reloaded {
-        id: LayerId,
-        reload_seq: u64,
-        crs_override_epoch: u64,
-        path: PathBuf,
-        outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
-    },
+    Reloaded(ReloadedPayload),
 }
 
 fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<OverlayIoResult>) {
@@ -83,7 +89,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             });
             (runtime.wakeup)();
         }
-        OverlayIoCmd::Reload {
+        OverlayIoCmd::Reload(ReloadRequest {
             id,
             reload_seq,
             crs_override_epoch,
@@ -91,7 +97,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             old_fingerprint_hex,
             crs_override,
             cancel,
-        } => {
+        }) => {
             if cancel.is_cancelled() {
                 return;
             }
@@ -119,13 +125,13 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
                     let _ = disk.clear_source(&new_fp);
                 }
             }
-            let _ = res_tx.send(OverlayIoResult::Reloaded {
+            let _ = res_tx.send(OverlayIoResult::Reloaded(ReloadedPayload {
                 id,
                 reload_seq,
                 crs_override_epoch,
                 path,
                 outcome,
-            });
+            }));
             (runtime.wakeup)();
         }
     }

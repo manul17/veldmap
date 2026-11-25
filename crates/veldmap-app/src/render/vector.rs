@@ -11,6 +11,7 @@ use wgpu::util::DeviceExt;
 
 use super::snapshot::{DrawSnapshot, DrawVectorId, DrawVectorLayer};
 use super::uniforms::{DynamicUniformArena, VectorUniform};
+use crate::clamp_opacity;
 
 /// Compact 24-byte GPU vertex matching `shaders/vector.wgsl` (`@location(0..1)`).
 #[repr(C)]
@@ -187,10 +188,60 @@ fn pack_layer_buffers(device: &wgpu::Device, layer: &DrawVectorLayer) -> CachedV
     }
 }
 
+enum VectorDrawKind<'a> {
+    Fill { ib: &'a wgpu::Buffer },
+    Line,
+    Point,
+}
+
+struct ClusterDrawTarget<'a> {
+    pipeline: &'a wgpu::RenderPipeline,
+    vb: &'a wgpu::Buffer,
+    kind: VectorDrawKind<'a>,
+}
+
+fn record_cluster_draws<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    target: ClusterDrawTarget<'a>,
+    arena: &'a DynamicUniformArena,
+    clusters: &[ClusterDrawRange],
+    offsets: &[ClusterDrawOffsets],
+) {
+    let mut bound = false;
+    for (cluster, off) in clusters.iter().zip(offsets.iter()) {
+        let (dyn_off, range) = match target.kind {
+            VectorDrawKind::Fill { .. } => (off.fill_offset, cluster.fill_indices.clone()),
+            VectorDrawKind::Line => (off.line_offset, cluster.line_vertices.clone()),
+            VectorDrawKind::Point => (off.line_offset, cluster.point_instances.clone()),
+        };
+        let Some(dyn_off) = dyn_off else {
+            continue;
+        };
+        if range.is_empty() {
+            continue;
+        }
+        if !bound {
+            pass.set_pipeline(target.pipeline);
+            pass.set_vertex_buffer(0, target.vb.slice(..));
+            if let VectorDrawKind::Fill { ib } = target.kind {
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            }
+            bound = true;
+        }
+        pass.set_bind_group(1, arena.vector_bind_group(), &[dyn_off]);
+        match target.kind {
+            VectorDrawKind::Fill { .. } => pass.draw_indexed(range, 0, 0..1),
+            VectorDrawKind::Line => pass.draw(range, 0..1),
+            VectorDrawKind::Point => pass.draw(0..6, range),
+        }
+    }
+}
+
 /// GPU buffer cache and Pass-2 recorder for draped vector layers.
 pub(super) struct VectorRenderer {
     buffers: HashMap<DrawVectorId, CachedVectorBuffers>,
-    draw_offsets: Vec<Vec<ClusterDrawOffsets>>,
+    draw_offsets: Vec<ClusterDrawOffsets>,
+    layer_offset_ranges: Vec<Range<usize>>,
 }
 
 impl VectorRenderer {
@@ -198,6 +249,7 @@ impl VectorRenderer {
         Self {
             buffers: HashMap::new(),
             draw_offsets: Vec::new(),
+            layer_offset_ranges: Vec::new(),
         }
     }
 
@@ -228,23 +280,24 @@ impl VectorRenderer {
         snapshot: &DrawSnapshot,
     ) {
         self.draw_offsets.clear();
+        self.layer_offset_ranges.clear();
         let eye = snapshot.camera.eye_ecef();
         let marker_radius_m = point_marker_radius_m(snapshot.camera.height_m());
 
         for layer in &snapshot.vectors {
-            let opacity = layer.opacity.clamp(0.0, 1.0);
+            let start = self.draw_offsets.len();
+            let opacity = clamp_opacity(layer.opacity);
             let fill_alpha = layer.fill_color[3] * opacity;
             let line_alpha = layer.line_color[3] * opacity;
 
             let Some(bufs) = self.buffers.get(&layer.id) else {
-                self.draw_offsets.push(Vec::new());
+                self.layer_offset_ranges.push(start..start);
                 continue;
             };
 
-            let mut cluster_offsets = Vec::with_capacity(bufs.clusters.len());
+            self.draw_offsets.reserve(bufs.clusters.len());
             for cluster in &bufs.clusters {
-                let delta = cluster.origin_ecef_m - eye;
-                let offset_eye = [delta.x as f32, delta.y as f32, delta.z as f32];
+                let offset_eye = (cluster.origin_ecef_m - eye).as_vec3().to_array();
 
                 let fill_offset =
                     (fill_alpha > 0.001 && !cluster.fill_indices.is_empty()).then(|| {
@@ -275,12 +328,13 @@ impl VectorRenderer {
                     })
                 });
 
-                cluster_offsets.push(ClusterDrawOffsets {
+                self.draw_offsets.push(ClusterDrawOffsets {
                     fill_offset,
                     line_offset,
                 });
             }
-            self.draw_offsets.push(cluster_offsets);
+            self.layer_offset_ranges
+                .push(start..self.draw_offsets.len());
         }
     }
 
@@ -296,67 +350,54 @@ impl VectorRenderer {
         if snapshot.vectors.is_empty() {
             return;
         }
-        for (layer, cluster_offsets) in snapshot.vectors.iter().zip(self.draw_offsets.iter()) {
+        for (layer, range) in snapshot.vectors.iter().zip(self.layer_offset_ranges.iter()) {
             let Some(bufs) = self.buffers.get(&layer.id) else {
+                continue;
+            };
+            let Some(cluster_offsets) = self.draw_offsets.get(range.clone()) else {
                 continue;
             };
 
             if let (Some(vb), Some(ib)) = (bufs.fill_vb.as_ref(), bufs.fill_ib.as_ref()) {
-                let mut bound = false;
-                for (cluster, offsets) in bufs.clusters.iter().zip(cluster_offsets.iter()) {
-                    let Some(dyn_off) = offsets.fill_offset else {
-                        continue;
-                    };
-                    if cluster.fill_indices.is_empty() {
-                        continue;
-                    }
-                    if !bound {
-                        pass.set_pipeline(fill_pipeline);
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                        bound = true;
-                    }
-                    pass.set_bind_group(1, arena.vector_bind_group(), &[dyn_off]);
-                    pass.draw_indexed(cluster.fill_indices.clone(), 0, 0..1);
-                }
+                record_cluster_draws(
+                    pass,
+                    ClusterDrawTarget {
+                        pipeline: fill_pipeline,
+                        vb,
+                        kind: VectorDrawKind::Fill { ib },
+                    },
+                    arena,
+                    &bufs.clusters,
+                    cluster_offsets,
+                );
             }
 
             if let Some(vb) = bufs.line_vb.as_ref() {
-                let mut bound = false;
-                for (cluster, offsets) in bufs.clusters.iter().zip(cluster_offsets.iter()) {
-                    let Some(dyn_off) = offsets.line_offset else {
-                        continue;
-                    };
-                    if cluster.line_vertices.is_empty() {
-                        continue;
-                    }
-                    if !bound {
-                        pass.set_pipeline(line_pipeline);
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                        bound = true;
-                    }
-                    pass.set_bind_group(1, arena.vector_bind_group(), &[dyn_off]);
-                    pass.draw(cluster.line_vertices.clone(), 0..1);
-                }
+                record_cluster_draws(
+                    pass,
+                    ClusterDrawTarget {
+                        pipeline: line_pipeline,
+                        vb,
+                        kind: VectorDrawKind::Line,
+                    },
+                    arena,
+                    &bufs.clusters,
+                    cluster_offsets,
+                );
             }
 
             if let Some(vb) = bufs.point_vb.as_ref() {
-                let mut bound = false;
-                for (cluster, offsets) in bufs.clusters.iter().zip(cluster_offsets.iter()) {
-                    let Some(dyn_off) = offsets.line_offset else {
-                        continue;
-                    };
-                    if cluster.point_instances.is_empty() {
-                        continue;
-                    }
-                    if !bound {
-                        pass.set_pipeline(point_pipeline);
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                        bound = true;
-                    }
-                    pass.set_bind_group(1, arena.vector_bind_group(), &[dyn_off]);
-                    pass.draw(0..6, cluster.point_instances.clone());
-                }
+                record_cluster_draws(
+                    pass,
+                    ClusterDrawTarget {
+                        pipeline: point_pipeline,
+                        vb,
+                        kind: VectorDrawKind::Point,
+                    },
+                    arena,
+                    &bufs.clusters,
+                    cluster_offsets,
+                );
             }
         }
     }

@@ -223,20 +223,13 @@ impl CursorProber {
             }),
         };
 
-        if let Err(err) = runtime.fast_pool.try_submit(job) {
-            // Clear `active_key` BEFORE dropping `job` so `CursorProbeGuard::drop`
-            // does not trigger a 100% CPU repaint spin loop when `fast_pool` is full.
-            {
-                let mut state = lock_unpoisoned(&self.cache);
-                if state.active_key == Some(probe_key) {
-                    state.active_key = None;
-                    state.active_cancel = None;
-                }
+        runtime.try_submit_guarded(&runtime.fast_pool, job, false, || {
+            let mut state = lock_unpoisoned(&self.cache);
+            if state.active_key == Some(probe_key) {
+                state.active_key = None;
+                state.active_cancel = None;
             }
-            drop(err);
-            return false;
-        }
-        true
+        })
     }
 
     /// Query the zoom-invariant native CPU display RGBA readout under

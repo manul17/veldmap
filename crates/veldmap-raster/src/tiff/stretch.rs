@@ -12,9 +12,8 @@ use crate::RasterError;
 use crate::pipeline::radiometry::{self, DisplayMapping, percentile_stretch};
 use crate::pipeline::singleflight::{SingleflightRole, SingleflightSlot, run_singleflight};
 
-use super::TiffFormat;
 use super::chunk_reader::DecoderPool;
-use super::tags::typed_samples;
+use super::format::{TiffFormat, typed_samples};
 
 type StretchSlot = SingleflightSlot<DisplayMapping>;
 

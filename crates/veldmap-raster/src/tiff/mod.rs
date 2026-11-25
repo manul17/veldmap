@@ -6,23 +6,24 @@
 //! caching.
 
 mod chunk_reader;
+mod format;
 mod georef;
 mod open;
 mod stretch;
 mod tags;
 mod ycbcr;
 
-use veldmap_core::tile::{RASTER_TILE_SIZE, SourceFingerprint, SourceId};
+use veldmap_core::tile::{SourceFingerprint, SourceId};
 
 use crate::RasterError;
 use crate::pipeline::driver::{self, Chunked as _, DirectRead};
 use crate::pipeline::grid::{Grid, chunk_working_bytes};
-use crate::pipeline::metadata::{RasterDescription, SampleType};
-use crate::pipeline::plan::{DISPLAY_STREAM_SPEC, PyramidMeta};
-use crate::pipeline::radiometry::{DisplayMapping, PixelLayout};
+use crate::pipeline::metadata::RasterDescription;
+use crate::pipeline::radiometry::DisplayMapping;
 use crate::pipeline::{DecodeContext, RasterSource, TileEmit};
 
 use chunk_reader::{ChunkReadMode, DecoderPool, TiffChunkReader};
+use format::TiffFormat;
 use stretch::{StretchCache, StretchRequest};
 
 /// BigTIFF file header signatures (`version = 43`).
@@ -45,17 +46,6 @@ pub const MAX_IFDS: usize = 64;
 pub fn has_tiff_magic(head: &[u8]) -> bool {
     CLASSIC_MAGIC.iter().any(|m| head.starts_with(m))
         || BIG_MAGIC.iter().any(|m| head.starts_with(m))
-}
-
-/// Compact sample-layout descriptor shared across TIFF overview scanning,
-/// chunk reading, and lazy display-mapping stretch computation.
-#[derive(Clone, Copy, Debug)]
-pub(in crate::tiff) struct TiffFormat {
-    pub(super) pixel_layout: PixelLayout,
-    pub(super) sample_bits: u8,
-    pub(super) sample_type: SampleType,
-    pub(super) depth: u32,
-    pub(super) nodata: Option<f32>,
 }
 
 /// Thread-safe opened GeoTIFF/BigTIFF/COG source backed by a positioned
@@ -125,17 +115,6 @@ impl RasterSource for TiffSource {
 
     fn description(&self) -> &RasterDescription {
         &self.description
-    }
-
-    fn pyramid_meta(&self) -> PyramidMeta {
-        PyramidMeta {
-            source: self.source_id,
-            spec: DISPLAY_STREAM_SPEC,
-            width: self.description.width,
-            height: self.description.height,
-            tile_size: RASTER_TILE_SIZE,
-            levels: self.description.levels.clone(),
-        }
     }
 
     fn pass_peak_bytes(&self) -> u64 {

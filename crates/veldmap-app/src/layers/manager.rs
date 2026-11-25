@@ -17,25 +17,18 @@ use veldmap_core::tile::{SourceId, TileKey};
 use veldmap_raster::{DecodePoolHandle, RasterSource};
 use veldmap_storage::TileDiskCache;
 
+use crate::clamp_opacity;
+use crate::crs_override::CrsOverride;
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSender};
 use crate::render::DrawOverlayLayer;
-use crate::session::{SavedCrsOverride, SavedLayerEntry};
 
 use super::cursor::CursorProber;
 use super::frame::{LayerFrameCtx, build_and_schedule_layer};
-use super::io_worker::{OverlayIoCmd, OverlayIoResult, OverlayIoWorker};
-use super::opener::{OpenRasterError, bind_frame_with_saved_override};
+use super::io_worker::{OverlayIoCmd, OverlayIoResult, OverlayIoWorker, ReloadedPayload};
+use super::opener::{OpenRasterError, bind_frame_with_override};
 use super::runtime::OverlayRuntime;
 use super::stack::{LayerInitOptions, LayerStack, OverlayLayer};
-use super::{CursorReadout, LayerId, LayerSummary, OverlayIoEvent};
-
-struct ReloadedPayload {
-    id: LayerId,
-    reload_seq: u64,
-    crs_override_epoch: u64,
-    path: PathBuf,
-    outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
-}
+use super::{CursorReadout, LayerId, LayerSummary, OverlayIoEvent, OverlayPersistEntry};
 
 /// Per-frame camera, viewport, cache, and appetite inputs for
 /// [`OverlayManager::build_and_schedule`].
@@ -145,23 +138,20 @@ impl OverlayManager {
         self.stack.layers().len()
     }
 
-    /// Look up the current saved CRS override for `id`, if any.
-    pub(crate) fn layer_crs_override(&self, id: LayerId) -> Option<SavedCrsOverride> {
+    /// Look up the current CRS override for `id`, if any.
+    pub(crate) fn layer_crs_override(&self, id: LayerId) -> Option<CrsOverride> {
         self.stack.get(id).and_then(|l| l.crs_override.clone())
     }
 
-    /// Snapshot current raster layers in painter's order for `session.json`.
-    pub(crate) fn saved_layer_entries(&self) -> Vec<SavedLayerEntry> {
-        self.stack
-            .layers()
-            .iter()
-            .map(|layer| SavedLayerEntry {
-                path: layer.path.clone(),
-                visible: layer.visible,
-                opacity: layer.opacity,
-                crs_override: layer.crs_override.clone(),
-            })
-            .collect()
+    /// Borrowed view of loaded raster layers in painter's order for session
+    /// persistence.
+    pub(crate) fn saved_entries_iter(&self) -> impl Iterator<Item = OverlayPersistEntry<'_>> {
+        self.stack.layers().iter().map(|layer| OverlayPersistEntry {
+            path: &layer.path,
+            visible: layer.visible,
+            opacity: layer.opacity,
+            crs_override: layer.crs_override.as_ref(),
+        })
     }
 
     /// Queue a non-blocking local raster open onto [`OverlayIoWorker`].
@@ -179,7 +169,7 @@ impl OverlayManager {
         fly_to: bool,
         visible: bool,
         opacity: f32,
-        crs_override: Option<SavedCrsOverride>,
+        crs_override: Option<CrsOverride>,
     ) -> Result<(), String> {
         let cancel = self.runtime.shutdown.child_token();
         if self.io_worker.send(OverlayIoCmd::Open {
@@ -187,7 +177,7 @@ impl OverlayManager {
             fly_to,
             options: LayerInitOptions {
                 visible,
-                opacity: opacity.clamp(0.0, 1.0),
+                opacity: clamp_opacity(opacity),
                 crs_override,
             },
             cancel,
@@ -205,31 +195,11 @@ impl OverlayManager {
         &mut self,
         id: LayerId,
     ) -> Result<OverlayMutation, String> {
-        let (
-            path,
-            old_src,
-            old_fp,
-            crs_override,
-            crs_override_epoch,
-            reload_seq,
-            reload_cancel,
-            prev_cancel,
-        ) = {
+        let (request, old_src, prev_cancel) = {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
             };
-            let cancel = self.runtime.shutdown.child_token();
-            let (reload_seq, prev) = layer.begin_reload(cancel.clone());
-            (
-                layer.path.clone(),
-                layer.source_id(),
-                layer.fingerprint_hex.clone(),
-                layer.crs_override.clone(),
-                layer.crs_override_epoch,
-                reload_seq,
-                cancel,
-                prev,
-            )
+            layer.begin_reload(self.runtime.shutdown.child_token())
         };
         if let Some(prev) = prev_cancel {
             prev.cancel();
@@ -239,15 +209,7 @@ impl OverlayManager {
         // so no worker can write stale pixels while reload runs.
         self.purge_source(old_src);
 
-        if !self.io_worker.send(OverlayIoCmd::Reload {
-            id,
-            reload_seq,
-            crs_override_epoch,
-            path,
-            old_fingerprint_hex: old_fp,
-            crs_override,
-            cancel: reload_cancel,
-        }) {
+        if !self.io_worker.send(OverlayIoCmd::Reload(request)) {
             if let Some(layer) = self.stack.get_mut(id) {
                 layer.abort_reload();
             }
@@ -282,23 +244,9 @@ impl OverlayManager {
                     &mut events,
                     &mut mutation,
                 ),
-                OverlayIoResult::Reloaded {
-                    id,
-                    reload_seq,
-                    crs_override_epoch,
-                    path,
-                    outcome,
-                } => self.handle_reloaded_result(
-                    ReloadedPayload {
-                        id,
-                        reload_seq,
-                        crs_override_epoch,
-                        path,
-                        outcome,
-                    },
-                    &mut events,
-                    &mut mutation,
-                ),
+                OverlayIoResult::Reloaded(payload) => {
+                    self.handle_reloaded_result(payload, &mut events, &mut mutation);
+                }
             }
         }
 
@@ -354,29 +302,28 @@ impl OverlayManager {
             path,
             outcome,
         } = reloaded;
-        let Some(live_override) = self.stack.get(id).and_then(|slot| {
-            slot.matches_reload_seq(reload_seq).then(|| {
-                (slot.crs_override_epoch != crs_override_epoch).then(|| slot.crs_override.clone())
-            })
-        }) else {
-            // Layer was removed or superseded by a newer reload trigger.
-            return;
-        };
-        match outcome {
-            Ok((source, mut frame)) => {
-                // If `override_layer_crs` ran while this reload was in flight,
-                // re-bind the reloaded source against the live `crs_override`
-                // so it never silently reverts.
-                if let Some(current_override) = live_override {
-                    match bind_frame_with_saved_override(
-                        source.description(),
-                        current_override.as_ref(),
-                    ) {
-                        Ok(rebound) => frame = rebound,
-                        Err(error) => {
-                            if let Some(slot) = self.stack.get_mut(id)
-                                && slot.finish_reload_err(reload_seq)
-                            {
+        let relaid = self.alloc_relaid();
+        let (old_src, new_src) = {
+            let Some(slot) = self.stack.get_mut(id) else {
+                return;
+            };
+            if !slot.matches_reload_seq(reload_seq) {
+                // Layer was superseded by a newer reload trigger.
+                return;
+            }
+            match outcome {
+                Ok((source, mut frame)) => {
+                    // If `override_layer_crs` ran while this reload was in flight,
+                    // re-bind the reloaded source against the live `crs_override`
+                    // so it never silently reverts.
+                    if slot.crs_override_epoch != crs_override_epoch {
+                        match bind_frame_with_override(
+                            source.description(),
+                            slot.crs_override.as_ref(),
+                        ) {
+                            Ok(rebound) => frame = rebound,
+                            Err(error) => {
+                                slot.finish_reload_err(reload_seq);
                                 slot.last_error = Some(error.clone());
                                 mutation.changed = true;
                                 events.push(OverlayIoEvent::Failed {
@@ -384,34 +331,20 @@ impl OverlayManager {
                                     error,
                                     can_assign_crs: true,
                                 });
+                                return;
                             }
-                            return;
                         }
                     }
+                    let new_src = source.source_id();
+                    let Some(old_src) =
+                        slot.replace_reloaded(reload_seq, path, source, frame, relaid)
+                    else {
+                        return;
+                    };
+                    (old_src, new_src)
                 }
-                let new_src = source.source_id();
-                let relaid = self.alloc_relaid();
-                let Some(old_src) = self.stack.get_mut(id).and_then(|slot| {
-                    slot.replace_reloaded(reload_seq, path, source, frame, relaid)
-                }) else {
-                    return;
-                };
-
-                // Purge runtime/GPU state for both `old_src` and `new_src`
-                // (in case a sibling layer decoded tiles during reload).
-                self.purge_source(old_src);
-                mutation.purge_sources.push(old_src);
-                if new_src != old_src {
-                    self.purge_source(new_src);
-                    mutation.purge_sources.push(new_src);
-                }
-                mutation.changed = true;
-                events.push(OverlayIoEvent::Reloaded { id });
-            }
-            Err(err) => {
-                if let Some(slot) = self.stack.get_mut(id)
-                    && slot.finish_reload_err(reload_seq)
-                {
+                Err(err) => {
+                    slot.finish_reload_err(reload_seq);
                     slot.last_error = Some(err.message.clone());
                     // Reload failed: leave the existing layer intact and
                     // resume normal rendering on the next frame.
@@ -421,9 +354,21 @@ impl OverlayManager {
                         error: err.message,
                         can_assign_crs: err.can_assign_crs,
                     });
+                    return;
                 }
             }
+        };
+
+        // Purge runtime/GPU state for both `old_src` and `new_src`
+        // (in case a sibling layer decoded tiles during reload).
+        self.purge_source(old_src);
+        mutation.purge_sources.push(old_src);
+        if new_src != old_src {
+            self.purge_source(new_src);
+            mutation.purge_sources.push(new_src);
         }
+        mutation.changed = true;
+        events.push(OverlayIoEvent::Reloaded { id });
     }
 
     /// Move layer toward the top of painter's order.
@@ -442,14 +387,13 @@ impl OverlayManager {
     pub(crate) fn override_layer_crs(
         &mut self,
         id: LayerId,
-        crs_override: Option<SavedCrsOverride>,
+        crs_override: Option<CrsOverride>,
     ) -> Result<Option<veldmap_core::geo::FootprintBounds>, String> {
         let relaid = self.alloc_relaid();
         let Some(layer) = self.stack.get_mut(id) else {
             return Err("layer no longer exists".to_owned());
         };
-        let frame =
-            bind_frame_with_saved_override(layer.source.description(), crs_override.as_ref())?;
+        let frame = bind_frame_with_override(layer.source.description(), crs_override.as_ref())?;
         layer.apply_rebound_frame(frame, crs_override, relaid);
         Ok(layer.footprint)
     }
@@ -499,7 +443,7 @@ impl OverlayManager {
     }
 
     pub(crate) fn set_opacity(&mut self, id: LayerId, opacity: f32) -> bool {
-        let clamped = opacity.clamp(0.0, 1.0);
+        let clamped = clamp_opacity(opacity);
         let Some(layer) = self.stack.get_mut(id) else {
             return false;
         };

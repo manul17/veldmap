@@ -20,3 +20,9 @@ const ERROR_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 110, 95);
 const WARN_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(240, 185, 85);
 /// Transient tile-error badge text color (`#EB915F`).
 const TILE_ERROR_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 145, 95);
+
+/// Return `true` when a single-line `egui::TextEdit` was submitted by pressing
+/// `Enter`.
+pub(super) fn submitted_with_enter(ui: &egui::Ui, resp: &egui::Response) -> bool {
+    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}

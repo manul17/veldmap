@@ -251,18 +251,49 @@ fn trace_edge_handles_non_positive_and_non_finite_limits_without_panicking() {
 }
 
 #[test]
-fn dedup_ring_removes_consecutive_and_wrap_around_duplicates() {
-    let ring = [
-        (0.0, 0.0),
-        (0.0, 0.0),
-        (1.0, 0.0),
-        (1.0, 1.0),
-        (1.0, 1.0),
-        (0.0, 0.0),
+fn dedup_geo_ring_removes_consecutive_wrap_around_and_non_finite_points() {
+    let pts = [
+        GeoPoint::new(0.0, 0.0),
+        GeoPoint::new(0.0, 0.0),
+        GeoPoint::new(f64::NAN, 1.0),
+        GeoPoint::new(1.0, 0.0),
+        GeoPoint::new(1.0, 1.0),
+        GeoPoint::new(1.0, 1.0),
+        GeoPoint::new(0.0, 0.0),
     ];
-    assert_eq!(dedup_ring(&ring), vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]);
-    assert_eq!(dedup_ring(&[(1.0, 2.0), (1.0, 2.0)]), vec![(1.0, 2.0)]);
-    assert!(dedup_ring(&[]).is_empty());
+    assert_eq!(
+        dedup_geo_ring(&pts),
+        vec![
+            GeoPoint::new(0.0, 0.0),
+            GeoPoint::new(1.0, 0.0),
+            GeoPoint::new(1.0, 1.0),
+        ]
+    );
+    assert_eq!(
+        dedup_geo_ring(&[GeoPoint::new(1.0, 2.0), GeoPoint::new(1.0, 2.0)]),
+        vec![GeoPoint::new(1.0, 2.0)]
+    );
+    assert!(dedup_geo_ring(&[]).is_empty());
+}
+
+#[test]
+fn covers_polygons_checks_disjoint_polygons_and_respects_holes() {
+    let donut = Polygon::with_holes(
+        ring(&[(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)]),
+        vec![ring(&[(3.0, 3.0), (3.0, 7.0), (7.0, 7.0), (7.0, 3.0)])],
+    );
+    let island = Polygon::new(ring(&[
+        (20.0, 20.0),
+        (20.0, 25.0),
+        (25.0, 25.0),
+        (25.0, 20.0),
+    ]));
+    let polygons = [donut, island];
+    assert!(covers_polygons(&polygons, 1.0, 1.0));
+    assert!(!covers_polygons(&polygons, 5.0, 5.0)); // inside hole
+    assert!(covers_polygons(&polygons, 22.0, 22.0)); // second polygon
+    assert!(!covers_polygons(&polygons, 15.0, 15.0)); // between polygons
+    assert!(!covers_polygons(&[], 1.0, 1.0));
 }
 
 #[test]

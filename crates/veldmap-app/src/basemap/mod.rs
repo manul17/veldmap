@@ -14,13 +14,14 @@
 //! - Shared `< 50%` VRAM appetite capping across bundled + live tiles
 
 mod adapters;
-pub(crate) mod bundled;
+mod bundled;
 mod manager;
 pub mod policy;
 
 use veldmap_core::tile::SourceId;
 use veldmap_net::NetworkStatus;
 
+pub use bundled::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG, BUNDLED_MAX_LEVEL};
 pub(crate) use manager::BasemapManager;
 
 /// App-owned view of live HTTP streaming status so `ui::basemap` never depends

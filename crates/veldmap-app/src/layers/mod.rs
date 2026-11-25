@@ -1,31 +1,29 @@
-//! Ordered raster overlay stack, two-lane `PassKey`-scoped scheduling with QOI
-//! disk caching, non-blocking local file open/reload I/O, and zoom-invariant
-//! CPU cursor readouts.
+//! Raster overlay subsystem: ordered raster overlay stack, two-lane
+//! `PassKey`-scoped scheduling with QOI disk caching, non-blocking local file
+//! open/reload I/O, and zoom-invariant CPU cursor readouts.
+//!
+//! Read-only GeoJSON vector layers live in [`crate::vectors`] and interactive
+//! geodesic measurement lives in [`crate::measure`].
 
 mod cursor;
 mod frame;
 mod io_worker;
 mod jobs;
 mod manager;
-mod measure;
 mod opener;
 mod qoi_cache;
 mod runtime;
 mod stack;
-mod vectors;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::RASTER_TILE_SIZE;
 
+use crate::crs_override::CrsOverride;
 use crate::gpu_tiles::display_tile_mip_bytes;
 
 pub(crate) use manager::{OverlayFrameCtx, OverlayManager, OverlayMutation};
-pub(crate) use measure::{MeasureMode, MeasureSession};
-pub(crate) use vectors::{
-    VectorIoWorker, VectorLayerId, VectorLayerStack, VectorLayerSummary, is_geojson_path,
-};
 
 /// Default unpacked VRAM byte weight for an 8-bit `512 x 512` display tile
 /// with full linear-light mip chain (`~1.33 MiB`), matching `BasemapManager`.
@@ -35,7 +33,7 @@ pub(super) fn default_display_tile_bytes() -> usize {
 
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct LayerId(pub(crate) u64);
+pub(crate) struct LayerId(u64);
 
 /// Read-only summary of an overlay layer rendered in the Layer List UI.
 #[derive(Clone, Debug)]
@@ -63,6 +61,16 @@ pub(crate) struct LayerSummary {
     pub(crate) can_move_down: bool,
 }
 
+/// Borrowed persistence view of a loaded raster overlay layer for
+/// `session.json` serialization without coupling `layers` to `crate::session`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OverlayPersistEntry<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
+    pub(crate) crs_override: Option<&'a CrsOverride>,
+}
+
 /// Classified value returned by a zoom-invariant CPU cursor probe so decode
 /// backpressure or giant-strip rejections are never misreported as `"nodata"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,8 +91,8 @@ pub(crate) struct CursorReadout {
     pub(crate) value: CursorReadoutValue,
 }
 
-/// Asynchronous result of a background local-file open or reload operation,
-/// drained by `VeldmapApp` at the start of each frame.
+/// Asynchronous result of a background local raster open or reload operation,
+/// drained by `SceneState` at the start of each frame.
 #[derive(Clone, Debug)]
 pub(crate) enum OverlayIoEvent {
     Opened {
@@ -100,15 +108,5 @@ pub(crate) enum OverlayIoEvent {
         path: PathBuf,
         error: String,
         can_assign_crs: bool,
-    },
-    VectorOpened {
-        id: VectorLayerId,
-        path: PathBuf,
-        bounds: Option<FootprintBounds>,
-        fly_to: bool,
-    },
-    VectorFailed {
-        path: PathBuf,
-        error: String,
     },
 }

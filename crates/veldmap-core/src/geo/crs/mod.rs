@@ -9,7 +9,7 @@ mod presets;
 use std::sync::Arc;
 
 use super::datum::{
-    Datum, DatumWarning, LinearUnit, PULKOVO_1942, WGS84_DATUM, known_datum_from_code,
+    Datum, DatumWarning, LinearUnit, PULKOVO_1942, WGS84_DATUM, known_geographic_epsg,
 };
 use super::proj4::{CrsError, Proj4Projection, looks_like_wkt};
 use super::projection::{Projection, System};
@@ -51,9 +51,7 @@ impl CrsSpec {
 
     /// Resolve any supported EPSG (or MSK-61 `633610x`) code into a [`CrsSpec`].
     pub fn from_epsg(code: u32) -> Result<Self, CrsError> {
-        if let Some(label) = known_geographic_epsg_label(code)
-            && let Some((datum, warning)) = known_datum_from_code(code)
-        {
+        if let Some((datum, label, warning)) = known_geographic_epsg(code) {
             return Ok(Self::Geographic {
                 datum,
                 label,
@@ -131,17 +129,6 @@ impl CrsSpec {
             Self::Geographic { warning, .. } => warning.as_ref(),
             Self::GeographicProj(p) => p.datum_warning(),
         }
-    }
-}
-
-fn known_geographic_epsg_label(code: u32) -> Option<String> {
-    match code {
-        4326 | 4979 => Some(format!("EPSG:{code} (WGS 84)")),
-        4284 => Some("EPSG:4284 (Pulkovo 1942)".to_string()),
-        4269 => Some("EPSG:4269 (NAD83)".to_string()),
-        4258 => Some("EPSG:4258 (ETRS89)".to_string()),
-        4277 => Some("EPSG:4277 (OSGB36)".to_string()),
-        _ => None,
     }
 }
 

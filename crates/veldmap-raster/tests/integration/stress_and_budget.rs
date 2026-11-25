@@ -12,7 +12,7 @@ use veldmap_core::tile::{
     SourceId, StreamKey, TileKey,
 };
 use veldmap_raster::{
-    DecodeContext, DecodeJob, DecodeJobKey, DecodeLane, DecodePoolConfig, RasterSource, ServeMode,
+    DecodeContext, DecodeJob, DecodeJobKey, DecodePoolConfig, RasterSource, ServeMode,
     SharedChunkCache, TiffSource, TileScheduler, TwoLaneDecodePool, TwoLaneDecodePoolConfig,
 };
 
@@ -150,7 +150,8 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
         },
         shutdown.clone(),
     );
-    let handle = pool.handle();
+    let fast_handle = pool.fast_handle();
+    let bulk_handle = pool.bulk_handle();
 
     let bulk_started = Arc::new(AtomicUsize::new(0));
     let release_bulk = CancelToken::new();
@@ -169,33 +170,30 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
             format: PixelFormat::Rgba8UnormSrgb,
             gutter: 0,
         };
-        assert!(handle.submit(
-            DecodeLane::Bulk,
-            DecodeJob {
-                key: DecodeJobKey::Pass(pass_key),
-                queued_bytes: 1024,
-                cancel: pass_cancel.clone(),
-                work: Box::new(move || {
-                    let ctx = DecodeContext {
-                        chunk_cache: &cache,
-                        budget_tracker: &tracker,
-                        budget: &budget,
-                        cancel: &pass_cancel,
-                    };
-                    let mut signaled = false;
-                    let _ = src.produce_pass(&ctx, &mut |_, _, _, _, _, _| {
-                        if !signaled {
-                            signaled = true;
-                            started.fetch_add(1, Ordering::AcqRel);
-                            while !rel.is_cancelled() {
-                                thread::sleep(Duration::from_millis(2));
-                            }
+        assert!(bulk_handle.submit(DecodeJob {
+            key: DecodeJobKey::Pass(pass_key),
+            queued_bytes: 1024,
+            cancel: pass_cancel.clone(),
+            work: Box::new(move || {
+                let ctx = DecodeContext {
+                    chunk_cache: &cache,
+                    budget_tracker: &tracker,
+                    budget: &budget,
+                    cancel: &pass_cancel,
+                };
+                let mut signaled = false;
+                let _ = src.produce_pass(&ctx, &mut |_, _, _, _, _, _| {
+                    if !signaled {
+                        signaled = true;
+                        started.fetch_add(1, Ordering::AcqRel);
+                        while !rel.is_cancelled() {
+                            thread::sleep(Duration::from_millis(2));
                         }
-                        Ok(())
-                    });
-                }),
-            }
-        ));
+                    }
+                    Ok(())
+                });
+            }),
+        }));
     }
 
     let wait_start = Instant::now();
@@ -213,26 +211,23 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
         let tracker = Arc::clone(&tracker);
         let fast_cancel = shutdown.child_token();
         let tx = tx.clone();
-        assert!(handle.submit(
-            DecodeLane::Fast,
-            DecodeJob {
-                key: DecodeJobKey::Tile(fast_tile_key(x)),
-                queued_bytes: 256,
-                cancel: fast_cancel.clone(),
-                work: Box::new(move || {
-                    let ctx = DecodeContext {
-                        chunk_cache: &cache,
-                        budget_tracker: &tracker,
-                        budget: &budget,
-                        cancel: &fast_cancel,
-                    };
-                    let tile = src
-                        .decode_pointwise_tile(0, x % 2, x / 2, &ctx)
-                        .expect("fast decode");
-                    let _ = tx.send((tile.width(), tile.height()));
-                }),
-            }
-        ));
+        assert!(fast_handle.submit(DecodeJob {
+            key: DecodeJobKey::Tile(fast_tile_key(x)),
+            queued_bytes: 256,
+            cancel: fast_cancel.clone(),
+            work: Box::new(move || {
+                let ctx = DecodeContext {
+                    chunk_cache: &cache,
+                    budget_tracker: &tracker,
+                    budget: &budget,
+                    cancel: &fast_cancel,
+                };
+                let tile = src
+                    .decode_pointwise_tile(0, x % 2, x / 2, &ctx)
+                    .expect("fast decode");
+                let _ = tx.send((tile.width(), tile.height()));
+            }),
+        }));
     }
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -452,7 +447,8 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
         },
         shutdown.clone(),
     );
-    let handle = pool.handle();
+    let fast_handle = pool.fast_handle();
+    let bulk_handle = pool.bulk_handle();
 
     let (paused_tx, paused_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -470,7 +466,7 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
         let src = Arc::clone(&strip_src);
         let cache = Arc::clone(&chunk_cache);
         let tr = Arc::clone(&tracker);
-        assert!(handle.bulk().submit(DecodeJob {
+        assert!(bulk_handle.submit(DecodeJob {
             key: DecodeJobKey::Pass(pass_key),
             queued_bytes: 1024,
             cancel: pass_cancel.clone(),
@@ -508,7 +504,7 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
         let cache = Arc::clone(&chunk_cache);
         let tr = Arc::clone(&tracker);
         let fast_cancel = admitted[0].cancel.clone();
-        assert!(handle.fast().submit(DecodeJob {
+        assert!(fast_handle.submit(DecodeJob {
             key: DecodeJobKey::Tile(cog_tile_key),
             queued_bytes: 256,
             cancel: fast_cancel.clone(),

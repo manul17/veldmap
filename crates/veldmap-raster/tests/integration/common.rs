@@ -184,3 +184,106 @@ pub fn build_multi_tile_tiff(tiles_x: u32, tiles_y: u32, chunk_side: u32) -> Vec
     }
     file.into_inner()
 }
+
+/// Build a minimal classic little-endian single-strip TIFF with explicit IFD
+/// entries (sorted by tag id).
+pub fn build_raw_tiff(entries: &mut [(u16, u16, u32, Vec<u8>)], pixel_payload: &[u8]) -> Vec<u8> {
+    entries.sort_by_key(|(tag, _, _, _)| *tag);
+    // Header: 8 bytes (II, 42, ifd_offset=8)
+    let mut out = vec![b'I', b'I', 42, 0, 8, 0, 0, 0];
+    let n_entries = entries.len() as u16;
+    out.extend_from_slice(&n_entries.to_le_bytes());
+
+    let ifd_size = 2 + entries.len() * 12 + 4;
+    let extra_data_offset = (8 + ifd_size) as u32;
+    let mut extra_blobs: Vec<u8> = Vec::new();
+
+    // Reserve pixel_payload right after extra blobs.
+    let mut inline_or_deferred: Vec<(u16, u16, u32, [u8; 4], bool)> = Vec::new();
+    for (tag, ty, count, raw) in entries.iter() {
+        if *tag == 273 {
+            // StripOffsets placeholder (patched once extra_blobs finishes)
+            inline_or_deferred.push((*tag, *ty, *count, [0; 4], true));
+            continue;
+        }
+        if raw.len() <= 4 {
+            let mut val = [0u8; 4];
+            val[..raw.len()].copy_from_slice(raw);
+            inline_or_deferred.push((*tag, *ty, *count, val, false));
+        } else {
+            let off = extra_data_offset + extra_blobs.len() as u32;
+            extra_blobs.extend_from_slice(raw);
+            if extra_blobs.len() % 2 == 1 {
+                extra_blobs.push(0);
+            }
+            inline_or_deferred.push((*tag, *ty, *count, off.to_le_bytes(), false));
+        }
+    }
+
+    let pixel_offset = extra_data_offset + extra_blobs.len() as u32;
+    for (tag, ty, count, mut val, is_strip_off) in inline_or_deferred {
+        if is_strip_off {
+            val = pixel_offset.to_le_bytes();
+        }
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&ty.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&val);
+    }
+    // Next IFD = 0
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&extra_blobs);
+    out.extend_from_slice(pixel_payload);
+    out
+}
+
+pub fn build_rgb_4x4_tiff(extra: &[(u16, u16, u32, Vec<u8>)], fill: u8) -> Vec<u8> {
+    let payload = vec![fill; 4 * 4 * 3];
+    let mut entries = vec![
+        tag_u32(256, 4),
+        tag_u32(257, 4),
+        tag_u16_vec(258, &[8, 8, 8]),
+        tag_u16(259, 1),
+        tag_u16(262, 2),
+        tag_u32(273, 0),
+        tag_u16(277, 3),
+        tag_u32(278, 4),
+        tag_u32(279, payload.len() as u32),
+        tag_u16(284, 1),
+    ];
+    entries.extend_from_slice(extra);
+    build_raw_tiff(&mut entries, &payload)
+}
+
+pub fn tag_u16(tag: u16, v: u16) -> (u16, u16, u32, Vec<u8>) {
+    (tag, 3, 1, v.to_le_bytes().to_vec())
+}
+
+pub fn tag_u16_vec(tag: u16, vals: &[u16]) -> (u16, u16, u32, Vec<u8>) {
+    let mut b = Vec::with_capacity(vals.len() * 2);
+    for v in vals {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    (tag, 3, vals.len() as u32, b)
+}
+
+pub fn tag_u32(tag: u16, v: u32) -> (u16, u16, u32, Vec<u8>) {
+    (tag, 4, 1, v.to_le_bytes().to_vec())
+}
+
+pub fn tag_f64_vec(tag: u16, vals: &[f64]) -> (u16, u16, u32, Vec<u8>) {
+    let mut b = Vec::with_capacity(vals.len() * 8);
+    for v in vals {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    (tag, 12, vals.len() as u32, b)
+}
+
+pub fn tag_rational_vec(tag: u16, vals: &[(u32, u32)]) -> (u16, u16, u32, Vec<u8>) {
+    let mut b = Vec::with_capacity(vals.len() * 8);
+    for &(n, d) in vals {
+        b.extend_from_slice(&n.to_le_bytes());
+        b.extend_from_slice(&d.to_le_bytes());
+    }
+    (tag, 5, vals.len() as u32, b)
+}
