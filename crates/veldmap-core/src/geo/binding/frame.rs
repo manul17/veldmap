@@ -5,12 +5,9 @@
 
 use std::sync::Arc;
 
-use super::super::crs::CrsSpec;
-use super::super::datum::{Datum, DatumWarning, WGS84_DATUM};
+use super::super::crs::{CrsSpec, Datum, DatumWarning, Proj4Projection, Projection, WGS84_DATUM};
 use super::super::footprint::FootprintBounds;
 use super::super::geodesy;
-use super::super::proj4::Proj4Projection;
-use super::super::projection::Projection;
 use super::tie_grid::{Tie, TieGrid};
 
 /// Web Mercator equatorial circumference in metres (`2 * pi * a`).

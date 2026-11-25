@@ -2,31 +2,17 @@
 //! (`proj4rs` + `proj4wkt` + `crs-definitions`) targeting WGS84 geodetic
 //! coordinates at the module boundary.
 //!
-//! Leaf module above [`super::datum`] and [`super::geodesy`] with no dependency
-//! on [`super::projection`] or [`super::crs`].
+//! Leaf module above [`super::datum`], [`super::error`], and
+//! [`super::super::geodesy`] with no dependency on [`super::projection`] or
+//! [`super::presets`].
 
 use std::sync::OnceLock;
 
 use proj4rs::proj::Proj;
-use thiserror::Error;
 
+use super::super::geodesy::WGS84;
 use super::datum::DatumWarning;
-use super::geodesy::WGS84;
-
-/// Errors produced when parsing or instantiating a CRS definition.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum CrsError {
-    #[error("unsupported or unknown EPSG code: EPSG:{0}")]
-    UnsupportedEpsg(u32),
-    #[error("failed to parse WKT CRS definition: {0}")]
-    InvalidWkt(String),
-    #[error("failed to parse PROJ CRS string: {0}")]
-    InvalidProj(String),
-    #[error("CRS definition is missing inverse or forward transform support")]
-    NonInvertible,
-    #[error("invalid custom Transverse Mercator parameters: {0}")]
-    InvalidCustomTm(String),
-}
+use super::error::CrsError;
 
 /// Pure-Rust `proj4rs` coordinate system wrapper targeting WGS84 geodetic
 /// coordinates at the module boundary.
@@ -136,7 +122,7 @@ impl Proj4Projection {
 
     /// Scale factor from this projection's linear units to metres (`1.0` for
     /// metres or geographic).
-    pub(super) fn unit_to_metres(&self) -> f64 {
+    pub(crate) fn unit_to_metres(&self) -> f64 {
         let m = self.proj.to_meter();
         if m.is_finite() && m > 0.0 { m } else { 1.0 }
     }
@@ -148,7 +134,7 @@ impl Proj4Projection {
 
     /// Convert projected `(x, y)` (or source-datum `(lon_deg, lat_deg)` when
     /// geographic) into WGS84 `(lat_deg, lon_deg)`.
-    pub(super) fn to_wgs84_geodetic(&self, x: f64, y: f64) -> (f64, f64) {
+    pub(crate) fn to_wgs84_geodetic(&self, x: f64, y: f64) -> (f64, f64) {
         if !(x.is_finite() && y.is_finite()) {
             return (f64::NAN, f64::NAN);
         }
@@ -171,7 +157,7 @@ impl Proj4Projection {
 
     /// Convert WGS84 `(lat_deg, lon_deg)` into projected `(x, y)` (or
     /// source-datum `(lon_deg, lat_deg)` when geographic).
-    pub(super) fn transform_from_wgs84_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
+    pub(crate) fn transform_from_wgs84_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         if !(lat_deg.is_finite() && lon_deg.is_finite()) {
             return (f64::NAN, f64::NAN);
         }

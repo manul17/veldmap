@@ -1,28 +1,35 @@
-//! Pure-Rust CRS catalog, unified CRS specification ([`CrsSpec`]), custom
+//! Pure-Rust CRS catalog, datums/units, fast in-house map projections, general
+//! `proj4rs` transforms, unified CRS specification ([`CrsSpec`]), custom
 //! Transverse Mercator builder, and searchable UI CRS presets.
-//!
-//! Fast in-house projections remain in [`super::projection`], datums/units in
-//! [`super::datum`], and general `proj4rs` transforms in [`super::proj4`].
 
+mod datum;
+mod error;
 mod presets;
+mod proj4;
+mod projection;
 
 use std::sync::Arc;
 
-use super::datum::{
-    Datum, DatumWarning, LinearUnit, PULKOVO_1942, WGS84_DATUM, known_geographic_epsg,
-};
-use super::proj4::{CrsError, Proj4Projection};
-use super::projection::{Projection, System};
+use serde::{Deserialize, Serialize};
 
-pub use presets::{CrsPreset, builtin_crs_presets, search_crs_presets};
+use self::datum::known_geographic_epsg;
+
+pub use self::datum::{
+    Datum, DatumWarning, HelmertConvention, KRASOVSKY, LinearUnit, PULKOVO_1942, US_SURVEY_FOOT_M,
+    WGS84_DATUM, ellipsoid_from_epsg, known_datum_from_code,
+};
+pub use self::error::CrsError;
+pub use self::presets::{CrsPreset, builtin_crs_presets, search_crs_presets};
+pub use self::proj4::Proj4Projection;
+pub use self::projection::{Projection, System, WEB_MERCATOR_LIMIT_DEG, web_mercator_lat_deg};
 
 /// Strip any leading UTF-8 BOM and surrounding whitespace from a CRS definition.
-pub(super) fn trim_crs_text(text: &str) -> &str {
+fn trim_crs_text(text: &str) -> &str {
     text.trim().trim_start_matches('\u{FEFF}').trim()
 }
 
 /// Parse an `EPSG:<code>`, `epsg:<code>`, or bare numeric EPSG shorthand.
-pub(super) fn parse_epsg_shorthand(trimmed: &str) -> Option<u32> {
+fn parse_epsg_shorthand(trimmed: &str) -> Option<u32> {
     if let Some(rest) = trimmed
         .strip_prefix("EPSG:")
         .or_else(|| trimmed.strip_prefix("epsg:"))
@@ -181,7 +188,8 @@ impl CrsSpec {
 }
 
 /// Datum preset choice for custom Transverse Mercator definitions (e.g., MSK-xx).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DatumPreset {
     #[default]
     Wgs84,
@@ -206,9 +214,10 @@ impl DatumPreset {
 
 /// User-configurable Transverse Mercator projection parameters (unlocking all
 /// regional MSK-xx zones, custom survey grids, and GeoTIFF user-defined TM).
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct CustomTmParams {
     pub name: String,
+    #[serde(default)]
     pub datum: DatumPreset,
     pub central_meridian_deg: f64,
     pub origin_lat_deg: f64,

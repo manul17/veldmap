@@ -34,11 +34,7 @@ pub struct NetworkStatus {
 
 /// Returns `true` when `key` is currently requested in `wanted` or is a pinned
 /// coarsest root tile of `active_source`.
-pub(super) fn is_wanted_or_root(
-    wanted: &HashSet<TileKey>,
-    key: &TileKey,
-    active_source: SourceId,
-) -> bool {
+fn is_wanted_or_root(wanted: &HashSet<TileKey>, key: &TileKey, active_source: SourceId) -> bool {
     wanted.contains(key) || key.is_root_of(active_source)
 }
 

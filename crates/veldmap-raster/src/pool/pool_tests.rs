@@ -400,12 +400,16 @@ fn probe_job_key_deduplicates_prioritizes_ahead_of_tiles_and_respects_root_rank(
     let cancel = CancelToken::new();
     let probe_a = DecodeJobKey::Probe {
         source: SourceId::new(7),
+        band: veldmap_core::tile::BandKey::Display,
+        format: PixelFormat::Rgba8UnormSrgb,
         x: 10,
         y: 20,
     };
     let probe_b = DecodeJobKey::Probe {
         source: SourceId::new(7),
-        x: 11,
+        band: veldmap_core::tile::BandKey::Index(0),
+        format: PixelFormat::R32Float,
+        x: 10,
         y: 20,
     };
 
@@ -485,4 +489,61 @@ fn probe_job_key_deduplicates_prioritizes_ahead_of_tiles_and_respects_root_rank(
     assert_eq!(first.expect("pop first").key, probe_a);
     let (second, _) = queue.pop_coarsest_or_drain_cancelled();
     assert_eq!(second.expect("pop second").key, root);
+
+    // Priority order is strictly Probe < BandStats < Tile < Pass.
+    let mut tier_queue = DecodeQueue::new(4, 1024);
+    let stats_key = DecodeJobKey::BandStats {
+        source: SourceId::new(7),
+        band: veldmap_core::tile::BandKey::Index(0),
+        layer_tag: 1,
+    };
+    let DecodeJobKey::Tile(root_tk) = root else {
+        unreachable!("root is a Tile key");
+    };
+    let pass_key = DecodeJobKey::Pass(root_tk.stream_key());
+    for key in [pass_key, root, stats_key, probe_a] {
+        tier_queue
+            .admit_job(
+                DecodeJob {
+                    key,
+                    queued_bytes: 16,
+                    cancel: cancel.clone(),
+                    work: Box::new(|| {}),
+                },
+                &mut to_drop,
+            )
+            .expect("admit tier job");
+    }
+    assert_eq!(
+        tier_queue
+            .pop_coarsest_or_drain_cancelled()
+            .0
+            .expect("1")
+            .key,
+        probe_a
+    );
+    assert_eq!(
+        tier_queue
+            .pop_coarsest_or_drain_cancelled()
+            .0
+            .expect("2")
+            .key,
+        stats_key
+    );
+    assert_eq!(
+        tier_queue
+            .pop_coarsest_or_drain_cancelled()
+            .0
+            .expect("3")
+            .key,
+        root
+    );
+    assert_eq!(
+        tier_queue
+            .pop_coarsest_or_drain_cancelled()
+            .0
+            .expect("4")
+            .key,
+        pass_key
+    );
 }

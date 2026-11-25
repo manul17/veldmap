@@ -13,15 +13,34 @@ use eframe::egui;
 use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::TileStreamSpec;
 
-use crate::app::UnavailableLayerNotice;
-use crate::colormap::{CategoricalPaletteId, ColormapId};
-use crate::layers::{LayerId, LayerSummary, StretchPreset};
+use crate::layers::{LayerId, LayerSummary, OverlayEdit};
 use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
 use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, submitted_with_enter};
 
 use raster_card::show_raster_card;
 use vector_card::show_vector_card;
+
+/// Immutable summary of a layer from the previous `session.json` that could not
+/// be reopened at startup (kept in `session.json` until reopened or explicitly
+/// forgotten so custom CRS overrides and stretch styles are never lost).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnavailableLayerNotice {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) error: String,
+    pub(crate) is_vector: bool,
+}
+
+/// Session persistence policy for an infallible [`OverlayEdit`] emitted from UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditPersist {
+    /// Persist `session.json` whenever the edit actually changed layer state.
+    OnChange,
+    /// Persist `session.json` only on explicit commit (e.g. slider/histogram
+    /// drag end, where the final frame may have `changed == false`).
+    OnCommit(bool),
+}
 
 /// User intent emitted by the Layer List panel, applied by `VeldmapApp`.
 #[derive(Clone, Debug)]
@@ -31,23 +50,37 @@ pub(crate) enum LayerUiAction {
     RetryUnavailableSessionLayers,
     HideUnavailableSessionNotice,
     ForgetUnavailableSessionLayers,
-    ToggleVisibility(LayerId, bool),
-    SetOpacity(LayerId, f32, bool),
+    EditRaster {
+        id: LayerId,
+        edit: OverlayEdit,
+        persist: EditPersist,
+    },
     SetStream(LayerId, TileStreamSpec),
-    SetStretchPreset(LayerId, StretchPreset),
-    SetStretchRange(LayerId, f64, f64, bool),
-    SetColormap(LayerId, ColormapId, bool),
-    SetCategoricalPalette(LayerId, CategoricalPaletteId),
-    MoveUp(LayerId),
-    MoveDown(LayerId),
     OpenCrsPicker(LayerId, String),
     OpenCrsPickerForPendingPath(PathBuf),
     ZoomToExtent(FootprintBounds),
     ReloadBypassCache(LayerId),
-    Remove(LayerId),
     ToggleVectorVisibility(VectorLayerId, bool),
     SetVectorOpacity(VectorLayerId, f32, bool),
     RemoveVector(VectorLayerId),
+}
+
+impl LayerUiAction {
+    pub(super) fn edit_raster(id: LayerId, edit: OverlayEdit) -> Self {
+        Self::EditRaster {
+            id,
+            edit,
+            persist: EditPersist::OnChange,
+        }
+    }
+
+    pub(super) fn edit_raster_drag(id: LayerId, edit: OverlayEdit, commit: bool) -> Self {
+        Self::EditRaster {
+            id,
+            edit,
+            persist: EditPersist::OnCommit(commit),
+        }
+    }
 }
 
 /// Transient UI state for the Layer List side panel and File Open input.

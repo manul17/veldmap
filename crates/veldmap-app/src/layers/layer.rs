@@ -19,7 +19,7 @@ use crate::render::DrawOverlayTrack;
 use crate::{clamp_opacity, display_name_from_path};
 
 use super::style::{
-    CategoricalStyle, LayerBandOption, SavedLayerStyle, ScientificStyle, StretchPreset, TrackKind,
+    CategoricalStyle, LayerBandOption, LayerStyleSpec, ScientificStyle, StretchPreset, TrackKind,
     build_band_options,
 };
 use super::{CrsOverride, LayerId, LayerInitOptions, OverlayPersistEntry};
@@ -163,11 +163,9 @@ impl OverlayLayer {
         let max_level = meta.max_level();
 
         let custom_color_map = source.color_map();
-        let mut scientific = ScientificStyle {
-            last_scientific_band: (meta.spec.format == PixelFormat::R32Float)
-                .then_some(meta.spec.band),
-            ..ScientificStyle::default()
-        };
+        let mut scientific = ScientificStyle::default();
+        scientific.last_scientific_band =
+            (meta.spec.format == PixelFormat::R32Float).then_some(meta.spec.band);
         let mut categorical = CategoricalStyle {
             palette: default_categorical_palette(custom_color_map.is_some()),
         };
@@ -422,7 +420,7 @@ impl OverlayLayer {
         }
     }
 
-    pub(super) fn saved_style(&self) -> Option<SavedLayerStyle> {
+    pub(super) fn saved_style(&self) -> Option<LayerStyleSpec> {
         let spec = self.meta().spec;
         let default_cat = default_categorical_palette(self.custom_color_map.is_some());
         if spec == self.source.default_stream_spec()
@@ -434,13 +432,13 @@ impl OverlayLayer {
         }
         let track_kind = TrackKind::from_format(spec.format);
         let (band_index, track) = match (spec.band, track_kind) {
-            (_, TrackKind::Display) => (None, Some(track_kind.as_str().to_owned())),
+            (_, TrackKind::Display) => (None, Some(track_kind)),
             (BandKey::Index(i), TrackKind::Scientific | TrackKind::Categorical) => {
-                (Some(i), Some(track_kind.as_str().to_owned()))
+                (Some(i), Some(track_kind))
             }
             _ => (None, None),
         };
-        Some(SavedLayerStyle {
+        Some(LayerStyleSpec {
             band_index,
             track,
             stretch_preset: Some(self.scientific.preset),

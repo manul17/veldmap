@@ -1,6 +1,6 @@
 use super::*;
-use crate::layers::{CrsOverride, SavedLayerStyle, StretchPreset};
-use crate::render::ColormapId;
+use crate::colormap::ColormapId;
+use crate::layers::{CrsOverride, LayerStyleSpec, StretchPreset};
 
 #[test]
 fn session_restore_tracker_preserves_unavailable_layers_deduplicates_on_reopen_and_supports_forget()
@@ -10,21 +10,21 @@ fn session_restore_tracker_preserves_unavailable_layers_deduplicates_on_reopen_a
     let raster_b = PathBuf::from("/mnt/nas/b.tif");
     let vector_a = PathBuf::from("/mnt/nas/a.geojson");
 
-    let custom_style = SavedLayerStyle {
+    let custom_style = LayerStyleSpec {
         stretch_preset: Some(StretchPreset::Custom),
         stretch_min: Some(0.1),
         stretch_max: Some(0.9),
         custom_stretch_range: true,
         colormap: Some(ColormapId::Viridis),
         invert_colormap: true,
-        ..SavedLayerStyle::default()
+        ..LayerStyleSpec::default()
     };
     let saved_a = SavedLayerEntry::with_style(
         raster_a.clone(),
         false,
         0.5,
         Some(&CrsOverride::Epsg(32637)),
-        Some(custom_style.clone()),
+        Some(&custom_style),
     );
 
     tracker.push_layer(saved_a.clone());
@@ -52,7 +52,7 @@ fn session_restore_tracker_preserves_unavailable_layers_deduplicates_on_reopen_a
         .find(|e| e.path == raster_a && !e.visible)
         .expect("unavailable entry preserved");
     assert_eq!(preserved_a.crs_override(), Some(CrsOverride::Epsg(32637)));
-    assert_eq!(preserved_a.style, Some(custom_style));
+    assert_eq!(preserved_a.style(), Some(custom_style));
 
     // Second duplicate `raster_a` opening consumes from `pending_layers` first,
     // leaving the unavailable copy intact.

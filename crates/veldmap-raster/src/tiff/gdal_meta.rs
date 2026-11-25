@@ -1,8 +1,25 @@
-//! Lightweight zero-dependency parser for GeoTIFF `GDAL_METADATA` (tag `42112`)
-//! XML items (`SCALE`, `OFFSET`, `UNITTYPE`, `DESCRIPTION`), supporting both
-//! file-wide and per-band (`sample="N"`) attributes.
+//! Lightweight zero-dependency parsers for GeoTIFF `GDAL_METADATA` (tag
+//! `42112`) XML items (`SCALE`, `OFFSET`, `UNITTYPE`, `DESCRIPTION`) and
+//! `GDAL_NODATA` (tag `42113`) ASCII values.
 
 use std::collections::HashMap;
+
+/// TIFF tag ID for `GDAL_METADATA` XML.
+pub(super) const TAG_GDAL_METADATA: u16 = 42112;
+
+/// Parse an ASCII `GDAL_NODATA` (tag 42113) string into a numeric nodata
+/// sentinel (`Some(f64::NAN)` for `"nan"`, or finite `f64`), returning `None`
+/// when empty or unparseable.
+pub(super) fn parse_gdal_nodata(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("nan") {
+        return Some(f64::NAN);
+    }
+    trimmed.parse::<f64>().ok().filter(|v| v.is_finite())
+}
 
 /// Per-band metadata parsed from `GDAL_METADATA` (tag 42112).
 #[derive(Clone, Debug, Default, PartialEq)]

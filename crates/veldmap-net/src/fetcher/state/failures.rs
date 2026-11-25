@@ -3,9 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use veldmap_core::tile::{SourceId, TileKey};
-
-use super::is_wanted_or_root;
+use veldmap_core::tile::TileKey;
 
 /// Upper bound on retained permanent/empty per-tile markers to prevent
 /// unbounded memory growth on sparse 404/204 layers over long sessions.
@@ -118,15 +116,11 @@ impl FailureTracker {
     pub(super) fn earliest_wanted_backoff(
         &self,
         now: Instant,
-        active_source: SourceId,
-        last_wanted: &HashSet<TileKey>,
+        is_wanted: impl Fn(&TileKey) -> bool,
     ) -> Option<Instant> {
         self.backoffs
             .iter()
-            .filter_map(|(k, entry)| {
-                (entry.until > now && is_wanted_or_root(last_wanted, k, active_source))
-                    .then_some(entry.until)
-            })
+            .filter_map(|(k, entry)| (entry.until > now && is_wanted(k)).then_some(entry.until))
             .min()
     }
 

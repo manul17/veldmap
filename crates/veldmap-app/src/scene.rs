@@ -5,6 +5,7 @@
 //! GeoJSON [`VectorManager`], interactive geodesic [`MeasureSession`], cached
 //! immutable [`DrawSnapshot`], and monotonic `scene_generation`.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +13,7 @@ use std::time::Duration;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::{SourceId, StreamKey, TileStreamSpec};
+use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileStreamSpec};
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
@@ -22,8 +23,8 @@ use crate::gpu_tiles::{
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::layers::{
-    CrsOverride, CursorReadout, LayerId, OverlayEdit, OverlayFrameCtx, OverlayIoEvent,
-    OverlayManager, OverlayMutation, SavedLayerStyle,
+    CrsOverride, CursorReadout, LayerId, LayerStyleSpec, OverlayEdit, OverlayFrameCtx,
+    OverlayIoEvent, OverlayManager, OverlayMutation,
 };
 use crate::measure::MeasureSession;
 use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
@@ -91,6 +92,15 @@ struct FrameState {
     deferred_protected: usize,
 }
 
+struct CachedFrameSnapshot {
+    key: SnapshotKey,
+    snapshot: Arc<DrawSnapshot>,
+    /// Exact GPU carrier tile keys referenced by `snapshot`'s basemap and
+    /// overlay layers, retained outside [`DrawSnapshot`] for active-frame
+    /// upload eviction protection.
+    carrier_keys: HashSet<TileKey>,
+}
+
 /// Coordinates tile caches, bounded GPU uploads, shared two-lane CPU decode
 /// threads, active basemap + raster/vector overlay scheduling, cursor probes,
 /// and cached frame snapshots.
@@ -104,7 +114,7 @@ pub(crate) struct SceneState {
     overlays: OverlayManager,
     vectors: VectorManager,
     measure: MeasureSession,
-    cached_snapshot: Option<(SnapshotKey, Arc<DrawSnapshot>)>,
+    cached_snapshot: Option<CachedFrameSnapshot>,
     scene_generation: u64,
     active_frame: Option<FrameState>,
 }
@@ -287,7 +297,7 @@ impl SceneState {
         visible: bool,
         opacity: f32,
         crs_override: Option<CrsOverride>,
-        style: Option<SavedLayerStyle>,
+        style: Option<LayerStyleSpec>,
     ) -> Result<(), String> {
         self.overlays.begin_open_file_with_options(
             path,
@@ -457,7 +467,7 @@ impl SceneState {
         let protected = self
             .cached_snapshot
             .as_ref()
-            .map(|(_, snap)| &snap.carrier_keys);
+            .map(|cached| &cached.carrier_keys);
         let report = self.pending_uploads.drain_and_upload(
             device,
             queue,
@@ -495,10 +505,10 @@ impl SceneState {
             show_graticule,
             self.scene_generation,
         );
-        if let Some((cached_key, snapshot)) = &self.cached_snapshot
-            && *cached_key == key
+        if let Some(cached) = &self.cached_snapshot
+            && cached.key == key
         {
-            return Arc::clone(snapshot);
+            return Arc::clone(&cached.snapshot);
         }
 
         let textured = self.basemap.is_textured();
@@ -506,7 +516,7 @@ impl SceneState {
         let policy = self.basemap.carrier_policy();
         let carrier =
             textured.then_some((&policy as &dyn TileCarrierPolicy, &mut self.gpu_tile_cache));
-        let mut snapshot_inner = DrawSnapshot::build(
+        let (mut snapshot_inner, mut carrier_keys) = DrawSnapshot::build(
             SnapshotBuildParams {
                 camera,
                 width_px,
@@ -533,7 +543,7 @@ impl SceneState {
             gpu_cache: &mut self.gpu_tile_cache,
             pending: &self.pending_uploads,
             total_appetite_weight: total_weight,
-            carrier_keys: &mut snapshot_inner.carrier_keys,
+            carrier_keys: &mut carrier_keys,
         });
         snapshot_inner.overlays = overlay_layers;
         let mut draw_vectors = self.vectors.draw_layers();
@@ -554,7 +564,11 @@ impl SceneState {
             basemap_appetite_bytes,
         );
 
-        self.cached_snapshot = Some((key, Arc::clone(&snapshot)));
+        self.cached_snapshot = Some(CachedFrameSnapshot {
+            key,
+            snapshot: Arc::clone(&snapshot),
+            carrier_keys,
+        });
         if let Some(frame) = &mut self.active_frame {
             frame.reconciled = true;
         }

@@ -159,21 +159,18 @@ impl TileDiskCache {
 
         let (total_bytes, _) = read_cache_meta_totals(&conn)?;
         if total_bytes > max_bytes {
-            let evicted_ids = {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let (current_bytes, current_count) = read_cache_meta_totals(&tx)?;
-                let evicted_ids = evict_in_tx(
-                    &tx,
+            let evicted_ids = Self::with_write_tx(&mut conn, |tx| {
+                let (current_bytes, current_count) = read_cache_meta_totals(tx)?;
+                evict_in_tx(
+                    tx,
                     current_bytes,
                     current_count,
                     max_bytes,
                     None,
                     None,
                     false,
-                )?;
-                tx.commit()?;
-                evicted_ids
-            };
+                )
+            })?;
             if !evicted_ids.is_empty() {
                 reclaim_space(&conn, false);
             }
@@ -335,7 +332,7 @@ impl TileDiskCache {
         payload: &[u8],
         cancel: &CancelToken,
     ) -> Result<(), StorageError> {
-        self.put_encoded_batch_inner(&[(key, encoding, payload)], Some(cancel))
+        self.put_encoded_batch_inner(&[(key, encoding, payload)], cancel)
     }
 
     /// Insert a batch of encoded tiles in a single SQLite `IMMEDIATE`
@@ -350,15 +347,15 @@ impl TileDiskCache {
         entries: &[(&DiskTileKey, TileBlobEncoding, &[u8])],
         cancel: &CancelToken,
     ) -> Result<(), StorageError> {
-        self.put_encoded_batch_inner(entries, Some(cancel))
+        self.put_encoded_batch_inner(entries, cancel)
     }
 
     fn put_encoded_batch_inner(
         &self,
         entries: &[(&DiskTileKey, TileBlobEncoding, &[u8])],
-        cancel: Option<&CancelToken>,
+        cancel: &CancelToken,
     ) -> Result<(), StorageError> {
-        if entries.is_empty() || cancel.is_some_and(CancelToken::is_cancelled) {
+        if entries.is_empty() || cancel.is_cancelled() {
             return Ok(());
         }
 
@@ -370,7 +367,7 @@ impl TileDiskCache {
         }
 
         let mut conn = lock_unpoisoned(&self.writer);
-        if cancel.is_some_and(CancelToken::is_cancelled) {
+        if cancel.is_cancelled() {
             return Ok(());
         }
         // Re-check under `self.writer` so a concurrent `set_max_bytes()` cannot
@@ -489,11 +486,7 @@ impl TileDiskCache {
     /// Delete every cached tile and reclaim both main-DB pages and WAL space.
     pub fn clear(&self) -> Result<(), StorageError> {
         let mut conn = lock_unpoisoned(&self.writer);
-        {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            clear_all_in_tx(&tx)?;
-            tx.commit()?;
-        }
+        Self::with_write_tx(&mut conn, clear_all_in_tx)?;
         self.touches.clear();
         reclaim_space(&conn, true);
         self.write_generation.fetch_add(1, Ordering::AcqRel);

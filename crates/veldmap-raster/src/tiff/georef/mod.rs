@@ -1,26 +1,30 @@
-//! GeoTIFF georeference parsing: `GeoKeyDirectoryTag` (`34735`–`34737`),
+//! Pure GeoTIFF georeference parsing: `GeoKeyDirectoryTag` (`34735`–`34737`),
 //! pixel-to-model affine & tie-point synthesis, and user-defined CRS/datum
-//! resolution.
+//! resolution from plain pre-extracted TIFF tag payloads.
 
 mod crs;
 mod geokeys;
 
-use tiff::decoder::Decoder;
-use tiff::tags::Tag;
 use veldmap_core::geo::CrsSpec;
-use veldmap_core::io::BufferedByteReader;
-use veldmap_core::sync::CancelToken;
 
-use crate::RasterError;
 use crate::pipeline::metadata::{GeoPlacement, GeoTie, PlacementCrs, is_valid_lat_lon};
-
-use super::tags::{read_tag_ascii_opt, read_tag_f64_vec_opt, read_tag_u16_vec_opt};
 
 use crs::{build_user_defined_projected_crs, resolve_geographic_crs};
 use geokeys::{
     GEOKEY_UNDEFINED, GEOKEY_USER_DEFINED, GeoKeyParams, MODEL_TYPE_GEOGRAPHIC,
     MODEL_TYPE_PROJECTED, parse_geokeys,
 };
+
+/// Plain pre-extracted GeoTIFF tag payloads consumed by [`parse_georef`],
+/// keeping `georef/` completely free of `tiff::decoder::Decoder`.
+pub(super) struct RawGeoTiffTags {
+    pub(super) raw_keys: Vec<u16>,
+    pub(super) double_params: Vec<f64>,
+    pub(super) ascii_params: String,
+    pub(super) points: Vec<f64>,
+    pub(super) scale: Vec<f64>,
+    pub(super) matrix: Vec<f64>,
+}
 
 pub(super) struct ParsedGeoref {
     pub(super) ties: Vec<GeoTie>,
@@ -32,28 +36,19 @@ pub(super) struct ParsedGeoref {
     pub(super) trouble: Option<String>,
 }
 
-pub(super) fn georef(
-    decoder: &mut Decoder<BufferedByteReader>,
-    width: u32,
-    height: u32,
-    cancel: &CancelToken,
-) -> Result<ParsedGeoref, RasterError> {
-    let raw_keys = read_tag_u16_vec_opt(decoder, Tag::GeoKeyDirectoryTag, cancel)?;
-    let double_params = read_tag_f64_vec_opt(decoder, Tag::GeoDoubleParamsTag, cancel)?;
-    let ascii_params = read_tag_ascii_opt(decoder, Tag::GeoAsciiParamsTag, cancel)?;
-    let geo_params = parse_geokeys(&raw_keys, &double_params, &ascii_params);
+pub(super) fn parse_georef(tags: &RawGeoTiffTags, width: u32, height: u32) -> ParsedGeoref {
+    let geo_params = parse_geokeys(&tags.raw_keys, &tags.double_params, &tags.ascii_params);
+    let points = &tags.points;
+    let scale = &tags.scale;
+    let matrix = &tags.matrix;
 
-    let points = read_tag_f64_vec_opt(decoder, Tag::ModelTiepointTag, cancel)?;
-    let scale = read_tag_f64_vec_opt(decoder, Tag::ModelPixelScaleTag, cancel)?;
-    let matrix = read_tag_f64_vec_opt(decoder, Tag::ModelTransformationTag, cancel)?;
-
-    let placement = geo_placement(&geo_params, &points, &scale, &matrix, width, height);
-    let ties = geo_ties(&geo_params, &points, &scale, &matrix, width, height);
+    let placement = geo_placement(&geo_params, points, scale, matrix, width, height);
+    let ties = geo_ties(&geo_params, points, scale, matrix, width, height);
     let embedded_affine = if placement.is_none() && points.len() <= 6 {
         affine_from_tags(
-            &points,
-            &scale,
-            &matrix,
+            points,
+            scale,
+            matrix,
             geo_params.raster_type.half_pixel_shift(),
         )
     } else {
@@ -77,13 +72,13 @@ pub(super) fn georef(
         )
     });
 
-    Ok(ParsedGeoref {
+    ParsedGeoref {
         ties,
         placement,
         embedded_affine,
         geographic_crs,
         trouble,
-    })
+    }
 }
 
 fn usable_step(scale: &[f64]) -> bool {

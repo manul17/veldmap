@@ -1,6 +1,8 @@
 //! Shared cancellable, panic-safe singleflight orchestration used by
 //! [`super::chunk_cache`] and lazy display-mapping stretch computation.
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -188,5 +190,70 @@ where
                 };
             }
         }
+    }
+}
+
+enum SlotEntry<V> {
+    InFlight(Arc<SingleflightSlot<V>>),
+    Ready(V),
+}
+
+/// Keyed lazy singleflight cache deduplicating concurrent computations per key
+/// while allowing uncancelled followers to take over cleanly if a leader cancels.
+pub(crate) struct SingleflightMap<K, V> {
+    entries: Mutex<HashMap<K, SlotEntry<V>>>,
+}
+
+impl<K: Copy + Eq + Hash, V: Clone + Send + 'static> SingleflightMap<K, V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn with_ready(key: K, value: V) -> Self {
+        let mut map = HashMap::with_capacity(1);
+        map.insert(key, SlotEntry::Ready(value));
+        Self {
+            entries: Mutex::new(map),
+        }
+    }
+
+    pub(crate) fn get_or_compute(
+        &self,
+        key: K,
+        cancel: &CancelToken,
+        panic_label: &'static str,
+        compute: impl FnOnce() -> Result<V, RasterError>,
+    ) -> Result<V, RasterError> {
+        run_singleflight(
+            cancel,
+            panic_label,
+            || {
+                let mut guard = lock_unpoisoned(&self.entries);
+                match guard.get(&key) {
+                    Some(SlotEntry::Ready(val)) => SingleflightRole::Ready(val.clone()),
+                    Some(SlotEntry::InFlight(slot)) => SingleflightRole::Follower(Arc::clone(slot)),
+                    None => {
+                        let slot = Arc::new(SingleflightSlot::new());
+                        guard.insert(key, SlotEntry::InFlight(Arc::clone(&slot)));
+                        SingleflightRole::Leader(slot)
+                    }
+                }
+            },
+            compute,
+            |_slot, computed| {
+                let mut guard = lock_unpoisoned(&self.entries);
+                guard.insert(key, SlotEntry::Ready(computed.clone()));
+            },
+            |slot| {
+                let mut guard = lock_unpoisoned(&self.entries);
+                if let Some(SlotEntry::InFlight(cur)) = guard.get(&key)
+                    && Arc::ptr_eq(cur, slot)
+                {
+                    guard.remove(&key);
+                }
+            },
+        )
     }
 }

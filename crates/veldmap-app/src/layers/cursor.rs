@@ -229,6 +229,8 @@ impl CursorProber {
         let job = DecodeJob {
             key: DecodeJobKey::Probe {
                 source: layer.source_id(),
+                band: spec.band,
+                format: spec.format,
                 x: pixel.0,
                 y: pixel.1,
             },

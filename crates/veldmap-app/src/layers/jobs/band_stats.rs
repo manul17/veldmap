@@ -93,15 +93,6 @@ impl BandStatsTracker {
 
         let rt = Arc::clone(runtime);
         let tx = self.tx.clone();
-        let band_tag = match band {
-            BandKey::Display => 0,
-            BandKey::Index(i) => u32::from(i) + 1,
-            BandKey::NamedHash(h) => (h as u32).max(1),
-        };
-        // Reserve high `x` namespace (`u32::MAX - 0xFFFF..=u32::MAX`) per layer
-        // so duplicate layers opening one `SourceId` never collide on queue keys
-        // while `TiffSource`'s singleflight deduplicates the underlying I/O.
-        let probe_x = u32::MAX.saturating_sub((id.0 as u32) & 0xFFFF);
 
         // Load-bearing against `try_submit_guarded` queue-full rejection: if
         // submission fails, `disarmed` is flipped BEFORE `job` drops so
@@ -119,10 +110,10 @@ impl BandStatsTracker {
             outcome: None,
         };
         let job = DecodeJob {
-            key: DecodeJobKey::Probe {
+            key: DecodeJobKey::BandStats {
                 source: source_id,
-                x: probe_x,
-                y: band_tag,
+                band,
+                layer_tag: id.0,
             },
             queued_bytes: 16 * 1024,
             cancel: cancel.clone(),

@@ -16,21 +16,22 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::TileScheme;
 
 mod adapters;
+mod basemap;
 mod color;
-mod display;
 mod image_codec;
+mod mipmap;
+mod open;
 mod pipeline;
 mod pool;
 mod sidecar;
 mod tiff;
+mod tile_codec;
 
 pub use adapters::{JpegSource, PngSource};
-pub use display::{
-    BundledBasemap, BundledBasemapConfig, MAX_LZ4_RAW_DECODED_BYTES, MAX_QOI_DECODED_BYTES,
-    decode_lz4_raw_tile, decode_map_tile_with_mipmaps, decode_qoi_rgba8, encode_lz4_raw_tile,
-    encode_qoi_rgba8, generate_tile_mipmaps,
-};
+pub use basemap::{BundledBasemap, BundledBasemapConfig, decode_map_tile_with_mipmaps};
 pub use image_codec::{has_jpeg_magic, has_png_magic};
+pub use mipmap::generate_tile_mipmaps;
+pub use open::{OpenedRaster, SidecarReader, open_raster};
 pub use pipeline::{
     AdmittedPass, AdmittedTile, BandInfo, BandSample, BandStats, DISPLAY_STREAM_SPEC,
     DecodeContext, GeoPlacement, GeoTie, HISTOGRAM_BINS, LevelPlan, MAX_SOURCE_SIDE, PlacementCrs,
@@ -44,6 +45,10 @@ pub use pool::{
 };
 pub use sidecar::{SidecarGeoref, load_sidecar_georef_with, parse_prj_text, parse_world_file};
 pub use tiff::{MAX_IFDS, TiffSource, has_tiff_magic};
+pub use tile_codec::{
+    MAX_CACHED_TILE_DECODED_BYTES, MAX_LZ4_RAW_DECODED_BYTES, MAX_QOI_DECODED_BYTES,
+    decode_lz4_raw_tile, decode_qoi_rgba8, encode_lz4_raw_tile, encode_qoi_rgba8,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

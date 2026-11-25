@@ -12,9 +12,11 @@ use veldmap_core::tile::{DecodedTile, PixelFormat};
 
 use crate::RasterError;
 
+use super::MAX_CACHED_TILE_DECODED_BYTES;
+
 /// Default maximum decoded tile byte size admitted for `Lz4Raw` caching
-/// (`16 MiB`, matching `MAX_QOI_DECODED_BYTES` and `veldmap-storage`).
-pub const MAX_LZ4_RAW_DECODED_BYTES: usize = 16 * 1024 * 1024;
+/// (`16 MiB`, matching [`MAX_CACHED_TILE_DECODED_BYTES`]).
+pub const MAX_LZ4_RAW_DECODED_BYTES: usize = MAX_CACHED_TILE_DECODED_BYTES;
 
 const MAGIC: [u8; 4] = *b"VML4";
 const VERSION: u8 = 1;

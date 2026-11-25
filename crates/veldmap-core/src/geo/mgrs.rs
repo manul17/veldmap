@@ -2,8 +2,8 @@
 
 use thiserror::Error;
 
+use super::crs::System;
 use super::geodesy::unwind;
-use super::projection::System;
 
 /// Errors produced when parsing an MGRS grid reference.
 #[derive(Debug, Error, PartialEq, Eq)]

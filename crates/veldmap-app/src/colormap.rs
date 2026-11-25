@@ -2,15 +2,12 @@
 //! IEC 61966-2-1 sRGB-to-linear transfer functions shared between GPU uniform
 //! LUTs, draped vector styling, and CPU `egui` colorbar / histogram widgets.
 
-use serde::{Deserialize, Serialize};
-
 /// Number of LUT entries in `PaletteUniform` (`256 * 16 B = 4096 B`, well
 /// within baseline WebGPU's 16 KiB uniform buffer limit).
 pub(crate) const PALETTE_LUT_LEN: usize = 256;
 
 /// Continuous scientific colormap presets for `R32Float` layers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ColormapId {
     Grayscale,
     #[default]
@@ -23,7 +20,7 @@ pub enum ColormapId {
 }
 
 impl ColormapId {
-    pub const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Grayscale,
         Self::Viridis,
         Self::Inferno,
@@ -33,7 +30,7 @@ impl ColormapId {
         Self::Terrain,
     ];
 
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Grayscale => "Grayscale",
             Self::Viridis => "Viridis",
@@ -47,8 +44,7 @@ impl ColormapId {
 }
 
 /// Discrete categorical palette presets for `R8Uint` / `R16Uint` layers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CategoricalPaletteId {
     /// Embedded source palette (e.g., TIFF `ColorMap` tag 320), falling back
     /// to [`Self::DistinctClasses`] when absent.
@@ -61,13 +57,13 @@ pub enum CategoricalPaletteId {
 }
 
 impl CategoricalPaletteId {
-    pub const ALL: [Self; 3] = [
+    pub(crate) const ALL: [Self; 3] = [
         Self::SourceColorMap,
         Self::Sentinel2Scl,
         Self::DistinctClasses,
     ];
 
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::SourceColorMap => "Source ColorMap",
             Self::Sentinel2Scl => "Sentinel-2 SCL",
@@ -79,7 +75,7 @@ impl CategoricalPaletteId {
 /// Convert an sRGB channel to exact linear light (IEC 61966-2-1), clamping
 /// out-of-range values to `[0.0, 1.0]` and sanitizing non-finite inputs to `0.0`.
 #[inline]
-pub(crate) fn srgb_to_linear_f32(c: f32) -> f32 {
+fn srgb_to_linear_f32(c: f32) -> f32 {
     let s = if c.is_finite() {
         c.clamp(0.0, 1.0)
     } else {

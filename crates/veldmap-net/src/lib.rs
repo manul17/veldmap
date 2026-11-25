@@ -103,12 +103,11 @@ pub enum DecodeFailure {
 }
 
 /// Receiver half of [`DecodeCompletion::channel`].
-pub struct DecodeCompletionRx(tokio::sync::oneshot::Receiver<Result<(), DecodeFailure>>);
+pub(crate) struct DecodeCompletionRx(tokio::sync::oneshot::Receiver<Result<(), DecodeFailure>>);
 
 impl DecodeCompletionRx {
-    /// Non-blocking poll for completion, returning `Some(Err(DecodeFailure::Aborted))`
-    /// if the sender was dropped without calling [`DecodeCompletion::complete`].
-    pub fn try_recv(&mut self) -> Option<Result<(), DecodeFailure>> {
+    #[cfg(any(test, feature = "test-support"))]
+    fn try_recv(&mut self) -> Option<Result<(), DecodeFailure>> {
         match self.0.try_recv() {
             Ok(res) => Some(res),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
@@ -133,7 +132,7 @@ pub struct DecodeCompletion(tokio::sync::oneshot::Sender<Result<(), DecodeFailur
 
 impl DecodeCompletion {
     /// Create a linked `(DecodeCompletion, DecodeCompletionRx)` pair.
-    pub fn channel() -> (Self, DecodeCompletionRx) {
+    pub(crate) fn channel() -> (Self, DecodeCompletionRx) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Self(tx), DecodeCompletionRx(rx))
     }
@@ -141,6 +140,31 @@ impl DecodeCompletion {
     /// Report the decode result back to the awaiting [`LiveTilePipeline`] task.
     pub fn complete(self, outcome: Result<(), DecodeFailure>) {
         let _ = self.0.send(outcome);
+    }
+}
+
+/// Test-only helpers for driving [`crate::TileDecodeExecutor`] implementations outside
+/// `veldmap-net`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::{DecodeCompletion, DecodeCompletionRx, DecodeFailure};
+
+    /// Non-blocking test probe for the receiver side of a [`DecodeCompletion`].
+    pub struct DecodeCompletionProbe(DecodeCompletionRx);
+
+    impl DecodeCompletionProbe {
+        /// Poll for completion, returning `Some(Err(DecodeFailure::Aborted))`
+        /// if the [`DecodeCompletion`] sender was dropped without completing.
+        pub fn try_recv(&mut self) -> Option<Result<(), DecodeFailure>> {
+            self.0.try_recv()
+        }
+    }
+
+    /// Construct a linked `(DecodeCompletion, DecodeCompletionProbe)` pair for
+    /// unit-testing [`crate::TileDecodeExecutor`] implementations.
+    pub fn decode_completion_channel() -> (DecodeCompletion, DecodeCompletionProbe) {
+        let (tx, rx) = DecodeCompletion::channel();
+        (tx, DecodeCompletionProbe(rx))
     }
 }
 

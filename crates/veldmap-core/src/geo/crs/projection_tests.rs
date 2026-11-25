@@ -1,5 +1,5 @@
+use super::super::datum::{INTERNATIONAL_FOOT_M, KRASOVSKY, US_SURVEY_FOOT_M};
 use super::*;
-use crate::geo::datum::{INTERNATIONAL_FOOT_M, KRASOVSKY, US_SURVEY_FOOT_M};
 use crate::geo::ground_m;
 
 #[test]

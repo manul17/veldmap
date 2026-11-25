@@ -1,7 +1,8 @@
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::tile::{DecodedTile, GlobeScheme, PixelFormat, TileScheme, traverse};
-use veldmap_net::{DecodeCompletion, DecodeFailure, DecodeRequest};
+use veldmap_net::test_support::decode_completion_channel;
+use veldmap_net::{DecodeFailure, DecodeRequest};
 use veldmap_raster::{DecodePool, DecodePoolConfig, TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::StoragePaths;
 use veldmap_storage::test_support::TestTempDir;
@@ -27,7 +28,9 @@ impl BasemapTestHarness {
         let root = TestTempDir::new(label);
         let paths = StoragePaths::with_root(root.path());
         if let Some(settings) = initial {
-            settings.save(&paths).expect("save initial settings");
+            settings
+                .save_for_test(&paths)
+                .expect("save initial settings");
         }
         let wakeup: Wakeup = Arc::new(|| {});
         let storage = AppStorage::open(Arc::clone(&wakeup), Some(paths));
@@ -308,7 +311,7 @@ fn rejected_or_cancelled_decode_request_signals_aborted() {
 
     let cancel = CancelToken::new();
     cancel.cancel();
-    let (on_decoded, mut rx) = DecodeCompletion::channel();
+    let (on_decoded, mut rx) = decode_completion_channel();
     let key = bundled_tile_key(QuadTileId {
         scheme: PlanetaryScheme::WebMercator,
         level: 0,

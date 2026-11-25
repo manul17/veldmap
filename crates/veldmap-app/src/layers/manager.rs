@@ -34,7 +34,7 @@ use super::runtime::OverlayRuntime;
 use super::stack::{LayerStack, OverlayLayer};
 use super::{
     ColorbarInfo, CrsOverride, CursorReadout, LayerId, LayerInitOptions, LayerSummary,
-    OverlayIoEvent, OverlayPersistEntry, SavedLayerStyle, StretchPreset,
+    OverlayIoEvent, OverlayPersistEntry, StretchPreset,
 };
 
 fn alloc_seq(counter: &mut u64) -> u64 {
@@ -196,7 +196,7 @@ impl OverlayManager {
         visible: bool,
         opacity: f32,
         crs_override: Option<CrsOverride>,
-        style: Option<SavedLayerStyle>,
+        style: Option<super::LayerStyleSpec>,
     ) -> Result<(), String> {
         if self.io_worker.send(OverlayIoCmd::Open {
             path: path.to_path_buf(),
@@ -410,6 +410,17 @@ impl OverlayManager {
         events.push(OverlayIoEvent::Reloaded { id });
     }
 
+    fn mutate_layer(
+        &mut self,
+        id: LayerId,
+        f: impl FnOnce(&mut OverlayLayer) -> bool,
+    ) -> OverlayMutation {
+        OverlayMutation {
+            changed: self.stack.get_mut(id).is_some_and(f),
+            ..OverlayMutation::default()
+        }
+    }
+
     /// Apply an infallible [`OverlayEdit`] to `id`, returning cache-purge and
     /// topology side effects for `SceneState`.
     pub(crate) fn edit_layer(&mut self, id: LayerId, edit: OverlayEdit) -> OverlayMutation {
@@ -424,26 +435,20 @@ impl OverlayManager {
                 changed: self.stack.move_down(id),
                 ..OverlayMutation::default()
             },
-            other => {
-                let changed = self.stack.get_mut(id).is_some_and(|layer| match other {
-                    OverlayEdit::SetOpacity(opacity) => layer.set_opacity(opacity),
-                    OverlayEdit::SetStretchPreset(preset) => layer.set_stretch_preset(preset),
-                    OverlayEdit::SetStretchRange { min, max } => layer.set_stretch_range(min, max),
-                    OverlayEdit::SetColormap { colormap, invert } => {
-                        layer.set_colormap(colormap, invert)
-                    }
-                    OverlayEdit::SetCategoricalPalette(palette) => {
-                        layer.set_categorical_palette(palette)
-                    }
-                    OverlayEdit::SetVisible(_)
-                    | OverlayEdit::MoveUp
-                    | OverlayEdit::MoveDown
-                    | OverlayEdit::Remove => unreachable!(),
-                });
-                OverlayMutation {
-                    changed,
-                    ..OverlayMutation::default()
-                }
+            OverlayEdit::SetOpacity(opacity) => {
+                self.mutate_layer(id, |layer| layer.set_opacity(opacity))
+            }
+            OverlayEdit::SetStretchPreset(preset) => {
+                self.mutate_layer(id, |layer| layer.set_stretch_preset(preset))
+            }
+            OverlayEdit::SetStretchRange { min, max } => {
+                self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
+            }
+            OverlayEdit::SetColormap { colormap, invert } => {
+                self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
+            }
+            OverlayEdit::SetCategoricalPalette(palette) => {
+                self.mutate_layer(id, |layer| layer.set_categorical_palette(palette))
             }
         }
     }

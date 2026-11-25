@@ -1,4 +1,4 @@
-//! Direct stateless raw-chunk GeoTIFF decompressor over [`ByteSource`].
+//! Direct stateless raw-chunk GeoTIFF decompressor over [`veldmap_core::io::ByteSource`].
 //!
 //! Bypasses `tiff::decoder::Decoder::read_chunk`, reusing already-locked codecs
 //! (`flate2`, `weezl`, `zstd`, `jpeg-decoder`, `image-webp`) with explicit
@@ -9,12 +9,11 @@
 mod codecs;
 mod predictor;
 
-use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
 
-use super::ifd::{CachedIfd, PlanarConfig, TiffByteOrder, TiffCompression};
+use super::ifd::{CachedIfd, ChunkDims, RawTiffAccess, TiffCompression};
 
 /// Result of decoding one stored TIFF chunk (or one plane of a planar chunk).
 pub(super) enum RawChunkPayload {
@@ -24,55 +23,46 @@ pub(super) enum RawChunkPayload {
     Bytes(Vec<u8>),
 }
 
-/// Decode one TIFF chunk `(ifd, plane, chunk_index)` directly from `byte_source`.
+/// Decode one TIFF chunk `(ifd, plane, chunk_index)` directly from `access`.
 ///
 /// For `PlanarConfig::Planar`, `plane` selects the exact band plane (`0..spp`)
 /// and returns 1 sample/pixel. For `PlanarConfig::Chunky`, `plane` is ignored
 /// and all `samples_per_pixel` interleaved samples are returned.
 pub(super) fn decode_raw_chunk(
-    byte_source: &dyn ByteSource,
+    access: &RawTiffAccess,
     ifd: &CachedIfd,
-    byte_order: TiffByteOrder,
     plane: usize,
     chunk_index: u32,
-    max_uncompressed_bytes: usize,
     cancel: &CancelToken,
 ) -> Result<(u32, u32, RawChunkPayload), RasterError> {
     if cancel.is_cancelled() {
         return Err(RasterError::Cancelled);
     }
-    let (dw, dh) = ifd.chunk_data_dims(chunk_index).ok_or_else(|| {
+    let dims = ifd.chunk_dims(chunk_index).ok_or_else(|| {
         RasterError::Decode(format!(
             "chunk index {chunk_index} out of range for IFD {}",
             ifd.image
         ))
     })?;
-    let (stored_w, stored_h) = if ifd.tiled {
-        (ifd.chunk_w, ifd.chunk_h)
-    } else {
-        (dw, dh)
-    };
     let (offset, byte_count) = ifd.chunk_span(plane, chunk_index)?;
     if offset == 0 || byte_count == 0 {
-        return Ok((dw, dh, RawChunkPayload::Sparse));
+        return Ok((dims.data_w, dims.data_h, RawChunkPayload::Sparse));
     }
 
-    let samples_in_chunk: usize = match ifd.planar {
-        PlanarConfig::Chunky => usize::from(ifd.samples_per_pixel),
-        PlanarConfig::Planar => 1,
-    };
+    let samples_in_chunk = ifd.samples_in_chunk();
     let sample_bytes = ifd.sample_type.byte_size();
-    let stored_row_bytes = (stored_w as usize)
+    let stored_row_bytes = (dims.stored_w as usize)
         .checked_mul(samples_in_chunk)
         .and_then(|n| n.checked_mul(sample_bytes))
         .ok_or_else(|| RasterError::Decode("TIFF chunk row byte size overflow".to_owned()))?;
     let stored_bytes = stored_row_bytes
-        .checked_mul(stored_h as usize)
+        .checked_mul(dims.stored_h as usize)
         .ok_or_else(|| RasterError::Decode("TIFF chunk total byte size overflow".to_owned()))?;
+    let max_uncompressed_bytes = access.max_chunk_bytes;
     if stored_bytes > max_uncompressed_bytes {
         return Err(RasterError::LimitExceeded {
-            width: stored_w,
-            height: stored_h,
+            width: dims.stored_w,
+            height: dims.stored_h,
             estimated_bytes: stored_bytes as u64,
             limit_bytes: max_uncompressed_bytes as u64,
         });
@@ -88,13 +78,13 @@ pub(super) fn decode_raw_chunk(
         as u64;
     if byte_count > max_compressed {
         return Err(RasterError::LimitExceeded {
-            width: stored_w,
-            height: stored_h,
+            width: dims.stored_w,
+            height: dims.stored_h,
             estimated_bytes: byte_count,
             limit_bytes: max_compressed,
         });
     }
-    let file_len = byte_source.len();
+    let file_len = access.byte_source.len();
     if offset
         .checked_add(byte_count)
         .is_none_or(|end| end > file_len)
@@ -106,51 +96,44 @@ pub(super) fn decode_raw_chunk(
     }
 
     let mut compressed = vec![0u8; byte_count as usize];
-    byte_source.read_exact_at(offset, &mut compressed, cancel)?;
+    access
+        .byte_source
+        .read_exact_at(offset, &mut compressed, cancel)?;
     if cancel.is_cancelled() {
         return Err(RasterError::Cancelled);
     }
 
-    decode_compressed_chunk_bytes(
-        compressed,
-        ifd,
-        byte_order,
-        chunk_index,
-        (stored_w, stored_h, dw, dh),
-        samples_in_chunk,
-        stored_bytes,
-        max_uncompressed_bytes,
-    )
+    decode_compressed_chunk_bytes(compressed, access, ifd, chunk_index, dims, stored_bytes)
 }
 
-#[expect(clippy::too_many_arguments, reason = "internal chunk decode pipeline")]
 fn decode_compressed_chunk_bytes(
     compressed: Vec<u8>,
+    access: &RawTiffAccess,
     ifd: &CachedIfd,
-    byte_order: TiffByteOrder,
     chunk_index: u32,
-    dims: (u32, u32, u32, u32),
-    samples_in_chunk: usize,
+    dims: ChunkDims,
     stored_bytes: usize,
-    max_uncompressed_bytes: usize,
 ) -> Result<(u32, u32, RawChunkPayload), RasterError> {
-    let (stored_w, _stored_h, dw, dh) = dims;
+    let samples_in_chunk = ifd.samples_in_chunk();
     let sample_bytes = ifd.sample_type.byte_size();
 
     let (mut raw, actual_row_w) = match ifd.compression {
-        TiffCompression::None => (compressed, stored_w),
+        TiffCompression::None => (compressed, dims.stored_w),
         TiffCompression::Deflate => (
             codecs::decompress_deflate(&compressed, stored_bytes)?,
-            stored_w,
+            dims.stored_w,
         ),
-        TiffCompression::Lzw => (codecs::decompress_lzw(&compressed, stored_bytes)?, stored_w),
+        TiffCompression::Lzw => (
+            codecs::decompress_lzw(&compressed, stored_bytes)?,
+            dims.stored_w,
+        ),
         TiffCompression::PackBits => (
             codecs::decompress_packbits(&compressed, stored_bytes)?,
-            stored_w,
+            dims.stored_w,
         ),
         TiffCompression::Zstd => (
             codecs::decompress_zstd(&compressed, stored_bytes)?,
-            stored_w,
+            dims.stored_w,
         ),
         TiffCompression::Jpeg => codecs::decompress_jpeg(
             &compressed,
@@ -163,7 +146,7 @@ fn decode_compressed_chunk_bytes(
         TiffCompression::WebP => codecs::decompress_webp(
             &compressed,
             samples_in_chunk,
-            max_uncompressed_bytes,
+            access.max_chunk_bytes,
             chunk_index,
             dims,
         )?,
@@ -174,23 +157,24 @@ fn decode_compressed_chunk_bytes(
         .and_then(|v| v.checked_mul(sample_bytes))
         .ok_or_else(|| RasterError::Decode("TIFF chunk row byte overflow".to_owned()))?;
 
-    // Some writers emit only `dh` rows for bottom-edge tiles (especially under
-    // PlanarConfiguration = 2 or stripped edge chunks). Require at least `dh`
+    // Some writers emit only `data_h` rows for bottom-edge tiles (especially under
+    // PlanarConfiguration = 2 or stripped edge chunks). Require at least `data_h`
     // full decoded rows.
     let min_rows_bytes = actual_row_bytes
-        .checked_mul(dh as usize)
+        .checked_mul(dims.data_h as usize)
         .ok_or_else(|| RasterError::Decode("TIFF chunk height byte overflow".to_owned()))?;
     if raw.len() < min_rows_bytes {
         return Err(RasterError::Decode(format!(
-            "decompressed TIFF chunk {} has {} bytes, expected at least {min_rows_bytes} ({actual_row_w}x{dh})",
+            "decompressed TIFF chunk {} has {} bytes, expected at least {min_rows_bytes} ({actual_row_w}x{})",
             chunk_index,
-            raw.len()
+            raw.len(),
+            dims.data_h
         )));
     }
 
     // Apply endianness fix and predictor reversal on every FULL stored row
     // before cropping tiled edge padding.
-    let rows_to_process = dh as usize;
+    let rows_to_process = dims.data_h as usize;
     raw.truncate(rows_to_process * actual_row_bytes);
 
     // JPEG & WebP always decode directly into native-endian 8-bit bytes without predictors.
@@ -203,7 +187,7 @@ fn decode_compressed_chunk_bytes(
             actual_row_bytes,
             samples_in_chunk,
             ifd.sample_type,
-            byte_order,
+            access.byte_order,
             ifd.predictor,
         );
     }
@@ -212,11 +196,11 @@ fn decode_compressed_chunk_bytes(
         raw,
         actual_row_w,
         actual_row_bytes,
-        dw,
+        dims.data_w,
         rows_to_process,
         samples_in_chunk * sample_bytes,
     );
-    Ok((dw, dh, RawChunkPayload::Bytes(cropped)))
+    Ok((dims.data_w, dims.data_h, RawChunkPayload::Bytes(cropped)))
 }
 
 fn crop_right_edge(

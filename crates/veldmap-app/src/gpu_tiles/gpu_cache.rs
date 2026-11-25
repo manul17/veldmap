@@ -29,6 +29,7 @@ pub struct GpuTile {
     pub(crate) tile_id: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl GpuTile {
     /// Pixel width of the uploaded GPU texture.
     pub fn width(&self) -> u32 {
@@ -89,6 +90,7 @@ impl GpuTileCache {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn total_bytes(&self) -> usize {
         self.cache.total_bytes()
     }
@@ -156,6 +158,7 @@ impl GpuTileCache {
 
     /// Validate and upload a CPU-decoded tile (including all precomputed CPU
     /// mip levels) into GPU memory and insert it into the LRU cache.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn upload_and_insert(
         &mut self,
         device: &wgpu::Device,

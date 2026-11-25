@@ -124,21 +124,41 @@ const _: () = {
     assert!(std::mem::offset_of!(VectorUniform, color) == 16);
 };
 
-#[repr(usize)]
-#[derive(Clone, Copy)]
-enum UniformSlot {
-    Tile = 0,
-    Overlay = 1,
-    ScientificOverlay = 2,
-    CategoricalOverlay = 3,
-    Vector = 4,
-}
-
 struct UniformSlotEntry {
     label: &'static str,
     binding_size: usize,
     layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
+}
+
+struct ArenaSlots {
+    tile: UniformSlotEntry,
+    overlay: UniformSlotEntry,
+    scientific: UniformSlotEntry,
+    categorical: UniformSlotEntry,
+    vector: UniformSlotEntry,
+}
+
+impl ArenaSlots {
+    fn as_array(&self) -> [&UniformSlotEntry; 5] {
+        [
+            &self.tile,
+            &self.overlay,
+            &self.scientific,
+            &self.categorical,
+            &self.vector,
+        ]
+    }
+
+    fn as_mut_array(&mut self) -> [&mut UniformSlotEntry; 5] {
+        [
+            &mut self.tile,
+            &mut self.overlay,
+            &mut self.scientific,
+            &mut self.categorical,
+            &mut self.vector,
+        ]
+    }
 }
 
 fn dynamic_uniform_bind_group(
@@ -181,7 +201,7 @@ pub(super) struct DynamicUniformArena {
     last_offset: usize,
     buffer: wgpu::Buffer,
     capacity_bytes: usize,
-    slots: [UniformSlotEntry; 5],
+    slots: ArenaSlots,
 }
 
 impl DynamicUniformArena {
@@ -201,33 +221,33 @@ impl DynamicUniformArena {
                     bind_group,
                 }
             };
-        let slots = [
-            make_slot(
+        let slots = ArenaSlots {
+            tile: make_slot(
                 "arena tile dynamic uniform bind group",
                 std::mem::size_of::<TileUniform>(),
                 layouts.tile,
             ),
-            make_slot(
+            overlay: make_slot(
                 "arena overlay dynamic uniform bind group",
                 std::mem::size_of::<OverlayPatchUniform>(),
                 layouts.overlay,
             ),
-            make_slot(
+            scientific: make_slot(
                 "arena scientific overlay dynamic uniform bind group",
                 std::mem::size_of::<ScientificPatchUniform>(),
                 layouts.scientific,
             ),
-            make_slot(
+            categorical: make_slot(
                 "arena categorical overlay dynamic uniform bind group",
                 std::mem::size_of::<CategoricalPatchUniform>(),
                 layouts.categorical,
             ),
-            make_slot(
+            vector: make_slot(
                 "arena vector dynamic uniform bind group",
                 std::mem::size_of::<VectorUniform>(),
                 layouts.vector,
             ),
-        ];
+        };
         Self {
             alignment,
             staging: Vec::with_capacity(initial_bytes),
@@ -275,7 +295,8 @@ impl DynamicUniformArena {
         }
         let max_binding = self
             .slots
-            .iter()
+            .as_array()
+            .into_iter()
             .map(|slot| slot.binding_size)
             .max()
             .unwrap_or(0);
@@ -284,7 +305,7 @@ impl DynamicUniformArena {
         if required_bytes > self.capacity_bytes {
             let next_cap = required_bytes.next_power_of_two().max(4096);
             self.buffer = Self::create_buffer(device, next_cap);
-            for slot in &mut self.slots {
+            for slot in self.slots.as_mut_array() {
                 slot.bind_group = dynamic_uniform_bind_group(
                     device,
                     slot.label,
@@ -301,27 +322,23 @@ impl DynamicUniformArena {
         queue.write_buffer(&self.buffer, 0, &self.staging[..copy_len]);
     }
 
-    fn bind_group(&self, slot: UniformSlot) -> &wgpu::BindGroup {
-        &self.slots[slot as usize].bind_group
-    }
-
     pub(super) fn tile_bind_group(&self) -> &wgpu::BindGroup {
-        self.bind_group(UniformSlot::Tile)
+        &self.slots.tile.bind_group
     }
 
     pub(super) fn overlay_bind_group(&self) -> &wgpu::BindGroup {
-        self.bind_group(UniformSlot::Overlay)
+        &self.slots.overlay.bind_group
     }
 
     pub(super) fn scientific_overlay_bind_group(&self) -> &wgpu::BindGroup {
-        self.bind_group(UniformSlot::ScientificOverlay)
+        &self.slots.scientific.bind_group
     }
 
     pub(super) fn categorical_overlay_bind_group(&self) -> &wgpu::BindGroup {
-        self.bind_group(UniformSlot::CategoricalOverlay)
+        &self.slots.categorical.bind_group
     }
 
     pub(super) fn vector_bind_group(&self) -> &wgpu::BindGroup {
-        self.bind_group(UniformSlot::Vector)
+        &self.slots.vector.bind_group
     }
 }

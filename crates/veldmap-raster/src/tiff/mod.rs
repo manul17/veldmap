@@ -9,10 +9,12 @@
 //! `JPEG` (`JPEGTables`), `Predictor = 2 & 3`, and typed `Display`, `Scientific`
 //! (`R32Float`), and `Categorical` (`R8Uint`/`R16Uint`) streams.
 
+mod chunk_convert;
 mod chunk_reader;
 mod gdal_meta;
 mod georef;
 mod ifd;
+mod ifd_parse;
 mod open;
 mod probe;
 mod raw_decode;
@@ -23,7 +25,6 @@ mod ycbcr;
 use std::sync::Arc;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::io::ByteSource;
 use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint, SourceId, TileStreamSpec};
 
 use crate::RasterError;
@@ -37,7 +38,8 @@ use crate::pipeline::radiometry::DisplayMapping;
 use crate::pipeline::{DecodeContext, RasterSource, TileEmit};
 
 use chunk_reader::{ChunkReadMode, TiffChunkReader};
-use ifd::{CachedIfd, Photometric, TiffByteOrder};
+use ifd::{CachedIfd, Photometric, RawTiffAccess};
+use probe::{ProbeContext, sample_display_rgba, sample_indexed_band};
 use stretch::{BandStatsCache, StretchCache, StretchRequest};
 
 /// BigTIFF file header signatures (`version = 43`).
@@ -60,17 +62,14 @@ pub fn has_tiff_magic(head: &[u8]) -> bool {
 /// [`veldmap_core::io::ByteSource`] with cached per-IFD tables and stateless
 /// direct raw-chunk decoding.
 pub struct TiffSource {
-    byte_source: Arc<dyn ByteSource>,
-    byte_order: TiffByteOrder,
+    access: RawTiffAccess,
     fingerprint: SourceFingerprint,
     source_id: SourceId,
     description: RasterDescription,
-    tiled: bool,
     grid: Grid,
     ifds: Vec<CachedIfd>,
     nodata_f64: Option<f64>,
     stats_ifd: usize,
-    max_chunk_bytes: usize,
     budget_snapshot: MemoryBudget,
     stretch: StretchCache,
     band_stats: BandStatsCache,
@@ -84,8 +83,8 @@ impl TiffSource {
     }
 
     /// Return whether the base IFD uses tiled TIFF storage (`TileWidth`).
-    pub const fn is_tiled(&self) -> bool {
-        self.tiled
+    pub fn is_tiled(&self) -> bool {
+        self.base_ifd().tiled
     }
 
     fn base_ifd(&self) -> &CachedIfd {
@@ -99,27 +98,37 @@ impl TiffSource {
             .unwrap_or(&self.ifds[0])
     }
 
+    fn band_scale_offset(&self, band: BandKey) -> (f64, f64) {
+        self.description
+            .band_info(band)
+            .map_or((1.0, 0.0), |info| (info.scale, info.offset))
+    }
+
     fn stretch_request<'a>(&'a self, ctx: &'a DecodeContext<'_>) -> StretchRequest<'a> {
         StretchRequest {
-            byte_source: &self.byte_source,
-            byte_order: self.byte_order,
+            access: &self.access,
             stats_ifd: self.stats_ifd_ref(),
             nodata_f64: self.nodata_f64,
-            max_chunk_bytes: self.max_chunk_bytes,
             budget_tracker: ctx.budget_tracker,
             cancel: ctx.cancel,
         }
     }
 
-    pub(super) fn display_mapping(
-        &self,
-        ctx: &DecodeContext<'_>,
-    ) -> Result<DisplayMapping, RasterError> {
+    fn probe_context(&self) -> ProbeContext<'_> {
+        ProbeContext {
+            access: &self.access,
+            source_id: self.source_id,
+            ifds: &self.ifds,
+            nodata_f64: self.nodata_f64,
+        }
+    }
+
+    fn display_mapping(&self, ctx: &DecodeContext<'_>) -> Result<DisplayMapping, RasterError> {
         let req = self.stretch_request(ctx);
         self.stretch.get_or_compute(&req)
     }
 
-    pub(super) fn validate_stream_spec(&self, spec: TileStreamSpec) -> Result<(), RasterError> {
+    fn validate_stream_spec(&self, spec: TileStreamSpec) -> Result<(), RasterError> {
         if spec.gutter != 0 {
             return Err(RasterError::Decode(format!(
                 "TiffSource does not support gutter={} yet",
@@ -167,14 +176,12 @@ impl TiffSource {
         mode: ChunkReadMode<'a>,
     ) -> TiffChunkReader<'a> {
         TiffChunkReader::new(
-            &self.byte_source,
-            self.byte_order,
+            &self.access,
             self.source_id,
             &self.ifds,
             spec,
             self.nodata_f64,
             display_mapping,
-            self.max_chunk_bytes,
             mode,
         )
     }
@@ -317,7 +324,29 @@ impl RasterSource for TiffSource {
         py: u32,
         ctx: &DecodeContext<'_>,
     ) -> Result<BandSample, RasterError> {
-        self.sample_band_impl(band, format, px, py, ctx)
+        if px >= self.description.width || py >= self.description.height {
+            return Ok(BandSample::Unavailable);
+        }
+        let probe = self.probe_context();
+        if band == BandKey::Display && format == PixelFormat::Rgba8UnormSrgb {
+            return sample_display_rgba(&probe, px, py, || self.display_mapping(ctx), ctx);
+        }
+        let spec = stream_spec_for_band(band, format);
+        if self.validate_stream_spec(spec).is_err() {
+            return Ok(BandSample::Unavailable);
+        }
+        let BandKey::Index(band_u16) = band else {
+            return Ok(BandSample::Unavailable);
+        };
+        sample_indexed_band(
+            &probe,
+            spec,
+            usize::from(band_u16),
+            self.band_scale_offset(band),
+            px,
+            py,
+            ctx,
+        )
     }
 
     fn band_stats(

@@ -2,13 +2,14 @@
 //! interactive geodesic measurement geometries with per-cluster CPU `f64` RTC
 //! offsets and GPU-instanced altitude-scaled point markers.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::{DVec3, Vec3};
 use wgpu::util::DeviceExt;
 
+use super::mesh_cache::{DEFAULT_MESH_CACHE_BYTES, ElasticMeshCache};
 use super::snapshot::{DrawSnapshot, DrawVectorId, DrawVectorLayer};
 use super::uniforms::{DynamicUniformArena, VectorUniform};
 use crate::clamp_opacity;
@@ -63,12 +64,32 @@ struct ClusterDrawRange {
 }
 
 struct CachedVectorBuffers {
-    rev: u64,
     fill_vb: Option<wgpu::Buffer>,
     fill_ib: Option<wgpu::Buffer>,
     line_vb: Option<wgpu::Buffer>,
     point_vb: Option<wgpu::Buffer>,
     clusters: Vec<ClusterDrawRange>,
+    byte_size: usize,
+}
+
+fn estimate_layer_gpu_bytes(layer: &DrawVectorLayer) -> usize {
+    let mut fill_verts = 0usize;
+    let mut fill_indices = 0usize;
+    let mut line_verts = 0usize;
+    let mut point_verts = 0usize;
+    for cluster in &layer.mesh.clusters {
+        if !cluster.fill_vertices.is_empty() && !cluster.fill_indices.is_empty() {
+            fill_verts = fill_verts.saturating_add(cluster.fill_vertices.len());
+            fill_indices = fill_indices.saturating_add(cluster.fill_indices.len());
+        }
+        line_verts = line_verts.saturating_add(cluster.line_vertices.len());
+        point_verts = point_verts.saturating_add(cluster.point_vertices.len());
+    }
+    fill_verts
+        .saturating_mul(std::mem::size_of::<GpuVectorVertex>())
+        .saturating_add(fill_indices.saturating_mul(std::mem::size_of::<u32>()))
+        .saturating_add(line_verts.saturating_mul(std::mem::size_of::<GpuVectorVertex>()))
+        .saturating_add(point_verts.saturating_mul(std::mem::size_of::<GpuVectorVertex>()))
 }
 
 struct ClusterDrawOffsets {
@@ -188,13 +209,18 @@ fn pack_layer_buffers(device: &wgpu::Device, layer: &DrawVectorLayer) -> CachedV
         wgpu::BufferUsages::VERTEX,
     );
 
+    let byte_size = [&fill_vb, &fill_ib, &line_vb, &point_vb]
+        .into_iter()
+        .flatten()
+        .fold(0usize, |acc, buf| acc.saturating_add(buf.size() as usize));
+
     CachedVectorBuffers {
-        rev: layer.rev,
         fill_vb,
         fill_ib,
         line_vb,
         point_vb,
         clusters,
+        byte_size,
     }
 }
 
@@ -247,9 +273,9 @@ fn record_cluster_draws<'a>(
     }
 }
 
-/// GPU buffer cache and Pass-2 recorder for draped vector layers.
+/// Elastic LRU GPU buffer cache and Pass-2 recorder for draped vector layers.
 pub(super) struct VectorRenderer {
-    buffers: HashMap<DrawVectorId, CachedVectorBuffers>,
+    buffers: ElasticMeshCache<(DrawVectorId, u64), CachedVectorBuffers>,
     draw_offsets: Vec<ClusterDrawOffsets>,
     layer_offset_ranges: Vec<Range<usize>>,
 }
@@ -257,7 +283,7 @@ pub(super) struct VectorRenderer {
 impl VectorRenderer {
     pub(super) fn new() -> Self {
         Self {
-            buffers: HashMap::new(),
+            buffers: ElasticMeshCache::new(DEFAULT_MESH_CACHE_BYTES),
             draw_offsets: Vec::new(),
             layer_offset_ranges: Vec::new(),
         }
@@ -265,23 +291,44 @@ impl VectorRenderer {
 
     pub(super) fn prepare_resources(&mut self, device: &wgpu::Device, snapshot: &DrawSnapshot) {
         if snapshot.vectors.is_empty() {
-            self.buffers.clear();
+            // Relax any elastic cap expansion back to `DEFAULT_MESH_CACHE_BYTES`
+            // without clearing warm entries so toggling visibility avoids full
+            // CPU repacking and GPU buffer re-upload.
+            self.buffers.begin_frame(0, std::iter::empty());
+            self.buffers.end_frame(0);
             return;
         }
-        self.buffers
-            .retain(|id, _| snapshot.vectors.iter().any(|v| v.id == *id));
 
+        let mut seen = HashSet::with_capacity(snapshot.vectors.len());
+        let mut active_keys = Vec::with_capacity(snapshot.vectors.len());
+        let mut estimated_needed = 0usize;
         for layer in &snapshot.vectors {
-            let needs_upload = self
-                .buffers
-                .get(&layer.id)
-                .is_none_or(|cached| cached.rev != layer.rev);
-            if !needs_upload {
+            let key = (layer.id, layer.rev);
+            if seen.insert(key) {
+                active_keys.push(key);
+                let bytes = self
+                    .buffers
+                    .peek(&key)
+                    .map_or_else(|| estimate_layer_gpu_bytes(layer), |b| b.byte_size);
+                estimated_needed = estimated_needed.saturating_add(bytes);
+            }
+        }
+
+        self.buffers.begin_frame(estimated_needed, &active_keys);
+        for layer in &snapshot.vectors {
+            let key = (layer.id, layer.rev);
+            if self.buffers.peek(&key).is_some() {
                 continue;
             }
             let packed = pack_layer_buffers(device, layer);
-            self.buffers.insert(layer.id, packed);
+            let byte_size = packed.byte_size;
+            self.buffers.insert(key, packed, byte_size);
         }
+
+        let actual_needed = active_keys.iter().fold(0usize, |acc, key| {
+            acc.saturating_add(self.buffers.peek(key).map_or(0, |b| b.byte_size))
+        });
+        self.buffers.end_frame(actual_needed);
     }
 
     pub(super) fn push_uniforms(
@@ -302,7 +349,7 @@ impl VectorRenderer {
             let fill_alpha = fill_linear[3];
             let line_alpha = line_linear[3];
 
-            let Some(bufs) = self.buffers.get(&layer.id) else {
+            let Some(bufs) = self.buffers.peek(&(layer.id, layer.rev)) else {
                 self.layer_offset_ranges.push(start..start);
                 continue;
             };
@@ -351,7 +398,7 @@ impl VectorRenderer {
             return;
         }
         for (layer, range) in snapshot.vectors.iter().zip(self.layer_offset_ranges.iter()) {
-            let Some(bufs) = self.buffers.get(&layer.id) else {
+            let Some(bufs) = self.buffers.peek(&(layer.id, layer.rev)) else {
                 continue;
             };
             let Some(cluster_offsets) = self.draw_offsets.get(range.clone()) else {

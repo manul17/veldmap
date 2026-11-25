@@ -1,4 +1,5 @@
-//! TIFF error mapping, typed optional tag readers, and GDAL nodata parsing.
+//! TIFF error mapping and typed optional tag readers (open-time seam over
+//! `tiff::decoder::Decoder`).
 
 use tiff::decoder::Decoder;
 use tiff::tags::Tag;
@@ -6,6 +7,8 @@ use veldmap_core::io::BufferedByteReader;
 use veldmap_core::sync::CancelToken;
 
 use crate::{RasterError, map_std_io_error};
+
+use super::georef::RawGeoTiffTags;
 
 pub(super) fn map_tiff_error(err: tiff::TiffError, cancel: &CancelToken) -> RasterError {
     if cancel.is_cancelled() {
@@ -198,18 +201,18 @@ pub(super) fn read_tag_ascii_opt(
     Ok(opt_tag(decoder.get_tag_ascii_string(tag), cancel)?.unwrap_or_default())
 }
 
-pub(super) fn parse_gdal_nodata(
+pub(super) fn read_geotiff_tags(
     decoder: &mut Decoder<BufferedByteReader>,
     cancel: &CancelToken,
-) -> Result<Option<f64>, RasterError> {
-    let Some(raw) = opt_tag(decoder.get_tag_ascii_string(Tag::GdalNodata), cancel)? else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-    if trimmed.eq_ignore_ascii_case("nan") {
-        return Ok(Some(f64::NAN));
-    }
-    Ok(trimmed.parse::<f64>().ok().filter(|v| v.is_finite()))
+) -> Result<RawGeoTiffTags, RasterError> {
+    Ok(RawGeoTiffTags {
+        raw_keys: read_tag_u16_vec_opt(decoder, Tag::GeoKeyDirectoryTag, cancel)?,
+        double_params: read_tag_f64_vec_opt(decoder, Tag::GeoDoubleParamsTag, cancel)?,
+        ascii_params: read_tag_ascii_opt(decoder, Tag::GeoAsciiParamsTag, cancel)?,
+        points: read_tag_f64_vec_opt(decoder, Tag::ModelTiepointTag, cancel)?,
+        scale: read_tag_f64_vec_opt(decoder, Tag::ModelPixelScaleTag, cancel)?,
+        matrix: read_tag_f64_vec_opt(decoder, Tag::ModelTransformationTag, cancel)?,
+    })
 }
 
 #[cfg(test)]

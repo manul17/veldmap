@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use super::super::projection::{
+use super::projection::{
     GK_PULKOVO_EPSG_BASE, GK_PULKOVO_ZONES, MSK61_EPSG_BASE, MSK61_ZONES, UTM_NORTH_EPSG_BASE,
     UTM_SOUTH_EPSG_BASE, UTM_ZONES,
 };
@@ -13,7 +13,6 @@ use super::{CrsSpec, parse_epsg_shorthand};
 pub struct CrsPreset {
     pub epsg: u32,
     pub name: String,
-    pub(super) category: &'static str,
 }
 
 impl CrsPreset {
@@ -62,57 +61,66 @@ const STATIC_PRESETS: &[(u32, &str, &str)] = &[
 fn preset_catalog() -> &'static PresetCatalog {
     static CATALOG: OnceLock<PresetCatalog> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        let mut presets = Vec::with_capacity(170);
-        presets.extend(
-            STATIC_PRESETS
-                .iter()
-                .map(|&(epsg, name, category)| CrsPreset {
+        let mut entries: Vec<(CrsPreset, &'static str)> = Vec::with_capacity(170);
+        entries.extend(STATIC_PRESETS.iter().map(|&(epsg, name, category)| {
+            (
+                CrsPreset {
                     epsg,
                     name: name.to_string(),
-                    category,
-                }),
-        );
+                },
+                category,
+            )
+        }));
         for zone in MSK61_ZONES {
-            presets.push(CrsPreset {
-                epsg: MSK61_EPSG_BASE + zone,
-                name: format!("MSK-61 / Pulkovo 1942 zone {zone}"),
-                category: "MSK / Pulkovo",
-            });
+            entries.push((
+                CrsPreset {
+                    epsg: MSK61_EPSG_BASE + zone,
+                    name: format!("MSK-61 / Pulkovo 1942 zone {zone}"),
+                },
+                "MSK / Pulkovo",
+            ));
         }
         for zone in GK_PULKOVO_ZONES {
-            presets.push(CrsPreset {
-                epsg: GK_PULKOVO_EPSG_BASE + zone,
-                name: format!("Pulkovo 1942 / Gauss-Kruger zone {zone}"),
-                category: "MSK / Pulkovo",
-            });
+            entries.push((
+                CrsPreset {
+                    epsg: GK_PULKOVO_EPSG_BASE + zone,
+                    name: format!("Pulkovo 1942 / Gauss-Kruger zone {zone}"),
+                },
+                "MSK / Pulkovo",
+            ));
         }
         for zone in UTM_ZONES {
-            presets.push(CrsPreset {
-                epsg: UTM_NORTH_EPSG_BASE + zone,
-                name: format!("WGS 84 / UTM zone {zone}N"),
-                category: "UTM North",
-            });
+            entries.push((
+                CrsPreset {
+                    epsg: UTM_NORTH_EPSG_BASE + zone,
+                    name: format!("WGS 84 / UTM zone {zone}N"),
+                },
+                "UTM North",
+            ));
         }
         for zone in UTM_ZONES {
-            presets.push(CrsPreset {
-                epsg: UTM_SOUTH_EPSG_BASE + zone,
-                name: format!("WGS 84 / UTM zone {zone}S"),
-                category: "UTM South",
-            });
+            entries.push((
+                CrsPreset {
+                    epsg: UTM_SOUTH_EPSG_BASE + zone,
+                    name: format!("WGS 84 / UTM zone {zone}S"),
+                },
+                "UTM South",
+            ));
         }
 
-        let search_keys = presets
+        let search_keys = entries
             .iter()
-            .map(|preset| {
+            .map(|(preset, category)| {
                 format!(
                     "epsg:{} {} {} {}",
                     preset.epsg,
                     preset.code_label().to_ascii_lowercase(),
                     preset.name.to_ascii_lowercase(),
-                    preset.category.to_ascii_lowercase()
+                    category.to_ascii_lowercase()
                 )
             })
             .collect();
+        let presets = entries.into_iter().map(|(preset, _)| preset).collect();
 
         PresetCatalog {
             presets,
@@ -154,7 +162,6 @@ pub fn search_crs_presets(query: &str, limit: usize) -> Vec<CrsPreset> {
             CrsPreset {
                 epsg: code,
                 name: format!("EPSG:{code} (crs-definitions)"),
-                category: "EPSG Catalog",
             },
         );
         results.truncate(limit);

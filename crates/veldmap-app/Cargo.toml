@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [lib]
 name = "veldmap_app"
 path = "src/lib.rs"
@@ -32,7 +35,9 @@ wgpu.workspace = true
 
 [dev-dependencies]
 naga.workspace = true
+veldmap-app = { path = ".", features = ["test-support"] }
 veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
+veldmap-net = { path = "../veldmap-net", features = ["test-support"] }
 veldmap-raster = { path = "../veldmap-raster", features = ["test-support"] }
 veldmap-storage = { path = "../veldmap-storage", features = ["test-support"] }
 

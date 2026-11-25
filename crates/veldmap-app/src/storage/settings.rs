@@ -36,10 +36,10 @@ pub(crate) const DISK_CACHE_MAX_MB_RANGE: RangeInclusive<u64> =
     MIN_DISK_CACHE_MAX_MB..=MAX_DISK_CACHE_MAX_MB;
 
 /// Minimum optional user override for the GPU tile cache cap (`128 MiB`).
-pub(crate) const MIN_GPU_CACHE_MAX_MB: u64 = 128;
+const MIN_GPU_CACHE_MAX_MB: u64 = 128;
 
 /// Maximum optional user override for the GPU tile cache cap (`4096 MiB`).
-pub(crate) const MAX_GPU_CACHE_MAX_MB: u64 = 4096;
+const MAX_GPU_CACHE_MAX_MB: u64 = 4096;
 
 /// Default value pre-filled when the user enables a custom GPU VRAM cap (`512 MiB`).
 pub(crate) const DEFAULT_CUSTOM_GPU_CACHE_MAX_MB: u64 = 512;
@@ -344,10 +344,15 @@ impl AppSettings {
 
     /// Persist settings durably via `write_json_durable_private` (`0600` on
     /// Unix so optional Custom XYZ API keys are owner-readable only).
-    pub(crate) fn save(&self, paths: &StoragePaths) -> Result<(), StorageError> {
+    pub(super) fn save(&self, paths: &StoragePaths) -> Result<(), StorageError> {
         let mut normalized = self.clone();
         normalized.normalize();
         write_json_durable_private(&paths.settings_path(), &normalized)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_for_test(&self, paths: &StoragePaths) -> Result<(), StorageError> {
+        self.save(paths)
     }
 }
 

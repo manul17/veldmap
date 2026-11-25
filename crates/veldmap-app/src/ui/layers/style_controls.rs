@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::colormap::{CategoricalPaletteId, ColormapId, sample_colormap_srgb};
-use crate::layers::{CategoricalSummary, LayerId, ScientificSummary, StretchPreset};
+use crate::layers::{CategoricalSummary, LayerId, OverlayEdit, ScientificSummary, StretchPreset};
 use crate::ui::widgets::{DragCommit, paint_colormap_ramp, track_drag_commit};
 
 use super::LayerUiAction;
@@ -153,8 +153,13 @@ fn handle_histogram_interaction(
                 )
             });
         }
-        actions.push(LayerUiAction::SetStretchRange(
-            layer_id, next_lo, next_hi, commit,
+        actions.push(LayerUiAction::edit_raster_drag(
+            layer_id,
+            OverlayEdit::SetStretchRange {
+                min: next_lo,
+                max: next_hi,
+            },
+            commit,
         ));
     } else if response.drag_stopped() {
         let was_changed = ui.data(|d| {
@@ -162,8 +167,13 @@ fn handle_histogram_interaction(
                 .is_some_and(|s| s.changed)
         });
         if was_changed {
-            actions.push(LayerUiAction::SetStretchRange(
-                layer_id, sci.min, sci.max, true,
+            actions.push(LayerUiAction::edit_raster_drag(
+                layer_id,
+                OverlayEdit::SetStretchRange {
+                    min: sci.min,
+                    max: sci.max,
+                },
+                true,
             ));
         }
     }
@@ -239,7 +249,10 @@ pub(super) fn show_scientific_controls(
             .show_ui(ui, |ui| {
                 for opt in StretchPreset::ALL {
                     if ui.selectable_value(&mut preset, opt, opt.label()).clicked() {
-                        actions.push(LayerUiAction::SetStretchPreset(layer_id, opt));
+                        actions.push(LayerUiAction::edit_raster(
+                            layer_id,
+                            OverlayEdit::SetStretchPreset(opt),
+                        ));
                     }
                 }
             });
@@ -254,10 +267,12 @@ pub(super) fn show_scientific_controls(
             .show_ui(ui, |ui| {
                 for opt in ColormapId::ALL {
                     if ui.selectable_value(&mut cmap, opt, opt.label()).clicked() {
-                        actions.push(LayerUiAction::SetColormap(
+                        actions.push(LayerUiAction::edit_raster(
                             layer_id,
-                            opt,
-                            sci.invert_colormap,
+                            OverlayEdit::SetColormap {
+                                colormap: opt,
+                                invert: sci.invert_colormap,
+                            },
                         ));
                     }
                 }
@@ -267,7 +282,13 @@ pub(super) fn show_scientific_controls(
             .checkbox(&mut invert, egui::RichText::new("Inv").small())
             .changed()
         {
-            actions.push(LayerUiAction::SetColormap(layer_id, sci.colormap, invert));
+            actions.push(LayerUiAction::edit_raster(
+                layer_id,
+                OverlayEdit::SetColormap {
+                    colormap: sci.colormap,
+                    invert,
+                },
+            ));
         }
     });
 
@@ -289,10 +310,18 @@ pub(super) fn show_scientific_controls(
         ) {
             DragCommit::None => {}
             DragCommit::Preview => {
-                actions.push(LayerUiAction::SetStretchRange(layer_id, lo, hi, false));
+                actions.push(LayerUiAction::edit_raster_drag(
+                    layer_id,
+                    OverlayEdit::SetStretchRange { min: lo, max: hi },
+                    false,
+                ));
             }
             DragCommit::Commit => {
-                actions.push(LayerUiAction::SetStretchRange(layer_id, lo, hi, true));
+                actions.push(LayerUiAction::edit_raster_drag(
+                    layer_id,
+                    OverlayEdit::SetStretchRange { min: lo, max: hi },
+                    true,
+                ));
             }
         }
     });
@@ -318,7 +347,10 @@ pub(super) fn show_categorical_controls(
                         continue;
                     }
                     if ui.selectable_value(&mut pal, opt, opt.label()).clicked() {
-                        actions.push(LayerUiAction::SetCategoricalPalette(layer_id, opt));
+                        actions.push(LayerUiAction::edit_raster(
+                            layer_id,
+                            OverlayEdit::SetCategoricalPalette(opt),
+                        ));
                     }
                 }
             });

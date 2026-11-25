@@ -1,16 +1,17 @@
 //! Geodetic datums, ellipsoids, linear units, and 7-parameter Helmert
 //! transformations targeting WGS84 at the module boundary.
 //!
-//! Pure leaf module above [`super::geodesy`] with no projection or PROJ
-//! dependencies so [`super::proj4`], [`super::projection`], and [`super::crs`]
-//! form a strictly acyclic dependency graph.
+//! Pure leaf module above [`super::super::geodesy`] with no projection or PROJ
+//! dependencies so [`super::proj4`], [`super::projection`], and [`super`] form
+//! a strictly acyclic dependency graph.
 
 use glam::DVec3;
+use serde::{Deserialize, Serialize};
 
-use super::geodesy::{Ellipsoid, Geodetic, WGS84};
+use super::super::geodesy::{Ellipsoid, Geodetic, WGS84};
 
 /// International foot in metres (EPSG:9002).
-pub(crate) const INTERNATIONAL_FOOT_M: f64 = 0.3048;
+pub(super) const INTERNATIONAL_FOOT_M: f64 = 0.3048;
 
 /// US Survey foot in metres (EPSG:9003, `1200 / 3937`).
 pub const US_SURVEY_FOOT_M: f64 = 1200.0 / 3937.0;
@@ -210,7 +211,8 @@ impl DatumWarning {
 }
 
 /// Supported linear coordinate units for projected coordinate systems.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LinearUnit {
     #[default]
     Metre,
@@ -294,7 +296,7 @@ pub fn known_datum_from_code(code: u32) -> Option<(Datum, Option<DatumWarning>)>
 
 /// Resolve a known static geographic CRS (4xxx EPSG code only, keeping 6xxx
 /// datum codes strictly distinct) into its `(Datum, label, Option<DatumWarning>)`.
-pub(crate) fn known_geographic_epsg(code: u32) -> Option<(Datum, String, Option<DatumWarning>)> {
+pub(super) fn known_geographic_epsg(code: u32) -> Option<(Datum, String, Option<DatumWarning>)> {
     let entry = lookup_known_datum(code)?;
     if !entry.is_geographic_crs {
         return None;

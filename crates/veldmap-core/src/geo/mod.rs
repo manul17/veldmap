@@ -7,14 +7,11 @@ mod camera;
 mod coords;
 mod crs;
 mod cull;
-mod datum;
 mod footprint;
 mod geodesic;
 mod geodesy;
 mod geojson;
 mod mgrs;
-mod proj4;
-mod projection;
 pub(crate) mod sag;
 mod shapes;
 
@@ -22,14 +19,12 @@ pub use binding::{Frame, Tie, TieGrid};
 pub use camera::{Camera, MIN_HEIGHT_M, ZOOM_PER_CLICK};
 pub use coords::{LocationKind, ParseLocationError, ParsedLocation, parse_location};
 pub use crs::{
-    CrsPreset, CrsSpec, CrsTextKind, CustomTmParams, DatumPreset, builtin_crs_presets,
-    search_crs_presets,
+    CrsError, CrsPreset, CrsSpec, CrsTextKind, CustomTmParams, Datum, DatumPreset, DatumWarning,
+    HelmertConvention, KRASOVSKY, LinearUnit, PULKOVO_1942, Proj4Projection, Projection, System,
+    US_SURVEY_FOOT_M, WEB_MERCATOR_LIMIT_DEG, WGS84_DATUM, builtin_crs_presets,
+    ellipsoid_from_epsg, known_datum_from_code, search_crs_presets, web_mercator_lat_deg,
 };
 pub use cull::{Ball, CullFrustum};
-pub use datum::{
-    Datum, DatumWarning, HelmertConvention, KRASOVSKY, LinearUnit, PULKOVO_1942, US_SURVEY_FOOT_M,
-    WGS84_DATUM, ellipsoid_from_epsg, known_datum_from_code,
-};
 pub use footprint::FootprintBounds;
 pub use geodesic::{GeodesicPolygonMeasurement, polyline_length_m, ring_perimeter_and_area};
 pub(crate) use geodesy::{EQUATORIAL_CIRCUMFERENCE_M, unwind};
@@ -39,8 +34,6 @@ pub use geojson::{
     GeoJsonGeometry, MAX_GEOJSON_BYTES, VectorCluster, VectorMesh, VectorVertex,
     export_geojson_feature_collection, parse_geojson,
 };
-pub use proj4::{CrsError, Proj4Projection};
-pub use projection::{Projection, System, WEB_MERCATOR_LIMIT_DEG, web_mercator_lat_deg};
 pub use shapes::{GeoPoint, Polygon, Ring};
 
 /// Local WGS84 surface distance approximation in metres for unit test error assertions.

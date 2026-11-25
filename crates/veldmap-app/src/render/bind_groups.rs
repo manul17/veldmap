@@ -199,11 +199,13 @@ impl TileBindGroupCache {
     }
 
     /// Total cached bind groups across all pixel formats.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the cache currently holds zero tile bind groups.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

@@ -3,13 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::layers::{CrsOverride, OverlayEdit};
+use crate::layers::CrsOverride;
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::storage::session::SavedCameraPose;
 use crate::ui::basemap::BasemapUiAction;
 use crate::ui::crs_picker::CrsPickerAction;
 use crate::ui::format;
-use crate::ui::layers::LayerUiAction;
+use crate::ui::layers::{EditPersist, LayerUiAction};
 use crate::ui::measure::MeasureAction;
 use crate::ui::toolbar::ToolbarAction;
 
@@ -106,19 +106,13 @@ impl VeldmapApp {
                     }
                     needs_repaint = true;
                 }
-                LayerUiAction::ToggleVisibility(id, visible) => {
-                    let changed = self
-                        .scene
-                        .edit_overlay(id, OverlayEdit::SetVisible(visible));
+                LayerUiAction::EditRaster { id, edit, persist } => {
+                    let changed = self.scene.edit_overlay(id, edit);
                     needs_repaint |= changed;
-                    session_dirty |= changed;
-                }
-                LayerUiAction::SetOpacity(id, opacity, commit) => {
-                    let changed = self
-                        .scene
-                        .edit_overlay(id, OverlayEdit::SetOpacity(opacity));
-                    needs_repaint |= changed;
-                    session_dirty |= commit;
+                    session_dirty |= match persist {
+                        EditPersist::OnChange => changed,
+                        EditPersist::OnCommit(commit) => commit,
+                    };
                 }
                 LayerUiAction::SetStream(id, spec) => {
                     match self.scene.set_overlay_stream(id, spec) {
@@ -131,44 +125,6 @@ impl VeldmapApp {
                             needs_repaint = true;
                         }
                     }
-                }
-                LayerUiAction::SetStretchPreset(id, preset) => {
-                    let changed = self
-                        .scene
-                        .edit_overlay(id, OverlayEdit::SetStretchPreset(preset));
-                    needs_repaint |= changed;
-                    session_dirty |= changed;
-                }
-                LayerUiAction::SetStretchRange(id, min, max, commit) => {
-                    let changed = self
-                        .scene
-                        .edit_overlay(id, OverlayEdit::SetStretchRange { min, max });
-                    needs_repaint |= changed;
-                    session_dirty |= commit;
-                }
-                LayerUiAction::SetColormap(id, colormap, invert) => {
-                    let changed = self
-                        .scene
-                        .edit_overlay(id, OverlayEdit::SetColormap { colormap, invert });
-                    needs_repaint |= changed;
-                    session_dirty |= changed;
-                }
-                LayerUiAction::SetCategoricalPalette(id, palette) => {
-                    let changed = self
-                        .scene
-                        .edit_overlay(id, OverlayEdit::SetCategoricalPalette(palette));
-                    needs_repaint |= changed;
-                    session_dirty |= changed;
-                }
-                LayerUiAction::MoveUp(id) => {
-                    let changed = self.scene.edit_overlay(id, OverlayEdit::MoveUp);
-                    needs_repaint |= changed;
-                    session_dirty |= changed;
-                }
-                LayerUiAction::MoveDown(id) => {
-                    let changed = self.scene.edit_overlay(id, OverlayEdit::MoveDown);
-                    needs_repaint |= changed;
-                    session_dirty |= changed;
                 }
                 LayerUiAction::OpenCrsPicker(id, name) => {
                     let existing = self.scene.overlays().layer_crs_override(id);
@@ -189,11 +145,6 @@ impl VeldmapApp {
                         self.panels.layers.push_error(err);
                     }
                     needs_repaint = true;
-                }
-                LayerUiAction::Remove(id) => {
-                    let changed = self.scene.edit_overlay(id, OverlayEdit::Remove);
-                    needs_repaint |= changed;
-                    session_dirty |= changed;
                 }
                 LayerUiAction::ToggleVectorVisibility(id, visible) => {
                     let changed = self.scene.set_vector_visible(id, visible);

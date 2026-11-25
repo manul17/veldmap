@@ -1,18 +1,10 @@
 //! TIFF 6.0 Section 21 `YCbCr -> RGBA8` color conversion (`YCbCrCoefficients`
 //! tag 529 and `ReferenceBlackWhite` tag 532).
 
-use tiff::decoder::Decoder;
-use tiff::tags::Tag;
-use veldmap_core::io::BufferedByteReader;
-use veldmap_core::sync::CancelToken;
-
-use crate::RasterError;
 use crate::pipeline::radiometry::is_data_f64;
 
-use super::tags::read_tag_numeric_f64_vec_opt;
-
-const TAG_YCBCR_COEFFICIENTS: u16 = 529;
-const TAG_REFERENCE_BLACK_WHITE: u16 = 532;
+pub(super) const TAG_YCBCR_COEFFICIENTS: u16 = 529;
+pub(super) const TAG_REFERENCE_BLACK_WHITE: u16 = 532;
 
 const DEFAULT_LUMA: [f64; 3] = [0.299, 0.587, 0.114];
 const DEFAULT_REF_BLACK_WHITE: [f64; 6] = [0.0, 255.0, 128.0, 255.0, 128.0, 255.0];
@@ -38,13 +30,32 @@ pub(super) struct YCbCrParams {
     scale_cr: f64,
 }
 
-impl Default for YCbCrParams {
-    fn default() -> Self {
-        Self::new(DEFAULT_LUMA, DEFAULT_REF_BLACK_WHITE)
-    }
-}
-
 impl YCbCrParams {
+    /// Construct validated `YCbCrParams` from optional raw TIFF tag slices
+    /// (`YCbCrCoefficients` tag 529 and `ReferenceBlackWhite` tag 532),
+    /// falling back to TIFF 6.0 defaults when absent or malformed.
+    pub(super) fn from_tags(coeffs: Option<&[f64]>, ref_black_white: Option<&[f64]>) -> Self {
+        let mut luma = DEFAULT_LUMA;
+        if let Some(coeffs) = coeffs
+            && coeffs.len() == 3
+            && coeffs.iter().all(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
+            && coeffs[1] > 1e-4
+        {
+            luma = [coeffs[0], coeffs[1], coeffs[2]];
+        }
+        let mut rbw_out = DEFAULT_REF_BLACK_WHITE;
+        if let Some(rbw) = ref_black_white
+            && rbw.len() == 6
+            && rbw.iter().all(|v| v.is_finite())
+            && (rbw[1] - rbw[0]).abs() > 1e-6
+            && (rbw[3] - rbw[2]).abs() > 1e-6
+            && (rbw[5] - rbw[4]).abs() > 1e-6
+        {
+            rbw_out = [rbw[0], rbw[1], rbw[2], rbw[3], rbw[4], rbw[5]];
+        }
+        Self::new(luma, rbw_out)
+    }
+
     fn new(luma: [f64; 3], ref_black_white: [f64; 6]) -> Self {
         let [lr, lg, lb] = luma;
         let [rb_y, rw_y, rb_cb, rw_cb, rb_cr, rw_cr] = ref_black_white;
@@ -122,31 +133,4 @@ impl YCbCrParams {
         }
         rgba
     }
-}
-
-pub(super) fn read_ycbcr_params(
-    decoder: &mut Decoder<BufferedByteReader>,
-    cancel: &CancelToken,
-) -> Result<YCbCrParams, RasterError> {
-    let mut luma = DEFAULT_LUMA;
-    if let Some(coeffs) =
-        read_tag_numeric_f64_vec_opt(decoder, Tag::Unknown(TAG_YCBCR_COEFFICIENTS), cancel)?
-        && coeffs.len() == 3
-        && coeffs.iter().all(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
-        && coeffs[1] > 1e-4
-    {
-        luma = [coeffs[0], coeffs[1], coeffs[2]];
-    }
-    let mut ref_black_white = DEFAULT_REF_BLACK_WHITE;
-    if let Some(rbw) =
-        read_tag_numeric_f64_vec_opt(decoder, Tag::Unknown(TAG_REFERENCE_BLACK_WHITE), cancel)?
-        && rbw.len() == 6
-        && rbw.iter().all(|v| v.is_finite())
-        && (rbw[1] - rbw[0]).abs() > 1e-6
-        && (rbw[3] - rbw[2]).abs() > 1e-6
-        && (rbw[5] - rbw[4]).abs() > 1e-6
-    {
-        ref_black_white = [rbw[0], rbw[1], rbw[2], rbw[3], rbw[4], rbw[5]];
-    }
-    Ok(YCbCrParams::new(luma, ref_black_white))
 }

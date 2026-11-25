@@ -4,14 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-use veldmap_core::geo::{Camera, CustomTmParams, DatumPreset, LinearUnit};
+use serde::{Deserialize, Deserializer, Serialize};
+use veldmap_core::geo::{Camera, CustomTmParams};
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
 };
 
 use crate::clamp_opacity;
-use crate::layers::{CrsOverride, SavedLayerStyle};
+use crate::colormap::{CategoricalPaletteId, ColormapId};
+use crate::layers::{CrsOverride, LayerStyleSpec, StretchPreset, TrackKind};
 
 /// Current on-disk schema version for `session.json`.
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -22,34 +23,198 @@ const MAX_RECENT_FILES: usize = 16;
 /// Maximum number of camera bookmarks kept in `session.json`.
 pub(crate) const MAX_BOOKMARKS: usize = 64;
 
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "DatumPreset", rename_all = "snake_case")]
-enum DatumPresetDef {
-    Wgs84,
-    Pulkovo1942,
+/// Forward-compatible `Option<T>` deserializer for string-encoded style enums:
+/// unknown variants written by newer versions fall back to `None` instead of
+/// failing the entire `session.json` load into `.corrupt`.
+fn deserialize_lossy_opt<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: for<'a> Deserialize<'a>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|s| {
+        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&s);
+        T::deserialize(de).ok()
+    }))
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "LinearUnit", rename_all = "snake_case")]
-enum LinearUnitDef {
-    Metre,
-    InternationalFoot,
-    UsSurveyFoot,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireTrackKind {
+    Display,
+    Scientific,
+    Categorical,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "CustomTmParams")]
-struct CustomTmParamsDef {
-    name: String,
-    #[serde(default, with = "DatumPresetDef")]
-    datum: DatumPreset,
-    central_meridian_deg: f64,
-    origin_lat_deg: f64,
-    scale: f64,
-    false_easting_m: f64,
-    false_northing_m: f64,
-    #[serde(with = "LinearUnitDef")]
-    unit: LinearUnit,
+impl From<TrackKind> for WireTrackKind {
+    fn from(k: TrackKind) -> Self {
+        match k {
+            TrackKind::Display => Self::Display,
+            TrackKind::Scientific => Self::Scientific,
+            TrackKind::Categorical => Self::Categorical,
+        }
+    }
+}
+
+impl From<WireTrackKind> for TrackKind {
+    fn from(k: WireTrackKind) -> Self {
+        match k {
+            WireTrackKind::Display => Self::Display,
+            WireTrackKind::Scientific => Self::Scientific,
+            WireTrackKind::Categorical => Self::Categorical,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireStretchPreset {
+    Percentile2_98,
+    MinMax,
+    Log10Db,
+    Custom,
+}
+
+impl From<StretchPreset> for WireStretchPreset {
+    fn from(p: StretchPreset) -> Self {
+        match p {
+            StretchPreset::Percentile2_98 => Self::Percentile2_98,
+            StretchPreset::MinMax => Self::MinMax,
+            StretchPreset::Log10Db => Self::Log10Db,
+            StretchPreset::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<WireStretchPreset> for StretchPreset {
+    fn from(p: WireStretchPreset) -> Self {
+        match p {
+            WireStretchPreset::Percentile2_98 => Self::Percentile2_98,
+            WireStretchPreset::MinMax => Self::MinMax,
+            WireStretchPreset::Log10Db => Self::Log10Db,
+            WireStretchPreset::Custom => Self::Custom,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireColormapId {
+    Grayscale,
+    Viridis,
+    Inferno,
+    Plasma,
+    Turbo,
+    RdBu,
+    Terrain,
+}
+
+impl From<ColormapId> for WireColormapId {
+    fn from(c: ColormapId) -> Self {
+        match c {
+            ColormapId::Grayscale => Self::Grayscale,
+            ColormapId::Viridis => Self::Viridis,
+            ColormapId::Inferno => Self::Inferno,
+            ColormapId::Plasma => Self::Plasma,
+            ColormapId::Turbo => Self::Turbo,
+            ColormapId::RdBu => Self::RdBu,
+            ColormapId::Terrain => Self::Terrain,
+        }
+    }
+}
+
+impl From<WireColormapId> for ColormapId {
+    fn from(c: WireColormapId) -> Self {
+        match c {
+            WireColormapId::Grayscale => Self::Grayscale,
+            WireColormapId::Viridis => Self::Viridis,
+            WireColormapId::Inferno => Self::Inferno,
+            WireColormapId::Plasma => Self::Plasma,
+            WireColormapId::Turbo => Self::Turbo,
+            WireColormapId::RdBu => Self::RdBu,
+            WireColormapId::Terrain => Self::Terrain,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireCategoricalPaletteId {
+    SourceColorMap,
+    Sentinel2Scl,
+    DistinctClasses,
+}
+
+impl From<CategoricalPaletteId> for WireCategoricalPaletteId {
+    fn from(p: CategoricalPaletteId) -> Self {
+        match p {
+            CategoricalPaletteId::SourceColorMap => Self::SourceColorMap,
+            CategoricalPaletteId::Sentinel2Scl => Self::Sentinel2Scl,
+            CategoricalPaletteId::DistinctClasses => Self::DistinctClasses,
+        }
+    }
+}
+
+impl From<WireCategoricalPaletteId> for CategoricalPaletteId {
+    fn from(p: WireCategoricalPaletteId) -> Self {
+        match p {
+            WireCategoricalPaletteId::SourceColorMap => Self::SourceColorMap,
+            WireCategoricalPaletteId::Sentinel2Scl => Self::Sentinel2Scl,
+            WireCategoricalPaletteId::DistinctClasses => Self::DistinctClasses,
+        }
+    }
+}
+
+/// Forward-compatible `session.json` wire proxy for [`LayerStyleSpec`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedLayerStyle {
+    band_index: Option<u16>,
+    #[serde(deserialize_with = "deserialize_lossy_opt")]
+    track: Option<WireTrackKind>,
+    #[serde(deserialize_with = "deserialize_lossy_opt")]
+    stretch_preset: Option<WireStretchPreset>,
+    stretch_min: Option<f64>,
+    stretch_max: Option<f64>,
+    #[serde(default)]
+    custom_stretch_range: bool,
+    #[serde(deserialize_with = "deserialize_lossy_opt")]
+    colormap: Option<WireColormapId>,
+    invert_colormap: bool,
+    #[serde(deserialize_with = "deserialize_lossy_opt")]
+    categorical_palette: Option<WireCategoricalPaletteId>,
+}
+
+impl From<&LayerStyleSpec> for SavedLayerStyle {
+    fn from(spec: &LayerStyleSpec) -> Self {
+        Self {
+            band_index: spec.band_index,
+            track: spec.track.map(WireTrackKind::from),
+            stretch_preset: spec.stretch_preset.map(WireStretchPreset::from),
+            stretch_min: spec.stretch_min,
+            stretch_max: spec.stretch_max,
+            custom_stretch_range: spec.custom_stretch_range,
+            colormap: spec.colormap.map(WireColormapId::from),
+            invert_colormap: spec.invert_colormap,
+            categorical_palette: spec.categorical_palette.map(WireCategoricalPaletteId::from),
+        }
+    }
+}
+
+impl From<&SavedLayerStyle> for LayerStyleSpec {
+    fn from(saved: &SavedLayerStyle) -> Self {
+        Self {
+            band_index: saved.band_index,
+            track: saved.track.map(TrackKind::from),
+            stretch_preset: saved.stretch_preset.map(StretchPreset::from),
+            stretch_min: saved.stretch_min,
+            stretch_max: saved.stretch_max,
+            custom_stretch_range: saved.custom_stretch_range,
+            colormap: saved.colormap.map(ColormapId::from),
+            invert_colormap: saved.invert_colormap,
+            categorical_palette: saved.categorical_palette.map(CategoricalPaletteId::from),
+        }
+    }
 }
 
 /// Minimal serde proxy preserving the exact flat `session.json` wire format
@@ -60,7 +225,7 @@ enum SavedCrsOverride {
     Epsg { code: u32 },
     Wkt { wkt: String },
     Proj { proj: String },
-    CustomTm(#[serde(with = "CustomTmParamsDef")] CustomTmParams),
+    CustomTm(CustomTmParams),
 }
 
 impl From<&CrsOverride> for SavedCrsOverride {
@@ -94,7 +259,7 @@ pub(crate) struct SavedLayerEntry {
     pub(crate) opacity: f32,
     crs_override: Option<SavedCrsOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) style: Option<SavedLayerStyle>,
+    style: Option<SavedLayerStyle>,
 }
 
 impl SavedLayerEntry {
@@ -113,19 +278,23 @@ impl SavedLayerEntry {
         visible: bool,
         opacity: f32,
         crs_override: Option<&CrsOverride>,
-        style: Option<SavedLayerStyle>,
+        style: Option<&LayerStyleSpec>,
     ) -> Self {
         Self {
             path,
             visible,
             opacity,
             crs_override: crs_override.map(SavedCrsOverride::from),
-            style,
+            style: style.map(SavedLayerStyle::from),
         }
     }
 
     pub(crate) fn crs_override(&self) -> Option<CrsOverride> {
         self.crs_override.as_ref().map(CrsOverride::from)
+    }
+
+    pub(crate) fn style(&self) -> Option<LayerStyleSpec> {
+        self.style.as_ref().map(LayerStyleSpec::from)
     }
 }
 

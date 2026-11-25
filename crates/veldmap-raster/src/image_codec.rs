@@ -95,41 +95,46 @@ fn cmyk_pixel_to_rgb(px: &[u8]) -> [u8; 3] {
     [r, g, b]
 }
 
-/// Convert `jpeg-decoder`'s un-inverted standard `[C, M, Y, K]` bytes (`0` = no
-/// ink / white, `255` = full ink / black) into opaque RGBA8.
-fn cmyk_to_rgba8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pixel_count.saturating_mul(4));
-    for px in cmyk.chunks_exact(4).take(pixel_count) {
-        let [r, g, b] = cmyk_pixel_to_rgb(px);
-        out.extend_from_slice(&[r, g, b, 255]);
+#[inline]
+fn push_rgb_or_rgba<const WITH_ALPHA: bool>(out: &mut Vec<u8>, rgb: [u8; 3]) {
+    if WITH_ALPHA {
+        out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+    } else {
+        out.extend_from_slice(&rgb);
     }
-    out
 }
 
 /// Convert `jpeg-decoder`'s un-inverted standard `[C, M, Y, K]` bytes (`0` = no
-/// ink / white, `255` = full ink / black) into packed RGB8.
-fn cmyk_to_rgb8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pixel_count.saturating_mul(3));
+/// ink / white, `255` = full ink / black) into tightly packed RGB8 or opaque
+/// RGBA8.
+fn cmyk_to_packed<const WITH_ALPHA: bool>(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
+    let bpp = if WITH_ALPHA { 4 } else { 3 };
+    let mut out = Vec::with_capacity(pixel_count.saturating_mul(bpp));
     for px in cmyk.chunks_exact(4).take(pixel_count) {
-        out.extend_from_slice(&cmyk_pixel_to_rgb(px));
+        push_rgb_or_rgba::<WITH_ALPHA>(&mut out, cmyk_pixel_to_rgb(px));
     }
     out
 }
 
-fn gray_to_rgba8(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
+fn gray_to_packed<const WITH_ALPHA: bool>(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
+    let bpp = if WITH_ALPHA { 4 } else { 3 };
     let count = pixel_count.min(pixels.len());
-    let mut out = Vec::with_capacity(count.saturating_mul(4));
+    let mut out = Vec::with_capacity(count.saturating_mul(bpp));
     for &g in pixels.iter().take(count) {
-        out.extend_from_slice(&[g, g, g, 255]);
+        push_rgb_or_rgba::<WITH_ALPHA>(&mut out, [g, g, g]);
     }
     out
 }
 
-fn gray_to_rgb8(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
-    let count = pixel_count.min(pixels.len());
-    let mut out = Vec::with_capacity(count.saturating_mul(3));
-    for &g in pixels.iter().take(count) {
-        out.extend_from_slice(&[g, g, g]);
+fn l16_to_packed<const WITH_ALPHA: bool>(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
+    let bpp = if WITH_ALPHA { 4 } else { 3 };
+    let scale = l16_normalization_scale(pixels, pixel_count);
+    let count = pixel_count.min(pixels.len() / 2);
+    let mut out = Vec::with_capacity(count.saturating_mul(bpp));
+    for p in pixels.chunks_exact(2).take(count) {
+        let v = f64::from(u16::from_ne_bytes([p[0], p[1]]));
+        let byte = (v * scale).round().clamp(0.0, 255.0) as u8;
+        push_rgb_or_rgba::<WITH_ALPHA>(&mut out, [byte, byte, byte]);
     }
     out
 }
@@ -154,21 +159,26 @@ pub(crate) fn rgba_to_rgb8(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
     out
 }
 
-/// Convert 8-bit normalized PNG pixels into tightly packed RGBA8, moving
-/// already-RGBA buffers in place.
-pub(crate) fn png_u8_to_rgba8(
+fn png_u8_to_packed<const WITH_ALPHA: bool>(
     color_type: png::ColorType,
     mut buf: Vec<u8>,
     pixel_count: usize,
 ) -> Vec<u8> {
     match color_type {
-        png::ColorType::Rgba => buf,
+        png::ColorType::Rgba if WITH_ALPHA => buf,
+        png::ColorType::Rgba => rgba_to_rgb8(&buf, pixel_count),
+        png::ColorType::Rgb if !WITH_ALPHA => buf,
         png::ColorType::Rgb => rgb_to_rgba8(&buf, pixel_count),
-        png::ColorType::Grayscale => gray_to_rgba8(&buf, pixel_count),
+        png::ColorType::Grayscale => gray_to_packed::<WITH_ALPHA>(&buf, pixel_count),
         png::ColorType::GrayscaleAlpha => {
-            let mut out = Vec::with_capacity(pixel_count.saturating_mul(4));
+            let bpp = if WITH_ALPHA { 4 } else { 3 };
+            let mut out = Vec::with_capacity(pixel_count.saturating_mul(bpp));
             for px in buf.chunks_exact(2).take(pixel_count) {
-                out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+                if WITH_ALPHA {
+                    out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+                } else {
+                    out.extend_from_slice(&[px[0], px[0], px[0]]);
+                }
             }
             out
         }
@@ -180,30 +190,24 @@ pub(crate) fn png_u8_to_rgba8(
     }
 }
 
+/// Convert 8-bit normalized PNG pixels into tightly packed RGBA8, moving
+/// already-RGBA buffers in place.
+pub(crate) fn png_u8_to_rgba8(
+    color_type: png::ColorType,
+    buf: Vec<u8>,
+    pixel_count: usize,
+) -> Vec<u8> {
+    png_u8_to_packed::<true>(color_type, buf, pixel_count)
+}
+
 /// Convert 8-bit normalized PNG pixels into tightly packed RGB8, moving
 /// already-RGB buffers in place.
 pub(crate) fn png_u8_to_rgb8(
     color_type: png::ColorType,
-    mut buf: Vec<u8>,
+    buf: Vec<u8>,
     pixel_count: usize,
 ) -> Vec<u8> {
-    match color_type {
-        png::ColorType::Rgb => buf,
-        png::ColorType::Rgba => rgba_to_rgb8(&buf, pixel_count),
-        png::ColorType::Grayscale => gray_to_rgb8(&buf, pixel_count),
-        png::ColorType::GrayscaleAlpha => {
-            let mut out = Vec::with_capacity(pixel_count.saturating_mul(3));
-            for px in buf.chunks_exact(2).take(pixel_count) {
-                out.extend_from_slice(&[px[0], px[0], px[0]]);
-            }
-            out
-        }
-        png::ColorType::Indexed => {
-            // `normalize_to_color8()` always expands indexed palettes before output.
-            buf.clear();
-            buf
-        }
-    }
+    png_u8_to_packed::<false>(color_type, buf, pixel_count)
 }
 
 fn l16_normalization_scale(pixels: &[u8], pixel_count: usize) -> f64 {
@@ -232,20 +236,10 @@ pub(crate) fn decode_jpeg_pixels_to_rgba8(
     pixel_count: usize,
 ) -> Vec<u8> {
     match format {
-        jpeg_decoder::PixelFormat::L8 => gray_to_rgba8(pixels, pixel_count),
+        jpeg_decoder::PixelFormat::L8 => gray_to_packed::<true>(pixels, pixel_count),
         jpeg_decoder::PixelFormat::RGB24 => rgb_to_rgba8(pixels, pixel_count),
-        jpeg_decoder::PixelFormat::L16 => {
-            let scale = l16_normalization_scale(pixels, pixel_count);
-            let count = pixel_count.min(pixels.len() / 2);
-            let mut out = Vec::with_capacity(count.saturating_mul(4));
-            for p in pixels.chunks_exact(2).take(count) {
-                let v = f64::from(u16::from_ne_bytes([p[0], p[1]]));
-                let byte = (v * scale).round().clamp(0.0, 255.0) as u8;
-                out.extend_from_slice(&[byte, byte, byte, 255]);
-            }
-            out
-        }
-        jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_rgba8(pixels, pixel_count),
+        jpeg_decoder::PixelFormat::L16 => l16_to_packed::<true>(pixels, pixel_count),
+        jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_packed::<true>(pixels, pixel_count),
     }
 }
 
@@ -258,19 +252,9 @@ pub(crate) fn decode_jpeg_pixels_to_rgb8(
 ) -> Vec<u8> {
     match format {
         jpeg_decoder::PixelFormat::RGB24 => pixels,
-        jpeg_decoder::PixelFormat::L8 => gray_to_rgb8(&pixels, pixel_count),
-        jpeg_decoder::PixelFormat::L16 => {
-            let scale = l16_normalization_scale(&pixels, pixel_count);
-            let count = pixel_count.min(pixels.len() / 2);
-            let mut out = Vec::with_capacity(count.saturating_mul(3));
-            for p in pixels.chunks_exact(2).take(count) {
-                let v = f64::from(u16::from_ne_bytes([p[0], p[1]]));
-                let byte = (v * scale).round().clamp(0.0, 255.0) as u8;
-                out.extend_from_slice(&[byte, byte, byte]);
-            }
-            out
-        }
-        jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_rgb8(&pixels, pixel_count),
+        jpeg_decoder::PixelFormat::L8 => gray_to_packed::<false>(&pixels, pixel_count),
+        jpeg_decoder::PixelFormat::L16 => l16_to_packed::<false>(&pixels, pixel_count),
+        jpeg_decoder::PixelFormat::CMYK32 => cmyk_to_packed::<false>(&pixels, pixel_count),
     }
 }
 
@@ -282,14 +266,14 @@ mod tests {
     fn cmyk_conversions_handle_uninverted_standard_cmyk() {
         // White (0,0,0,0), pure cyan (255,0,0,0), pure black (0,0,0,255), mid-gray (0,0,0,128).
         let input = [0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 128];
-        let rgba = cmyk_to_rgba8(&input, 4);
+        let rgba = cmyk_to_packed::<true>(&input, 4);
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
         assert_eq!(&rgba[4..8], &[0, 255, 255, 255]);
         assert_eq!(&rgba[8..12], &[0, 0, 0, 255]);
         assert_eq!(rgba[12], 127);
         assert_eq!(rgba[15], 255);
 
-        let rgb = cmyk_to_rgb8(&input, 4);
+        let rgb = cmyk_to_packed::<false>(&input, 4);
         assert_eq!(&rgb[0..3], &[255, 255, 255]);
         assert_eq!(&rgb[3..6], &[0, 255, 255]);
         assert_eq!(&rgb[6..9], &[0, 0, 0]);

@@ -1,57 +1,13 @@
 //! CPU mipmap generation across raster tracks:
 //! - Linear-light alpha-weighted mipmaps for `Rgba8UnormSrgb` display tiles
 //! - NaN-skipping `f64`-accumulated mipmaps for `R32Float` scientific tiles
-//! - 1-mip clearing for `R8Uint`/`R16Uint` categorical tiles
-//! - Equirectangular horizontal-wrap 2x RGB8 downsampling for bundled basemaps.
+//! - 1-mip clearing for `R8Uint`/`R16Uint` categorical tiles.
 
 use veldmap_core::tile::{DecodedTile, PixelFormat, max_mip_levels, mip_dimensions};
 
 use crate::color::{
-    LINEAR_TO_SRGB_LUT_LEN, average_srgb_rgba8_block, linear_to_srgb_lut, mix_2x2_srgb_rgb,
-    srgb_to_linear_lut,
+    LINEAR_TO_SRGB_LUT_LEN, average_srgb_rgba8_block, linear_to_srgb_lut, srgb_to_linear_lut,
 };
-
-/// Downsample an opaque packed `Rgb8` sRGB image 2x in linear light, wrapping
-/// horizontally for equirectangular continuity.
-pub(super) fn downsample_rgb8_srgb_wrap_x_2x(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-) -> (u32, u32, Vec<u8>) {
-    let to_lin = srgb_to_linear_lut();
-    let to_srgb = linear_to_srgb_lut();
-    let sw = src_w as usize;
-    let sh = src_h as usize;
-    let dw = (sw / 2).max(1);
-    let dh = (sh / 2).max(1);
-    let mut dst = vec![0u8; dw * dh * 3];
-
-    for y in 0..dh {
-        let sy0 = (y * 2).min(sh - 1);
-        let sy1 = (sy0 + 1).min(sh - 1);
-        for x in 0..dw {
-            let sx0 = (x * 2).min(sw - 1);
-            let sx1 = (sx0 + 1) % sw;
-            let offsets = [
-                (sy0 * sw + sx0) * 3,
-                (sy0 * sw + sx1) * 3,
-                (sy1 * sw + sx0) * 3,
-                (sy1 * sw + sx1) * 3,
-            ];
-            let out = (y * dw + x) * 3;
-            mix_2x2_srgb_rgb(
-                src,
-                offsets,
-                [0.25; 4],
-                to_lin,
-                to_srgb,
-                &mut dst[out..out + 3],
-            );
-        }
-    }
-
-    (dw as u32, dh as u32, dst)
-}
 
 fn downsample_rgba8_srgb_2x(
     src: &[u8],
@@ -141,7 +97,7 @@ fn generate_mips_with(
 /// Non-display formats (`R32Float`, `R8Uint`, `R16Uint`), guttered tiles, and
 /// padded partial-edge tiles are left untouched with `mips` cleared so 2x box
 /// filtering never shifts gutters or bleeds padding into valid pixels.
-pub(super) fn generate_linear_mipmaps(tile: &mut DecodedTile) {
+pub(crate) fn generate_linear_mipmaps(tile: &mut DecodedTile) {
     let to_lin = srgb_to_linear_lut();
     let to_srgb = linear_to_srgb_lut();
     generate_mips_with(tile, PixelFormat::Rgba8UnormSrgb, |src, pw, ph, dw, dh| {

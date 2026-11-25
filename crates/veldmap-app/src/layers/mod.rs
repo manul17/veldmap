@@ -27,7 +27,7 @@ use crate::colormap::{CategoricalPaletteId, ColormapId};
 
 pub(crate) use crs_override::CrsOverride;
 pub(crate) use manager::{OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayMutation};
-pub(crate) use style::{ColorbarInfo, LayerBandOption, SavedLayerStyle, StretchPreset};
+pub(crate) use style::{ColorbarInfo, LayerBandOption, LayerStyleSpec, StretchPreset, TrackKind};
 
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -40,7 +40,7 @@ pub(super) struct LayerInitOptions {
     pub(super) visible: bool,
     pub(super) opacity: f32,
     pub(super) crs_override: Option<CrsOverride>,
-    pub(super) style: Option<SavedLayerStyle>,
+    pub(super) style: Option<LayerStyleSpec>,
 }
 
 /// Read-only scientific track summary projected into [`LayerSummary`].
@@ -105,7 +105,7 @@ pub(crate) struct OverlayPersistEntry<'a> {
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
     pub(crate) crs_override: Option<&'a CrsOverride>,
-    pub(crate) style: Option<SavedLayerStyle>,
+    pub(crate) style: Option<LayerStyleSpec>,
 }
 
 /// Classified value returned by a zoom-invariant CPU cursor probe.

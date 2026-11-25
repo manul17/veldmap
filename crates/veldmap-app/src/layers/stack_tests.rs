@@ -280,7 +280,7 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
 
 #[test]
 fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
-    use crate::layers::style::{SavedLayerStyle, StretchPreset};
+    use crate::layers::style::{LayerStyleSpec, StretchPreset};
     use crate::render::CategoricalPaletteId;
     use veldmap_core::tile::{BandKey, PixelFormat};
     use veldmap_raster::{BandStats, DISPLAY_STREAM_SPEC, stream_spec_for_band};
@@ -310,9 +310,9 @@ fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
             visible: true,
             opacity: 1.0,
             crs_override: None,
-            style: Some(SavedLayerStyle {
+            style: Some(LayerStyleSpec {
                 categorical_palette: Some(CategoricalPaletteId::SourceColorMap),
-                ..SavedLayerStyle::default()
+                ..LayerStyleSpec::default()
             }),
         },
         1,

@@ -154,12 +154,9 @@ pub struct DrawSnapshot {
     /// graticule.
     pub overlays: Vec<DrawOverlayLayer>,
     /// Ordered draped vector overlays (GeoJSON + active geodesic measurements)
-    /// rendered in Pass 2 above raster overlays and below the graticule.
+    /// rendered in Pass 2 above raster overlays and below the procedural
+    /// graticule.
     pub vectors: Vec<DrawVectorLayer>,
-    /// Exact GPU carrier tile keys referenced by `tiles` and `overlays`, used
-    /// for active-frame `TileCache` protection so uploads never evict currently
-    /// visible tiles.
-    pub carrier_keys: HashSet<TileKey>,
     pub grid_cells: u32,
     pub show_graticule: bool,
     pub grid_step_deg: f64,
@@ -172,14 +169,14 @@ impl DrawSnapshot {
         self.tiles.iter().map(|t| t.visible.tex_id)
     }
 
-    /// Build a draw snapshot from grouped viewport, camera, graticule, and
-    /// quadtree parameters plus an optional ([`TileCarrierPolicy`],
-    /// [`GpuTileCache`]) pair (`Some` for textured rendering, `None` for
-    /// untextured ellipsoid rendering).
+    /// Build a draw snapshot and its referenced GPU carrier tile keys from
+    /// grouped viewport, camera, graticule, and quadtree parameters plus an
+    /// optional ([`TileCarrierPolicy`], [`GpuTileCache`]) pair (`Some` for
+    /// textured rendering, `None` for untextured ellipsoid rendering).
     pub fn build(
         params: SnapshotBuildParams<'_>,
         mut carrier: Option<(&dyn TileCarrierPolicy, &mut GpuTileCache)>,
-    ) -> Self {
+    ) -> (Self, HashSet<TileKey>) {
         let visible = traverse(
             &params.camera,
             params.width_px,
@@ -212,16 +209,16 @@ impl DrawSnapshot {
             });
         }
 
-        Self {
+        let snapshot = Self {
             camera: params.camera,
             tiles,
             overlays: Vec::new(),
             vectors: Vec::new(),
-            carrier_keys,
             grid_cells: params.config.grid_cells.max(1),
             show_graticule: params.show_graticule,
             grid_step_deg,
             grid_width_px,
-        }
+        };
+        (snapshot, carrier_keys)
     }
 }

@@ -23,8 +23,47 @@ use crate::color::{
     LINEAR_TO_SRGB_LUT_LEN, linear_to_srgb_lut, mix_2x2_srgb_rgb, srgb_to_linear_lut,
 };
 
+use crate::mipmap::generate_linear_mipmaps;
+
 use super::map_tile::decode_rgb8_limited;
-use super::mipmap::{downsample_rgb8_srgb_wrap_x_2x, generate_linear_mipmaps};
+
+/// Downsample an opaque packed `Rgb8` sRGB image 2x in linear light, wrapping
+/// horizontally for equirectangular continuity.
+fn downsample_rgb8_srgb_wrap_x_2x(src: &[u8], src_w: u32, src_h: u32) -> (u32, u32, Vec<u8>) {
+    let to_lin = srgb_to_linear_lut();
+    let to_srgb = linear_to_srgb_lut();
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let dw = (sw / 2).max(1);
+    let dh = (sh / 2).max(1);
+    let mut dst = vec![0u8; dw * dh * 3];
+
+    for y in 0..dh {
+        let sy0 = (y * 2).min(sh - 1);
+        let sy1 = (sy0 + 1).min(sh - 1);
+        for x in 0..dw {
+            let sx0 = (x * 2).min(sw - 1);
+            let sx1 = (sx0 + 1) % sw;
+            let offsets = [
+                (sy0 * sw + sx0) * 3,
+                (sy0 * sw + sx1) * 3,
+                (sy1 * sw + sx0) * 3,
+                (sy1 * sw + sx1) * 3,
+            ];
+            let out = (y * dw + x) * 3;
+            mix_2x2_srgb_rgb(
+                src,
+                offsets,
+                [0.25; 4],
+                to_lin,
+                to_srgb,
+                &mut dst[out..out + 3],
+            );
+        }
+    }
+
+    (dw as u32, dh as u32, dst)
+}
 
 /// Maximum single virtual tile dimension accepted by [`BundledBasemap::render_tile_sized`].
 const MAX_BASEMAP_TILE_DIM: u32 = 2048;
@@ -385,5 +424,5 @@ struct TileRenderContext<'a> {
 }
 
 #[cfg(test)]
-#[path = "basemap_tests.rs"]
+#[path = "bundled_tests.rs"]
 mod tests;

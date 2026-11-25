@@ -1,3 +1,4 @@
+use veldmap_core::geo::{DatumPreset, LinearUnit};
 use veldmap_storage::test_support::TestTempDir;
 
 use super::*;
@@ -186,16 +187,16 @@ fn session_normalize_rejects_out_of_range_poses_and_nan_opacity() {
 
 #[test]
 fn session_layer_style_round_trips_and_tolerates_unknown_future_variants() {
-    use crate::layers::{SavedLayerStyle, StretchPreset};
-    use crate::render::{CategoricalPaletteId, ColormapId};
+    use crate::colormap::{CategoricalPaletteId, ColormapId};
+    use crate::layers::{LayerStyleSpec, StretchPreset, TrackKind};
 
     let tmp = TestTempDir::new("veldmap-session-style");
     let paths = StoragePaths::with_root(tmp.path());
 
     let mut session = AppSession::default();
-    let style = SavedLayerStyle {
+    let style = LayerStyleSpec {
         band_index: Some(2),
-        track: Some("scientific".to_owned()),
+        track: Some(TrackKind::Scientific),
         stretch_preset: Some(StretchPreset::Log10Db),
         stretch_min: Some(-25.0),
         stretch_max: Some(-2.0),
@@ -209,12 +210,12 @@ fn session_layer_style_round_trips_and_tolerates_unknown_future_variants() {
         true,
         0.85,
         None,
-        Some(style.clone()),
+        Some(&style),
     ));
     session.save(&paths).expect("save session");
     let loaded = AppSession::load_or_default(&paths);
     assert_eq!(loaded.open_layers.len(), 1);
-    assert_eq!(loaded.open_layers[0].style, Some(style));
+    assert_eq!(loaded.open_layers[0].style(), Some(style));
 
     // Unknown future enum variants must fall back to None instead of corrupting the whole session.
     std::fs::write(
@@ -242,7 +243,8 @@ fn session_layer_style_round_trips_and_tolerates_unknown_future_variants() {
         1,
         "session must NOT be wiped to .corrupt"
     );
-    let st = fwd.open_layers[0].style.as_ref().expect("style present");
+    let st = fwd.open_layers[0].style().expect("style present");
+    assert_eq!(st.track, Some(TrackKind::Scientific));
     assert_eq!(st.stretch_preset, None);
     assert_eq!(st.colormap, None);
     assert_eq!(st.categorical_palette, None);

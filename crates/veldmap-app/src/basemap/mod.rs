@@ -21,6 +21,7 @@ pub mod policy;
 use veldmap_core::tile::SourceId;
 use veldmap_net::NetworkStatus;
 
+#[cfg(any(test, feature = "test-support"))]
 pub use bundled::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG, BUNDLED_MAX_LEVEL};
 pub(crate) use manager::BasemapManager;
 

@@ -11,7 +11,7 @@ use veldmap_core::tile::{QuadTileId, TileKey};
 use crate::basemap::LiveBasemapSpec;
 use crate::http::PermitDenied;
 
-use super::PipelineState;
+use super::{PipelineState, is_wanted_or_root};
 
 /// Shared tile metadata passed from dispatch planning to disk/HTTP workers.
 pub(in crate::fetcher) struct TileTarget {
@@ -83,10 +83,10 @@ impl PipelineState {
             &mut earliest_wakeup,
         );
 
-        if let Some(backoff_at) =
-            self.failures
-                .earliest_wanted_backoff(now, spec.source_id(), &self.last_wanted)
-        {
+        let active_source = spec.source_id();
+        if let Some(backoff_at) = self.failures.earliest_wanted_backoff(now, |k| {
+            is_wanted_or_root(&self.last_wanted, k, active_source)
+        }) {
             earliest_wakeup = min_instant(earliest_wakeup, backoff_at);
         }
 

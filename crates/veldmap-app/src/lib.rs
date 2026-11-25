@@ -1,7 +1,7 @@
-//! Library surface of `veldmap-app` exposing [`VeldmapApp`] and [`AppError`]
-//! for the binary entry point plus the headless-testable rendering boundary
-//! (`render`, `gpu_tiles`, `basemap_policy`, [`BUNDLED_BASEMAP_CONFIG`], and
-//! [`BUNDLED_BASEMAP_JPEG`]) for GPU smoke tests and `naga` shader validation.
+//! Library surface of `veldmap-app` exposing [`VeldmapApp`], [`AppError`],
+//! and [`render::clamp_to_primary_backends`] for the binary entry point, plus
+//! a `test-support`-gated headless rendering/upload harness for GPU smoke tests
+//! and `naga` shader validation.
 
 #![forbid(unsafe_code)]
 
@@ -10,6 +10,9 @@ use std::path::Path;
 mod app;
 mod basemap;
 mod colormap;
+#[cfg(not(any(test, feature = "test-support")))]
+mod gpu_tiles;
+#[cfg(any(test, feature = "test-support"))]
 pub mod gpu_tiles;
 mod layers;
 mod measure;
@@ -21,7 +24,9 @@ mod vectors;
 mod worker;
 
 pub use app::{AppError, VeldmapApp};
+#[cfg(any(test, feature = "test-support"))]
 pub use basemap::policy as basemap_policy;
+#[cfg(any(test, feature = "test-support"))]
 pub use basemap::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG, BUNDLED_MAX_LEVEL};
 
 /// Clamp a display opacity into `0.0..=1.0`, falling back to `1.0` for

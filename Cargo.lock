@@ -3577,6 +3577,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
+ "veldmap-app",
  "veldmap-core",
  "veldmap-net",
  "veldmap-raster",
@@ -3594,6 +3595,7 @@ dependencies = [
  "glam",
  "proj4rs",
  "proj4wkt",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
 ]

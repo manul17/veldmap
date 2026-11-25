@@ -221,7 +221,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     // 2. While live tiles have not arrived yet, DrawSnapshot parameterized by
     //    `live_source` falls back cleanly to bundled WebMercator blue.
     let (w, h) = (65, 65);
-    let fallback_snap = build_snapshot(
+    let (fallback_snap, fallback_carriers) = crate::common::build_snapshot_with_carriers(
         Camera::at(0.0, 0.0, 2_000_000.0),
         w,
         h,
@@ -230,7 +230,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         &merc_cfg,
         Some(&mut cache),
     );
-    assert!(fallback_snap.carrier_keys.contains(&wm_bundled_root));
+    assert!(fallback_carriers.contains(&wm_bundled_root));
     let fb_px = pixel_at(
         &render_srgb(&mut renderer, device, queue, w, h, &fallback_snap),
         w,
@@ -245,7 +245,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     // 3. PolarCap under active `live_source` ALWAYS resolves to bundled polar
     //    white (never live_source). This touches `south_polar_root`, making
     //    `wm_bundled_root` the LRU tail.
-    let polar_snap = build_snapshot(
+    let (polar_snap, polar_carriers) = crate::common::build_snapshot_with_carriers(
         Camera::at(-89.5, 0.0, 400_000.0),
         w,
         h,
@@ -254,7 +254,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         &merc_cfg,
         Some(&mut cache),
     );
-    assert!(polar_snap.carrier_keys.contains(&south_polar_root));
+    assert!(polar_carriers.contains(&south_polar_root));
     let polar_px = pixel_at(
         &render_srgb(&mut renderer, device, queue, w, h, &polar_snap),
         w,
@@ -290,7 +290,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         &mut cache,
         UploadPassParams {
             wanted: &[&HashSet::from([live_root])],
-            protected: Some(&fallback_snap.carrier_keys),
+            protected: Some(&fallback_carriers),
             byte_budget: 1024 * 1024,
             time_budget: Duration::from_secs(1),
         },
@@ -332,7 +332,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         "protected-refused tile must stay deferred in queue"
     );
 
-    let live_snap = build_snapshot(
+    let (live_snap, live_carriers) = crate::common::build_snapshot_with_carriers(
         Camera::at(0.0, 0.0, 2_000_000.0),
         w,
         h,
@@ -360,7 +360,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         &mut cache,
         UploadPassParams {
             wanted: &[&HashSet::from([south_polar_root])],
-            protected: Some(&live_snap.carrier_keys),
+            protected: Some(&live_carriers),
             byte_budget: 1024 * 1024,
             time_budget: Duration::from_secs(1),
         },

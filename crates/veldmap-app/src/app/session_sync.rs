@@ -9,20 +9,10 @@ use crate::display_name_from_path;
 use crate::layers::OverlayIoEvent;
 use crate::scene::SceneIoEvent;
 use crate::storage::session::{SavedCameraPose, SavedLayerEntry, SavedVectorEntry};
+use crate::ui::layers::UnavailableLayerNotice;
 use crate::vectors::VectorIoEvent;
 
 use super::VeldmapApp;
-
-/// Immutable summary of a layer from the previous `session.json` that could not
-/// be reopened at startup (kept in `session.json` until reopened or explicitly
-/// forgotten so custom CRS overrides and stretch styles are never lost).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct UnavailableLayerNotice {
-    pub(crate) name: String,
-    pub(crate) path: PathBuf,
-    pub(crate) error: String,
-    pub(crate) is_vector: bool,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LayerKind {
@@ -226,7 +216,7 @@ impl VeldmapApp {
                 saved.visible,
                 saved.opacity,
                 saved.crs_override(),
-                saved.style.clone(),
+                saved.style(),
             ) {
                 Ok(()) => self.restore_tracker.push_layer(saved),
                 Err(err) => self.restore_tracker.record_unavailable_layer(saved, err),
@@ -267,7 +257,7 @@ impl VeldmapApp {
                     entry.visible,
                     entry.opacity,
                     entry.crs_override,
-                    entry.style,
+                    entry.style.as_ref(),
                 )
             })
             .collect();

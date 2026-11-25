@@ -7,6 +7,8 @@ use std::io::{Cursor, Read};
 use crate::RasterError;
 use crate::image_codec::{rgb_to_rgba8, rgba_to_rgb8};
 
+use super::super::ifd::ChunkDims;
+
 pub(super) fn decompress_deflate(
     compressed: &[u8],
     expected_max: usize,
@@ -115,24 +117,21 @@ pub(super) fn decompress_zstd(
     Ok(out)
 }
 
-#[expect(clippy::too_many_arguments, reason = "chunk dimension validator")]
 fn validate_decoded_chunk_dims(
     codec: &str,
     chunk_index: u32,
     w: u32,
     h: u32,
-    stored_w: u32,
-    stored_h: u32,
-    dw: u32,
-    dh: u32,
+    expected: ChunkDims,
 ) -> Result<(), RasterError> {
-    let valid_w = w == stored_w || w == dw;
-    let valid_h = h == stored_h || h == dh;
-    if valid_w && valid_h && w >= dw && h >= dh {
+    let valid_w = w == expected.stored_w || w == expected.data_w;
+    let valid_h = h == expected.stored_h || h == expected.data_h;
+    if valid_w && valid_h && w >= expected.data_w && h >= expected.data_h {
         Ok(())
     } else {
         Err(RasterError::Decode(format!(
-            "TIFF {codec} chunk {chunk_index} decoded {w}x{h}, expected {stored_w}x{stored_h} or {dw}x{dh}"
+            "TIFF {codec} chunk {chunk_index} decoded {w}x{h}, expected {}x{} or {}x{}",
+            expected.stored_w, expected.stored_h, expected.data_w, expected.data_h
         )))
     }
 }
@@ -143,7 +142,7 @@ pub(super) fn decompress_jpeg(
     expected_samples: usize,
     max_decoded_bytes: usize,
     chunk_index: u32,
-    expected_dims: (u32, u32, u32, u32),
+    expected_dims: ChunkDims,
 ) -> Result<(Vec<u8>, u32), RasterError> {
     let combined: Cow<'_, [u8]> = if let Some(tables) = jpeg_tables {
         if compressed.len() < 2 || tables.len() < 2 {
@@ -222,10 +221,9 @@ pub(super) fn decompress_jpeg(
             "TIFF JPEG decoded {decoded_channels} channels, expected {expected_samples}"
         )));
     }
-    let (stored_w, stored_h, dw, dh) = expected_dims;
     let w = u32::from(info.width);
     let h = u32::from(info.height);
-    validate_decoded_chunk_dims("JPEG", chunk_index, w, h, stored_w, stored_h, dw, dh)?;
+    validate_decoded_chunk_dims("JPEG", chunk_index, w, h, expected_dims)?;
 
     let mut pixels = decoder
         .decode()
@@ -243,13 +241,12 @@ pub(super) fn decompress_webp(
     expected_samples: usize,
     max_decoded_bytes: usize,
     chunk_index: u32,
-    expected_dims: (u32, u32, u32, u32),
+    expected_dims: ChunkDims,
 ) -> Result<(Vec<u8>, u32), RasterError> {
     let mut decoder = image_webp::WebPDecoder::new(Cursor::new(compressed))
         .map_err(|e| RasterError::Decode(format!("TIFF WebP init failed: {e}")))?;
     let (w, h) = decoder.dimensions();
-    let (stored_w, stored_h, dw, dh) = expected_dims;
-    validate_decoded_chunk_dims("WebP", chunk_index, w, h, stored_w, stored_h, dw, dh)?;
+    validate_decoded_chunk_dims("WebP", chunk_index, w, h, expected_dims)?;
 
     let webp_channels = if decoder.has_alpha() { 4usize } else { 3usize };
     let webp_bytes = (w as usize)

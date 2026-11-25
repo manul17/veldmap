@@ -4,9 +4,11 @@
 
 use crate::RasterError;
 
+use super::MAX_CACHED_TILE_DECODED_BYTES;
+
 /// Default maximum decoded RGBA8 byte size admitted for QOI tile caching
-/// (`16 MiB`, matching the disk-cache tile size cap in `veldmap-storage`).
-pub const MAX_QOI_DECODED_BYTES: usize = 16 * 1024 * 1024;
+/// (`16 MiB`, matching [`MAX_CACHED_TILE_DECODED_BYTES`]).
+pub const MAX_QOI_DECODED_BYTES: usize = MAX_CACHED_TILE_DECODED_BYTES;
 
 /// Encode an 8-bit `Rgba8UnormSrgb` tile into lossless QOI bytes.
 ///

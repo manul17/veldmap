@@ -1,8 +1,10 @@
 //! Per-layer analytical rendering style (`ScientificStyle`, `CategoricalStyle`,
-//! `StretchPreset`, `BandStatsState`), band/track option descriptors, colorbar
-//! HUD projection, and forward-compatible `session.json` persistence snapshots.
+//! `StretchPreset`, `LayerStyleSpec`), band/track option descriptors, and
+//! colorbar HUD projection.
+//!
+//! Kept strictly free of `serde` and `session.json` wire-format concerns;
+//! persistence proxies live in `crate::storage::session`.
 
-use serde::{Deserialize, Deserializer, Serialize};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
 use veldmap_raster::{
@@ -20,35 +22,17 @@ pub(crate) enum TrackKind {
 }
 
 impl TrackKind {
-    pub(crate) const fn from_format(format: PixelFormat) -> Self {
+    pub(super) const fn from_format(format: PixelFormat) -> Self {
         match format {
             PixelFormat::Rgba8UnormSrgb => Self::Display,
             PixelFormat::R32Float => Self::Scientific,
             PixelFormat::R8Uint | PixelFormat::R16Uint => Self::Categorical,
         }
     }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Display => "display",
-            Self::Scientific => "scientific",
-            Self::Categorical => "categorical",
-        }
-    }
-
-    pub(crate) fn parse_str(s: &str) -> Option<Self> {
-        match s {
-            "display" => Some(Self::Display),
-            "scientific" => Some(Self::Scientific),
-            "categorical" => Some(Self::Categorical),
-            _ => None,
-        }
-    }
 }
 
 /// Live contrast stretch mode for `R32Float` scientific layers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum StretchPreset {
     #[default]
     Percentile2_98,
@@ -81,7 +65,7 @@ impl StretchPreset {
 
 /// Async lifecycle state for a layer's sampled physical [`BandStats`].
 #[derive(Clone, Debug, Default)]
-pub(crate) enum BandStatsState {
+enum BandStatsState {
     #[default]
     NotRequested,
     Loading {
@@ -95,15 +79,15 @@ pub(crate) enum BandStatsState {
 
 /// Live GPU stretch & colormap state for a scientific (`R32Float`) layer.
 #[derive(Clone, Debug)]
-pub(crate) struct ScientificStyle {
-    pub(crate) preset: StretchPreset,
-    pub(crate) min: f64,
-    pub(crate) max: f64,
-    pub(crate) custom_range_applied: bool,
-    pub(crate) colormap: ColormapId,
-    pub(crate) invert_colormap: bool,
-    pub(crate) last_scientific_band: Option<BandKey>,
-    pub(crate) stats_state: BandStatsState,
+pub(super) struct ScientificStyle {
+    pub(super) preset: StretchPreset,
+    pub(super) min: f64,
+    pub(super) max: f64,
+    pub(super) custom_range_applied: bool,
+    pub(super) colormap: ColormapId,
+    pub(super) invert_colormap: bool,
+    pub(super) last_scientific_band: Option<BandKey>,
+    stats_state: BandStatsState,
 }
 
 impl Default for ScientificStyle {
@@ -122,43 +106,43 @@ impl Default for ScientificStyle {
 }
 
 impl ScientificStyle {
-    pub(crate) fn stats(&self) -> Option<&BandStats> {
+    pub(super) fn stats(&self) -> Option<&BandStats> {
         match &self.stats_state {
             BandStatsState::Ready(stats) => Some(stats),
             _ => None,
         }
     }
 
-    pub(crate) fn is_loading(&self) -> bool {
+    pub(super) fn is_loading(&self) -> bool {
         matches!(self.stats_state, BandStatsState::Loading { .. })
     }
 
-    pub(crate) fn needs_stats(&self) -> bool {
+    pub(super) fn needs_stats(&self) -> bool {
         matches!(self.stats_state, BandStatsState::NotRequested)
     }
 
-    pub(crate) fn is_default_untouched(&self) -> bool {
+    pub(super) fn is_default_untouched(&self) -> bool {
         self.preset == StretchPreset::Percentile2_98
             && !self.custom_range_applied
             && self.colormap == ColormapId::Viridis
             && !self.invert_colormap
     }
 
-    pub(crate) fn cancel_loading(&mut self) {
+    pub(super) fn cancel_loading(&mut self) {
         if let BandStatsState::Loading { cancel, .. } = &self.stats_state {
             cancel.cancel();
             self.stats_state = BandStatsState::NotRequested;
         }
     }
 
-    pub(crate) fn begin_loading(&mut self, job_id: u64, cancel: CancelToken) {
+    pub(super) fn begin_loading(&mut self, job_id: u64, cancel: CancelToken) {
         self.cancel_loading();
         self.stats_state = BandStatsState::Loading { job_id, cancel };
     }
 
     /// Apply newly computed [`BandStats`] to the stretch bounds unless the user
     /// already pinned a custom range, cancelling any superseded in-flight token.
-    pub(crate) fn apply_ready(&mut self, stats: BandStats) {
+    pub(super) fn apply_ready(&mut self, stats: BandStats) {
         if let BandStatsState::Loading { cancel, .. } = &self.stats_state {
             cancel.cancel();
         }
@@ -169,7 +153,7 @@ impl ScientificStyle {
     }
 
     /// Mark stats empty only if `job_id` matches the currently active job.
-    pub(crate) fn apply_empty(&mut self, job_id: u64) -> bool {
+    pub(super) fn apply_empty(&mut self, job_id: u64) -> bool {
         match &self.stats_state {
             BandStatsState::Loading { job_id: active, .. } if *active == job_id => {
                 self.stats_state = BandStatsState::Empty;
@@ -180,7 +164,7 @@ impl ScientificStyle {
     }
 
     /// Reset a cancelled loading job back to `NotRequested` without poisoning `Empty`.
-    pub(crate) fn apply_cancelled(&mut self, job_id: u64) -> bool {
+    pub(super) fn apply_cancelled(&mut self, job_id: u64) -> bool {
         match &self.stats_state {
             BandStatsState::Loading { job_id: active, .. } if *active == job_id => {
                 self.stats_state = BandStatsState::NotRequested;
@@ -191,7 +175,7 @@ impl ScientificStyle {
     }
 
     /// Recompute `(min, max)` from cached `stats` for the current `preset`.
-    pub(crate) fn recompute_bounds_from_stats(&mut self) {
+    fn recompute_bounds_from_stats(&mut self) {
         let Some(stats) = self.stats().cloned() else {
             return;
         };
@@ -220,7 +204,7 @@ impl ScientificStyle {
         }
     }
 
-    pub(crate) fn apply_saved(&mut self, saved: &SavedLayerStyle) {
+    pub(super) fn apply_saved(&mut self, saved: &LayerStyleSpec) {
         if let Some(preset) = saved.stretch_preset {
             self.preset = preset;
         }
@@ -241,7 +225,7 @@ impl ScientificStyle {
         self.invert_colormap = saved.invert_colormap;
     }
 
-    pub(crate) fn on_stream_switched(&mut self, spec: TileStreamSpec) {
+    pub(super) fn on_stream_switched(&mut self, spec: TileStreamSpec) {
         if spec.format == PixelFormat::R32Float {
             if self.last_scientific_band != Some(spec.band) {
                 self.cancel_loading();
@@ -260,7 +244,7 @@ impl ScientificStyle {
         }
     }
 
-    pub(crate) fn set_stretch_preset(&mut self, preset: StretchPreset) -> bool {
+    pub(super) fn set_stretch_preset(&mut self, preset: StretchPreset) -> bool {
         if self.preset == preset && (preset == StretchPreset::Custom || !self.custom_range_applied)
         {
             return false;
@@ -273,7 +257,7 @@ impl ScientificStyle {
         true
     }
 
-    pub(crate) fn set_stretch_range(&mut self, min: f64, max: f64) -> bool {
+    pub(super) fn set_stretch_range(&mut self, min: f64, max: f64) -> bool {
         if !min.is_finite() || !max.is_finite() {
             return false;
         }
@@ -295,7 +279,7 @@ impl ScientificStyle {
         true
     }
 
-    pub(crate) fn set_colormap(&mut self, colormap: ColormapId, invert: bool) -> bool {
+    pub(super) fn set_colormap(&mut self, colormap: ColormapId, invert: bool) -> bool {
         if self.colormap == colormap && self.invert_colormap == invert {
             return false;
         }
@@ -307,8 +291,8 @@ impl ScientificStyle {
 
 /// Live categorical (`R8Uint`/`R16Uint`) palette state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CategoricalStyle {
-    pub(crate) palette: CategoricalPaletteId,
+pub(super) struct CategoricalStyle {
+    pub(super) palette: CategoricalPaletteId,
 }
 
 /// One selectable band/track entry in the Layer Card dropdown.
@@ -319,7 +303,7 @@ pub(crate) struct LayerBandOption {
 }
 
 /// Build the ordered list of selectable streams for `desc`.
-pub(crate) fn build_band_options(desc: &RasterDescription) -> Vec<LayerBandOption> {
+pub(super) fn build_band_options(desc: &RasterDescription) -> Vec<LayerBandOption> {
     let mut opts = Vec::new();
     opts.push(LayerBandOption {
         label: "Display (RGB)".to_owned(),
@@ -346,7 +330,7 @@ pub(crate) fn build_band_options(desc: &RasterDescription) -> Vec<LayerBandOptio
     opts
 }
 
-pub(crate) fn format_band_label(info: &BandInfo) -> String {
+pub(super) fn format_band_label(info: &BandInfo) -> String {
     match &info.name {
         Some(name) if !name.is_empty() => format!("Band {} ({name})", info.index + 1),
         _ => format!("Band {}", info.index + 1),
@@ -365,46 +349,27 @@ pub(crate) struct ColorbarInfo {
     pub(crate) invert_colormap: bool,
 }
 
-/// Forward-compatible `Option<T>` deserializer for string-encoded style enums:
-/// unknown variants written by newer versions fall back to `None` instead of
-/// failing the entire `session.json` load into `.corrupt`.
-fn deserialize_lossy_opt<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: for<'a> Deserialize<'a>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw.and_then(|s| {
-        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&s);
-        T::deserialize(de).ok()
-    }))
-}
-
-/// Optional persisted analytical rendering style stored inside `session.json`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct SavedLayerStyle {
+/// Pure domain snapshot of a layer's analytical rendering style used for
+/// session restore/persistence and in-memory reload preservation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LayerStyleSpec {
     /// Selected band index (`None` = Display composite).
     pub(crate) band_index: Option<u16>,
-    /// Selected track (`"display"`, `"scientific"`, or `"categorical"`).
-    pub(crate) track: Option<String>,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
+    /// Selected track (`Display`, `Scientific`, or `Categorical`).
+    pub(crate) track: Option<TrackKind>,
     pub(crate) stretch_preset: Option<StretchPreset>,
     pub(crate) stretch_min: Option<f64>,
     pub(crate) stretch_max: Option<f64>,
-    #[serde(default)]
     pub(crate) custom_stretch_range: bool,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
     pub(crate) colormap: Option<ColormapId>,
     pub(crate) invert_colormap: bool,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
     pub(crate) categorical_palette: Option<CategoricalPaletteId>,
 }
 
-impl SavedLayerStyle {
-    /// Resolve a persisted [`TileStreamSpec`] against `desc`, if valid.
-    pub(crate) fn resolve_stream_spec(&self, desc: &RasterDescription) -> Option<TileStreamSpec> {
-        let track = TrackKind::parse_str(self.track.as_deref()?)?;
+impl LayerStyleSpec {
+    /// Resolve a target [`TileStreamSpec`] against `desc`, if valid.
+    pub(super) fn resolve_stream_spec(&self, desc: &RasterDescription) -> Option<TileStreamSpec> {
+        let track = self.track?;
         match track {
             TrackKind::Display => Some(DISPLAY_STREAM_SPEC),
             TrackKind::Scientific => {

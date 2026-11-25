@@ -13,7 +13,7 @@ use crate::image_codec::{
     jpeg_pixel_format_channels, png_u8_to_rgb8, png_u8_to_rgba8,
 };
 
-use super::mipmap::generate_linear_mipmaps;
+use crate::mipmap::generate_linear_mipmaps;
 
 /// Maximum single map-tile dimension accepted by [`decode_map_tile`].
 const MAX_MAP_TILE_DIM: u32 = 2048;

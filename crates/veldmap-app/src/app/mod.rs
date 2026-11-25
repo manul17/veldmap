@@ -33,8 +33,6 @@ use crate::ui::measure::{MeasureUiState, show_measure_window};
 use crate::ui::toolbar::{self, ToolbarInputs, ToolbarState};
 use crate::ui::{self, status_bar};
 
-pub(crate) use session_sync::UnavailableLayerNotice;
-
 use dialogs::DialogHost;
 use fonts::build_font_definitions;
 use session_sync::SessionRestoreTracker;

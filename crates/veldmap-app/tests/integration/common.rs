@@ -90,7 +90,10 @@ fn build_raw_snapshot(
     show_graticule: bool,
     config: &QuadtreeConfig,
     carrier: Option<(&dyn TileCarrierPolicy, &mut GpuTileCache)>,
-) -> DrawSnapshot {
+) -> (
+    DrawSnapshot,
+    std::collections::HashSet<veldmap_core::tile::TileKey>,
+) {
     DrawSnapshot::build(
         SnapshotBuildParams {
             camera,
@@ -104,6 +107,25 @@ fn build_raw_snapshot(
     )
 }
 
+pub(crate) fn build_snapshot_with_carriers(
+    camera: Camera,
+    width_px: u32,
+    height_px: u32,
+    show_graticule: bool,
+    active_source: SourceId,
+    config: &QuadtreeConfig,
+    cache: Option<&mut GpuTileCache>,
+) -> (
+    Arc<DrawSnapshot>,
+    std::collections::HashSet<veldmap_core::tile::TileKey>,
+) {
+    let policy = BasemapCarrierPolicy::new(active_source);
+    let carrier = cache.map(|gpu_cache| (&policy as &dyn TileCarrierPolicy, gpu_cache));
+    let (snap, carriers) =
+        build_raw_snapshot(camera, width_px, height_px, show_graticule, config, carrier);
+    (Arc::new(snap), carriers)
+}
+
 pub(crate) fn build_snapshot(
     camera: Camera,
     width_px: u32,
@@ -113,16 +135,16 @@ pub(crate) fn build_snapshot(
     config: &QuadtreeConfig,
     cache: Option<&mut GpuTileCache>,
 ) -> Arc<DrawSnapshot> {
-    let policy = BasemapCarrierPolicy::new(active_source);
-    let carrier = cache.map(|gpu_cache| (&policy as &dyn TileCarrierPolicy, gpu_cache));
-    Arc::new(build_raw_snapshot(
+    build_snapshot_with_carriers(
         camera,
         width_px,
         height_px,
         show_graticule,
+        active_source,
         config,
-        carrier,
-    ))
+        cache,
+    )
+    .0
 }
 
 pub(crate) fn build_empty_snapshot(
@@ -131,7 +153,7 @@ pub(crate) fn build_empty_snapshot(
     height_px: u32,
     config: &QuadtreeConfig,
 ) -> DrawSnapshot {
-    build_raw_snapshot(camera, width_px, height_px, false, config, None)
+    build_raw_snapshot(camera, width_px, height_px, false, config, None).0
 }
 
 pub(crate) fn readback_rgba8(

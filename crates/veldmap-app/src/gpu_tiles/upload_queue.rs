@@ -23,8 +23,8 @@ pub(crate) const DEFAULT_UPLOAD_TIME_BUDGET: Duration = Duration::from_millis(2)
 /// awaiting GPU upload (`64 MiB`).
 const DEFAULT_MAX_QUEUED_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
-/// Error returned by [`UploadSender::send`] after `PendingUploads::close`
-/// shuts down the upload queue.
+/// Error returned by [`UploadSender`] (`send_if_uncancelled`) after
+/// `PendingUploads::close` shuts down the upload queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UploadChannelClosed;
 
@@ -246,6 +246,7 @@ impl UploadSender {
     /// Returns `Err(UploadChannelClosed)` once `PendingUploads::close` has
     /// been called; otherwise admits the tile under `max_queued_bytes`
     /// (evicting finest non-pinned tiles outside the lock if needed).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn send(&self, item: (TileKey, DecodedTile)) -> Result<(), UploadChannelClosed> {
         self.send_inner(item, None).map(|_| ())
     }
@@ -346,7 +347,7 @@ impl PendingUploads {
     }
 
     /// Discard any queued decoded tiles matching `predicate`.
-    pub(crate) fn clear_where<F>(&mut self, mut predicate: F)
+    fn clear_where<F>(&mut self, mut predicate: F)
     where
         F: FnMut(&TileKey) -> bool,
     {

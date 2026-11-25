@@ -8,30 +8,30 @@
 
 use std::sync::Arc;
 
+use super::super::geodesy::{Ellipsoid, SEMI_MAJOR_M, unwind};
 use super::datum::{Datum, DatumWarning, PULKOVO_1942, WGS84_DATUM};
-use super::geodesy::{Ellipsoid, SEMI_MAJOR_M, unwind};
 use super::proj4::Proj4Projection;
 
 /// Base EPSG code for WGS 84 / UTM North zones (`UTM_NORTH_EPSG_BASE + zone`).
-pub(crate) const UTM_NORTH_EPSG_BASE: u32 = 32_600;
+pub(super) const UTM_NORTH_EPSG_BASE: u32 = 32_600;
 
 /// Base EPSG code for WGS 84 / UTM South zones (`UTM_SOUTH_EPSG_BASE + zone`).
-pub(crate) const UTM_SOUTH_EPSG_BASE: u32 = 32_700;
+pub(super) const UTM_SOUTH_EPSG_BASE: u32 = 32_700;
 
 /// Valid UTM zone numbers (`1..=60`).
-pub(crate) const UTM_ZONES: std::ops::RangeInclusive<u32> = 1..=60;
+pub(super) const UTM_ZONES: std::ops::RangeInclusive<u32> = 1..=60;
 
 /// Base EPSG code for Pulkovo 1942 / Gauss-Kruger zones (`GK_PULKOVO_EPSG_BASE + zone`).
-pub(crate) const GK_PULKOVO_EPSG_BASE: u32 = 28_400;
+pub(super) const GK_PULKOVO_EPSG_BASE: u32 = 28_400;
 
 /// Valid Pulkovo 1942 / Gauss-Kruger EPSG zone numbers (`2..=32`).
-pub(crate) const GK_PULKOVO_ZONES: std::ops::RangeInclusive<u32> = 2..=32;
+pub(super) const GK_PULKOVO_ZONES: std::ops::RangeInclusive<u32> = 2..=32;
 
 /// Base regional pseudo-EPSG code for MSK-61 zones (`MSK61_EPSG_BASE + zone`).
-pub(crate) const MSK61_EPSG_BASE: u32 = 6_336_100;
+pub(super) const MSK61_EPSG_BASE: u32 = 6_336_100;
 
 /// Valid MSK-61 3-degree zone numbers (`1..=3`).
-pub(crate) const MSK61_ZONES: std::ops::RangeInclusive<u32> = 1..=3;
+pub(super) const MSK61_ZONES: std::ops::RangeInclusive<u32> = 1..=3;
 
 fn rectifying_radius(ellipsoid: Ellipsoid) -> f64 {
     let n = ellipsoid.third_flattening();
@@ -142,7 +142,7 @@ impl Projection {
 
     /// Resolve an EPSG (or MSK-61 `633610x`) code via fast in-house formulas
     /// only, without falling back to `proj4rs`.
-    pub(crate) fn from_epsg_in_house(code: u32) -> Option<Self> {
+    pub(super) fn from_epsg_in_house(code: u32) -> Option<Self> {
         if code == 3857 {
             return Some(Self::WebMercator);
         }

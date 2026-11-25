@@ -2,13 +2,8 @@
 //! mapping) and per-band physical statistics + histograms (`BandStatsCache`),
 //! built over the stateless direct raw-chunk decoder.
 
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::sync::{Arc, Mutex};
-
 use veldmap_core::budget::DecodeBudgetTracker;
-use veldmap_core::io::ByteSource;
-use veldmap_core::sync::{CancelToken, lock_unpoisoned};
+use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
 use crate::pipeline::grid;
@@ -17,75 +12,11 @@ use crate::pipeline::radiometry::{
     self, DisplayMapping, compute_band_stats, is_data_f64, percentile_stretch,
     read_native_sample_f64,
 };
-use crate::pipeline::singleflight::{SingleflightRole, SingleflightSlot, run_singleflight};
+use crate::pipeline::singleflight::SingleflightMap;
 
-use super::ifd::{CachedIfd, Photometric, PlanarConfig, TiffByteOrder};
+use super::chunk_convert::for_each_band_sample_f64;
+use super::ifd::{CachedIfd, Photometric, PlanarConfig, RawTiffAccess};
 use super::raw_decode::{RawChunkPayload, decode_raw_chunk};
-
-enum SlotEntry<V> {
-    InFlight(Arc<SingleflightSlot<V>>),
-    Ready(V),
-}
-
-/// Keyed lazy singleflight cache deduplicating concurrent computations per key
-/// while allowing uncancelled followers to take over cleanly if a leader cancels.
-struct SingleflightMap<K, V> {
-    entries: Mutex<HashMap<K, SlotEntry<V>>>,
-}
-
-impl<K: Copy + Eq + Hash, V: Clone + Send + 'static> SingleflightMap<K, V> {
-    fn new() -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn with_ready(key: K, value: V) -> Self {
-        let mut map = HashMap::with_capacity(1);
-        map.insert(key, SlotEntry::Ready(value));
-        Self {
-            entries: Mutex::new(map),
-        }
-    }
-
-    fn get_or_compute(
-        &self,
-        key: K,
-        cancel: &CancelToken,
-        panic_label: &'static str,
-        compute: impl FnOnce() -> Result<V, RasterError>,
-    ) -> Result<V, RasterError> {
-        run_singleflight(
-            cancel,
-            panic_label,
-            || {
-                let mut guard = lock_unpoisoned(&self.entries);
-                match guard.get(&key) {
-                    Some(SlotEntry::Ready(val)) => SingleflightRole::Ready(val.clone()),
-                    Some(SlotEntry::InFlight(slot)) => SingleflightRole::Follower(Arc::clone(slot)),
-                    None => {
-                        let slot = Arc::new(SingleflightSlot::new());
-                        guard.insert(key, SlotEntry::InFlight(Arc::clone(&slot)));
-                        SingleflightRole::Leader(slot)
-                    }
-                }
-            },
-            compute,
-            |_slot, computed| {
-                let mut guard = lock_unpoisoned(&self.entries);
-                guard.insert(key, SlotEntry::Ready(computed.clone()));
-            },
-            |slot| {
-                let mut guard = lock_unpoisoned(&self.entries);
-                if let Some(SlotEntry::InFlight(cur)) = guard.get(&key)
-                    && Arc::ptr_eq(cur, slot)
-                {
-                    guard.remove(&key);
-                }
-            },
-        )
-    }
-}
 
 pub(super) struct StretchCache {
     map: SingleflightMap<(), DisplayMapping>,
@@ -148,11 +79,9 @@ impl BandStatsCache {
 }
 
 pub(super) struct StretchRequest<'a> {
-    pub(super) byte_source: &'a Arc<dyn ByteSource>,
-    pub(super) byte_order: TiffByteOrder,
+    pub(super) access: &'a RawTiffAccess,
     pub(super) stats_ifd: &'a CachedIfd,
     pub(super) nodata_f64: Option<f64>,
-    pub(super) max_chunk_bytes: usize,
     pub(super) budget_tracker: &'a DecodeBudgetTracker,
     pub(super) cancel: &'a CancelToken,
 }
@@ -191,13 +120,12 @@ fn for_each_sampled_chunk(
         if req.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
-        let Some((dw, dh)) = ifd.chunk_data_dims(index) else {
+        let Some(dims) = ifd.chunk_dims(index) else {
             continue;
         };
-        let (stored_w, stored_h) = ifd.chunk_stored_dims(index).unwrap_or((dw, dh));
-        let est_bytes = grid::chunk_working_bytes(stored_w, stored_h, raw_depth, 0);
+        let est_bytes = grid::chunk_working_bytes(dims.stored_w, dims.stored_h, raw_depth, 0);
         let _lease = req.budget_tracker.reserve_blocking(est_bytes, req.cancel)?;
-        let pixels = (dw as usize) * (dh as usize);
+        let pixels = (dims.data_w as usize) * (dims.data_h as usize);
         visit(index, pixels, target_per_chunk)?;
     }
     Ok(())
@@ -219,15 +147,7 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
             let step = (pixels * colors).div_ceil(target_per_chunk).max(1);
             match ifd.planar {
                 PlanarConfig::Chunky => {
-                    let (_, _, payload) = decode_raw_chunk(
-                        req.byte_source.as_ref(),
-                        ifd,
-                        req.byte_order,
-                        0,
-                        index,
-                        req.max_chunk_bytes,
-                        req.cancel,
-                    )?;
+                    let (_, _, payload) = decode_raw_chunk(req.access, ifd, 0, index, req.cancel)?;
                     let RawChunkPayload::Bytes(data) = payload else {
                         return Ok(());
                     };
@@ -248,15 +168,8 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
                 }
                 PlanarConfig::Planar => {
                     for ch in 0..colors {
-                        let (_, _, payload) = decode_raw_chunk(
-                            req.byte_source.as_ref(),
-                            ifd,
-                            req.byte_order,
-                            ch,
-                            index,
-                            req.max_chunk_bytes,
-                            req.cancel,
-                        )?;
+                        let (_, _, payload) =
+                            decode_raw_chunk(req.access, ifd, ch, index, req.cancel)?;
                         let RawChunkPayload::Bytes(data) = payload else {
                             continue;
                         };
@@ -296,54 +209,33 @@ fn compute_single_band_stats(
         return Ok(None);
     }
     let plane = ifd.band_plane(band_idx);
-    let (stride, ch_off) = ifd.band_stride_offset(band_idx);
     let mut values = Vec::new();
 
     for_each_sampled_chunk(
         req,
         ifd.band_raw_pixel_bytes(),
         |index, pixels, target_per_chunk| {
-            let (_, _, payload) = decode_raw_chunk(
-                req.byte_source.as_ref(),
-                ifd,
-                req.byte_order,
-                plane,
-                index,
-                req.max_chunk_bytes,
-                req.cancel,
-            )?;
+            let (_, _, payload) = decode_raw_chunk(req.access, ifd, plane, index, req.cancel)?;
             let RawChunkPayload::Bytes(data) = payload else {
                 return Ok(());
             };
             let step = pixels.div_ceil(target_per_chunk).max(1);
-            if let Some(params) = ifd.ycbcr_band_params(band_idx) {
-                for at in (0..pixels).step_by(step) {
-                    let off = at * 3;
-                    if off + 3 <= data.len() {
-                        let rgb =
-                            params.convert_u8_pixel_to_rgb(data[off], data[off + 1], data[off + 2]);
-                        let raw = f64::from(rgb[band_idx]);
-                        if is_data_f64(raw, req.nodata_f64) {
-                            let phys = raw.mul_add(scale, offset);
-                            if phys.is_finite() {
-                                values.push(phys);
-                            }
+            for_each_band_sample_f64(
+                &data,
+                ifd,
+                band_idx,
+                pixels,
+                step,
+                req.nodata_f64,
+                |sample| {
+                    if let Some(raw) = sample {
+                        let phys = raw.mul_add(scale, offset);
+                        if phys.is_finite() {
+                            values.push(phys);
                         }
                     }
-                }
-                return Ok(());
-            }
-            for at in (0..pixels).step_by(step) {
-                if let Some(raw) =
-                    read_native_sample_f64(&data, ifd.sample_type, at * stride + ch_off)
-                    && is_data_f64(raw, req.nodata_f64)
-                {
-                    let phys = raw.mul_add(scale, offset);
-                    if phys.is_finite() {
-                        values.push(phys);
-                    }
-                }
-            }
+                },
+            );
             Ok(())
         },
     )?;
@@ -353,6 +245,7 @@ fn compute_single_band_stats(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;

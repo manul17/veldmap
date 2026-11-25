@@ -127,7 +127,7 @@ fn overlay_warp_mesh_drapes_with_south_up_winding_graticule_on_top_and_zero_idle
         .enumerate()
     {
         let src = SourceId::new(900 + case_idx as u64);
-        let (tile_key, gpu_tile) =
+        let (_, gpu_tile) =
             upload_overlay_tile(device, queue, &mut gpu_cache, src, 32, 32, |_, _| {
                 [255, 0, 255, 255]
             });
@@ -136,7 +136,6 @@ fn overlay_warp_mesh_drapes_with_south_up_winding_graticule_on_top_and_zero_idle
         assert_eq!(warp.flip_winding, expected_flip);
 
         let mut snap = build_empty_snapshot(cam, width, height, &config);
-        snap.carrier_keys.insert(tile_key);
         snap.overlays.push(single_patch_layer(
             frame,
             src,
@@ -213,7 +212,7 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
         Frame::quad([(5.0, -5.0), (5.0, 5.0), (-5.0, 5.0), (-5.0, -5.0)]).expect("coarse quad"),
     );
     let src_coarse = SourceId::new(940);
-    let (k_coarse, tex_coarse) =
+    let (_, tex_coarse) =
         upload_overlay_tile(device, queue, &mut gpu_cache, src_coarse, 32, 32, |_, _| {
             [255, 0, 255, 255]
         });
@@ -223,7 +222,6 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
     let half_step = 10.0 / f64::from(segs_coarse) * 0.5;
     let cam_2m = Camera::at(half_step, half_step, 2.0);
     let mut snap_2m = build_empty_snapshot(cam_2m, width, height, &config);
-    snap_2m.carrier_keys.insert(k_coarse);
     snap_2m.overlays.push(single_patch_layer(
         &coarse_frame,
         src_coarse,
@@ -262,13 +260,12 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
             .expect("limb quad"),
     );
     let src_limb = SourceId::new(950);
-    let (k_limb, tex_limb) =
+    let (_, tex_limb) =
         upload_overlay_tile(device, queue, &mut gpu_cache, src_limb, 32, 32, |_, _| {
             [255, 0, 255, 255]
         });
     let segs_limb = level_segments(&limb_frame, 512, 512, 0);
     let mut limb_snap = (*base_snap).clone();
-    limb_snap.carrier_keys.insert(k_limb);
     limb_snap.overlays.push(single_patch_layer(
         &limb_frame,
         src_limb,
@@ -336,7 +333,7 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
     // Bottom layer: solid green on the right half (`x >= 16`), blue on the left half (`x < 16`).
     // Using ancestor sub-rect `uv_rect = [0.5, 0.0, 0.5, 1.0]` must sample ONLY the green right half!
     let src_bot = SourceId::new(960);
-    let (k_bot, tex_bot) =
+    let (_, tex_bot) =
         upload_overlay_tile(device, queue, &mut gpu_cache, src_bot, 32, 32, |x, _| {
             if x < 16 {
                 [0, 0, 255, 255]
@@ -347,7 +344,7 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
     // Top layer: left half transparent nodata (`a = 0`), right half opaque red (`255, 0, 0, 255`),
     // drawn at 50% opacity.
     let src_top = SourceId::new(961);
-    let (k_top, tex_top) =
+    let (_, tex_top) =
         upload_overlay_tile(device, queue, &mut gpu_cache, src_top, 32, 32, |x, _| {
             if x < 16 {
                 [255, 0, 0, 0]
@@ -357,8 +354,6 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
         });
 
     let mut snap = build_empty_snapshot(cam, width, height, &config);
-    snap.carrier_keys.insert(k_bot);
-    snap.carrier_keys.insert(k_top);
     snap.overlays.push(single_patch_layer(
         &frame,
         src_bot,
@@ -421,7 +416,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
 
     // Base Display layer (solid green) beneath Scientific layer to detect nodata discard.
     let src_base = SourceId::new(970);
-    let (k_base, tex_base) =
+    let (_, tex_base) =
         upload_overlay_tile(device, queue, &mut gpu_cache, src_base, 16, 16, |_, _| {
             [0, 255, 0, 255]
         });
@@ -466,8 +461,6 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     // 1. Render Scientific R32Float with Grayscale ramp over [0, 100]:
     //    Left half (NaN/±Inf) discards to green base; Right half (1000*0.1 = 100) maps to white!
     let mut snap = build_empty_snapshot(cam, width, height, &config);
-    snap.carrier_keys.insert(k_base);
-    snap.carrier_keys.insert(k_sci);
     snap.overlays.push(single_patch_layer(
         &frame,
         src_base,
@@ -522,8 +515,6 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     // 1b. Verify `log10_db = true` stretch (`10 * log10(100.0) = 20 dB`):
     //     over [20, 40] dB -> black (and with `invert_colormap = true` -> white).
     let mut snap_db = build_empty_snapshot(cam, width, height, &config);
-    snap_db.carrier_keys.insert(k_base);
-    snap_db.carrier_keys.insert(k_sci);
     snap_db.overlays.push(single_patch_layer(
         &frame,
         src_base,
@@ -579,8 +570,6 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     //     8-tap trilinear mip blending across NaN-skipping mipmaps without NaN artifacts.
     let cam_far = Camera::at(clat, clon, 180_000.0);
     let mut snap_far = build_empty_snapshot(cam_far, width, height, &config);
-    snap_far.carrier_keys.insert(k_base);
-    snap_far.carrier_keys.insert(k_sci);
     snap_far.overlays.push(single_patch_layer(
         &frame,
         src_base,
@@ -659,8 +648,6 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     let custom_cmap: Arc<[[u8; 4]]> = Arc::from(cmap);
 
     let mut snap_cat = build_empty_snapshot(cam, width, height, &config);
-    snap_cat.carrier_keys.insert(k_base);
-    snap_cat.carrier_keys.insert(k_cat8);
     snap_cat.overlays.push(single_patch_layer(
         &frame,
         src_base,
@@ -734,8 +721,6 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         .upload_and_insert(device, queue, k_cat16, &dec_cat16)
         .expect("upload r16u");
     let mut snap_cat16 = build_empty_snapshot(cam, width, height, &config);
-    snap_cat16.carrier_keys.insert(k_base);
-    snap_cat16.carrier_keys.insert(k_cat16);
     snap_cat16.overlays.push(single_patch_layer(
         &frame,
         src_base,

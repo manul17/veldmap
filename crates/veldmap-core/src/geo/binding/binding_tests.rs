@@ -1,7 +1,7 @@
 use super::*;
 use crate::geo::crs::CrsSpec;
+use crate::geo::crs::{Projection, System};
 use crate::geo::geodesy;
-use crate::geo::projection::{Projection, System};
 
 #[test]
 fn projected_and_axial_tie_grid_fraction_inverse_round_trip() {
@@ -271,7 +271,7 @@ fn pole_touching_pixel_is_point_tie_grid_is_measurable_and_clamps_outer_half_pix
 
 #[test]
 fn foreign_datum_geographic_frame_shifts_to_wgs84_and_inverts_cleanly() {
-    use super::super::datum::PULKOVO_1942;
+    use super::super::crs::PULKOVO_1942;
 
     let ties = [
         Tie {

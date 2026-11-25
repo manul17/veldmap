@@ -18,18 +18,19 @@ use crate::pipeline::metadata::{
 use crate::pipeline::plan::{build_chunked_level_table, check_max_source_side};
 use crate::pipeline::radiometry::DisplayMapping;
 
-use super::gdal_meta::{GdalMetadata, parse_gdal_metadata};
-use super::georef::{ParsedGeoref, georef};
-use super::ifd::{CachedIfd, Photometric, TiffByteOrder, parse_cached_ifd};
+use super::gdal_meta::{GdalMetadata, TAG_GDAL_METADATA, parse_gdal_metadata, parse_gdal_nodata};
+use super::georef::{ParsedGeoref, parse_georef};
+use super::ifd::{CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, RawTiffAccess, TiffByteOrder};
+use super::ifd_parse::parse_cached_ifd;
 use super::stretch::{BandStatsCache, StretchCache};
-use super::tags::{is_overview, map_tiff_error, opt_tag, parse_gdal_nodata, read_tag_ascii_opt};
+use super::tags::{is_overview, map_tiff_error, opt_tag, read_geotiff_tags, read_tag_ascii_opt};
 use super::{MAX_IFDS, TiffSource};
-
-const TAG_GDAL_METADATA: u16 = 42112;
 
 fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
     let mut limits = Limits::default();
-    limits.decoding_buffer_size = budget.decode_working_bytes.min(256 * 1024 * 1024) as usize;
+    // Enforced by `tiff 0.11.3` during open-time IFD tag value reads
+    // (TileOffsets, ColorMap, JPEGTables, ASCII tags).
+    limits.decoding_buffer_size = budget.decode_working_bytes.min(MAX_SINGLE_CHUNK_BYTES) as usize;
     limits.intermediate_buffer_size = budget
         .decode_working_bytes
         .clamp(4 * 1024 * 1024, 128 * 1024 * 1024) as usize;
@@ -244,7 +245,8 @@ impl TiffSource {
             check_max_source_side(base_ifd.width, base_ifd.height)?;
         }
 
-        let nodata_f64 = parse_gdal_nodata(&mut decoder, cancel)?;
+        let nodata_raw = read_tag_ascii_opt(&mut decoder, Tag::GdalNodata, cancel)?;
+        let nodata_f64 = parse_gdal_nodata(&nodata_raw);
         let gdal_xml = read_tag_ascii_opt(&mut decoder, Tag::Unknown(TAG_GDAL_METADATA), cancel)?;
         let gdal_meta = if gdal_xml.is_empty() {
             GdalMetadata::default()
@@ -252,13 +254,14 @@ impl TiffSource {
             parse_gdal_metadata(&gdal_xml)
         };
 
+        let raw_geotiff_tags = read_geotiff_tags(&mut decoder, cancel)?;
         let ParsedGeoref {
             ties,
             placement,
             embedded_affine,
             geographic_crs,
             trouble,
-        } = georef(&mut decoder, base_ifd.width, base_ifd.height, cancel)?;
+        } = parse_georef(&raw_geotiff_tags, base_ifd.width, base_ifd.height);
 
         let (placement, binding_trouble) = merge_georef_with_sidecar(
             placement,
@@ -278,7 +281,6 @@ impl TiffSource {
 
         let width = base_ifd.width;
         let height = base_ifd.height;
-        let tiled = base_ifd.tiled;
         let depth = base_ifd.raw_pixel_bytes();
         let grid = Grid {
             chunk: (base_ifd.chunk_w, base_ifd.chunk_h),
@@ -331,20 +333,21 @@ impl TiffSource {
             levels,
         };
 
-        Ok(Self {
+        let access = RawTiffAccess {
             byte_source,
             byte_order,
+            max_chunk_bytes: budget.decode_working_bytes.min(MAX_SINGLE_CHUNK_BYTES) as usize,
+        };
+
+        Ok(Self {
+            access,
             fingerprint,
             source_id: SourceId::from_fingerprint(&fingerprint),
             description,
-            tiled,
             grid,
             ifds,
             nodata_f64,
             stats_ifd,
-            max_chunk_bytes: budget
-                .decode_working_bytes
-                .min(super::ifd::MAX_SINGLE_CHUNK_BYTES) as usize,
             budget_snapshot: *budget,
             stretch: StretchCache::new(initial_mapping),
             band_stats: BandStatsCache::new(),

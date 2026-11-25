@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::layers::LayerSummary;
+use crate::layers::{LayerSummary, OverlayEdit};
 use crate::ui::widgets::show_opacity_slider;
 use crate::ui::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format};
 
@@ -55,7 +55,11 @@ fn show_layer_status_banners(ui: &mut egui::Ui, layer: &LayerSummary) {
 
 fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec<LayerUiAction>) {
     if let Some((opacity, commit)) = show_opacity_slider(ui, ("raster", layer.id), layer.opacity) {
-        actions.push(LayerUiAction::SetOpacity(layer.id, opacity, commit));
+        actions.push(LayerUiAction::edit_raster_drag(
+            layer.id,
+            OverlayEdit::SetOpacity(opacity),
+            commit,
+        ));
     }
 
     if layer.band_options.len() > 1 {
@@ -139,7 +143,7 @@ fn show_layer_actions(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec
             .on_hover_text("Remove layer and free VRAM")
             .clicked()
         {
-            actions.push(LayerUiAction::Remove(layer.id));
+            actions.push(LayerUiAction::edit_raster(layer.id, OverlayEdit::Remove));
         }
     });
 }
@@ -154,7 +158,10 @@ pub(super) fn show_raster_card(
             ui.horizontal(|ui| {
                 let mut visible = layer.visible;
                 if ui.checkbox(&mut visible, "").changed() {
-                    actions.push(LayerUiAction::ToggleVisibility(layer.id, visible));
+                    actions.push(LayerUiAction::edit_raster(
+                        layer.id,
+                        OverlayEdit::SetVisible(visible),
+                    ));
                 }
                 ui.add(egui::Label::new(egui::RichText::new(&layer.name).strong()).truncate())
                     .on_hover_text(layer.path.display().to_string());
@@ -164,14 +171,14 @@ pub(super) fn show_raster_card(
                         .on_hover_text("Move layer down")
                         .clicked()
                     {
-                        actions.push(LayerUiAction::MoveDown(layer.id));
+                        actions.push(LayerUiAction::edit_raster(layer.id, OverlayEdit::MoveDown));
                     }
                     if ui
                         .add_enabled(layer.can_move_up, egui::Button::new("↑").small())
                         .on_hover_text("Move layer up")
                         .clicked()
                     {
-                        actions.push(LayerUiAction::MoveUp(layer.id));
+                        actions.push(LayerUiAction::edit_raster(layer.id, OverlayEdit::MoveUp));
                     }
                 });
             });
