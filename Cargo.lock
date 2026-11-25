@@ -3254,10 +3254,8 @@ dependencies = [
  "fax",
  "flate2",
  "half",
- "image-webp",
  "quick-error",
  "weezl",
- "zstd",
  "zune-jpeg",
 ]
 

@@ -1,6 +1,10 @@
-//! Alpha-weighted linear-light RGBA8 pyramid halving (`halve_rgba8`),
-//! fractional window area resampling (`resample_rgba8_window`), and nodata
-//! color bleeding (`bleed_alpha`).
+//! Multi-format raster resampling kernels:
+//! - Linear-light alpha-weighted RGBA8 halving/window resampling (`halve_rgba8`,
+//!   `resample_rgba8_window`) and display-only nodata color bleeding (`bleed_alpha`)
+//! - NaN-skipping `R32Float` halving and area-weighted resampling (`halve_f32`,
+//!   `resample_f32_window`)
+//! - Non-averaging nearest-neighbor `R8Uint`/`R16Uint` halving and window
+//!   resampling (`halve_uint_nearest`, `resample_uint_nearest_window`).
 
 use crate::color::{
     average_srgb_rgba8_block, linear_to_srgb_lut, linear_to_srgb_u8, srgb_to_linear_lut,
@@ -313,7 +317,8 @@ pub(crate) fn resample_f32_window(
                 }
                 sy += 1;
             }
-            let val = if weight > 0.0 {
+            let cell_area = (x1 - x0) * (y1 - y0);
+            let val = if weight > cell_area * 1e-9 {
                 (sum / weight) as f32
             } else {
                 f32::NAN
@@ -324,43 +329,24 @@ pub(crate) fn resample_f32_window(
     out
 }
 
-/// Non-averaging nearest-neighbor 2x2 decimation for `R8Uint` categorical tiles.
-pub(super) fn halve_u8_nearest(src: &[u8], w: u32, h: u32) -> Vec<u8> {
-    if w == 0 || h == 0 {
+/// Non-averaging nearest-neighbor 2x2 decimation for categorical `R8Uint` /
+/// `R16Uint` tiles (`bpp` = 1 or 2).
+pub(super) fn halve_uint_nearest(src: &[u8], w: u32, h: u32, bpp: usize) -> Vec<u8> {
+    if w == 0 || h == 0 || bpp == 0 {
         return Vec::new();
     }
-    debug_assert_eq!(src.len(), (w as usize) * (h as usize));
+    debug_assert_eq!(src.len(), (w as usize) * (h as usize) * bpp);
     let (dw, dh) = (w.div_ceil(2), h.div_ceil(2));
-    let mut out = vec![0u8; (dw as usize) * (dh as usize)];
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * bpp];
     for dy in 0..dh {
         let sy = (dy * 2).min(h - 1) as usize;
         let src_row = sy * (w as usize);
         let dst_row = (dy as usize) * (dw as usize);
         for dx in 0..dw {
             let sx = (dx * 2).min(w - 1) as usize;
-            out[dst_row + (dx as usize)] = src[src_row + sx];
-        }
-    }
-    out
-}
-
-/// Non-averaging nearest-neighbor 2x2 decimation for `R16Uint` categorical tiles.
-pub(super) fn halve_u16_nearest(src: &[u8], w: u32, h: u32) -> Vec<u8> {
-    if w == 0 || h == 0 {
-        return Vec::new();
-    }
-    debug_assert_eq!(src.len(), (w as usize) * (h as usize) * 2);
-    let (dw, dh) = (w.div_ceil(2), h.div_ceil(2));
-    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 2];
-    for dy in 0..dh {
-        let sy = (dy * 2).min(h - 1) as usize;
-        let src_row = sy * (w as usize);
-        let dst_row = (dy as usize) * (dw as usize);
-        for dx in 0..dw {
-            let sx = (dx * 2).min(w - 1) as usize;
-            let s_off = (src_row + sx) * 2;
-            let d_off = (dst_row + (dx as usize)) * 2;
-            out[d_off..d_off + 2].copy_from_slice(&src[s_off..s_off + 2]);
+            let s_off = (src_row + sx) * bpp;
+            let d_off = (dst_row + (dx as usize)) * bpp;
+            out[d_off..d_off + bpp].copy_from_slice(&src[s_off..s_off + bpp]);
         }
     }
     out
@@ -393,12 +379,14 @@ pub(crate) fn resample_uint_nearest_window(
     let scale_y = (window.y1 - window.y0) / f64::from(dh);
     let mut out = vec![0u8; (dw as usize) * (dh as usize) * bpp];
     for dy in 0..dh {
-        let sy_f = window.y0 + (f64::from(dy) + 0.5) * scale_y;
+        // Subtract `1e-9` before `floor()` so exact 2x decimation breaks ties
+        // toward top-left (`2 * dy`), matching `halve_uint_nearest`.
+        let sy_f = window.y0 + (f64::from(dy) + 0.5) * scale_y - 1e-9;
         let sy = (sy_f.floor().clamp(0.0, f64::from(sh - 1))) as usize;
         let src_row = sy * (sw as usize);
         let dst_row = (dy as usize) * (dw as usize);
         for dx in 0..dw {
-            let sx_f = window.x0 + (f64::from(dx) + 0.5) * scale_x;
+            let sx_f = window.x0 + (f64::from(dx) + 0.5) * scale_x - 1e-9;
             let sx = (sx_f.floor().clamp(0.0, f64::from(sw - 1))) as usize;
             let s_off = (src_row + sx) * bpp;
             let d_off = (dst_row + (dx as usize)) * bpp;
@@ -492,5 +480,73 @@ mod tests {
         bleed_alpha(&mut bleed_buf, 3, 1);
         assert_eq!(&bleed_buf[4..8], &[200, 100, 50, 0]);
         assert_eq!(&bleed_buf[8..12], &[200, 100, 50, 0]);
+    }
+
+    #[test]
+    fn scientific_and_categorical_resamplers_match_halve_and_skip_nan_slivers() {
+        // R32Float NaN-skipping halve & sliver-guarded window resample.
+        let f32_src: Vec<u8> = [10.0f32, f32::NAN, 30.0, f32::NAN]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+        let h = halve_f32(&f32_src, 2, 2);
+        assert!((read_f32_ne(&h, 0) - 20.0).abs() < 1e-6);
+
+        // Tiny floating-point boundary sliver (1e-13) into finite neighbor must NOT bleed into all-NaN cell.
+        let sliver_src: Vec<u8> = [100.0f32, f32::NAN]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+        let sliver_out = resample_f32_window(
+            &sliver_src,
+            2,
+            1,
+            Window {
+                x0: 1.0 - 1e-13,
+                y0: 0.0,
+                x1: 2.0,
+                y1: 1.0,
+            },
+            1,
+            1,
+        );
+        assert!(read_f32_ne(&sliver_out, 0).is_nan());
+
+        // Categorical 2x exact decimation: pointwise window and cascade halve must agree verbatim.
+        let u8_grid: Vec<u8> = (0u8..16).collect();
+        let halved_u8 = halve_uint_nearest(&u8_grid, 4, 4, 1);
+        let win_u8 = resample_uint_nearest_window(
+            &u8_grid,
+            4,
+            4,
+            Window {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 4.0,
+                y1: 4.0,
+            },
+            2,
+            2,
+            1,
+        );
+        assert_eq!(win_u8, halved_u8);
+
+        let u16_grid: Vec<u8> = (100u16..116).flat_map(u16::to_ne_bytes).collect();
+        let halved_u16 = halve_uint_nearest(&u16_grid, 4, 4, 2);
+        let win_u16 = resample_uint_nearest_window(
+            &u16_grid,
+            4,
+            4,
+            Window {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 4.0,
+                y1: 4.0,
+            },
+            2,
+            2,
+            2,
+        );
+        assert_eq!(win_u16, halved_u16);
     }
 }

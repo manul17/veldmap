@@ -138,18 +138,18 @@ impl OverlayRuntime {
         Some(deadline.saturating_duration_since(Instant::now()))
     }
 
-    /// Snapshot `(in_flight_count, pass_active)` for each `(source_id, stream_key)`
-    /// pair under a single scheduler lock acquisition.
+    /// Snapshot `(in_flight_count, pass_active)` for each active [`StreamKey`]
+    /// under a single scheduler lock acquisition.
     pub(super) fn layer_flight_stats(
         &self,
-        streams: impl IntoIterator<Item = (SourceId, StreamKey)>,
+        streams: impl IntoIterator<Item = StreamKey>,
     ) -> Vec<(usize, bool)> {
         let sched = lock_unpoisoned(&self.scheduler);
         streams
             .into_iter()
-            .map(|(source_id, stream_key)| {
+            .map(|stream_key| {
                 (
-                    sched.in_flight_count_for_source(source_id),
+                    sched.in_flight_count_for_stream(stream_key),
                     sched.has_active_pass(stream_key),
                 )
             })

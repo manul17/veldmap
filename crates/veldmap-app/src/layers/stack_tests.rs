@@ -1,10 +1,15 @@
-use veldmap_core::geo::Projection;
-use veldmap_core::tile::SourceFingerprint;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use veldmap_core::geo::{Frame, Projection};
+use veldmap_core::sync::{CancelToken, lock_unpoisoned};
+use veldmap_core::tile::{SourceFingerprint, SourceId};
 use veldmap_raster::{
-    DecodeContext, LevelPlan, RasterDescription, RasterError, ServeMode, TileEmit,
+    DecodeContext, LevelPlan, RasterDescription, RasterError, RasterSource, ServeMode, TileEmit,
 };
 
 use super::*;
+use crate::layers::{CrsOverride, LayerInitOptions};
 
 struct StubSource {
     fp: SourceFingerprint,
@@ -45,6 +50,17 @@ impl RasterSource for StubSource {
 
     fn description(&self) -> &RasterDescription {
         &self.desc
+    }
+
+    fn pyramid_meta_for(
+        &self,
+        spec: veldmap_core::tile::TileStreamSpec,
+    ) -> Result<veldmap_raster::PyramidMeta, RasterError> {
+        Ok(veldmap_raster::PyramidMeta {
+            source: self.src,
+            spec,
+            levels: self.desc.levels.clone(),
+        })
     }
 
     fn pass_peak_bytes(&self) -> u64 {
@@ -114,10 +130,10 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
     assert!(!stack.move_down(LayerId(1)));
     assert!(!stack.move_up(LayerId(3)));
     assert!(stack.move_up(LayerId(1)));
-    let ids: Vec<LayerId> = stack.layers().iter().map(|l| l.id).collect();
+    let ids: Vec<LayerId> = stack.layers().iter().map(OverlayLayer::id).collect();
     assert_eq!(ids, vec![LayerId(2), LayerId(1), LayerId(3)]);
     assert!(stack.move_down(LayerId(1)));
-    let ids: Vec<LayerId> = stack.layers().iter().map(|l| l.id).collect();
+    let ids: Vec<LayerId> = stack.layers().iter().map(OverlayLayer::id).collect();
     assert_eq!(ids, vec![LayerId(1), LayerId(2), LayerId(3)]);
 
     // Shared-source queries and topmost active pixel size.
@@ -204,7 +220,7 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
         layer.pin_root(),
         "local raster layers opt into root pinning by default"
     );
-    layer.pin_root = false;
+    layer.set_pin_root(false);
     assert!(!layer.pin_root());
 
     let primary_key = layer.meta().stream_key();
@@ -216,7 +232,7 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
     };
     let mut extra_meta = layer.meta().clone();
     extra_meta.spec = extra_spec;
-    layer.streams.push(LayerStream::new(extra_meta));
+    layer.push_aux_stream_for_test(extra_meta);
     let extra_key = layer.streams()[1].stream_key();
 
     // Distinct streams sharing one SourceId track independent tile-byte weights
@@ -226,24 +242,143 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
     assert_eq!(layer.streams()[0].observed_tile_bytes(), 2_000_000);
     assert_eq!(layer.streams()[1].observed_tile_bytes(), 262_144);
     assert_eq!(layer.appetite_weight_bytes(), 2_000_000 + 262_144);
+    assert_eq!(layer.cell_observed_bytes(), 2_000_000 + 262_144);
+
+    // Reloading preserves opt-in `pin_root` flag.
+    let reloaded_src = StubSource::arc(11, 512, 512);
+    layer.replace_reloaded(
+        PathBuf::from("/tmp/reloaded.tif"),
+        reloaded_src,
+        utm_frame(10.0),
+        2,
+    );
+    assert!(
+        !layer.pin_root(),
+        "replace_reloaded must preserve pin_root=false"
+    );
 
     stack.push(layer);
-    let pinned: Vec<SourceId> = stack
-        .layers()
-        .iter()
-        .filter(|l| l.is_active() && l.pin_root())
-        .map(OverlayLayer::source_id)
-        .collect();
+    let mut pinned = Vec::new();
+    stack.extend_pinned_root_streams(&mut pinned);
     assert!(
         pinned.is_empty(),
-        "unpinned layer must not opt into pinned root sources"
+        "unpinned layer must not opt into pinned root streams"
     );
-    stack.get_mut(LayerId(10)).expect("layer").pin_root = true;
-    let pinned_after: Vec<SourceId> = stack
-        .layers()
-        .iter()
-        .filter(|l| l.is_active() && l.pin_root())
-        .map(OverlayLayer::source_id)
-        .collect();
-    assert_eq!(pinned_after.len(), 1);
+    stack
+        .get_mut(LayerId(10))
+        .expect("layer")
+        .set_pin_root(true);
+    stack.extend_pinned_root_streams(&mut pinned);
+    assert_eq!(pinned.len(), 1);
+    // Calling extend a second time deduplicates cleanly.
+    stack.extend_pinned_root_streams(&mut pinned);
+    assert_eq!(pinned.len(), 1);
+}
+
+#[test]
+fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
+    use crate::layers::style::{SavedLayerStyle, StretchPreset};
+    use crate::render::CategoricalPaletteId;
+    use veldmap_core::tile::{BandKey, PixelFormat};
+    use veldmap_raster::{BandStats, DISPLAY_STREAM_SPEC, stream_spec_for_band};
+
+    let sample_stats = |lo: f64, hi: f64| BandStats {
+        min: lo,
+        max: hi,
+        p2: lo + 1.0,
+        p98: hi - 1.0,
+        db_min: Some(-20.0),
+        db_max: Some(0.0),
+        db_p2: Some(-18.0),
+        db_p98: Some(-2.0),
+        sample_count: 100,
+        histogram: [0; 64],
+        db_histogram: [0; 64],
+    };
+
+    // Restoring `SourceColorMap` on a source without a TIFF ColorMap falls back cleanly.
+    let src = StubSource::arc(21, 512, 512);
+    let mut layer = OverlayLayer::from_source(
+        LayerId(21),
+        PathBuf::from("/tmp/sci.tif"),
+        src,
+        utm_frame(10.0),
+        LayerInitOptions {
+            visible: true,
+            opacity: 1.0,
+            crs_override: None,
+            style: Some(SavedLayerStyle {
+                categorical_palette: Some(CategoricalPaletteId::SourceColorMap),
+                ..SavedLayerStyle::default()
+            }),
+        },
+        1,
+    );
+    assert!(
+        layer.saved_style().is_none(),
+        "untouched default Display saves as None"
+    );
+    assert!(
+        layer
+            .to_summary(0, false, false, false)
+            .categorical
+            .is_none()
+    );
+
+    // Switch to Band 0 Scientific, load stats, apply custom range.
+    let b0_spec = stream_spec_for_band(BandKey::Index(0), PixelFormat::R32Float);
+    let b1_spec = stream_spec_for_band(BandKey::Index(1), PixelFormat::R32Float);
+    assert!(layer.set_active_stream(b0_spec).expect("switch b0"));
+    assert_eq!(layer.needs_band_stats(), Some(BandKey::Index(0)));
+
+    let tok1 = CancelToken::new();
+    layer.begin_stats_job(1, tok1.clone());
+    assert!(layer.scientific_style().is_loading());
+    // Stale job_id cannot clobber active job 1.
+    assert!(!layer.apply_band_stats_empty(BandKey::Index(0), 99));
+    assert!(layer.scientific_style().is_loading());
+    // Cancelled job resets back to NotRequested (never poisons Empty).
+    assert!(layer.apply_band_stats_cancelled(BandKey::Index(0), 1));
+    assert_eq!(layer.needs_band_stats(), Some(BandKey::Index(0)));
+
+    layer.begin_stats_job(2, CancelToken::new());
+    assert!(layer.apply_band_stats_ready(BandKey::Index(0), sample_stats(0.0, 100.0)));
+    assert_eq!(
+        (layer.scientific_style().min, layer.scientific_style().max),
+        (1.0, 99.0)
+    );
+
+    assert!(layer.set_stretch_range(10.0, 80.0));
+    assert_eq!(layer.scientific_style().preset, StretchPreset::Custom);
+    // No-op range and preset calls return false.
+    assert!(!layer.set_stretch_range(10.0, 80.0));
+    assert!(!layer.set_stretch_preset(StretchPreset::Custom));
+    assert!(layer.saved_style().is_some());
+
+    // Toggling Display -> back to SAME Band 0 preserves Ready stats and custom bounds.
+    assert!(
+        layer
+            .set_active_stream(DISPLAY_STREAM_SPEC)
+            .expect("display")
+    );
+    assert!(layer.set_active_stream(b0_spec).expect("back to b0"));
+    assert_eq!(layer.needs_band_stats(), None);
+    assert_eq!(
+        (layer.scientific_style().min, layer.scientific_style().max),
+        (10.0, 80.0)
+    );
+    assert_eq!(layer.scientific_style().preset, StretchPreset::Custom);
+
+    // Switching to DIFFERENT Band 1 resets Custom -> Percentile2_98 so new stats apply cleanly.
+    assert!(layer.set_active_stream(b1_spec).expect("switch b1"));
+    assert_eq!(
+        layer.scientific_style().preset,
+        StretchPreset::Percentile2_98
+    );
+    assert_eq!(layer.needs_band_stats(), Some(BandKey::Index(1)));
+    assert!(layer.apply_band_stats_ready(BandKey::Index(1), sample_stats(500.0, 1000.0)));
+    assert_eq!(
+        (layer.scientific_style().min, layer.scientific_style().max),
+        (501.0, 999.0)
+    );
 }

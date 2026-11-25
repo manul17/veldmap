@@ -93,13 +93,14 @@ pub(super) struct SharedLayouts {
 fn uniform_buffer_layout<T>(
     device: &wgpu::Device,
     label: &str,
+    visibility: wgpu::ShaderStages,
     dynamic: bool,
 ) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            visibility,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: dynamic,
@@ -110,16 +111,10 @@ fn uniform_buffer_layout<T>(
     })
 }
 
-fn texture_sampler_layout(
+fn non_filtering_texture_sampler_layout(
     device: &wgpu::Device,
     label: &str,
-    filterable: bool,
 ) -> wgpu::BindGroupLayout {
-    let sampler_ty = if filterable {
-        wgpu::SamplerBindingType::Filtering
-    } else {
-        wgpu::SamplerBindingType::NonFiltering
-    };
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -127,7 +122,7 @@ fn texture_sampler_layout(
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable },
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
@@ -136,7 +131,7 @@ fn texture_sampler_layout(
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(sampler_ty),
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                 count: None,
             },
         ],
@@ -144,43 +139,41 @@ fn texture_sampler_layout(
 }
 
 fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
+    let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
     let camera_layout =
-        uniform_buffer_layout::<CameraUniform>(device, "globe camera bind group layout", false);
-    let tile_uniform_layout =
-        uniform_buffer_layout::<TileUniform>(device, "globe per-tile dynamic uniform layout", true);
+        uniform_buffer_layout::<CameraUniform>(device, "globe camera bind group layout", vf, false);
+    let tile_uniform_layout = uniform_buffer_layout::<TileUniform>(
+        device,
+        "globe per-tile dynamic uniform layout",
+        vf,
+        true,
+    );
     let overlay_uniform_layout = uniform_buffer_layout::<OverlayPatchUniform>(
         device,
         "overlay patch dynamic uniform layout",
+        vf,
         true,
     );
     let scientific_uniform_layout = uniform_buffer_layout::<ScientificPatchUniform>(
         device,
         "scientific overlay patch dynamic uniform layout",
+        vf,
         true,
     );
     let categorical_uniform_layout = uniform_buffer_layout::<CategoricalPatchUniform>(
         device,
         "categorical overlay patch dynamic uniform layout",
+        vf,
         true,
     );
-    let palette_uniform_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("overlay palette LUT uniform layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<PaletteUniform>() as u64
-                    ),
-                },
-                count: None,
-            }],
-        });
+    let palette_uniform_layout = uniform_buffer_layout::<PaletteUniform>(
+        device,
+        "overlay palette LUT uniform layout",
+        wgpu::ShaderStages::FRAGMENT,
+        false,
+    );
     let vector_uniform_layout =
-        uniform_buffer_layout::<VectorUniform>(device, "vector dynamic uniform layout", true);
+        uniform_buffer_layout::<VectorUniform>(device, "vector dynamic uniform layout", vf, true);
 
     SharedLayouts {
         camera_layout,
@@ -294,6 +287,41 @@ fn create_body_and_grid_pipelines(
     )
 }
 
+fn create_overlay_track_pipeline(
+    device: &wgpu::Device,
+    shader_label: &str,
+    shader_source: &str,
+    layout_label: &str,
+    bind_group_layouts: &[Option<&wgpu::BindGroupLayout>],
+    pipeline_label: &'static str,
+    fragment_entry: &'static str,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(shader_label),
+        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(layout_label),
+        bind_group_layouts,
+        immediate_size: 0,
+    });
+    create_globe_pipeline(
+        device,
+        &shader,
+        &layout,
+        GlobePipelineSpec {
+            label: pipeline_label,
+            vertex_entry: "vs_main",
+            vertex_layout: OverlayVertex::LAYOUT,
+            fragment_entry,
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back),
+            blend: wgpu::BlendState::ALPHA_BLENDING,
+            depth_stencil: None,
+        },
+    )
+}
+
 fn create_overlay_pipelines(
     device: &wgpu::Device,
     layouts: &SharedLayouts,
@@ -303,93 +331,46 @@ fn create_overlay_pipelines(
     wgpu::RenderPipeline,
     wgpu::RenderPipeline,
 ) {
-    let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("overlay warp-mesh wgsl"),
-        source: wgpu::ShaderSource::Wgsl(OVERLAY_WGSL.into()),
-    });
-    let overlay_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("overlay warp-mesh pipeline layout"),
-        bind_group_layouts: &[
+    let display_pipeline = create_overlay_track_pipeline(
+        device,
+        "overlay warp-mesh wgsl",
+        OVERLAY_WGSL,
+        "overlay warp-mesh pipeline layout",
+        &[
             Some(&layouts.camera_layout),
             Some(&layouts.overlay_uniform_layout),
             Some(tile_bind_groups.rgba8_layout()),
         ],
-        immediate_size: 0,
-    });
-    let display_pipeline = create_globe_pipeline(
-        device,
-        &overlay_shader,
-        &overlay_pipeline_layout,
-        GlobePipelineSpec {
-            label: "overlay display warp-mesh pipeline (depth-less)",
-            vertex_entry: "vs_main",
-            vertex_layout: OverlayVertex::LAYOUT,
-            fragment_entry: "fs_overlay",
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::ALPHA_BLENDING,
-            depth_stencil: None,
-        },
+        "overlay display warp-mesh pipeline (depth-less)",
+        "fs_overlay",
     );
-
-    let sci_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("overlay scientific R32Float wgsl"),
-        source: wgpu::ShaderSource::Wgsl(OVERLAY_SCIENTIFIC_WGSL.into()),
-    });
-    let sci_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("overlay scientific pipeline layout"),
-        bind_group_layouts: &[
+    let scientific_pipeline = create_overlay_track_pipeline(
+        device,
+        "overlay scientific R32Float wgsl",
+        OVERLAY_SCIENTIFIC_WGSL,
+        "overlay scientific pipeline layout",
+        &[
             Some(&layouts.camera_layout),
             Some(&layouts.scientific_uniform_layout),
             Some(tile_bind_groups.r32f_layout()),
             Some(&layouts.palette_uniform_layout),
         ],
-        immediate_size: 0,
-    });
-    let scientific_pipeline = create_globe_pipeline(
-        device,
-        &sci_shader,
-        &sci_pipeline_layout,
-        GlobePipelineSpec {
-            label: "overlay scientific R32Float pipeline (depth-less)",
-            vertex_entry: "vs_main",
-            vertex_layout: OverlayVertex::LAYOUT,
-            fragment_entry: "fs_scientific",
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::ALPHA_BLENDING,
-            depth_stencil: None,
-        },
+        "overlay scientific R32Float pipeline (depth-less)",
+        "fs_scientific",
     );
-
-    let cat_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("overlay categorical Uint wgsl"),
-        source: wgpu::ShaderSource::Wgsl(OVERLAY_CATEGORICAL_WGSL.into()),
-    });
-    let cat_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("overlay categorical pipeline layout"),
-        bind_group_layouts: &[
+    let categorical_pipeline = create_overlay_track_pipeline(
+        device,
+        "overlay categorical Uint wgsl",
+        OVERLAY_CATEGORICAL_WGSL,
+        "overlay categorical pipeline layout",
+        &[
             Some(&layouts.camera_layout),
             Some(&layouts.categorical_uniform_layout),
             Some(tile_bind_groups.uint_layout()),
             Some(&layouts.palette_uniform_layout),
         ],
-        immediate_size: 0,
-    });
-    let categorical_pipeline = create_globe_pipeline(
-        device,
-        &cat_shader,
-        &cat_pipeline_layout,
-        GlobePipelineSpec {
-            label: "overlay categorical Uint pipeline (depth-less)",
-            vertex_entry: "vs_main",
-            vertex_layout: OverlayVertex::LAYOUT,
-            fragment_entry: "fs_categorical",
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::ALPHA_BLENDING,
-            depth_stencil: None,
-        },
+        "overlay categorical Uint pipeline (depth-less)",
+        "fs_categorical",
     );
 
     (display_pipeline, scientific_pipeline, categorical_pipeline)
@@ -476,7 +457,8 @@ fn create_composite_resources(
         source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
     });
 
-    let composite_layout = texture_sampler_layout(device, "composite bind group layout", false);
+    let composite_layout =
+        non_filtering_texture_sampler_layout(device, "composite bind group layout");
 
     let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("composite nearest sampler"),

@@ -27,20 +27,30 @@ fn encoding_for_format(format: PixelFormat) -> TileBlobEncoding {
 }
 
 fn encode_tile_blob(tile: &DecodedTile) -> Option<(TileBlobEncoding, Vec<u8>)> {
-    match tile.format() {
-        PixelFormat::Rgba8UnormSrgb => {
-            let bytes = encode_qoi_rgba8(
-                tile.width(),
-                tile.height(),
-                tile.data(),
-                MAX_QOI_DECODED_BYTES,
-            )
-            .ok()?;
-            Some((TileBlobEncoding::Qoi, bytes))
-        }
+    let res = match tile.format() {
+        PixelFormat::Rgba8UnormSrgb => encode_qoi_rgba8(
+            tile.width(),
+            tile.height(),
+            tile.data(),
+            MAX_QOI_DECODED_BYTES,
+        )
+        .map(|bytes| (TileBlobEncoding::Qoi, bytes)),
         PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => {
-            let bytes = encode_lz4_raw_tile(tile, MAX_LZ4_RAW_DECODED_BYTES).ok()?;
-            Some((TileBlobEncoding::Lz4Raw, bytes))
+            encode_lz4_raw_tile(tile, MAX_LZ4_RAW_DECODED_BYTES)
+                .map(|bytes| (TileBlobEncoding::Lz4Raw, bytes))
+        }
+    };
+    match res {
+        Ok(encoded) => Some(encoded),
+        Err(err) => {
+            tracing::warn!(
+                format = ?tile.format(),
+                width = tile.width(),
+                height = tile.height(),
+                error = %err,
+                "Failed to encode overlay tile for disk cache"
+            );
+            None
         }
     }
 }

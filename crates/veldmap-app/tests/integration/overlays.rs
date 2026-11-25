@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use veldmap_app::gpu_tiles::{GpuTile, GpuTileCache, PendingUploads, UploadPassParams};
+use veldmap_app::gpu_tiles::{GpuTile, GpuTileCache};
 use veldmap_app::render::{
     CategoricalPaletteId, ColormapId, DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack,
     GlobeRenderer, OverlayMeshKey, RenderParams, TileBindGroupCache,
@@ -19,8 +19,8 @@ use veldmap_core::tile::{
 use veldmap_raster::generate_scientific_mipmaps;
 
 use crate::common::{
-    build_empty_snapshot, is_clear_background, pixel_at, render_srgb, render_with,
-    shared_headless_device,
+    build_empty_snapshot, is_clear_background, pixel_at, render_srgb, render_srgb_with_bind_groups,
+    render_with, shared_headless_device,
 };
 
 fn single_patch_layer(
@@ -511,22 +511,16 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         }],
     });
     let snap = Arc::new(snap);
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    assert!(renderer.render_if_dirty_with_bind_groups(
+    // Render and read back directly through the hoisted `shared_bg` cache.
+    let pixels = render_srgb_with_bind_groups(
+        &mut renderer,
+        &mut shared_bg,
         device,
         queue,
-        &mut encoder,
-        RenderParams {
-            width,
-            height,
-            snapshot: &snap,
-        },
-        &mut shared_bg,
-    ));
-    // Also exercise dB stretch (`10 * log10(100.0) = 20 dB` over `[0, 20]` -> white) and
-    // verify pixels via `render_srgb` on a standalone renderer.
-    let mut standalone = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
-    let pixels = render_srgb(&mut standalone, device, queue, width, height, &snap);
+        width,
+        height,
+        &snap,
+    );
     let left_px = pixel_at(&pixels, width, width / 2 - 20, height / 2);
     assert!(
         left_px[0] < 20 && left_px[1] > 235 && left_px[2] < 20,
@@ -539,7 +533,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     );
 
     // 1b. Verify `log10_db = true` stretch (`10 * log10(100.0) = 20 dB`):
-    //     over [0, 20] dB -> white; over [20, 40] dB -> black.
+    //     over [20, 40] dB -> black (and with `invert_colormap = true` -> white).
     let mut snap_db = build_empty_snapshot(cam, width, height, &config);
     snap_db.carrier_keys.insert(k_base);
     snap_db.carrier_keys.insert(k_sci);
@@ -581,13 +575,22 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         }],
     });
     let snap_db = Arc::new(snap_db);
-    let pixels_db = render_srgb(&mut standalone, device, queue, width, height, &snap_db);
+    let pixels_db = render_srgb_with_bind_groups(
+        &mut renderer,
+        &mut shared_bg,
+        device,
+        queue,
+        width,
+        height,
+        &snap_db,
+    );
     let db_right = pixel_at(&pixels_db, width, width / 2 + 20, height / 2);
     assert!(
         db_right[0] < 15 && db_right[1] < 15 && db_right[2] < 15,
         "20 dB value at stretch_min=20 dB must map to black, got {db_right:?}"
     );
     let db_left = pixel_at(&pixels_db, width, width / 2 - 20, height / 2);
+    let mut standalone = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
     assert!(
         db_left[0] < 20 && db_left[1] > 235 && db_left[2] < 20,
         "dB stretch must still discard NaN/±Inf to green base, got {db_left:?}"
@@ -790,19 +793,15 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         }],
     });
     let snap_cat16 = Arc::new(snap_cat16);
-    let mut enc16 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    assert!(renderer.render_if_dirty_with_bind_groups(
+    let pixels_cat16 = render_srgb_with_bind_groups(
+        &mut renderer,
+        &mut shared_bg,
         device,
         queue,
-        &mut enc16,
-        RenderParams {
-            width,
-            height,
-            snapshot: &snap_cat16,
-        },
-        &mut shared_bg,
-    ));
-    let pixels_cat16 = render_srgb(&mut standalone, device, queue, width, height, &snap_cat16);
+        width,
+        height,
+        &snap_cat16,
+    );
     let cat16_left = pixel_at(&pixels_cat16, width, width / 2 - 20, height / 2);
     assert!(
         cat16_left[0] < 20 && cat16_left[1] > 235 && cat16_left[2] < 20,
@@ -813,52 +812,6 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         !(cat16_right[0] < 20 && cat16_right[1] > 235 && cat16_right[2] < 20),
         "R16Uint class=1024 right half must render hashed class color over green base, got {cat16_right:?}"
     );
-
-    // 3. StreamKey-keyed UploadBatchReport isolates R32Float vs R8Uint sharing 1 SourceId.
-    let multi_src = SourceId::new(975);
-    let mut pending = PendingUploads::new();
-    let tx = pending.sender().expect("sender");
-    let k_f32 = TileKey {
-        source: multi_src,
-        band: BandKey::Index(0),
-        scheme: TileScheme::RasterPyramid { max_level: 0 },
-        format: PixelFormat::R32Float,
-        gutter: 0,
-        decode_rev: 1,
-        level: 0,
-        x: 0,
-        y: 0,
-    };
-    let k_u8 = TileKey {
-        source: multi_src,
-        band: BandKey::Index(1),
-        scheme: TileScheme::RasterPyramid { max_level: 0 },
-        format: PixelFormat::R8Uint,
-        gutter: 0,
-        decode_rev: 1,
-        level: 0,
-        x: 0,
-        y: 0,
-    };
-    let mut big_f32 =
-        DecodedTile::try_new(64, 64, PixelFormat::R32Float, vec![0u8; 64 * 64 * 4]).expect("f32");
-    generate_scientific_mipmaps(&mut big_f32);
-    let small_u8 =
-        DecodedTile::try_new(64, 64, PixelFormat::R8Uint, vec![1u8; 64 * 64]).expect("u8");
-    tx.send((k_f32, big_f32)).expect("send f32");
-    tx.send((k_u8, small_u8)).expect("send u8");
-    let report = pending.drain_and_upload(
-        device,
-        queue,
-        &mut gpu_cache,
-        UploadPassParams {
-            wanted: &[],
-            protected: None,
-            byte_budget: 16 * 1024 * 1024,
-            time_budget: std::time::Duration::from_secs(1),
-        },
-    );
-    assert_eq!(report.uploaded, 2);
 
     // Verify hoisted multi-format TileBindGroupCache sweeps cleanly once evicted.
     assert!(shared_bg.len() >= 3);

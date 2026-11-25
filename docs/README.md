@@ -24,7 +24,7 @@ VeldMap is a strict 3-tier acyclic workspace with zero horizontal dependencies a
                      v               v                v
           veldmap-raster      veldmap-storage      veldmap-net
       (GeoTIFF/PNG/JPEG,    (SQLite WAL cache,   (tokio, reqwest,
-      QOI, TwoLanePool)     atomic JSON, I/O)     rustls + ring)
+       QOI/Lz4Raw, Pool)    atomic JSON, I/O)     rustls + ring)
                       \              |               /
                        v             v              v
                      veldmap-app (eframe/egui + wgpu)

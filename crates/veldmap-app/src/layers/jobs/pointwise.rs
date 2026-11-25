@@ -11,7 +11,7 @@ use veldmap_storage::DiskTileKey;
 
 use crate::gpu_tiles::tile_format_bytes;
 
-use super::super::qoi_cache::{load_cached_tile, store_cached_tile};
+use super::super::disk_cache::{load_cached_tile, store_cached_tile};
 use super::super::runtime::OverlayRuntime;
 
 /// RAII guard guaranteeing a pointwise tile never remains stuck in-flight in

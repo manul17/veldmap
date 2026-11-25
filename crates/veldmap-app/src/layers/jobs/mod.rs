@@ -1,5 +1,5 @@
 //! Two-lane pointwise/pass decode scheduling, RAII flight guards, and worker
-//! execution over [`super::qoi_cache`].
+//! execution over [`super::disk_cache`].
 
 mod pass;
 mod pointwise;

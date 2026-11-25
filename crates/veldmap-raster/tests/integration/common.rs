@@ -145,10 +145,13 @@ pub fn write_tile_grid_u32<W: Write + Seek>(
 
 pub fn fake_fingerprint(bytes: &[u8]) -> SourceFingerprint {
     let mut digest = [0u8; 32];
-    for (i, b) in bytes.iter().take(32).enumerate() {
-        digest[i] = *b;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (bytes.len() as u64);
+    for (i, &b) in bytes.iter().enumerate() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        digest[i & 31] ^= (h >> ((i & 7) * 8)) as u8;
     }
-    digest[31] ^= (bytes.len() & 0xFF) as u8;
+    digest[0..8].copy_from_slice(&h.to_le_bytes());
     SourceFingerprint::from_digest(digest)
 }
 

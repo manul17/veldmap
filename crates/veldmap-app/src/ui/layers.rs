@@ -311,20 +311,7 @@ fn paint_interactive_histogram(
     );
 
     // Draw colormap gradient strip underneath.
-    let steps = 48usize;
-    let step_w = ramp_rect.width() / (steps as f32);
-    for i in 0..steps {
-        let t = (i as f32) / ((steps - 1) as f32);
-        let [r, g, b, _] = sample_colormap_srgb(sci.colormap, t, sci.invert_colormap);
-        let seg = egui::Rect::from_min_max(
-            egui::pos2(ramp_rect.left() + (i as f32) * step_w, ramp_rect.top()),
-            egui::pos2(
-                ramp_rect.left() + ((i + 1) as f32) * step_w + 0.5,
-                ramp_rect.bottom(),
-            ),
-        );
-        painter.rect_filled(seg, 0.0, egui::Color32::from_rgb(r, g, b));
-    }
+    super::hud::paint_colormap_ramp(painter, ramp_rect, sci.colormap, sci.invert_colormap, 48);
     painter.rect_stroke(
         hist_rect,
         2.0,
@@ -332,27 +319,86 @@ fn paint_interactive_histogram(
         egui::StrokeKind::Inside,
     );
 
-    // Interactive click/drag moves whichever stretch handle (min or max) is closer.
+    // Interactive click/drag latches whichever stretch handle (min or max) was
+    // closest at drag start so handles never jump mid-drag, and only commits
+    // when values actually changed.
+    #[derive(Clone, Copy)]
+    enum HistHandle {
+        Min,
+        Max,
+    }
+    #[derive(Clone, Copy)]
+    struct HistDragState {
+        handle: HistHandle,
+        changed: bool,
+    }
+    let state_id = response.id.with("hist_drag_state");
+    if response.drag_started()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let f = f64::from(((pos.x - hist_rect.left()) / hist_rect.width()).clamp(0.0, 1.0));
+        let val = data_min + f * data_span;
+        let handle = if (val - sci.min).abs() <= (val - sci.max).abs() {
+            HistHandle::Min
+        } else {
+            HistHandle::Max
+        };
+        ui.data_mut(|d| {
+            d.insert_temp(
+                state_id,
+                HistDragState {
+                    handle,
+                    changed: false,
+                },
+            )
+        });
+    }
     if (response.dragged() || response.clicked())
         && let Some(pos) = response.interact_pointer_pos()
     {
         let f = f64::from(((pos.x - hist_rect.left()) / hist_rect.width()).clamp(0.0, 1.0));
         let val = data_min + f * data_span;
-        let dist_lo = (val - sci.min).abs();
-        let dist_hi = (val - sci.max).abs();
-        let (next_lo, next_hi) = if dist_lo <= dist_hi {
-            (val.min(sci.max - data_span * 1e-4), sci.max)
-        } else {
-            (sci.min, val.max(sci.min + data_span * 1e-4))
+        let handle = ui
+            .data(|d| d.get_temp::<HistDragState>(state_id).map(|s| s.handle))
+            .unwrap_or_else(|| {
+                if (val - sci.min).abs() <= (val - sci.max).abs() {
+                    HistHandle::Min
+                } else {
+                    HistHandle::Max
+                }
+            });
+        let (next_lo, next_hi) = match handle {
+            HistHandle::Min => (val.min(sci.max - data_span * 1e-4), sci.max),
+            HistHandle::Max => (sci.min, val.max(sci.min + data_span * 1e-4)),
         };
         let commit = response.clicked() || response.drag_stopped();
+        if response.dragged() {
+            ui.data_mut(|d| {
+                d.insert_temp(
+                    state_id,
+                    HistDragState {
+                        handle,
+                        changed: true,
+                    },
+                )
+            });
+        }
         actions.push(LayerUiAction::SetStretchRange(
             layer_id, next_lo, next_hi, commit,
         ));
     } else if response.drag_stopped() {
-        actions.push(LayerUiAction::SetStretchRange(
-            layer_id, sci.min, sci.max, true,
-        ));
+        let was_changed = ui.data(|d| {
+            d.get_temp::<HistDragState>(state_id)
+                .is_some_and(|s| s.changed)
+        });
+        if was_changed {
+            actions.push(LayerUiAction::SetStretchRange(
+                layer_id, sci.min, sci.max, true,
+            ));
+        }
+    }
+    if response.drag_stopped() {
+        ui.data_mut(|d| d.remove::<HistDragState>(state_id));
     }
     response.on_hover_text("Click or drag to adjust stretch min/max");
 }
@@ -407,16 +453,28 @@ fn show_scientific_controls(
     let mut lo = sci.min;
     let mut hi = sci.max;
     let speed = ((sci.max - sci.min).abs() * 0.005).max(1e-4);
+    let drag_dirty_id = ui.scope_id().with(("stretch_drag_dirty", layer_id));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Min").small());
         let r_lo = ui.add(egui::DragValue::new(&mut lo).speed(speed).max_decimals(4));
         ui.label(egui::RichText::new("Max").small());
         let r_hi = ui.add(egui::DragValue::new(&mut hi).speed(speed).max_decimals(4));
         if r_lo.changed() || r_hi.changed() {
-            let commit = !r_lo.dragged() && !r_hi.dragged();
-            actions.push(LayerUiAction::SetStretchRange(layer_id, lo, hi, commit));
+            let dragging = r_lo.dragged() || r_hi.dragged();
+            if dragging {
+                ui.data_mut(|d| d.insert_temp(drag_dirty_id, true));
+            } else {
+                ui.data_mut(|d| d.remove::<bool>(drag_dirty_id));
+            }
+            actions.push(LayerUiAction::SetStretchRange(layer_id, lo, hi, !dragging));
         } else if r_lo.drag_stopped() || r_hi.drag_stopped() {
-            actions.push(LayerUiAction::SetStretchRange(layer_id, lo, hi, true));
+            let was_dirty = ui
+                .data(|d| d.get_temp::<bool>(drag_dirty_id))
+                .unwrap_or(false);
+            ui.data_mut(|d| d.remove::<bool>(drag_dirty_id));
+            if was_dirty {
+                actions.push(LayerUiAction::SetStretchRange(layer_id, lo, hi, true));
+            }
         }
     });
 

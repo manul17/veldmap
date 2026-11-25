@@ -7,7 +7,7 @@ use veldmap_core::io::BufferedByteReader;
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
-use crate::pipeline::radiometry::is_data;
+use crate::pipeline::radiometry::is_data_f64;
 
 use super::tags::read_tag_numeric_f64_vec_opt;
 
@@ -33,14 +33,9 @@ impl Default for YCbCrParams {
 }
 
 impl YCbCrParams {
-    /// Convert upsampled 8-bit `YCbCr` triplets directly to tightly packed
-    /// `RGBA8` without allocating an intermediate `RGB` buffer.
-    pub(super) fn convert_u8_to_rgba(
-        &self,
-        ycbcr: &[u8],
-        pixels: usize,
-        nodata: Option<f32>,
-    ) -> Vec<u8> {
+    /// Convert a single 8-bit `YCbCr` triplet to `[R, G, B]` using TIFF 6.0
+    /// Section 21 `YCbCrCoefficients` (tag 529) and `ReferenceBlackWhite` (tag 532).
+    pub(super) fn convert_u8_pixel_to_rgb(&self, y_raw: u8, cb_raw: u8, cr_raw: u8) -> [u8; 3] {
         let [lr, lg, lb] = self.luma;
         let [rb_y, rw_y, rb_cb, rw_cb, rb_cr, rw_cr] = self.ref_black_white;
         let scale_y = if (rw_y - rb_y).abs() > 1e-6 {
@@ -66,21 +61,33 @@ impl YCbCrParams {
             1.0 / 0.587
         };
 
+        let y = (f64::from(y_raw) - rb_y) * scale_y;
+        let cb = (f64::from(cb_raw) - rb_cb) * scale_cb;
+        let cr = (f64::from(cr_raw) - rb_cr) * scale_cr;
+        let r = (cr * kr + y).clamp(0.0, 255.0).round() as u8;
+        let b = (cb * kb + y).clamp(0.0, 255.0).round() as u8;
+        let g = ((y - lb * f64::from(b) - lr * f64::from(r)) * inv_lg)
+            .clamp(0.0, 255.0)
+            .round() as u8;
+        [r, g, b]
+    }
+
+    /// Convert upsampled 8-bit `YCbCr` triplets directly to tightly packed
+    /// `RGBA8` without allocating an intermediate `RGB` buffer.
+    pub(super) fn convert_u8_to_rgba(
+        &self,
+        ycbcr: &[u8],
+        pixels: usize,
+        nodata: Option<f64>,
+    ) -> Vec<u8> {
         let count = pixels.min(ycbcr.len() / 3);
         let mut rgba = Vec::with_capacity(count * 4);
         for px in ycbcr.chunks_exact(3).take(count) {
-            let y = (f64::from(px[0]) - rb_y) * scale_y;
-            let cb = (f64::from(px[1]) - rb_cb) * scale_cb;
-            let cr = (f64::from(px[2]) - rb_cr) * scale_cr;
-            let r = (cr * kr + y).clamp(0.0, 255.0).round() as u8;
-            let b = (cb * kb + y).clamp(0.0, 255.0).round() as u8;
-            let g = ((y - lb * f64::from(b) - lr * f64::from(r)) * inv_lg)
-                .clamp(0.0, 255.0)
-                .round() as u8;
+            let [r, g, b] = self.convert_u8_pixel_to_rgb(px[0], px[1], px[2]);
             let void = nodata.is_some()
-                && !is_data(f32::from(r), nodata)
-                && !is_data(f32::from(g), nodata)
-                && !is_data(f32::from(b), nodata);
+                && !is_data_f64(f64::from(r), nodata)
+                && !is_data_f64(f64::from(g), nodata)
+                && !is_data_f64(f64::from(b), nodata);
             if void {
                 rgba.extend_from_slice(&[0, 0, 0, 0]);
             } else {

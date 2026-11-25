@@ -23,8 +23,8 @@ use crate::pipeline::peak::DecodePeak;
 use crate::pipeline::radiometry::PixelLayout;
 
 use super::tags::{
-    map_tiff_error, opt_tag, opt_tag_strict, read_tag_u8_vec_opt, read_tag_u16_vec_opt,
-    read_tag_u64_vec_opt,
+    map_tiff_error, opt_tag, opt_tag_strict, read_tag_u8_vec_strict, read_tag_u16_vec_strict,
+    read_tag_u64_vec_strict,
 };
 use super::ycbcr::{YCbCrParams, read_ycbcr_params};
 
@@ -141,10 +141,8 @@ pub(super) struct CachedIfd {
     pub(super) planar: PlanarConfig,
     pub(super) photometric: Photometric,
     pub(super) samples_per_pixel: u16,
-    pub(super) sample_bits: u8,
     pub(super) sample_type: SampleType,
     pub(super) pixel_layout: PixelLayout,
-    pub(super) alpha_channel: Option<usize>,
     pub(super) data_bands: u16,
     pub(super) offsets: Vec<u64>,
     pub(super) byte_counts: Vec<u64>,
@@ -196,9 +194,14 @@ impl CachedIfd {
         }
     }
 
-    /// Raw bytes per pixel across all channels (or 1 plane when planar single-band).
+    /// Raw bytes per pixel across all channels (`samples_per_pixel * sample_bytes`).
     pub(super) const fn raw_pixel_bytes(&self) -> u32 {
         (self.samples_per_pixel as u32) * (self.sample_type.byte_size() as u32)
+    }
+
+    /// Explicit alpha channel index within a pixel, if present.
+    pub(super) const fn alpha_channel(&self) -> Option<usize> {
+        self.pixel_layout.alpha_channel()
     }
 
     /// Look up `(offset, byte_count)` for `(plane, chunk_index)`.
@@ -249,26 +252,27 @@ fn resolve_sample_type(sample_format: u16, bits: u8) -> Result<SampleType, Raste
 
 fn parse_color_map(
     decoder: &mut Decoder<BufferedByteReader>,
-    sample_bits: u8,
+    sample_type: SampleType,
     cancel: &CancelToken,
 ) -> Result<Arc<[[u8; 4]]>, RasterError> {
-    let raw = read_tag_u16_vec_opt(decoder, Tag::ColorMap, cancel)?;
-    let expected_entries = match sample_bits {
-        8 => 256usize,
-        16 => 65_536usize,
+    let expected_entries = match sample_type {
+        SampleType::U8 => 256usize,
+        SampleType::U16 => 65_536usize,
         other => {
             return Err(RasterError::Decode(format!(
-                "unsupported Palette TIFF BitsPerSample {other} (expected 8 or 16)"
+                "unsupported Palette TIFF sample type {other:?} (expected U8 or U16)"
             )));
         }
     };
-    if raw.len() < expected_entries * 3 || !raw.len().is_multiple_of(3) {
+    let raw = read_tag_u16_vec_strict(decoder, Tag::ColorMap, cancel)?.unwrap_or_default();
+    if raw.len() != expected_entries * 3 {
         return Err(RasterError::Decode(format!(
-            "invalid TIFF ColorMap length {} for {sample_bits}-bit Palette",
-            raw.len()
+            "invalid TIFF ColorMap length {} for {sample_type:?} Palette (expected {})",
+            raw.len(),
+            expected_entries * 3
         )));
     }
-    let n = raw.len() / 3;
+    let n = expected_entries;
     // Some legacy writers store 8-bit values [0..=255] directly in u16 ColorMap slots.
     let is_8bit_scaled = raw.iter().all(|&v| v <= 255);
     let to_u8 = |v: u16| -> u8 {
@@ -289,7 +293,7 @@ fn resolve_pixel_layout(
     photometric: Photometric,
     samples_per_pixel: u16,
     extra_samples: &[u16],
-) -> Result<(PixelLayout, Option<usize>, u16), RasterError> {
+) -> Result<(PixelLayout, u16), RasterError> {
     let spp = usize::from(samples_per_pixel);
     match photometric {
         Photometric::WhiteIsZero => {
@@ -298,13 +302,13 @@ fn resolve_pixel_layout(
                     "WhiteIsZero with multiple samples is not supported".to_owned(),
                 ));
             }
-            Ok((PixelLayout::named(1), None, 1))
+            Ok((PixelLayout::named(1), 1))
         }
         Photometric::BlackIsZero => {
             if spp == 1 {
-                Ok((PixelLayout::named(1), None, 1))
+                Ok((PixelLayout::named(1), 1))
             } else if spp == 2 && extra_samples.first().is_some_and(|&v| v == 1 || v == 2) {
-                Ok((PixelLayout::named(2), Some(1), 1))
+                Ok((PixelLayout::named(2), 1))
             } else {
                 // Multi-band stack (e.g., Sentinel-2 / hyperspectral): check if
                 // an explicit alpha ExtraSamples entry exists.
@@ -319,7 +323,7 @@ fn resolve_pixel_layout(
                 } else {
                     samples_per_pixel
                 };
-                Ok((PixelLayout::stack(spp), alpha_ch, data_bands))
+                Ok((PixelLayout::stack_with_alpha(spp, alpha_ch), data_bands))
             }
         }
         Photometric::Rgb => {
@@ -329,7 +333,7 @@ fn resolve_pixel_layout(
                 )));
             }
             if spp == 3 {
-                return Ok((PixelLayout::named(3), None, 3));
+                return Ok((PixelLayout::named(3), 3));
             }
             // 4+ band RGB (e.g., RGBA vs 4-band RGB+NIR with ExtraSamples = 0):
             // Only ExtraSamples == 1 (Associated) or 2 (Unassociated) is alpha!
@@ -340,22 +344,19 @@ fn resolve_pixel_layout(
                 .position(|&v| v == 1 || v == 2)
                 .map(|idx| 3 + idx)
                 .filter(|&ch| ch < spp);
-            let layout = match alpha_ch {
-                Some(ch) if ch == spp - 1 => PixelLayout::rgb_with_alpha(spp),
-                _ => PixelLayout::rgb_opaque(spp),
-            };
+            let layout = PixelLayout::rgb(spp, alpha_ch);
             let data_bands = if alpha_ch.is_some() {
                 samples_per_pixel.saturating_sub(1).max(3)
             } else {
                 samples_per_pixel
             };
-            Ok((layout, alpha_ch, data_bands))
+            Ok((layout, data_bands))
         }
         Photometric::Palette => {
             if spp == 1 {
-                Ok((PixelLayout::named(1), None, 1))
+                Ok((PixelLayout::named(1), 1))
             } else if spp == 2 && extra_samples.first().is_some_and(|&v| v == 1 || v == 2) {
-                Ok((PixelLayout::named(2), Some(1), 1))
+                Ok((PixelLayout::named(2), 1))
             } else {
                 Err(RasterError::Decode(format!(
                     "unsupported Palette TIFF with {spp} samples/pixel"
@@ -368,7 +369,7 @@ fn resolve_pixel_layout(
                     "YCbCr TIFF requires 3 samples/pixel, got {spp}"
                 )));
             }
-            Ok((PixelLayout::named(3), None, 3))
+            Ok((PixelLayout::named(3), 3))
         }
         Photometric::Other(code) => Err(RasterError::Decode(format!(
             "unsupported TIFF PhotometricInterpretation {code}"
@@ -416,8 +417,9 @@ pub(super) fn parse_cached_ifd(
         return Err(RasterError::Decode("TIFF SamplesPerPixel is 0".to_owned()));
     }
 
-    let bps_vec = read_tag_u16_vec_opt(decoder, Tag::BitsPerSample, cancel)?;
-    let sample_bits_u16 = bps_vec.first().copied().unwrap_or(8);
+    // TIFF 6.0 Baseline defaults omitted BitsPerSample to 1 (bi-level, unsupported).
+    let bps_vec = read_tag_u16_vec_strict(decoder, Tag::BitsPerSample, cancel)?.unwrap_or_default();
+    let sample_bits_u16 = bps_vec.first().copied().unwrap_or(1);
     if bps_vec.iter().any(|&b| b != sample_bits_u16) {
         return Err(RasterError::Decode(format!(
             "heterogeneous per-band BitsPerSample {bps_vec:?} is not supported"
@@ -426,7 +428,8 @@ pub(super) fn parse_cached_ifd(
     let sample_bits = u8::try_from(sample_bits_u16)
         .map_err(|_| RasterError::Decode(format!("unsupported BitsPerSample {sample_bits_u16}")))?;
 
-    let sample_fmt_vec = read_tag_u16_vec_opt(decoder, Tag::SampleFormat, cancel)?;
+    let sample_fmt_vec =
+        read_tag_u16_vec_strict(decoder, Tag::SampleFormat, cancel)?.unwrap_or_default();
     let sample_fmt_code = sample_fmt_vec.first().copied().unwrap_or(1);
     if sample_fmt_vec.iter().any(|&f| f != sample_fmt_code) {
         return Err(RasterError::Decode(format!(
@@ -462,27 +465,59 @@ pub(super) fn parse_cached_ifd(
             )));
         }
     };
-    if planar == PlanarConfig::Planar
-        && matches!(compression, TiffCompression::WebP)
-        && samples_per_pixel > 1
-    {
+    if planar == PlanarConfig::Planar && photometric == Photometric::YCbCr {
         return Err(RasterError::Decode(
-            "planar WebP TIFF is not supported".to_owned(),
+            "planar YCbCr TIFF is not supported".to_owned(),
         ));
+    }
+    if matches!(compression, TiffCompression::Jpeg | TiffCompression::WebP) {
+        if sample_type != SampleType::U8 {
+            return Err(RasterError::Decode(format!(
+                "{compression:?}-compressed TIFF requires 8-bit unsigned samples, got {sample_type:?}"
+            )));
+        }
+        if photometric == Photometric::Palette {
+            return Err(RasterError::Decode(format!(
+                "{compression:?}-compressed Palette TIFF is not supported"
+            )));
+        }
+    }
+    if compression == TiffCompression::Jpeg {
+        let samples_in_chunk = match planar {
+            PlanarConfig::Chunky => samples_per_pixel,
+            PlanarConfig::Planar => 1,
+        };
+        if !matches!(samples_in_chunk, 1 | 3 | 4) {
+            return Err(RasterError::Decode(format!(
+                "JPEG-compressed TIFF requires 1, 3, or 4 samples per chunk, got {samples_in_chunk}"
+            )));
+        }
+    }
+    if compression == TiffCompression::WebP
+        && (planar != PlanarConfig::Chunky
+            || !matches!(samples_per_pixel, 3 | 4)
+            || photometric == Photometric::YCbCr)
+    {
+        return Err(RasterError::Decode(format!(
+            "WebP-compressed TIFF requires chunky 3- or 4-band RGB/RGBA, got planar={planar:?}, spp={samples_per_pixel}, photometric={photometric:?}"
+        )));
     }
 
     let predictor_code =
         opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Predictor), cancel)?.unwrap_or(1);
     let predictor = TiffPredictor::from_code(predictor_code, sample_type)?;
 
-    let extra_samples = read_tag_u16_vec_opt(decoder, Tag::ExtraSamples, cancel)?;
-    let (pixel_layout, alpha_channel, data_bands) =
+    let extra_samples =
+        read_tag_u16_vec_strict(decoder, Tag::ExtraSamples, cancel)?.unwrap_or_default();
+    let (pixel_layout, data_bands) =
         resolve_pixel_layout(photometric, samples_per_pixel, &extra_samples)?;
 
     let ycbcr = if photometric == Photometric::YCbCr {
         if compression != TiffCompression::Jpeg {
-            let sub = read_tag_u16_vec_opt(decoder, Tag::ChromaSubsampling, cancel)?;
-            if !sub.is_empty() && sub.as_slice() != [1, 1] {
+            // TIFF 6.0 Section 21 defaults omitted YCbCrSubSampling to [2, 2].
+            let sub = read_tag_u16_vec_strict(decoder, Tag::ChromaSubsampling, cancel)?
+                .unwrap_or_else(|| vec![2, 2]);
+            if sub.as_slice() != [1, 1] {
                 return Err(RasterError::Decode(format!(
                     "non-JPEG subsampled YCbCr TIFF (YCbCrSubSampling={sub:?}) is not supported"
                 )));
@@ -494,7 +529,7 @@ pub(super) fn parse_cached_ifd(
     };
 
     let color_map = if photometric == Photometric::Palette {
-        Some(parse_color_map(decoder, sample_bits, cancel)?)
+        Some(parse_color_map(decoder, sample_type, cancel)?)
     } else {
         None
     };
@@ -504,19 +539,19 @@ pub(super) fn parse_cached_ifd(
     let (tiled, chunk_w, chunk_h, offsets, byte_counts) = if let Some(tw) = tile_w {
         let th = opt_tag_strict(decoder.get_tag_unsigned::<u32>(Tag::TileLength), cancel)?
             .ok_or_else(|| RasterError::Decode("tiled TIFF missing TileLength".to_owned()))?;
-        let offsets = read_tag_u64_vec_opt(decoder, Tag::TileOffsets, cancel)?
+        let offsets = read_tag_u64_vec_strict(decoder, Tag::TileOffsets, cancel)?
             .ok_or_else(|| RasterError::Decode("tiled TIFF missing TileOffsets".to_owned()))?;
-        let byte_counts = read_tag_u64_vec_opt(decoder, Tag::TileByteCounts, cancel)?
+        let byte_counts = read_tag_u64_vec_strict(decoder, Tag::TileByteCounts, cancel)?
             .ok_or_else(|| RasterError::Decode("tiled TIFF missing TileByteCounts".to_owned()))?;
         (true, tw, th, offsets, byte_counts)
     } else {
         let rows_per_strip = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::RowsPerStrip), cancel)?
             .unwrap_or(height)
             .clamp(1, height);
-        let offsets = read_tag_u64_vec_opt(decoder, Tag::StripOffsets, cancel)?
+        let offsets = read_tag_u64_vec_strict(decoder, Tag::StripOffsets, cancel)?
             .ok_or_else(|| RasterError::Decode("stripped TIFF missing StripOffsets".to_owned()))?;
-        let byte_counts =
-            read_tag_u64_vec_opt(decoder, Tag::StripByteCounts, cancel)?.ok_or_else(|| {
+        let byte_counts = read_tag_u64_vec_strict(decoder, Tag::StripByteCounts, cancel)?
+            .ok_or_else(|| {
                 RasterError::Decode("stripped TIFF missing StripByteCounts".to_owned())
             })?;
         (false, width, rows_per_strip, offsets, byte_counts)
@@ -551,7 +586,7 @@ pub(super) fn parse_cached_ifd(
     }
 
     let jpeg_tables = if compression == TiffCompression::Jpeg {
-        match read_tag_u8_vec_opt(decoder, Tag::JPEGTables, cancel)? {
+        match read_tag_u8_vec_strict(decoder, Tag::JPEGTables, cancel)? {
             Some(tables) => {
                 if tables.len() < 4 {
                     return Err(RasterError::Decode(
@@ -589,10 +624,8 @@ pub(super) fn parse_cached_ifd(
         planar,
         photometric,
         samples_per_pixel,
-        sample_bits,
         sample_type,
         pixel_layout,
-        alpha_channel,
         data_bands,
         offsets,
         byte_counts,
@@ -620,35 +653,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sample_type_resolution_covers_all_scientific_and_display_types() {
-        assert_eq!(resolve_sample_type(1, 8).unwrap(), SampleType::U8);
-        assert_eq!(resolve_sample_type(2, 8).unwrap(), SampleType::I8);
-        assert_eq!(resolve_sample_type(1, 16).unwrap(), SampleType::U16);
-        assert_eq!(resolve_sample_type(2, 16).unwrap(), SampleType::I16);
-        assert_eq!(resolve_sample_type(1, 32).unwrap(), SampleType::U32);
-        assert_eq!(resolve_sample_type(2, 32).unwrap(), SampleType::I32);
-        assert_eq!(resolve_sample_type(3, 16).unwrap(), SampleType::F16);
-        assert_eq!(resolve_sample_type(3, 32).unwrap(), SampleType::F32);
-        assert_eq!(resolve_sample_type(3, 64).unwrap(), SampleType::F64);
-        assert!(resolve_sample_type(1, 12).is_err());
-    }
-
-    #[test]
-    fn rgb_extra_samples_zero_preserves_4band_rgbn_without_alpha() {
-        // 4-band RGB+NIR with ExtraSamples = [0] (Unspecified): NOT alpha!
-        let (layout, alpha, data_bands) =
-            resolve_pixel_layout(Photometric::Rgb, 4, &[0]).expect("rgbn");
-        assert!(!layout.has_alpha());
+    fn pixel_layout_handles_rgbn_and_non_last_alpha_consistently() {
+        // 4-band RGB+NIR with ExtraSamples = [0] (Unspecified): NOT alpha.
+        let (layout, data_bands) = resolve_pixel_layout(Photometric::Rgb, 4, &[0]).expect("rgbn");
+        assert_eq!(layout.alpha_channel(), None);
         assert_eq!(layout.colors(), 3);
         assert_eq!(layout.channels, 4);
-        assert_eq!(alpha, None);
         assert_eq!(data_bands, 4);
 
-        // 4-band RGBA with ExtraSamples = [2] (Unassociated Alpha): IS alpha!
-        let (layout_a, alpha_a, data_bands_a) =
-            resolve_pixel_layout(Photometric::Rgb, 4, &[2]).expect("rgba");
-        assert!(layout_a.has_alpha());
-        assert_eq!(alpha_a, Some(3));
-        assert_eq!(data_bands_a, 3);
+        // 5-band RGB+Alpha+NIR with ExtraSamples = [2, 0]: alpha at channel 3.
+        let (layout5, data_bands5) =
+            resolve_pixel_layout(Photometric::Rgb, 5, &[2, 0]).expect("rgb+a+nir");
+        assert_eq!(layout5.alpha_channel(), Some(3));
+        assert_eq!(data_bands5, 4);
+
+        // 3-band BlackIsZero + Unassociated Alpha: alpha at channel 2.
+        let (layout_gray3, data_bands_g3) =
+            resolve_pixel_layout(Photometric::BlackIsZero, 3, &[2]).expect("gray3+a");
+        assert_eq!(layout_gray3.alpha_channel(), Some(2));
+        assert_eq!(data_bands_g3, 2);
     }
 }

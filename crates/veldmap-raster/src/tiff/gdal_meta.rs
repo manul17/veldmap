@@ -39,29 +39,56 @@ impl GdalMetadata {
 }
 
 fn extract_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
-    let mut rest = attrs;
-    while let Some(pos) = rest.find(key) {
-        let after_key = &rest[pos + key.len()..];
-        // Ensure key is preceded by whitespace or start of attributes.
-        let valid_start = pos == 0
-            || rest[..pos]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_whitespace());
-        if !valid_start {
-            rest = after_key;
+    let bytes = attrs.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'/' {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = &attrs[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
             continue;
         }
-        let after_eq = after_key.trim_start().strip_prefix('=')?;
-        let trimmed = after_eq.trim_start();
-        let quote = trimmed.as_bytes().first().copied()?;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let Some(&quote) = bytes.get(i) else {
+            break;
+        };
         if quote != b'"' && quote != b'\'' {
-            rest = after_key;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
             continue;
         }
-        let val_start = &trimmed[1..];
-        let end = val_start.find(quote as char)?;
-        return Some(&val_start[..end]);
+        i += 1;
+        let val_start = i;
+        while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let val = &attrs[val_start..i];
+        i += 1;
+        if name == key {
+            return Some(val);
+        }
     }
     None
 }
@@ -83,6 +110,14 @@ pub(super) fn parse_gdal_metadata(xml: &str) -> GdalMetadata {
 
     while let Some(start) = cursor.find("<Item") {
         let after_tag = &cursor[start + "<Item".len()..];
+        let is_item_elem = after_tag
+            .as_bytes()
+            .first()
+            .is_some_and(|&b| b.is_ascii_whitespace() || b == b'>' || b == b'/');
+        if !is_item_elem {
+            cursor = after_tag;
+            continue;
+        }
         let Some(gt) = after_tag.find('>') else {
             break;
         };
@@ -98,12 +133,20 @@ pub(super) fn parse_gdal_metadata(xml: &str) -> GdalMetadata {
         let raw_val = unescape_xml(body_start[..end_item].trim());
         cursor = &body_start[end_item + "</Item>".len()..];
 
+        // Only read items in the default GDAL metadata domain (absent or empty `domain`).
+        if let Some(domain) = extract_attr(attrs, "domain")
+            && !domain.is_empty()
+        {
+            continue;
+        }
         let Some(name) = extract_attr(attrs, "name") else {
             continue;
         };
-        let sample = extract_attr(attrs, "sample").and_then(|s| s.parse::<u16>().ok());
-        let target = match sample {
-            Some(idx) => meta.per_band.entry(idx).or_default(),
+        let target = match extract_attr(attrs, "sample") {
+            Some(s) => match s.parse::<u16>() {
+                Ok(idx) => meta.per_band.entry(idx).or_default(),
+                Err(_) => continue,
+            },
             None => &mut meta.defaults,
         };
 
@@ -157,5 +200,21 @@ mod tests {
         assert_eq!(b1.scale, None);
         assert_eq!(b1.units.as_deref(), Some("reflectance"));
         assert_eq!(b1.description.as_deref(), Some("B08 NIR & SWIR"));
+    }
+
+    #[test]
+    fn gdal_metadata_handles_attr_prefixes_quoted_text_domains_and_bad_sample() {
+        let xml = r#"<GDALMetadata>
+  <ItemList><Item namespace="gdal" name="SCALE" sample="0">0.25</Item></ItemList>
+  <Item domain="IMAGE_STRUCTURE" name="SCALE">999.0</Item>
+  <Item name="SCALE" sample="not_a_number">888.0</Item>
+  <Item role="sample='1' name='WRONG'" name="DESCRIPTION" sample="0">Valid Band</Item>
+</GDALMetadata>"#;
+        let parsed = parse_gdal_metadata(xml);
+        let b0 = parsed.for_band(0);
+        assert_eq!(b0.scale, Some(0.25));
+        assert_eq!(b0.description.as_deref(), Some("Valid Band"));
+        // Neither domain="IMAGE_STRUCTURE" nor sample="not_a_number" may pollute band 1 defaults.
+        assert_eq!(parsed.for_band(1).scale, None);
     }
 }

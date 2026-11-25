@@ -179,6 +179,22 @@ impl TiffSource {
             mode,
         )
     }
+
+    fn base_chunk_loc(&self, px: u32, py: u32) -> Result<(u32, u32, u32, u32, u32), RasterError> {
+        let base = self.base_ifd();
+        let (cw, ch) = (base.chunk_w.max(1), base.chunk_h.max(1));
+        let cx = px / cw;
+        let cy = py / ch;
+        let chunk_index = cy
+            .checked_mul(base.chunks_across)
+            .and_then(|row| row.checked_add(cx))
+            .ok_or_else(|| RasterError::Decode("chunk index overflow".to_owned()))?;
+        let (dw, dh) = base.chunk_data_dims(chunk_index).unwrap_or((
+            cw.min(self.description.width.saturating_sub(cx * cw)),
+            ch.min(self.description.height.saturating_sub(cy * ch)),
+        ));
+        Ok((chunk_index, px % cw, py % ch, dw, dh))
+    }
 }
 
 impl RasterSource for TiffSource {
@@ -206,7 +222,7 @@ impl RasterSource for TiffSource {
         // Single-band numeric >8-bit or float rasters default to the Scientific
         // R32Float track for lossless live stretch, colormaps, and histograms.
         if base.data_bands == 1
-            && base.alpha_channel.is_none()
+            && base.alpha_channel().is_none()
             && !matches!(base.sample_type, SampleType::U8)
         {
             return stream_spec_for_band(BandKey::Index(0), PixelFormat::R32Float);
@@ -338,20 +354,8 @@ impl RasterSource for TiffSource {
             return Ok(None);
         }
         let base = self.base_ifd();
-        let (cw, ch) = (base.chunk_w.max(1), base.chunk_h.max(1));
-        let cx = px / cw;
-        let cy = py / ch;
-        let Some(chunk_index) = cy
-            .checked_mul(base.chunks_across)
-            .and_then(|row| row.checked_add(cx))
-        else {
-            return Err(RasterError::Decode("chunk index overflow".to_owned()));
-        };
-        let lx = px % cw;
-        let ly = py % ch;
-
-        let dw = cw.min(self.description.width - cx * cw);
-        let dh = ch.min(self.description.height - cy * ch);
+        let (chunk_index, lx, ly, dw, dh) = self.base_chunk_loc(px, py)?;
+        let (stored_w, stored_h) = base.chunk_stored_dims(chunk_index).unwrap_or((dw, dh));
         let rgba_bytes = u64::from(dw)
             .saturating_mul(u64::from(dh))
             .saturating_mul(4);
@@ -364,11 +368,11 @@ impl RasterSource for TiffSource {
                 limit_bytes: rgba_cap,
             });
         }
-        let working_bytes = chunk_working_bytes(dw, dh, base.raw_pixel_bytes(), 4);
+        let working_bytes = chunk_working_bytes(stored_w, stored_h, base.raw_pixel_bytes(), 4);
         if working_bytes > ctx.budget.decode_working_bytes {
             return Err(RasterError::LimitExceeded {
-                width: dw,
-                height: dh,
+                width: stored_w,
+                height: stored_h,
                 estimated_bytes: working_bytes,
                 limit_bytes: ctx.budget.decode_working_bytes,
             });
@@ -423,41 +427,104 @@ impl RasterSource for TiffSource {
         if band_idx >= usize::from(base.samples_per_pixel) {
             return Ok(BandSample::Unavailable);
         }
-        let (cw, ch) = (base.chunk_w.max(1), base.chunk_h.max(1));
-        let cx = px / cw;
-        let cy = py / ch;
-        let Some(chunk_index) = cy
-            .checked_mul(base.chunks_across)
-            .and_then(|row| row.checked_add(cx))
-        else {
-            return Err(RasterError::Decode("chunk index overflow".to_owned()));
-        };
-        let lx = (px % cw) as usize;
-        let ly = (py % ch) as usize;
-        let dw = cw.min(self.description.width - cx * cw);
-        let dh = ch.min(self.description.height - cy * ch);
+        let (chunk_index, lx_u32, ly_u32, dw, dh) = self.base_chunk_loc(px, py)?;
+        let (stored_w, stored_h) = base.chunk_stored_dims(chunk_index).unwrap_or((dw, dh));
         let raw_depth = match base.planar {
             PlanarConfig::Planar => base.sample_type.byte_size() as u32,
             PlanarConfig::Chunky => base.raw_pixel_bytes(),
         };
-        let chunk_raw_bytes = u64::from(dw)
-            .saturating_mul(u64::from(dh))
+        let chunk_raw_bytes = u64::from(stored_w)
+            .saturating_mul(u64::from(stored_h))
             .saturating_mul(u64::from(raw_depth));
         let cap = (ctx.budget.decoded_chunk_cache_bytes as u64)
             .min(ctx.budget.decode_working_bytes)
             .min(MAX_CURSOR_CHUNK_BYTES);
         if chunk_raw_bytes > cap {
             return Err(RasterError::LimitExceeded {
-                width: dw,
-                height: dh,
+                width: stored_w,
+                height: stored_h,
                 estimated_bytes: chunk_raw_bytes,
                 limit_bytes: cap,
             });
         }
 
-        // For Scientific / Categorical readouts, read native precision directly
-        // from the base IFD (preserving full f64 / i32 / u32 precision beyond
-        // GPU f32's 24-bit mantissa).
+        // Reuse `SharedChunkCache` for sample types lossless in `R32Float` /
+        // `R8Uint` / `R16Uint` so hover probes avoid re-decompressing chunks on
+        // every cursor move. Fall back to direct raw-chunk `f64` reads for
+        // `U32`/`I32`/`F64` whose precision exceeds f32's 24-bit mantissa.
+        let needs_raw_f64 = format == PixelFormat::R32Float
+            && matches!(
+                base.sample_type,
+                SampleType::U32 | SampleType::I32 | SampleType::F64
+            );
+        if !needs_raw_f64
+            && matches!(
+                format,
+                PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint
+            )
+        {
+            let spec = stream_spec_for_band(band, format);
+            let mut reader = self.make_reader(
+                spec,
+                None,
+                ChunkReadMode::Pointwise {
+                    chunk_cache: ctx.chunk_cache,
+                    budget_tracker: ctx.budget_tracker,
+                },
+            );
+            let chunk = reader.chunk(0, chunk_index, ctx.cancel)?;
+            if lx_u32 >= chunk.width || ly_u32 >= chunk.height {
+                return Ok(BandSample::Unavailable);
+            }
+            let pix_idx = (ly_u32 as usize) * (chunk.width as usize) + (lx_u32 as usize);
+            return match format {
+                PixelFormat::R8Uint => {
+                    let Some(&v) = chunk.data.get(pix_idx) else {
+                        return Ok(BandSample::Unavailable);
+                    };
+                    if !is_data_f64(f64::from(v), self.nodata_f64) {
+                        Ok(BandSample::Nodata)
+                    } else {
+                        Ok(BandSample::Categorical(u16::from(v)))
+                    }
+                }
+                PixelFormat::R16Uint => {
+                    let off = pix_idx * 2;
+                    let Some(slice) = chunk.data.get(off..off + 2) else {
+                        return Ok(BandSample::Unavailable);
+                    };
+                    let v = u16::from_ne_bytes([slice[0], slice[1]]);
+                    if !is_data_f64(f64::from(v), self.nodata_f64) {
+                        Ok(BandSample::Nodata)
+                    } else {
+                        Ok(BandSample::Categorical(v))
+                    }
+                }
+                PixelFormat::R32Float => {
+                    let off = pix_idx * 4;
+                    let Some(slice) = chunk.data.get(off..off + 4) else {
+                        return Ok(BandSample::Unavailable);
+                    };
+                    let raw =
+                        f64::from(f32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]));
+                    if !raw.is_finite() {
+                        return Ok(BandSample::Nodata);
+                    }
+                    let (scale, offset) = self
+                        .description
+                        .band_info(band)
+                        .map_or((1.0, 0.0), |info| (info.scale, info.offset));
+                    Ok(BandSample::Scalar {
+                        raw,
+                        physical: raw.mul_add(scale, offset),
+                    })
+                }
+                PixelFormat::Rgba8UnormSrgb => Ok(BandSample::Unavailable),
+            };
+        }
+
+        let lx = lx_u32 as usize;
+        let ly = ly_u32 as usize;
         let _lease = ctx
             .budget_tracker
             .reserve_blocking(chunk_raw_bytes, ctx.cancel)?;
@@ -474,7 +541,7 @@ impl RasterSource for TiffSource {
             self.max_chunk_bytes,
             ctx.cancel,
         )?;
-        let RawChunkPayload::Bytes { data, .. } = payload else {
+        let RawChunkPayload::Bytes(data) = payload else {
             return Ok(BandSample::Nodata);
         };
         if lx >= cdw as usize || ly >= cdh as usize {
@@ -491,22 +558,14 @@ impl RasterSource for TiffSource {
         if !is_data_f64(raw, self.nodata_f64) {
             return Ok(BandSample::Nodata);
         }
-        match format {
-            PixelFormat::R8Uint | PixelFormat::R16Uint => Ok(BandSample::Categorical(
-                raw.round().clamp(0.0, f64::from(u16::MAX)) as u16,
-            )),
-            PixelFormat::R32Float => {
-                let (scale, offset) = self
-                    .description
-                    .band_info(band)
-                    .map_or((1.0, 0.0), |info| (info.scale, info.offset));
-                Ok(BandSample::Scalar {
-                    raw,
-                    physical: raw.mul_add(scale, offset),
-                })
-            }
-            PixelFormat::Rgba8UnormSrgb => Ok(BandSample::Unavailable),
-        }
+        let (scale, offset) = self
+            .description
+            .band_info(band)
+            .map_or((1.0, 0.0), |info| (info.scale, info.offset));
+        Ok(BandSample::Scalar {
+            raw,
+            physical: raw.mul_add(scale, offset),
+        })
     }
 
     fn band_stats(
@@ -525,8 +584,8 @@ impl RasterSource for TiffSource {
         self.band_stats.get_or_compute(b, scale, offset, &req)
     }
 
-    fn color_map(&self) -> Option<&[[u8; 4]]> {
-        self.base_ifd().color_map.as_deref()
+    fn color_map(&self) -> Option<Arc<[[u8; 4]]>> {
+        self.base_ifd().color_map.clone()
     }
 }
 

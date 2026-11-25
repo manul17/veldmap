@@ -183,3 +183,67 @@ fn session_normalize_rejects_out_of_range_poses_and_nan_opacity() {
     assert!(session.bookmarks.is_empty());
     assert!(session.last_camera.is_none());
 }
+
+#[test]
+fn session_layer_style_round_trips_and_tolerates_unknown_future_variants() {
+    use crate::layers::{SavedLayerStyle, StretchPreset};
+    use crate::render::{CategoricalPaletteId, ColormapId};
+
+    let tmp = TestTempDir::new("veldmap-session-style");
+    let paths = StoragePaths::with_root(tmp.path());
+
+    let mut session = AppSession::default();
+    let style = SavedLayerStyle {
+        band_index: Some(2),
+        track: Some("scientific".to_owned()),
+        stretch_preset: Some(StretchPreset::Log10Db),
+        stretch_min: Some(-25.0),
+        stretch_max: Some(-2.0),
+        custom_stretch_range: true,
+        colormap: Some(ColormapId::Inferno),
+        invert_colormap: true,
+        categorical_palette: Some(CategoricalPaletteId::Sentinel2Scl),
+    };
+    session.open_layers.push(SavedLayerEntry::with_style(
+        PathBuf::from("/tmp/sar.tif"),
+        true,
+        0.85,
+        None,
+        Some(style.clone()),
+    ));
+    session.save(&paths).expect("save session");
+    let loaded = AppSession::load_or_default(&paths);
+    assert_eq!(loaded.open_layers.len(), 1);
+    assert_eq!(loaded.open_layers[0].style, Some(style));
+
+    // Unknown future enum variants must fall back to None instead of corrupting the whole session.
+    std::fs::write(
+        paths.session_path(),
+        r#"{
+          "version": 1,
+          "open_layers": [{
+            "path": "/tmp/future.tif",
+            "visible": true,
+            "opacity": 0.9,
+            "style": {
+              "band_index": 0,
+              "track": "scientific",
+              "stretch_preset": "future_histogram_eq",
+              "colormap": "future_cividis",
+              "categorical_palette": "future_modis_qa"
+            }
+          }]
+        }"#,
+    )
+    .expect("write future session");
+    let fwd = AppSession::load_or_default(&paths);
+    assert_eq!(
+        fwd.open_layers.len(),
+        1,
+        "session must NOT be wiped to .corrupt"
+    );
+    let st = fwd.open_layers[0].style.as_ref().expect("style present");
+    assert_eq!(st.stretch_preset, None);
+    assert_eq!(st.colormap, None);
+    assert_eq!(st.categorical_palette, None);
+}

@@ -1,5 +1,5 @@
 //! Baseline GIS HUD widgets: dynamic metric scale bar, North compass /
-//! Reset-North control, and basemap attribution badge.
+//! Reset-North control, scientific colorbar legend, and basemap attribution badge.
 
 use eframe::egui;
 
@@ -277,18 +277,29 @@ pub(crate) fn paint_attribution_badge(
     Some(badge_rect)
 }
 
+/// Paint a horizontal linear colormap gradient strip cleanly clipped to `rect`.
+pub(crate) fn paint_colormap_ramp(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    colormap: crate::render::ColormapId,
+    invert: bool,
+    steps: usize,
+) {
+    let steps = steps.max(2);
+    let seg_w = rect.width() / (steps as f32);
+    for i in 0..steps {
+        let t = (i as f32) / ((steps - 1) as f32);
+        let [r, g, b, _] = sample_colormap_srgb(colormap, t, invert);
+        let x0 = rect.left() + (i as f32) * seg_w;
+        let x1 = (rect.left() + ((i + 1) as f32) * seg_w + 0.5).min(rect.right());
+        let seg =
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom()));
+        painter.rect_filled(seg, 0.0, egui::Color32::from_rgb(r, g, b));
+    }
+}
+
 fn format_colorbar_tick(v: f64) -> String {
-    if !v.is_finite() {
-        return "—".to_owned();
-    }
-    let abs = v.abs();
-    if abs >= 10_000.0 || (abs > 0.0 && abs < 0.01) {
-        format!("{v:.2e}")
-    } else if abs >= 100.0 {
-        format!("{v:.1}")
-    } else {
-        format!("{v:.3}")
-    }
+    super::format::format_scalar(v)
 }
 
 /// Paint a floating horizontal colorbar HUD above the bottom-left scale bar
@@ -341,20 +352,7 @@ pub(crate) fn paint_colorbar(
         egui::pos2(box_rect.left() + pad_x, box_rect.top() + 22.0),
         egui::vec2(box_w - pad_x * 2.0, 12.0),
     );
-    let steps = 64usize;
-    let seg_w = bar_rect.width() / (steps as f32);
-    for i in 0..steps {
-        let t = (i as f32) / ((steps - 1) as f32);
-        let [r, g, b, _] = sample_colormap_srgb(info.colormap, t, info.invert_colormap);
-        let seg = egui::Rect::from_min_max(
-            egui::pos2(bar_rect.left() + (i as f32) * seg_w, bar_rect.top()),
-            egui::pos2(
-                bar_rect.left() + ((i + 1) as f32) * seg_w + 0.5,
-                bar_rect.bottom(),
-            ),
-        );
-        painter.rect_filled(seg, 0.0, egui::Color32::from_rgb(r, g, b));
-    }
+    paint_colormap_ramp(painter, bar_rect, info.colormap, info.invert_colormap, 64);
     painter.rect_stroke(
         bar_rect,
         1.0,

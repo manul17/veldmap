@@ -12,7 +12,9 @@ use veldmap_core::tile::{PixelFormat, SourceFingerprint, SourceId};
 
 use crate::RasterError;
 use crate::pipeline::grid::{Grid, Overview};
-use crate::pipeline::metadata::{BandInfo, GeoPlacement, PlacementCrs, RasterDescription};
+use crate::pipeline::metadata::{
+    BandInfo, GeoPlacement, PlacementCrs, RasterDescription, SampleType,
+};
 use crate::pipeline::plan::{build_chunked_level_table, check_max_source_side};
 use crate::pipeline::radiometry::DisplayMapping;
 
@@ -103,9 +105,8 @@ fn scan_overviews(
                 && overview_ifd.photometric == Photometric::YCbCr);
         if !photo_compat
             || overview_ifd.samples_per_pixel != base_ifd.samples_per_pixel
-            || overview_ifd.sample_bits != base_ifd.sample_bits
             || overview_ifd.sample_type != base_ifd.sample_type
-            || overview_ifd.alpha_channel != base_ifd.alpha_channel
+            || overview_ifd.alpha_channel() != base_ifd.alpha_channel()
         {
             continue;
         }
@@ -166,13 +167,13 @@ fn build_band_infos(
     bands.push(BandInfo::display(
         base_ifd.sample_type,
         usize::from(base_ifd.samples_per_pixel),
-        base_ifd.alpha_channel.is_some(),
+        base_ifd.alpha_channel().is_some(),
         nodata_f64,
     ));
 
     let is_palette = base_ifd.photometric == Photometric::Palette;
     for b in 0..base_ifd.samples_per_pixel {
-        if base_ifd.alpha_channel == Some(usize::from(b)) {
+        if base_ifd.alpha_channel() == Some(usize::from(b)) {
             continue;
         }
         let gmeta = gdal_meta.for_band(b);
@@ -302,12 +303,12 @@ impl TiffSource {
             .map_or(0, |o| o.image);
 
         let bands = build_band_infos(&base_ifd, nodata_f64, &gdal_meta);
-        let initial_nodata_f32 = nodata_f64.and_then(|v| {
-            (v.is_finite() && v >= f64::from(f32::MIN) && v <= f64::from(f32::MAX))
-                .then_some(v as f32)
+        // Only unsigned 8-bit rasters use identity [0, 255] display mapping; signed
+        // `I8` (-128..=127) and >8-bit / float types compute a percentile stretch.
+        let initial_mapping = (base_ifd.sample_type == SampleType::U8).then(|| {
+            DisplayMapping::identity(nodata_f64)
+                .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
         });
-        let initial_mapping =
-            (base_ifd.sample_bits <= 8).then(|| DisplayMapping::identity(initial_nodata_f32));
 
         let mut ifds = Vec::with_capacity(1 + cached_overviews.len());
         ifds.push(base_ifd);

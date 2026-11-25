@@ -54,6 +54,23 @@ pub(crate) fn format_source_pixel_size(mx: f64, my: f64) -> String {
     }
 }
 
+/// Format a scientific scalar cleanly (switching to scientific notation for
+/// very large or very small magnitudes so values like `1.5e-6` never display
+/// as `0.0000`).
+pub(crate) fn format_scalar(v: f64) -> String {
+    if !v.is_finite() {
+        return "—".to_owned();
+    }
+    let abs = v.abs();
+    if abs >= 10_000.0 || (abs > 0.0 && abs < 0.01) {
+        format!("{v:.2e}")
+    } else if abs >= 100.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.3}")
+    }
+}
+
 /// Format area cleanly in `m²`, `ha`, or `km²`.
 pub(crate) fn format_area_m2(area_m2: f64) -> String {
     if !area_m2.is_finite() || area_m2 <= 0.0 {
@@ -98,5 +115,11 @@ mod tests {
         assert_eq!(format_area_m2(450.5), "450.5 m²");
         assert_eq!(format_area_m2(25_000.0), "2.500 ha");
         assert_eq!(format_area_m2(3_500_000.0), "3.500 km²");
+        assert_eq!(format_scalar(0.0), "0.000");
+        assert_eq!(format_scalar(1.5e-6), "1.50e-6");
+        assert_eq!(format_scalar(42.125), "42.125");
+        assert_eq!(format_scalar(250.4), "250.4");
+        assert_eq!(format_scalar(25_000.0), "2.50e4");
+        assert_eq!(format_scalar(f64::NAN), "—");
     }
 }

@@ -71,7 +71,7 @@ pub(super) fn build_and_schedule_layer(
     let appetite_bytes = ctx
         .gpu_cache
         .proportional_pyramid_byte_cap(weight, ctx.total_appetite_weight);
-    let cap_tiles = (appetite_bytes / layer.observed_tile_bytes().max(1)).max(1);
+    let cap_tiles = (appetite_bytes / layer.cell_observed_bytes()).max(1);
 
     let sharpest = layer
         .frame()

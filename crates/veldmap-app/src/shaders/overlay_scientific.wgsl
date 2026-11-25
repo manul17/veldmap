@@ -154,22 +154,25 @@ fn fs_scientific(in: VsOut) -> @location(0) vec4<f32> {
     let s0 = sample_bilinear_nodata(sample_uv, i32(m0));
     var raw_val = s0.x;
     var valid_cov = s0.y;
-    if m1 != m0 {
+    if m1 != m0 && mfrac > 0.0 {
         let s1 = sample_bilinear_nodata(sample_uv, i32(m1));
-        valid_cov = mix(s0.y, s1.y, mfrac);
-        if s0.y > 0.0 && s1.y > 0.0 {
-            raw_val = mix(s0.x, s1.x, mfrac);
-        } else if s1.y > 0.0 {
-            raw_val = s1.x;
+        let w0 = s0.y * (1.0 - mfrac);
+        let w1 = s1.y * mfrac;
+        valid_cov = w0 + w1;
+        if valid_cov > 0.0 {
+            raw_val = (s0.x * w0 + s1.x * w1) / valid_cov;
         }
     }
 
-    // Crisp nodata cutoff at exact texel boundary (`< 0.5` coverage discards).
+    // Discard fragments with < 50% valid coverage (exact texel boundary at lod == 0).
     if valid_cov < 0.5 {
         discard;
     }
 
     let physical = fma(raw_val, tile.scale, tile.offset);
+    if !is_finite_f32(physical) {
+        discard;
+    }
     var mapped = physical;
     if tile.stretch_mode == 1u {
         // SAR dB stretch: `10 * log10(x) = 10 * log2(x) / log2(10)`.

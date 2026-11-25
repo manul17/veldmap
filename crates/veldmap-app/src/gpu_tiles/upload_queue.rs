@@ -38,8 +38,8 @@ impl std::error::Error for UploadChannelClosed {}
 
 /// Parameters governing one frame's [`PendingUploads::drain_and_upload`] pass.
 ///
-/// Pinned root sources are configured once via
-/// [`PendingUploads::set_pinned_root_sources`] so enqueue-time overflow
+/// Pinned root streams are configured once via
+/// [`PendingUploads::set_pinned_root_streams`] so enqueue-time overflow
 /// shedding and drain-time pruning always share a single source of truth.
 #[derive(Clone, Copy, Debug)]
 pub struct UploadPassParams<'a> {
@@ -95,8 +95,8 @@ impl UploadBatchReport {
     }
 }
 
-fn is_pinned_root(key: &TileKey, pinned_root_sources: &[SourceId]) -> bool {
-    pinned_root_sources.iter().any(|&src| key.is_root_of(src))
+fn is_pinned_root(key: &TileKey, pinned_root_streams: &[StreamKey]) -> bool {
+    pinned_root_streams.contains(&key.stream_key()) && key.is_root_of(key.source)
 }
 
 fn is_in_any_wanted(key: &TileKey, wanted: &[&HashSet<TileKey>]) -> bool {
@@ -108,7 +108,7 @@ struct SharedUploadQueue {
     queued: HashMap<TileKey, DecodedTile>,
     queued_bytes: usize,
     max_queued_bytes: usize,
-    pinned_root_sources: Vec<SourceId>,
+    pinned_root_streams: Vec<StreamKey>,
 }
 
 impl SharedUploadQueue {
@@ -118,7 +118,12 @@ impl SharedUploadQueue {
             queued: HashMap::new(),
             queued_bytes: 0,
             max_queued_bytes,
-            pinned_root_sources: vec![SourceId::BUNDLED_BASEMAP],
+            pinned_root_streams: vec![StreamKey::new(
+                SourceId::BUNDLED_BASEMAP,
+                veldmap_core::tile::BandKey::Display,
+                veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
+                0,
+            )],
         }
     }
 
@@ -128,7 +133,7 @@ impl SharedUploadQueue {
         decoded: DecodedTile,
         to_drop: &mut Vec<DecodedTile>,
     ) {
-        let pinned = is_pinned_root(&key, &self.pinned_root_sources);
+        let pinned = is_pinned_root(&key, &self.pinned_root_streams);
         let added = decoded.byte_size();
         if !pinned && added > self.max_queued_bytes {
             to_drop.push(decoded);
@@ -172,7 +177,7 @@ impl SharedUploadQueue {
             .queued
             .keys()
             .copied()
-            .filter(|k| !is_pinned_root(k, &self.pinned_root_sources))
+            .filter(|k| !is_pinned_root(k, &self.pinned_root_streams))
             .collect();
         candidates.sort_by_key(|k| Reverse(k.coarsest_first_key()));
         for key in candidates {
@@ -288,15 +293,15 @@ impl PendingUploads {
         })
     }
 
-    /// Update the set of sources whose coarsest root tiles stay pinned against
-    /// enqueue-time overflow shedding.
-    pub fn set_pinned_root_sources(&self, sources: &[SourceId]) {
+    /// Update the set of active streams whose coarsest root tiles stay pinned
+    /// against enqueue-time overflow shedding and `drain_and_upload` pruning.
+    pub fn set_pinned_root_streams(&self, streams: &[StreamKey]) {
         let mut to_drop = Vec::new();
         {
             let mut state = lock_unpoisoned(&self.shared);
             if !state.closed {
-                state.pinned_root_sources.clear();
-                state.pinned_root_sources.extend_from_slice(sources);
+                state.pinned_root_streams.clear();
+                state.pinned_root_streams.extend_from_slice(streams);
                 state.enforce_cap(&mut to_drop);
             }
         }
@@ -354,7 +359,7 @@ impl PendingUploads {
     }
 
     /// Prune cached/unwanted tiles (retaining roots configured via
-    /// [`Self::set_pinned_root_sources`]), enforce `max_queued_bytes`, and
+    /// [`Self::set_pinned_root_streams`]), enforce `max_queued_bytes`, and
     /// upload coarsest-first within `(byte_budget, time_budget)` while
     /// protecting active-frame carriers and guaranteeing `>= 1` tile per frame
     /// whenever an admissible tile is queued.
@@ -372,7 +377,7 @@ impl PendingUploads {
                 return UploadBatchReport::default();
             }
 
-            let pinned = state.pinned_root_sources.clone();
+            let pinned = state.pinned_root_streams.clone();
             state.retain_keys(
                 |key| {
                     if cache.contains(key) {

@@ -204,7 +204,7 @@ pub trait RasterSource: Send + Sync {
     }
 
     /// Optional embedded palette RGBA LUT (e.g., TIFF `ColorMap` tag 320).
-    fn color_map(&self) -> Option<&[[u8; 4]]> {
+    fn color_map(&self) -> Option<std::sync::Arc<[[u8; 4]]>> {
         None
     }
 }

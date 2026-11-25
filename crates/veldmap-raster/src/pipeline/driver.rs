@@ -78,11 +78,17 @@ fn blit_chunk(
         return;
     }
     let run = ((ix1 - ix0) as usize) * bpp;
+    let chunk_stride = (chunk.width as usize).saturating_mul(bpp);
+    let dst_stride = (dw as usize).saturating_mul(bpp);
     for y in iy0..iy1 {
-        let src_off =
-            (((y - cy0) as usize) * (chunk.width as usize) + ((ix0 - cx0) as usize)) * bpp;
-        let dst_off = (((y - dy0) as usize) * (dw as usize) + ((ix0 - dx0) as usize)) * bpp;
-        dst[dst_off..dst_off + run].copy_from_slice(&chunk.data[src_off..src_off + run]);
+        let src_off = ((y - cy0) as usize) * chunk_stride + ((ix0 - cx0) as usize) * bpp;
+        let dst_off = ((y - dy0) as usize) * dst_stride + ((ix0 - dx0) as usize) * bpp;
+        if let (Some(src_slice), Some(dst_slice)) = (
+            chunk.data.get(src_off..src_off + run),
+            dst.get_mut(dst_off..dst_off + run),
+        ) {
+            dst_slice.copy_from_slice(src_slice);
+        }
     }
 }
 
@@ -227,40 +233,27 @@ pub(crate) fn pass<S: Chunked>(
     let down = height.div_ceil(ch);
 
     let mut cascade = Cascade::new_for_format(0, width, height, format);
-    if format == PixelFormat::Rgba8UnormSrgb {
-        let mut bled_emit = bleed_display_emit(emit);
-        for cy in 0..down {
-            if cancel.is_cancelled() {
-                return Err(RasterError::Cancelled);
-            }
-            let rows = ch.min(height - cy * ch);
-            let mut band = alloc_empty_surface((width as usize) * (rows as usize), format);
-            for cx in 0..across {
-                if cancel.is_cancelled() {
-                    return Err(RasterError::Cancelled);
-                }
-                let chunk = source.chunk(0, cy * across + cx, cancel)?;
-                blit_chunk(&mut band, (0, 0), (width, rows), (cx * cw, 0), &chunk, bpp);
-            }
-            cascade.push_rows(&band, rows, &mut bled_emit)?;
-        }
-        cascade.finish(&mut bled_emit)
+    let mut bled_holder;
+    let sink: TileEmit<'_> = if format == PixelFormat::Rgba8UnormSrgb {
+        bled_holder = bleed_display_emit(emit);
+        &mut bled_holder
     } else {
-        for cy in 0..down {
+        emit
+    };
+    for cy in 0..down {
+        if cancel.is_cancelled() {
+            return Err(RasterError::Cancelled);
+        }
+        let rows = ch.min(height - cy * ch);
+        let mut band = alloc_empty_surface((width as usize) * (rows as usize), format);
+        for cx in 0..across {
             if cancel.is_cancelled() {
                 return Err(RasterError::Cancelled);
             }
-            let rows = ch.min(height - cy * ch);
-            let mut band = alloc_empty_surface((width as usize) * (rows as usize), format);
-            for cx in 0..across {
-                if cancel.is_cancelled() {
-                    return Err(RasterError::Cancelled);
-                }
-                let chunk = source.chunk(0, cy * across + cx, cancel)?;
-                blit_chunk(&mut band, (0, 0), (width, rows), (cx * cw, 0), &chunk, bpp);
-            }
-            cascade.push_rows(&band, rows, emit)?;
+            let chunk = source.chunk(0, cy * across + cx, cancel)?;
+            blit_chunk(&mut band, (0, 0), (width, rows), (cx * cw, 0), &chunk, bpp);
         }
-        cascade.finish(emit)
+        cascade.push_rows(&band, rows, sink)?;
     }
+    cascade.finish(sink)
 }

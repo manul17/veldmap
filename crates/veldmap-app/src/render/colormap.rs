@@ -202,13 +202,7 @@ pub fn scientific_lut_linear(colormap: ColormapId) -> [[f32; 4]; PALETTE_LUT_LEN
     let mut lut = [[0.0f32; 4]; PALETTE_LUT_LEN];
     for (i, slot) in lut.iter_mut().enumerate() {
         let t = (i as f32) / ((PALETTE_LUT_LEN - 1) as f32);
-        let [r, g, b, a] = sample_colormap_srgb(colormap, t, false);
-        *slot = [
-            srgb_to_linear_f32(f32::from(r) / 255.0),
-            srgb_to_linear_f32(f32::from(g) / 255.0),
-            srgb_to_linear_f32(f32::from(b) / 255.0),
-            f32::from(a) / 255.0,
-        ];
+        *slot = srgb_rgba_to_linear(sample_colormap_srgb(colormap, t, false));
     }
     lut
 }

@@ -4,8 +4,9 @@
 //! (`flate2`, `weezl`, `zstd`, `jpeg-decoder`, `image-webp`) with explicit
 //! pre-allocation bounds, TIFF endianness handling, `Predictor = 2` & `3`
 //! (on full stored tile rows before edge cropping), `PlanarConfiguration = 2`
-//! single-plane reads, sparse chunk synthesis, and `WhiteIsZero` inversion.
+//! single-plane reads, and sparse chunk synthesis.
 
+use std::borrow::Cow;
 use std::io::{Cursor, Read};
 
 use veldmap_core::io::ByteSource;
@@ -14,20 +15,14 @@ use veldmap_core::sync::CancelToken;
 use crate::RasterError;
 use crate::pipeline::metadata::SampleType;
 
-use super::ifd::{
-    CachedIfd, Photometric, PlanarConfig, TiffByteOrder, TiffCompression, TiffPredictor,
-};
+use super::ifd::{CachedIfd, PlanarConfig, TiffByteOrder, TiffCompression, TiffPredictor};
 
 /// Result of decoding one stored TIFF chunk (or one plane of a planar chunk).
 pub(super) enum RawChunkPayload {
     /// Sparse chunk (`offset == 0 || byte_count == 0`): no bytes stored on disk.
     Sparse,
     /// Tightly packed native-endian raw sample bytes cropped to `(dw, dh)`.
-    Bytes {
-        data: Vec<u8>,
-        /// True when `jpeg-decoder` already converted YCbCr -> RGB8.
-        jpeg_already_rgb: bool,
-    },
+    Bytes(Vec<u8>),
 }
 
 /// Decode one TIFF chunk `(ifd, plane, chunk_index)` directly from `byte_source`.
@@ -53,12 +48,11 @@ pub(super) fn decode_raw_chunk(
             ifd.image
         ))
     })?;
-    let (stored_w, stored_h) = ifd.chunk_stored_dims(chunk_index).ok_or_else(|| {
-        RasterError::Decode(format!(
-            "chunk index {chunk_index} out of range for IFD {}",
-            ifd.image
-        ))
-    })?;
+    let (stored_w, stored_h) = if ifd.tiled {
+        (ifd.chunk_w, ifd.chunk_h)
+    } else {
+        (dw, dh)
+    };
     let (offset, byte_count) = ifd.chunk_span(plane, chunk_index)?;
     if offset == 0 || byte_count == 0 {
         return Ok((dw, dh, RawChunkPayload::Sparse));
@@ -85,11 +79,14 @@ pub(super) fn decode_raw_chunk(
         });
     }
 
-    // Cap compressed input read size generously relative to decoded size (while
-    // still guarding against corrupt multi-gigabyte byte_count tags).
-    let max_compressed = max_uncompressed_bytes
+    // Cap compressed input read size relative to this chunk's `stored_bytes`
+    // (never the global 256 MiB chunk cap) to prevent crafted multi-hundred-MiB
+    // allocations on tiny tiles.
+    let max_compressed = stored_bytes
         .saturating_mul(2)
-        .max(4 * 1024 * 1024) as u64;
+        .max(4 * 1024 * 1024)
+        .min(max_uncompressed_bytes.saturating_mul(2).max(64 * 1024))
+        as u64;
     if byte_count > max_compressed {
         return Err(RasterError::LimitExceeded {
             width: stored_w,
@@ -116,35 +113,32 @@ pub(super) fn decode_raw_chunk(
     }
 
     // Decompress into stored chunk buffer.
-    let (mut raw, actual_row_w, jpeg_already_rgb) = match ifd.compression {
-        TiffCompression::None => (compressed, stored_w, false),
-        TiffCompression::Deflate => (
-            decompress_deflate(&compressed, stored_bytes)?,
-            stored_w,
-            false,
-        ),
-        TiffCompression::Lzw => (decompress_lzw(&compressed, stored_bytes)?, stored_w, false),
-        TiffCompression::PackBits => (
-            decompress_packbits(&compressed, stored_bytes)?,
-            stored_w,
-            false,
-        ),
-        TiffCompression::Zstd => (decompress_zstd(&compressed, stored_bytes)?, stored_w, false),
+    let (mut raw, actual_row_w) = match ifd.compression {
+        TiffCompression::None => (compressed, stored_w),
+        TiffCompression::Deflate => (decompress_deflate(&compressed, stored_bytes)?, stored_w),
+        TiffCompression::Lzw => (decompress_lzw(&compressed, stored_bytes)?, stored_w),
+        TiffCompression::PackBits => (decompress_packbits(&compressed, stored_bytes)?, stored_w),
+        TiffCompression::Zstd => (decompress_zstd(&compressed, stored_bytes)?, stored_w),
         TiffCompression::Jpeg => {
-            let (decoded, w, h, is_rgb24) = decompress_jpeg(
+            let (decoded, w) = decompress_jpeg(
                 &compressed,
                 ifd.jpeg_tables.as_deref(),
                 samples_in_chunk,
-                max_uncompressed_bytes,
+                stored_bytes,
+                chunk_index,
+                (stored_w, stored_h, dw, dh),
             )?;
-            validate_decoded_chunk_dims("JPEG", chunk_index, w, h, stored_w, stored_h, dw, dh)?;
-            (decoded, w, is_rgb24)
+            (decoded, w)
         }
         TiffCompression::WebP => {
-            let (decoded, w, h) =
-                decompress_webp(&compressed, samples_in_chunk, max_uncompressed_bytes)?;
-            validate_decoded_chunk_dims("WebP", chunk_index, w, h, stored_w, stored_h, dw, dh)?;
-            (decoded, w, false)
+            let (decoded, w) = decompress_webp(
+                &compressed,
+                samples_in_chunk,
+                max_uncompressed_bytes,
+                chunk_index,
+                (stored_w, stored_h, dw, dh),
+            )?;
+            (decoded, w)
         }
     };
 
@@ -190,7 +184,7 @@ pub(super) fn decode_raw_chunk(
 
     // Crop right-edge padding on tiled chunks (`dw < actual_row_w`).
     let data_row_bytes = (dw as usize) * samples_in_chunk * sample_bytes;
-    let mut cropped = if dw < actual_row_w {
+    let cropped = if dw < actual_row_w {
         let mut out = Vec::with_capacity(data_row_bytes * rows_to_process);
         for row in raw.chunks_exact(actual_row_bytes) {
             out.extend_from_slice(&row[..data_row_bytes]);
@@ -200,18 +194,7 @@ pub(super) fn decode_raw_chunk(
         raw
     };
 
-    if ifd.photometric == Photometric::WhiteIsZero {
-        invert_white_is_zero(&mut cropped, ifd.sample_type);
-    }
-
-    Ok((
-        dw,
-        dh,
-        RawChunkPayload::Bytes {
-            data: cropped,
-            jpeg_already_rgb,
-        },
-    ))
+    Ok((dw, dh, RawChunkPayload::Bytes(cropped)))
 }
 
 fn decompress_deflate(compressed: &[u8], expected_max: usize) -> Result<Vec<u8>, RasterError> {
@@ -337,8 +320,10 @@ fn decompress_jpeg(
     jpeg_tables: Option<&[u8]>,
     expected_samples: usize,
     max_decoded_bytes: usize,
-) -> Result<(Vec<u8>, u32, u32, bool), RasterError> {
-    let combined: Vec<u8> = if let Some(tables) = jpeg_tables {
+    chunk_index: u32,
+    expected_dims: (u32, u32, u32, u32),
+) -> Result<(Vec<u8>, u32), RasterError> {
+    let combined: Cow<'_, [u8]> = if let Some(tables) = jpeg_tables {
         if compressed.len() < 2 || tables.len() < 2 {
             return Err(RasterError::Decode(
                 "truncated TIFF JPEG stream or JPEGTables".to_owned(),
@@ -357,16 +342,46 @@ fn decompress_jpeg(
         let mut buf = Vec::with_capacity(table_prefix.len() + chunk_suffix.len());
         buf.extend_from_slice(table_prefix);
         buf.extend_from_slice(chunk_suffix);
-        buf
+        Cow::Owned(buf)
     } else {
-        compressed.to_vec()
+        Cow::Borrowed(compressed)
     };
 
-    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(combined));
+    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(combined.as_ref()));
     decoder.set_max_decoding_buffer_size(max_decoded_bytes);
-    let pixels = decoder
-        .decode()
-        .map_err(|e| RasterError::Decode(format!("TIFF JPEG decode failed: {e}")))?;
+    // Work around `jpeg-decoder 0.3.2` quirks:
+    // - Do NOT use `ColorTransform::None` (it outputs row-planar bytes and panics on
+    //   subsampled 4:2:0/4:2:2 JPEGs).
+    // - `ColorTransform::RGB` for 3-channel streams zips upsampled planes verbatim
+    //   with ZERO color conversion — giving exact raw `[R, G, B]` for RGB TIFFs AND
+    //   exact upsampled `[Y, Cb, Cr]` for YCbCr TIFFs (so our `YCbCrParams` applies
+    //   tags 529 & 532 cleanly).
+    // - `ColorTransform::CMYK` for 4-channel streams zips upsampled planes with
+    //   `255 - c`; bitwise inverting the output recovers exact raw 4-band samples.
+    let invert_cmyk = match expected_samples {
+        1 => {
+            decoder.set_color_transform(jpeg_decoder::ColorTransform::Grayscale);
+            false
+        }
+        3 => {
+            decoder.set_color_transform(jpeg_decoder::ColorTransform::RGB);
+            false
+        }
+        4 => {
+            decoder.set_color_transform(jpeg_decoder::ColorTransform::CMYK);
+            true
+        }
+        other => {
+            return Err(RasterError::Decode(format!(
+                "unsupported TIFF JPEG sample count {other}"
+            )));
+        }
+    };
+
+    // Validate dimensions and channel count BEFORE allocating/decoding pixels.
+    decoder
+        .read_info()
+        .map_err(|e| RasterError::Decode(format!("TIFF JPEG header decode failed: {e}")))?;
     let info = decoder
         .info()
         .ok_or_else(|| RasterError::Decode("TIFF JPEG decoder missing image info".to_owned()))?;
@@ -385,23 +400,35 @@ fn decompress_jpeg(
             "TIFF JPEG decoded {decoded_channels} channels, expected {expected_samples}"
         )));
     }
-    let is_rgb24 = info.pixel_format == jpeg_decoder::PixelFormat::RGB24;
-    Ok((
-        pixels,
-        u32::from(info.width),
-        u32::from(info.height),
-        is_rgb24,
-    ))
+    let (stored_w, stored_h, dw, dh) = expected_dims;
+    let w = u32::from(info.width);
+    let h = u32::from(info.height);
+    validate_decoded_chunk_dims("JPEG", chunk_index, w, h, stored_w, stored_h, dw, dh)?;
+
+    let mut pixels = decoder
+        .decode()
+        .map_err(|e| RasterError::Decode(format!("TIFF JPEG decode failed: {e}")))?;
+    if invert_cmyk {
+        for b in &mut pixels {
+            *b = !*b;
+        }
+    }
+    Ok((pixels, w))
 }
 
 fn decompress_webp(
     compressed: &[u8],
     expected_samples: usize,
     max_decoded_bytes: usize,
-) -> Result<(Vec<u8>, u32, u32), RasterError> {
+    chunk_index: u32,
+    expected_dims: (u32, u32, u32, u32),
+) -> Result<(Vec<u8>, u32), RasterError> {
     let mut decoder = image_webp::WebPDecoder::new(Cursor::new(compressed))
         .map_err(|e| RasterError::Decode(format!("TIFF WebP init failed: {e}")))?;
     let (w, h) = decoder.dimensions();
+    let (stored_w, stored_h, dw, dh) = expected_dims;
+    validate_decoded_chunk_dims("WebP", chunk_index, w, h, stored_w, stored_h, dw, dh)?;
+
     let webp_channels = if decoder.has_alpha() { 4usize } else { 3usize };
     let webp_bytes = (w as usize)
         .checked_mul(h as usize)
@@ -420,7 +447,7 @@ fn decompress_webp(
         .read_image(&mut buf)
         .map_err(|e| RasterError::Decode(format!("TIFF WebP decode failed: {e}")))?;
     if webp_channels == expected_samples {
-        return Ok((buf, w, h));
+        return Ok((buf, w));
     }
     // Adapt RGB <-> RGBA if WebP alpha presence differs from TIFF SamplesPerPixel.
     let pixels = (w as usize) * (h as usize);
@@ -429,14 +456,14 @@ fn decompress_webp(
         for px in buf.chunks_exact(4) {
             rgb.extend_from_slice(&px[..3]);
         }
-        Ok((rgb, w, h))
+        Ok((rgb, w))
     } else if webp_channels == 3 && expected_samples == 4 {
         let mut rgba = Vec::with_capacity(pixels * 4);
         for px in buf.chunks_exact(3) {
             rgba.extend_from_slice(px);
             rgba.push(255);
         }
-        Ok((rgba, w, h))
+        Ok((rgba, w))
     } else {
         Err(RasterError::Decode(format!(
             "TIFF WebP decoded {webp_channels} channels, expected {expected_samples}"
@@ -579,42 +606,5 @@ fn apply_endianness_and_predictor(
                 );
             }
         }
-    }
-}
-
-fn invert_white_is_zero(buf: &mut [u8], sample_type: SampleType) {
-    match sample_type {
-        SampleType::U8 => {
-            for b in buf.iter_mut() {
-                *b = !*b;
-            }
-        }
-        SampleType::U16 => {
-            for chunk in buf.chunks_exact_mut(2) {
-                let v = u16::from_ne_bytes([chunk[0], chunk[1]]);
-                chunk.copy_from_slice(&(u16::MAX - v).to_ne_bytes());
-            }
-        }
-        SampleType::U32 => {
-            for chunk in buf.chunks_exact_mut(4) {
-                let v = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                chunk.copy_from_slice(&(u32::MAX - v).to_ne_bytes());
-            }
-        }
-        SampleType::F32 => {
-            for chunk in buf.chunks_exact_mut(4) {
-                let v = f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                chunk.copy_from_slice(&(1.0 - v).to_ne_bytes());
-            }
-        }
-        SampleType::F64 => {
-            for chunk in buf.chunks_exact_mut(8) {
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(chunk);
-                let v = f64::from_ne_bytes(arr);
-                chunk.copy_from_slice(&(1.0 - v).to_ne_bytes());
-            }
-        }
-        SampleType::I8 | SampleType::I16 | SampleType::I32 | SampleType::F16 => {}
     }
 }

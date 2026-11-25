@@ -8,14 +8,17 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::{Camera, Frame};
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::{BandKey, SourceId, TileKey, TileStreamSpec};
-use veldmap_raster::{BandStats, DecodeJob, DecodeJobKey, DecodePoolHandle, RasterSource};
+use veldmap_core::tile::{BandKey, SourceId, StreamKey, TileKey, TileStreamSpec};
+use veldmap_raster::{
+    BandStats, DecodeJob, DecodeJobKey, DecodePoolHandle, RasterError, RasterSource,
+};
 use veldmap_storage::TileDiskCache;
 
 use crate::clamp_opacity;
@@ -36,11 +39,18 @@ use super::{
     OverlayIoEvent, OverlayPersistEntry, SavedLayerStyle, StretchPreset,
 };
 
+enum BandStatsOutcome {
+    Ready(Box<BandStats>),
+    Empty,
+    Cancelled,
+}
+
 struct BandStatsMsg {
     layer_id: LayerId,
+    job_id: u64,
     source_id: SourceId,
     band: BandKey,
-    stats: Option<BandStats>,
+    outcome: BandStatsOutcome,
 }
 
 fn alloc_seq(counter: &mut u64) -> u64 {
@@ -71,12 +81,13 @@ pub(crate) struct OverlayMutation {
 }
 
 /// Coordinates local raster overlays: non-blocking open/reload via the overlay
-/// I/O worker, `StreamKey`-scoped two-lane scheduling, lossless QOI disk
-/// caching, and zoom-invariant CPU cursor readouts.
+/// I/O worker, `StreamKey`-scoped two-lane scheduling, lossless QOI & `Lz4Raw`
+/// disk caching, and zoom-invariant CPU cursor readouts.
 pub(crate) struct OverlayManager {
     stack: LayerStack,
     next_layer_id: u64,
     next_relaid: u64,
+    next_stats_job_id: u64,
     runtime: Arc<OverlayRuntime>,
     cursor: CursorProber,
     io_worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
@@ -103,6 +114,7 @@ impl OverlayManager {
             stack: LayerStack::default(),
             next_layer_id: 1,
             next_relaid: 1,
+            next_stats_job_id: 1,
             runtime,
             cursor: CursorProber::new(),
             io_worker,
@@ -111,8 +123,8 @@ impl OverlayManager {
         }
     }
 
-    pub(crate) fn extend_pinned_root_sources(&self, out: &mut Vec<SourceId>) {
-        self.stack.extend_pinned_root_sources(out);
+    pub(crate) fn extend_pinned_root_streams(&self, out: &mut Vec<StreamKey>) {
+        self.stack.extend_pinned_root_streams(out);
     }
 
     pub(crate) fn extend_wanted_tile_sets<'a>(&'a self, out: &mut Vec<&'a HashSet<TileKey>>) {
@@ -132,15 +144,16 @@ impl OverlayManager {
     }
 
     fn request_band_stats_if_needed(&mut self, id: LayerId) {
-        let Some((band, source, source_id)) = self.stack.get_mut(id).and_then(|layer| {
+        let Some((band, source, source_id)) = self.stack.get(id).and_then(|layer| {
             let band = layer.needs_band_stats()?;
             Some((band, Arc::clone(layer.source()), layer.source_id()))
         }) else {
             return;
         };
+        let job_id = alloc_seq(&mut self.next_stats_job_id);
         let cancel = self.runtime.shutdown.child_token();
         if let Some(layer) = self.stack.get_mut(id) {
-            layer.set_stats_loading(cancel.clone());
+            layer.begin_stats_job(job_id, cancel.clone());
         }
         let rt = Arc::clone(&self.runtime);
         let tx = self.stats_tx.clone();
@@ -154,21 +167,29 @@ impl OverlayManager {
         // while `TiffSource`'s singleflight deduplicates the underlying I/O.
         let probe_x = u32::MAX.saturating_sub((id.0 as u32) & 0xFFFF);
 
+        let disarmed = Arc::new(AtomicBool::new(false));
         struct StatsCompletionGuard {
             tx: mpsc::Sender<BandStatsMsg>,
             wakeup: Arc<dyn Fn() + Send + Sync>,
+            disarmed: Arc<AtomicBool>,
             layer_id: LayerId,
+            job_id: u64,
             source_id: SourceId,
             band: BandKey,
-            stats: Option<BandStats>,
+            outcome: Option<BandStatsOutcome>,
         }
         impl Drop for StatsCompletionGuard {
             fn drop(&mut self) {
+                if self.disarmed.load(Ordering::Acquire) {
+                    return;
+                }
+                let outcome = self.outcome.take().unwrap_or(BandStatsOutcome::Empty);
                 let _ = self.tx.send(BandStatsMsg {
                     layer_id: self.layer_id,
+                    job_id: self.job_id,
                     source_id: self.source_id,
                     band: self.band,
-                    stats: self.stats.take(),
+                    outcome,
                 });
                 (self.wakeup)();
             }
@@ -177,10 +198,12 @@ impl OverlayManager {
         let guard = StatsCompletionGuard {
             tx,
             wakeup: Arc::clone(&rt.wakeup),
+            disarmed: Arc::clone(&disarmed),
             layer_id: id,
+            job_id,
             source_id,
             band,
-            stats: None,
+            outcome: None,
         };
         let job = DecodeJob {
             key: DecodeJobKey::Probe {
@@ -192,17 +215,28 @@ impl OverlayManager {
             cancel: cancel.clone(),
             work: Box::new(move || {
                 let mut guard = guard;
-                let ctx = rt.decode_context(&cancel);
-                if let Ok(Some(stats)) = source.band_stats(band, &ctx) {
-                    guard.stats = Some(stats);
+                if cancel.is_cancelled() {
+                    guard.outcome = Some(BandStatsOutcome::Cancelled);
+                    return;
                 }
+                let ctx = rt.decode_context(&cancel);
+                guard.outcome = Some(match source.band_stats(band, &ctx) {
+                    Ok(Some(stats)) => BandStatsOutcome::Ready(Box::new(stats)),
+                    Ok(None) => BandStatsOutcome::Empty,
+                    Err(RasterError::Cancelled) => BandStatsOutcome::Cancelled,
+                    Err(_) if cancel.is_cancelled() => BandStatsOutcome::Cancelled,
+                    Err(_) => BandStatsOutcome::Empty,
+                });
             }),
         };
-        let submitted = self
-            .runtime
-            .try_submit_guarded(&self.runtime.fast_pool, job, false, || {});
+        let disarm_on_reject = Arc::clone(&disarmed);
+        let submitted =
+            self.runtime
+                .try_submit_guarded(&self.runtime.fast_pool, job, true, move || {
+                    disarm_on_reject.store(true, Ordering::Release);
+                });
         if !submitted && let Some(layer) = self.stack.get_mut(id) {
-            layer.clear_stats_loading();
+            layer.cancel_stats_job();
         }
     }
 
@@ -214,11 +248,9 @@ impl OverlayManager {
     /// Return immutable UI summaries of all loaded overlay layers.
     pub(crate) fn layer_summaries(&self) -> Vec<LayerSummary> {
         let layers = self.stack.layers();
-        let stats = self.runtime.layer_flight_stats(
-            layers
-                .iter()
-                .map(|l| (l.source_id(), l.meta().stream_key())),
-        );
+        let stats = self
+            .runtime
+            .layer_flight_stats(layers.iter().map(|l| l.meta().stream_key()));
         let len = layers.len();
         layers
             .iter()
@@ -355,19 +387,31 @@ impl OverlayManager {
         }
 
         while let Ok(msg) = self.stats_rx.try_recv() {
-            if let Some(stats) = msg.stats {
-                for layer in self.stack.layers_mut() {
-                    if layer.source_id() == msg.source_id
-                        && layer.apply_band_stats(msg.band, Some(stats.clone()))
+            match msg.outcome {
+                BandStatsOutcome::Ready(stats) => {
+                    for layer in self.stack.layers_mut() {
+                        if layer.source_id() == msg.source_id
+                            && layer.apply_band_stats_ready(msg.band, (*stats).clone())
+                        {
+                            mutation.changed = true;
+                        }
+                    }
+                }
+                BandStatsOutcome::Empty => {
+                    if let Some(layer) = self.stack.get_mut(msg.layer_id)
+                        && layer.source_id() == msg.source_id
+                        && layer.apply_band_stats_empty(msg.band, msg.job_id)
                     {
                         mutation.changed = true;
                     }
                 }
-            } else if let Some(layer) = self.stack.get_mut(msg.layer_id)
-                && layer.source_id() == msg.source_id
-                && layer.apply_band_stats(msg.band, None)
-            {
-                mutation.changed = true;
+                BandStatsOutcome::Cancelled => {
+                    if let Some(layer) = self.stack.get_mut(msg.layer_id)
+                        && layer.source_id() == msg.source_id
+                    {
+                        let _ = layer.apply_band_stats_cancelled(msg.band, msg.job_id);
+                    }
+                }
             }
         }
 
@@ -693,10 +737,17 @@ impl OverlayManager {
         };
 
         let mut draw_layers = Vec::new();
+        let mut stats_needed_ids = Vec::new();
         for layer in self.stack.layers_mut() {
+            if layer.needs_band_stats().is_some() {
+                stats_needed_ids.push(layer.id());
+            }
             if let Some(draw_layer) = build_and_schedule_layer(layer, &mut layer_ctx) {
                 draw_layers.push(draw_layer);
             }
+        }
+        for id in stats_needed_ids {
+            self.request_band_stats_if_needed(id);
         }
         draw_layers
     }

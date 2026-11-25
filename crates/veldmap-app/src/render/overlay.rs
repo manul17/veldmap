@@ -58,7 +58,33 @@ pub(super) struct OverlayPipelines<'a> {
 enum PaletteKey {
     Scientific(ColormapId),
     CategoricalPreset(CategoricalPaletteId),
-    CustomSource(SourceId),
+    /// Keyed by `(source_id, arc_ptr)` so two layers opening the same palette
+    /// file independently never thrash each other's cached GPU palette buffer.
+    CustomSource(SourceId, usize),
+}
+
+fn palette_key(track: &DrawOverlayTrack) -> Option<PaletteKey> {
+    match track {
+        DrawOverlayTrack::Display => None,
+        DrawOverlayTrack::Scientific { colormap, .. } => Some(PaletteKey::Scientific(*colormap)),
+        DrawOverlayTrack::Categorical {
+            source,
+            palette,
+            custom_color_map,
+            ..
+        } => {
+            if *palette == CategoricalPaletteId::SourceColorMap
+                && let Some(cmap) = custom_color_map
+            {
+                Some(PaletteKey::CustomSource(
+                    *source,
+                    Arc::as_ptr(cmap) as *const () as usize,
+                ))
+            } else {
+                Some(PaletteKey::CategoricalPreset(*palette))
+            }
+        }
+    }
 }
 
 struct CachedPalette {
@@ -124,17 +150,18 @@ impl OverlayRenderer {
         palette_layout: &wgpu::BindGroupLayout,
         track: &DrawOverlayTrack,
     ) {
-        let (key, lut, custom_weak) = match track {
+        let Some(key) = palette_key(track) else {
+            return;
+        };
+        if self.palettes.contains_key(&key) {
+            return;
+        }
+        let (lut, custom_weak) = match track {
             DrawOverlayTrack::Display => return,
             DrawOverlayTrack::Scientific { colormap, .. } => {
-                let key = PaletteKey::Scientific(*colormap);
-                if self.palettes.contains_key(&key) {
-                    return;
-                }
-                (key, scientific_lut_linear(*colormap), None)
+                (scientific_lut_linear(*colormap), None)
             }
             DrawOverlayTrack::Categorical {
-                source,
                 palette,
                 custom_color_map,
                 ..
@@ -142,26 +169,12 @@ impl OverlayRenderer {
                 if *palette == CategoricalPaletteId::SourceColorMap
                     && let Some(cmap) = custom_color_map
                 {
-                    let key = PaletteKey::CustomSource(*source);
-                    let reuse = self.palettes.get(&key).is_some_and(|entry| {
-                        entry.custom_weak.as_ref().is_some_and(|w| {
-                            w.strong_count() > 0 && std::ptr::eq(w.as_ptr(), Arc::as_ptr(cmap))
-                        })
-                    });
-                    if reuse {
-                        return;
-                    }
                     (
-                        key,
                         categorical_lut_linear(*palette, Some(cmap.as_ref())),
                         Some(Arc::downgrade(cmap)),
                     )
                 } else {
-                    let key = PaletteKey::CategoricalPreset(*palette);
-                    if self.palettes.contains_key(&key) {
-                        return;
-                    }
-                    (key, categorical_lut_linear(*palette, None), None)
+                    (categorical_lut_linear(*palette, None), None)
                 }
             }
         };
@@ -191,22 +204,7 @@ impl OverlayRenderer {
     }
 
     fn palette_bind_group(&self, track: &DrawOverlayTrack) -> Option<&wgpu::BindGroup> {
-        let key = match track {
-            DrawOverlayTrack::Display => return None,
-            DrawOverlayTrack::Scientific { colormap, .. } => PaletteKey::Scientific(*colormap),
-            DrawOverlayTrack::Categorical {
-                source,
-                palette,
-                custom_color_map,
-                ..
-            } => {
-                if *palette == CategoricalPaletteId::SourceColorMap && custom_color_map.is_some() {
-                    PaletteKey::CustomSource(*source)
-                } else {
-                    PaletteKey::CategoricalPreset(*palette)
-                }
-            }
-        };
+        let key = palette_key(track)?;
         self.palettes.get(&key).map(|p| &p.bind_group)
     }
 
@@ -404,10 +402,22 @@ impl OverlayRenderer {
         let mut offset_idx = 0usize;
 
         for layer in &snapshot.overlays {
-            let desired_pipeline = match &layer.track {
-                DrawOverlayTrack::Display => ActiveOverlayPipeline::Display,
-                DrawOverlayTrack::Scientific { .. } => ActiveOverlayPipeline::Scientific,
-                DrawOverlayTrack::Categorical { .. } => ActiveOverlayPipeline::Categorical,
+            let (desired_pipeline, rp, uniform_bg) = match &layer.track {
+                DrawOverlayTrack::Display => (
+                    ActiveOverlayPipeline::Display,
+                    pipelines.display,
+                    arena.overlay_bind_group(),
+                ),
+                DrawOverlayTrack::Scientific { .. } => (
+                    ActiveOverlayPipeline::Scientific,
+                    pipelines.scientific,
+                    arena.scientific_overlay_bind_group(),
+                ),
+                DrawOverlayTrack::Categorical { .. } => (
+                    ActiveOverlayPipeline::Categorical,
+                    pipelines.categorical,
+                    arena.categorical_overlay_bind_group(),
+                ),
             };
             let palette_bg = match &layer.track {
                 DrawOverlayTrack::Display => None,
@@ -448,11 +458,6 @@ impl OverlayRenderer {
                 };
 
                 if last_pipeline != Some(desired_pipeline) {
-                    let rp = match desired_pipeline {
-                        ActiveOverlayPipeline::Display => pipelines.display,
-                        ActiveOverlayPipeline::Scientific => pipelines.scientific,
-                        ActiveOverlayPipeline::Categorical => pipelines.categorical,
-                    };
                     pass.set_pipeline(rp);
                     last_pipeline = Some(desired_pipeline);
                     last_tex_id = None;
@@ -472,11 +477,6 @@ impl OverlayRenderer {
                     last_tex_id = Some(patch.texture.tile_id);
                 }
                 pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-                let uniform_bg = match desired_pipeline {
-                    ActiveOverlayPipeline::Display => arena.overlay_bind_group(),
-                    ActiveOverlayPipeline::Scientific => arena.scientific_overlay_bind_group(),
-                    ActiveOverlayPipeline::Categorical => arena.categorical_overlay_bind_group(),
-                };
                 pass.set_bind_group(1, uniform_bg, &[dyn_offset]);
                 pass.draw_indexed(0..*idx_count, 0, 0..1);
             }

@@ -226,17 +226,31 @@ fn multi_band_streams_under_same_source_schedule_and_forgive_independently() {
     let pass_scl_2 = sched
         .admit_pass(&scl, 2, &[scl.tile_key(2, 0, 0)], |_| false, &root_cancel)
         .expect("restart SCL");
+
+    // Per-stream in-flight count and `reset_stream` isolate B04 from SCL on the same SourceId
+    // (each currently has 1 pointwise tile + 1 pass-level tile in flight).
+    assert_eq!(sched.in_flight_count_for_stream(b04.stream_key()), 2);
+    assert_eq!(sched.in_flight_count_for_stream(scl.stream_key()), 2);
+    let b04_tokens = sched.reset_stream(b04.stream_key());
+    for t in &b04_tokens {
+        t.cancel();
+    }
+    assert!(pass_b04_2.cancel.is_cancelled());
+    assert!(adm_b04[0].cancel.is_cancelled());
+    assert!(!pass_scl_2.cancel.is_cancelled());
+    assert!(!adm_scl[0].cancel.is_cancelled());
+    assert_eq!(sched.in_flight_count_for_stream(b04.stream_key()), 0);
+    assert_eq!(sched.in_flight_count_for_stream(scl.stream_key()), 2);
+    assert!(!sched.is_terminal_failed(&p_b04));
+
     let tokens = sched.reset_source(src);
     for t in &tokens {
         t.cancel();
     }
-    assert!(pass_b04_2.cancel.is_cancelled());
     assert!(pass_scl_2.cancel.is_cancelled());
-    assert!(adm_b04[0].cancel.is_cancelled());
     assert!(adm_scl[0].cancel.is_cancelled());
     assert!(!sched.has_any_active_pass(src));
     assert_eq!(sched.in_flight_count_for_source(src), 0);
-    assert!(!sched.is_terminal_failed(&p_b04));
 }
 
 #[test]

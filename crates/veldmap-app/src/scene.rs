@@ -165,19 +165,30 @@ impl SceneState {
             scene_generation: 1,
             active_frame: None,
         };
-        scene.sync_pinned_root_sources();
+        scene.sync_pinned_root_streams();
         Ok(scene)
     }
 
-    fn pinned_root_sources(&self) -> Vec<SourceId> {
-        let mut sources = vec![self.basemap.active_source(), SourceId::BUNDLED_BASEMAP];
-        self.overlays.extend_pinned_root_sources(&mut sources);
-        sources
+    fn pinned_root_streams(&self) -> Vec<veldmap_core::tile::StreamKey> {
+        let display_stream = |source: SourceId| {
+            veldmap_core::tile::StreamKey::new(
+                source,
+                veldmap_core::tile::BandKey::Display,
+                veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
+                0,
+            )
+        };
+        let mut streams = vec![
+            display_stream(self.basemap.active_source()),
+            display_stream(SourceId::BUNDLED_BASEMAP),
+        ];
+        self.overlays.extend_pinned_root_streams(&mut streams);
+        streams
     }
 
-    fn sync_pinned_root_sources(&self) {
-        let sources = self.pinned_root_sources();
-        self.pending_uploads.set_pinned_root_sources(&sources);
+    fn sync_pinned_root_streams(&self) {
+        let streams = self.pinned_root_streams();
+        self.pending_uploads.set_pinned_root_streams(&streams);
     }
 
     /// Bump `scene_generation` after internal basemap, layer, or upload state
@@ -199,10 +210,10 @@ impl SceneState {
         self.pending_uploads.clear_source(src);
     }
 
-    /// Re-sync pinned root sources and bump `scene_generation` after basemap or
+    /// Re-sync pinned root streams and bump `scene_generation` after basemap or
     /// overlay topology changes.
     fn mark_topology_changed(&mut self) {
-        self.sync_pinned_root_sources();
+        self.sync_pinned_root_streams();
         self.mark_dirty();
     }
 
@@ -309,7 +320,7 @@ impl SceneState {
     }
 
     /// Queue a non-blocking reload of an existing overlay layer from disk,
-    /// bypassing both the stat fingerprint cache and any cached QOI disk tiles.
+    /// bypassing both the stat fingerprint cache and any cached disk tiles.
     pub(crate) fn begin_reload_overlay_bypass_cache(&mut self, id: LayerId) -> Result<(), String> {
         let mutation = self.overlays.begin_reload_bypass_cache(id)?;
         let _ = self.apply_overlay_mutation(mutation);

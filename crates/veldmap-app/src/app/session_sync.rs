@@ -130,7 +130,7 @@ impl VeldmapApp {
                     entry.visible,
                     entry.opacity,
                     entry.crs_override,
-                    Some(entry.style),
+                    entry.style,
                 )
             })
             .collect();

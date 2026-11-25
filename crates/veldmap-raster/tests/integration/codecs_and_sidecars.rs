@@ -229,6 +229,19 @@ fn png_and_jpeg_adapters_decode_world_file_and_enforce_memory_budget() {
         })
         .expect("JPEG pass succeeds");
     assert_eq!(emitted_jpg, 1);
+    assert_eq!(
+        jpg_src
+            .sample_band(
+                veldmap_core::tile::BandKey::Display,
+                veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
+                2,
+                3,
+                &ctx,
+            )
+            .expect("jpeg sample_band"),
+        veldmap_raster::BandSample::Unavailable,
+        "JPEG hover readout must report Unavailable rather than Nodata"
+    );
 
     // Tiny working budget must reject JPEG upfront BEFORE allocating the full frame.
     let mut tiny_budget = budget;

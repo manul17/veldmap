@@ -205,6 +205,14 @@ impl TileScheduler {
         self.in_flight.keys().filter(|k| k.source == source).count()
     }
 
+    /// Return the number of tiles currently in-flight for `stream`.
+    pub fn in_flight_count_for_stream(&self, stream: StreamKey) -> usize {
+        self.in_flight
+            .keys()
+            .filter(|k| k.stream_key() == stream)
+            .count()
+    }
+
     /// Return whether `key` is permanently or transiently suppressed from
     /// re-requesting.
     pub fn is_terminal_failed(&self, key: &TileKey) -> bool {

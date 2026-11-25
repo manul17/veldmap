@@ -20,10 +20,10 @@ use super::grid::Grid;
 pub const MAX_SOURCE_SIDE: u32 = 65_536;
 
 /// Current display decode revision encoded into analytical display `TileKey`s.
-const DISPLAY_DECODE_REV: u32 = 1;
+const DISPLAY_DECODE_REV: u32 = 2;
 
 /// Current scientific/categorical decode revision encoded into `TileKey`s.
-const TRACK_DECODE_REV: u32 = 1;
+const TRACK_DECODE_REV: u32 = 2;
 
 /// Canonical display stream spec shared across analytical display decoders
 /// (`TiffSource`, `PngSource`, `JpegSource`).

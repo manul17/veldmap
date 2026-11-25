@@ -296,9 +296,11 @@ impl AppSettings {
     /// host-RAM budget.
     pub(crate) fn effective_gpu_tile_cache_bytes(&self, default_bytes: usize) -> usize {
         match self.gpu_tile_cache_max_mb {
-            Some(mb) => mb
-                .clamp(MIN_GPU_CACHE_MAX_MB, MAX_GPU_CACHE_MAX_MB)
-                .saturating_mul(1024 * 1024) as usize,
+            Some(mb) => usize::try_from(
+                mb.clamp(MIN_GPU_CACHE_MAX_MB, MAX_GPU_CACHE_MAX_MB)
+                    .saturating_mul(1024 * 1024),
+            )
+            .unwrap_or(usize::MAX),
             None => default_bytes,
         }
     }

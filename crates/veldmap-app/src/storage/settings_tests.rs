@@ -117,3 +117,44 @@ fn basemap_draft_preserves_unrelated_app_settings_and_validates_partial_edits() 
     draft.apply_into(&mut settings);
     assert_eq!(settings.custom_xyz.url_template, "   ");
 }
+
+#[test]
+fn gpu_tile_cache_cap_clamps_persists_and_loads_legacy_settings() {
+    let mut settings = AppSettings::default();
+    assert_eq!(settings.gpu_tile_cache_max_mb, None);
+    assert_eq!(
+        settings.effective_gpu_tile_cache_bytes(512 * 1024 * 1024),
+        512 * 1024 * 1024
+    );
+
+    settings.gpu_tile_cache_max_mb = Some(16);
+    settings.normalize();
+    assert_eq!(settings.gpu_tile_cache_max_mb, Some(MIN_GPU_CACHE_MAX_MB));
+    assert_eq!(
+        settings.effective_gpu_tile_cache_bytes(512 * 1024 * 1024),
+        (MIN_GPU_CACHE_MAX_MB as usize) * 1024 * 1024
+    );
+
+    settings.gpu_tile_cache_max_mb = Some(99_999);
+    settings.normalize();
+    assert_eq!(settings.gpu_tile_cache_max_mb, Some(MAX_GPU_CACHE_MAX_MB));
+    assert!(settings.effective_gpu_tile_cache_bytes(512 * 1024 * 1024) >= 128 * 1024 * 1024);
+
+    let mut draft = BasemapSettingsDraft::from_settings(&settings);
+    draft.gpu_tile_cache_max_mb = Some(768);
+    draft.apply_into(&mut settings);
+    assert_eq!(settings.gpu_tile_cache_max_mb, Some(768));
+
+    // Legacy settings JSON without `gpu_tile_cache_max_mb` deserializes cleanly to None (Auto).
+    let dir = TestTempDir::new("settings-legacy-gpu");
+    let paths = StoragePaths::with_root(dir.path());
+    let settings_path = paths.settings_path();
+    std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &settings_path,
+        r#"{"active_basemap":"bundled_blue_marble"}"#,
+    )
+    .expect("write legacy settings");
+    let legacy = AppSettings::load_or_default(&paths);
+    assert_eq!(legacy.gpu_tile_cache_max_mb, None);
+}

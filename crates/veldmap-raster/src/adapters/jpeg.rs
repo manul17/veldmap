@@ -266,6 +266,19 @@ impl RasterSource for JpegSource {
         // the Fast hover probe lane on every cursor movement.
         Ok(None)
     }
+
+    fn sample_band(
+        &self,
+        _band: veldmap_core::tile::BandKey,
+        _format: veldmap_core::tile::PixelFormat,
+        _px: u32,
+        _py: u32,
+        _ctx: &DecodeContext<'_>,
+    ) -> Result<crate::pipeline::metadata::BandSample, RasterError> {
+        // Full-frame JPEG probing is intentionally disabled on the Fast hover lane;
+        // report Unavailable rather than Nodata.
+        Ok(crate::pipeline::metadata::BandSample::Unavailable)
+    }
 }
 
 fn clamp_u16(v: u32) -> u16 {

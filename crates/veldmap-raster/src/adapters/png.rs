@@ -274,6 +274,33 @@ impl RasterSource for PngSource {
         }
         Ok(None)
     }
+
+    fn sample_band(
+        &self,
+        band: veldmap_core::tile::BandKey,
+        format: veldmap_core::tile::PixelFormat,
+        px: u32,
+        py: u32,
+        ctx: &DecodeContext<'_>,
+    ) -> Result<crate::pipeline::metadata::BandSample, RasterError> {
+        use crate::pipeline::metadata::BandSample;
+        if (band != veldmap_core::tile::BandKey::Display
+            && format != veldmap_core::tile::PixelFormat::Rgba8UnormSrgb)
+            || px >= self.description.width
+            || py >= self.description.height
+        {
+            return Ok(BandSample::Unavailable);
+        }
+        let total_px =
+            u64::from(self.description.width).saturating_mul(u64::from(self.description.height));
+        if self.interlaced || total_px > 2_000_000 {
+            return Ok(BandSample::Unavailable);
+        }
+        Ok(match self.sample_display_rgba(px, py, ctx)? {
+            Some(rgba) => BandSample::Rgba(rgba),
+            None => BandSample::Nodata,
+        })
+    }
 }
 
 fn map_png_error(err: png::DecodingError, cancel: &CancelToken) -> RasterError {

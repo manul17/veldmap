@@ -1,5 +1,8 @@
-//! CPU linear-light mipmap generation for `Rgba8UnormSrgb` tiles and
-//! equirectangular horizontal-wrap 2x RGB8 downsampling.
+//! CPU mipmap generation across raster tracks:
+//! - Linear-light alpha-weighted mipmaps for `Rgba8UnormSrgb` display tiles
+//! - NaN-skipping `f64`-accumulated mipmaps for `R32Float` scientific tiles
+//! - 1-mip clearing for `R8Uint`/`R16Uint` categorical tiles
+//! - Equirectangular horizontal-wrap 2x RGB8 downsampling for bundled basemaps.
 
 use veldmap_core::tile::{DecodedTile, PixelFormat, max_mip_levels, mip_dimensions};
 
@@ -87,20 +90,15 @@ fn downsample_rgba8_srgb_2x(
     dst
 }
 
-/// Populate the complete CPU linear-light mipmap chain on `tile` when
-/// `tile.format() == PixelFormat::Rgba8UnormSrgb`, `tile.gutter() == 0`, the
-/// valid interior covers the full texture (`tile.valid_w() == tile.width() &&
-/// tile.valid_h() == tile.height()`), and `tile.data()` matches
-/// `width x height x 4`.
-///
-/// Non-display formats (`R32Float`, `R8Uint`, `R16Uint`), guttered tiles, and
-/// padded partial-edge tiles are left untouched with `mips` cleared so 2x box
-/// filtering never shifts gutters or bleeds padding into valid pixels.
-pub fn generate_linear_mipmaps(tile: &mut DecodedTile) {
+fn generate_mips_with(
+    tile: &mut DecodedTile,
+    expected_format: PixelFormat,
+    mut step: impl FnMut(&[u8], u32, u32, u32, u32) -> Vec<u8>,
+) {
     tile.clear_mips();
     let width = tile.width();
     let height = tile.height();
-    if tile.format() != PixelFormat::Rgba8UnormSrgb
+    if tile.format() != expected_format
         || tile.gutter() != 0
         || tile.valid_w() != width
         || tile.valid_h() != height
@@ -113,10 +111,7 @@ pub fn generate_linear_mipmaps(tile: &mut DecodedTile) {
         return;
     }
 
-    let to_lin = srgb_to_linear_lut();
-    let to_srgb = linear_to_srgb_lut();
     let mut mips: Vec<Vec<u8>> = Vec::with_capacity((total_levels - 1) as usize);
-
     let mut prev_w = width;
     let mut prev_h = height;
     for level in 1..total_levels {
@@ -126,12 +121,32 @@ pub fn generate_linear_mipmaps(tile: &mut DecodedTile) {
         } else {
             mips[(level - 2) as usize].as_slice()
         };
-        let next = downsample_rgba8_srgb_2x(src, prev_w, prev_h, dst_w, dst_h, to_lin, to_srgb);
-        mips.push(next);
+        mips.push(step(src, prev_w, prev_h, dst_w, dst_h));
         prev_w = dst_w;
         prev_h = dst_h;
     }
-    let _ = tile.try_set_mips(mips);
+    let res = tile.try_set_mips(mips);
+    debug_assert!(
+        res.is_ok(),
+        "generated mip chain must match tile layout: {res:?}"
+    );
+}
+
+/// Populate the complete CPU linear-light mipmap chain on `tile` when
+/// `tile.format() == PixelFormat::Rgba8UnormSrgb`, `tile.gutter() == 0`, the
+/// valid interior covers the full texture (`tile.valid_w() == tile.width() &&
+/// tile.valid_h() == tile.height()`), and `tile.data()` matches
+/// `width x height x 4`.
+///
+/// Non-display formats (`R32Float`, `R8Uint`, `R16Uint`), guttered tiles, and
+/// padded partial-edge tiles are left untouched with `mips` cleared so 2x box
+/// filtering never shifts gutters or bleeds padding into valid pixels.
+pub fn generate_linear_mipmaps(tile: &mut DecodedTile) {
+    let to_lin = srgb_to_linear_lut();
+    let to_srgb = linear_to_srgb_lut();
+    generate_mips_with(tile, PixelFormat::Rgba8UnormSrgb, |src, pw, ph, dw, dh| {
+        downsample_rgba8_srgb_2x(src, pw, ph, dw, dh, to_lin, to_srgb)
+    });
 }
 
 fn downsample_r32f_nan_skipping_2x(
@@ -187,38 +202,7 @@ fn downsample_r32f_nan_skipping_2x(
 /// `NaN` / non-finite nodata samples are excluded; a footprint containing only
 /// non-finite samples produces `f32::NAN`.
 pub fn generate_scientific_mipmaps(tile: &mut DecodedTile) {
-    tile.clear_mips();
-    let width = tile.width();
-    let height = tile.height();
-    if tile.format() != PixelFormat::R32Float
-        || tile.gutter() != 0
-        || tile.valid_w() != width
-        || tile.valid_h() != height
-    {
-        return;
-    }
-
-    let total_levels = max_mip_levels(width, height);
-    if total_levels <= 1 {
-        return;
-    }
-
-    let mut mips: Vec<Vec<u8>> = Vec::with_capacity((total_levels - 1) as usize);
-    let mut prev_w = width;
-    let mut prev_h = height;
-    for level in 1..total_levels {
-        let (dst_w, dst_h) = mip_dimensions(width, height, level);
-        let src = if level == 1 {
-            tile.data()
-        } else {
-            mips[(level - 2) as usize].as_slice()
-        };
-        let next = downsample_r32f_nan_skipping_2x(src, prev_w, prev_h, dst_w, dst_h);
-        mips.push(next);
-        prev_w = dst_w;
-        prev_h = dst_h;
-    }
-    let _ = tile.try_set_mips(mips);
+    generate_mips_with(tile, PixelFormat::R32Float, downsample_r32f_nan_skipping_2x);
 }
 
 /// Generate format-appropriate CPU mipmaps on `tile`:
@@ -319,5 +303,66 @@ mod tests {
         .expect("guttered");
         generate_linear_mipmaps(&mut guttered);
         assert_eq!(guttered.mip_level_count(), 1);
+    }
+
+    #[test]
+    fn scientific_mipmaps_skip_nan_and_inf_handle_npot_and_categorical_stays_1mip() {
+        let f32_bytes =
+            |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_ne_bytes()).collect() };
+        let read_f32 = |bytes: &[u8], idx: usize| -> f32 {
+            let o = idx * 4;
+            f32::from_ne_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+        };
+
+        // 4x2 tile: left 2x2 has [10, NaN, 30, +Inf] -> 20; right 2x2 is all NaN/-Inf -> NaN.
+        let data = f32_bytes(&[
+            10.0,
+            f32::NAN,
+            f32::NAN,
+            f32::NEG_INFINITY,
+            30.0,
+            f32::INFINITY,
+            f32::NAN,
+            f32::NAN,
+        ]);
+        let mut tile = DecodedTile::try_new(4, 2, PixelFormat::R32Float, data).expect("sci");
+        generate_tile_mipmaps(&mut tile);
+        assert_eq!(tile.mip_level_count(), 3); // 4x2 -> 2x1 -> 1x1
+        let mip1 = tile.mip_data(1).expect("mip1");
+        assert!((read_f32(mip1, 0) - 20.0).abs() < 1e-5);
+        assert!(read_f32(mip1, 1).is_nan());
+        let mip2 = tile.mip_data(2).expect("mip2");
+        assert!((read_f32(mip2, 0) - 20.0).abs() < 1e-5);
+
+        // NPOT 5x3 folds trailing column/row into last texel cleanly.
+        let mut npot =
+            DecodedTile::try_new(5, 3, PixelFormat::R32Float, f32_bytes(&[4.0; 15])).expect("npot");
+        generate_scientific_mipmaps(&mut npot);
+        assert_eq!(npot.mip_level_count(), 3);
+        assert!((read_f32(npot.mip_data(2).unwrap(), 0) - 4.0).abs() < 1e-5);
+
+        // Guttered R32Float stays 1 mip.
+        let mut guttered = DecodedTile::try_with_valid_region(
+            6,
+            6,
+            4,
+            4,
+            1,
+            PixelFormat::R32Float,
+            f32_bytes(&[1.0; 36]),
+        )
+        .expect("guttered");
+        generate_scientific_mipmaps(&mut guttered);
+        assert_eq!(guttered.mip_level_count(), 1);
+
+        // Categorical tiles stay strictly 1 mip.
+        let mut u8_tile =
+            DecodedTile::try_new(4, 4, PixelFormat::R8Uint, vec![3u8; 16]).expect("u8");
+        generate_tile_mipmaps(&mut u8_tile);
+        assert_eq!(u8_tile.mip_level_count(), 1);
+        let mut u16_tile =
+            DecodedTile::try_new(4, 4, PixelFormat::R16Uint, vec![0u8; 32]).expect("u16");
+        generate_tile_mipmaps(&mut u16_tile);
+        assert_eq!(u16_tile.mip_level_count(), 1);
     }
 }

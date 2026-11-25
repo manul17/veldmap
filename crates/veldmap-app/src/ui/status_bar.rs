@@ -54,13 +54,15 @@ pub(crate) fn show_status_bar(
                             String::new()
                         };
                         let raw_part = if readout.has_affine_scaling {
-                            format!(" [raw {raw:.4}]")
+                            format!(" [raw {}]", format::format_scalar(raw))
                         } else {
                             String::new()
                         };
                         format!(
-                            "Val: {physical:.4}{unit}{db_part}{raw_part} @ ({},{})",
-                            readout.pixel.0, readout.pixel.1
+                            "Val: {}{unit}{db_part}{raw_part} @ ({},{})",
+                            format::format_scalar(physical),
+                            readout.pixel.0,
+                            readout.pixel.1
                         )
                     }
                     CursorReadoutValue::Categorical(class_id) => {

@@ -74,11 +74,18 @@ fn pending_uploads_enforces_byte_cap_on_enqueue_and_preserves_roots() {
 #[test]
 fn pinned_root_check_handles_planetary_and_raster_pyramid() {
     let live = SourceId::from_stable_key("eox");
+    let live_display = StreamKey::new(live, BandKey::Display, PixelFormat::Rgba8UnormSrgb, 0);
+    let bundled_display = StreamKey::new(
+        SourceId::BUNDLED_BASEMAP,
+        BandKey::Display,
+        PixelFormat::Rgba8UnormSrgb,
+        0,
+    );
     let wm_root = wm_key(live, 0, 0, 0);
     let wm_child = wm_key(live, 1, 0, 0);
-    assert!(is_pinned_root(&wm_root, &[live]));
-    assert!(!is_pinned_root(&wm_root, &[SourceId::BUNDLED_BASEMAP]));
-    assert!(!is_pinned_root(&wm_child, &[live]));
+    assert!(is_pinned_root(&wm_root, &[live_display]));
+    assert!(!is_pinned_root(&wm_root, &[bundled_display]));
+    assert!(!is_pinned_root(&wm_child, &[live_display]));
 
     let pyr_root = TileKey {
         source: live,
@@ -99,9 +106,20 @@ fn pinned_root_check_handles_planetary_and_raster_pyramid() {
         level: 5,
         ..pyr_root
     };
-    assert!(is_pinned_root(&pyr_root, &[live]));
-    assert!(!is_pinned_root(&pyr_finest, &[live]));
-    assert!(!is_pinned_root(&pyr_oob, &[live]));
+    let pyr_band1_root = TileKey {
+        band: BandKey::Index(1),
+        format: PixelFormat::R32Float,
+        ..pyr_root
+    };
+    assert!(is_pinned_root(&pyr_root, &[live_display]));
+    assert!(!is_pinned_root(&pyr_finest, &[live_display]));
+    assert!(!is_pinned_root(&pyr_oob, &[live_display]));
+    // Pinning Display stream must NOT pin an obsolete Band 1 root on the same SourceId.
+    assert!(!is_pinned_root(&pyr_band1_root, &[live_display]));
+    assert!(is_pinned_root(
+        &pyr_band1_root,
+        &[pyr_band1_root.stream_key()]
+    ));
 }
 
 #[test]

@@ -1,5 +1,5 @@
-//! Sequential pass (`ServeMode::Pass`) bulk-lane decode jobs, QOI hit draining,
-//! and RAII flight guard.
+//! Sequential pass (`ServeMode::Pass`) bulk-lane decode jobs, disk-cache hit
+//! draining (`Qoi` & `Lz4Raw`), and RAII flight guard.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use veldmap_storage::DiskTileKey;
 
 use crate::gpu_tiles::tile_format_bytes;
 
-use super::super::qoi_cache::{TileWriteBatch, load_cached_tile};
+use super::super::disk_cache::{TileWriteBatch, load_cached_tile};
 use super::super::runtime::OverlayRuntime;
 
 pub(super) struct PassJobSpec {
@@ -93,20 +93,21 @@ fn deliver_pass_tile(
     }
 }
 
-enum QoiDrainOutcome {
+enum CacheDrainOutcome {
     Cancelled,
     AllHit,
     NeedsPass(HashSet<TileKey>),
 }
 
-/// Stream any QOI disk-cache hits for `spec.admitted.tiles` immediately
-/// (never buffering an entire rung in RAM or discarding partial hits on 1 miss).
-fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
+/// Stream any disk-cache hits (`Qoi` or `Lz4Raw`) for `spec.admitted.tiles`
+/// immediately (never buffering an entire rung in RAM or discarding partial
+/// hits on 1 miss).
+fn drain_pass_cache_hits(spec: &PassJobSpec) -> CacheDrainOutcome {
     let Some(ref disk) = spec.runtime.disk_cache else {
-        return QoiDrainOutcome::NeedsPass(HashSet::new());
+        return CacheDrainOutcome::NeedsPass(HashSet::new());
     };
     let Some(&first_tk) = spec.admitted.tiles.first() else {
-        return QoiDrainOutcome::AllHit;
+        return CacheDrainOutcome::AllHit;
     };
     let stream_key = spec.admitted.key;
     let pass_id = spec.admitted.pass_id;
@@ -116,7 +117,7 @@ fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
     let mut dk = DiskTileKey::from_tile_key(spec.fingerprint_hex.clone(), &first_tk);
     for &tk in &spec.admitted.tiles {
         if pass_cancel.is_cancelled() {
-            return QoiDrainOutcome::Cancelled;
+            return CacheDrainOutcome::Cancelled;
         }
         dk.level = tk.level;
         dk.x = tk.x;
@@ -130,9 +131,9 @@ fn drain_pass_qoi_hits(spec: &PassJobSpec) -> QoiDrainOutcome {
         }
     }
     if any_miss {
-        QoiDrainOutcome::NeedsPass(already_hit)
+        CacheDrainOutcome::NeedsPass(already_hit)
     } else {
-        QoiDrainOutcome::AllHit
+        CacheDrainOutcome::AllHit
     }
 }
 
@@ -207,16 +208,16 @@ fn run_source_pass(spec: &PassJobSpec, already_hit: &HashSet<TileKey>) -> Result
 }
 
 fn run_pass_job(spec: PassJobSpec, guard: PassFlightGuard) {
-    let already_hit = match drain_pass_qoi_hits(&spec) {
-        QoiDrainOutcome::Cancelled => {
+    let already_hit = match drain_pass_cache_hits(&spec) {
+        CacheDrainOutcome::Cancelled => {
             guard.abort();
             return;
         }
-        QoiDrainOutcome::AllHit => {
+        CacheDrainOutcome::AllHit => {
             guard.finish(true);
             return;
         }
-        QoiDrainOutcome::NeedsPass(hits) => hits,
+        CacheDrainOutcome::NeedsPass(hits) => hits,
     };
 
     match run_source_pass(&spec, &already_hit) {

@@ -1,7 +1,8 @@
-//! Integration tests for COG I/O amplification, pooled decoder reuse,
-//! overview-vs-pass equivalence, TIFF compression/sample formats (ZSTD +
-//! Predictor=3 Float32, i16 + GDAL nodata, Gray+Alpha, PlanarConfiguration=2),
-//! and IFD/dimension limit guards.
+//! Integration tests for COG I/O amplification, stateless cached-IFD chunk
+//! reading, overview-vs-pass equivalence, TIFF compression/sample formats
+//! (ZSTD + Predictor=3 Float32, JPEG, i16/i8 + GDAL nodata, WhiteIsZero,
+//! Gray+Alpha, PlanarConfiguration=2, Palette, sparse chunks), and IFD/dimension
+//! limit guards.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -43,7 +44,7 @@ fn near_head_or_ifd(span: (u64, u64), ifds: &[u64]) -> bool {
 }
 
 #[test]
-fn describing_reads_only_header_and_ifds_and_pointwise_reuses_pooled_decoder() {
+fn describing_reads_only_header_and_ifds_and_pointwise_avoids_rereading_ifds() {
     let levels = 2;
     let (file, base_tiles, ifds) =
         build_tiled_cog(2 * RASTER_TILE_SIZE, 2 * RASTER_TILE_SIZE, levels);
@@ -1019,4 +1020,258 @@ fn direct_raw_decoder_handles_deflate_lzw_packbits_predictor2_big_endian_and_sci
     assert_eq!(pass_vals[1], 12.5);
     assert_eq!(pass_vals[2], 42.25);
     assert!(pass_vals[3].is_nan(), "source NaN must remain NaN");
+}
+
+#[test]
+fn direct_raw_decoder_handles_jpeg_ycbcr_white_is_zero_i8_sparse_and_compressed_cap() {
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        budget: &budget,
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        cancel: &cancel,
+    };
+
+    // 1. TIFF Compression = 7 (JPEG) with Photometric = YCbCr (6) & custom YCbCrCoefficients (529):
+    // Encode a solid red 8x8 JPEG via `image` crate (which writes standard YCbCr JFIF).
+    let mut jpeg_bytes = Vec::new();
+    let rgb_img = image::RgbImage::from_pixel(8, 8, image::Rgb([220, 30, 40]));
+    image::DynamicImage::ImageRgb8(rgb_img)
+        .write_to(&mut Cursor::new(&mut jpeg_bytes), image::ImageFormat::Jpeg)
+        .expect("encode jpeg");
+    let mut ycbcr_tif = Vec::new();
+    {
+        let mut enc = TiffEncoder::new(Cursor::new(&mut ycbcr_tif)).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                width: 8,
+                height: 8,
+                samples_per_pixel: 3,
+                bits_per_sample: &[8, 8, 8],
+                photometric: 6, // YCbCr
+                compression: 7, // JPEG
+                planar_configuration: 1,
+                sample_format: None,
+                is_overview: false,
+            },
+        );
+        // Explicitly set BT.709 YCbCrCoefficients (tag 529) as rationals to verify tags are applied.
+        dir.write_tag(
+            Tag::Unknown(529),
+            &[
+                ::tiff::encoder::Rational { n: 2126, d: 10_000 },
+                ::tiff::encoder::Rational { n: 7152, d: 10_000 },
+                ::tiff::encoder::Rational { n: 722, d: 10_000 },
+            ][..],
+        )
+        .expect("coeffs");
+        write_single_strip_u32(&mut dir, 8, &jpeg_bytes);
+        dir.finish().expect("finish");
+    }
+    let ycbcr_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(ycbcr_tif.clone())),
+        fake_fingerprint(&ycbcr_tif),
+        &budget,
+        &cancel,
+    )
+    .expect("open JPEG YCbCr TIFF");
+    let display_px = ycbcr_src
+        .sample_display_rgba(4, 4, &ctx)
+        .expect("sample ycbcr")
+        .expect("opaque");
+    assert!(
+        display_px[0] > 180 && display_px[1] < 80 && display_px[2] < 80 && display_px[3] == 255,
+        "JPEG YCbCr red should decode cleanly, got {display_px:?}"
+    );
+    // Scientific band 0 on YCbCr IFD must also return converted Red, not raw Y luma!
+    let sci_red = ycbcr_src
+        .sample_band(BandKey::Index(0), PixelFormat::R32Float, 4, 4, &ctx)
+        .expect("sample sci ycbcr");
+    match sci_red {
+        BandSample::Scalar { raw, .. } => {
+            assert!(raw > 180.0, "expected converted Red > 180, got {raw}");
+        }
+        other => panic!("expected Scalar, got {other:?}"),
+    }
+
+    // 2. WhiteIsZero with GDAL_NODATA = "0": Display inverts valid pixels AFTER nodata check,
+    //    while Scientific readout preserves exact raw uninverted values.
+    let mut wiz_tif = Vec::new();
+    {
+        let mut enc = TiffEncoder::new(Cursor::new(&mut wiz_tif)).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                width: 4,
+                height: 1,
+                samples_per_pixel: 1,
+                bits_per_sample: &[8],
+                photometric: 0, // WhiteIsZero
+                compression: 1,
+                planar_configuration: 1,
+                sample_format: Some(1),
+                is_overview: false,
+            },
+        );
+        dir.write_tag(Tag::GdalNodata, "0").expect("nodata");
+        write_single_strip_u32(&mut dir, 1, &[0u8, 10, 200, 255]);
+        dir.finish().expect("finish");
+    }
+    let wiz_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(wiz_tif.clone())),
+        fake_fingerprint(&wiz_tif),
+        &budget,
+        &cancel,
+    )
+    .expect("open WhiteIsZero");
+    assert_eq!(
+        wiz_src.sample_display_rgba(0, 0, &ctx).unwrap(),
+        None,
+        "nodata 0 stays transparent"
+    );
+    assert_eq!(
+        wiz_src.sample_display_rgba(1, 0, &ctx).unwrap(),
+        Some([245, 245, 245, 255])
+    );
+    assert_eq!(
+        wiz_src.sample_display_rgba(3, 0, &ctx).unwrap(),
+        Some([0, 0, 0, 255])
+    );
+    assert_eq!(
+        wiz_src
+            .sample_band(BandKey::Index(0), PixelFormat::R32Float, 0, 0, &ctx)
+            .unwrap(),
+        BandSample::Nodata
+    );
+    assert_eq!(
+        wiz_src
+            .sample_band(BandKey::Index(0), PixelFormat::R32Float, 1, 0, &ctx)
+            .unwrap(),
+        BandSample::Scalar {
+            raw: 10.0,
+            physical: 10.0
+        }
+    );
+
+    // 3. Signed 8-bit (`SampleType::I8`) stretches negative values on Display instead of crushing to 0.
+    let mut i8_tif = Vec::new();
+    {
+        let mut enc = TiffEncoder::new(Cursor::new(&mut i8_tif)).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                width: 4,
+                height: 1,
+                samples_per_pixel: 1,
+                bits_per_sample: &[8],
+                photometric: 1,
+                compression: 1,
+                planar_configuration: 1,
+                sample_format: Some(2), // signed int
+                is_overview: false,
+            },
+        );
+        let raw_i8: [u8; 4] = [(-100i8) as u8, (-50i8) as u8, 0u8, 100u8];
+        write_single_strip_u32(&mut dir, 1, &raw_i8);
+        dir.finish().expect("finish");
+    }
+    let i8_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(i8_tif.clone())),
+        fake_fingerprint(&i8_tif),
+        &budget,
+        &cancel,
+    )
+    .expect("open I8 TIFF");
+    let px_neg50 = i8_src
+        .sample_display_rgba(1, 0, &ctx)
+        .unwrap()
+        .expect("opaque");
+    assert!(
+        px_neg50[0] > 40 && px_neg50[0] < 90,
+        "I8 value -50 over [-100, 100] should stretch to ~64, got {px_neg50:?}"
+    );
+
+    // 4. Sparse chunk (`offset = 0, byte_count = 0`) returns transparent Display and Nodata Scientific.
+    let mut sparse_tif = Vec::new();
+    {
+        let mut enc = TiffEncoder::new(Cursor::new(&mut sparse_tif)).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                width: 4,
+                height: 4,
+                samples_per_pixel: 1,
+                bits_per_sample: &[32],
+                photometric: 1,
+                compression: 1,
+                planar_configuration: 1,
+                sample_format: Some(3),
+                is_overview: false,
+            },
+        );
+        dir.write_tag(Tag::RowsPerStrip, 4u32).expect("rps");
+        dir.write_tag(Tag::StripOffsets, &[0u32][..]).expect("off");
+        dir.write_tag(Tag::StripByteCounts, &[0u32][..])
+            .expect("bc");
+        dir.finish().expect("finish");
+    }
+    let sparse_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(sparse_tif.clone())),
+        fake_fingerprint(&sparse_tif),
+        &budget,
+        &cancel,
+    )
+    .expect("open sparse TIFF");
+    assert_eq!(sparse_src.sample_display_rgba(1, 1, &ctx).unwrap(), None);
+    assert_eq!(
+        sparse_src
+            .sample_band(BandKey::Index(0), PixelFormat::R32Float, 1, 1, &ctx)
+            .unwrap(),
+        BandSample::Nodata
+    );
+
+    // 5. Crafted oversized StripByteCounts on tiny 4x4 tile rejected by per-chunk `max_compressed` cap.
+    let mut bomb_tif = Vec::new();
+    {
+        let mut enc = TiffEncoder::new(Cursor::new(&mut bomb_tif)).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                width: 4,
+                height: 4,
+                samples_per_pixel: 1,
+                bits_per_sample: &[8],
+                photometric: 1,
+                compression: 8, // Deflate
+                planar_configuration: 1,
+                sample_format: Some(1),
+                is_overview: false,
+            },
+        );
+        dir.write_tag(Tag::RowsPerStrip, 4u32).expect("rps");
+        dir.write_tag(Tag::StripOffsets, &[8u32][..]).expect("off");
+        dir.write_tag(Tag::StripByteCounts, &[32u32 * 1024 * 1024][..])
+            .expect("bc");
+        dir.finish().expect("finish");
+    }
+    let bomb_src = TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(bomb_tif.clone())),
+        fake_fingerprint(&bomb_tif),
+        &budget,
+        &cancel,
+    )
+    .expect("open bomb TIFF");
+    assert!(matches!(
+        bomb_src.sample_display_rgba(0, 0, &ctx),
+        Err(RasterError::LimitExceeded { .. })
+    ));
 }

@@ -6,8 +6,8 @@ use std::sync::{Arc, OnceLock, mpsc};
 use veldmap_app::basemap_policy::BasemapCarrierPolicy;
 use veldmap_app::gpu_tiles::GpuTileCache;
 use veldmap_app::render::{
-    DrawSnapshot, GlobeRenderer, RenderParams, SnapshotBuildParams, TileCarrierPolicy,
-    clamp_to_primary_backends,
+    DrawSnapshot, GlobeRenderer, RenderParams, SnapshotBuildParams, TileBindGroupCache,
+    TileCarrierPolicy, clamp_to_primary_backends,
 };
 use veldmap_app::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG};
 use veldmap_core::geo::Camera;
@@ -278,6 +278,69 @@ pub(crate) fn render_srgb(
         },
         true,
     )
+}
+
+pub(crate) fn render_srgb_with_bind_groups(
+    renderer: &mut GlobeRenderer,
+    bind_groups: &mut TileBindGroupCache,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    snapshot: &Arc<DrawSnapshot>,
+) -> Vec<u8> {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("shared-bg smoke render encoder"),
+    });
+    let rendered = renderer.render_if_dirty_with_bind_groups(
+        device,
+        queue,
+        &mut encoder,
+        RenderParams {
+            width,
+            height,
+            snapshot,
+        },
+        bind_groups,
+    );
+    assert!(rendered, "expected shared-bind-groups render to run");
+
+    let composite_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("composite target (shared bg)"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let composite_view = composite_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("composite pass (shared bg)"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &composite_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        renderer.composite_into(&mut pass);
+    }
+    queue.submit(Some(encoder.finish()));
+    readback_rgba8(device, queue, &composite_tex, width, height)
 }
 
 pub(crate) fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {

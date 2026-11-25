@@ -282,8 +282,8 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
     tx.send((live_root, live_tile.clone())).expect("send live");
-    let pinned_live = [live_source, SourceId::BUNDLED_BASEMAP];
-    pending.set_pinned_root_sources(&pinned_live);
+    let pinned_live = [live_root.stream_key(), wm_bundled_root.stream_key()];
+    pending.set_pinned_root_streams(&pinned_live);
     let rep = pending.drain_and_upload(
         device,
         queue,

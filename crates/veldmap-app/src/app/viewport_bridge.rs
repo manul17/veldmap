@@ -2,10 +2,11 @@
 //! viewport pixel mapping) using the hoisted [`TileBindGroupCache`] inside
 //! `egui_wgpu::CallbackResources`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor};
+use veldmap_core::sync::lock_unpoisoned;
 
 use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams, TileBindGroupCache};
 
@@ -51,32 +52,24 @@ impl CallbackTrait for GlobePaintCallback {
             screen_descriptor.pixels_per_point,
             screen_descriptor.size_in_pixels,
         );
-        if vp.width_px <= 0 || vp.height_px <= 0 {
-            if let Some(bg) = callback_resources.get_mut::<TileBindGroupCache>() {
-                bg.sweep_stale();
-            }
-            return Vec::new();
-        }
-
-        // Temporarily extract the hoisted `TileBindGroupCache` so both
-        // resources can be borrowed mutably without nested locks.
-        let Some(mut bind_groups) = callback_resources.remove::<TileBindGroupCache>() else {
-            if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
-                renderer.render_if_dirty(
-                    device,
-                    queue,
-                    egui_encoder,
-                    RenderParams {
-                        width: vp.width_px as u32,
-                        height: vp.height_px as u32,
-                        snapshot: &self.snapshot,
-                    },
-                );
-            }
+        let Some(bind_groups_arc) = callback_resources
+            .get::<Arc<Mutex<TileBindGroupCache>>>()
+            .cloned()
+        else {
+            debug_assert!(
+                false,
+                "hoisted Arc<Mutex<TileBindGroupCache>> missing from CallbackResources"
+            );
             return Vec::new();
         };
 
+        if vp.width_px <= 0 || vp.height_px <= 0 {
+            lock_unpoisoned(&bind_groups_arc).sweep_stale();
+            return Vec::new();
+        }
+
         if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
+            let mut bind_groups = lock_unpoisoned(&bind_groups_arc);
             renderer.render_if_dirty_with_bind_groups(
                 device,
                 queue,
@@ -89,7 +82,6 @@ impl CallbackTrait for GlobePaintCallback {
                 &mut bind_groups,
             );
         }
-        callback_resources.insert(bind_groups);
         Vec::new()
     }
 

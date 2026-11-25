@@ -2,8 +2,11 @@
 //! mip-0 scientific (`R32Float`) and categorical (`R8Uint`/`R16Uint`) tiles.
 //!
 //! Kept inside `veldmap-raster` so `veldmap-storage` remains strictly
-//! codec-free. Payloads carry a compact 24-byte self-describing header
-//! validated **before** allocating decompression buffers.
+//! codec-free. Payloads carry a compact 24-byte little-endian self-describing
+//! header validated **before** allocating decompression buffers. Multi-byte
+//! sample payloads (`R32Float`/`R16Uint`) are stored in host native endianness
+//! (matching `DecodedTile` and desktop x86_64/aarch64 little-endian targets)
+//! inside the local ephemeral SQLite tile cache.
 
 use veldmap_core::tile::{DecodedTile, PixelFormat};
 
@@ -106,24 +109,28 @@ pub fn encode_lz4_raw_tile(
     }
 
     let bpp = format.bytes_per_pixel();
-    let (flags, compressed) = if bpp > 1 {
-        let shuffled = byte_shuffle(raw, bpp);
-        (FLAG_BYTE_SHUFFLED, lz4_flex::block::compress(&shuffled))
+    let shuffled;
+    let (flags, src): (u8, &[u8]) = if bpp > 1 {
+        shuffled = byte_shuffle(raw, bpp);
+        (FLAG_BYTE_SHUFFLED, &shuffled)
     } else {
-        (0u8, lz4_flex::block::compress(raw))
+        (0u8, raw)
     };
 
-    let mut out = Vec::with_capacity(HEADER_LEN + compressed.len());
-    out.extend_from_slice(&MAGIC);
-    out.push(VERSION);
-    out.push(format_tag);
-    out.push(gutter);
-    out.push(flags);
-    out.extend_from_slice(&width.to_le_bytes());
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(&valid_w.to_le_bytes());
-    out.extend_from_slice(&valid_h.to_le_bytes());
-    out.extend_from_slice(&compressed);
+    let max_comp = lz4_flex::block::get_maximum_output_size(src.len());
+    let mut out = vec![0u8; HEADER_LEN + max_comp];
+    out[0..4].copy_from_slice(&MAGIC);
+    out[4] = VERSION;
+    out[5] = format_tag;
+    out[6] = gutter;
+    out[7] = flags;
+    out[8..12].copy_from_slice(&width.to_le_bytes());
+    out[12..16].copy_from_slice(&height.to_le_bytes());
+    out[16..20].copy_from_slice(&valid_w.to_le_bytes());
+    out[20..24].copy_from_slice(&valid_h.to_le_bytes());
+    let written = lz4_flex::block::compress_into(src, &mut out[HEADER_LEN..])
+        .map_err(|e| RasterError::Decode(format!("Lz4Raw compression failed: {e}")))?;
+    out.truncate(HEADER_LEN + written);
     Ok(out)
 }
 
@@ -179,7 +186,8 @@ pub fn decode_lz4_raw_tile(
         return Err(RasterError::InvalidDimensions { width, height });
     }
     let gutter_twice = u32::from(gutter).saturating_mul(2);
-    if valid_w.saturating_add(gutter_twice) > width || valid_h.saturating_add(gutter_twice) > height
+    if valid_w.checked_add(gutter_twice).is_none_or(|w| w > width)
+        || valid_h.checked_add(gutter_twice).is_none_or(|h| h > height)
     {
         return Err(RasterError::InvalidDimensions { width, height });
     }
@@ -334,5 +342,59 @@ mod tests {
             )
             .is_err()
         );
+
+        // Bad magic, bad version, unknown flags, and overflowed valid_w + 2*gutter rejected.
+        let mut bad_magic = blob.clone();
+        bad_magic[0] = b'X';
+        assert!(
+            decode_lz4_raw_tile(&bad_magic, PixelFormat::R32Float, MAX_LZ4_RAW_DECODED_BYTES)
+                .is_err()
+        );
+
+        let mut bad_ver = blob.clone();
+        bad_ver[4] = VERSION + 1;
+        assert!(
+            decode_lz4_raw_tile(&bad_ver, PixelFormat::R32Float, MAX_LZ4_RAW_DECODED_BYTES)
+                .is_err()
+        );
+
+        let mut bad_flags = blob.clone();
+        bad_flags[7] = 0x80;
+        assert!(
+            decode_lz4_raw_tile(&bad_flags, PixelFormat::R32Float, MAX_LZ4_RAW_DECODED_BYTES)
+                .is_err()
+        );
+
+        let mut bad_geom = blob.clone();
+        bad_geom[6] = 1; // gutter = 1 while valid_w == width == 8
+        assert!(matches!(
+            decode_lz4_raw_tile(&bad_geom, PixelFormat::R32Float, MAX_LZ4_RAW_DECODED_BYTES),
+            Err(RasterError::InvalidDimensions { .. })
+        ));
+
+        // Unshuffled (flags = 0) multi-byte payload also decodes cleanly.
+        let raw_f32: Vec<u8> = [1.5f32, -2.25f32, f32::NAN, 42.0f32]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+        let comp = lz4_flex::block::compress(&raw_f32);
+        let mut unshuffled = Vec::with_capacity(HEADER_LEN + comp.len());
+        unshuffled.extend_from_slice(&MAGIC);
+        unshuffled.push(VERSION);
+        unshuffled.push(1);
+        unshuffled.push(0);
+        unshuffled.push(0); // flags = 0 (no shuffle)
+        unshuffled.extend_from_slice(&2u32.to_le_bytes());
+        unshuffled.extend_from_slice(&2u32.to_le_bytes());
+        unshuffled.extend_from_slice(&2u32.to_le_bytes());
+        unshuffled.extend_from_slice(&2u32.to_le_bytes());
+        unshuffled.extend_from_slice(&comp);
+        let dec = decode_lz4_raw_tile(
+            &unshuffled,
+            PixelFormat::R32Float,
+            MAX_LZ4_RAW_DECODED_BYTES,
+        )
+        .expect("unshuffled decode");
+        assert_eq!(dec.data(), raw_f32.as_slice());
     }
 }

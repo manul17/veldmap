@@ -46,6 +46,7 @@ impl std::fmt::Debug for GpuTile {
             .field("valid_w", &self.valid_w)
             .field("valid_h", &self.valid_h)
             .field("gutter", &self.gutter)
+            .field("mip_level_count", &self.mip_level_count)
             .field("byte_size", &self.byte_size)
             .finish()
     }

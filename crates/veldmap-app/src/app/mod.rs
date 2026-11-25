@@ -142,7 +142,9 @@ impl VeldmapApp {
         );
         {
             let mut wgpu_renderer = render_state.renderer.write();
-            wgpu_renderer.callback_resources.insert(bind_groups);
+            wgpu_renderer
+                .callback_resources
+                .insert(Arc::new(std::sync::Mutex::new(bind_groups)));
             wgpu_renderer.callback_resources.insert(renderer);
         }
 

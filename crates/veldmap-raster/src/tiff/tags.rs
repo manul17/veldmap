@@ -102,52 +102,84 @@ pub(super) fn read_tag_u16_vec_opt(
     Ok(opt_tag(decoder.get_tag_u16_vec(tag), cancel)?.unwrap_or_default())
 }
 
-fn value_to_u64(val: &tiff::decoder::ifd::Value) -> Option<u64> {
+fn value_to_u16(val: &tiff::decoder::ifd::Value, tag: Tag) -> Result<u16, RasterError> {
     use tiff::decoder::ifd::Value;
     match *val {
-        Value::Byte(v) => Some(u64::from(v)),
-        Value::Short(v) => Some(u64::from(v)),
-        Value::Unsigned(v) => Some(u64::from(v)),
-        Value::UnsignedBig(v) => Some(v),
-        _ => None,
+        Value::Byte(v) => Ok(u16::from(v)),
+        Value::Short(v) => Ok(v),
+        Value::Unsigned(v) => u16::try_from(v)
+            .map_err(|_| RasterError::Decode(format!("TIFF tag {tag:?} value {v} overflows u16"))),
+        Value::UnsignedBig(v) => u16::try_from(v)
+            .map_err(|_| RasterError::Decode(format!("TIFF tag {tag:?} value {v} overflows u16"))),
+        _ => Err(RasterError::Decode(format!(
+            "TIFF tag {tag:?} has unexpected non-integer value type"
+        ))),
     }
 }
 
-pub(super) fn read_tag_u64_vec_opt(
+/// Strictly read an optional unsigned 16-bit integer tag (scalar or list,
+/// admitting `BYTE`/`SHORT`/`LONG`/`LONG8` if values fit in `u16`), propagating
+/// type errors and `LimitsExceeded` instead of silently falling back.
+pub(super) fn read_tag_u16_vec_strict(
     decoder: &mut Decoder<BufferedByteReader>,
     tag: Tag,
     cancel: &CancelToken,
-) -> Result<Option<Vec<u64>>, RasterError> {
-    let Some(val) = opt_tag(decoder.get_tag(tag), cancel)? else {
-        return Ok(None);
-    };
-    let out = match val {
-        tiff::decoder::ifd::Value::List(items) => items.iter().filter_map(value_to_u64).collect(),
-        single => value_to_u64(&single).into_iter().collect(),
-    };
-    Ok(Some(out))
-}
-
-pub(super) fn read_tag_u8_vec_opt(
-    decoder: &mut Decoder<BufferedByteReader>,
-    tag: Tag,
-    cancel: &CancelToken,
-) -> Result<Option<Vec<u8>>, RasterError> {
-    let Some(val) = opt_tag(decoder.get_tag(tag), cancel)? else {
+) -> Result<Option<Vec<u16>>, RasterError> {
+    let Some(val) = opt_tag_strict(decoder.get_tag(tag), cancel)? else {
         return Ok(None);
     };
     let out = match val {
         tiff::decoder::ifd::Value::List(items) => items
             .iter()
-            .filter_map(|v| match *v {
-                tiff::decoder::ifd::Value::Byte(b) => Some(b),
-                _ => None,
-            })
-            .collect(),
-        tiff::decoder::ifd::Value::Byte(b) => vec![b],
-        _ => return Ok(None),
+            .map(|v| value_to_u16(v, tag))
+            .collect::<Result<Vec<_>, _>>()?,
+        single => vec![value_to_u16(&single, tag)?],
     };
     Ok(Some(out))
+}
+
+fn value_to_u64(val: &tiff::decoder::ifd::Value, tag: Tag) -> Result<u64, RasterError> {
+    use tiff::decoder::ifd::Value;
+    match *val {
+        Value::Byte(v) => Ok(u64::from(v)),
+        Value::Short(v) => Ok(u64::from(v)),
+        Value::Unsigned(v) => Ok(u64::from(v)),
+        Value::UnsignedBig(v) => Ok(v),
+        _ => Err(RasterError::Decode(format!(
+            "TIFF tag {tag:?} has unexpected non-integer value type"
+        ))),
+    }
+}
+
+/// Strictly read an optional unsigned 64-bit integer tag (scalar or list,
+/// admitting only `BYTE`/`SHORT`/`LONG`/`LONG8`), rejecting malformed entries
+/// instead of silently dropping them.
+pub(super) fn read_tag_u64_vec_strict(
+    decoder: &mut Decoder<BufferedByteReader>,
+    tag: Tag,
+    cancel: &CancelToken,
+) -> Result<Option<Vec<u64>>, RasterError> {
+    let Some(val) = opt_tag_strict(decoder.get_tag(tag), cancel)? else {
+        return Ok(None);
+    };
+    let out = match val {
+        tiff::decoder::ifd::Value::List(items) => items
+            .iter()
+            .map(|v| value_to_u64(v, tag))
+            .collect::<Result<Vec<_>, _>>()?,
+        single => vec![value_to_u64(&single, tag)?],
+    };
+    Ok(Some(out))
+}
+
+/// Strictly read an optional raw byte-array tag (`BYTE` or `UNDEFINED`, such as
+/// `JPEGTables`), propagating type and limit errors.
+pub(super) fn read_tag_u8_vec_strict(
+    decoder: &mut Decoder<BufferedByteReader>,
+    tag: Tag,
+    cancel: &CancelToken,
+) -> Result<Option<Vec<u8>>, RasterError> {
+    opt_tag_strict(decoder.get_tag_u8_vec(tag), cancel)
 }
 
 pub(super) fn read_tag_f64_vec_opt(

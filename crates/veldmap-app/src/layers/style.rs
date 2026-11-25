@@ -1,8 +1,9 @@
 //! Per-layer analytical rendering style (`ScientificStyle`, `CategoricalStyle`,
-//! `StretchPreset`), band/track option descriptors, colorbar HUD projection,
-//! and optional `session.json` persistence snapshots.
+//! `StretchPreset`, `BandStatsState`), band/track option descriptors, colorbar
+//! HUD projection, and forward-compatible `session.json` persistence snapshots.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
 use veldmap_raster::{
     BandInfo, BandStats, DISPLAY_STREAM_SPEC, RasterDescription, stream_spec_for_band,
@@ -61,6 +62,20 @@ impl StretchPreset {
     }
 }
 
+/// Async lifecycle state for a layer's sampled physical [`BandStats`].
+#[derive(Clone, Debug, Default)]
+pub(crate) enum BandStatsState {
+    #[default]
+    NotRequested,
+    Loading {
+        job_id: u64,
+        cancel: CancelToken,
+    },
+    Ready(Box<BandStats>),
+    /// Stats job completed and confirmed no finite samples (or unsupported).
+    Empty,
+}
+
 /// Live GPU stretch & colormap state for a scientific (`R32Float`) layer.
 #[derive(Clone, Debug)]
 pub(crate) struct ScientificStyle {
@@ -70,8 +85,8 @@ pub(crate) struct ScientificStyle {
     pub(crate) custom_range_applied: bool,
     pub(crate) colormap: ColormapId,
     pub(crate) invert_colormap: bool,
-    pub(crate) stats: Option<BandStats>,
-    pub(crate) stats_loading: bool,
+    pub(crate) last_scientific_band: Option<BandKey>,
+    pub(crate) stats_state: BandStatsState,
 }
 
 impl Default for ScientificStyle {
@@ -83,26 +98,84 @@ impl Default for ScientificStyle {
             custom_range_applied: false,
             colormap: ColormapId::Viridis,
             invert_colormap: false,
-            stats: None,
-            stats_loading: false,
+            last_scientific_band: None,
+            stats_state: BandStatsState::NotRequested,
         }
     }
 }
 
 impl ScientificStyle {
+    pub(crate) fn stats(&self) -> Option<&BandStats> {
+        match &self.stats_state {
+            BandStatsState::Ready(stats) => Some(stats),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        matches!(self.stats_state, BandStatsState::Loading { .. })
+    }
+
+    pub(crate) fn needs_stats(&self) -> bool {
+        matches!(self.stats_state, BandStatsState::NotRequested)
+    }
+
+    pub(crate) fn is_default_untouched(&self) -> bool {
+        self.preset == StretchPreset::Percentile2_98
+            && !self.custom_range_applied
+            && self.colormap == ColormapId::Viridis
+            && !self.invert_colormap
+    }
+
+    pub(crate) fn cancel_loading(&mut self) {
+        if let BandStatsState::Loading { cancel, .. } = &self.stats_state {
+            cancel.cancel();
+            self.stats_state = BandStatsState::NotRequested;
+        }
+    }
+
+    pub(crate) fn begin_loading(&mut self, job_id: u64, cancel: CancelToken) {
+        self.cancel_loading();
+        self.stats_state = BandStatsState::Loading { job_id, cancel };
+    }
+
     /// Apply newly computed [`BandStats`] to the stretch bounds unless the user
-    /// already pinned a custom range.
-    pub(crate) fn apply_stats(&mut self, stats: Option<BandStats>) {
-        self.stats_loading = false;
-        self.stats = stats;
+    /// already pinned a custom range, cancelling any superseded in-flight token.
+    pub(crate) fn apply_ready(&mut self, stats: BandStats) {
+        if let BandStatsState::Loading { cancel, .. } = &self.stats_state {
+            cancel.cancel();
+        }
+        self.stats_state = BandStatsState::Ready(Box::new(stats));
         if !self.custom_range_applied {
             self.recompute_bounds_from_stats();
         }
     }
 
+    /// Mark stats empty only if `job_id` matches the currently active job.
+    pub(crate) fn apply_empty(&mut self, job_id: u64) -> bool {
+        match &self.stats_state {
+            BandStatsState::Loading { job_id: active, .. } if *active == job_id => {
+                self.stats_state = BandStatsState::Empty;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Reset a cancelled loading job back to `NotRequested` without poisoning `Empty`.
+    pub(crate) fn apply_cancelled(&mut self, job_id: u64) -> bool {
+        match &self.stats_state {
+            BandStatsState::Loading { job_id: active, .. } if *active == job_id => {
+                self.stats_state = BandStatsState::NotRequested;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Recompute `(min, max)` from cached `stats` for the current `preset`.
     pub(crate) fn recompute_bounds_from_stats(&mut self) {
-        let Some(ref stats) = self.stats else {
+        let Some(stats) = self.stats().cloned() else {
             return;
         };
         match self.preset {
@@ -195,6 +268,21 @@ pub(crate) struct ColorbarInfo {
     pub(crate) invert_colormap: bool,
 }
 
+/// Forward-compatible `Option<T>` deserializer for string-encoded style enums:
+/// unknown variants written by newer versions fall back to `None` instead of
+/// failing the entire `session.json` load into `.corrupt`.
+fn deserialize_lossy_opt<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: for<'a> Deserialize<'a>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|s| {
+        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&s);
+        T::deserialize(de).ok()
+    }))
+}
+
 /// Optional persisted analytical rendering style stored inside `session.json`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -203,13 +291,16 @@ pub(crate) struct SavedLayerStyle {
     pub(crate) band_index: Option<u16>,
     /// Selected track (`"display"`, `"scientific"`, or `"categorical"`).
     pub(crate) track: Option<String>,
+    #[serde(deserialize_with = "deserialize_lossy_opt")]
     pub(crate) stretch_preset: Option<StretchPreset>,
     pub(crate) stretch_min: Option<f64>,
     pub(crate) stretch_max: Option<f64>,
     #[serde(default)]
     pub(crate) custom_stretch_range: bool,
+    #[serde(deserialize_with = "deserialize_lossy_opt")]
     pub(crate) colormap: Option<ColormapId>,
     pub(crate) invert_colormap: bool,
+    #[serde(deserialize_with = "deserialize_lossy_opt")]
     pub(crate) categorical_palette: Option<CategoricalPaletteId>,
 }
 

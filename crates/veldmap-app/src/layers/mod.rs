@@ -5,12 +5,13 @@
 
 mod crs_override;
 mod cursor;
+mod disk_cache;
 mod frame;
 mod io_worker;
 mod jobs;
+mod layer;
 mod manager;
 mod opener;
-mod qoi_cache;
 mod runtime;
 mod stack;
 mod style;
@@ -103,7 +104,7 @@ pub(crate) struct OverlayPersistEntry<'a> {
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
     pub(crate) crs_override: Option<&'a CrsOverride>,
-    pub(crate) style: SavedLayerStyle,
+    pub(crate) style: Option<SavedLayerStyle>,
 }
 
 /// Classified value returned by a zoom-invariant CPU cursor probe.
