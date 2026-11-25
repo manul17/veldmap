@@ -193,10 +193,17 @@ impl AppStorage {
         self.save_settings();
 
         let next_cache_bytes = self.settings.disk_cache_max_bytes();
-        if next_cache_bytes != prev_cache_bytes
-            && let Some(worker) = &self.disk_worker
-        {
-            worker.request_set_max_bytes(next_cache_bytes);
+        if next_cache_bytes != prev_cache_bytes {
+            if let Some(worker) = &self.disk_worker {
+                worker.request_set_max_bytes(next_cache_bytes);
+            } else if let Some(cache) = &self.disk_cache
+                && let Err(err) = cache.set_max_bytes(next_cache_bytes)
+            {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to update SQLite disk cache budget directly"
+                );
+            }
         }
         true
     }

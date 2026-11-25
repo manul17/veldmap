@@ -124,26 +124,7 @@ fn flattening_is_real_in_metres() {
 }
 
 #[test]
-fn between_follows_the_arc_not_the_degrees() {
-    let (ne, nw) = ((73.395_172, 2.707_061), (74.523_872, -10.408_985));
-    let arc = between(ne, nw, 0.5);
-    let flat = ((ne.0 + nw.0) / 2.0, (ne.1 + nw.1) / 2.0);
-    let apart = separation(arc, flat).to_radians() * SEMI_MAJOR_M;
-    assert!(
-        (12_000.0..14_000.0).contains(&apart),
-        "diverged by {apart:.0} m"
-    );
-    assert!(arc.0 > flat.0, "{} vs {}", arc.0, flat.0);
-
-    assert_eq!(between(ne, nw, 0.0), ne);
-    assert_eq!(between(ne, nw, 1.0), nw);
-}
-
-#[test]
-fn between_crosses_the_antimeridian_the_short_way() {
-    let (lat, lon) = between((10.0, 179.0), (10.0, -179.0), 0.5);
-    assert!((lon - 180.0).abs() < 1e-9, "{lon}");
-    assert!(lat > 10.0, "northern hemisphere arc bows poleward: {lat}");
+fn separation_crosses_the_antimeridian_the_short_way() {
     assert!((separation((10.0, 179.0), (10.0, -179.0)) - 1.9696).abs() < 1e-3);
 }
 
@@ -193,16 +174,12 @@ fn ray_hits_and_misses_in_metres() {
 }
 
 #[test]
-fn sub_metre_separation_and_between_preserve_precision() {
+fn sub_metre_separation_preserves_precision() {
     let p0 = (47.2357, 39.7015);
     let dlat = 0.01 / (SEMI_MAJOR_M * std::f64::consts::PI / 180.0);
     let p1 = (p0.0 + dlat, p0.1);
     let sep_m = separation(p0, p1).to_radians() * SEMI_MAJOR_M;
     assert!((sep_m - 0.01).abs() < 1e-6, "sep_m={sep_m}");
-
-    let mid = between(p0, p1, 0.5);
-    assert!((mid.0 - (p0.0 + 0.5 * dlat)).abs() < 1e-12);
-    assert!((mid.1 - p0.1).abs() < 1e-12);
 }
 
 #[test]

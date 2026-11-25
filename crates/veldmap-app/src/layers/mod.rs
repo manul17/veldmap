@@ -15,6 +15,7 @@ mod opener;
 mod runtime;
 mod stack;
 mod style;
+mod summary;
 
 use std::path::{Path, PathBuf};
 
@@ -22,10 +23,10 @@ use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::TileStreamSpec;
 use veldmap_raster::BandStats;
 
-use crate::render::{CategoricalPaletteId, ColormapId};
+use crate::colormap::{CategoricalPaletteId, ColormapId};
 
 pub(crate) use crs_override::CrsOverride;
-pub(crate) use manager::{OverlayFrameCtx, OverlayManager, OverlayMutation};
+pub(crate) use manager::{OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayMutation};
 pub(crate) use style::{ColorbarInfo, LayerBandOption, SavedLayerStyle, StretchPreset};
 
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].

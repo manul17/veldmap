@@ -6,15 +6,16 @@ use std::sync::Arc;
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::QuadTileId;
 use veldmap_net::{
-    BlobStoreError, DecodeFailure, DecodeRequest, TileBlobStore, TileDecodeExecutor,
+    BlobLease, BlobStoreError, DecodeFailure, DecodeRequest, TileBlobStore, TileDecodeExecutor,
 };
 use veldmap_raster::{DecodeJob, DecodeJobKey, DecodePoolHandle, decode_map_tile_with_mipmaps};
-use veldmap_storage::{DiskTileKey, StorageError, TileDiskCache};
+use veldmap_storage::{DiskTileEntry, DiskTileKey, StorageError, TileBlobEncoding, TileDiskCache};
 
 use crate::gpu_tiles::UploadSender;
 
 /// Adapter bridging `veldmap-storage`'s [`TileDiskCache`] into `veldmap-net`'s
-/// storage-agnostic [`TileBlobStore`] trait.
+/// storage-agnostic [`TileBlobStore`] trait using ABA-safe [`DiskTileEntry`]
+/// leases and cancellation-checked writes.
 pub(super) struct SqliteBlobStore(pub(super) Arc<TileDiskCache>);
 
 impl SqliteBlobStore {
@@ -34,19 +35,49 @@ impl SqliteBlobStore {
 }
 
 impl TileBlobStore for SqliteBlobStore {
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, BlobStoreError> {
+    fn get(
+        &self,
+        source_key: &str,
+        id: QuadTileId,
+    ) -> Result<Option<(Vec<u8>, BlobLease)>, BlobStoreError> {
         let key = Self::disk_key(source_key, id);
-        self.0.get(&key).map_err(Self::map_err)
+        let Some((entry, _, payload)) = self
+            .0
+            .get_encoded_entry(&key, Some(TileBlobEncoding::EncodedImage))
+            .map_err(Self::map_err)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((payload, BlobLease::new(entry))))
     }
 
-    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), BlobStoreError> {
-        let key = Self::disk_key(source_key, id);
-        self.0.put(&key, payload).map_err(Self::map_err)
+    fn touch(&self, lease: BlobLease) {
+        if let Some(entry) = lease.downcast::<DiskTileEntry>() {
+            self.0.touch_entry(entry);
+        }
     }
 
-    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), BlobStoreError> {
+    fn put(
+        &self,
+        source_key: &str,
+        id: QuadTileId,
+        payload: &[u8],
+        cancel: &CancelToken,
+    ) -> Result<(), BlobStoreError> {
         let key = Self::disk_key(source_key, id);
-        self.0.delete(&key).map(|_| ()).map_err(Self::map_err)
+        self.0
+            .put_encoded_if_uncancelled(&key, TileBlobEncoding::EncodedImage, payload, cancel)
+            .map_err(Self::map_err)
+    }
+
+    fn delete(&self, lease: BlobLease) -> Result<(), BlobStoreError> {
+        let Some(entry) = lease.downcast::<DiskTileEntry>() else {
+            return Ok(());
+        };
+        self.0
+            .delete_entry(entry)
+            .map(|_| ())
+            .map_err(Self::map_err)
     }
 }
 

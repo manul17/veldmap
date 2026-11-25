@@ -3,16 +3,15 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::layers::CrsOverride;
+use crate::layers::{CrsOverride, OverlayEdit};
 use crate::measure::{MeasureMode, MeasureSession};
-use crate::storage::session::{CameraBookmark, SavedCameraPose};
+use crate::storage::session::SavedCameraPose;
 use crate::ui::basemap::BasemapUiAction;
 use crate::ui::crs_picker::CrsPickerAction;
 use crate::ui::format;
 use crate::ui::layers::LayerUiAction;
 use crate::ui::measure::MeasureAction;
 use crate::ui::toolbar::ToolbarAction;
-use crate::vectors::is_geojson_path;
 
 use super::VeldmapApp;
 use super::dialogs::{DialogSpawnError, FileDialogEvent};
@@ -36,23 +35,8 @@ impl VeldmapApp {
     }
 
     fn open_local_path(&mut self, path: &Path, fly_to: bool, crs_override: Option<CrsOverride>) {
-        if is_geojson_path(path) {
-            if let Err(err) = self.scene.vectors().begin_open(path, fly_to, true, 1.0) {
-                tracing::warn!(path = %path.display(), error = %err, "Failed to queue GeoJSON open");
-                self.panels.layers.push_error(err);
-            }
-            return;
-        }
-
-        if let Err(err) = self.scene.overlays().begin_open_file_with_options(
-            path,
-            fly_to,
-            true,
-            1.0,
-            crs_override,
-            None,
-        ) {
-            tracing::warn!(path = %path.display(), error = %err, "Failed to queue overlay open");
+        if let Err(err) = self.scene.begin_open_local_path(path, fly_to, crs_override) {
+            tracing::warn!(path = %path.display(), error = %err, "Failed to queue local layer open");
             self.panels.layers.push_error(err);
         }
     }
@@ -123,12 +107,16 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 LayerUiAction::ToggleVisibility(id, visible) => {
-                    let changed = self.scene.set_overlay_visible(id, visible);
+                    let changed = self
+                        .scene
+                        .edit_overlay(id, OverlayEdit::SetVisible(visible));
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
                 LayerUiAction::SetOpacity(id, opacity, commit) => {
-                    let changed = self.scene.set_overlay_opacity(id, opacity);
+                    let changed = self
+                        .scene
+                        .edit_overlay(id, OverlayEdit::SetOpacity(opacity));
                     needs_repaint |= changed;
                     session_dirty |= commit;
                 }
@@ -145,32 +133,40 @@ impl VeldmapApp {
                     }
                 }
                 LayerUiAction::SetStretchPreset(id, preset) => {
-                    let changed = self.scene.set_overlay_stretch_preset(id, preset);
+                    let changed = self
+                        .scene
+                        .edit_overlay(id, OverlayEdit::SetStretchPreset(preset));
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
                 LayerUiAction::SetStretchRange(id, min, max, commit) => {
-                    let changed = self.scene.set_overlay_stretch_range(id, min, max);
+                    let changed = self
+                        .scene
+                        .edit_overlay(id, OverlayEdit::SetStretchRange { min, max });
                     needs_repaint |= changed;
                     session_dirty |= commit;
                 }
                 LayerUiAction::SetColormap(id, colormap, invert) => {
-                    let changed = self.scene.set_overlay_colormap(id, colormap, invert);
+                    let changed = self
+                        .scene
+                        .edit_overlay(id, OverlayEdit::SetColormap { colormap, invert });
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
                 LayerUiAction::SetCategoricalPalette(id, palette) => {
-                    let changed = self.scene.set_overlay_categorical_palette(id, palette);
+                    let changed = self
+                        .scene
+                        .edit_overlay(id, OverlayEdit::SetCategoricalPalette(palette));
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
                 LayerUiAction::MoveUp(id) => {
-                    let changed = self.scene.move_overlay_up(id);
+                    let changed = self.scene.edit_overlay(id, OverlayEdit::MoveUp);
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
                 LayerUiAction::MoveDown(id) => {
-                    let changed = self.scene.move_overlay_down(id);
+                    let changed = self.scene.edit_overlay(id, OverlayEdit::MoveDown);
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
@@ -195,7 +191,7 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 LayerUiAction::Remove(id) => {
-                    let changed = self.scene.remove_overlay(id);
+                    let changed = self.scene.edit_overlay(id, OverlayEdit::Remove);
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
@@ -253,14 +249,14 @@ impl VeldmapApp {
                 needs_repaint |= self
                     .storage
                     .mutate_settings(|s| s.active_basemap = selection);
-                needs_repaint |= self.scene.sync_basemap_settings(self.storage.settings());
+                needs_repaint |= self.scene.sync_settings(self.storage.settings());
                 self.panels
                     .basemap
                     .set_draft_active_basemap(self.storage.settings().active_basemap);
             }
             BasemapUiAction::ApplyDraft(draft) => {
                 needs_repaint |= self.storage.mutate_settings(|s| draft.apply_into(s));
-                needs_repaint |= self.scene.sync_basemap_settings(self.storage.settings());
+                needs_repaint |= self.scene.sync_settings(self.storage.settings());
                 self.panels
                     .basemap
                     .sync_from_settings(self.storage.settings());
@@ -327,8 +323,7 @@ impl VeldmapApp {
                     } else {
                         raw_name
                     };
-                    let bm = CameraBookmark { name, pose };
-                    let _ = self.storage.mutate_session(|s| s.bookmarks.push(bm));
+                    let _ = self.storage.mutate_session(|s| s.add_bookmark(name, pose));
                     needs_repaint = true;
                 }
                 ToolbarAction::GoToBookmark(bm) => {
@@ -341,11 +336,7 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 ToolbarAction::DeleteBookmark(idx) => {
-                    let _ = self.storage.mutate_session(|s| {
-                        if idx < s.bookmarks.len() {
-                            s.bookmarks.remove(idx);
-                        }
-                    });
+                    let _ = self.storage.mutate_session(|s| s.remove_bookmark(idx));
                     needs_repaint = true;
                 }
                 ToolbarAction::FocusLocation(loc) => {

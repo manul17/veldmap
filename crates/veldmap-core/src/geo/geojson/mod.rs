@@ -11,7 +11,8 @@ mod triangulate;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use super::footprint::{FootprintBounds, GeoPoint, Polygon, frame_coords};
+use super::footprint::{FootprintBounds, frame_coords};
+use super::shapes::{GeoPoint, Polygon};
 
 pub use export::export_geojson_feature_collection;
 pub use mesh::{DEFAULT_VECTOR_MAX_CHORD_DEG, VectorCluster, VectorMesh, VectorVertex};

@@ -12,6 +12,21 @@ use super::datum::{Datum, DatumWarning, PULKOVO_1942, WGS84_DATUM};
 use super::geodesy::{Ellipsoid, SEMI_MAJOR_M, unwind};
 use super::proj4::Proj4Projection;
 
+/// Base EPSG code for WGS 84 / UTM North zones (`UTM_NORTH_EPSG_BASE + zone`).
+pub(crate) const UTM_NORTH_EPSG_BASE: u32 = 32_600;
+
+/// Base EPSG code for WGS 84 / UTM South zones (`UTM_SOUTH_EPSG_BASE + zone`).
+pub(crate) const UTM_SOUTH_EPSG_BASE: u32 = 32_700;
+
+/// Valid UTM zone numbers (`1..=60`).
+pub(crate) const UTM_ZONES: std::ops::RangeInclusive<u32> = 1..=60;
+
+/// Base EPSG code for Pulkovo 1942 / Gauss-Kruger zones (`GK_PULKOVO_EPSG_BASE + zone`).
+pub(crate) const GK_PULKOVO_EPSG_BASE: u32 = 28_400;
+
+/// Valid Pulkovo 1942 / Gauss-Kruger EPSG zone numbers (`2..=32`).
+pub(crate) const GK_PULKOVO_ZONES: std::ops::RangeInclusive<u32> = 2..=32;
+
 /// Base regional pseudo-EPSG code for MSK-61 zones (`MSK61_EPSG_BASE + zone`).
 pub(crate) const MSK61_EPSG_BASE: u32 = 6_336_100;
 
@@ -312,18 +327,31 @@ impl System {
 
     /// Look up a transverse projection system by EPSG (or MSK-61 `633610x`) code.
     pub fn from_epsg(code: u32) -> Option<Self> {
-        match code {
-            32601..=32660 => Some(Self::utm(code - 32600, false)),
-            32701..=32760 => Some(Self::utm(code - 32700, true)),
-            28402..=28432 => Some(Self::gauss_kruger(code - 28400)),
-            code if code
-                .checked_sub(MSK61_EPSG_BASE)
-                .is_some_and(|zone| MSK61_ZONES.contains(&zone)) =>
-            {
-                Self::msk61(code - MSK61_EPSG_BASE)
-            }
-            _ => None,
+        if let Some(zone) = code
+            .checked_sub(UTM_NORTH_EPSG_BASE)
+            .filter(|z| UTM_ZONES.contains(z))
+        {
+            return Some(Self::utm(zone, false));
         }
+        if let Some(zone) = code
+            .checked_sub(UTM_SOUTH_EPSG_BASE)
+            .filter(|z| UTM_ZONES.contains(z))
+        {
+            return Some(Self::utm(zone, true));
+        }
+        if let Some(zone) = code
+            .checked_sub(GK_PULKOVO_EPSG_BASE)
+            .filter(|z| GK_PULKOVO_ZONES.contains(z))
+        {
+            return Some(Self::gauss_kruger(zone));
+        }
+        if let Some(zone) = code
+            .checked_sub(MSK61_EPSG_BASE)
+            .filter(|z| MSK61_ZONES.contains(z))
+        {
+            return Self::msk61(zone);
+        }
+        None
     }
 
     fn safe_unit_to_metres(&self) -> f64 {
@@ -343,13 +371,13 @@ impl System {
             && (self.safe_unit_to_metres() - 1.0).abs() < 1e-12
         {
             let zone_f = (self.central_meridian_deg + 183.0) / 6.0;
-            let zone = zone_f.round() as i32;
-            if (1..=60).contains(&zone) && (zone_f - f64::from(zone)).abs() < 1e-9 {
+            let zone = zone_f.round() as u32;
+            if UTM_ZONES.contains(&zone) && (zone_f - f64::from(zone)).abs() < 1e-9 {
                 if self.false_northing_m == 0.0 {
-                    return format!("EPSG:{} (UTM {zone}N)", 32600 + zone);
+                    return format!("EPSG:{} (UTM {zone}N)", UTM_NORTH_EPSG_BASE + zone);
                 }
                 if (self.false_northing_m - UTM_FALSE_NORTHING_SOUTH).abs() < 1e-6 {
-                    return format!("EPSG:{} (UTM {zone}S)", 32700 + zone);
+                    return format!("EPSG:{} (UTM {zone}S)", UTM_SOUTH_EPSG_BASE + zone);
                 }
             }
         }
@@ -360,12 +388,15 @@ impl System {
         {
             let zone_f = (self.central_meridian_deg + 3.0) / 6.0;
             let zone = zone_f.round() as u32;
-            if (2..=32).contains(&zone)
+            if GK_PULKOVO_ZONES.contains(&zone)
                 && (zone_f - f64::from(zone)).abs() < 1e-9
                 && (self.false_easting_m - (f64::from(zone) * 1_000_000.0 + 500_000.0)).abs() < 1e-3
                 && self.false_northing_m.abs() < 1e-3
             {
-                return format!("EPSG:{} (Pulkovo 1942 / GK zone {zone})", 28_400 + zone);
+                return format!(
+                    "EPSG:{} (Pulkovo 1942 / GK zone {zone})",
+                    GK_PULKOVO_EPSG_BASE + zone
+                );
             }
             for zone in MSK61_ZONES {
                 if let Some(msk) = Self::msk61(zone)

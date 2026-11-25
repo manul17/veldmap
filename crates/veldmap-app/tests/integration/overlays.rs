@@ -9,18 +9,18 @@ use std::sync::Arc;
 use veldmap_app::gpu_tiles::{GpuTile, GpuTileCache};
 use veldmap_app::render::{
     CategoricalPaletteId, ColormapId, DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack,
-    GlobeRenderer, OverlayMeshKey, RenderParams, TileBindGroupCache,
+    OverlayMeshKey, RenderParams,
 };
 use veldmap_core::geo::{Camera, Frame, Projection};
 use veldmap_core::tile::{
     BandKey, DecodedTile, MIN_WARP_SEGMENTS, PixelFormat, QuadtreeConfig, SourceId, TileKey,
     TileScheme, build_warp_patch, level_segments,
 };
-use veldmap_raster::generate_scientific_mipmaps;
+use veldmap_raster::generate_tile_mipmaps;
 
 use crate::common::{
-    build_empty_snapshot, is_clear_background, pixel_at, render_srgb, render_srgb_with_bind_groups,
-    render_with, shared_headless_device,
+    TestGlobe, build_empty_snapshot, is_clear_background, pixel_at, render_srgb, render_with,
+    shared_headless_device,
 };
 
 fn single_patch_layer(
@@ -95,7 +95,7 @@ fn overlay_warp_mesh_drapes_with_south_up_winding_graticule_on_top_and_zero_idle
     };
 
     let (width, height) = (128u32, 128u32);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
 
     let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
@@ -188,8 +188,8 @@ fn overlay_warp_mesh_drapes_with_south_up_winding_graticule_on_top_and_zero_idle
         drop(snap_grid);
         drop(gpu_tile);
         gpu_cache.remove_source(src);
-        renderer.sweep_stale_bind_groups();
-        assert_eq!(renderer.cached_tile_bind_group_count(), 0);
+        renderer.bind_groups.sweep_stale();
+        assert_eq!(renderer.bind_groups.len(), 0);
     }
 }
 
@@ -200,7 +200,7 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
     };
 
     let (width, height) = (128u32, 128u32);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
     let config = QuadtreeConfig::default();
 
@@ -316,7 +316,7 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
     };
 
     let (width, height) = (128u32, 128u32);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
 
     let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
@@ -402,12 +402,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     };
 
     let (width, height) = (128u32, 128u32);
-    let mut shared_bg = TileBindGroupCache::new(device);
-    let mut renderer = GlobeRenderer::new_with_shared_bind_groups(
-        device,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        &shared_bg,
-    );
+    let mut globe = TestGlobe::new_srgb(device);
     let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
 
     let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
@@ -462,7 +457,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     }
     let mut dec_sci =
         DecodedTile::try_new(64, 64, PixelFormat::R32Float, f32_bytes).expect("r32f tile");
-    generate_scientific_mipmaps(&mut dec_sci);
+    generate_tile_mipmaps(&mut dec_sci);
     assert!(dec_sci.mip_level_count() > 1);
     let (tex_sci, _) = gpu_cache
         .upload_and_insert(device, queue, k_sci, &dec_sci)
@@ -511,16 +506,8 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         }],
     });
     let snap = Arc::new(snap);
-    // Render and read back directly through the hoisted `shared_bg` cache.
-    let pixels = render_srgb_with_bind_groups(
-        &mut renderer,
-        &mut shared_bg,
-        device,
-        queue,
-        width,
-        height,
-        &snap,
-    );
+    // Render and read back directly through the hoisted `bind_groups` cache.
+    let pixels = render_srgb(&mut globe, device, queue, width, height, &snap);
     let left_px = pixel_at(&pixels, width, width / 2 - 20, height / 2);
     assert!(
         left_px[0] < 20 && left_px[1] > 235 && left_px[2] < 20,
@@ -575,22 +562,13 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         }],
     });
     let snap_db = Arc::new(snap_db);
-    let pixels_db = render_srgb_with_bind_groups(
-        &mut renderer,
-        &mut shared_bg,
-        device,
-        queue,
-        width,
-        height,
-        &snap_db,
-    );
+    let pixels_db = render_srgb(&mut globe, device, queue, width, height, &snap_db);
     let db_right = pixel_at(&pixels_db, width, width / 2 + 20, height / 2);
     assert!(
         db_right[0] < 15 && db_right[1] < 15 && db_right[2] < 15,
         "20 dB value at stretch_min=20 dB must map to black, got {db_right:?}"
     );
     let db_left = pixel_at(&pixels_db, width, width / 2 - 20, height / 2);
-    let mut standalone = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
     assert!(
         db_left[0] < 20 && db_left[1] > 235 && db_left[2] < 20,
         "dB stretch must still discard NaN/±Inf to green base, got {db_left:?}"
@@ -641,7 +619,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         }],
     });
     let snap_far = Arc::new(snap_far);
-    let pixels_far = render_srgb(&mut standalone, device, queue, width, height, &snap_far);
+    let pixels_far = render_srgb(&mut globe, device, queue, width, height, &snap_far);
     let far_right = pixel_at(&pixels_far, width, width / 2 + 4, height / 2);
     assert!(
         far_right[0] > 230 && far_right[1] > 230 && far_right[2] > 230,
@@ -718,7 +696,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         }],
     });
     let snap_cat = Arc::new(snap_cat);
-    let pixels_cat = render_srgb(&mut standalone, device, queue, width, height, &snap_cat);
+    let pixels_cat = render_srgb(&mut globe, device, queue, width, height, &snap_cat);
     let cat_left = pixel_at(&pixels_cat, width, width / 2 - 20, height / 2);
     assert!(
         cat_left[0] < 20 && cat_left[1] > 235 && cat_left[2] < 20,
@@ -793,15 +771,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         }],
     });
     let snap_cat16 = Arc::new(snap_cat16);
-    let pixels_cat16 = render_srgb_with_bind_groups(
-        &mut renderer,
-        &mut shared_bg,
-        device,
-        queue,
-        width,
-        height,
-        &snap_cat16,
-    );
+    let pixels_cat16 = render_srgb(&mut globe, device, queue, width, height, &snap_cat16);
     let cat16_left = pixel_at(&pixels_cat16, width, width / 2 - 20, height / 2);
     assert!(
         cat16_left[0] < 20 && cat16_left[1] > 235 && cat16_left[2] < 20,
@@ -814,7 +784,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     );
 
     // Verify hoisted multi-format TileBindGroupCache sweeps cleanly once evicted.
-    assert!(shared_bg.len() >= 3);
+    assert!(globe.bind_groups.len() >= 3);
     drop(snap);
     drop(snap_db);
     drop(snap_far);
@@ -828,6 +798,6 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     gpu_cache.remove_source(src_sci);
     gpu_cache.remove_source(src_cat8);
     gpu_cache.remove_source(src_cat16);
-    shared_bg.sweep_stale();
-    assert_eq!(shared_bg.len(), 0);
+    globe.bind_groups.sweep_stale();
+    assert_eq!(globe.bind_groups.len(), 0);
 }

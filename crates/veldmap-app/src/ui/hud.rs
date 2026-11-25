@@ -4,7 +4,7 @@
 use eframe::egui;
 
 use crate::layers::ColorbarInfo;
-use crate::render::sample_colormap_srgb;
+use crate::ui::widgets::paint_colormap_ramp;
 
 const HUD_PANEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(11, 19, 32, 196);
 const HUD_PANEL_BG_HOVER: egui::Color32 =
@@ -277,36 +277,14 @@ pub(crate) fn paint_attribution_badge(
     Some(badge_rect)
 }
 
-/// Paint a horizontal linear colormap gradient strip cleanly clipped to `rect`.
-pub(crate) fn paint_colormap_ramp(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    colormap: crate::render::ColormapId,
-    invert: bool,
-    steps: usize,
-) {
-    let steps = steps.max(2);
-    let seg_w = rect.width() / (steps as f32);
-    for i in 0..steps {
-        let t = (i as f32) / ((steps - 1) as f32);
-        let [r, g, b, _] = sample_colormap_srgb(colormap, t, invert);
-        let x0 = rect.left() + (i as f32) * seg_w;
-        let x1 = (rect.left() + ((i + 1) as f32) * seg_w + 0.5).min(rect.right());
-        let seg =
-            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom()));
-        painter.rect_filled(seg, 0.0, egui::Color32::from_rgb(r, g, b));
-    }
-}
-
-fn format_colorbar_tick(v: f64) -> String {
-    super::format::format_scalar(v)
-}
-
 /// Paint a floating horizontal colorbar HUD above the bottom-left scale bar
-/// whenever the topmost active overlay is on a scientific (`R32Float`) track.
+/// (or anchored directly to the bottom-left margin when the scale bar is hidden
+/// at extreme orbital zoom) whenever the topmost active overlay is on a
+/// scientific (`R32Float`) track.
 pub(crate) fn paint_colorbar(
     painter: &egui::Painter,
     viewport_rect: egui::Rect,
+    scale_rect: Option<egui::Rect>,
     info: &ColorbarInfo,
 ) -> Option<egui::Rect> {
     if viewport_rect.width() < 260.0 || viewport_rect.height() < 150.0 {
@@ -315,12 +293,11 @@ pub(crate) fn paint_colorbar(
     let box_w = (viewport_rect.width() * 0.28).clamp(180.0, 260.0);
     let box_h = 54.0;
     let margin_x = SCALE_BAR_MARGIN_PT;
-    // Sit cleanly above the bottom-left scale bar (`34 pt + 16 pt margin + 8 pt gap`).
+    let bottom_y = scale_rect.map_or(viewport_rect.bottom() - SCALE_BAR_MARGIN_PT, |sr| {
+        sr.top() - 8.0
+    });
     let box_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            viewport_rect.left() + margin_x,
-            viewport_rect.bottom() - 58.0 - box_h,
-        ),
+        egui::pos2(viewport_rect.left() + margin_x, bottom_y - box_h),
         egui::vec2(box_w, box_h),
     );
 
@@ -366,21 +343,21 @@ pub(crate) fn paint_colorbar(
     painter.text(
         egui::pos2(bar_rect.left(), tick_y),
         egui::Align2::LEFT_CENTER,
-        format_colorbar_tick(info.min),
+        super::format::format_scalar(info.min),
         tick_font.clone(),
         HUD_INK_PRIMARY,
     );
     painter.text(
         egui::pos2(bar_rect.center().x, tick_y),
         egui::Align2::CENTER_CENTER,
-        format_colorbar_tick(mid),
+        super::format::format_scalar(mid),
         tick_font.clone(),
         HUD_INK_PRIMARY,
     );
     painter.text(
         egui::pos2(bar_rect.right(), tick_y),
         egui::Align2::RIGHT_CENTER,
-        format_colorbar_tick(info.max),
+        super::format::format_scalar(info.max),
         tick_font,
         HUD_INK_PRIMARY,
     );

@@ -145,7 +145,7 @@ pub(super) async fn run_disk_lookup(
 
     match read_outcome {
         DiskReadOutcome::Cancelled => {}
-        DiskReadOutcome::Hit(bytes) => {
+        DiskReadOutcome::Hit(bytes, lease) => {
             let Some((guard, outcome)) =
                 submit_and_await_decode(&ctx, key, Arc::from(bytes), &cancel, guard, true).await
             else {
@@ -153,6 +153,7 @@ pub(super) async fn run_disk_lookup(
             };
             match outcome {
                 DecodeOutcome::Ok => {
+                    gate.touch_async(lease, &ctx.shared.shutdown);
                     guard.finish(|st, key, generation| st.mark_completed(key, generation, true));
                 }
                 DecodeOutcome::InvalidPayload(err) => {
@@ -161,7 +162,7 @@ pub(super) async fn run_disk_lookup(
                         error = %err,
                         "Cached disk tile failed decode; deleting corrupt entry and falling back to HTTP"
                     );
-                    gate.delete_corrupt(spec, key, id, &cancel).await;
+                    gate.delete_corrupt(lease, key, &cancel).await;
                     promote_to_http(&cancel, guard);
                 }
             }

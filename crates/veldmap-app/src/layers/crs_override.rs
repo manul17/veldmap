@@ -12,16 +12,6 @@ pub(crate) enum CrsOverride {
     CustomTm(CustomTmParams),
 }
 
-fn parse_epsg_shorthand(trimmed: &str) -> Option<u32> {
-    if let Some(rest) = trimmed
-        .strip_prefix("EPSG:")
-        .or_else(|| trimmed.strip_prefix("epsg:"))
-    {
-        return rest.trim().parse::<u32>().ok();
-    }
-    trimmed.parse::<u32>().ok()
-}
-
 impl CrsOverride {
     /// Parse and validate a user-entered CRS text (WKT1/WKT2, PROJ.4, or
     /// `EPSG:<code>` / bare numeric EPSG shorthand), stripping any leading
@@ -31,13 +21,8 @@ impl CrsOverride {
         let (_, kind) = CrsSpec::parse_text(trimmed).map_err(|e| e.to_string())?;
         match kind {
             CrsTextKind::Wkt => Ok(Self::Wkt(trimmed.to_owned())),
-            CrsTextKind::UserString => {
-                if let Some(code) = parse_epsg_shorthand(trimmed) {
-                    Ok(Self::Epsg(code))
-                } else {
-                    Ok(Self::Proj(trimmed.to_owned()))
-                }
-            }
+            CrsTextKind::Epsg(code) => Ok(Self::Epsg(code)),
+            CrsTextKind::Proj => Ok(Self::Proj(trimmed.to_owned())),
         }
     }
 

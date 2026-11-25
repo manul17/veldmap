@@ -66,14 +66,6 @@ const UPSERT_BLOB_SQL: &str = "INSERT INTO tile_blobs (tile_id, payload)
 const TOUCH_META_SQL: &str =
     "UPDATE tile_meta SET last_used_ms = ?1 WHERE tile_id = ?2 AND last_used_ms < ?1";
 
-const DELETE_META_BY_KEY_SQL: &str = concat!(
-    "DELETE FROM tile_meta
-     WHERE ",
-    key_where_sql!(),
-    "
-     RETURNING tile_id, byte_size"
-);
-
 const DELETE_META_BY_ID_SQL: &str = "DELETE FROM tile_meta WHERE tile_id = ?1";
 
 const DELETE_META_BY_ID_AND_TS_SQL: &str =
@@ -189,21 +181,6 @@ pub(super) fn flush_touches_in_tx(
     Ok(())
 }
 
-pub(super) fn delete_tile_in_tx(
-    tx: &Transaction<'_>,
-    enc: &EncodedKey<'_>,
-) -> Result<Option<i64>, rusqlite::Error> {
-    let mut stmt = tx.prepare(DELETE_META_BY_KEY_SQL)?;
-    let deleted: Option<(i64, i64)> = stmt
-        .query_row(enc.key_params(), |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let Some((tile_id, sz)) = deleted else {
-        return Ok(None);
-    };
-    decrement_cache_meta(tx, sz.max(0), 1)?;
-    Ok(Some(tile_id))
-}
-
 pub(super) fn delete_entry_in_tx(
     tx: &Transaction<'_>,
     tile_id: i64,
@@ -218,20 +195,6 @@ pub(super) fn delete_entry_in_tx(
     };
     decrement_cache_meta(tx, sz.max(0), 1)?;
     Ok(true)
-}
-
-pub(super) fn delete_meta_ids(
-    tx: &Transaction<'_>,
-    tile_ids: &[i64],
-) -> Result<(), rusqlite::Error> {
-    if tile_ids.is_empty() {
-        return Ok(());
-    }
-    let mut stmt = tx.prepare(DELETE_META_BY_ID_SQL)?;
-    for &tile_id in tile_ids {
-        stmt.execute(params![tile_id])?;
-    }
-    Ok(())
 }
 
 pub(super) fn clear_source_in_tx(
@@ -285,21 +248,52 @@ fn collect_evict_rows(
     Ok(batch)
 }
 
-pub(super) fn select_evict_batch(
-    tx: &Transaction<'_>,
-    limit: i64,
+/// Transaction-scoped prepared statements for batched LRU eviction, avoiding
+/// re-preparing the `SELECT` and `DELETE` SQL inside multi-batch loops.
+pub(super) struct TileEvictor<'tx> {
+    select_batch: Statement<'tx>,
+    delete_meta: Statement<'tx>,
     protect_id: Option<i64>,
-) -> Result<Vec<(i64, u64, i64)>, rusqlite::Error> {
-    // `ORDER BY last_used_ms ASC` (without `, tile_id ASC`) lets SQLite satisfy
-    // the query directly from covering index `idx_tile_meta_lru (last_used_ms,
-    // byte_size)` with zero temp B-tree sorting and zero table lookups.
-    let capacity = limit.max(0) as usize;
-    if let Some(protected) = protect_id {
-        let mut stmt = tx.prepare(SELECT_EVICT_BATCH_PROTECTED_SQL)?;
-        collect_evict_rows(&mut stmt, params![protected, limit], capacity)
-    } else {
-        let mut stmt = tx.prepare(SELECT_EVICT_BATCH_SQL)?;
-        collect_evict_rows(&mut stmt, params![limit], capacity)
+}
+
+impl<'tx> TileEvictor<'tx> {
+    pub(super) fn new(
+        tx: &'tx Transaction<'_>,
+        protect_id: Option<i64>,
+    ) -> Result<Self, rusqlite::Error> {
+        // `ORDER BY last_used_ms ASC` (without `, tile_id ASC`) lets SQLite
+        // satisfy the query directly from covering index `idx_tile_meta_lru
+        // (last_used_ms, byte_size)` with zero temp B-tree sorting and zero
+        // table lookups.
+        let select_sql = if protect_id.is_some() {
+            SELECT_EVICT_BATCH_PROTECTED_SQL
+        } else {
+            SELECT_EVICT_BATCH_SQL
+        };
+        Ok(Self {
+            select_batch: tx.prepare(select_sql)?,
+            delete_meta: tx.prepare(DELETE_META_BY_ID_SQL)?,
+            protect_id,
+        })
+    }
+
+    pub(super) fn select_batch(
+        &mut self,
+        limit: i64,
+    ) -> Result<Vec<(i64, u64, i64)>, rusqlite::Error> {
+        let capacity = limit.max(0) as usize;
+        if let Some(protected) = self.protect_id {
+            collect_evict_rows(&mut self.select_batch, params![protected, limit], capacity)
+        } else {
+            collect_evict_rows(&mut self.select_batch, params![limit], capacity)
+        }
+    }
+
+    pub(super) fn delete_ids(&mut self, tile_ids: &[i64]) -> Result<(), rusqlite::Error> {
+        for &tile_id in tile_ids {
+            self.delete_meta.execute(params![tile_id])?;
+        }
+        Ok(())
     }
 }
 
@@ -334,7 +328,6 @@ fn decrement_cache_meta(
 mod tests {
     use super::*;
     use crate::test_support::TestTempDir;
-    use crate::tile_cache::evict::EVICT_BATCH_ROWS;
     use crate::tile_cache::schema::open_and_init_file_db;
 
     #[test]
@@ -349,7 +342,7 @@ mod tests {
             ))
             .expect("explain");
         let details: Vec<String> = stmt
-            .query_map(params![1i64, EVICT_BATCH_ROWS], |r| r.get::<_, String>(3))
+            .query_map(params![1i64, 128i64], |r| r.get::<_, String>(3))
             .expect("query plan")
             .map(|r| r.expect("plan row"))
             .collect();

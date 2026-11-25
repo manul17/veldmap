@@ -5,13 +5,14 @@
 //! GeoJSON [`VectorManager`], interactive geodesic [`MeasureSession`], cached
 //! immutable [`DrawSnapshot`], and monotonic `scene_generation`.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::{SourceId, TileStreamSpec};
+use veldmap_core::tile::{SourceId, StreamKey, TileStreamSpec};
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
@@ -21,15 +22,13 @@ use crate::gpu_tiles::{
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::layers::{
-    CrsOverride, CursorReadout, LayerId, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
-    OverlayMutation, StretchPreset,
+    CrsOverride, CursorReadout, LayerId, OverlayEdit, OverlayFrameCtx, OverlayIoEvent,
+    OverlayManager, OverlayMutation, SavedLayerStyle,
 };
 use crate::measure::MeasureSession;
-use crate::render::{
-    CategoricalPaletteId, ColormapId, DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy,
-};
+use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
 use crate::storage::settings::AppSettings;
-use crate::vectors::{VectorIoEvent, VectorLayerId, VectorManager};
+use crate::vectors::{VectorIoEvent, VectorLayerId, VectorManager, is_geojson_path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SnapshotKey {
@@ -132,7 +131,7 @@ impl SceneState {
         let decode_pool = TwoLaneDecodePool::spawn(decode_cfg, decode_shutdown.clone());
 
         let basemap = BasemapManager::new(
-            settings,
+            settings.basemap_config(),
             disk_cache.clone(),
             done_tx.clone(),
             Arc::clone(&wakeup),
@@ -169,18 +168,10 @@ impl SceneState {
         Ok(scene)
     }
 
-    fn pinned_root_streams(&self) -> Vec<veldmap_core::tile::StreamKey> {
-        let display_stream = |source: SourceId| {
-            veldmap_core::tile::StreamKey::new(
-                source,
-                veldmap_core::tile::BandKey::Display,
-                veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
-                0,
-            )
-        };
+    fn pinned_root_streams(&self) -> Vec<StreamKey> {
         let mut streams = vec![
-            display_stream(self.basemap.active_source()),
-            display_stream(SourceId::BUNDLED_BASEMAP),
+            StreamKey::display(self.basemap.active_source()),
+            StreamKey::display(SourceId::BUNDLED_BASEMAP),
         ];
         self.overlays.extend_pinned_root_streams(&mut streams);
         streams
@@ -272,6 +263,54 @@ impl SceneState {
         }
     }
 
+    /// Queue a non-blocking local raster or GeoJSON vector open based on path
+    /// extension.
+    pub(crate) fn begin_open_local_path(
+        &self,
+        path: &Path,
+        fly_to: bool,
+        crs_override: Option<CrsOverride>,
+    ) -> Result<(), String> {
+        if is_geojson_path(path) {
+            self.begin_open_vector(path, fly_to, true, 1.0)
+        } else {
+            self.begin_open_overlay(path, fly_to, true, 1.0, crs_override, None)
+        }
+    }
+
+    /// Queue a non-blocking local raster overlay open with explicit initial
+    /// display/style/CRS options (used by session restoration and local open).
+    pub(crate) fn begin_open_overlay(
+        &self,
+        path: &Path,
+        fly_to: bool,
+        visible: bool,
+        opacity: f32,
+        crs_override: Option<CrsOverride>,
+        style: Option<SavedLayerStyle>,
+    ) -> Result<(), String> {
+        self.overlays.begin_open_file_with_options(
+            path,
+            fly_to,
+            visible,
+            opacity,
+            crs_override,
+            style,
+        )
+    }
+
+    /// Queue a non-blocking GeoJSON vector layer open with explicit initial
+    /// visibility and opacity.
+    pub(crate) fn begin_open_vector(
+        &self,
+        path: &Path,
+        fly_to: bool,
+        visible: bool,
+        opacity: f32,
+    ) -> Result<(), String> {
+        self.vectors.begin_open(path, fly_to, visible, opacity)
+    }
+
     pub(crate) fn set_vector_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
         let changed = self.vectors.set_visible(id, visible);
         self.mark_dirty_if(changed)
@@ -299,14 +338,11 @@ impl SceneState {
         mutation.changed
     }
 
-    pub(crate) fn move_overlay_up(&mut self, id: LayerId) -> bool {
-        let changed = self.overlays.move_layer_up(id);
-        self.mark_dirty_if(changed)
-    }
-
-    pub(crate) fn move_overlay_down(&mut self, id: LayerId) -> bool {
-        let changed = self.overlays.move_layer_down(id);
-        self.mark_dirty_if(changed)
+    /// Apply an infallible [`OverlayEdit`] to `id` and synchronize caches and
+    /// `scene_generation`.
+    pub(crate) fn edit_overlay(&mut self, id: LayerId, edit: OverlayEdit) -> bool {
+        let mutation = self.overlays.edit_layer(id, edit);
+        self.apply_overlay_mutation(mutation)
     }
 
     pub(crate) fn override_overlay_crs(
@@ -346,24 +382,6 @@ impl SceneState {
         events
     }
 
-    /// Remove an overlay layer and reclaim its VRAM/pending/chunk state.
-    pub(crate) fn remove_overlay(&mut self, id: LayerId) -> bool {
-        let mutation = self.overlays.remove_layer(id);
-        self.apply_overlay_mutation(mutation)
-    }
-
-    /// Toggle visibility of an overlay layer.
-    pub(crate) fn set_overlay_visible(&mut self, id: LayerId, visible: bool) -> bool {
-        let mutation = self.overlays.set_visible(id, visible);
-        self.apply_overlay_mutation(mutation)
-    }
-
-    /// Set opacity (`0.0..=1.0`) of an overlay layer.
-    pub(crate) fn set_overlay_opacity(&mut self, id: LayerId, opacity: f32) -> bool {
-        let changed = self.overlays.set_opacity(id, opacity);
-        self.mark_dirty_if(changed)
-    }
-
     pub(crate) fn set_overlay_stream(
         &mut self,
         id: LayerId,
@@ -373,43 +391,10 @@ impl SceneState {
         Ok(self.apply_overlay_mutation(mutation))
     }
 
-    pub(crate) fn set_overlay_stretch_preset(
-        &mut self,
-        id: LayerId,
-        preset: StretchPreset,
-    ) -> bool {
-        let changed = self.overlays.set_stretch_preset(id, preset);
-        self.mark_dirty_if(changed)
-    }
-
-    pub(crate) fn set_overlay_stretch_range(&mut self, id: LayerId, min: f64, max: f64) -> bool {
-        let changed = self.overlays.set_stretch_range(id, min, max);
-        self.mark_dirty_if(changed)
-    }
-
-    pub(crate) fn set_overlay_colormap(
-        &mut self,
-        id: LayerId,
-        colormap: ColormapId,
-        invert: bool,
-    ) -> bool {
-        let changed = self.overlays.set_colormap(id, colormap, invert);
-        self.mark_dirty_if(changed)
-    }
-
-    pub(crate) fn set_overlay_categorical_palette(
-        &mut self,
-        id: LayerId,
-        palette: CategoricalPaletteId,
-    ) -> bool {
-        let changed = self.overlays.set_categorical_palette(id, palette);
-        self.mark_dirty_if(changed)
-    }
-
     /// Synchronize basemap providers and GPU tile cache cap with updated
     /// [`AppSettings`], purging any superseded live source from VRAM / pending
     /// uploads and updating pinned roots.
-    pub(crate) fn sync_basemap_settings(&mut self, settings: &AppSettings) -> bool {
+    pub(crate) fn sync_settings(&mut self, settings: &AppSettings) -> bool {
         let next_gpu_cap =
             settings.effective_gpu_tile_cache_bytes(self.default_gpu_tile_cache_bytes);
         let mut gpu_changed = false;
@@ -417,7 +402,7 @@ impl SceneState {
             self.gpu_tile_cache.set_max_bytes(next_gpu_cap);
             gpu_changed = true;
         }
-        let outcome = self.basemap.sync_settings(settings);
+        let outcome = self.basemap.sync_settings(settings.basemap_config());
         if let Some(evict) = outcome.evict_source {
             self.purge_source_caches(evict);
         }

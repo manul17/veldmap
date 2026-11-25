@@ -133,16 +133,6 @@ impl TileScheme {
         }
     }
 
-    /// Return the grid dimensions `(cols, rows)` at `level` for planetary
-    /// schemes, or `None` for raster pyramids (whose dimensions depend on the
-    /// underlying raster) or out-of-range shift levels.
-    pub const fn grid_dims(self, level: u8) -> Option<(u32, u32)> {
-        match self.as_planetary() {
-            Some(p) => p.grid_dims(level),
-            None => None,
-        }
-    }
-
     /// Return the coarser parent tile `(parent_level, parent_x, parent_y)`, or
     /// `None` if `(level, x, y)` is already at the coarsest root of the scheme
     /// (or above `max_level` for `RasterPyramid`).

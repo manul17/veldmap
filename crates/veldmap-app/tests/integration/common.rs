@@ -203,8 +203,41 @@ pub(crate) fn readback_rgba8(
     pixels
 }
 
+/// Headless test harness pairing a [`GlobeRenderer`] with its hoisted
+/// [`TileBindGroupCache`].
+pub(crate) struct TestGlobe {
+    pub(crate) renderer: GlobeRenderer,
+    pub(crate) bind_groups: TileBindGroupCache,
+}
+
+impl TestGlobe {
+    pub(crate) fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let bind_groups = TileBindGroupCache::new(device);
+        let renderer = GlobeRenderer::new(device, target_format, &bind_groups);
+        Self {
+            renderer,
+            bind_groups,
+        }
+    }
+
+    pub(crate) fn new_srgb(device: &wgpu::Device) -> Self {
+        Self::new(device, wgpu::TextureFormat::Rgba8UnormSrgb)
+    }
+
+    pub(crate) fn render_if_dirty(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: RenderParams<'_>,
+    ) -> bool {
+        self.renderer
+            .render_if_dirty(device, queue, encoder, params, &mut self.bind_groups)
+    }
+}
+
 pub(crate) fn render_with(
-    renderer: &mut GlobeRenderer,
+    globe: &mut TestGlobe,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     target_format: wgpu::TextureFormat,
@@ -215,7 +248,7 @@ pub(crate) fn render_with(
         label: Some("smoke render encoder"),
     });
 
-    let rendered = renderer.render_if_dirty(device, queue, &mut encoder, params);
+    let rendered = globe.render_if_dirty(device, queue, &mut encoder, params);
     assert_eq!(rendered, expect_rendered);
 
     let composite_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -251,7 +284,7 @@ pub(crate) fn render_with(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        renderer.composite_into(&mut pass);
+        globe.renderer.composite_into(&mut pass);
     }
 
     queue.submit(Some(encoder.finish()));
@@ -259,7 +292,7 @@ pub(crate) fn render_with(
 }
 
 pub(crate) fn render_srgb(
-    renderer: &mut GlobeRenderer,
+    globe: &mut TestGlobe,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     width: u32,
@@ -267,7 +300,7 @@ pub(crate) fn render_srgb(
     snapshot: &Arc<DrawSnapshot>,
 ) -> Vec<u8> {
     render_with(
-        renderer,
+        globe,
         device,
         queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -278,69 +311,6 @@ pub(crate) fn render_srgb(
         },
         true,
     )
-}
-
-pub(crate) fn render_srgb_with_bind_groups(
-    renderer: &mut GlobeRenderer,
-    bind_groups: &mut TileBindGroupCache,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    width: u32,
-    height: u32,
-    snapshot: &Arc<DrawSnapshot>,
-) -> Vec<u8> {
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("shared-bg smoke render encoder"),
-    });
-    let rendered = renderer.render_if_dirty_with_bind_groups(
-        device,
-        queue,
-        &mut encoder,
-        RenderParams {
-            width,
-            height,
-            snapshot,
-        },
-        bind_groups,
-    );
-    assert!(rendered, "expected shared-bind-groups render to run");
-
-    let composite_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("composite target (shared bg)"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let composite_view = composite_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("composite pass (shared bg)"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &composite_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        renderer.composite_into(&mut pass);
-    }
-    queue.submit(Some(encoder.finish()));
-    readback_rgba8(device, queue, &composite_tex, width, height)
 }
 
 pub(crate) fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {

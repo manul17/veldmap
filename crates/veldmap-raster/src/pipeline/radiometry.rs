@@ -22,7 +22,7 @@ pub(crate) fn is_data_f64(value: f64, nodata: Option<f64>) -> bool {
 
 /// Decode an IEEE-754 binary16 (`f16`) bit pattern into `f32` without extra
 /// crate dependencies.
-pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
+fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits & 0x8000) << 16;
     let exp = u32::from((bits >> 10) & 0x1F);
     let mant = u32::from(bits & 0x03FF);
@@ -157,7 +157,7 @@ pub(crate) fn expand_u8_into_rgba(
 
 /// Expand raw 8-bit samples directly to RGBA8 without stretching or nodata
 /// keying.
-pub(crate) fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
+fn to_rgba8(samples: &[u8], pixel: PixelLayout, pixels: usize) -> Vec<u8> {
     let mut rgba = Vec::new();
     expand_u8_into_rgba(samples, pixel, pixels, &mut rgba);
     rgba

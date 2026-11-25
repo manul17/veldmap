@@ -52,7 +52,7 @@ impl RasterSource for StubSource {
         &self.desc
     }
 
-    fn pyramid_meta_for(
+    fn pyramid_meta(
         &self,
         spec: veldmap_core::tile::TileStreamSpec,
     ) -> Result<veldmap_raster::PyramidMeta, RasterError> {
@@ -63,25 +63,28 @@ impl RasterSource for StubSource {
         })
     }
 
-    fn pass_peak_bytes(&self) -> u64 {
+    fn pass_peak_bytes(&self, _spec: veldmap_core::tile::TileStreamSpec) -> u64 {
         1024
     }
 
     fn produce_pass(
         &self,
+        _spec: veldmap_core::tile::TileStreamSpec,
         _ctx: &DecodeContext<'_>,
         _emit: TileEmit<'_>,
     ) -> Result<(), RasterError> {
         Ok(())
     }
 
-    fn sample_display_rgba(
+    fn sample_band(
         &self,
+        _band: veldmap_core::tile::BandKey,
+        _format: veldmap_core::tile::PixelFormat,
         _px: u32,
         _py: u32,
         _ctx: &DecodeContext<'_>,
-    ) -> Result<Option<[u8; 4]>, RasterError> {
-        Ok(None)
+    ) -> Result<veldmap_raster::BandSample, RasterError> {
+        Ok(veldmap_raster::BandSample::Unavailable)
     }
 }
 

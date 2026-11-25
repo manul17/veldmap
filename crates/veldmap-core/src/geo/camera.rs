@@ -121,7 +121,7 @@ impl Camera {
 
     /// Vertical focal length in pixels for a viewport of `height_px` physical
     /// pixels, derived from the camera's active vertical field of view.
-    pub fn focal_length_px(&self, height_px: f64) -> f64 {
+    pub(crate) fn focal_length_px(&self, height_px: f64) -> f64 {
         (height_px * 0.5) / (FOV_Y_DEG * 0.5).to_radians().tan()
     }
 
@@ -157,7 +157,7 @@ impl Camera {
 
     /// Angular radius in degrees visible from the center of the viewport to
     /// the vertical edge.
-    pub fn visible_deg(&self) -> f64 {
+    fn visible_deg(&self) -> f64 {
         match self.arc_at((FOV_Y_DEG * 0.5).to_radians()) {
             Some(arc) => arc.to_degrees(),
             None => (1.0 / self.radius()).acos().to_degrees(),

@@ -6,8 +6,6 @@ use std::time::Instant;
 
 use veldmap_core::sync::lock_unpoisoned;
 
-use crate::http::PermitDenied;
-
 use super::context::PipelineContext;
 use super::disk::DiskCacheGate;
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
@@ -27,15 +25,10 @@ fn plan_dispatch_batch(ctx: &PipelineContext, now: Instant) -> DispatchBatch {
     let planned = {
         let mut st = lock_unpoisoned(&ctx.shared.state);
         st.plan_dispatch(
-            ctx.disk_cache.is_some(),
             MAX_CONCURRENT_DISK_LOOKUPS,
             &ctx.shared.shutdown,
             now,
-            |host| match ctx.shared.host_limiters.try_acquire_permit(host, now) {
-                Ok(permit) => Ok(permit),
-                Err(PermitDenied::Cooldown(until)) => Err(Some(until)),
-                Err(PermitDenied::Saturated) => Err(None),
-            },
+            |host| ctx.shared.host_limiters.try_acquire_permit(host, now),
         )
     };
 

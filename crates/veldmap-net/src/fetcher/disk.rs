@@ -8,7 +8,7 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{QuadTileId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
-use crate::{BlobStoreError, TileBlobStore};
+use crate::{BlobLease, BlobStoreError, TileBlobStore};
 
 /// Maximum concurrent blocking disk-cache write/delete tasks (`cache.put()` /
 /// `cache.delete()`) so burst completions serialize cleanly without piling up
@@ -21,7 +21,7 @@ const MAX_QUEUED_DISK_WRITES: usize = 32;
 
 /// Outcome of a bounded blocking disk-cache read.
 pub(super) enum DiskReadOutcome {
-    Hit(Vec<u8>),
+    Hit(Vec<u8>, BlobLease),
     Miss,
     Cancelled,
     Error(String),
@@ -73,7 +73,7 @@ impl DiskCacheGate {
                     return DiskReadOutcome::Cancelled;
                 }
                 match store.get(spec.cache_key(), id) {
-                    Ok(Some(bytes)) => DiskReadOutcome::Hit(bytes),
+                    Ok(Some((bytes, lease))) => DiskReadOutcome::Hit(bytes, lease),
                     Ok(None) => DiskReadOutcome::Miss,
                     Err(BlobStoreError::Backend(msg)) => DiskReadOutcome::Error(msg),
                 }
@@ -95,7 +95,7 @@ impl DiskCacheGate {
         cancel: CancelToken,
         key: TileKey,
         op_label: &'static str,
-        op: impl FnOnce(&dyn TileBlobStore) -> Result<(), BlobStoreError> + Send + 'static,
+        op: impl FnOnce(&dyn TileBlobStore, &CancelToken) -> Result<(), BlobStoreError> + Send + 'static,
     ) {
         let put_permit = tokio::select! {
             _ = cancel.cancelled() => return,
@@ -113,7 +113,7 @@ impl DiskCacheGate {
                 if cancel_for_write.is_cancelled() {
                     return Ok(());
                 }
-                op(store.as_ref())
+                op(store.as_ref(), &cancel_for_write)
             }) => res,
         };
         match res {
@@ -132,16 +132,32 @@ impl DiskCacheGate {
         }
     }
 
-    /// Best-effort bounded deletion of a corrupt cached tile entry.
+    /// Record an LRU recency touch for a decode-validated [`BlobLease`] on the
+    /// blocking thread pool so opportunistic touch flushes never stall Tokio
+    /// async worker threads.
+    pub(super) fn touch_async(&self, lease: BlobLease, shutdown: &CancelToken) {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let shutdown = shutdown.clone();
+        tokio::task::spawn_blocking(move || {
+            if !shutdown.is_cancelled() {
+                store.touch(lease);
+            }
+        });
+    }
+
+    /// Best-effort bounded deletion of a corrupt cached tile entry represented
+    /// by `lease`.
     ///
     /// Both `queue_permit` and `put_permit` are moved into `spawn_blocking` so
     /// cancellation mid-delete never drops `queue_permit` early while the
     /// blocking SQLite call is still executing.
     pub(super) async fn delete_corrupt(
         &self,
-        spec: Arc<LiveBasemapSpec>,
+        lease: BlobLease,
         key: TileKey,
-        id: QuadTileId,
         cancel: &CancelToken,
     ) {
         if cancel.is_cancelled() {
@@ -161,7 +177,7 @@ impl DiskCacheGate {
             cancel.clone(),
             key,
             "delete_corrupt",
-            move |store| store.delete(spec.cache_key(), id),
+            move |store, _| store.delete(lease),
         )
         .await;
     }
@@ -195,7 +211,7 @@ impl DiskCacheGate {
             shutdown,
             key,
             "persist_tile",
-            move |store| store.put(spec.cache_key(), id, &bytes),
+            move |store, cancel| store.put(spec.cache_key(), id, &bytes, cancel),
         ));
     }
 }

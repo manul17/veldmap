@@ -141,7 +141,7 @@ fn generate_mips_with(
 /// Non-display formats (`R32Float`, `R8Uint`, `R16Uint`), guttered tiles, and
 /// padded partial-edge tiles are left untouched with `mips` cleared so 2x box
 /// filtering never shifts gutters or bleeds padding into valid pixels.
-pub fn generate_linear_mipmaps(tile: &mut DecodedTile) {
+pub(super) fn generate_linear_mipmaps(tile: &mut DecodedTile) {
     let to_lin = srgb_to_linear_lut();
     let to_srgb = linear_to_srgb_lut();
     generate_mips_with(tile, PixelFormat::Rgba8UnormSrgb, |src, pw, ph, dw, dh| {
@@ -201,7 +201,7 @@ fn downsample_r32f_nan_skipping_2x(
 /// Finite samples inside each downsample footprint are averaged in `f64`, while
 /// `NaN` / non-finite nodata samples are excluded; a footprint containing only
 /// non-finite samples produces `f32::NAN`.
-pub fn generate_scientific_mipmaps(tile: &mut DecodedTile) {
+fn generate_scientific_mipmaps(tile: &mut DecodedTile) {
     generate_mips_with(tile, PixelFormat::R32Float, downsample_r32f_nan_skipping_2x);
 }
 

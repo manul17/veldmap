@@ -98,7 +98,7 @@ impl GpuTileCache {
     }
 
     /// Update the VRAM byte ceiling live, evicting oldest entries if needed.
-    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+    pub(crate) fn set_max_bytes(&mut self, max_bytes: usize) {
         let evicted = self.cache.set_max_bytes(max_bytes);
         drop(evicted);
     }

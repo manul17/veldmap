@@ -6,10 +6,7 @@
 mod context;
 mod disk;
 mod dispatch;
-mod failures;
 mod guards;
-mod in_flight;
-mod queue;
 mod state;
 mod workers;
 
@@ -102,7 +99,7 @@ impl LiveTilePipeline {
 
         let shared = Arc::new(PipelineShared {
             shutdown,
-            state: Mutex::new(PipelineState::default()),
+            state: Mutex::new(PipelineState::new(disk_cache.is_some())),
             host_limiters: HostLimiters::new(config.max_concurrent_per_host),
             notify: Notify::new(),
         });

@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{Wakeup, lock_unpoisoned};
-use veldmap_storage::{DiskCacheStats, StoragePaths, TileDiskCache};
+use veldmap_storage::{DiskCacheStats, StorageError, StoragePaths, TileDiskCache};
 
 use crate::worker::{CommandSendError, CommandWorker};
 
@@ -139,6 +139,30 @@ struct DiskWorkerCtx<'a> {
     persistence_faults: &'a PersistenceFaults,
 }
 
+impl DiskWorkerCtx<'_> {
+    fn persist_json<T>(
+        &self,
+        label: &str,
+        value: &T,
+        save: impl FnOnce(&T, &StoragePaths) -> Result<(), StorageError>,
+        record_result: impl FnOnce(&PersistenceFaults, Option<String>) -> bool,
+    ) {
+        let Some(paths) = self.paths else {
+            return;
+        };
+        let changed = match save(value, paths) {
+            Ok(()) => record_result(self.persistence_faults, None),
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to persist {label}");
+                record_result(self.persistence_faults, Some(err.to_string()))
+            }
+        };
+        if changed {
+            (self.wakeup)();
+        }
+    }
+}
+
 fn handle_disk_cmd(
     cmd: DiskCacheCmd,
     rx: &mpsc::Receiver<DiskCacheCmd>,
@@ -197,42 +221,28 @@ fn handle_disk_cmd(
             (ctx.wakeup)();
         }
         DiskCacheCmd::SaveSettings(initial) => {
-            let settings = drain_coalesced(rx, pending_cmd, initial, |cmd| match cmd {
+            let latest = drain_coalesced(rx, pending_cmd, initial, |cmd| match cmd {
                 DiskCacheCmd::SaveSettings(newer) => CoalesceStep::Update(newer),
                 other => CoalesceStep::Defer(other),
             });
-            if let Some(paths) = ctx.paths {
-                let changed = match settings.save(paths) {
-                    Ok(()) => ctx.persistence_faults.set_settings_result(None),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "Failed to persist user settings");
-                        ctx.persistence_faults
-                            .set_settings_result(Some(err.to_string()))
-                    }
-                };
-                if changed {
-                    (ctx.wakeup)();
-                }
-            }
+            ctx.persist_json(
+                "user settings",
+                &latest,
+                AppSettings::save,
+                PersistenceFaults::set_settings_result,
+            );
         }
         DiskCacheCmd::SaveSession(initial) => {
-            let session = drain_coalesced(rx, pending_cmd, initial, |cmd| match cmd {
+            let latest = drain_coalesced(rx, pending_cmd, initial, |cmd| match cmd {
                 DiskCacheCmd::SaveSession(newer) => CoalesceStep::Update(newer),
                 other => CoalesceStep::Defer(other),
             });
-            if let Some(paths) = ctx.paths {
-                let changed = match session.save(paths) {
-                    Ok(()) => ctx.persistence_faults.set_session_result(None),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "Failed to persist session");
-                        ctx.persistence_faults
-                            .set_session_result(Some(err.to_string()))
-                    }
-                };
-                if changed {
-                    (ctx.wakeup)();
-                }
-            }
+            ctx.persist_json(
+                "session",
+                &latest,
+                AppSession::save,
+                PersistenceFaults::set_session_result,
+            );
         }
     }
 }

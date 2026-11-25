@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn cascade_handles_non_tile_row_batches_npot_dims_and_short_slices() {
     let (w, h) = (700u32, 600u32);
-    let mut cascade = Cascade::new(0, w, h);
+    let mut cascade = Cascade::new(0, w, h, PixelFormat::Rgba8UnormSrgb);
     assert!(
         cascade
             .push_rows(&[0u8; 8], 1, &mut |_, _, _, _, _, _| Ok(()))
@@ -35,7 +35,7 @@ fn cascade_handles_non_tile_row_batches_npot_dims_and_short_slices() {
     // Level 0: 2x2 = 4 tiles; Level 1 (350x300 <= 512): 1 apex tile.
     assert_eq!(emitted.len(), 5);
     assert!(emitted.contains(&(1, 0, 0, 350, 300, 350 * 300 * 4)));
-    assert!(bytes(w, h) > bands_bytes(w, h, 4));
+    assert!(bytes(w, h, PixelFormat::Rgba8UnormSrgb) > bands_bytes(w, h, 4));
     // Apex-only raster has zero halving buffer cost.
     assert_eq!(
         flush_bytes(256, 256, 4),
@@ -47,7 +47,7 @@ fn cascade_handles_non_tile_row_batches_npot_dims_and_short_slices() {
 #[test]
 fn cascade_supports_r32float_and_r8uint_with_format_semantics() {
     // R8Uint 600x4 -> 300x2 nearest-neighbor (never averaging class 1 and class 9 into 5).
-    let mut cat = Cascade::new_for_format(0, 600, 4, PixelFormat::R8Uint);
+    let mut cat = Cascade::new(0, 600, 4, PixelFormat::R8Uint);
     let mut rows = vec![9u8; 600 * 4];
     rows[0] = 1;
     let mut apex_u8 = None;
@@ -70,7 +70,7 @@ fn cascade_supports_r32float_and_r8uint_with_format_semantics() {
     assert_eq!(apex[1], 9);
 
     // R16Uint 600x4 -> 300x2 nearest-neighbor preserves 16-bit class IDs verbatim.
-    let mut cat16 = Cascade::new_for_format(0, 600, 4, PixelFormat::R16Uint);
+    let mut cat16 = Cascade::new(0, 600, 4, PixelFormat::R16Uint);
     let mut rows16 = Vec::with_capacity(600 * 4 * 2);
     for i in 0..(600 * 4) {
         let v: u16 = if i == 0 { 1024 } else { 4096 };
@@ -98,7 +98,7 @@ fn cascade_supports_r32float_and_r8uint_with_format_semantics() {
     assert_eq!(u16::from_ne_bytes([apex16[2], apex16[3]]), 4096);
 
     // R32Float 600x4 -> 300x2 NaN-skipping average (cell 0: [10, NaN, 20, NaN] -> 15; cell 1: all NaN -> NaN).
-    let mut sci = Cascade::new_for_format(0, 600, 4, PixelFormat::R32Float);
+    let mut sci = Cascade::new(0, 600, 4, PixelFormat::R32Float);
     let mut rows_f32 = Vec::with_capacity(600 * 4 * 4);
     for y in 0..4u32 {
         for x in 0..600u32 {

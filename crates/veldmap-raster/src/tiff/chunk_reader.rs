@@ -11,11 +11,11 @@ use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileStreamSpec};
 
 use crate::RasterError;
 use crate::pipeline::chunk_cache::{ChunkKey, DecodedChunk, SharedChunkCache};
-use crate::pipeline::driver::Chunked;
+use crate::pipeline::driver::{Chunked, alloc_empty_surface};
 use crate::pipeline::grid;
 use crate::pipeline::metadata::SampleType;
 use crate::pipeline::radiometry::{
-    DisplayMapping, is_data_f64, raw_bytes_to_rgba, read_native_sample_f64,
+    DisplayMapping, PixelLayout, is_data_f64, raw_bytes_to_rgba, read_native_sample_f64,
 };
 
 use super::ifd::{CachedIfd, Photometric, PlanarConfig, TiffByteOrder};
@@ -81,6 +81,25 @@ impl<'a> TiffChunkReader<'a> {
             .ok_or_else(|| RasterError::Decode(format!("TIFF IFD {image} is not cached")))
     }
 
+    fn decode_plane(
+        &self,
+        ifd: &CachedIfd,
+        plane: usize,
+        index: u32,
+        cancel: &CancelToken,
+    ) -> Result<RawChunkPayload, RasterError> {
+        Ok(decode_raw_chunk(
+            self.byte_source.as_ref(),
+            ifd,
+            self.byte_order,
+            plane,
+            index,
+            self.max_chunk_bytes,
+            cancel,
+        )?
+        .2)
+    }
+
     fn decode_chunk_uncached(
         &self,
         image: usize,
@@ -97,10 +116,10 @@ impl<'a> TiffChunkReader<'a> {
         })?;
         let (stored_w, stored_h) = ifd.chunk_stored_dims(index).unwrap_or((dw, dh));
         let out_bpp = self.spec.format.bytes_per_pixel() as u32;
-        let raw_depth = match (self.spec.format, ifd.planar) {
-            (PixelFormat::Rgba8UnormSrgb, _) => ifd.raw_pixel_bytes(),
-            (_, PlanarConfig::Planar) => ifd.sample_type.byte_size() as u32,
-            (_, PlanarConfig::Chunky) => ifd.raw_pixel_bytes(),
+        let raw_depth = if self.spec.format == PixelFormat::Rgba8UnormSrgb {
+            ifd.raw_pixel_bytes()
+        } else {
+            ifd.band_raw_pixel_bytes()
         };
         let est_bytes = grid::chunk_working_bytes(stored_w, stored_h, raw_depth, out_bpp);
         let _lease = match budget_tracker {
@@ -157,129 +176,119 @@ impl<'a> TiffChunkReader<'a> {
                 .with_invert(ifd.photometric == Photometric::WhiteIsZero)
         });
 
-        // Palette TIFF: expand ColorMap indices to RGBA8.
         if ifd.photometric == Photometric::Palette {
-            let color_map = ifd
-                .color_map
-                .as_deref()
-                .ok_or_else(|| RasterError::Decode("Palette TIFF missing ColorMap".to_owned()))?;
-            let (_, _, payload) = decode_raw_chunk(
-                self.byte_source.as_ref(),
-                ifd,
-                self.byte_order,
-                0,
-                index,
-                self.max_chunk_bytes,
-                cancel,
-            )?;
-            let RawChunkPayload::Bytes(data) = payload else {
-                return Ok(vec![0u8; pixels * 4]);
-            };
-            let alpha_plane = if ifd.planar == PlanarConfig::Planar {
-                if let Some(a_ch) = ifd.alpha_channel() {
-                    match decode_raw_chunk(
-                        self.byte_source.as_ref(),
-                        ifd,
-                        self.byte_order,
-                        a_ch,
-                        index,
-                        self.max_chunk_bytes,
-                        cancel,
-                    )?
-                    .2
-                    {
-                        RawChunkPayload::Bytes(data) => Some(data),
-                        RawChunkPayload::Sparse => {
-                            // Sparse alpha plane means alpha == 0 across the chunk.
-                            return Ok(vec![0u8; pixels * 4]);
-                        }
+            return self.decode_palette_display_chunk(ifd, index, pixels, cancel);
+        }
+        if ifd.planar == PlanarConfig::Planar {
+            return self.decode_planar_display_chunk(ifd, index, pixels, mapping, cancel);
+        }
+        self.decode_chunky_display_chunk(ifd, index, pixels, mapping, cancel)
+    }
+
+    fn decode_palette_display_chunk(
+        &self,
+        ifd: &CachedIfd,
+        index: u32,
+        pixels: usize,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, RasterError> {
+        let color_map = ifd
+            .color_map
+            .as_deref()
+            .ok_or_else(|| RasterError::Decode("Palette TIFF missing ColorMap".to_owned()))?;
+        let RawChunkPayload::Bytes(data) = self.decode_plane(ifd, 0, index, cancel)? else {
+            return Ok(alloc_empty_surface(pixels, PixelFormat::Rgba8UnormSrgb));
+        };
+        let alpha_plane = if ifd.planar == PlanarConfig::Planar {
+            if let Some(a_ch) = ifd.alpha_channel() {
+                match self.decode_plane(ifd, a_ch, index, cancel)? {
+                    RawChunkPayload::Bytes(data) => Some(data),
+                    RawChunkPayload::Sparse => {
+                        // Sparse alpha plane means alpha == 0 across the chunk.
+                        return Ok(alloc_empty_surface(pixels, PixelFormat::Rgba8UnormSrgb));
                     }
-                } else {
-                    None
                 }
             } else {
                 None
-            };
-            let palette_alpha = match (ifd.planar, ifd.alpha_channel(), alpha_plane.as_deref()) {
-                (PlanarConfig::Planar, Some(_), Some(ap)) => PaletteAlpha::Planar(ap),
-                (PlanarConfig::Chunky, Some(a_ch), _) => PaletteAlpha::Chunky(a_ch),
-                _ => PaletteAlpha::None,
-            };
-            return Ok(expand_palette_to_rgba(
-                &data,
-                palette_alpha,
-                ifd,
-                color_map,
-                self.nodata_f64,
-                pixels,
-            ));
-        }
+            }
+        } else {
+            None
+        };
+        let palette_alpha = match (ifd.planar, ifd.alpha_channel(), alpha_plane.as_deref()) {
+            (PlanarConfig::Planar, Some(_), Some(ap)) => PaletteAlpha::Planar(ap),
+            (PlanarConfig::Chunky, Some(a_ch), _) => PaletteAlpha::Chunky(a_ch),
+            _ => PaletteAlpha::None,
+        };
+        Ok(expand_palette_to_rgba(
+            &data,
+            palette_alpha,
+            ifd,
+            color_map,
+            self.nodata_f64,
+            pixels,
+        ))
+    }
 
-        // PlanarConfiguration = 2 display read: read needed planes and interleave.
-        if ifd.planar == PlanarConfig::Planar {
-            let need_planes: Vec<usize> = match (ifd.pixel_layout.colors(), ifd.alpha_channel()) {
-                (1, None) => vec![0],
-                (1, Some(a)) => vec![0, a],
-                (_, None) => vec![0, 1, 2],
-                (_, Some(a)) => vec![0, 1, 2, a],
-            };
-            let sample_bytes = ifd.sample_type.byte_size();
-            let interleaved_spp = need_planes.len();
-            let mut interleaved = vec![0u8; pixels * interleaved_spp * sample_bytes];
-            let mut any_non_sparse = false;
+    fn decode_planar_display_chunk(
+        &self,
+        ifd: &CachedIfd,
+        index: u32,
+        pixels: usize,
+        mapping: DisplayMapping,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, RasterError> {
+        let need_planes: Vec<usize> = match (ifd.pixel_layout.colors(), ifd.alpha_channel()) {
+            (1, None) => vec![0],
+            (1, Some(a)) => vec![0, a],
+            (_, None) => vec![0, 1, 2],
+            (_, Some(a)) => vec![0, 1, 2, a],
+        };
+        let sample_bytes = ifd.sample_type.byte_size();
+        let interleaved_spp = need_planes.len();
+        let mut interleaved = vec![0u8; pixels * interleaved_spp * sample_bytes];
+        let mut any_non_sparse = false;
 
-            for (slot, &plane) in need_planes.iter().enumerate() {
-                let (_, _, payload) = decode_raw_chunk(
-                    self.byte_source.as_ref(),
-                    ifd,
-                    self.byte_order,
-                    plane,
-                    index,
-                    self.max_chunk_bytes,
-                    cancel,
-                )?;
-                if let RawChunkPayload::Bytes(data) = payload {
-                    any_non_sparse = true;
-                    for px in 0..pixels {
-                        let s = px * sample_bytes;
-                        let d = (px * interleaved_spp + slot) * sample_bytes;
-                        if s + sample_bytes <= data.len() && d + sample_bytes <= interleaved.len() {
-                            interleaved[d..d + sample_bytes]
-                                .copy_from_slice(&data[s..s + sample_bytes]);
-                        }
+        for (slot, &plane) in need_planes.iter().enumerate() {
+            if let RawChunkPayload::Bytes(data) = self.decode_plane(ifd, plane, index, cancel)? {
+                any_non_sparse = true;
+                for px in 0..pixels {
+                    let s = px * sample_bytes;
+                    let d = (px * interleaved_spp + slot) * sample_bytes;
+                    if s + sample_bytes <= data.len() && d + sample_bytes <= interleaved.len() {
+                        interleaved[d..d + sample_bytes]
+                            .copy_from_slice(&data[s..s + sample_bytes]);
                     }
                 }
             }
-            if !any_non_sparse {
-                return Ok(vec![0u8; pixels * 4]);
-            }
-            let packed_layout = match (ifd.pixel_layout.colors(), ifd.alpha_channel().is_some()) {
-                (1, false) => crate::pipeline::radiometry::PixelLayout::named(1),
-                (1, true) => crate::pipeline::radiometry::PixelLayout::named(2),
-                (_, false) => crate::pipeline::radiometry::PixelLayout::named(3),
-                (_, true) => crate::pipeline::radiometry::PixelLayout::named(4),
-            };
-            return Ok(raw_bytes_to_rgba(
-                &mapping,
-                &interleaved,
-                ifd.sample_type,
-                packed_layout,
-                pixels,
-            ));
         }
+        if !any_non_sparse {
+            return Ok(alloc_empty_surface(pixels, PixelFormat::Rgba8UnormSrgb));
+        }
+        let packed_layout = match (ifd.pixel_layout.colors(), ifd.alpha_channel().is_some()) {
+            (1, false) => PixelLayout::named(1),
+            (1, true) => PixelLayout::named(2),
+            (_, false) => PixelLayout::named(3),
+            (_, true) => PixelLayout::named(4),
+        };
+        Ok(raw_bytes_to_rgba(
+            &mapping,
+            &interleaved,
+            ifd.sample_type,
+            packed_layout,
+            pixels,
+        ))
+    }
 
-        // Chunky display read.
-        let (_, _, payload) = decode_raw_chunk(
-            self.byte_source.as_ref(),
-            ifd,
-            self.byte_order,
-            0,
-            index,
-            self.max_chunk_bytes,
-            cancel,
-        )?;
-        let RawChunkPayload::Bytes(data) = payload else {
-            return Ok(vec![0u8; pixels * 4]);
+    fn decode_chunky_display_chunk(
+        &self,
+        ifd: &CachedIfd,
+        index: u32,
+        pixels: usize,
+        mapping: DisplayMapping,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, RasterError> {
+        let RawChunkPayload::Bytes(data) = self.decode_plane(ifd, 0, index, cancel)? else {
+            return Ok(alloc_empty_surface(pixels, PixelFormat::Rgba8UnormSrgb));
         };
 
         if let Some(params) = ifd.ycbcr
@@ -307,35 +316,15 @@ impl<'a> TiffChunkReader<'a> {
     ) -> Result<Vec<u8>, RasterError> {
         let band = self.band_index(ifd)?;
         let pixels = (dw as usize) * (dh as usize);
-        let plane = match ifd.planar {
-            PlanarConfig::Planar => band,
-            PlanarConfig::Chunky => 0,
-        };
-        let (_, _, payload) = decode_raw_chunk(
-            self.byte_source.as_ref(),
-            ifd,
-            self.byte_order,
-            plane,
-            index,
-            self.max_chunk_bytes,
-            cancel,
-        )?;
-        let RawChunkPayload::Bytes(data) = payload else {
-            // Sparse chunk -> all NaN.
-            let nan = f32::NAN.to_ne_bytes();
-            let mut out = Vec::with_capacity(pixels * 4);
-            for _ in 0..pixels {
-                out.extend_from_slice(&nan);
-            }
-            return Ok(out);
+        let RawChunkPayload::Bytes(data) =
+            self.decode_plane(ifd, ifd.band_plane(band), index, cancel)?
+        else {
+            return Ok(alloc_empty_surface(pixels, PixelFormat::R32Float));
         };
 
         // YCbCr IFDs (including YCbCr overviews on RGB COGs) store raw Y/Cb/Cr bytes;
         // convert to RGB before extracting the requested band.
-        if let Some(params) = ifd.ycbcr
-            && ifd.sample_type == SampleType::U8
-            && band < 3
-        {
+        if let Some(params) = ifd.ycbcr_band_params(band) {
             let mut out = Vec::with_capacity(pixels * 4);
             for px in data.chunks_exact(3).take(pixels) {
                 let rgb = params.convert_u8_pixel_to_rgb(px[0], px[1], px[2]);
@@ -350,10 +339,7 @@ impl<'a> TiffChunkReader<'a> {
             return Ok(out);
         }
 
-        let (stride, ch_offset) = match ifd.planar {
-            PlanarConfig::Planar => (1usize, 0usize),
-            PlanarConfig::Chunky => (usize::from(ifd.samples_per_pixel), band),
-        };
+        let (stride, ch_offset) = ifd.band_stride_offset(band);
         let mut out = Vec::with_capacity(pixels * 4);
         for px in 0..pixels {
             let sample_idx = px * stride + ch_offset;
@@ -381,20 +367,9 @@ impl<'a> TiffChunkReader<'a> {
         let band = self.band_index(ifd)?;
         let pixels = (dw as usize) * (dh as usize);
         let bpp = self.spec.format.bytes_per_pixel();
-        let plane = match ifd.planar {
-            PlanarConfig::Planar => band,
-            PlanarConfig::Chunky => 0,
-        };
-        let (_, _, payload) = decode_raw_chunk(
-            self.byte_source.as_ref(),
-            ifd,
-            self.byte_order,
-            plane,
-            index,
-            self.max_chunk_bytes,
-            cancel,
-        )?;
-        let RawChunkPayload::Bytes(mut data) = payload else {
+        let RawChunkPayload::Bytes(mut data) =
+            self.decode_plane(ifd, ifd.band_plane(band), index, cancel)?
+        else {
             // Sparse categorical chunk -> nodata value (if integer) or 0.
             let fill_u16 = self
                 .nodata_f64
@@ -414,10 +389,7 @@ impl<'a> TiffChunkReader<'a> {
             });
         };
 
-        if let Some(params) = ifd.ycbcr
-            && ifd.sample_type == SampleType::U8
-            && band < 3
-        {
+        if let Some(params) = ifd.ycbcr_band_params(band) {
             return Ok(match self.spec.format {
                 PixelFormat::R8Uint => data
                     .chunks_exact(3)
@@ -437,10 +409,7 @@ impl<'a> TiffChunkReader<'a> {
             });
         }
 
-        let (stride, ch_offset) = match ifd.planar {
-            PlanarConfig::Planar => (1usize, 0usize),
-            PlanarConfig::Chunky => (usize::from(ifd.samples_per_pixel), band),
-        };
+        let (stride, ch_offset) = ifd.band_stride_offset(band);
         match (self.spec.format, ifd.sample_type) {
             (PixelFormat::R8Uint, SampleType::U8) if stride == 1 => {
                 data.truncate(pixels);

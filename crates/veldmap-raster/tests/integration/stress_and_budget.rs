@@ -12,8 +12,9 @@ use veldmap_core::tile::{
     SourceId, StreamKey, TileKey,
 };
 use veldmap_raster::{
-    DecodeContext, DecodeJob, DecodeJobKey, DecodePoolConfig, RasterSource, ServeMode,
-    SharedChunkCache, TiffSource, TileScheduler, TwoLaneDecodePool, TwoLaneDecodePoolConfig,
+    DISPLAY_STREAM_SPEC, DecodeContext, DecodeJob, DecodeJobKey, DecodePoolConfig, RasterSource,
+    ServeMode, SharedChunkCache, TiffSource, TileScheduler, TwoLaneDecodePool,
+    TwoLaneDecodePoolConfig,
 };
 
 use crate::common::build_multi_tile_tiff;
@@ -77,7 +78,7 @@ fn concurrent_decode_respects_memory_cap_and_deduplicates_shared_chunks() {
                     budget: &budget,
                     cancel: &cancel,
                 };
-                src.decode_pointwise_tile(0, tx, ty, &ctx)
+                src.decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, tx, ty, &ctx)
             })
         })
         .collect();
@@ -182,7 +183,7 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
                     cancel: &pass_cancel,
                 };
                 let mut signaled = false;
-                let _ = src.produce_pass(&ctx, &mut |_, _, _, _, _, _| {
+                let _ = src.produce_pass(DISPLAY_STREAM_SPEC, &ctx, &mut |_, _, _, _, _, _| {
                     if !signaled {
                         signaled = true;
                         started.fetch_add(1, Ordering::AcqRel);
@@ -223,7 +224,7 @@ fn two_lane_decode_pool_prevents_bulk_jobs_from_blocking_fast_tiles() {
                     cancel: &fast_cancel,
                 };
                 let tile = src
-                    .decode_pointwise_tile(0, x % 2, x / 2, &ctx)
+                    .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, x % 2, x / 2, &ctx)
                     .expect("fast decode");
                 let _ = tx.send((tile.width(), tile.height()));
             }),
@@ -256,7 +257,9 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
         .expect("open"),
     );
 
-    let meta = src.pyramid_meta();
+    let meta = src
+        .pyramid_meta(DISPLAY_STREAM_SPEC)
+        .expect("display pyramid meta");
     let mut sched = TileScheduler::new();
     let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
     let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
@@ -278,7 +281,7 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
                 assert_eq!(admitted.len(), 1);
                 assert_eq!(admitted[0].key, k0);
                 let tile = src
-                    .decode_pointwise_tile(k0.level, k0.x, k0.y, &ctx)
+                    .decode_pointwise_tile(DISPLAY_STREAM_SPEC, k0.level, k0.x, k0.y, &ctx)
                     .expect("pointwise decode");
                 assert_eq!(
                     (tile.width(), tile.height()),
@@ -291,7 +294,7 @@ fn scheduler_and_tiff_source_coordinate_pointwise_and_pass_execution() {
                     .admit_pass(&meta, lvl, &[k0], |_| false, &cancel)
                     .expect("admit pass");
                 assert_eq!(admitted.tiles, vec![k0]);
-                src.produce_pass(&ctx, &mut |plvl, px, py, _, _, _| {
+                src.produce_pass(DISPLAY_STREAM_SPEC, &ctx, &mut |plvl, px, py, _, _, _| {
                     sched.on_pass_tile_arrived(
                         admitted.key,
                         admitted.pass_id,
@@ -324,7 +327,7 @@ fn concurrent_pass_and_pointwise_under_tight_budget_never_deadlock() {
 
     // Budget is large enough for the pass alone, NOT pass + chunk simultaneously,
     // exercising sequential non-deadlocking handoff between pass and pointwise.
-    let pass_total = src.pass_peak_bytes();
+    let pass_total = src.pass_peak_bytes(DISPLAY_STREAM_SPEC);
     let tracker = Arc::new(DecodeBudgetTracker::new(pass_total));
     let chunk_cache = Arc::new(SharedChunkCache::new(budget.decoded_chunk_cache_bytes));
     let barrier = Arc::new(Barrier::new(2));
@@ -344,10 +347,14 @@ fn concurrent_pass_and_pointwise_under_tight_budget_never_deadlock() {
                 cancel: &cancel,
             };
             let mut count = 0usize;
-            src.produce_pass(&ctx, &mut |_lvl, _tx, _ty, _w, _h, _rgba| {
-                count += 1;
-                Ok(())
-            })
+            src.produce_pass(
+                DISPLAY_STREAM_SPEC,
+                &ctx,
+                &mut |_lvl, _tx, _ty, _w, _h, _rgba| {
+                    count += 1;
+                    Ok(())
+                },
+            )
             .expect("pass completes");
             count
         })
@@ -367,7 +374,7 @@ fn concurrent_pass_and_pointwise_under_tight_budget_never_deadlock() {
                 budget: &budget,
                 cancel: &cancel,
             };
-            src.decode_pointwise_tile(0, 1, 1, &ctx)
+            src.decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 1, 1, &ctx)
                 .expect("pointwise completes")
         })
     };
@@ -419,8 +426,12 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
         .expect("open tiled cog"),
     );
 
-    let strip_meta = strip_src.pyramid_meta();
-    let cog_meta = cog_src.pyramid_meta();
+    let strip_meta = strip_src
+        .pyramid_meta(DISPLAY_STREAM_SPEC)
+        .expect("strip display meta");
+    let cog_meta = cog_src
+        .pyramid_meta(DISPLAY_STREAM_SPEC)
+        .expect("cog display meta");
     assert!(!strip_src.is_tiled());
     assert!(cog_src.is_tiled());
     assert!(matches!(
@@ -478,7 +489,7 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
                     cancel: &pass_cancel,
                 };
                 let mut signaled = false;
-                let _ = src.produce_pass(&ctx, &mut |_, _, _, _, _, _| {
+                let _ = src.produce_pass(DISPLAY_STREAM_SPEC, &ctx, &mut |_, _, _, _, _, _| {
                     if !signaled {
                         signaled = true;
                         let _ = paused_tx.send(());
@@ -516,7 +527,7 @@ fn untiled_stripped_pass_on_bulk_lane_never_blocks_tiled_cog_pointwise_on_fast_l
                     cancel: &fast_cancel,
                 };
                 let tile = src
-                    .decode_pointwise_tile(0, 1, 1, &ctx)
+                    .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 1, 1, &ctx)
                     .expect("cog fast tile");
                 let _ = tx.send((tile.width(), tile.height()));
             }),

@@ -113,8 +113,11 @@ fn parse_text_and_from_proj_string_labeled_classify_inputs_cleanly() {
     assert!(looks_like_wkt("\u{FEFF}  geogcs[\"WGS 84\"]"));
     assert!(!looks_like_wkt("+proj=utm +zone=37 +datum=WGS84"));
     let (crs, kind) = CrsSpec::parse_text("EPSG:32637").expect("EPSG shorthand");
-    assert_eq!(kind, CrsTextKind::UserString);
+    assert_eq!(kind, CrsTextKind::Epsg(32637));
     assert!(crs.label().contains("32637"));
+    let (_, proj_kind) =
+        CrsSpec::parse_text("+proj=utm +zone=37 +datum=WGS84 +units=m +no_defs").expect("PROJ");
+    assert_eq!(proj_kind, CrsTextKind::Proj);
     let err = CrsSpec::parse_text("PROJCS[\"Broken\"").expect_err("malformed WKT");
     assert!(matches!(err, CrsError::InvalidWkt(_)));
 

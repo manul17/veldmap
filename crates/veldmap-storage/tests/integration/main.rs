@@ -98,7 +98,12 @@ fn durable_json_and_sqlite_disk_cache_persist_across_reopen() {
     reopened.touch_entry(entry);
     assert_eq!(encoding, TileBlobEncoding::Lz4Raw);
     assert_eq!(got_payload, payload);
-    assert!(reopened.get(&disk_key).expect("filtered get").is_none());
+    assert!(
+        reopened
+            .get_encoded_entry(&disk_key, Some(TileBlobEncoding::EncodedImage))
+            .expect("filtered get")
+            .is_none()
+    );
     assert_eq!(reopened.clear_source("deadbeef").expect("clear source"), 1);
     assert_eq!(reopened.stats().expect("post clear stats").tile_count, 0);
 }

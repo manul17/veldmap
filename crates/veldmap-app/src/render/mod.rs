@@ -7,20 +7,20 @@
 //! `egui_wgpu`'s target format via `view_formats`.
 
 mod bind_groups;
-mod colormap;
 mod globe;
 mod graticule;
 mod mesh;
 mod mesh_cache;
 mod overlay;
+mod palette_cache;
 mod pipelines;
 mod snapshot;
 mod uniforms;
 mod vector;
 mod viewport;
 
+pub use crate::colormap::{CategoricalPaletteId, ColormapId};
 pub use bind_groups::TileBindGroupCache;
-pub use colormap::{CategoricalPaletteId, ColormapId, sample_colormap_srgb};
 pub use globe::GlobeRenderer;
 pub use snapshot::{
     DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack, DrawSnapshot, DrawTile, DrawVectorId,

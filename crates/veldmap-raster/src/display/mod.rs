@@ -11,5 +11,5 @@ mod qoi;
 pub use basemap::{BundledBasemap, BundledBasemapConfig};
 pub use lz4_raw::{MAX_LZ4_RAW_DECODED_BYTES, decode_lz4_raw_tile, encode_lz4_raw_tile};
 pub use map_tile::decode_map_tile_with_mipmaps;
-pub use mipmap::{generate_linear_mipmaps, generate_scientific_mipmaps, generate_tile_mipmaps};
+pub use mipmap::generate_tile_mipmaps;
 pub use qoi::{MAX_QOI_DECODED_BYTES, decode_qoi_rgba8, encode_qoi_rgba8};

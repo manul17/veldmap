@@ -1,7 +1,7 @@
 use super::*;
-use crate::geo::footprint::{Ring, covers_polygon};
 use crate::geo::geodesic::ring_signed_area_m2;
 use crate::geo::geodesy::WGS84;
+use crate::geo::shapes::Ring;
 use glam::Vec3;
 
 #[test]
@@ -31,8 +31,8 @@ fn parses_feature_collection_with_holes_and_round_trips_rfc7946_winding() {
     let GeoJsonGeometry::Polygon(ref poly) = fc.features[0].geometry else {
         panic!("expected polygon");
     };
-    assert!(covers_polygon(poly, 47.1, 39.1));
-    assert!(!covers_polygon(poly, 47.5, 39.5));
+    assert_eq!(poly.exterior.points.len(), 5);
+    assert_eq!(poly.holes.len(), 1);
     assert!(fc.bounds().is_some());
 
     let exported = export_geojson_feature_collection(&fc);
@@ -151,11 +151,18 @@ fn tessellates_polar_antimeridian_and_over_hemisphere_polygons_accurately() {
             GeoPoint::new(60.0, 172.0),
         ],
     });
-    assert!(covers_polygon(&polar, 89.5, 45.0));
-    assert!(covers_polygon(&polar, 90.0, 0.0));
-    assert!(!covers_polygon(&polar, 70.0, 45.0));
-    assert!(covers_polygon(&antimeridian, 55.0, 179.0));
-    assert!(covers_polygon(&antimeridian, 55.0, -179.0));
+    let polar_and_seam_fc = GeoJsonFeatureCollection {
+        features: vec![
+            GeoJsonFeature::new(Some("Polar".to_string()), GeoJsonGeometry::Polygon(polar)),
+            GeoJsonFeature::new(
+                Some("Antimeridian".to_string()),
+                GeoJsonGeometry::Polygon(antimeridian),
+            ),
+        ],
+    };
+    let polar_and_seam_mesh = VectorMesh::from_collection(&polar_and_seam_fc, 5.0);
+    assert!(polar_and_seam_mesh.fill_triangle_count() > 10);
+    assert!(polar_and_seam_mesh.line_segment_count() > 10);
 
     // >hemisphere RFC 7946 CCW cap: boundary at lat = -20 deg going East,
     // enclosing the Northern Hemisphere + equatorial band down to -20 deg

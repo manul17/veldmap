@@ -12,6 +12,7 @@ use wgpu::util::DeviceExt;
 use super::snapshot::{DrawSnapshot, DrawVectorId, DrawVectorLayer};
 use super::uniforms::{DynamicUniformArena, VectorUniform};
 use crate::clamp_opacity;
+use crate::colormap::srgb_rgba_f32_to_linear;
 
 /// Borrowed Pass-2 vector render pipelines passed into
 /// [`VectorRenderer::record_pass`].
@@ -73,21 +74,6 @@ struct CachedVectorBuffers {
 struct ClusterDrawOffsets {
     fill_offset: Option<u32>,
     line_offset: Option<u32>,
-}
-
-/// Exact IEC 61966-2-1 sRGB-to-linear transfer function for a normalized
-/// channel in `0.0..=1.0`.
-fn srgb_channel_to_linear(c: f32) -> f32 {
-    let s = if c.is_finite() {
-        c.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    if s <= 0.04045 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    }
 }
 
 fn point_marker_radius_m(camera_height_m: f64) -> f32 {
@@ -311,20 +297,10 @@ impl VectorRenderer {
         for layer in &snapshot.vectors {
             let start = self.draw_offsets.len();
             let opacity = clamp_opacity(layer.opacity);
-            let fill_alpha = layer.fill_color[3] * opacity;
-            let line_alpha = layer.line_color[3] * opacity;
-            let fill_linear = [
-                srgb_channel_to_linear(layer.fill_color[0]),
-                srgb_channel_to_linear(layer.fill_color[1]),
-                srgb_channel_to_linear(layer.fill_color[2]),
-                fill_alpha,
-            ];
-            let line_linear = [
-                srgb_channel_to_linear(layer.line_color[0]),
-                srgb_channel_to_linear(layer.line_color[1]),
-                srgb_channel_to_linear(layer.line_color[2]),
-                line_alpha,
-            ];
+            let fill_linear = srgb_rgba_f32_to_linear(layer.fill_color, opacity);
+            let line_linear = srgb_rgba_f32_to_linear(layer.line_color, opacity);
+            let fill_alpha = fill_linear[3];
+            let line_alpha = line_linear[3];
 
             let Some(bufs) = self.buffers.get(&layer.id) else {
                 self.layer_offset_ranges.push(start..start);

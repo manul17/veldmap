@@ -4,22 +4,18 @@
 //! nearest-neighbor class palettes).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::DVec3;
-use veldmap_core::tile::{MAX_WARP_SEGMENTS, PixelFormat, SourceId, build_warp_patch};
+use veldmap_core::tile::{MAX_WARP_SEGMENTS, PixelFormat, build_warp_patch};
 use wgpu::util::DeviceExt;
 
 use super::bind_groups::TileBindGroupCache;
-use super::colormap::{
-    CategoricalPaletteId, ColormapId, categorical_lut_linear, scientific_lut_linear,
-};
 use super::mesh_cache::{DEFAULT_MESH_CACHE_BYTES, ElasticMeshCache, push_grid_quad_indices};
+use super::palette_cache::PaletteCache;
 use super::snapshot::{DrawOverlayTrack, DrawSnapshot, OverlayMeshKey};
 use super::uniforms::{
-    CategoricalPatchUniform, DynamicUniformArena, OverlayPatchUniform, PaletteUniform,
-    ScientificPatchUniform,
+    CategoricalPatchUniform, DynamicUniformArena, OverlayPatchUniform, ScientificPatchUniform,
 };
 use crate::clamp_opacity;
 
@@ -54,45 +50,6 @@ pub(super) struct OverlayPipelines<'a> {
     pub(super) categorical: &'a wgpu::RenderPipeline,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum PaletteKey {
-    Scientific(ColormapId),
-    CategoricalPreset(CategoricalPaletteId),
-    /// Keyed by `(source_id, arc_ptr)` so two layers opening the same palette
-    /// file independently never thrash each other's cached GPU palette buffer.
-    CustomSource(SourceId, usize),
-}
-
-fn palette_key(track: &DrawOverlayTrack) -> Option<PaletteKey> {
-    match track {
-        DrawOverlayTrack::Display => None,
-        DrawOverlayTrack::Scientific { colormap, .. } => Some(PaletteKey::Scientific(*colormap)),
-        DrawOverlayTrack::Categorical {
-            source,
-            palette,
-            custom_color_map,
-            ..
-        } => {
-            if *palette == CategoricalPaletteId::SourceColorMap
-                && let Some(cmap) = custom_color_map
-            {
-                Some(PaletteKey::CustomSource(
-                    *source,
-                    Arc::as_ptr(cmap) as *const () as usize,
-                ))
-            } else {
-                Some(PaletteKey::CategoricalPreset(*palette))
-            }
-        }
-    }
-}
-
-struct CachedPalette {
-    _buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    custom_weak: Option<Weak<[[u8; 4]]>>,
-}
-
 struct CachedOverlayMesh {
     buffer: wgpu::Buffer,
     origin_ecef_m: DVec3,
@@ -107,13 +64,80 @@ enum ActiveOverlayPipeline {
     Categorical,
 }
 
+/// Layer-invariant uniform parameters sanitized once per layer outside the
+/// per-patch loop in [`OverlayRenderer::push_uniforms`].
+#[derive(Clone, Copy)]
+enum PreparedTrackParams {
+    Display,
+    Scientific {
+        scale: f32,
+        offset: f32,
+        stretch_min: f32,
+        stretch_inv_range: f32,
+        stretch_mode: u32,
+        invert_colormap: u32,
+    },
+    Categorical {
+        has_nodata: u32,
+        nodata_value: u32,
+    },
+}
+
+impl PreparedTrackParams {
+    fn from_track(track: &DrawOverlayTrack) -> Self {
+        match track {
+            DrawOverlayTrack::Display => Self::Display,
+            DrawOverlayTrack::Scientific {
+                scale,
+                offset,
+                stretch_min,
+                stretch_max,
+                log10_db,
+                invert_colormap,
+                ..
+            } => {
+                let safe_scale = if scale.is_finite() { *scale } else { 1.0 };
+                let safe_offset = if offset.is_finite() { *offset } else { 0.0 };
+                let safe_min = if stretch_min.is_finite() {
+                    *stretch_min
+                } else {
+                    0.0
+                };
+                let safe_max = if stretch_max.is_finite() {
+                    *stretch_max
+                } else {
+                    safe_min + 1.0
+                };
+                let span = safe_max - safe_min;
+                let stretch_inv_range = if span.is_finite() && span.abs() > 1e-12 {
+                    1.0 / span
+                } else {
+                    0.0
+                };
+                Self::Scientific {
+                    scale: safe_scale,
+                    offset: safe_offset,
+                    stretch_min: safe_min,
+                    stretch_inv_range,
+                    stretch_mode: u32::from(*log10_db),
+                    invert_colormap: u32::from(*invert_colormap),
+                }
+            }
+            DrawOverlayTrack::Categorical { nodata_value, .. } => Self::Categorical {
+                has_nodata: u32::from(nodata_value.is_some()),
+                nodata_value: nodata_value.unwrap_or(0),
+            },
+        }
+    }
+}
+
 /// Manages shared per-density index buffers, bounded LRU cache of lazily built
 /// per-cell RTC warp-mesh vertex buffers, cached 256-entry palette LUT uniform
 /// bind groups, and per-frame dynamic uniform offsets for draped raster overlays.
 pub(super) struct OverlayRenderer {
     index_buffers: HashMap<(u32, bool), (wgpu::Buffer, u32)>,
     meshes: ElasticMeshCache<OverlayMeshKey, CachedOverlayMesh>,
-    palettes: HashMap<PaletteKey, CachedPalette>,
+    palettes: PaletteCache,
     uniform_offsets: Vec<Option<u32>>,
 }
 
@@ -122,7 +146,7 @@ impl OverlayRenderer {
         Self {
             index_buffers: HashMap::new(),
             meshes: ElasticMeshCache::new(DEFAULT_MESH_CACHE_BYTES),
-            palettes: HashMap::new(),
+            palettes: PaletteCache::new(),
             uniform_offsets: Vec::new(),
         }
     }
@@ -144,70 +168,6 @@ impl OverlayRenderer {
             .insert((segs, flip_winding), (buffer, count));
     }
 
-    fn ensure_palette(
-        &mut self,
-        device: &wgpu::Device,
-        palette_layout: &wgpu::BindGroupLayout,
-        track: &DrawOverlayTrack,
-    ) {
-        let Some(key) = palette_key(track) else {
-            return;
-        };
-        if self.palettes.contains_key(&key) {
-            return;
-        }
-        let (lut, custom_weak) = match track {
-            DrawOverlayTrack::Display => return,
-            DrawOverlayTrack::Scientific { colormap, .. } => {
-                (scientific_lut_linear(*colormap), None)
-            }
-            DrawOverlayTrack::Categorical {
-                palette,
-                custom_color_map,
-                ..
-            } => {
-                if *palette == CategoricalPaletteId::SourceColorMap
-                    && let Some(cmap) = custom_color_map
-                {
-                    (
-                        categorical_lut_linear(*palette, Some(cmap.as_ref())),
-                        Some(Arc::downgrade(cmap)),
-                    )
-                } else {
-                    (categorical_lut_linear(*palette, None), None)
-                }
-            }
-        };
-
-        let uniform = PaletteUniform { entries: lut };
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("overlay palette LUT uniform buffer"),
-            contents: bytemuck::bytes_of(&uniform),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("overlay palette LUT bind group"),
-            layout: palette_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
-        });
-        self.palettes.insert(
-            key,
-            CachedPalette {
-                _buffer: buffer,
-                bind_group,
-                custom_weak,
-            },
-        );
-    }
-
-    fn palette_bind_group(&self, track: &DrawOverlayTrack) -> Option<&wgpu::BindGroup> {
-        let key = palette_key(track)?;
-        self.palettes.get(&key).map(|p| &p.bind_group)
-    }
-
     /// Ensure vertex buffers, index buffers, palette LUT bind groups, and
     /// format-appropriate texture bind groups exist for every overlay patch.
     pub(super) fn prepare_resources(
@@ -217,9 +177,7 @@ impl OverlayRenderer {
         bind_groups: &mut TileBindGroupCache,
         snapshot: &DrawSnapshot,
     ) {
-        // Sweep custom TIFF ColorMap palette entries whose owning source dropped.
-        self.palettes
-            .retain(|_, p| p.custom_weak.as_ref().is_none_or(|w| w.strong_count() > 0));
+        self.palettes.sweep_stale();
 
         if snapshot.overlays.is_empty() {
             self.meshes.clear_and_reset_cap();
@@ -246,7 +204,7 @@ impl OverlayRenderer {
         );
 
         for layer in &snapshot.overlays {
-            self.ensure_palette(device, palette_layout, &layer.track);
+            self.palettes.ensure(device, palette_layout, &layer.track);
             let segs = layer.segments.clamp(1, MAX_WARP_SEGMENTS);
             for patch in &layer.patches {
                 bind_groups.ensure(device, &patch.texture);
@@ -306,76 +264,48 @@ impl OverlayRenderer {
         self.uniform_offsets.clear();
         for layer in &snapshot.overlays {
             let opacity = clamp_opacity(layer.opacity);
+            let params = PreparedTrackParams::from_track(&layer.track);
             for patch in &layer.patches {
                 let offset = self.meshes.peek(&patch.mesh_key).map(|mesh| {
                     let offset_eye = (mesh.origin_ecef_m - eye).as_vec3().to_array();
-                    match &layer.track {
-                        DrawOverlayTrack::Display => {
-                            let u = OverlayPatchUniform {
-                                offset_eye,
-                                opacity,
-                                uv_rect: patch.uv_rect,
-                            };
-                            arena.push(&u)
-                        }
-                        DrawOverlayTrack::Scientific {
+                    match params {
+                        PreparedTrackParams::Display => arena.push(&OverlayPatchUniform {
+                            offset_eye,
+                            opacity,
+                            uv_rect: patch.uv_rect,
+                        }),
+                        PreparedTrackParams::Scientific {
                             scale,
-                            offset: phys_offset,
+                            offset,
                             stretch_min,
-                            stretch_max,
-                            log10_db,
+                            stretch_inv_range,
+                            stretch_mode,
                             invert_colormap,
-                            ..
-                        } => {
-                            let safe_scale = if scale.is_finite() { *scale } else { 1.0 };
-                            let safe_offset = if phys_offset.is_finite() {
-                                *phys_offset
-                            } else {
-                                0.0
-                            };
-                            let safe_min = if stretch_min.is_finite() {
-                                *stretch_min
-                            } else {
-                                0.0
-                            };
-                            let safe_max = if stretch_max.is_finite() {
-                                *stretch_max
-                            } else {
-                                safe_min + 1.0
-                            };
-                            let span = safe_max - safe_min;
-                            let stretch_inv_range = if span.is_finite() && span.abs() > 1e-12 {
-                                1.0 / span
-                            } else {
-                                0.0
-                            };
-                            let u = ScientificPatchUniform {
-                                offset_eye,
-                                opacity,
-                                uv_rect: patch.uv_rect,
-                                scale: safe_scale,
-                                offset: safe_offset,
-                                stretch_min: safe_min,
-                                stretch_inv_range,
-                                stretch_mode: u32::from(*log10_db),
-                                invert_colormap: u32::from(*invert_colormap),
-                                mip_count: patch.texture.mip_level_count.max(1),
-                                _pad0: 0,
-                            };
-                            arena.push(&u)
-                        }
-                        DrawOverlayTrack::Categorical { nodata_value, .. } => {
-                            let u = CategoricalPatchUniform {
-                                offset_eye,
-                                opacity,
-                                uv_rect: patch.uv_rect,
-                                has_nodata: u32::from(nodata_value.is_some()),
-                                nodata_value: nodata_value.unwrap_or(0),
-                                _pad0: 0,
-                                _pad1: 0,
-                            };
-                            arena.push(&u)
-                        }
+                        } => arena.push(&ScientificPatchUniform {
+                            offset_eye,
+                            opacity,
+                            uv_rect: patch.uv_rect,
+                            scale,
+                            offset,
+                            stretch_min,
+                            stretch_inv_range,
+                            stretch_mode,
+                            invert_colormap,
+                            mip_count: patch.texture.mip_level_count.max(1),
+                            _pad0: 0,
+                        }),
+                        PreparedTrackParams::Categorical {
+                            has_nodata,
+                            nodata_value,
+                        } => arena.push(&CategoricalPatchUniform {
+                            offset_eye,
+                            opacity,
+                            uv_rect: patch.uv_rect,
+                            has_nodata,
+                            nodata_value,
+                            _pad0: 0,
+                            _pad1: 0,
+                        }),
                     }
                 });
                 self.uniform_offsets.push(offset);
@@ -422,7 +352,7 @@ impl OverlayRenderer {
             let palette_bg = match &layer.track {
                 DrawOverlayTrack::Display => None,
                 DrawOverlayTrack::Scientific { .. } | DrawOverlayTrack::Categorical { .. } => {
-                    let Some(bg) = self.palette_bind_group(&layer.track) else {
+                    let Some(bg) = self.palettes.bind_group(&layer.track) else {
                         offset_idx += layer.patches.len();
                         continue;
                     };

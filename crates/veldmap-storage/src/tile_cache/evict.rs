@@ -3,7 +3,7 @@
 
 use rusqlite::{Connection, Transaction};
 
-use super::queries::{delete_meta_ids, select_evict_batch, set_cache_meta_totals};
+use super::queries::{TileEvictor, set_cache_meta_totals};
 
 /// Eviction headroom divisor (`10` => evict down to `90%` of budget so
 /// subsequent inserts do not trigger eviction on every single tile).
@@ -26,6 +26,12 @@ pub(super) fn reclaim_space(conn: &Connection, full_vacuum: bool) {
     }
 }
 
+/// Evict oldest tiles while `total_bytes > max_bytes`, returning the evicted
+/// `tile_id`s.
+///
+/// Updates `cache_meta` once when `always_write_meta` is true or when at least
+/// one tile was evicted, avoiding duplicate `UPDATE cache_meta` writes on
+/// evicting inserts.
 pub(super) fn evict_in_tx(
     tx: &Transaction<'_>,
     mut total_bytes: u64,
@@ -33,50 +39,59 @@ pub(super) fn evict_in_tx(
     max_bytes: u64,
     protect_id: Option<i64>,
     batch_start_ts: Option<i64>,
+    always_write_meta: bool,
 ) -> Result<Vec<i64>, rusqlite::Error> {
     if total_bytes <= max_bytes {
+        if always_write_meta {
+            set_cache_meta_totals(tx, total_bytes, tile_count)?;
+        }
         return Ok(Vec::new());
     }
 
     let target = max_bytes.saturating_sub(max_bytes / EVICT_HEADROOM_DIVISOR);
     let mut evicted_ids = Vec::new();
 
-    while total_bytes > target {
-        let batch = select_evict_batch(tx, EVICT_BATCH_ROWS, protect_id)?;
-        if batch.is_empty() {
-            break;
-        }
-
-        let mut to_delete = Vec::with_capacity(batch.len());
-        let mut stopped_at_batch_boundary = false;
-        for (tile_id, sz, last_used_ms) in batch {
-            // Pre-batch entries evict down to `target` (90% headroom); entries
-            // inserted by the current batch only evict while `total_bytes > max_bytes`
-            // so a batch never self-evicts into headroom while still honoring the
-            // hard `max_bytes` cap.
-            let is_current_batch = batch_start_ts.is_some_and(|start| last_used_ms >= start);
-            let limit = if is_current_batch { max_bytes } else { target };
-            if total_bytes <= limit {
-                if is_current_batch {
-                    stopped_at_batch_boundary = true;
-                }
+    {
+        let mut evictor = TileEvictor::new(tx, protect_id)?;
+        while total_bytes > target {
+            let batch = evictor.select_batch(EVICT_BATCH_ROWS)?;
+            if batch.is_empty() {
                 break;
             }
-            to_delete.push(tile_id);
-            evicted_ids.push(tile_id);
-            total_bytes = total_bytes.saturating_sub(sz);
-            tile_count = tile_count.saturating_sub(1);
-        }
-        if to_delete.is_empty() {
-            break;
-        }
-        delete_meta_ids(tx, &to_delete)?;
-        if stopped_at_batch_boundary {
-            break;
+
+            let mut to_delete = Vec::with_capacity(batch.len());
+            let mut stopped_at_batch_boundary = false;
+            for (tile_id, sz, last_used_ms) in batch {
+                // Pre-batch entries evict down to `target` (90% headroom); entries
+                // inserted by the current batch only evict while `total_bytes > max_bytes`
+                // so a batch never self-evicts into headroom while still honoring the
+                // hard `max_bytes` cap.
+                let is_current_batch = batch_start_ts.is_some_and(|start| last_used_ms >= start);
+                let limit = if is_current_batch { max_bytes } else { target };
+                if total_bytes <= limit {
+                    if is_current_batch {
+                        stopped_at_batch_boundary = true;
+                    }
+                    break;
+                }
+                to_delete.push(tile_id);
+                evicted_ids.push(tile_id);
+                total_bytes = total_bytes.saturating_sub(sz);
+                tile_count = tile_count.saturating_sub(1);
+            }
+            if to_delete.is_empty() {
+                break;
+            }
+            evictor.delete_ids(&to_delete)?;
+            if stopped_at_batch_boundary {
+                break;
+            }
         }
     }
 
-    set_cache_meta_totals(tx, total_bytes, tile_count)?;
+    if always_write_meta || !evicted_ids.is_empty() {
+        set_cache_meta_totals(tx, total_bytes, tile_count)?;
+    }
 
     Ok(evicted_ids)
 }

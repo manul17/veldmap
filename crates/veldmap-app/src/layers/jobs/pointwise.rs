@@ -122,7 +122,7 @@ fn run_pointwise_job(
 
     let spec = tile_key.stream_spec();
     let ctx = rt.decode_context(cancel);
-    match source.decode_pointwise_tile_stream(spec, tile_key.level, tile_key.x, tile_key.y, &ctx) {
+    match source.decode_pointwise_tile(spec, tile_key.level, tile_key.x, tile_key.y, &ctx) {
         Ok(mut tile) => {
             if cancel.is_cancelled() {
                 guard.mark_cancelled();

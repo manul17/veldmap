@@ -90,6 +90,22 @@ impl TouchBuffer {
         std::mem::take(&mut *lock_unpoisoned(&self.pending))
     }
 
+    /// Merge drained touches back into `pending` (keeping the newest timestamp
+    /// per `tile_id`) when a write transaction fails so buffered LRU recency
+    /// hits are not lost on transient SQLite errors.
+    pub(super) fn restore(&self, touches: HashMap<i64, i64>) {
+        if touches.is_empty() {
+            return;
+        }
+        let mut pending = lock_unpoisoned(&self.pending);
+        for (tile_id, ts) in touches {
+            pending
+                .entry(tile_id)
+                .and_modify(|prev| *prev = (*prev).max(ts))
+                .or_insert(ts);
+        }
+    }
+
     pub(super) fn prune(&self, tile_ids: &[i64]) {
         if tile_ids.is_empty() {
             return;

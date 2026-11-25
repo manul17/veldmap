@@ -1,5 +1,5 @@
-//! Generation-checked table of active disk/HTTP/decode tasks plus bounded
-//! disk-lookup slot accounting for [`super::state::PipelineState`].
+//! Generation-checked table of active disk/HTTP/decode tasks for
+//! [`super::PipelineState`].
 
 use std::collections::HashMap;
 
@@ -10,7 +10,6 @@ use veldmap_core::tile::TileKey;
 pub(super) struct InFlightTable {
     entries: HashMap<TileKey, (u64, CancelToken)>,
     next_gen: u64,
-    disk_in_flight: usize,
 }
 
 impl InFlightTable {
@@ -20,18 +19,6 @@ impl InFlightTable {
 
     pub(super) fn contains(&self, key: &TileKey) -> bool {
         self.entries.contains_key(key)
-    }
-
-    pub(super) fn disk_in_flight(&self) -> usize {
-        self.disk_in_flight
-    }
-
-    pub(super) fn acquire_disk_slot(&mut self) {
-        self.disk_in_flight += 1;
-    }
-
-    pub(super) fn release_disk_slot(&mut self) {
-        self.disk_in_flight = self.disk_in_flight.saturating_sub(1);
     }
 
     pub(super) fn register(&mut self, key: TileKey, shutdown: &CancelToken) -> (u64, CancelToken) {

@@ -1,6 +1,6 @@
 //! WGS84 geodesy, map projections, CRS/WKT catalog, Karney geodesics,
 //! georeference bindings, MGRS indexing, nadir globe camera, frustum culling,
-//! chord sagitta helpers, and footprint hit-testing.
+//! chord sagitta helpers, vector shapes, and footprint framing.
 
 mod binding;
 mod camera;
@@ -16,6 +16,7 @@ mod mgrs;
 mod proj4;
 mod projection;
 pub(crate) mod sag;
+mod shapes;
 
 pub use binding::{Frame, Tie, TieGrid};
 pub use camera::{Camera, MIN_HEIGHT_M, ZOOM_PER_CLICK};
@@ -29,7 +30,7 @@ pub use datum::{
     Datum, DatumWarning, HelmertConvention, KRASOVSKY, LinearUnit, PULKOVO_1942, US_SURVEY_FOOT_M,
     WGS84_DATUM, ellipsoid_from_epsg, known_datum_from_code,
 };
-pub use footprint::{FootprintBounds, GeoPoint, Polygon, Ring, covers_polygon, covers_polygons};
+pub use footprint::FootprintBounds;
 pub use geodesic::{GeodesicPolygonMeasurement, polyline_length_m, ring_perimeter_and_area};
 pub(crate) use geodesy::{EQUATORIAL_CIRCUMFERENCE_M, unwind};
 pub use geodesy::{Ellipsoid, Geodetic, SEMI_MAJOR_M, WGS84};
@@ -40,6 +41,7 @@ pub use geojson::{
 };
 pub use proj4::{CrsError, Proj4Projection};
 pub use projection::{Projection, System, WEB_MERCATOR_LIMIT_DEG, web_mercator_lat_deg};
+pub use shapes::{GeoPoint, Polygon, Ring};
 
 /// Local WGS84 surface distance approximation in metres for unit test error assertions.
 #[cfg(test)]

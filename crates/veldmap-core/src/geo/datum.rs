@@ -22,7 +22,7 @@ pub const KRASOVSKY: Ellipsoid = Ellipsoid {
 };
 
 /// Airy 1830 ellipsoid (OSGB36 / EPSG:7001).
-pub(crate) const AIRY_1830: Ellipsoid = Ellipsoid {
+const AIRY_1830: Ellipsoid = Ellipsoid {
     semi_major_m: 6_377_563.396,
     flattening: 1.0 / 299.324_964_6,
 };
@@ -276,16 +276,20 @@ fn lookup_known_datum(code: u32) -> Option<KnownDatumEntry> {
     })
 }
 
+impl KnownDatumEntry {
+    fn warning(&self, code: u32) -> Option<DatumWarning> {
+        self.grid_shift_recommended
+            .then(|| DatumWarning::GridShiftRecommended {
+                label: format!("{} (EPSG:{code})", self.name),
+            })
+    }
+}
+
 /// Resolve a known static [`Datum`] from a geographic CRS EPSG code (`2048`) or
 /// geodetic datum EPSG code (`2050`).
 pub fn known_datum_from_code(code: u32) -> Option<(Datum, Option<DatumWarning>)> {
     let entry = lookup_known_datum(code)?;
-    let warning = entry
-        .grid_shift_recommended
-        .then(|| DatumWarning::GridShiftRecommended {
-            label: format!("{} (EPSG:{code})", entry.name),
-        });
-    Some((entry.datum, warning))
+    Some((entry.datum, entry.warning(code)))
 }
 
 /// Resolve a known static geographic CRS (4xxx EPSG code only, keeping 6xxx
@@ -295,15 +299,10 @@ pub(crate) fn known_geographic_epsg(code: u32) -> Option<(Datum, String, Option<
     if !entry.is_geographic_crs {
         return None;
     }
-    let warning = entry
-        .grid_shift_recommended
-        .then(|| DatumWarning::GridShiftRecommended {
-            label: format!("{} (EPSG:{code})", entry.name),
-        });
     Some((
         entry.datum,
         format!("EPSG:{code} ({})", entry.name),
-        warning,
+        entry.warning(code),
     ))
 }
 

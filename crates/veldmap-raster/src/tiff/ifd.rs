@@ -3,7 +3,7 @@
 //! compression/predictor descriptors) bounded by [`MemoryBudget`].
 //!
 //! Parsing and caching IFD tables once during `TiffSource::open` allows the
-//! direct raw-chunk decoder (`raw_decode.rs`) to execute lock-free positioned
+//! direct raw-chunk decoder (`raw_decode`) to execute lock-free positioned
 //! reads over `ByteSource` without stateful `tiff::decoder::Decoder` pooling,
 //! while also resolving `tiff 0.11.3`'s `RGBPalette`, 4-band RGB+NIR, and
 //! tiled `PlanarConfiguration = 2` blockers.
@@ -199,6 +199,41 @@ impl CachedIfd {
         (self.samples_per_pixel as u32) * (self.sample_type.byte_size() as u32)
     }
 
+    /// Raw bytes per pixel decoded when reading a single band (`sample_bytes`
+    /// for `PlanarConfig::Planar`, full `raw_pixel_bytes` for `Chunky`).
+    pub(super) const fn band_raw_pixel_bytes(&self) -> u32 {
+        match self.planar {
+            PlanarConfig::Planar => self.sample_type.byte_size() as u32,
+            PlanarConfig::Chunky => self.raw_pixel_bytes(),
+        }
+    }
+
+    /// TIFF plane index holding `band` (`band` for `Planar`, `0` for `Chunky`).
+    pub(super) const fn band_plane(&self, band: usize) -> usize {
+        match self.planar {
+            PlanarConfig::Planar => band,
+            PlanarConfig::Chunky => 0,
+        }
+    }
+
+    /// Interleaved `(sample_stride, channel_offset)` within a decoded chunk for `band`.
+    pub(super) const fn band_stride_offset(&self, band: usize) -> (usize, usize) {
+        match self.planar {
+            PlanarConfig::Planar => (1, 0),
+            PlanarConfig::Chunky => (self.samples_per_pixel as usize, band),
+        }
+    }
+
+    /// Return `Some(YCbCrParams)` when reading single RGB band `band < 3` from
+    /// an 8-bit `YCbCr` IFD.
+    pub(super) const fn ycbcr_band_params(&self, band: usize) -> Option<YCbCrParams> {
+        if matches!(self.sample_type, SampleType::U8) && band < 3 {
+            self.ycbcr
+        } else {
+            None
+        }
+    }
+
     /// Explicit alpha channel index within a pixel, if present.
     pub(super) const fn alpha_channel(&self) -> Option<usize> {
         self.pixel_layout.alpha_channel()
@@ -382,41 +417,10 @@ pub(super) fn max_cached_ifd_table_bytes(budget: &MemoryBudget) -> u64 {
     (budget.decode_working_bytes / 16).max(4 * 1024 * 1024)
 }
 
-/// Parse and validate all chunk/tag metadata for the currently aimed IFD.
-pub(super) fn parse_cached_ifd(
+fn read_sample_type(
     decoder: &mut Decoder<BufferedByteReader>,
-    image: usize,
-    budget: &MemoryBudget,
-    table_bytes_used: u64,
     cancel: &CancelToken,
-) -> Result<CachedIfd, RasterError> {
-    let (width, height) = decoder
-        .dimensions()
-        .map_err(|e| map_tiff_error(e, cancel))?;
-    if width == 0 || height == 0 {
-        return Err(RasterError::InvalidDimensions { width, height });
-    }
-
-    let compression_code =
-        opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Compression), cancel)?.unwrap_or(1);
-    let compression = TiffCompression::from_code(compression_code)?;
-
-    let photometric_code = opt_tag_strict(
-        decoder.get_tag_unsigned::<u16>(Tag::PhotometricInterpretation),
-        cancel,
-    )?
-    .unwrap_or(1);
-    let photometric = Photometric::from_code(photometric_code);
-
-    let samples_per_pixel = opt_tag_strict(
-        decoder.get_tag_unsigned::<u16>(Tag::SamplesPerPixel),
-        cancel,
-    )?
-    .unwrap_or(1);
-    if samples_per_pixel == 0 {
-        return Err(RasterError::Decode("TIFF SamplesPerPixel is 0".to_owned()));
-    }
-
+) -> Result<SampleType, RasterError> {
     // TIFF 6.0 Baseline defaults omitted BitsPerSample to 1 (bi-level, unsupported).
     let bps_vec = read_tag_u16_vec_strict(decoder, Tag::BitsPerSample, cancel)?.unwrap_or_default();
     let sample_bits_u16 = bps_vec.first().copied().unwrap_or(1);
@@ -436,8 +440,16 @@ pub(super) fn parse_cached_ifd(
             "heterogeneous per-band SampleFormat {sample_fmt_vec:?} is not supported"
         )));
     }
-    let sample_type = resolve_sample_type(sample_fmt_code, sample_bits)?;
+    resolve_sample_type(sample_fmt_code, sample_bits)
+}
 
+fn validate_codec_and_layout(
+    compression: TiffCompression,
+    photometric: Photometric,
+    planar: PlanarConfig,
+    samples_per_pixel: u16,
+    sample_type: SampleType,
+) -> Result<(), RasterError> {
     if photometric == Photometric::YCbCr && sample_type != SampleType::U8 {
         return Err(RasterError::Decode(format!(
             "YCbCr TIFF requires 8-bit unsigned samples, got {sample_type:?}"
@@ -450,21 +462,6 @@ pub(super) fn parse_cached_ifd(
             "Palette TIFF requires 8- or 16-bit unsigned indices, got {sample_type:?}"
         )));
     }
-
-    let planar_code = opt_tag_strict(
-        decoder.get_tag_unsigned::<u16>(Tag::PlanarConfiguration),
-        cancel,
-    )?
-    .unwrap_or(1);
-    let planar = match planar_code {
-        1 => PlanarConfig::Chunky,
-        2 => PlanarConfig::Planar,
-        other => {
-            return Err(RasterError::Decode(format!(
-                "unsupported TIFF PlanarConfiguration {other}"
-            )));
-        }
-    };
     if planar == PlanarConfig::Planar && photometric == Photometric::YCbCr {
         return Err(RasterError::Decode(
             "planar YCbCr TIFF is not supported".to_owned(),
@@ -502,39 +499,28 @@ pub(super) fn parse_cached_ifd(
             "WebP-compressed TIFF requires chunky 3- or 4-band RGB/RGBA, got planar={planar:?}, spp={samples_per_pixel}, photometric={photometric:?}"
         )));
     }
+    Ok(())
+}
 
-    let predictor_code =
-        opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Predictor), cancel)?.unwrap_or(1);
-    let predictor = TiffPredictor::from_code(predictor_code, sample_type)?;
+struct ChunkTables {
+    tiled: bool,
+    chunk_w: u32,
+    chunk_h: u32,
+    chunks_across: u32,
+    chunks_per_plane: u32,
+    offsets: Vec<u64>,
+    byte_counts: Vec<u64>,
+}
 
-    let extra_samples =
-        read_tag_u16_vec_strict(decoder, Tag::ExtraSamples, cancel)?.unwrap_or_default();
-    let (pixel_layout, data_bands) =
-        resolve_pixel_layout(photometric, samples_per_pixel, &extra_samples)?;
-
-    let ycbcr = if photometric == Photometric::YCbCr {
-        if compression != TiffCompression::Jpeg {
-            // TIFF 6.0 Section 21 defaults omitted YCbCrSubSampling to [2, 2].
-            let sub = read_tag_u16_vec_strict(decoder, Tag::ChromaSubsampling, cancel)?
-                .unwrap_or_else(|| vec![2, 2]);
-            if sub.as_slice() != [1, 1] {
-                return Err(RasterError::Decode(format!(
-                    "non-JPEG subsampled YCbCr TIFF (YCbCrSubSampling={sub:?}) is not supported"
-                )));
-            }
-        }
-        Some(read_ycbcr_params(decoder, cancel)?)
-    } else {
-        None
-    };
-
-    let color_map = if photometric == Photometric::Palette {
-        Some(parse_color_map(decoder, sample_type, cancel)?)
-    } else {
-        None
-    };
-
-    // Determine tiled vs stripped layout and read offset/byte-count tables.
+fn read_chunk_tables(
+    decoder: &mut Decoder<BufferedByteReader>,
+    image: usize,
+    width: u32,
+    height: u32,
+    planar: PlanarConfig,
+    samples_per_pixel: u16,
+    cancel: &CancelToken,
+) -> Result<ChunkTables, RasterError> {
     let tile_w = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::TileWidth), cancel)?;
     let (tiled, chunk_w, chunk_h, offsets, byte_counts) = if let Some(tw) = tile_w {
         let th = opt_tag_strict(decoder.get_tag_unsigned::<u32>(Tag::TileLength), cancel)?
@@ -585,6 +571,144 @@ pub(super) fn parse_cached_ifd(
         )));
     }
 
+    Ok(ChunkTables {
+        tiled,
+        chunk_w,
+        chunk_h,
+        chunks_across,
+        chunks_per_plane,
+        offsets,
+        byte_counts,
+    })
+}
+
+fn admit_ifd_budget(
+    cached: &CachedIfd,
+    budget: &MemoryBudget,
+    table_bytes_used: u64,
+) -> Result<(), RasterError> {
+    let chunk_cap = budget.decode_working_bytes.min(MAX_SINGLE_CHUNK_BYTES);
+    DecodePeak::new()
+        .with(
+            "fresh chunk",
+            grid::chunk_working_bytes(cached.chunk_w, cached.chunk_h, cached.raw_pixel_bytes(), 4),
+        )
+        .admit(chunk_cap)?;
+
+    let table_cap = max_cached_ifd_table_bytes(budget);
+    let new_total = table_bytes_used.saturating_add(cached.table_bytes());
+    if new_total > table_cap {
+        return Err(RasterError::LimitExceeded {
+            width: cached.width,
+            height: cached.height,
+            estimated_bytes: new_total,
+            limit_bytes: table_cap,
+        });
+    }
+    Ok(())
+}
+
+/// Parse and validate all chunk/tag metadata for the currently aimed IFD.
+pub(super) fn parse_cached_ifd(
+    decoder: &mut Decoder<BufferedByteReader>,
+    image: usize,
+    budget: &MemoryBudget,
+    table_bytes_used: u64,
+    cancel: &CancelToken,
+) -> Result<CachedIfd, RasterError> {
+    let (width, height) = decoder
+        .dimensions()
+        .map_err(|e| map_tiff_error(e, cancel))?;
+    if width == 0 || height == 0 {
+        return Err(RasterError::InvalidDimensions { width, height });
+    }
+
+    let compression_code =
+        opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Compression), cancel)?.unwrap_or(1);
+    let compression = TiffCompression::from_code(compression_code)?;
+
+    let photometric_code = opt_tag_strict(
+        decoder.get_tag_unsigned::<u16>(Tag::PhotometricInterpretation),
+        cancel,
+    )?
+    .unwrap_or(1);
+    let photometric = Photometric::from_code(photometric_code);
+
+    let samples_per_pixel = opt_tag_strict(
+        decoder.get_tag_unsigned::<u16>(Tag::SamplesPerPixel),
+        cancel,
+    )?
+    .unwrap_or(1);
+    if samples_per_pixel == 0 {
+        return Err(RasterError::Decode("TIFF SamplesPerPixel is 0".to_owned()));
+    }
+
+    let sample_type = read_sample_type(decoder, cancel)?;
+
+    let planar_code = opt_tag_strict(
+        decoder.get_tag_unsigned::<u16>(Tag::PlanarConfiguration),
+        cancel,
+    )?
+    .unwrap_or(1);
+    let planar = match planar_code {
+        1 => PlanarConfig::Chunky,
+        2 => PlanarConfig::Planar,
+        other => {
+            return Err(RasterError::Decode(format!(
+                "unsupported TIFF PlanarConfiguration {other}"
+            )));
+        }
+    };
+
+    validate_codec_and_layout(
+        compression,
+        photometric,
+        planar,
+        samples_per_pixel,
+        sample_type,
+    )?;
+
+    let predictor_code =
+        opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Predictor), cancel)?.unwrap_or(1);
+    let predictor = TiffPredictor::from_code(predictor_code, sample_type)?;
+
+    let extra_samples =
+        read_tag_u16_vec_strict(decoder, Tag::ExtraSamples, cancel)?.unwrap_or_default();
+    let (pixel_layout, data_bands) =
+        resolve_pixel_layout(photometric, samples_per_pixel, &extra_samples)?;
+
+    let ycbcr = if photometric == Photometric::YCbCr {
+        if compression != TiffCompression::Jpeg {
+            // TIFF 6.0 Section 21 defaults omitted YCbCrSubSampling to [2, 2].
+            let sub = read_tag_u16_vec_strict(decoder, Tag::ChromaSubsampling, cancel)?
+                .unwrap_or_else(|| vec![2, 2]);
+            if sub.as_slice() != [1, 1] {
+                return Err(RasterError::Decode(format!(
+                    "non-JPEG subsampled YCbCr TIFF (YCbCrSubSampling={sub:?}) is not supported"
+                )));
+            }
+        }
+        Some(read_ycbcr_params(decoder, cancel)?)
+    } else {
+        None
+    };
+
+    let color_map = if photometric == Photometric::Palette {
+        Some(parse_color_map(decoder, sample_type, cancel)?)
+    } else {
+        None
+    };
+
+    let tables = read_chunk_tables(
+        decoder,
+        image,
+        width,
+        height,
+        planar,
+        samples_per_pixel,
+        cancel,
+    )?;
+
     let jpeg_tables = if compression == TiffCompression::Jpeg {
         match read_tag_u8_vec_strict(decoder, Tag::JPEGTables, cancel)? {
             Some(tables) => {
@@ -601,24 +725,15 @@ pub(super) fn parse_cached_ifd(
         None
     };
 
-    let depth = (samples_per_pixel as u32) * (sample_type.byte_size() as u32);
-    let chunk_cap = budget.decode_working_bytes.min(MAX_SINGLE_CHUNK_BYTES);
-    DecodePeak::new()
-        .with(
-            "fresh chunk",
-            grid::chunk_working_bytes(chunk_w, chunk_h, depth, 4),
-        )
-        .admit(chunk_cap)?;
-
     let cached = CachedIfd {
         image,
         width,
         height,
-        tiled,
-        chunk_w,
-        chunk_h,
-        chunks_across,
-        chunks_per_plane,
+        tiled: tables.tiled,
+        chunk_w: tables.chunk_w,
+        chunk_h: tables.chunk_h,
+        chunks_across: tables.chunks_across,
+        chunks_per_plane: tables.chunks_per_plane,
         compression,
         predictor,
         planar,
@@ -627,24 +742,14 @@ pub(super) fn parse_cached_ifd(
         sample_type,
         pixel_layout,
         data_bands,
-        offsets,
-        byte_counts,
+        offsets: tables.offsets,
+        byte_counts: tables.byte_counts,
         jpeg_tables,
         ycbcr,
         color_map,
     };
 
-    let table_cap = max_cached_ifd_table_bytes(budget);
-    let new_total = table_bytes_used.saturating_add(cached.table_bytes());
-    if new_total > table_cap {
-        return Err(RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes: new_total,
-            limit_bytes: table_cap,
-        });
-    }
-
+    admit_ifd_budget(&cached, budget, table_bytes_used)?;
     Ok(cached)
 }
 

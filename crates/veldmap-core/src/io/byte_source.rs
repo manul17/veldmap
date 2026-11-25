@@ -140,12 +140,6 @@ impl BufferedByteReader {
         }
     }
 
-    /// Replace the active [`CancelToken`] (used when checking out/returning a
-    /// pooled decoder so a cancelled request never poisons reuse).
-    pub fn set_cancel(&mut self, cancel: CancelToken) {
-        self.cancel = cancel;
-    }
-
     fn buffered_end(&self) -> u64 {
         self.buf_offset.saturating_add(self.buf_len as u64)
     }

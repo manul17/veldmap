@@ -13,18 +13,16 @@ use veldmap_core::tile::{
 };
 use veldmap_raster::{BandStats, PyramidMeta, RasterSource};
 
+use crate::colormap::{CategoricalPaletteId, ColormapId};
 use crate::gpu_tiles::tile_format_bytes;
-use crate::render::{CategoricalPaletteId, ColormapId, DrawOverlayTrack};
+use crate::render::DrawOverlayTrack;
 use crate::{clamp_opacity, display_name_from_path};
 
 use super::style::{
-    BandStatsState, CategoricalStyle, ColorbarInfo, LayerBandOption, SavedLayerStyle,
-    ScientificStyle, StretchPreset, TrackKind, build_band_options, format_band_label,
+    CategoricalStyle, LayerBandOption, SavedLayerStyle, ScientificStyle, StretchPreset, TrackKind,
+    build_band_options,
 };
-use super::{
-    CategoricalSummary, CrsOverride, LayerId, LayerInitOptions, LayerSummary, OverlayPersistEntry,
-    ScientificSummary,
-};
+use super::{CrsOverride, LayerId, LayerInitOptions, OverlayPersistEntry};
 
 /// Layer-domain state transition record returned by [`OverlayLayer::begin_reload`].
 pub(super) struct ReloadPrep {
@@ -155,8 +153,13 @@ impl OverlayLayer {
             .and_then(|s| s.resolve_stream_spec(desc))
             .unwrap_or_else(|| source.default_stream_spec());
         let meta = source
-            .pyramid_meta_for(preferred_spec)
-            .unwrap_or_else(|_| source.pyramid_meta());
+            .pyramid_meta(preferred_spec)
+            .or_else(|_| source.pyramid_meta(veldmap_raster::DISPLAY_STREAM_SPEC))
+            .unwrap_or_else(|_| PyramidMeta {
+                source: source.source_id(),
+                spec: veldmap_raster::DISPLAY_STREAM_SPEC,
+                levels: desc.levels.clone(),
+            });
         let max_level = meta.max_level();
 
         let custom_color_map = source.color_map();
@@ -169,25 +172,7 @@ impl OverlayLayer {
             palette: default_categorical_palette(custom_color_map.is_some()),
         };
         if let Some(saved) = &options.style {
-            if let Some(preset) = saved.stretch_preset {
-                scientific.preset = preset;
-            }
-            if let (Some(lo), Some(hi)) = (saved.stretch_min, saved.stretch_max)
-                && lo.is_finite()
-                && hi.is_finite()
-                && hi > lo
-            {
-                scientific.min = lo;
-                scientific.max = hi;
-                if saved.custom_stretch_range || saved.stretch_preset == Some(StretchPreset::Custom)
-                {
-                    scientific.custom_range_applied = true;
-                }
-            }
-            if let Some(cm) = saved.colormap {
-                scientific.colormap = cm;
-            }
-            scientific.invert_colormap = saved.invert_colormap;
+            scientific.apply_saved(saved);
             if let Some(pal) = saved.categorical_palette
                 && (pal != CategoricalPaletteId::SourceColorMap || custom_color_map.is_some())
             {
@@ -257,6 +242,26 @@ impl OverlayLayer {
 
     pub(super) fn scientific_style(&self) -> &ScientificStyle {
         &self.scientific
+    }
+
+    pub(super) fn categorical_palette(&self) -> CategoricalPaletteId {
+        self.categorical.palette
+    }
+
+    pub(super) fn has_source_color_map(&self) -> bool {
+        self.custom_color_map.is_some()
+    }
+
+    pub(super) fn band_options(&self) -> &[LayerBandOption] {
+        &self.band_options
+    }
+
+    pub(super) fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub(super) fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     pub(super) fn fingerprint_hex(&self) -> &str {
@@ -351,75 +356,24 @@ impl OverlayLayer {
         if self.meta().spec == spec {
             return Ok(false);
         }
-        let meta = self
-            .source
-            .pyramid_meta_for(spec)
-            .map_err(|e| e.to_string())?;
+        let meta = self.source.pyramid_meta(spec).map_err(|e| e.to_string())?;
         let desc = self.source.description();
         self.cull = OverlayCullTree::new(desc.width, desc.height, meta.max_level());
         self.streams = vec![LayerStream::new(meta)];
-        if spec.format == PixelFormat::R32Float {
-            if self.scientific.last_scientific_band != Some(spec.band) {
-                self.cancel_stats_job();
-                self.scientific.stats_state = BandStatsState::NotRequested;
-                self.scientific.custom_range_applied = false;
-                if self.scientific.preset == StretchPreset::Custom {
-                    self.scientific.preset = StretchPreset::Percentile2_98;
-                }
-                self.scientific.last_scientific_band = Some(spec.band);
-            }
-        } else {
-            // Cancel any in-flight stats scan while away from Scientific,
-            // preserving Ready stats/custom bounds if the user returns to the
-            // same band.
-            self.cancel_stats_job();
-        }
+        self.scientific.on_stream_switched(spec);
         Ok(true)
     }
 
     pub(super) fn set_stretch_preset(&mut self, preset: StretchPreset) -> bool {
-        if self.scientific.preset == preset
-            && (preset == StretchPreset::Custom || !self.scientific.custom_range_applied)
-        {
-            return false;
-        }
-        self.scientific.preset = preset;
-        if preset != StretchPreset::Custom {
-            self.scientific.custom_range_applied = false;
-            self.scientific.recompute_bounds_from_stats();
-        }
-        true
+        self.scientific.set_stretch_preset(preset)
     }
 
     pub(super) fn set_stretch_range(&mut self, min: f64, max: f64) -> bool {
-        if !min.is_finite() || !max.is_finite() {
-            return false;
-        }
-        let (lo, hi) = if max > min {
-            (min, max)
-        } else {
-            (min, min + min.abs().max(1.0) * 1e-6)
-        };
-        let eps = lo.abs().max(hi.abs()).max(1e-30) * 1e-12;
-        if (self.scientific.min - lo).abs() <= eps && (self.scientific.max - hi).abs() <= eps {
-            return false;
-        }
-        self.scientific.min = lo;
-        self.scientific.max = hi;
-        self.scientific.custom_range_applied = true;
-        if !self.scientific.preset.is_log10_db() {
-            self.scientific.preset = StretchPreset::Custom;
-        }
-        true
+        self.scientific.set_stretch_range(min, max)
     }
 
     pub(super) fn set_colormap(&mut self, colormap: ColormapId, invert: bool) -> bool {
-        if self.scientific.colormap == colormap && self.scientific.invert_colormap == invert {
-            return false;
-        }
-        self.scientific.colormap = colormap;
-        self.scientific.invert_colormap = invert;
-        true
+        self.scientific.set_colormap(colormap, invert)
     }
 
     pub(super) fn set_categorical_palette(&mut self, palette: CategoricalPaletteId) -> bool {
@@ -433,7 +387,7 @@ impl OverlayLayer {
         true
     }
 
-    fn categorical_nodata_value(&self, band: BandKey) -> Option<u32> {
+    pub(super) fn categorical_nodata_value(&self, band: BandKey) -> Option<u32> {
         self.source
             .description()
             .band_info(band)
@@ -468,28 +422,6 @@ impl OverlayLayer {
         }
     }
 
-    pub(super) fn colorbar_info(&self) -> Option<ColorbarInfo> {
-        let spec = self.meta().spec;
-        if !self.is_active() || spec.format != PixelFormat::R32Float {
-            return None;
-        }
-        let info = self.source.description().band_info(spec.band);
-        let band_title = info.map(format_band_label);
-        let title = match band_title {
-            Some(bt) => format!("{} · {bt}", self.name),
-            None => self.name.clone(),
-        };
-        Some(ColorbarInfo {
-            title,
-            units: info.and_then(|b| b.units.clone()),
-            min: self.scientific.min,
-            max: self.scientific.max,
-            log10_db: self.scientific.preset.is_log10_db(),
-            colormap: self.scientific.colormap,
-            invert_colormap: self.scientific.invert_colormap,
-        })
-    }
-
     pub(super) fn saved_style(&self) -> Option<SavedLayerStyle> {
         let spec = self.meta().spec;
         let default_cat = default_categorical_palette(self.custom_color_map.is_some());
@@ -500,11 +432,11 @@ impl OverlayLayer {
         {
             return None;
         }
-        let (band_index, track) = match (spec.band, TrackKind::from_format(spec.format)) {
-            (_, TrackKind::Display) => (None, Some("display".to_owned())),
-            (BandKey::Index(i), TrackKind::Scientific) => (Some(i), Some("scientific".to_owned())),
-            (BandKey::Index(i), TrackKind::Categorical) => {
-                (Some(i), Some("categorical".to_owned()))
+        let track_kind = TrackKind::from_format(spec.format);
+        let (band_index, track) = match (spec.band, track_kind) {
+            (_, TrackKind::Display) => (None, Some(track_kind.as_str().to_owned())),
+            (BandKey::Index(i), TrackKind::Scientific | TrackKind::Categorical) => {
+                (Some(i), Some(track_kind.as_str().to_owned()))
             }
             _ => (None, None),
         };
@@ -560,83 +492,6 @@ impl OverlayLayer {
             if s.stream_key() == stream {
                 s.observe_tile_bytes(bytes);
             }
-        }
-    }
-
-    pub(super) fn to_summary(
-        &self,
-        in_flight: usize,
-        pass_active: bool,
-        can_move_up: bool,
-        can_move_down: bool,
-    ) -> LayerSummary {
-        let desc = self.source.description();
-        let active_spec = self.meta().spec;
-        let sample_info = desc.bands.first().map_or_else(
-            || "Display RGBA".to_owned(),
-            |b| {
-                let nodata_str = b
-                    .nodata
-                    .map(|v| format!(", nodata={v}"))
-                    .unwrap_or_default();
-                format!("{} ch, {:?}{nodata_str}", b.channels, b.sample_type)
-            },
-        );
-        let active_band_info = desc.band_info(active_spec.band);
-        let scientific = (active_spec.format == PixelFormat::R32Float).then(|| {
-            let (scale, offset) = active_band_info.map_or((1.0, 0.0), |b| (b.scale, b.offset));
-            ScientificSummary {
-                preset: self.scientific.preset,
-                min: self.scientific.min,
-                max: self.scientific.max,
-                colormap: self.scientific.colormap,
-                invert_colormap: self.scientific.invert_colormap,
-                units: active_band_info.and_then(|b| b.units.clone()),
-                scale,
-                offset,
-                stats: self.scientific.stats().cloned(),
-                stats_loading: self.scientific.is_loading(),
-            }
-        });
-        let categorical = matches!(
-            active_spec.format,
-            PixelFormat::R8Uint | PixelFormat::R16Uint
-        )
-        .then(|| CategoricalSummary {
-            palette: self.categorical.palette,
-            has_source_color_map: self.custom_color_map.is_some(),
-            nodata_value: self.categorical_nodata_value(active_spec.band),
-        });
-
-        LayerSummary {
-            id: self.id,
-            name: self.name.clone(),
-            path: self.path.clone(),
-            visible: self.visible,
-            opacity: self.opacity,
-            width: desc.width,
-            height: desc.height,
-            source_pixel_size_m: self.source_pixel_size_m,
-            footprint: self.footprint,
-            in_flight,
-            pass_active,
-            reloading: self.is_reloading(),
-            crs_label: self.frame.crs_label(),
-            datum_warning: self.frame.datum_warning().map(|w| w.message()),
-            sample_info,
-            detail_limit_level: self
-                .meta()
-                .finest_fitting_level()
-                .unwrap_or(self.meta().max_level()),
-            can_override_crs: desc.can_override_crs(),
-            has_crs_override: self.crs_override.is_some(),
-            last_error: self.last_error.clone(),
-            can_move_up,
-            can_move_down,
-            active_spec,
-            band_options: self.band_options.clone(),
-            scientific,
-            categorical,
         }
     }
 

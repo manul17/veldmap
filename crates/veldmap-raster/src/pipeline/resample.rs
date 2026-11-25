@@ -60,6 +60,18 @@ pub(crate) struct Window {
     pub(crate) y1: f64,
 }
 
+impl Window {
+    #[inline]
+    fn is_identity(self, sw: u32, sh: u32, dw: u32, dh: u32) -> bool {
+        sw == dw
+            && sh == dh
+            && self.x0 == 0.0
+            && self.y0 == 0.0
+            && self.x1 == f64::from(sw)
+            && self.y1 == f64::from(sh)
+    }
+}
+
 /// Area-weighted resampling of fractional `window` inside `src` (`sw x sh`) to
 /// `dw x dh` RGBA8 output, preserving exact seam alignment across adjacent tiles.
 pub(crate) fn resample_rgba8_window(
@@ -75,13 +87,7 @@ pub(crate) fn resample_rgba8_window(
     }
     debug_assert_eq!(src.len(), (sw as usize) * (sh as usize) * 4);
 
-    if sw == dw
-        && sh == dh
-        && window.x0 == 0.0
-        && window.y0 == 0.0
-        && window.x1 == f64::from(sw)
-        && window.y1 == f64::from(sh)
-    {
+    if window.is_identity(sw, sh, dw, dh) {
         return src.to_vec();
     }
 
@@ -272,7 +278,7 @@ pub(super) fn halve_f32(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
 /// Area-weighted NaN-skipping resampling of fractional `window` inside an
 /// `R32Float` buffer (`sw x sh`) to `dw x dh`.
-pub(crate) fn resample_f32_window(
+pub(super) fn resample_f32_window(
     src: &[u8],
     sw: u32,
     sh: u32,
@@ -284,13 +290,7 @@ pub(crate) fn resample_f32_window(
         return Vec::new();
     }
     debug_assert_eq!(src.len(), (sw as usize) * (sh as usize) * 4);
-    if sw == dw
-        && sh == dh
-        && window.x0 == 0.0
-        && window.y0 == 0.0
-        && window.x1 == f64::from(sw)
-        && window.y1 == f64::from(sh)
-    {
+    if window.is_identity(sw, sh, dw, dh) {
         return src.to_vec();
     }
     let x_spans = spans(window.x0, window.x1, dw);
@@ -353,7 +353,7 @@ pub(super) fn halve_uint_nearest(src: &[u8], w: u32, h: u32, bpp: usize) -> Vec<
 }
 
 /// Nearest-neighbor resampling of fractional `window` for categorical `R8Uint` / `R16Uint`.
-pub(crate) fn resample_uint_nearest_window(
+pub(super) fn resample_uint_nearest_window(
     src: &[u8],
     sw: u32,
     sh: u32,
@@ -366,13 +366,7 @@ pub(crate) fn resample_uint_nearest_window(
         return Vec::new();
     }
     debug_assert_eq!(src.len(), (sw as usize) * (sh as usize) * bpp);
-    if sw == dw
-        && sh == dh
-        && window.x0 == 0.0
-        && window.y0 == 0.0
-        && window.x1 == f64::from(sw)
-        && window.y1 == f64::from(sh)
-    {
+    if window.is_identity(sw, sh, dw, dh) {
         return src.to_vec();
     }
     let scale_x = (window.x1 - window.x0) / f64::from(dw);

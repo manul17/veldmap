@@ -281,36 +281,6 @@ pub(super) fn separation(from: (f64, f64), to: (f64, f64)) -> f64 {
     a.cross(b).length().atan2(a.dot(b)).to_degrees()
 }
 
-/// Interpolate along the great-circle arc between two `(lat_deg, lon_deg)`
-/// points at fraction `t`, keeping longitude continuous with `from.1`.
-pub(super) fn between(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
-    if t <= 0.0 {
-        return from;
-    }
-    if t >= 1.0 {
-        return (to.0, unwind(from.1, to.1));
-    }
-
-    let (a, b) = (unit(from.0, from.1), unit(to.0, to.1));
-    let angle = a.cross(b).length().atan2(a.dot(b));
-    let mid = if angle < 1e-6 {
-        let v = a * (1.0 - t) + b * t;
-        if v.length_squared() <= 0.0 {
-            return from;
-        }
-        v.normalize()
-    } else {
-        let sin = angle.sin();
-        if sin.abs() < 1e-12 {
-            return from;
-        }
-        let (head, tail) = (((1.0 - t) * angle).sin() / sin, (t * angle).sin() / sin);
-        (a * head + b * tail).normalize()
-    };
-    let (lat, lon) = angles(mid);
-    (lat, unwind(from.1, lon))
-}
-
 /// One full turn of longitude in degrees.
 pub(crate) const TURN_DEG: f64 = 360.0;
 

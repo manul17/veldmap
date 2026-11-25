@@ -137,7 +137,7 @@ fn drain_pass_cache_hits(spec: &PassJobSpec) -> CacheDrainOutcome {
     }
 }
 
-/// Execute the source's sequential `produce_pass_stream`, batch-writing newly
+/// Execute the source's sequential `produce_pass`, batch-writing newly
 /// produced tiles (`Qoi` or `Lz4Raw`) to disk cache and uploading wanted/apex
 /// tiles live.
 fn run_source_pass(spec: &PassJobSpec, already_hit: &HashSet<TileKey>) -> Result<(), RasterError> {
@@ -158,7 +158,7 @@ fn run_source_pass(spec: &PassJobSpec, already_hit: &HashSet<TileKey>) -> Result
 
     let result =
         spec.source
-            .produce_pass_stream(stream_spec, &ctx, &mut |level, tx, ty, tw, th, bytes| {
+            .produce_pass(stream_spec, &ctx, &mut |level, tx, ty, tw, th, bytes| {
                 if pass_cancel.is_cancelled() {
                     return Err(RasterError::Cancelled);
                 }
@@ -241,7 +241,7 @@ pub(super) fn submit_pass_job(spec: PassJobSpec) {
     let runtime = Arc::clone(&spec.runtime);
     let queued_bytes = spec
         .source
-        .pass_peak_bytes_for(spec.meta.spec)
+        .pass_peak_bytes(spec.meta.spec)
         .min(runtime.budget.bulk_lane_pending_bytes as u64) as usize;
     let guard = PassFlightGuard::new(Arc::clone(&runtime), stream_key, pass_id);
 

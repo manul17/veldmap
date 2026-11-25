@@ -197,4 +197,10 @@ impl StreamKey {
             gutter,
         }
     }
+
+    /// Construct the canonical display [`StreamKey`] (`BandKey::Display`,
+    /// `PixelFormat::Rgba8UnormSrgb`, `gutter = 0`) for `source`.
+    pub const fn display(source: SourceId) -> Self {
+        Self::new(source, BandKey::Display, PixelFormat::Rgba8UnormSrgb, 0)
+    }
 }

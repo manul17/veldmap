@@ -9,7 +9,7 @@ use geographiclib_rs::{
     Geodesic, GeodesicLine, InverseGeodesic, PolygonArea, Winding, geodesic_capability as caps,
 };
 
-use super::footprint::{GeoPoint, dedup_geo_ring};
+use super::shapes::{GeoPoint, dedup_geo_ring};
 
 /// Result of Karney's inverse geodesic problem between two WGS84 points.
 #[derive(Clone, Copy, PartialEq, Debug)]

@@ -41,7 +41,7 @@ pub(crate) struct DirectRead<'a> {
     pub(crate) cancel: &'a CancelToken,
 }
 
-fn alloc_empty_surface(pixels: usize, format: PixelFormat) -> Vec<u8> {
+pub(crate) fn alloc_empty_surface(pixels: usize, format: PixelFormat) -> Vec<u8> {
     let bpp = format.bytes_per_pixel();
     let byte_len = pixels.saturating_mul(bpp);
     match format {
@@ -232,7 +232,7 @@ pub(crate) fn pass<S: Chunked>(
     let across = width.div_ceil(cw);
     let down = height.div_ceil(ch);
 
-    let mut cascade = Cascade::new_for_format(0, width, height, format);
+    let mut cascade = Cascade::new(0, width, height, format);
     let mut bled_holder;
     let sink: TileEmit<'_> = if format == PixelFormat::Rgba8UnormSrgb {
         bled_holder = bleed_display_emit(emit);

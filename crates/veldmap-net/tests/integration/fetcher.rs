@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, TileKey};
 use veldmap_net::{
-    BlobStoreError, CustomBasemapConfig, DecodeFailure, DecodeRequest, FetcherConfig,
+    BlobLease, BlobStoreError, CustomBasemapConfig, DecodeFailure, DecodeRequest, FetcherConfig,
     LiveBasemapSpec, LiveTilePipeline, TileBlobStore, TileDecodeExecutor,
 };
 
@@ -18,29 +18,69 @@ const TEST_TILE_MAGIC: &[u8] = b"VELDMAP_TEST_TILE_8X8";
 
 #[derive(Default)]
 struct MemBlobStore {
-    map: Mutex<HashMap<BlobMapKey, Vec<u8>>>,
+    map: Mutex<HashMap<BlobMapKey, (u64, Vec<u8>)>>,
+    next_rev: AtomicUsize,
+}
+
+impl MemBlobStore {
+    fn has_entry(&self, source_key: &str, id: QuadTileId) -> bool {
+        lock_unpoisoned(&self.map).contains_key(&(
+            source_key.to_owned(),
+            id.scheme,
+            id.level,
+            id.x,
+            id.y,
+        ))
+    }
+
+    fn seed(&self, source_key: &str, id: QuadTileId, payload: &[u8]) {
+        self.put(source_key, id, payload, &CancelToken::new())
+            .expect("seed blob");
+    }
 }
 
 impl TileBlobStore for MemBlobStore {
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, BlobStoreError> {
+    fn get(
+        &self,
+        source_key: &str,
+        id: QuadTileId,
+    ) -> Result<Option<(Vec<u8>, BlobLease)>, BlobStoreError> {
+        let key = (source_key.to_owned(), id.scheme, id.level, id.x, id.y);
         let map = lock_unpoisoned(&self.map);
         Ok(map
-            .get(&(source_key.to_owned(), id.scheme, id.level, id.x, id.y))
-            .cloned())
+            .get(&key)
+            .map(|(rev, bytes)| (bytes.clone(), BlobLease::new((key, *rev)))))
     }
 
-    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), BlobStoreError> {
+    fn touch(&self, _lease: BlobLease) {}
+
+    fn put(
+        &self,
+        source_key: &str,
+        id: QuadTileId,
+        payload: &[u8],
+        cancel: &CancelToken,
+    ) -> Result<(), BlobStoreError> {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let rev = self.next_rev.fetch_add(1, Ordering::AcqRel) as u64 + 1;
         let mut map = lock_unpoisoned(&self.map);
         map.insert(
             (source_key.to_owned(), id.scheme, id.level, id.x, id.y),
-            payload.to_vec(),
+            (rev, payload.to_vec()),
         );
         Ok(())
     }
 
-    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), BlobStoreError> {
+    fn delete(&self, lease: BlobLease) -> Result<(), BlobStoreError> {
+        let Some((key, expected_rev)) = lease.downcast::<(BlobMapKey, u64)>() else {
+            return Ok(());
+        };
         let mut map = lock_unpoisoned(&self.map);
-        map.remove(&(source_key.to_owned(), id.scheme, id.level, id.x, id.y));
+        if map.get(&key).is_some_and(|(rev, _)| *rev == expected_rev) {
+            map.remove(&key);
+        }
         Ok(())
     }
 }
@@ -389,10 +429,7 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
     while Instant::now() < settle_deadline {
         let all_cached = valid_keys.iter().all(|k| {
             h.store()
-                .get(h.spec.cache_key(), k.quad_id().expect("quad"))
-                .ok()
-                .flatten()
-                .is_some()
+                .has_entry(h.spec.cache_key(), k.quad_id().expect("quad"))
         });
         if h.wakes.load(Ordering::Acquire) >= 4
             && h.pipeline().status().completed_from_net == 4
@@ -446,20 +483,16 @@ fn corrupt_disk_blob_self_heals_from_http_and_cached_tiles_do_not_starve_behind_
     let k_slow = h.wm_key(2, 1, 0);
     let k_cached = h.wm_key(2, 2, 0);
 
-    h.store()
-        .put(
-            h.spec.cache_key(),
-            k_corrupt.quad_id().expect("quad"),
-            b"not-a-valid-tile",
-        )
-        .expect("seed corrupt");
-    h.store()
-        .put(
-            h.spec.cache_key(),
-            k_cached.quad_id().expect("quad"),
-            &payload,
-        )
-        .expect("seed valid");
+    h.store().seed(
+        h.spec.cache_key(),
+        k_corrupt.quad_id().expect("quad"),
+        b"not-a-valid-tile",
+    );
+    h.store().seed(
+        h.spec.cache_key(),
+        k_cached.quad_id().expect("quad"),
+        &payload,
+    );
 
     h.pipeline()
         .reconcile_wanted(&HashSet::from([k_corrupt]), |_| false);
@@ -560,10 +593,8 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
     }
     assert_eq!(h.pipeline().status().failed_count, 1);
     assert!(
-        h.store()
-            .get(h.spec.cache_key(), k_corrupt.quad_id().expect("quad"))
-            .expect("get")
-            .is_none()
+        !h.store()
+            .has_entry(h.spec.cache_key(), k_corrupt.quad_id().expect("quad"))
     );
 
     h.pipeline()

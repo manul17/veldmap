@@ -9,11 +9,11 @@ use super::cluster::build_rtc_clusters;
 use super::mesh::{DEFAULT_VECTOR_MAX_CHORD_DEG, RawPrimitives, VectorMesh};
 use super::triangulate::triangulate_spherical_polygon;
 use super::{GeoJsonFeatureCollection, GeoJsonGeometry};
-use crate::geo::footprint::{
-    GeoPoint, Polygon, dedup_geo_ring, push_dedup_geo_point, trim_closing_geo_point,
-};
 use crate::geo::geodesic::sample_geodesic_arc;
 use crate::geo::geodesy::{self, WGS84};
+use crate::geo::shapes::{
+    GeoPoint, Polygon, dedup_geo_ring, push_dedup_geo_point, trim_closing_geo_point,
+};
 
 impl VectorMesh {
     /// Build a subdivided WGS84 globe mesh from a [`GeoJsonFeatureCollection`].

@@ -61,31 +61,19 @@ pub(crate) fn max_subcell_arc_deg(sample_units: &[DVec3], side: usize) -> f64 {
         .to_degrees()
 }
 
-/// Maximum chord arc in degrees whose sagitta stays within `tolerance_m`
-/// metres. The inverse of [`sag_m`].
-pub(super) fn max_chord_deg(tolerance_m: f64) -> f64 {
-    let half_sag = (tolerance_m.max(0.0) / (2.0 * SEMI_MAJOR_M)).clamp(0.0, 1.0);
-    4.0 * half_sag.sqrt().asin().to_degrees()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn limit_chord_sags_exactly_to_tolerance() {
+    fn sag_bounds_are_conservative_and_match_ellipsoid_geometry() {
         // 1 degree equatorial arc sags ~243.0 m on WGS84 (R * (1 - cos(0.5 deg))).
         assert!(
             (sag_m(1.0) - 243.0).abs() < 0.2,
             "sag_m(1.0)={}",
             sag_m(1.0)
         );
-        for tolerance_m in [0.001, 1.0, 70.0, 10_000.0] {
-            let sag = sag_m(max_chord_deg(tolerance_m));
-            assert!(
-                (sag - tolerance_m).abs() < 1e-9,
-                "limit chord sag {sag} m != {tolerance_m} m"
-            );
-        }
+        assert!(oblate_sag_m(1.0) > sag_m(1.0));
+        assert!(subcell_bulge_m(1.0) > oblate_sag_m(1.0));
     }
 }

@@ -9,7 +9,7 @@ use veldmap_raster::{
     BandInfo, BandStats, DISPLAY_STREAM_SPEC, RasterDescription, stream_spec_for_band,
 };
 
-use crate::render::{CategoricalPaletteId, ColormapId};
+use crate::colormap::{CategoricalPaletteId, ColormapId};
 
 /// High-level track classification for a selectable raster stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +25,23 @@ impl TrackKind {
             PixelFormat::Rgba8UnormSrgb => Self::Display,
             PixelFormat::R32Float => Self::Scientific,
             PixelFormat::R8Uint | PixelFormat::R16Uint => Self::Categorical,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Display => "display",
+            Self::Scientific => "scientific",
+            Self::Categorical => "categorical",
+        }
+    }
+
+    pub(crate) fn parse_str(s: &str) -> Option<Self> {
+        match s {
+            "display" => Some(Self::Display),
+            "scientific" => Some(Self::Scientific),
+            "categorical" => Some(Self::Categorical),
+            _ => None,
         }
     }
 }
@@ -202,6 +219,90 @@ impl ScientificStyle {
             StretchPreset::Custom => {}
         }
     }
+
+    pub(crate) fn apply_saved(&mut self, saved: &SavedLayerStyle) {
+        if let Some(preset) = saved.stretch_preset {
+            self.preset = preset;
+        }
+        if let (Some(lo), Some(hi)) = (saved.stretch_min, saved.stretch_max)
+            && lo.is_finite()
+            && hi.is_finite()
+            && hi > lo
+        {
+            self.min = lo;
+            self.max = hi;
+            if saved.custom_stretch_range || saved.stretch_preset == Some(StretchPreset::Custom) {
+                self.custom_range_applied = true;
+            }
+        }
+        if let Some(cm) = saved.colormap {
+            self.colormap = cm;
+        }
+        self.invert_colormap = saved.invert_colormap;
+    }
+
+    pub(crate) fn on_stream_switched(&mut self, spec: TileStreamSpec) {
+        if spec.format == PixelFormat::R32Float {
+            if self.last_scientific_band != Some(spec.band) {
+                self.cancel_loading();
+                self.stats_state = BandStatsState::NotRequested;
+                self.custom_range_applied = false;
+                if self.preset == StretchPreset::Custom {
+                    self.preset = StretchPreset::Percentile2_98;
+                }
+                self.last_scientific_band = Some(spec.band);
+            }
+        } else {
+            // Cancel any in-flight stats scan while away from Scientific,
+            // preserving Ready stats/custom bounds if the user returns to the
+            // same band.
+            self.cancel_loading();
+        }
+    }
+
+    pub(crate) fn set_stretch_preset(&mut self, preset: StretchPreset) -> bool {
+        if self.preset == preset && (preset == StretchPreset::Custom || !self.custom_range_applied)
+        {
+            return false;
+        }
+        self.preset = preset;
+        if preset != StretchPreset::Custom {
+            self.custom_range_applied = false;
+            self.recompute_bounds_from_stats();
+        }
+        true
+    }
+
+    pub(crate) fn set_stretch_range(&mut self, min: f64, max: f64) -> bool {
+        if !min.is_finite() || !max.is_finite() {
+            return false;
+        }
+        let (lo, hi) = if max > min {
+            (min, max)
+        } else {
+            (min, min + min.abs().max(1.0) * 1e-6)
+        };
+        let eps = lo.abs().max(hi.abs()).max(1e-30) * 1e-12;
+        if (self.min - lo).abs() <= eps && (self.max - hi).abs() <= eps {
+            return false;
+        }
+        self.min = lo;
+        self.max = hi;
+        self.custom_range_applied = true;
+        if !self.preset.is_log10_db() {
+            self.preset = StretchPreset::Custom;
+        }
+        true
+    }
+
+    pub(crate) fn set_colormap(&mut self, colormap: ColormapId, invert: bool) -> bool {
+        if self.colormap == colormap && self.invert_colormap == invert {
+            return false;
+        }
+        self.colormap = colormap;
+        self.invert_colormap = invert;
+        true
+    }
 }
 
 /// Live categorical (`R8Uint`/`R16Uint`) palette state.
@@ -215,7 +316,6 @@ pub(crate) struct CategoricalStyle {
 pub(crate) struct LayerBandOption {
     pub(crate) label: String,
     pub(crate) spec: TileStreamSpec,
-    pub(crate) track_kind: TrackKind,
 }
 
 /// Build the ordered list of selectable streams for `desc`.
@@ -224,14 +324,12 @@ pub(crate) fn build_band_options(desc: &RasterDescription) -> Vec<LayerBandOptio
     opts.push(LayerBandOption {
         label: "Display (RGB)".to_owned(),
         spec: DISPLAY_STREAM_SPEC,
-        track_kind: TrackKind::Display,
     });
     for info in desc.indexed_bands() {
         let base_label = format_band_label(info);
         opts.push(LayerBandOption {
             label: format!("{base_label} · Scientific (f32)"),
             spec: stream_spec_for_band(info.band_key, PixelFormat::R32Float),
-            track_kind: TrackKind::Scientific,
         });
         if let Some(cat_fmt) = info.sample_type.categorical_pixel_format() {
             let fmt_tag = match cat_fmt {
@@ -242,7 +340,6 @@ pub(crate) fn build_band_options(desc: &RasterDescription) -> Vec<LayerBandOptio
             opts.push(LayerBandOption {
                 label: format!("{base_label} · Categorical ({fmt_tag})"),
                 spec: stream_spec_for_band(info.band_key, cat_fmt),
-                track_kind: TrackKind::Categorical,
             });
         }
     }
@@ -307,23 +404,22 @@ pub(crate) struct SavedLayerStyle {
 impl SavedLayerStyle {
     /// Resolve a persisted [`TileStreamSpec`] against `desc`, if valid.
     pub(crate) fn resolve_stream_spec(&self, desc: &RasterDescription) -> Option<TileStreamSpec> {
-        let track = self.track.as_deref()?;
+        let track = TrackKind::parse_str(self.track.as_deref()?)?;
         match track {
-            "display" => Some(DISPLAY_STREAM_SPEC),
-            "scientific" => {
+            TrackKind::Display => Some(DISPLAY_STREAM_SPEC),
+            TrackKind::Scientific => {
                 let idx = self.band_index.unwrap_or(0);
                 let band = BandKey::Index(idx);
                 desc.band_info(band)?;
                 Some(stream_spec_for_band(band, PixelFormat::R32Float))
             }
-            "categorical" => {
+            TrackKind::Categorical => {
                 let idx = self.band_index.unwrap_or(0);
                 let band = BandKey::Index(idx);
                 let info = desc.band_info(band)?;
                 let fmt = info.sample_type.categorical_pixel_format()?;
                 Some(stream_spec_for_band(band, fmt))
             }
-            _ => None,
         }
     }
 }

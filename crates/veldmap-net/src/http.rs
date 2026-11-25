@@ -182,6 +182,34 @@ fn map_reqwest_err(err: reqwest::Error) -> FetchFailure {
     })
 }
 
+fn classify_http_error(status: reqwest::StatusCode, retry_after: Option<&str>) -> FetchFailure {
+    let code = status.as_u16();
+    let msg = format!("HTTP {code}");
+    if matches!(code, 429 | 503) {
+        return FetchFailure::Transient(TransientFetchError {
+            msg,
+            kind: TransientKind::RateLimited {
+                retry_after: parse_retry_after_seconds(retry_after),
+            },
+        });
+    }
+    if code == 408 {
+        // Request Timeout is transient, and receiving an HTTP response proves
+        // the host is reachable (so do not set `offline = true`).
+        return FetchFailure::Transient(TransientFetchError {
+            msg,
+            kind: TransientKind::ServerError,
+        });
+    }
+    if status.is_client_error() {
+        return FetchFailure::Terminal(msg);
+    }
+    FetchFailure::Transient(TransientFetchError {
+        msg,
+        kind: TransientKind::ServerError,
+    })
+}
+
 pub(crate) async fn download_capped(
     client: &reqwest::Client,
     url: &str,
@@ -194,23 +222,11 @@ pub(crate) async fn download_capped(
         return Ok(FetchOutcome::Empty204);
     }
     if !status.is_success() {
-        let code = status.as_u16();
-        let msg = format!("HTTP {code}");
-        if matches!(code, 400 | 401 | 403 | 404 | 410 | 451) {
-            return Err(FetchFailure::Terminal(msg));
-        }
-        let kind = if matches!(code, 429 | 503) {
-            let hdr = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok());
-            TransientKind::RateLimited {
-                retry_after: parse_retry_after_seconds(hdr),
-            }
-        } else {
-            TransientKind::ServerError
-        };
-        return Err(FetchFailure::Transient(TransientFetchError { msg, kind }));
+        let hdr = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok());
+        return Err(classify_http_error(status, hdr));
     }
 
     if let Some(len) = resp.content_length()
@@ -290,5 +306,44 @@ mod tests {
 
         limiters.clear_cooldowns();
         assert!(limiters.try_acquire_permit("example.org", now).is_ok());
+    }
+
+    #[test]
+    fn classify_http_error_treats_client_errors_as_terminal_except_408_and_429() {
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            reqwest::StatusCode::PRECONDITION_FAILED,
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(
+                matches!(classify_http_error(status, None), FetchFailure::Terminal(_)),
+                "expected terminal for {status}"
+            );
+        }
+        assert!(matches!(
+            classify_http_error(reqwest::StatusCode::REQUEST_TIMEOUT, None),
+            FetchFailure::Transient(TransientFetchError {
+                kind: TransientKind::ServerError,
+                ..
+            })
+        ));
+        assert!(matches!(
+            classify_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, Some("7")),
+            FetchFailure::Transient(TransientFetchError {
+                kind: TransientKind::RateLimited {
+                    retry_after: Some(d),
+                },
+                ..
+            }) if d == Duration::from_secs(7)
+        ));
+        assert!(matches!(
+            classify_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None),
+            FetchFailure::Transient(TransientFetchError {
+                kind: TransientKind::ServerError,
+                ..
+            })
+        ));
     }
 }

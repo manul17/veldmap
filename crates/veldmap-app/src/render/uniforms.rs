@@ -4,7 +4,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use super::colormap::PALETTE_LUT_LEN;
+use crate::colormap::PALETTE_LUT_LEN;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -162,6 +162,16 @@ fn dynamic_uniform_bind_group(
     })
 }
 
+/// Named bind-group layouts required to build a [`DynamicUniformArena`].
+#[derive(Clone, Copy)]
+pub(super) struct DynamicUniformLayouts<'a> {
+    pub(super) tile: &'a wgpu::BindGroupLayout,
+    pub(super) overlay: &'a wgpu::BindGroupLayout,
+    pub(super) scientific: &'a wgpu::BindGroupLayout,
+    pub(super) categorical: &'a wgpu::BindGroupLayout,
+    pub(super) vector: &'a wgpu::BindGroupLayout,
+}
+
 /// Frame-wide dynamic uniform arena shared across globe body, post-body
 /// display/scientific/categorical raster overlays, vector overlays, and
 /// graticule passes.
@@ -175,14 +185,7 @@ pub(super) struct DynamicUniformArena {
 }
 
 impl DynamicUniformArena {
-    pub(super) fn new(
-        device: &wgpu::Device,
-        tile_layout: &wgpu::BindGroupLayout,
-        overlay_layout: &wgpu::BindGroupLayout,
-        scientific_layout: &wgpu::BindGroupLayout,
-        categorical_layout: &wgpu::BindGroupLayout,
-        vector_layout: &wgpu::BindGroupLayout,
-    ) -> Self {
+    pub(super) fn new(device: &wgpu::Device, layouts: DynamicUniformLayouts<'_>) -> Self {
         let alignment = device.limits().min_uniform_buffer_offset_alignment.max(1);
         let min_slot = alignment as usize;
         let initial_bytes = (128 * min_slot).max(4096);
@@ -202,27 +205,27 @@ impl DynamicUniformArena {
             make_slot(
                 "arena tile dynamic uniform bind group",
                 std::mem::size_of::<TileUniform>(),
-                tile_layout,
+                layouts.tile,
             ),
             make_slot(
                 "arena overlay dynamic uniform bind group",
                 std::mem::size_of::<OverlayPatchUniform>(),
-                overlay_layout,
+                layouts.overlay,
             ),
             make_slot(
                 "arena scientific overlay dynamic uniform bind group",
                 std::mem::size_of::<ScientificPatchUniform>(),
-                scientific_layout,
+                layouts.scientific,
             ),
             make_slot(
                 "arena categorical overlay dynamic uniform bind group",
                 std::mem::size_of::<CategoricalPatchUniform>(),
-                categorical_layout,
+                layouts.categorical,
             ),
             make_slot(
                 "arena vector dynamic uniform bind group",
                 std::mem::size_of::<VectorUniform>(),
-                vector_layout,
+                layouts.vector,
             ),
         ];
         Self {

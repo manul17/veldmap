@@ -186,7 +186,7 @@ impl Grid {
                     .saturating_mul(bpp),
             )
             .with("fresh chunk", self.chunk_bytes(self.chunk, format))
-            .with("cascade", cascade::bytes_for_format(width, height, format))
+            .with("cascade", cascade::bytes(width, height, format))
     }
 }
 

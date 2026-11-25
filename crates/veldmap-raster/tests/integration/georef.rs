@@ -19,13 +19,14 @@ use veldmap_core::io::testing::MemoryByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{MIN_WARP_SEGMENTS, SourceFingerprint, build_warp_patch};
 use veldmap_raster::{
-    DecodeContext, PlacementCrs, RasterError, RasterSource, SharedChunkCache, SidecarGeoref,
-    TiffSource, frame_from_description, has_tiff_magic,
+    DISPLAY_STREAM_SPEC, DecodeContext, PlacementCrs, RasterError, RasterSource, SharedChunkCache,
+    SidecarGeoref, TiffSource, frame_from_description, has_tiff_magic,
 };
 
 use crate::common::{
-    TiffIfdHeader, build_rgb_4x4_tiff, build_tiled_cog, fake_fingerprint, rgb_pattern, tag_f64_vec,
-    tag_u16_vec, write_ifd_header, write_single_strip_u32, write_single_strip_u64,
+    TiffIfdHeader, build_rgb_4x4_tiff, build_tiled_cog, fake_fingerprint, rgb_pattern,
+    sample_display_rgba, tag_f64_vec, tag_u16_vec, write_ifd_header, write_single_strip_u32,
+    write_single_strip_u64,
 };
 
 #[test]
@@ -517,7 +518,7 @@ fn decodes_bigtiff_with_geodouble_geoascii_pixel_is_point_and_model_transformati
     assert!((lon - 39.0).abs() < 1e-9, "got lon={lon}");
 
     let tile = big_src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         .expect("decode BigTIFF tile");
     assert_eq!((tile.width(), tile.height()), (8, 8));
 }
@@ -643,21 +644,15 @@ fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() 
         255,
     ];
     assert_eq!(
-        src_area
-            .sample_display_rgba(px, py, &ctx)
-            .expect("sample area"),
+        sample_display_rgba(src_area.as_ref(), px, py, &ctx).expect("sample area"),
         Some(expected)
     );
     assert_eq!(
-        src_point
-            .sample_display_rgba(px, py, &ctx)
-            .expect("sample point"),
+        sample_display_rgba(src_point.as_ref(), px, py, &ctx).expect("sample point"),
         Some(expected)
     );
     assert_eq!(
-        src_area
-            .sample_display_rgba(64, 0, &ctx)
-            .expect("out of bounds"),
+        sample_display_rgba(src_area.as_ref(), 64, 0, &ctx).expect("out of bounds"),
         None
     );
 
@@ -679,9 +674,7 @@ fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() 
         255,
     ];
     assert_eq!(
-        cog_src
-            .sample_display_rgba(cpx, cpy, &ctx)
-            .expect("sample multi-chunk cog"),
+        sample_display_rgba(&cog_src, cpx, cpy, &ctx).expect("sample multi-chunk cog"),
         Some(cog_expected)
     );
 
@@ -697,7 +690,7 @@ fn pixel_is_area_vs_pixel_is_point_shifts_warp_mesh_and_readout_by_half_pixel() 
         cancel: &cancel,
     };
     assert!(matches!(
-        cog_src.sample_display_rgba(cpx, cpy, &tiny_ctx),
+        sample_display_rgba(&cog_src, cpx, cpy, &tiny_ctx),
         Err(RasterError::LimitExceeded { .. })
     ));
 }

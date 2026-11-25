@@ -15,13 +15,13 @@ use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{BandKey, PixelFormat, RASTER_TILE_SIZE, tile_extent};
 use veldmap_raster::{
-    BandSample, DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError, RasterSource,
-    SharedChunkCache, TiffSource, generate_scientific_mipmaps, stream_spec_for_band,
+    BandSample, DISPLAY_STREAM_SPEC, DecodeContext, MAX_IFDS, MAX_SOURCE_SIDE, RasterError,
+    RasterSource, SharedChunkCache, TiffSource, generate_tile_mipmaps, stream_spec_for_band,
 };
 
 use crate::common::{
-    TiffIfdHeader, build_stripped_tiff, build_tiled_cog, fake_fingerprint, write_ifd_header,
-    write_single_strip_u32,
+    TiffIfdHeader, build_stripped_tiff, build_tiled_cog, fake_fingerprint, sample_display_rgba,
+    write_ifd_header, write_single_strip_u32,
 };
 
 const WINDOW: u64 = 64 * 1024;
@@ -107,7 +107,7 @@ fn describing_reads_only_header_and_ifds_and_pointwise_avoids_rereading_ifds() {
         cancel: &cancel,
     };
     let tile = src
-        .decode_pointwise_tile(0, 1, 1, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 1, 1, &ctx)
         .expect("decode tile (1,1)");
     assert_eq!(
         (tile.width(), tile.height()),
@@ -137,7 +137,7 @@ fn describing_reads_only_header_and_ifds_and_pointwise_avoids_rereading_ifds() {
     // re-reading offset 0 (TIFF header) or re-walking IFDs.
     counting.reset();
     let tile2 = src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         .expect("decode tile (0,0)");
     assert_eq!(
         (tile2.width(), tile2.height()),
@@ -177,16 +177,20 @@ fn direct_overview_matches_sequential_pass_on_halved_cog() {
         cancel: &cancel,
     };
     let direct_tile = src
-        .decode_pointwise_tile(1, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 1, 0, 0, &ctx)
         .expect("direct overview tile");
 
     let mut pass_lvl1 = None;
-    src.produce_pass(&ctx, &mut |lvl, tx, ty, _w, _h, rgba| {
-        if (lvl, tx, ty) == (1, 0, 0) {
-            pass_lvl1 = Some(rgba);
-        }
-        Ok(())
-    })
+    src.produce_pass(
+        DISPLAY_STREAM_SPEC,
+        &ctx,
+        &mut |lvl, tx, ty, _w, _h, rgba| {
+            if (lvl, tx, ty) == (1, 0, 0) {
+                pass_lvl1 = Some(rgba);
+            }
+            Ok(())
+        },
+    )
     .expect("sequential pass");
     assert_eq!(
         direct_tile.data(),
@@ -210,7 +214,7 @@ fn direct_overview_matches_sequential_pass_on_halved_cog() {
     s_counting.reset();
     let mut emitted = Vec::new();
     s_src
-        .produce_pass(&ctx, &mut |lvl, tx, ty, w, h, rgba| {
+        .produce_pass(DISPLAY_STREAM_SPEC, &ctx, &mut |lvl, tx, ty, w, h, rgba| {
             assert_eq!(rgba.len(), (w * h * 4) as usize);
             emitted.push((lvl, tx, ty));
             Ok(())
@@ -234,11 +238,11 @@ fn direct_overview_matches_sequential_pass_on_halved_cog() {
     )
     .expect("open NPOT");
     let npot_direct = npot_src
-        .decode_pointwise_tile(1, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 1, 0, 0, &ctx)
         .expect("direct NPOT lvl 1");
     let mut npot_pass = None;
     npot_src
-        .produce_pass(&ctx, &mut |lvl, tx, ty, w, h, rgba| {
+        .produce_pass(DISPLAY_STREAM_SPEC, &ctx, &mut |lvl, tx, ty, w, h, rgba| {
             if (lvl, tx, ty) == (1, 0, 0) {
                 npot_pass = Some((w, h, rgba));
             }
@@ -311,7 +315,7 @@ fn decodes_zstd_predictor3_f32_with_gdal_nodata() {
     )
     .expect("open ZSTD Predictor=3 Float32 TIFF");
     let f32_tile = f32_src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         .expect("decode ZSTD Predictor=3 Float32");
     assert_eq!(f32_tile.data()[3], 0, "nodata -9999 must be transparent");
     assert_eq!(f32_tile.data()[7], 255, "valid 10.0 pixel must be opaque");
@@ -382,7 +386,7 @@ fn decodes_geographic_pulkovo42_i16_with_gdal_nodata() {
     assert!((i16_src.description().ties[3].lon - 12.0).abs() < 1e-9);
     assert!((i16_src.description().ties[3].lat - 49.5).abs() < 1e-9);
     let i16_tile = i16_src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         .expect("decode i16");
     assert_eq!(i16_tile.data()[3], 0, "i16 nodata must be transparent");
     assert_eq!(i16_tile.data()[7], 255);
@@ -429,7 +433,7 @@ fn decodes_gray_alpha_preserving_transparency() {
     .expect("open Gray+Alpha");
     assert!(ga_src.description().bands[0].has_alpha);
     let ga_tile = ga_src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         .expect("decode Gray+Alpha");
     assert_eq!(
         ga_tile.data()[3],
@@ -573,7 +577,7 @@ fn tiled_tiff_above_max_source_side_opens_and_decodes_while_untiled_is_rejected(
         cancel: &cancel,
     };
     let tile = tiled_src
-        .decode_pointwise_tile(0, across - 1, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, across - 1, 0, &ctx)
         .expect("decode far-right edge tile");
     assert_eq!(
         (tile.width(), tile.height()),
@@ -640,7 +644,7 @@ fn decodes_planar2_npot_tiled_rgb_and_single_band_scientific_and_palette_and_rgb
     )
     .expect("open tiled Planar-2 NPOT TIFF");
     let display_tile = planar_src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         .expect("decode Planar-2 Display");
     assert_eq!((display_tile.width(), display_tile.height()), (pw, ph));
     // Verify bottom-right NPOT corner pixel (19, 17).
@@ -653,9 +657,9 @@ fn decodes_planar2_npot_tiled_rgb_and_single_band_scientific_and_palette_and_rgb
     // Single-band Scientific R32Float read of plane 2 (value 240.0).
     let sci_spec = stream_spec_for_band(BandKey::Index(2), PixelFormat::R32Float);
     let mut sci_tile = planar_src
-        .decode_pointwise_tile_stream(sci_spec, 0, 0, 0, &ctx)
+        .decode_pointwise_tile(sci_spec, 0, 0, 0, &ctx)
         .expect("decode Planar-2 Band 2 R32Float");
-    generate_scientific_mipmaps(&mut sci_tile);
+    generate_tile_mipmaps(&mut sci_tile);
     assert!(sci_tile.mip_level_count() > 1);
     let f0 = f32::from_ne_bytes(sci_tile.data()[0..4].try_into().expect("4B"));
     assert_eq!(f0, 240.0);
@@ -693,7 +697,7 @@ fn decodes_planar2_npot_tiled_rgb_and_single_band_scientific_and_palette_and_rgb
     assert_eq!(pal_src.default_stream_spec().format, PixelFormat::R8Uint);
     assert!(pal_src.color_map().is_some());
     let pal_disp = pal_src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         .expect("decode Palette Display");
     assert_eq!(
         pal_disp.data()[3],
@@ -704,7 +708,7 @@ fn decodes_planar2_npot_tiled_rgb_and_single_band_scientific_and_palette_and_rgb
     assert_eq!(&pal_disp.data()[8..12], &[0, 255, 0, 255]); // class 2 green
 
     let pal_cat = pal_src
-        .decode_pointwise_tile_stream(pal_src.default_stream_spec(), 0, 0, 0, &ctx)
+        .decode_pointwise_tile(pal_src.default_stream_spec(), 0, 0, 0, &ctx)
         .expect("decode Palette Categorical");
     assert_eq!(pal_cat.format(), PixelFormat::R8Uint);
     assert_eq!(pal_cat.data(), &[0, 1, 2, 1, 2, 1, 0, 2]);
@@ -761,7 +765,7 @@ fn decodes_planar2_npot_tiled_rgb_and_single_band_scientific_and_palette_and_rgb
     assert!(!rgbn_src.description().bands[0].has_alpha);
     assert_eq!(rgbn_src.description().indexed_bands().count(), 4);
     let rgbn_disp = rgbn_src
-        .decode_pointwise_tile(0, 0, 0, &ctx)
+        .decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         .expect("decode RGBN Display");
     assert_eq!(
         rgbn_disp.data()[3],
@@ -770,7 +774,7 @@ fn decodes_planar2_npot_tiled_rgb_and_single_band_scientific_and_palette_and_rgb
     );
     let nir_spec = stream_spec_for_band(BandKey::Index(3), PixelFormat::R32Float);
     let nir_tile = rgbn_src
-        .decode_pointwise_tile_stream(nir_spec, 0, 0, 0, &ctx)
+        .decode_pointwise_tile(nir_spec, 0, 0, 0, &ctx)
         .expect("decode NIR R32Float");
     let nir_vals: Vec<f32> = nir_tile
         .data()
@@ -853,7 +857,7 @@ fn direct_raw_decoder_handles_deflate_lzw_packbits_predictor2_big_endian_and_sci
     )
     .expect("open Deflate+Predictor2 u16 TIFF");
     let def_tile = def_src
-        .decode_pointwise_tile_stream(
+        .decode_pointwise_tile(
             stream_spec_for_band(BandKey::Index(0), PixelFormat::R32Float),
             0,
             0,
@@ -896,7 +900,7 @@ fn direct_raw_decoder_handles_deflate_lzw_packbits_predictor2_big_endian_and_sci
     )
     .expect("open LZW TIFF");
     let lzw_tile = lzw_src
-        .decode_pointwise_tile_stream(
+        .decode_pointwise_tile(
             stream_spec_for_band(BandKey::Index(0), PixelFormat::R8Uint),
             0,
             0,
@@ -932,7 +936,7 @@ fn direct_raw_decoder_handles_deflate_lzw_packbits_predictor2_big_endian_and_sci
     )
     .expect("open PackBits TIFF");
     let pb_tile = pb_src
-        .decode_pointwise_tile_stream(
+        .decode_pointwise_tile(
             stream_spec_for_band(BandKey::Index(0), PixelFormat::R8Uint),
             0,
             0,
@@ -942,7 +946,7 @@ fn direct_raw_decoder_handles_deflate_lzw_packbits_predictor2_big_endian_and_sci
         .expect("decode PackBits");
     assert_eq!(pb_tile.data(), &raw_lzw);
 
-    // 3. Big-Endian ("MM") multi-byte Float32 TIFF + `produce_pass_stream`
+    // 3. Big-Endian ("MM") multi-byte Float32 TIFF + `produce_pass`
     //    verifying exact `f32::NAN` preservation (confirming `bleed_alpha` never runs on Scientific).
     let be_vals: [f32; 4] = [-9999.0, 12.5, 42.25, f32::NAN];
     let mut be_raw = Vec::with_capacity(16);
@@ -1003,12 +1007,12 @@ fn direct_raw_decoder_handles_deflate_lzw_packbits_predictor2_big_endian_and_sci
         Ok(())
     };
     be_src
-        .produce_pass_stream(
+        .produce_pass(
             stream_spec_for_band(BandKey::Index(0), PixelFormat::R32Float),
             &ctx,
             &mut emit_fn as TileEmit<'_>,
         )
-        .expect("produce_pass_stream R32Float");
+        .expect("produce_pass R32Float");
     assert_eq!(emitted.len(), 1);
     assert_eq!((emitted[0].3, emitted[0].4), (2, 2));
     let pass_vals: Vec<f32> = emitted[0]
@@ -1080,8 +1084,7 @@ fn direct_raw_decoder_handles_jpeg_ycbcr_white_is_zero_i8_sparse_and_compressed_
         &cancel,
     )
     .expect("open JPEG YCbCr TIFF");
-    let display_px = ycbcr_src
-        .sample_display_rgba(4, 4, &ctx)
+    let display_px = sample_display_rgba(&ycbcr_src, 4, 4, &ctx)
         .expect("sample ycbcr")
         .expect("opaque");
     assert!(
@@ -1131,16 +1134,16 @@ fn direct_raw_decoder_handles_jpeg_ycbcr_white_is_zero_i8_sparse_and_compressed_
     )
     .expect("open WhiteIsZero");
     assert_eq!(
-        wiz_src.sample_display_rgba(0, 0, &ctx).unwrap(),
+        sample_display_rgba(&wiz_src, 0, 0, &ctx).unwrap(),
         None,
         "nodata 0 stays transparent"
     );
     assert_eq!(
-        wiz_src.sample_display_rgba(1, 0, &ctx).unwrap(),
+        sample_display_rgba(&wiz_src, 1, 0, &ctx).unwrap(),
         Some([245, 245, 245, 255])
     );
     assert_eq!(
-        wiz_src.sample_display_rgba(3, 0, &ctx).unwrap(),
+        sample_display_rgba(&wiz_src, 3, 0, &ctx).unwrap(),
         Some([0, 0, 0, 255])
     );
     assert_eq!(
@@ -1189,8 +1192,7 @@ fn direct_raw_decoder_handles_jpeg_ycbcr_white_is_zero_i8_sparse_and_compressed_
         &cancel,
     )
     .expect("open I8 TIFF");
-    let px_neg50 = i8_src
-        .sample_display_rgba(1, 0, &ctx)
+    let px_neg50 = sample_display_rgba(&i8_src, 1, 0, &ctx)
         .unwrap()
         .expect("opaque");
     assert!(
@@ -1230,7 +1232,7 @@ fn direct_raw_decoder_handles_jpeg_ycbcr_white_is_zero_i8_sparse_and_compressed_
         &cancel,
     )
     .expect("open sparse TIFF");
-    assert_eq!(sparse_src.sample_display_rgba(1, 1, &ctx).unwrap(), None);
+    assert_eq!(sample_display_rgba(&sparse_src, 1, 1, &ctx).unwrap(), None);
     assert_eq!(
         sparse_src
             .sample_band(BandKey::Index(0), PixelFormat::R32Float, 1, 1, &ctx)
@@ -1271,7 +1273,7 @@ fn direct_raw_decoder_handles_jpeg_ycbcr_white_is_zero_i8_sparse_and_compressed_
     )
     .expect("open bomb TIFF");
     assert!(matches!(
-        bomb_src.sample_display_rgba(0, 0, &ctx),
+        sample_display_rgba(&bomb_src, 0, 0, &ctx),
         Err(RasterError::LimitExceeded { .. })
     ));
 }

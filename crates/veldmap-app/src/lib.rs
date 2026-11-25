@@ -9,6 +9,7 @@ use std::path::Path;
 
 mod app;
 mod basemap;
+mod colormap;
 pub mod gpu_tiles;
 mod layers;
 mod measure;

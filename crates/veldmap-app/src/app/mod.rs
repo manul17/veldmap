@@ -21,7 +21,6 @@ use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 use veldmap_storage::detect_memory_budget;
 
 use crate::gpu_tiles::UploadChannelClosed;
-use crate::render::{GlobeRenderer, TileBindGroupCache};
 use crate::scene::{SceneRepaintHint, SceneState};
 use crate::storage::AppStorage;
 use crate::storage::session::SavedCameraPose;
@@ -34,10 +33,12 @@ use crate::ui::measure::{MeasureUiState, show_measure_window};
 use crate::ui::toolbar::{self, ToolbarInputs, ToolbarState};
 use crate::ui::{self, status_bar};
 
+pub(crate) use session_sync::UnavailableLayerNotice;
+
 use dialogs::DialogHost;
 use fonts::build_font_definitions;
 use session_sync::SessionRestoreTracker;
-use viewport_bridge::{GlobePaintCallback, viewport_pixels};
+use viewport_bridge::{GlobePaintCallback, install_wgpu_resources, viewport_pixels};
 use viewport_input::ViewportInteraction;
 
 #[derive(Debug, Error)]
@@ -197,50 +198,7 @@ impl VeldmapApp {
         });
 
         let gpu_faults = Arc::new(GpuFaultState::default());
-        {
-            let faults = Arc::clone(&gpu_faults);
-            let wake = Arc::clone(&wakeup);
-            render_state
-                .device
-                .on_uncaptured_error(Arc::new(move |err| {
-                    let msg = err.to_string();
-                    tracing::error!(error = %msg, "Uncaptured wgpu device error");
-                    if faults.record_uncaptured_error(msg) {
-                        (wake)();
-                    }
-                }));
-        }
-        {
-            let faults = Arc::clone(&gpu_faults);
-            let wake = Arc::clone(&wakeup);
-            render_state
-                .device
-                .set_device_lost_callback(move |reason, message| {
-                    // Normal shutdown destroys the wgpu device; ignore expected teardown.
-                    if reason == wgpu::DeviceLostReason::Destroyed {
-                        tracing::debug!(?reason, %message, "wgpu device destroyed during teardown");
-                        return;
-                    }
-                    tracing::error!(?reason, %message, "wgpu device lost");
-                    if faults.record_device_lost(message) {
-                        (wake)();
-                    }
-                });
-        }
-
-        let bind_groups = TileBindGroupCache::new(&render_state.device);
-        let renderer = GlobeRenderer::new_with_shared_bind_groups(
-            &render_state.device,
-            render_state.target_format,
-            &bind_groups,
-        );
-        {
-            let mut wgpu_renderer = render_state.renderer.write();
-            wgpu_renderer
-                .callback_resources
-                .insert(Arc::new(std::sync::Mutex::new(bind_groups)));
-            wgpu_renderer.callback_resources.insert(renderer);
-        }
+        install_wgpu_resources(render_state, &gpu_faults, &wakeup);
 
         let device = render_state.device.clone();
         let queue = render_state.queue.clone();
@@ -340,7 +298,7 @@ impl VeldmapApp {
                         .scene
                         .overlays()
                         .topmost_colorbar_info()
-                        .and_then(|cb| hud::paint_colorbar(&painter, rect, &cb));
+                        .and_then(|cb| hud::paint_colorbar(&painter, rect, scale_rect, &cb));
                     self.viewport
                         .set_hud_rects(scale_rect, attr_rect, colorbar_rect);
                 } else {
@@ -503,11 +461,12 @@ impl eframe::App for VeldmapApp {
         if self.panels.layers.is_open() {
             let layer_summaries = self.scene.overlays().layer_summaries();
             let vector_summaries = self.scene.vectors().summaries();
+            let visible_notices = self.restore_tracker.visible_notices();
             let layer_actions = show_layers_panel(
                 ui,
                 &layer_summaries,
                 &vector_summaries,
-                self.restore_tracker.visible_notices(),
+                &visible_notices,
                 &mut self.panels.layers,
             );
             needs_repaint |= self.apply_layer_actions(layer_actions, frame);

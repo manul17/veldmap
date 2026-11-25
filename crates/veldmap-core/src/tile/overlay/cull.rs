@@ -8,7 +8,7 @@ use glam::DVec3;
 use crate::geo::{Ball, CullFrustum, Frame, SEMI_MAJOR_M, sag, unwind};
 
 use super::super::pyramid::{cell_image_rect, grid_dim, level_size};
-use super::{FrameGridSpec, sample_frame_grid};
+use super::grid::{FrameGridSpec, sample_frame_grid};
 
 /// Probe grid side used to construct conservative [`Ball`] culling spheres.
 ///

@@ -183,7 +183,7 @@ impl PyramidMeta {
 
 /// Build the per-level serving plan (`0..level_count`) for a chunked raster in
 /// `format`.
-pub(crate) fn build_chunked_level_table_for_format(
+pub(crate) fn build_chunked_level_table(
     grid: &Grid,
     width: u32,
     height: u32,
@@ -218,16 +218,6 @@ pub(crate) fn build_chunked_level_table_for_format(
         .collect()
 }
 
-/// Build the per-level serving plan (`0..level_count`) for an RGBA8 display raster.
-pub(crate) fn build_chunked_level_table(
-    grid: &Grid,
-    width: u32,
-    height: u32,
-    budget: &MemoryBudget,
-) -> Vec<LevelPlan> {
-    build_chunked_level_table_for_format(grid, width, height, PixelFormat::Rgba8UnormSrgb, budget)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,7 +230,8 @@ mod tests {
             overviews: Vec::new(),
             depth: 3,
         };
-        let tbl = build_chunked_level_table(&grid, 8192, 8192, &tiny_budget);
+        let tbl =
+            build_chunked_level_table(&grid, 8192, 8192, PixelFormat::Rgba8UnormSrgb, &tiny_budget);
         assert!(!tbl.is_empty());
         assert!(matches!(tbl[0].serve, ServeMode::Pass { from: 0 }));
     }

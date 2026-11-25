@@ -8,8 +8,8 @@ use eframe::egui;
 use super::super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 use super::{BasemapUiAction, BasemapUiState};
 use crate::storage::settings::{
-    AppSettings, BasemapSelection, CUSTOM_MAX_LEVEL_RANGE, DISK_CACHE_MAX_MB_RANGE,
-    GPU_CACHE_MAX_MB_RANGE, validate_gibs_date,
+    AppSettings, BasemapSelection, CUSTOM_MAX_LEVEL_RANGE, DEFAULT_CUSTOM_GPU_CACHE_MAX_MB,
+    DISK_CACHE_MAX_MB_RANGE, GPU_CACHE_MAX_MB_RANGE, validate_gibs_date,
 };
 use crate::storage::{DiskCacheNotice, DiskCacheStatus};
 
@@ -156,7 +156,11 @@ fn show_disk_cache_section(
             .checkbox(&mut custom_vram, "Custom GPU VRAM cap (MiB):")
             .changed()
         {
-            *gpu_tile_cache_max_mb = if custom_vram { Some(512) } else { None };
+            *gpu_tile_cache_max_mb = if custom_vram {
+                Some(DEFAULT_CUSTOM_GPU_CACHE_MAX_MB)
+            } else {
+                None
+            };
         }
         if let Some(mb) = gpu_tile_cache_max_mb {
             ui.add(egui::Slider::new(mb, GPU_CACHE_MAX_MB_RANGE).logarithmic(true));

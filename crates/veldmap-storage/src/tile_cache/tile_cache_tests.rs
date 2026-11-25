@@ -19,6 +19,25 @@ fn key(source: &str, level: u8, x: u32, y: u32) -> DiskTileKey {
     DiskTileKey::new(source, TileScheme::WebMercator, level, x, y)
 }
 
+fn get_image(cache: &TileDiskCache, k: &DiskTileKey) -> Result<Option<Vec<u8>>, StorageError> {
+    let Some((entry, _, payload)) =
+        cache.get_encoded_entry(k, Some(TileBlobEncoding::EncodedImage))?
+    else {
+        return Ok(None);
+    };
+    cache.touch_entry(entry);
+    Ok(Some(payload))
+}
+
+fn put_image(cache: &TileDiskCache, k: &DiskTileKey, payload: &[u8]) -> Result<(), StorageError> {
+    cache.put_encoded_if_uncancelled(
+        k,
+        TileBlobEncoding::EncodedImage,
+        payload,
+        &CancelToken::new(),
+    )
+}
+
 fn count_rows(cache: &TileDiskCache, table: &str) -> i64 {
     let conn = lock_unpoisoned(&cache.writer);
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -43,20 +62,20 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
     let k_c = key("eox", 12, 2, 0);
     let k_d = key("eox", 12, 3, 0);
 
-    cache.put(&k_a, &[1u8; 40]).expect("put a");
-    cache.put(&k_b, &[2u8; 20]).expect("put b");
-    cache.put(&k_c, &[3u8; 40]).expect("put c");
+    put_image(&cache, &k_a, &[1u8; 40]).expect("put a");
+    put_image(&cache, &k_b, &[2u8; 20]).expect("put b");
+    put_image(&cache, &k_c, &[3u8; 40]).expect("put c");
     assert_eq!(cache.stats().expect("stats").payload_bytes, 100);
     assert_eq!(cache.stats().expect("stats").tile_count, 3);
     assert_eq!(cache.write_generation(), 3);
 
     // Touch `k_a` (debounced in memory) -> must flush before eviction so `k_b`
     // is evicted first, NOT `k_a`.
-    assert_eq!(cache.get(&k_a).expect("get a"), Some(vec![1u8; 40]));
+    assert_eq!(get_image(&cache, &k_a).expect("get a"), Some(vec![1u8; 40]));
 
     // Insert `k_d` (30 B): total becomes 130 > 100, target = 90.
     // Evicting `k_b` (20) -> 110 > 90; evicting `k_c` (40) -> 70 <= 90.
-    cache.put(&k_d, &[4u8; 30]).expect("put d");
+    put_image(&cache, &k_d, &[4u8; 30]).expect("put d");
     assert_eq!(cache.write_generation(), 4);
 
     let stats = cache.stats().expect("stats");
@@ -64,10 +83,10 @@ fn validates_source_keys_and_enforces_lru_eviction_with_headroom() {
     assert_eq!(stats.payload_bytes, 70);
     assert!(stats.payload_bytes <= 100);
 
-    assert!(cache.get(&k_a).expect("get a").is_some());
-    assert!(cache.get(&k_b).expect("get b").is_none());
-    assert!(cache.get(&k_c).expect("get c").is_none());
-    assert!(cache.get(&k_d).expect("get d").is_some());
+    assert!(get_image(&cache, &k_a).expect("get a").is_some());
+    assert!(get_image(&cache, &k_b).expect("get b").is_none());
+    assert!(get_image(&cache, &k_c).expect("get c").is_none());
+    assert!(get_image(&cache, &k_d).expect("get d").is_some());
 
     assert_eq!(count_rows(&cache, "tile_meta"), 2);
     assert_eq!(count_rows(&cache, "tile_blobs"), 2);
@@ -85,7 +104,7 @@ fn recovers_from_corrupt_sqlite_file_and_persists_across_reopen() {
     assert_eq!(cache.stats().expect("stats").tile_count, 0);
 
     let k1 = key("gibs", 3, 2, 1);
-    cache.put(&k1, b"png-bytes").expect("put k1");
+    put_image(&cache, &k1, b"png-bytes").expect("put k1");
     let ts_before = cache.clock.current_ms();
     drop(cache);
 
@@ -96,7 +115,7 @@ fn recovers_from_corrupt_sqlite_file_and_persists_across_reopen() {
         "reopen must seed last_ts_ms from MAX(last_used_ms)"
     );
     assert_eq!(
-        reopened.get(&k1).expect("get k1"),
+        get_image(&reopened, &k1).expect("get k1"),
         Some(b"png-bytes".to_vec())
     );
 
@@ -108,9 +127,7 @@ fn recovers_from_corrupt_sqlite_file_and_persists_across_reopen() {
     // Put a sizeable blob, then clear() and confirm WAL/file bytes shrink.
     reopened.set_max_bytes(256 * 1024).expect("grow cap");
     for i in 0..8u32 {
-        reopened
-            .put(&key("gibs", 4, i, 0), &vec![0xAB; 16 * 1024])
-            .expect("put chunk");
+        put_image(&reopened, &key("gibs", 4, i, 0), &vec![0xAB; 16 * 1024]).expect("put chunk");
     }
     let before_clear = reopened.stats().expect("stats before clear").file_bytes;
     reopened.clear().expect("clear");
@@ -125,12 +142,8 @@ fn recovers_from_corrupt_sqlite_file_and_persists_across_reopen() {
     );
 
     // 4. Reopening an over-budget cache enforces `max_bytes` while keeping `write_generation == 0`.
-    reopened
-        .put(&key("gibs", 5, 0, 0), &[1u8; 64])
-        .expect("put 1");
-    reopened
-        .put(&key("gibs", 5, 1, 0), &[2u8; 64])
-        .expect("put 2");
+    put_image(&reopened, &key("gibs", 5, 0, 0), &[1u8; 64]).expect("put 1");
+    put_image(&reopened, &key("gibs", 5, 1, 0), &[2u8; 64]).expect("put 2");
     drop(reopened);
     let capped = TileDiskCache::open(&db_path, 80).expect("reopen capped");
     assert_eq!(capped.write_generation(), 0);
@@ -146,7 +159,7 @@ fn file_backed_open_waits_for_brief_external_lock_and_serves_concurrent_wal_read
 
     let initial = TileDiskCache::open(&db_path, 1024 * 1024).expect("initial open");
     let k0 = key("eox", 2, 1, 1);
-    initial.put(&k0, b"cached-payload").expect("seed tile");
+    put_image(&initial, &k0, b"cached-payload").expect("seed tile");
     drop(initial);
 
     // Hold an exclusive transaction briefly on a separate connection; opening
@@ -174,7 +187,7 @@ fn file_backed_open_waits_for_brief_external_lock_and_serves_concurrent_wal_read
     let reader_cache = Arc::clone(&cache);
     let reader = thread::spawn(move || {
         assert_eq!(
-            reader_cache.get(&k0).expect("concurrent wal read"),
+            get_image(&reader_cache, &k0).expect("concurrent wal read"),
             Some(b"cached-payload".to_vec())
         );
         assert_eq!(
@@ -248,10 +261,9 @@ fn multi_band_format_gutter_and_encoding_never_alias() {
         cache.touch_entry(entry);
         assert_eq!((enc, payload.as_slice()), (expected_enc, expected_bytes));
     }
-    // `get()` only returns `EncodedImage` entries and must never hand Qoi/Lz4Raw
-    // payloads to a raw-image caller.
-    assert_eq!(cache.get(&k_b04).expect("get b04 raw"), None);
-    assert_eq!(cache.get(&k_dem_g1).expect("get dem raw"), None);
+    // Filtering by `EncodedImage` never hands Qoi/Lz4Raw payloads to raw-image callers.
+    assert_eq!(get_image(&cache, &k_b04).expect("get b04 raw"), None);
+    assert_eq!(get_image(&cache, &k_dem_g1).expect("get dem raw"), None);
     assert_eq!(cache.stats().expect("stats").tile_count, 4);
     assert_eq!(count_rows(&cache, "tile_blobs"), 4);
 }
@@ -262,22 +274,22 @@ fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
     let k = key("eox", 5, 1, 1);
 
     // Overwrite with larger then smaller payloads; byte & tile_count stay exact.
-    cache.put(&k, &[1u8; 100]).expect("put 100");
+    put_image(&cache, &k, &[1u8; 100]).expect("put 100");
     assert_eq!(cache.stats().expect("s1").payload_bytes, 100);
     assert_eq!(cache.stats().expect("s1").tile_count, 1);
-    cache.put(&k, &[2u8; 350]).expect("put 350");
+    put_image(&cache, &k, &[2u8; 350]).expect("put 350");
     assert_eq!(cache.stats().expect("s2").payload_bytes, 350);
     assert_eq!(cache.stats().expect("s2").tile_count, 1);
-    cache.put(&k, &[3u8; 50]).expect("put 50");
+    put_image(&cache, &k, &[3u8; 50]).expect("put 50");
     assert_eq!(cache.stats().expect("s3").payload_bytes, 50);
     assert_eq!(cache.stats().expect("s3").tile_count, 1);
     assert_eq!(count_rows(&cache, "tile_blobs"), 1);
 
     // Skipped puts (empty or > max_bytes) leave accounting and write_generation unchanged.
     let gen_before_skips = cache.write_generation();
-    cache.put(&k, &[]).expect("skip empty");
+    put_image(&cache, &k, &[]).expect("skip empty");
     assert_eq!(cache.stats().expect("after empty").payload_bytes, 50);
-    cache.put(&k, &vec![0u8; 20_000]).expect("skip oversized");
+    put_image(&cache, &k, &vec![0u8; 20_000]).expect("skip oversized");
     assert_eq!(cache.stats().expect("after big").payload_bytes, 50);
     assert_eq!(cache.write_generation(), gen_before_skips);
 
@@ -285,9 +297,7 @@ fn overwrite_accounting_skipped_puts_and_multi_batch_eviction_stay_exact() {
     // multi-batch eviction.
     cache.clear().expect("clear");
     for i in 0..200u32 {
-        cache
-            .put(&key("eox", 8, i, 0), &[i as u8; 40])
-            .expect("put batch tile");
+        put_image(&cache, &key("eox", 8, i, 0), &[i as u8; 40]).expect("put batch tile");
     }
     assert_eq!(cache.stats().expect("pre-evict").tile_count, 200);
     cache.set_max_bytes(1000).expect("multi-batch evict");
@@ -303,13 +313,13 @@ fn clear_source_removes_only_matching_source_without_orphan_blobs() {
     let (_dir, cache) = open_temp_cache("clear-source", 4096);
     let k1 = key("gibs", 1, 0, 0);
     let k2 = key("eox", 1, 0, 0);
-    cache.put(&k1, &[1u8; 100]).expect("put k1");
-    cache.put(&k2, &[2u8; 200]).expect("put k2");
+    put_image(&cache, &k1, &[1u8; 100]).expect("put k1");
+    put_image(&cache, &k2, &[2u8; 200]).expect("put k2");
 
     let removed = cache.clear_source("gibs").expect("clear gibs");
     assert_eq!(removed, 1);
-    assert!(cache.get(&k1).expect("get k1").is_none());
-    assert!(cache.get(&k2).expect("get k2").is_some());
+    assert!(get_image(&cache, &k1).expect("get k1").is_none());
+    assert!(get_image(&cache, &k2).expect("get k2").is_some());
     let stats = cache.stats().expect("stats");
     assert_eq!(stats.payload_bytes, 200);
     assert_eq!(stats.tile_count, 1);
@@ -324,26 +334,55 @@ fn clear_source_removes_only_matching_source_without_orphan_blobs() {
 }
 
 #[test]
-fn large_tile_near_budget_never_self_evicts_and_delete_updates_total() {
+fn large_tile_near_budget_never_self_evicts_and_delete_entry_updates_total() {
     let (_dir, cache) = open_temp_cache("large-tile", 100);
     let old = key("eox", 1, 0, 0);
     let big = key("eox", 1, 1, 0);
 
-    cache.put(&old, &[1u8; 20]).expect("put old");
+    put_image(&cache, &old, &[1u8; 20]).expect("put old");
     // 95 B exceeds the 90 B headroom target, yet fits within 100 B cap.
     // Eviction must drop `old` and MUST NOT self-evict `big`.
-    cache.put(&big, &[2u8; 95]).expect("put big");
+    put_image(&cache, &big, &[2u8; 95]).expect("put big");
     let stats_after_big = cache.stats().expect("stats after big");
     assert_eq!(stats_after_big.tile_count, 1);
     assert_eq!(stats_after_big.payload_bytes, 95);
-    assert!(cache.get(&old).expect("get old").is_none());
-    assert_eq!(cache.get(&big).expect("get big"), Some(vec![2u8; 95]));
+    assert!(get_image(&cache, &old).expect("get old").is_none());
+    let (entry, _, payload) = cache
+        .get_encoded_entry(&big, Some(TileBlobEncoding::EncodedImage))
+        .expect("get big")
+        .expect("big present");
+    assert_eq!(payload, vec![2u8; 95]);
 
-    assert!(cache.delete(&big).expect("delete big"));
+    assert!(cache.delete_entry(entry).expect("delete big"));
     let stats = cache.stats().expect("stats");
     assert_eq!(stats.payload_bytes, 0);
     assert_eq!(stats.tile_count, 0);
     assert_eq!(count_rows(&cache, "tile_blobs"), 0);
+}
+
+#[test]
+fn delete_entry_succeeds_even_when_unflushed_touch_is_buffered_for_same_row() {
+    let (_dir, cache) = open_temp_cache("aba-unflushed-touch", 4096);
+    let k = key("eox", 2, 0, 0);
+    put_image(&cache, &k, b"payload").expect("put");
+
+    let (entry, _, _) = cache
+        .get_encoded_entry(&k, Some(TileBlobEncoding::EncodedImage))
+        .expect("get")
+        .expect("present");
+    // Simulate a pending unflushed LRU touch in `TouchBuffer` for the same tile_id.
+    cache.touch_entry(entry);
+    assert_eq!(cache.touches.len(), 1);
+
+    // `delete_entry` must not flush `TouchBuffer` ahead of `DELETE ... WHERE
+    // tile_id = ?1 AND last_used_ms = ?2`, so deleting `entry` succeeds and
+    // prunes the buffered touch.
+    assert!(
+        cache.delete_entry(entry).expect("delete entry"),
+        "unflushed touch must not defeat ABA delete_entry"
+    );
+    assert!(cache.touches.is_empty());
+    assert_eq!(cache.stats().expect("stats").tile_count, 0);
 }
 
 #[test]
@@ -356,8 +395,8 @@ fn concurrent_reads_and_writes_keep_budget_and_accounting_consistent() {
         threads.push(thread::spawn(move || {
             for i in 0..40u32 {
                 let k = key("eox", 10, tid, i);
-                c.put(&k, &[tid as u8; 128]).expect("concurrent put");
-                let _ = c.get(&k).expect("concurrent get");
+                put_image(&c, &k, &[tid as u8; 128]).expect("concurrent put");
+                let _ = get_image(&c, &k).expect("concurrent get");
             }
         }));
     }
@@ -404,8 +443,8 @@ fn entry_delete_is_aba_safe_and_batch_put_honors_cancel_headroom_and_cap() {
         .expect("present");
     assert_eq!(enc, TileBlobEncoding::Qoi);
     assert_eq!(payload, b"corrupt");
-    // `get()` only returns `EncodedImage`, so `Qoi` must not alias raw HTTP tiles.
-    assert!(cache.get(&k0).expect("get encoded image").is_none());
+    // Filtering by `EncodedImage` must not alias `Qoi` payloads.
+    assert!(get_image(&cache, &k0).expect("get encoded image").is_none());
 
     // Concurrent writer replaces `k0` with valid bytes.
     cache

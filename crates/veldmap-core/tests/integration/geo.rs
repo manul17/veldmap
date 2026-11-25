@@ -1,10 +1,7 @@
 //! Cross-module integration tests exercising the public `veldmap-core::geo` API.
 
 use glam::DVec3;
-use veldmap_core::geo::{
-    Ball, Camera, GeoPoint, Geodetic, MIN_HEIGHT_M, Polygon, Ring, SEMI_MAJOR_M, WGS84,
-    covers_polygon,
-};
+use veldmap_core::geo::{Ball, Camera, Geodetic, MIN_HEIGHT_M, SEMI_MAJOR_M, WGS84};
 
 fn surface_world(lat: f64, lon: f64) -> DVec3 {
     WGS84.to_ecef(Geodetic::surface(lat, lon))
@@ -88,17 +85,4 @@ fn oblate_horizon_plane_separates_near_limb_points_at_mid_latitude() {
         assert!(frustum.admits(&point_ball(45.0, 39.7 + (lo - 0.05).max(0.0))));
         assert!(!frustum.admits(&point_ball(45.0, 39.7 + hi + 0.05)));
     }
-}
-
-#[test]
-fn footprint_covers_geodesic_polygon_cleanly() {
-    let coords = [(72.0, 10.0), (72.0, 30.0), (73.0, 30.0), (73.0, 10.0)];
-    let points: Vec<GeoPoint> = coords
-        .iter()
-        .map(|&(lat, lon)| GeoPoint::new(lat, lon))
-        .collect();
-    let poly = Polygon::new(Ring { points });
-
-    assert!(covers_polygon(&poly, 72.5, 20.0));
-    assert!(!covers_polygon(&poly, 73.1, 20.0));
 }

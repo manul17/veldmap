@@ -7,9 +7,9 @@ use std::sync::Arc;
 use veldmap_core::geo::{Camera, Frame, VectorMesh};
 use veldmap_core::tile::{QuadTileId, QuadtreeConfig, SourceId, TileKey, VisibleTile, traverse};
 
+use crate::colormap::{CategoricalPaletteId, ColormapId};
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
 
-use super::colormap::{CategoricalPaletteId, ColormapId};
 use super::graticule::adaptive_grid_step_deg;
 
 /// Cache identity for an uploaded overlay cell warp-mesh vertex buffer.

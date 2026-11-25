@@ -58,7 +58,14 @@ fn disk_cache_worker_handles_refresh_cap_clear_and_disconnected_recovery() {
     let mut storage = AppStorage::open(wakeup, Some(paths));
     let cache = storage.disk_cache().expect("disk cache opened");
     let tile_key = DiskTileKey::new("test-src", TileScheme::WebMercator, 1, 0, 0);
-    cache.put(&tile_key, &[7u8; 256]).expect("put tile");
+    cache
+        .put_encoded_if_uncancelled(
+            &tile_key,
+            veldmap_storage::TileBlobEncoding::EncodedImage,
+            &[7u8; 256],
+            &veldmap_core::sync::CancelToken::new(),
+        )
+        .expect("put tile");
 
     // Opening Settings triggers an async stats refresh.
     storage.maybe_refresh_disk_stats(true);

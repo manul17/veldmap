@@ -201,7 +201,8 @@ impl TileScheduler {
     }
 
     /// Return the number of tiles currently in-flight for `source`.
-    pub fn in_flight_count_for_source(&self, source: SourceId) -> usize {
+    #[cfg(test)]
+    fn in_flight_count_for_source(&self, source: SourceId) -> usize {
         self.in_flight.keys().filter(|k| k.source == source).count()
     }
 
@@ -533,16 +534,13 @@ impl TileScheduler {
         Some(self.failures.record_pointwise_failure(*key, terminal))
     }
 
-    /// Drop all active passes, pointwise in-flight entries, and failure state
-    /// for a single [`StreamKey`], returning all [`CancelToken`]s so the caller
-    /// can cancel them outside any scheduler lock.
-    pub fn reset_stream(&mut self, stream: StreamKey) -> Vec<CancelToken> {
-        let mut tokens = Vec::new();
-        if let Some(pass) = self.active_passes.remove(&stream) {
-            tokens.push(pass.cancel);
-        }
+    fn drain_in_flight_where(
+        &mut self,
+        tokens: &mut Vec<CancelToken>,
+        mut matches: impl FnMut(&TileKey) -> bool,
+    ) {
         self.in_flight.retain(|k, entry| {
-            if k.stream_key() == stream {
+            if matches(k) {
                 if let FlightEntry::Pointwise { cancel, .. } = entry {
                     tokens.push(cancel.clone());
                 }
@@ -551,6 +549,17 @@ impl TileScheduler {
                 true
             }
         });
+    }
+
+    /// Drop all active passes, pointwise in-flight entries, and failure state
+    /// for a single [`StreamKey`], returning all [`CancelToken`]s so the caller
+    /// can cancel them outside any scheduler lock.
+    pub fn reset_stream(&mut self, stream: StreamKey) -> Vec<CancelToken> {
+        let mut tokens = Vec::new();
+        if let Some(pass) = self.active_passes.remove(&stream) {
+            tokens.push(pass.cancel);
+        }
+        self.drain_in_flight_where(&mut tokens, |k| k.stream_key() == stream);
         self.failures.clear_stream(stream);
         tokens
     }
@@ -568,16 +577,7 @@ impl TileScheduler {
                 true
             }
         });
-        self.in_flight.retain(|k, entry| {
-            if k.source == source {
-                if let FlightEntry::Pointwise { cancel, .. } = entry {
-                    tokens.push(cancel.clone());
-                }
-                false
-            } else {
-                true
-            }
-        });
+        self.drain_in_flight_where(&mut tokens, |k| k.source == source);
         self.failures.clear_source(source);
         tokens
     }

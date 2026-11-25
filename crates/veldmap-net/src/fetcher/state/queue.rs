@@ -32,6 +32,7 @@ struct CoarsestTileQueue {
 }
 
 impl CoarsestTileQueue {
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -65,12 +66,6 @@ impl CoarsestTileQueue {
     /// allocations.
     fn retain(&mut self, mut keep: impl FnMut(&TileKey) -> bool) {
         self.items.retain(|entry| keep(&entry.0));
-    }
-
-    fn drain(&mut self) -> impl Iterator<Item = TileKey> + use<> {
-        std::mem::take(&mut self.items)
-            .into_iter()
-            .map(|entry| entry.0)
     }
 }
 
@@ -134,18 +129,6 @@ impl PendingQueues {
 
     pub(super) fn pop_http(&mut self) -> Option<TileKey> {
         self.http.pop()
-    }
-
-    /// Move all eligible entries from `disk` into `http`, leaving `disk` empty.
-    pub(super) fn drain_disk_to_http(&mut self, mut keep: impl FnMut(&TileKey) -> bool) {
-        if self.disk.is_empty() {
-            return;
-        }
-        for key in self.disk.drain() {
-            if keep(&key) {
-                self.http.insert_unique(key);
-            }
-        }
     }
 
     /// Retain still-wanted / active-root entries in place across both stages.

@@ -32,20 +32,14 @@ pub trait RasterSource: Send + Sync {
         DISPLAY_STREAM_SPEC
     }
 
-    /// Scheduler-facing [`PyramidMeta`] for the display band.
-    fn pyramid_meta(&self) -> PyramidMeta {
-        let desc = self.description();
-        PyramidMeta {
-            source: self.source_id(),
-            spec: DISPLAY_STREAM_SPEC,
-            levels: desc.levels.clone(),
-        }
-    }
-
-    /// Scheduler-facing [`PyramidMeta`] for an arbitrary `spec`.
-    fn pyramid_meta_for(&self, spec: TileStreamSpec) -> Result<PyramidMeta, RasterError> {
+    /// Scheduler-facing [`PyramidMeta`] for stream `spec`.
+    fn pyramid_meta(&self, spec: TileStreamSpec) -> Result<PyramidMeta, RasterError> {
         if spec == DISPLAY_STREAM_SPEC {
-            Ok(self.pyramid_meta())
+            Ok(PyramidMeta {
+                source: self.source_id(),
+                spec: DISPLAY_STREAM_SPEC,
+                levels: self.description().levels.clone(),
+            })
         } else {
             Err(RasterError::Decode(format!(
                 "raster source only supports Display RGBA8 stream, not {spec:?}"
@@ -53,83 +47,36 @@ pub trait RasterSource: Send + Sync {
         }
     }
 
-    /// Estimated peak working bytes required by [`Self::produce_pass`].
-    fn pass_peak_bytes(&self) -> u64;
+    /// Estimated peak working bytes required by [`Self::produce_pass`] for `spec`.
+    fn pass_peak_bytes(&self, spec: TileStreamSpec) -> u64;
 
-    /// Estimated peak working bytes required by [`Self::produce_pass_stream`]
-    /// for `spec`.
-    fn pass_peak_bytes_for(&self, spec: TileStreamSpec) -> u64 {
-        let _ = spec;
-        self.pass_peak_bytes()
-    }
-
-    /// Produce pointwise display tiles `wants` at `level`.
+    /// Produce pointwise tiles `wants` at `level` for stream `spec`.
     fn produce_direct(
         &self,
+        spec: TileStreamSpec,
         level: u8,
         wants: &[(u32, u32)],
         ctx: &DecodeContext<'_>,
         emit: TileEmit<'_>,
     ) -> Result<(), RasterError> {
-        let _ = (wants, ctx, emit);
+        let _ = (spec, wants, ctx, emit);
         Err(RasterError::Decode(format!(
             "raster source does not support pointwise random access at level {level}; use sequential pass"
         )))
     }
 
-    /// Produce pointwise tiles `wants` at `level` for stream `spec`.
-    fn produce_direct_stream(
-        &self,
-        spec: TileStreamSpec,
-        level: u8,
-        wants: &[(u32, u32)],
-        ctx: &DecodeContext<'_>,
-        emit: TileEmit<'_>,
-    ) -> Result<(), RasterError> {
-        if spec == DISPLAY_STREAM_SPEC {
-            self.produce_direct(level, wants, ctx, emit)
-        } else {
-            Err(RasterError::Decode(format!(
-                "raster source does not support stream {spec:?}"
-            )))
-        }
-    }
-
-    /// Run a sequential top-to-bottom pass over the base image for the display
-    /// track, emitting every pyramid tile via `emit`.
-    fn produce_pass(&self, ctx: &DecodeContext<'_>, emit: TileEmit<'_>) -> Result<(), RasterError>;
-
-    /// Run a sequential top-to-bottom pass for stream `spec`.
-    fn produce_pass_stream(
+    /// Run a sequential top-to-bottom pass for stream `spec`, emitting every
+    /// pyramid tile via `emit`.
+    fn produce_pass(
         &self,
         spec: TileStreamSpec,
         ctx: &DecodeContext<'_>,
         emit: TileEmit<'_>,
-    ) -> Result<(), RasterError> {
-        if spec == DISPLAY_STREAM_SPEC {
-            self.produce_pass(ctx, emit)
-        } else {
-            Err(RasterError::Decode(format!(
-                "raster source does not support sequential pass for stream {spec:?}"
-            )))
-        }
-    }
-
-    /// Produce a single pointwise display tile `(level, tx, ty)` into a
-    /// validated [`DecodedTile`].
-    fn decode_pointwise_tile(
-        &self,
-        level: u8,
-        tx: u32,
-        ty: u32,
-        ctx: &DecodeContext<'_>,
-    ) -> Result<DecodedTile, RasterError> {
-        self.decode_pointwise_tile_stream(DISPLAY_STREAM_SPEC, level, tx, ty, ctx)
-    }
+    ) -> Result<(), RasterError>;
 
     /// Produce a single pointwise tile `(level, tx, ty)` for stream `spec` into
     /// a validated [`DecodedTile`].
-    fn decode_pointwise_tile_stream(
+    fn decode_pointwise_tile(
         &self,
         spec: TileStreamSpec,
         level: u8,
@@ -138,7 +85,7 @@ pub trait RasterSource: Send + Sync {
         ctx: &DecodeContext<'_>,
     ) -> Result<DecodedTile, RasterError> {
         let mut produced: Option<DecodedTile> = None;
-        self.produce_direct_stream(
+        self.produce_direct(
             spec,
             level,
             &[(tx, ty)],
@@ -151,9 +98,12 @@ pub trait RasterSource: Send + Sync {
             },
         )?;
         let scheme = self
-            .pyramid_meta_for(spec)
+            .pyramid_meta(spec)
             .map(|m| m.scheme())
-            .unwrap_or_else(|_| self.pyramid_meta().scheme());
+            .unwrap_or_else(|_| {
+                let max_level = self.description().levels.len().saturating_sub(1) as u8;
+                veldmap_core::tile::TileScheme::RasterPyramid { max_level }
+            });
         produced.ok_or(RasterError::TileOutOfRange {
             scheme,
             level,
@@ -161,14 +111,6 @@ pub trait RasterSource: Send + Sync {
             y: ty,
         })
     }
-
-    /// Zoom-invariant CPU display-RGBA readout at native base pixel `(px, py)`.
-    fn sample_display_rgba(
-        &self,
-        px: u32,
-        py: u32,
-        ctx: &DecodeContext<'_>,
-    ) -> Result<Option<[u8; 4]>, RasterError>;
 
     /// Zoom-invariant native-resolution CPU sample readout for `band` and
     /// `format` at `(px, py)`.
@@ -179,18 +121,7 @@ pub trait RasterSource: Send + Sync {
         px: u32,
         py: u32,
         ctx: &DecodeContext<'_>,
-    ) -> Result<BandSample, RasterError> {
-        if band == BandKey::Display || format == PixelFormat::Rgba8UnormSrgb {
-            if px >= self.description().width || py >= self.description().height {
-                return Ok(BandSample::Unavailable);
-            }
-            return Ok(match self.sample_display_rgba(px, py, ctx)? {
-                Some(rgba) => BandSample::Rgba(rgba),
-                None => BandSample::Nodata,
-            });
-        }
-        Ok(BandSample::Unavailable)
-    }
+    ) -> Result<BandSample, RasterError>;
 
     /// Compute or return cached sampled physical statistics and histograms for
     /// `band` (`None` if unsupported or all nodata).

@@ -275,6 +275,18 @@ impl AppSession {
         self.recent_files.truncate(MAX_RECENT_FILES);
     }
 
+    /// Append a camera bookmark (bounded to `MAX_BOOKMARKS` during normalize).
+    pub(crate) fn add_bookmark(&mut self, name: String, pose: SavedCameraPose) {
+        self.bookmarks.push(CameraBookmark { name, pose });
+    }
+
+    /// Remove the bookmark at `index`, if in bounds.
+    pub(crate) fn remove_bookmark(&mut self, index: usize) {
+        if index < self.bookmarks.len() {
+            self.bookmarks.remove(index);
+        }
+    }
+
     /// Load `session.json` from `paths` (backing up corrupt files to `.corrupt`).
     pub(super) fn load_or_default(paths: &StoragePaths) -> Self {
         let mut session: Self = read_json_or_default_with_backup(&paths.session_path());

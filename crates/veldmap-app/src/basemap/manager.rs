@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::{PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, TileKey};
+use veldmap_core::tile::{
+    PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, StreamKey, TileKey,
+};
 use veldmap_net::{
     FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError, TileBlobStore, TileDecodeExecutor,
 };
@@ -21,27 +23,27 @@ use super::{BasemapStatusSnapshot, BasemapSyncOutcome, LiveStreamStatus};
 use crate::gpu_tiles::{
     GpuTileCache, PendingUploads, UploadBatchReport, UploadSender, display_tile_mip_bytes,
 };
-use crate::storage::settings::{AppSettings, BasemapSelection};
+use crate::storage::settings::{BasemapConfigView, BasemapSelection};
 
 /// Attribution string displayed for the bundled public-domain Blue Marble
 /// offline basemap.
 const BUNDLED_ATTRIBUTION: &str = "Imagery: NASA Blue Marble Next Generation (Public Domain)";
 
-/// Resolve the active [`LiveBasemapSpec`] from persisted [`AppSettings`],
+/// Resolve the active [`LiveBasemapSpec`] from a borrowed [`BasemapConfigView`],
 /// returning `Ok(None)` for offline (`BundledBlueMarble`) or `EllipsoidOnly`
 /// modes.
-fn spec_from_settings(settings: &AppSettings) -> Result<Option<LiveBasemapSpec>, NetError> {
-    match settings.active_basemap {
+fn spec_from_config(config: BasemapConfigView<'_>) -> Result<Option<LiveBasemapSpec>, NetError> {
+    match config.active_basemap {
         BasemapSelection::BundledBlueMarble | BasemapSelection::EllipsoidOnly => Ok(None),
         BasemapSelection::NasaGibsBlueMarble => Ok(Some(LiveBasemapSpec::nasa_gibs_blue_marble())),
         BasemapSelection::NasaGibsViirs => {
-            LiveBasemapSpec::nasa_gibs_viirs(&settings.gibs_date).map(Some)
+            LiveBasemapSpec::nasa_gibs_viirs(config.gibs_date).map(Some)
         }
         BasemapSelection::EoxSentinel2Cloudless => {
             Ok(Some(LiveBasemapSpec::eox_sentinel2_cloudless()))
         }
         BasemapSelection::CustomXyz => {
-            LiveBasemapSpec::custom(settings.custom_xyz.as_net_config()).map(Some)
+            LiveBasemapSpec::custom(config.custom_xyz.as_net_config()).map(Some)
         }
     }
 }
@@ -69,12 +71,12 @@ impl Drop for BasemapManager {
 }
 
 impl BasemapManager {
-    /// Initialize basemap orchestration using initial `settings`, an injected
+    /// Initialize basemap orchestration using initial `config`, an injected
     /// fast-lane [`DecodePoolHandle`] + `decode_shutdown` token from
     /// [`crate::scene::SceneState`], and an optional shared SQLite
     /// [`TileDiskCache`].
     pub(crate) fn new(
-        settings: &AppSettings,
+        config: BasemapConfigView<'_>,
         disk_cache: Option<Arc<TileDiskCache>>,
         done_tx: UploadSender,
         wakeup: Wakeup,
@@ -110,7 +112,7 @@ impl BasemapManager {
         };
 
         let mut manager = Self {
-            active_basemap: settings.active_basemap,
+            active_basemap: config.active_basemap,
             bundled_provider,
             live_pipeline,
             live_pipeline_error,
@@ -121,7 +123,7 @@ impl BasemapManager {
             wanted_live: HashSet::new(),
         };
 
-        manager.sync_active_spec(settings);
+        manager.sync_active_spec(config);
         if manager.is_textured() {
             let scheme = manager.quadtree_config().scheme;
             manager.bundled_provider.seed_roots(scheme);
@@ -216,12 +218,7 @@ impl BasemapManager {
     /// appetite budgeting accounts for 512 px / `@2x` Custom XYZ tiles cleanly.
     pub(crate) fn record_upload_report(&mut self, report: &UploadBatchReport) {
         if let Some(spec) = &self.active_live_spec {
-            let max_bytes = report.max_tile_bytes_for_stream(veldmap_core::tile::StreamKey::new(
-                spec.source_id(),
-                veldmap_core::tile::BandKey::Display,
-                veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
-                0,
-            ));
+            let max_bytes = report.max_tile_bytes_for_stream(StreamKey::display(spec.source_id()));
             if max_bytes > 0 {
                 self.observed_live_tile_bytes = self.observed_live_tile_bytes.max(max_bytes);
             }
@@ -235,16 +232,16 @@ impl BasemapManager {
         }
     }
 
-    /// Synchronize active basemap providers with updated [`AppSettings`],
+    /// Synchronize active basemap providers with updated [`BasemapConfigView`],
     /// returning explicit eviction intent so the caller (`SceneState`) owns
     /// GPU cache and upload queue purging.
-    pub(crate) fn sync_settings(&mut self, settings: &AppSettings) -> BasemapSyncOutcome {
+    pub(crate) fn sync_settings(&mut self, config: BasemapConfigView<'_>) -> BasemapSyncOutcome {
         let prev_source = self.active_source();
         let prev_mode = self.active_basemap;
         let prev_spec = self.active_live_spec.clone();
-        self.active_basemap = settings.active_basemap;
+        self.active_basemap = config.active_basemap;
 
-        self.sync_active_spec(settings);
+        self.sync_active_spec(config);
         let next_source = self.active_source();
 
         let mut evict_source = None;
@@ -274,8 +271,8 @@ impl BasemapManager {
         }
     }
 
-    fn sync_active_spec(&mut self, settings: &AppSettings) {
-        match spec_from_settings(settings) {
+    fn sync_active_spec(&mut self, config: BasemapConfigView<'_>) {
+        match spec_from_config(config) {
             Ok(spec) => {
                 self.config_error = None;
                 // Only activate a live spec when `live_pipeline` is actually

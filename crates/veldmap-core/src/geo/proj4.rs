@@ -217,10 +217,7 @@ fn rewrite_missing_nadgrid_proj(proj_str: &str) -> String {
 }
 
 fn is_plate_fixed_grid_epsg(code: u32) -> bool {
-    matches!(
-        code,
-        2154 | 3035 | 4171 | 4258 | 25_828..=25_838 | 3038..=3051
-    )
+    matches!(code, 2154 | 3035 | 4171 | 25_828..=25_838 | 3038..=3051)
 }
 
 fn extract_wkt_name(wkt: &str) -> Option<String> {

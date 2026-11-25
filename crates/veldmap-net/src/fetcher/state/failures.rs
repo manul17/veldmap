@@ -1,23 +1,15 @@
-//! Bounded failure-marker and retry-backoff tracking for [`super::state::PipelineState`].
+//! Bounded failure-marker and retry-backoff tracking for [`super::PipelineState`].
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use veldmap_core::tile::{SourceId, TileKey};
 
+use super::is_wanted_or_root;
+
 /// Upper bound on retained permanent/empty per-tile markers to prevent
 /// unbounded memory growth on sparse 404/204 layers over long sessions.
 pub(super) const MAX_FAILURE_ENTRIES: usize = 4096;
-
-/// Returns `true` when `key` is currently requested in `wanted` or is a pinned
-/// coarsest root tile of `active_source`.
-pub(super) fn is_wanted_or_root(
-    wanted: &HashSet<TileKey>,
-    key: &TileKey,
-    active_source: SourceId,
-) -> bool {
-    wanted.contains(key) || key.is_root_of(active_source)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FailureMarker {

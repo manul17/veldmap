@@ -9,12 +9,22 @@ use crate::display_name_from_path;
 use crate::layers::OverlayIoEvent;
 use crate::scene::SceneIoEvent;
 use crate::storage::session::{SavedCameraPose, SavedLayerEntry, SavedVectorEntry};
-use crate::ui::layers::UnavailableLayerNotice;
 use crate::vectors::VectorIoEvent;
 
 use super::VeldmapApp;
 
-#[derive(Clone, Copy)]
+/// Immutable summary of a layer from the previous `session.json` that could not
+/// be reopened at startup (kept in `session.json` until reopened or explicitly
+/// forgotten so custom CRS overrides and stretch styles are never lost).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnavailableLayerNotice {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) error: String,
+    pub(crate) is_vector: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum LayerKind {
     Raster,
     Vector,
@@ -27,21 +37,42 @@ impl LayerKind {
             Self::Vector => "GeoJSON vector",
         }
     }
+}
 
-    fn is_vector(self) -> bool {
-        matches!(self, Self::Vector)
+enum SavedEntry {
+    Raster(SavedLayerEntry),
+    Vector(SavedVectorEntry),
+}
+
+impl SavedEntry {
+    fn kind(&self) -> LayerKind {
+        match self {
+            Self::Raster(_) => LayerKind::Raster,
+            Self::Vector(_) => LayerKind::Vector,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Raster(entry) => &entry.path,
+            Self::Vector(entry) => &entry.path,
+        }
+    }
+
+    fn to_notice(&self, error: String) -> UnavailableLayerNotice {
+        let path = self.path();
+        UnavailableLayerNotice {
+            name: display_name_from_path(path),
+            path: path.to_path_buf(),
+            error,
+            is_vector: self.kind() == LayerKind::Vector,
+        }
     }
 }
 
-fn take_entry_by_path<T>(
-    entries: &mut Vec<T>,
-    path: &Path,
-    entry_path: impl Fn(&T) -> &Path,
-) -> Option<T> {
-    entries
-        .iter()
-        .position(|entry| entry_path(entry) == path)
-        .map(|pos| entries.remove(pos))
+struct UnavailableEntry {
+    saved: SavedEntry,
+    notice: UnavailableLayerNotice,
 }
 
 /// Tracks layers and vectors queued from `session.json` at startup whose
@@ -50,115 +81,83 @@ fn take_entry_by_path<T>(
 /// silently wipes persisted CRS overrides or stretch styles.
 #[derive(Default)]
 pub(super) struct SessionRestoreTracker {
-    pending_layers: Vec<SavedLayerEntry>,
-    pending_vectors: Vec<SavedVectorEntry>,
-    unavailable_layers: Vec<SavedLayerEntry>,
-    unavailable_vectors: Vec<SavedVectorEntry>,
-    unavailable_notices: Vec<UnavailableLayerNotice>,
+    pending: Vec<SavedEntry>,
+    unavailable: Vec<UnavailableEntry>,
     notices_hidden: bool,
 }
 
 impl SessionRestoreTracker {
     fn push_layer(&mut self, entry: SavedLayerEntry) {
-        self.pending_layers.push(entry);
+        self.pending.push(SavedEntry::Raster(entry));
     }
 
     fn push_vector(&mut self, entry: SavedVectorEntry) {
-        self.pending_vectors.push(entry);
+        self.pending.push(SavedEntry::Vector(entry));
+    }
+
+    fn record_unavailable(&mut self, saved: SavedEntry, error: String) {
+        let notice = saved.to_notice(error);
+        self.unavailable.push(UnavailableEntry { saved, notice });
+        self.notices_hidden = false;
     }
 
     fn record_unavailable_layer(&mut self, entry: SavedLayerEntry, error: String) {
-        self.unavailable_notices.push(UnavailableLayerNotice {
-            name: display_name_from_path(&entry.path),
-            path: entry.path.clone(),
-            error,
-            is_vector: false,
-        });
-        self.unavailable_layers.push(entry);
-        self.notices_hidden = false;
+        self.record_unavailable(SavedEntry::Raster(entry), error);
     }
 
     fn record_unavailable_vector(&mut self, entry: SavedVectorEntry, error: String) {
-        self.unavailable_notices.push(UnavailableLayerNotice {
-            name: display_name_from_path(&entry.path),
-            path: entry.path.clone(),
-            error,
-            is_vector: true,
-        });
-        self.unavailable_vectors.push(entry);
-        self.notices_hidden = false;
+        self.record_unavailable(SavedEntry::Vector(entry), error);
     }
 
-    fn remove_unavailable_notice(&mut self, kind: LayerKind, path: &Path) {
-        let is_vector = kind.is_vector();
-        if let Some(pos) = self
-            .unavailable_notices
-            .iter()
-            .position(|n| n.is_vector == is_vector && n.path == path)
-        {
-            self.unavailable_notices.remove(pos);
-        }
-    }
-
-    /// Consume a matching entry when a layer opens: prefer `pending_*` first so
+    /// Consume a matching entry when a layer opens: prefer `pending` first so
     /// duplicate paths in `session.json` consume FIFO; only when no pending
-    /// restore matches does a later manual open clear a preserved `unavailable_*`
+    /// restore matches does a later manual open clear a preserved `unavailable`
     /// entry so `session.json` never duplicates it.
     fn on_opened(&mut self, kind: LayerKind, path: &Path) {
-        let consumed_pending = match kind {
-            LayerKind::Raster => {
-                take_entry_by_path(&mut self.pending_layers, path, |e| &e.path).is_some()
-            }
-            LayerKind::Vector => {
-                take_entry_by_path(&mut self.pending_vectors, path, |e| &e.path).is_some()
-            }
-        };
-        if !consumed_pending {
-            let removed_unavailable = match kind {
-                LayerKind::Raster => {
-                    take_entry_by_path(&mut self.unavailable_layers, path, |e| &e.path).is_some()
-                }
-                LayerKind::Vector => {
-                    take_entry_by_path(&mut self.unavailable_vectors, path, |e| &e.path).is_some()
-                }
-            };
-            if removed_unavailable {
-                self.remove_unavailable_notice(kind, path);
-            }
+        if let Some(pos) = self
+            .pending
+            .iter()
+            .position(|e| e.kind() == kind && e.path() == path)
+        {
+            self.pending.remove(pos);
+            return;
+        }
+        if let Some(pos) = self
+            .unavailable
+            .iter()
+            .position(|e| e.saved.kind() == kind && e.saved.path() == path)
+        {
+            self.unavailable.remove(pos);
         }
     }
 
     /// If `path` belonged to a pending startup restore, move its full saved
-    /// entry into `unavailable_*` (preserving CRS override and style) and
-    /// return `true`. Returns `false` for non-restore open failures.
+    /// entry into `unavailable` (preserving CRS override and style) and return
+    /// `true`. Returns `false` for non-restore open failures.
     fn on_failed(&mut self, kind: LayerKind, path: &Path, error: &str) -> bool {
-        match kind {
-            LayerKind::Raster => {
-                let Some(entry) = take_entry_by_path(&mut self.pending_layers, path, |e| &e.path)
-                else {
-                    return false;
-                };
-                self.record_unavailable_layer(entry, error.to_owned());
-                true
-            }
-            LayerKind::Vector => {
-                let Some(entry) = take_entry_by_path(&mut self.pending_vectors, path, |e| &e.path)
-                else {
-                    return false;
-                };
-                self.record_unavailable_vector(entry, error.to_owned());
-                true
-            }
-        }
+        let Some(pos) = self
+            .pending
+            .iter()
+            .position(|e| e.kind() == kind && e.path() == path)
+        else {
+            return false;
+        };
+        let entry = self.pending.remove(pos);
+        self.record_unavailable(entry, error.to_owned());
+        true
     }
 
     fn take_unavailable_for_retry(&mut self) -> (Vec<SavedLayerEntry>, Vec<SavedVectorEntry>) {
-        self.unavailable_notices.clear();
         self.notices_hidden = false;
-        (
-            std::mem::take(&mut self.unavailable_layers),
-            std::mem::take(&mut self.unavailable_vectors),
-        )
+        let mut layers = Vec::new();
+        let mut vectors = Vec::new();
+        for item in self.unavailable.drain(..) {
+            match item.saved {
+                SavedEntry::Raster(e) => layers.push(e),
+                SavedEntry::Vector(e) => vectors.push(e),
+            }
+        }
+        (layers, vectors)
     }
 
     pub(super) fn hide_notices(&mut self) {
@@ -170,36 +169,44 @@ impl SessionRestoreTracker {
     }
 
     pub(super) fn forget_unavailable(&mut self) -> bool {
-        let had_any = !self.unavailable_layers.is_empty() || !self.unavailable_vectors.is_empty();
-        self.unavailable_layers.clear();
-        self.unavailable_vectors.clear();
-        self.unavailable_notices.clear();
+        let had_any = !self.unavailable.is_empty();
+        self.unavailable.clear();
         self.notices_hidden = false;
         had_any
     }
 
     pub(super) fn unavailable_count(&self) -> usize {
-        self.unavailable_notices.len()
+        self.unavailable.len()
     }
 
-    pub(super) fn visible_notices(&self) -> &[UnavailableLayerNotice] {
-        if self.notices_hidden {
-            &[]
-        } else {
-            &self.unavailable_notices
+    pub(super) fn visible_notices(&self) -> Vec<UnavailableLayerNotice> {
+        if self.notices_hidden || self.unavailable.is_empty() {
+            return Vec::new();
         }
+        self.unavailable
+            .iter()
+            .map(|item| item.notice.clone())
+            .collect()
+    }
+
+    fn all_preserved(&self) -> impl Iterator<Item = &SavedEntry> {
+        self.pending
+            .iter()
+            .chain(self.unavailable.iter().map(|e| &e.saved))
     }
 
     fn preserved_layers(&self) -> impl Iterator<Item = &SavedLayerEntry> {
-        self.pending_layers
-            .iter()
-            .chain(self.unavailable_layers.iter())
+        self.all_preserved().filter_map(|e| match e {
+            SavedEntry::Raster(layer) => Some(layer),
+            SavedEntry::Vector(_) => None,
+        })
     }
 
     fn preserved_vectors(&self) -> impl Iterator<Item = &SavedVectorEntry> {
-        self.pending_vectors
-            .iter()
-            .chain(self.unavailable_vectors.iter())
+        self.all_preserved().filter_map(|e| match e {
+            SavedEntry::Vector(vec_layer) => Some(vec_layer),
+            SavedEntry::Raster(_) => None,
+        })
     }
 }
 
@@ -213,7 +220,7 @@ impl VeldmapApp {
         open_vectors: Vec<SavedVectorEntry>,
     ) {
         for saved in open_layers {
-            match self.scene.overlays().begin_open_file_with_options(
+            match self.scene.begin_open_overlay(
                 &saved.path,
                 false,
                 saved.visible,
@@ -226,7 +233,7 @@ impl VeldmapApp {
             }
         }
         for saved_vec in open_vectors {
-            match self.scene.vectors().begin_open(
+            match self.scene.begin_open_vector(
                 &saved_vec.path,
                 false,
                 saved_vec.visible,

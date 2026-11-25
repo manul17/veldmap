@@ -5,10 +5,64 @@
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use eframe::egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor};
-use veldmap_core::sync::lock_unpoisoned;
+use eframe::egui_wgpu::{CallbackResources, CallbackTrait, RenderState, ScreenDescriptor};
+use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 
 use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams, TileBindGroupCache};
+
+use super::GpuFaultState;
+
+/// Install `wgpu` uncaptured-error / device-lost hooks and register the shared
+/// [`TileBindGroupCache`] and [`GlobeRenderer`] inside
+/// `egui_wgpu::CallbackResources`.
+pub(super) fn install_wgpu_resources(
+    render_state: &RenderState,
+    gpu_faults: &Arc<GpuFaultState>,
+    wakeup: &Wakeup,
+) {
+    {
+        let faults = Arc::clone(gpu_faults);
+        let wake = Arc::clone(wakeup);
+        render_state
+            .device
+            .on_uncaptured_error(Arc::new(move |err| {
+                let msg = err.to_string();
+                tracing::error!(error = %msg, "Uncaptured wgpu device error");
+                if faults.record_uncaptured_error(msg) {
+                    (wake)();
+                }
+            }));
+    }
+    {
+        let faults = Arc::clone(gpu_faults);
+        let wake = Arc::clone(wakeup);
+        render_state
+            .device
+            .set_device_lost_callback(move |reason, message| {
+                // Normal shutdown destroys the wgpu device; ignore expected teardown.
+                if reason == wgpu::DeviceLostReason::Destroyed {
+                    tracing::debug!(?reason, %message, "wgpu device destroyed during teardown");
+                    return;
+                }
+                tracing::error!(?reason, %message, "wgpu device lost");
+                if faults.record_device_lost(message) {
+                    (wake)();
+                }
+            });
+    }
+
+    let bind_groups = TileBindGroupCache::new(&render_state.device);
+    let renderer = GlobeRenderer::new(
+        &render_state.device,
+        render_state.target_format,
+        &bind_groups,
+    );
+    let mut wgpu_renderer = render_state.renderer.write();
+    wgpu_renderer
+        .callback_resources
+        .insert(Arc::new(Mutex::new(bind_groups)));
+    wgpu_renderer.callback_resources.insert(renderer);
+}
 
 /// Estimate physical viewport dimensions from `egui::Context` during `App::ui`
 /// (where `egui_wgpu::ScreenDescriptor::size_in_pixels` is not exposed yet;
@@ -70,7 +124,7 @@ impl CallbackTrait for GlobePaintCallback {
 
         if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
             let mut bind_groups = lock_unpoisoned(&bind_groups_arc);
-            renderer.render_if_dirty_with_bind_groups(
+            renderer.render_if_dirty(
                 device,
                 queue,
                 egui_encoder,

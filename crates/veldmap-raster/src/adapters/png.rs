@@ -10,12 +10,16 @@ use std::sync::Arc;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{SourceFingerprint, SourceId, level_count};
+use veldmap_core::tile::{
+    BandKey, PixelFormat, SourceFingerprint, SourceId, TileStreamSpec, level_count,
+};
 
 use crate::image_codec::{build_normalized_png_decoder, build_png_decoder, png_u8_to_rgba8};
 use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
-use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
-use crate::pipeline::plan::{LevelPlan, ServeMode, check_max_source_side};
+use crate::pipeline::metadata::{
+    BandInfo, BandSample, GeoPlacement, RasterDescription, SampleType,
+};
+use crate::pipeline::plan::{DISPLAY_STREAM_SPEC, LevelPlan, ServeMode, check_max_source_side};
 use crate::pipeline::radiometry::{PixelLayout, expand_u8_into_rgba};
 use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
@@ -67,7 +71,7 @@ impl PngSource {
             png::ColorType::Rgba => 4,
         };
 
-        let cascade_bytes = cascade::bytes(width, height);
+        let cascade_bytes = cascade::bytes(width, height, PixelFormat::Rgba8UnormSrgb);
         let row_bytes = u64::from(width).saturating_mul(4);
         let pass_peak_bytes = if interlaced {
             // Adam7 requires a full decoded frame buffer + RGBA conversion + cascade.
@@ -147,11 +151,21 @@ impl RasterSource for PngSource {
         &self.description
     }
 
-    fn pass_peak_bytes(&self) -> u64 {
+    fn pass_peak_bytes(&self, _spec: TileStreamSpec) -> u64 {
         self.pass_peak_bytes
     }
 
-    fn produce_pass(&self, ctx: &DecodeContext<'_>, emit: TileEmit<'_>) -> Result<(), RasterError> {
+    fn produce_pass(
+        &self,
+        spec: TileStreamSpec,
+        ctx: &DecodeContext<'_>,
+        emit: TileEmit<'_>,
+    ) -> Result<(), RasterError> {
+        if spec != DISPLAY_STREAM_SPEC {
+            return Err(RasterError::Decode(format!(
+                "PngSource only supports Display RGBA8 stream, not {spec:?}"
+            )));
+        }
         if ctx.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
@@ -167,7 +181,7 @@ impl RasterSource for PngSource {
             ));
         }
 
-        let mut cascade = Cascade::new(0, w, h);
+        let mut cascade = Cascade::new(0, w, h, PixelFormat::Rgba8UnormSrgb);
         let mut bled_emit = bleed_display_emit(emit);
 
         if interlaced || self.interlaced {
@@ -176,7 +190,7 @@ impl RasterSource for PngSource {
             })?;
             let est = (buf_len as u64)
                 .saturating_add(u64::from(w).saturating_mul(u64::from(h)).saturating_mul(4))
-                .saturating_add(cascade::bytes(w, h));
+                .saturating_add(cascade::bytes(w, h, PixelFormat::Rgba8UnormSrgb));
             if est > ctx.budget.decode_working_bytes {
                 return Err(RasterError::LimitExceeded {
                     width: w,
@@ -219,14 +233,20 @@ impl RasterSource for PngSource {
         cascade.finish(&mut bled_emit)
     }
 
-    fn sample_display_rgba(
+    fn sample_band(
         &self,
+        band: BandKey,
+        format: PixelFormat,
         px: u32,
         py: u32,
         ctx: &DecodeContext<'_>,
-    ) -> Result<Option<[u8; 4]>, RasterError> {
-        if px >= self.description.width || py >= self.description.height {
-            return Ok(None);
+    ) -> Result<BandSample, RasterError> {
+        if band != BandKey::Display
+            || format != PixelFormat::Rgba8UnormSrgb
+            || px >= self.description.width
+            || py >= self.description.height
+        {
+            return Ok(BandSample::Unavailable);
         }
         // Only perform on-demand row scans for compact non-interlaced PNGs
         // (<= 2 MP) under an explicit budget lease so hover probes never stall
@@ -234,7 +254,7 @@ impl RasterSource for PngSource {
         let total_px =
             u64::from(self.description.width).saturating_mul(u64::from(self.description.height));
         if self.interlaced || total_px > 2_000_000 {
-            return Ok(None);
+            return Ok(BandSample::Unavailable);
         }
         if ctx.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
@@ -255,7 +275,7 @@ impl RasterSource for PngSource {
                 .next_row()
                 .map_err(|e| map_png_error(e, ctx.cancel))?
             else {
-                return Ok(None);
+                return Ok(BandSample::Unavailable);
             };
             if row_idx == py {
                 expand_u8_into_rgba(
@@ -266,40 +286,17 @@ impl RasterSource for PngSource {
                 );
                 let idx = (px as usize).saturating_mul(4);
                 let Some(px_bytes) = row_rgba.get(idx..idx + 4) else {
-                    return Ok(None);
+                    return Ok(BandSample::Unavailable);
                 };
                 let color = [px_bytes[0], px_bytes[1], px_bytes[2], px_bytes[3]];
-                return Ok((color[3] > 0).then_some(color));
+                return Ok(if color[3] > 0 {
+                    BandSample::Rgba(color)
+                } else {
+                    BandSample::Nodata
+                });
             }
         }
-        Ok(None)
-    }
-
-    fn sample_band(
-        &self,
-        band: veldmap_core::tile::BandKey,
-        format: veldmap_core::tile::PixelFormat,
-        px: u32,
-        py: u32,
-        ctx: &DecodeContext<'_>,
-    ) -> Result<crate::pipeline::metadata::BandSample, RasterError> {
-        use crate::pipeline::metadata::BandSample;
-        if (band != veldmap_core::tile::BandKey::Display
-            && format != veldmap_core::tile::PixelFormat::Rgba8UnormSrgb)
-            || px >= self.description.width
-            || py >= self.description.height
-        {
-            return Ok(BandSample::Unavailable);
-        }
-        let total_px =
-            u64::from(self.description.width).saturating_mul(u64::from(self.description.height));
-        if self.interlaced || total_px > 2_000_000 {
-            return Ok(BandSample::Unavailable);
-        }
-        Ok(match self.sample_display_rgba(px, py, ctx)? {
-            Some(rgba) => BandSample::Rgba(rgba),
-            None => BandSample::Nodata,
-        })
+        Ok(BandSample::Unavailable)
     }
 }
 

@@ -285,7 +285,13 @@ impl TiffSource {
             overviews,
             depth,
         };
-        let levels = build_chunked_level_table(&grid, width, height, budget);
+        let levels = build_chunked_level_table(
+            &grid,
+            width,
+            height,
+            veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
+            budget,
+        );
         if levels.is_empty() || levels.iter().all(|row| !row.fits) {
             let max_peak = levels.last().map_or(0, |row| row.estimated_peak_bytes);
             return Err(RasterError::LimitExceeded {

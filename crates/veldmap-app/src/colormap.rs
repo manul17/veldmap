@@ -1,12 +1,12 @@
-//! Scientific continuous colormaps and categorical class palettes shared
-//! between GPU uniform LUTs (`PaletteUniform`, linear-light `vec4<f32>`) and
-//! CPU `egui` colorbar / histogram previews (sRGB `[u8; 4]`).
+//! Scientific continuous colormaps, categorical class palettes, and exact
+//! IEC 61966-2-1 sRGB-to-linear transfer functions shared between GPU uniform
+//! LUTs, draped vector styling, and CPU `egui` colorbar / histogram widgets.
 
 use serde::{Deserialize, Serialize};
 
-/// Number of LUT entries in [`super::uniforms::PaletteUniform`] (`256 * 16 B = 4096 B`, well
+/// Number of LUT entries in `PaletteUniform` (`256 * 16 B = 4096 B`, well
 /// within baseline WebGPU's 16 KiB uniform buffer limit).
-pub const PALETTE_LUT_LEN: usize = 256;
+pub(crate) const PALETTE_LUT_LEN: usize = 256;
 
 /// Continuous scientific colormap presets for `R32Float` layers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -76,14 +76,37 @@ impl CategoricalPaletteId {
     }
 }
 
-/// Convert an sRGB channel in `[0, 1]` to exact linear light (IEC 61966-2-1).
+/// Convert an sRGB channel to exact linear light (IEC 61966-2-1), clamping
+/// out-of-range values to `[0.0, 1.0]` and sanitizing non-finite inputs to `0.0`.
 #[inline]
-pub fn srgb_to_linear_f32(c: f32) -> f32 {
-    if c <= 0.04045 {
-        c / 12.92
+pub(crate) fn srgb_to_linear_f32(c: f32) -> f32 {
+    let s = if c.is_finite() {
+        c.clamp(0.0, 1.0)
     } else {
-        ((c + 0.055) / 1.055).powf(2.4)
+        0.0
+    };
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Convert a normalized `[r, g, b, a]` sRGB color to linear-light RGB with
+/// clamped finite alpha scaled by `opacity`.
+#[inline]
+pub(crate) fn srgb_rgba_f32_to_linear(rgba: [f32; 4], opacity: f32) -> [f32; 4] {
+    let a = if rgba[3].is_finite() {
+        rgba[3].clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    [
+        srgb_to_linear_f32(rgba[0]),
+        srgb_to_linear_f32(rgba[1]),
+        srgb_to_linear_f32(rgba[2]),
+        (a * opacity).clamp(0.0, 1.0),
+    ]
 }
 
 fn sample_stops_srgb(stops: &[[u8; 3]], t: f32) -> [u8; 4] {
@@ -179,7 +202,7 @@ const TERRAIN_STOPS: &[[u8; 3]] = &[
 ];
 
 /// Evaluate a continuous scientific colormap in sRGB `[r, g, b, 255]` at `t` in `[0, 1]`.
-pub fn sample_colormap_srgb(colormap: ColormapId, t: f32, invert: bool) -> [u8; 4] {
+pub(crate) fn sample_colormap_srgb(colormap: ColormapId, t: f32, invert: bool) -> [u8; 4] {
     let u = if invert {
         1.0 - t.clamp(0.0, 1.0)
     } else {
@@ -198,7 +221,7 @@ pub fn sample_colormap_srgb(colormap: ColormapId, t: f32, invert: bool) -> [u8; 
 }
 
 /// Build a 256-entry linear-light RGBA LUT for a scientific [`ColormapId`].
-pub fn scientific_lut_linear(colormap: ColormapId) -> [[f32; 4]; PALETTE_LUT_LEN] {
+pub(crate) fn scientific_lut_linear(colormap: ColormapId) -> [[f32; 4]; PALETTE_LUT_LEN] {
     let mut lut = [[0.0f32; 4]; PALETTE_LUT_LEN];
     for (i, slot) in lut.iter_mut().enumerate() {
         let t = (i as f32) / ((PALETTE_LUT_LEN - 1) as f32);
@@ -263,7 +286,7 @@ const SENTINEL2_SCL_SRGB: [[u8; 4]; 12] = [
 ];
 
 /// Build a 256-entry linear-light RGBA LUT for a categorical palette.
-pub fn categorical_lut_linear(
+pub(crate) fn categorical_lut_linear(
     palette: CategoricalPaletteId,
     custom_color_map: Option<&[[u8; 4]]>,
 ) -> [[f32; 4]; PALETTE_LUT_LEN] {

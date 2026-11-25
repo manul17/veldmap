@@ -97,7 +97,7 @@ fn cmyk_pixel_to_rgb(px: &[u8]) -> [u8; 3] {
 
 /// Convert `jpeg-decoder`'s un-inverted standard `[C, M, Y, K]` bytes (`0` = no
 /// ink / white, `255` = full ink / black) into opaque RGBA8.
-pub(crate) fn cmyk_to_rgba8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
+fn cmyk_to_rgba8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(pixel_count.saturating_mul(4));
     for px in cmyk.chunks_exact(4).take(pixel_count) {
         let [r, g, b] = cmyk_pixel_to_rgb(px);
@@ -108,7 +108,7 @@ pub(crate) fn cmyk_to_rgba8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
 
 /// Convert `jpeg-decoder`'s un-inverted standard `[C, M, Y, K]` bytes (`0` = no
 /// ink / white, `255` = full ink / black) into packed RGB8.
-pub(crate) fn cmyk_to_rgb8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
+fn cmyk_to_rgb8(cmyk: &[u8], pixel_count: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(pixel_count.saturating_mul(3));
     for px in cmyk.chunks_exact(4).take(pixel_count) {
         out.extend_from_slice(&cmyk_pixel_to_rgb(px));
@@ -134,11 +134,22 @@ fn gray_to_rgb8(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
     out
 }
 
-fn rgb_to_rgba8(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
+/// Expand packed RGB8 pixels into opaque RGBA8 (`alpha = 255`).
+pub(crate) fn rgb_to_rgba8(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
     let count = pixel_count.min(pixels.len() / 3);
     let mut out = Vec::with_capacity(count.saturating_mul(4));
     for px in pixels.chunks_exact(3).take(count) {
         out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+    }
+    out
+}
+
+/// Strip the alpha channel from packed RGBA8 pixels into tightly packed RGB8.
+pub(crate) fn rgba_to_rgb8(pixels: &[u8], pixel_count: usize) -> Vec<u8> {
+    let count = pixel_count.min(pixels.len() / 4);
+    let mut out = Vec::with_capacity(count.saturating_mul(3));
+    for px in pixels.chunks_exact(4).take(count) {
+        out.extend_from_slice(&px[..3]);
     }
     out
 }
@@ -178,13 +189,7 @@ pub(crate) fn png_u8_to_rgb8(
 ) -> Vec<u8> {
     match color_type {
         png::ColorType::Rgb => buf,
-        png::ColorType::Rgba => {
-            let mut out = Vec::with_capacity(pixel_count.saturating_mul(3));
-            for px in buf.chunks_exact(4).take(pixel_count) {
-                out.extend_from_slice(&px[..3]);
-            }
-            out
-        }
+        png::ColorType::Rgba => rgba_to_rgb8(&buf, pixel_count),
         png::ColorType::Grayscale => gray_to_rgb8(&buf, pixel_count),
         png::ColorType::GrayscaleAlpha => {
             let mut out = Vec::with_capacity(pixel_count.saturating_mul(3));

@@ -104,16 +104,15 @@ fn band_key_from_name_and_source_id_are_deterministic() {
 #[test]
 fn grid_dims_sub_rect_and_coarsest_first_tie_breaking_are_deterministic() {
     assert_eq!(
-        TileScheme::WebMercator.grid_dims(30),
+        PlanetaryScheme::WebMercator.grid_dims(30),
         Some((1 << 30, 1 << 30))
     );
-    assert_eq!(TileScheme::WebMercator.grid_dims(31), None);
-    assert_eq!(TileScheme::Geodetic.grid_dims(29), Some((1 << 30, 1 << 29)));
-    assert_eq!(TileScheme::Geodetic.grid_dims(30), None);
+    assert_eq!(PlanetaryScheme::WebMercator.grid_dims(31), None);
     assert_eq!(
-        TileScheme::RasterPyramid { max_level: 4 }.grid_dims(0),
-        None
+        PlanetaryScheme::Geodetic.grid_dims(29),
+        Some((1 << 30, 1 << 29))
     );
+    assert_eq!(PlanetaryScheme::Geodetic.grid_dims(30), None);
 
     assert_eq!(PixelFormat::Rgba8UnormSrgb.bytes_per_pixel(), 4);
     assert_eq!(PixelFormat::R32Float.bytes_per_pixel(), 4);

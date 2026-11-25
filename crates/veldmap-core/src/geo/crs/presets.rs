@@ -2,8 +2,11 @@
 
 use std::sync::OnceLock;
 
-use super::super::projection::{MSK61_EPSG_BASE, MSK61_ZONES};
-use super::CrsSpec;
+use super::super::projection::{
+    GK_PULKOVO_EPSG_BASE, GK_PULKOVO_ZONES, MSK61_EPSG_BASE, MSK61_ZONES, UTM_NORTH_EPSG_BASE,
+    UTM_SOUTH_EPSG_BASE, UTM_ZONES,
+};
+use super::{CrsSpec, parse_epsg_shorthand};
 
 /// Searchable CRS preset entry for the UI CRS picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,23 +79,23 @@ fn preset_catalog() -> &'static PresetCatalog {
                 category: "MSK / Pulkovo",
             });
         }
-        for zone in 2..=32 {
+        for zone in GK_PULKOVO_ZONES {
             presets.push(CrsPreset {
-                epsg: 28_400 + zone,
+                epsg: GK_PULKOVO_EPSG_BASE + zone,
                 name: format!("Pulkovo 1942 / Gauss-Kruger zone {zone}"),
                 category: "MSK / Pulkovo",
             });
         }
-        for zone in 1..=60 {
+        for zone in UTM_ZONES {
             presets.push(CrsPreset {
-                epsg: 32_600 + zone,
+                epsg: UTM_NORTH_EPSG_BASE + zone,
                 name: format!("WGS 84 / UTM zone {zone}N"),
                 category: "UTM North",
             });
         }
-        for zone in 1..=60 {
+        for zone in UTM_ZONES {
             presets.push(CrsPreset {
-                epsg: 32_700 + zone,
+                epsg: UTM_SOUTH_EPSG_BASE + zone,
                 name: format!("WGS 84 / UTM zone {zone}S"),
                 category: "UTM South",
             });
@@ -142,8 +145,7 @@ pub fn search_crs_presets(query: &str, limit: usize) -> Vec<CrsPreset> {
         .collect();
 
     // Allow direct lookup of any EPSG code in `crs-definitions` even if not in the curated list.
-    let digits = q.strip_prefix("epsg:").unwrap_or(&q).trim();
-    if let Ok(code) = digits.parse::<u32>()
+    if let Some(code) = parse_epsg_shorthand(&q)
         && !results.iter().any(|p| p.epsg == code)
         && CrsSpec::from_epsg(code).is_ok()
     {

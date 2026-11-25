@@ -8,6 +8,7 @@ pub(crate) mod layers;
 pub(crate) mod measure;
 pub(crate) mod status_bar;
 pub(crate) mod toolbar;
+pub(crate) mod widgets;
 
 use eframe::egui;
 

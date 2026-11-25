@@ -4,14 +4,13 @@
 use veldmap_app::BUNDLED_MAX_LEVEL;
 use veldmap_app::basemap_policy::bundled_tile_key;
 use veldmap_app::gpu_tiles::GpuTileCache;
-use veldmap_app::render::GlobeRenderer;
 use veldmap_core::geo::{Camera, MIN_HEIGHT_M, WEB_MERCATOR_LIMIT_DEG};
 use veldmap_core::tile::{
     DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId,
 };
 
 use crate::common::{
-    build_snapshot, is_clear_background, pixel_at, render_srgb, shared_bundled_basemap,
+    TestGlobe, build_snapshot, is_clear_background, pixel_at, render_srgb, shared_bundled_basemap,
     shared_headless_device,
 };
 
@@ -23,7 +22,7 @@ fn bundled_blue_marble_renders_sahara_pacific_and_antarctica() {
 
     let basemap = shared_bundled_basemap();
     let cfg = QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let mut cache = GpuTileCache::new(32 * 1024 * 1024);
 
     for id in [
@@ -132,7 +131,7 @@ fn close_up_2m_between_vertices_rtc_shift_and_parent_overzoom() {
 
     let (w, h) = (65, 65);
     let cfg = QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
 
     // 1. Midpoint between-vertices sag clearance at 2 m altitude.
     let between_cam = Camera::at(45.000_73, 45.000_73, MIN_HEIGHT_M);
@@ -297,7 +296,7 @@ fn multi_lod_polar_seam_and_web_mercator_continuity() {
     };
 
     let cfg = QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
 
     // 1. Genuine multi-LOD transition: assert `max_l > min_l` strictly and zero cracks.
     let (mw, mh) = (193, 193);

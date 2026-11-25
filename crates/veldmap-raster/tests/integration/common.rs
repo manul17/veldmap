@@ -7,9 +7,23 @@ use ::tiff::encoder::{
 };
 use ::tiff::tags::Tag;
 use veldmap_core::tile::{
-    DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, level_size,
+    BandKey, DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, level_size,
 };
-use veldmap_raster::generate_linear_mipmaps;
+use veldmap_raster::{BandSample, DecodeContext, RasterError, RasterSource, generate_tile_mipmaps};
+
+/// Test helper wrapping [`RasterSource::sample_band`] for display RGBA8 readouts.
+pub fn sample_display_rgba(
+    src: &dyn RasterSource,
+    px: u32,
+    py: u32,
+    ctx: &DecodeContext<'_>,
+) -> Result<Option<[u8; 4]>, RasterError> {
+    match src.sample_band(BandKey::Display, PixelFormat::Rgba8UnormSrgb, px, py, ctx)? {
+        BandSample::Rgba(px) => Ok(Some(px)),
+        BandSample::Nodata | BandSample::Unavailable => Ok(None),
+        other => panic!("unexpected sample for display stream: {other:?}"),
+    }
+}
 
 /// Core TIFF IFD tags shared across synthetic test fixtures.
 pub struct TiffIfdHeader<'a> {
@@ -183,7 +197,7 @@ fn halve_rgb_linear(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut tile =
         DecodedTile::try_new(width, height, PixelFormat::Rgba8UnormSrgb, rgb_to_rgba(rgb))
             .expect("build decoded tile for halving");
-    generate_linear_mipmaps(&mut tile);
+    generate_tile_mipmaps(&mut tile);
     let mip1 = tile.mip_data(1).expect("mip level 1");
     rgba_to_rgb(mip1)
 }

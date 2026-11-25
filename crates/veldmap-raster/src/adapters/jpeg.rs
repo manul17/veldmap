@@ -17,14 +17,18 @@ use std::sync::Arc;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::io::{BufferedByteReader, ByteSource};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{SourceFingerprint, SourceId, level_count, level_size};
+use veldmap_core::tile::{
+    BandKey, PixelFormat, SourceFingerprint, SourceId, TileStreamSpec, level_count, level_size,
+};
 
 use crate::image_codec::{
     decode_jpeg_pixels_to_rgba8, jpeg_codec_working_bytes, jpeg_pixel_format_channels,
 };
 use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
-use crate::pipeline::metadata::{BandInfo, GeoPlacement, RasterDescription, SampleType};
-use crate::pipeline::plan::{LevelPlan, ServeMode};
+use crate::pipeline::metadata::{
+    BandInfo, BandSample, GeoPlacement, RasterDescription, SampleType,
+};
+use crate::pipeline::plan::{DISPLAY_STREAM_SPEC, LevelPlan, ServeMode};
 use crate::pipeline::resample::{Window, resample_rgba8_window};
 use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
@@ -176,11 +180,21 @@ impl RasterSource for JpegSource {
         &self.description
     }
 
-    fn pass_peak_bytes(&self) -> u64 {
+    fn pass_peak_bytes(&self, _spec: TileStreamSpec) -> u64 {
         self.pass_peak_bytes
     }
 
-    fn produce_pass(&self, ctx: &DecodeContext<'_>, emit: TileEmit<'_>) -> Result<(), RasterError> {
+    fn produce_pass(
+        &self,
+        spec: TileStreamSpec,
+        ctx: &DecodeContext<'_>,
+        emit: TileEmit<'_>,
+    ) -> Result<(), RasterError> {
+        if spec != DISPLAY_STREAM_SPEC {
+            return Err(RasterError::Decode(format!(
+                "JpegSource only supports Display RGBA8 stream, not {spec:?}"
+            )));
+        }
         if ctx.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
@@ -250,34 +264,23 @@ impl RasterSource for JpegSource {
             rgba
         };
 
-        let mut cascade = Cascade::new(self.pass_level, lw, lh);
+        let mut cascade = Cascade::new(self.pass_level, lw, lh, PixelFormat::Rgba8UnormSrgb);
         let mut bled_emit = bleed_display_emit(emit);
         cascade.push_rows(&rgba, lh, &mut bled_emit)?;
         cascade.finish(&mut bled_emit)
     }
 
-    fn sample_display_rgba(
-        &self,
-        _px: u32,
-        _py: u32,
-        _ctx: &DecodeContext<'_>,
-    ) -> Result<Option<[u8; 4]>, RasterError> {
-        // Full-frame JPEG decoding is deferred to Bulk passes rather than blocking
-        // the Fast hover probe lane on every cursor movement.
-        Ok(None)
-    }
-
     fn sample_band(
         &self,
-        _band: veldmap_core::tile::BandKey,
-        _format: veldmap_core::tile::PixelFormat,
+        _band: BandKey,
+        _format: PixelFormat,
         _px: u32,
         _py: u32,
         _ctx: &DecodeContext<'_>,
-    ) -> Result<crate::pipeline::metadata::BandSample, RasterError> {
+    ) -> Result<BandSample, RasterError> {
         // Full-frame JPEG probing is intentionally disabled on the Fast hover lane;
         // report Unavailable rather than Nodata.
-        Ok(crate::pipeline::metadata::BandSample::Unavailable)
+        Ok(BandSample::Unavailable)
     }
 }
 
@@ -332,7 +335,7 @@ fn jpeg_level_peak_bytes(inputs: JpegPeakInputs) -> u64 {
         .max(rgba.saturating_add(resampled));
     codec_working
         .saturating_add(max_frame_pair)
-        .saturating_add(cascade::bytes(lw, lh))
+        .saturating_add(cascade::bytes(lw, lh, PixelFormat::Rgba8UnormSrgb))
 }
 
 fn map_jpeg_error(err: jpeg_decoder::Error, cancel: &CancelToken) -> RasterError {

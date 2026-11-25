@@ -1,21 +1,22 @@
 use std::time::Duration;
 
-use veldmap_core::tile::PlanetaryScheme;
+use veldmap_core::tile::{PlanetaryScheme, QuadTileId};
 
-use super::super::failures::MAX_FAILURE_ENTRIES;
+use crate::http::PermitDenied;
+
+use super::failures::MAX_FAILURE_ENTRIES;
 use super::*;
 
-fn active_state(spec: &Arc<LiveBasemapSpec>) -> PipelineState {
-    PipelineState {
-        active_spec: Some(Arc::clone(spec)),
-        ..PipelineState::default()
-    }
+fn active_state(spec: &Arc<LiveBasemapSpec>, has_disk_cache: bool) -> PipelineState {
+    let mut st = PipelineState::new(has_disk_cache);
+    st.active_spec = Some(Arc::clone(spec));
+    st
 }
 
 #[test]
 fn expired_backoffs_route_directly_to_http_or_disk_queues() {
     let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
-    let mut st = active_state(&spec);
+    let mut st = active_state(&spec, true);
     let now = Instant::now();
     let http_key = spec.wm_key(4, 1, 2);
     let disk_key = spec.wm_key(4, 2, 2);
@@ -48,7 +49,7 @@ fn expired_backoffs_route_directly_to_http_or_disk_queues() {
 #[test]
 fn retry_failed_preserves_204_empty_and_ignores_stale_generations() {
     let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
-    let mut st = active_state(&spec);
+    let mut st = active_state(&spec, true);
     let empty_key = spec.wm_key(4, 3, 2);
     let terminal_key = spec.wm_key(4, 4, 2);
     st.last_wanted.insert(terminal_key);
@@ -91,7 +92,7 @@ fn retry_failed_preserves_204_empty_and_ignores_stale_generations() {
 #[test]
 fn active_root_stays_pinned_across_reconcile_and_backoff_expiry() {
     let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
-    let mut st = active_state(&spec);
+    let mut st = active_state(&spec, true);
     let now = Instant::now();
     let root_key = spec.wm_key(0, 0, 0);
 
@@ -115,7 +116,7 @@ fn active_root_stays_pinned_across_reconcile_and_backoff_expiry() {
             retry_disk: true,
         },
     );
-    let planned = st.plan_dispatch(true, 4, &CancelToken::new(), now, |_| Ok(()));
+    let planned = st.plan_dispatch(4, &CancelToken::new(), now, |_| Ok(()));
     assert!(planned.disk_tasks.is_empty());
     assert!(planned.http_tasks.is_empty());
     assert_eq!(planned.earliest_wakeup, Some(backoff_until));
@@ -131,7 +132,7 @@ fn active_root_stays_pinned_across_reconcile_and_backoff_expiry() {
 #[test]
 fn failure_cap_eviction_never_drops_active_backoffs() {
     let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
-    let mut st = active_state(&spec);
+    let mut st = active_state(&spec, true);
     let now = Instant::now();
     let shutdown = CancelToken::new();
 
@@ -160,7 +161,7 @@ fn failure_cap_eviction_never_drops_active_backoffs() {
 #[test]
 fn mark_empty_204_wakes_ui_and_clears_offline_status() {
     let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
-    let mut st = active_state(&spec);
+    let mut st = active_state(&spec, true);
     let key = spec.wm_key(3, 1, 2);
     let shutdown = CancelToken::new();
 
@@ -187,7 +188,7 @@ fn mark_empty_204_wakes_ui_and_clears_offline_status() {
 #[test]
 fn reconcile_wanted_routes_expired_backoffs_and_skips_ready_roots() {
     let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
-    let mut st = active_state(&spec);
+    let mut st = active_state(&spec, true);
     let now = Instant::now();
 
     let root_key = spec.wm_key(0, 0, 0);
@@ -228,22 +229,22 @@ fn reconcile_wanted_routes_expired_backoffs_and_skips_ready_roots() {
 }
 
 #[test]
-fn plan_dispatch_without_disk_cache_drains_only_eligible_keys() {
+fn reconcile_without_disk_cache_routes_eligible_keys_directly_to_http() {
     let spec = Arc::new(LiveBasemapSpec::eox_sentinel2_cloudless());
     let other_spec = LiveBasemapSpec::nasa_gibs_blue_marble();
-    let mut st = active_state(&spec);
+    let mut st = active_state(&spec, false);
 
     let eligible_key = spec.wm_key(2, 0, 0);
     let suppressed_key = spec.wm_key(2, 1, 0);
     let wrong_source_key = other_spec.wm_key(2, 0, 0);
 
     st.insert_failure(suppressed_key, FailureMarker::Terminal);
-    for key in [eligible_key, suppressed_key, wrong_source_key] {
-        st.pending.insert_disk(key);
-    }
+    let wanted = HashSet::from([eligible_key, suppressed_key, wrong_source_key]);
+    let now = Instant::now();
+    st.reconcile_wanted(&wanted, &|_| false, now);
 
-    let planned = st.plan_dispatch(false, 4, &CancelToken::new(), Instant::now(), |_| {
-        Err::<(), _>(None)
+    let planned = st.plan_dispatch(4, &CancelToken::new(), now, |_| {
+        Err::<(), _>(PermitDenied::Saturated)
     });
     assert!(planned.disk_tasks.is_empty());
     assert!(planned.http_tasks.is_empty());
@@ -256,7 +257,6 @@ fn plan_dispatch_without_disk_cache_drains_only_eligible_keys() {
 #[test]
 fn plan_dispatch_carries_quad_id_and_defers_cooled_down_hosts() {
     let spec = LiveBasemapSpec::eox_sentinel2_cloudless();
-    let mut st = PipelineState::default();
     let now = Instant::now();
     let shutdown = CancelToken::new();
 
@@ -274,24 +274,28 @@ fn plan_dispatch_carries_quad_id_and_defers_cooled_down_hosts() {
     };
     let k0 = spec.tile_key(id0);
     let k1 = spec.tile_key(id1);
-    st.set_active_spec(Some(spec.clone()));
-    st.reconcile_wanted(&HashSet::from([k0, k1]), &|_| false, now);
 
     // With disk cache enabled, disk tasks are planned with unpacked QuadTileId
     // and transition atomically to in_flight.
-    let disk_batch = st.plan_dispatch(true, 1, &shutdown, now, |_| Ok(()));
+    let mut disk_st = PipelineState::new(true);
+    disk_st.set_active_spec(Some(spec.clone()));
+    disk_st.reconcile_wanted(&HashSet::from([k0, k1]), &|_| false, now);
+    let disk_batch = disk_st.plan_dispatch(1, &shutdown, now, |_| Ok(()));
     assert_eq!(disk_batch.disk_tasks.len(), 1);
     assert_eq!(disk_batch.disk_tasks[0].target.key, k0);
     assert_eq!(disk_batch.disk_tasks[0].target.id, id0);
     assert!(disk_batch.http_tasks.is_empty());
-    assert_eq!(st.status().in_flight, 1);
+    assert_eq!(disk_st.status().in_flight, 1);
 
-    // Without disk cache, remaining pending.disk drains to HTTP and respects host cooldown.
+    // Without disk cache, tiles route straight to HTTP and respect host cooldown.
+    let mut http_st = PipelineState::new(false);
+    http_st.set_active_spec(Some(spec.clone()));
+    http_st.reconcile_wanted(&HashSet::from([k1]), &|_| false, now);
     let cooldown_until = now + Duration::from_secs(10);
     let blocked_host = spec.host_for(id1).to_owned();
-    let deferred = st.plan_dispatch(false, 4, &shutdown, now, |host| {
+    let deferred = http_st.plan_dispatch(4, &shutdown, now, |host| {
         if host == blocked_host {
-            Err(Some(cooldown_until))
+            Err(PermitDenied::Cooldown(cooldown_until))
         } else {
             Ok(())
         }
@@ -299,13 +303,13 @@ fn plan_dispatch_carries_quad_id_and_defers_cooled_down_hosts() {
     assert!(deferred.disk_tasks.is_empty());
     assert!(deferred.http_tasks.is_empty());
     assert_eq!(deferred.earliest_wakeup, Some(cooldown_until));
-    assert!(st.pending.contains_http(&k1));
+    assert!(http_st.pending.contains_http(&k1));
 
     // After cooldown expires, HTTP task is planned with exact QuadTileId and in_flight entry.
-    let http_batch = st.plan_dispatch(false, 4, &shutdown, cooldown_until, |_| Ok(42u8));
+    let http_batch = http_st.plan_dispatch(4, &shutdown, cooldown_until, |_| Ok(42u8));
     assert_eq!(http_batch.http_tasks.len(), 1);
     assert_eq!(http_batch.http_tasks[0].target.key, k1);
     assert_eq!(http_batch.http_tasks[0].target.id, id1);
     assert_eq!(http_batch.http_tasks[0].permit, 42u8);
-    assert_eq!(st.status().in_flight, 2);
+    assert_eq!(http_st.status().in_flight, 1);
 }

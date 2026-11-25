@@ -112,7 +112,7 @@ impl TileBindGroupCache {
     }
 
     /// Ensure a format-appropriate bind group exists for `gpu_tile`.
-    pub fn ensure(&mut self, device: &wgpu::Device, gpu_tile: &Arc<GpuTile>) {
+    pub(super) fn ensure(&mut self, device: &wgpu::Device, gpu_tile: &Arc<GpuTile>) {
         let reuse = self
             .entries
             .get(&gpu_tile.tile_id)

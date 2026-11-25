@@ -13,8 +13,8 @@ use crate::StorageError;
 use super::evict::{evict_in_tx, reclaim_space};
 use super::key::{DiskTileKey, EncodedKey, TileBlobEncoding, valid_source_key};
 use super::queries::{
-    TileUpserter, clear_all_in_tx, clear_source_in_tx, delete_entry_in_tx, delete_tile_in_tx,
-    flush_touches_in_tx, read_cache_meta_totals, select_tile_blob, set_cache_meta_totals,
+    TileUpserter, clear_all_in_tx, clear_source_in_tx, delete_entry_in_tx, flush_touches_in_tx,
+    read_cache_meta_totals, select_tile_blob,
 };
 use super::readers::ReaderPool;
 use super::schema::{
@@ -162,8 +162,15 @@ impl TileDiskCache {
             let evicted_ids = {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (current_bytes, current_count) = read_cache_meta_totals(&tx)?;
-                let evicted_ids =
-                    evict_in_tx(&tx, current_bytes, current_count, max_bytes, None, None)?;
+                let evicted_ids = evict_in_tx(
+                    &tx,
+                    current_bytes,
+                    current_count,
+                    max_bytes,
+                    None,
+                    None,
+                    false,
+                )?;
                 tx.commit()?;
                 evicted_ids
             };
@@ -199,24 +206,53 @@ impl TileDiskCache {
         if touches.is_empty() {
             return;
         }
-        if let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            && flush_touches_in_tx(&tx, &touches).is_ok()
-        {
-            let _ = tx.commit();
+        let committed = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .and_then(|tx| {
+                flush_touches_in_tx(&tx, &touches)?;
+                tx.commit()
+            })
+            .is_ok();
+        if !committed {
+            self.touches.restore(touches);
         }
     }
 
+    /// Execute an `IMMEDIATE` write transaction without flushing pending LRU
+    /// touches beforehand (used by non-evicting deletes such as
+    /// [`Self::delete_entry`] and [`Self::clear_source`] so buffered touches
+    /// neither mutate `last_used_ms` ahead of an ABA delete guard nor perform
+    /// wasted `UPDATE`s on rows about to be deleted).
     fn with_write_tx<T>(
+        conn: &mut Connection,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, rusqlite::Error>,
+    ) -> Result<T, StorageError> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Flush buffered LRU touches before executing an evicting write
+    /// transaction so recently read tiles are protected from LRU eviction.
+    /// Restores drained touches if the transaction fails or rolls back.
+    fn with_write_tx_flushing_touches<T>(
         &self,
         conn: &mut Connection,
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, rusqlite::Error>,
     ) -> Result<T, StorageError> {
         let touches = self.touches.take_all();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        flush_touches_in_tx(&tx, &touches)?;
-        let out = f(&tx)?;
-        tx.commit()?;
-        Ok(out)
+        let res = (|| -> Result<T, rusqlite::Error> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            flush_touches_in_tx(&tx, &touches)?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            Ok(out)
+        })();
+        if res.is_err() {
+            self.touches.restore(touches);
+        }
+        res.map_err(Into::into)
     }
 
     /// Look up cached tile bytes without recording an LRU touch yet, returning
@@ -277,7 +313,7 @@ impl TileDiskCache {
     /// never delete a newer valid overwrite or reused SQLite `ROWID`.
     pub fn delete_entry(&self, entry: DiskTileEntry) -> Result<bool, StorageError> {
         let mut conn = lock_unpoisoned(&self.writer);
-        let deleted = self.with_write_tx(&mut conn, |tx| {
+        let deleted = Self::with_write_tx(&mut conn, |tx| {
             delete_entry_in_tx(tx, entry.tile_id, entry.row_last_used_ms)
         })?;
         if deleted {
@@ -285,26 +321,6 @@ impl TileDiskCache {
             self.write_generation.fetch_add(1, Ordering::AcqRel);
         }
         Ok(deleted)
-    }
-
-    /// Look up cached encoded image bytes (`TileBlobEncoding::EncodedImage`)
-    /// for `key`, recording a debounced LRU touch on hit. Returns `Ok(None)` if
-    /// the stored entry uses a different encoding (e.g. `Qoi` or `Lz4Raw`).
-    pub fn get(&self, key: &DiskTileKey) -> Result<Option<Vec<u8>>, StorageError> {
-        let Some((entry, _, payload)) =
-            self.get_encoded_entry(key, Some(TileBlobEncoding::EncodedImage))?
-        else {
-            return Ok(None);
-        };
-        self.touch_entry(entry);
-        Ok(Some(payload))
-    }
-
-    /// Insert or replace encoded image tile bytes (`TileBlobEncoding::EncodedImage`)
-    /// for `key`, enforcing `payload_bytes <= max_bytes` via O(log N) per-tile
-    /// LRU eviction and `PRAGMA incremental_vacuum`.
-    pub fn put(&self, key: &DiskTileKey, payload: &[u8]) -> Result<(), StorageError> {
-        self.put_encoded_batch_inner(&[(key, TileBlobEncoding::EncodedImage, payload)], None)
     }
 
     /// Insert or replace tile bytes only if `cancel` has not been triggered.
@@ -374,7 +390,7 @@ impl TileDiskCache {
             return Ok(());
         }
 
-        let (evicted_ids, wrote_any) = self.with_write_tx(conn, |tx| {
+        let (evicted_ids, wrote_any) = self.with_write_tx_flushing_touches(conn, |tx| {
             let (mut total_bytes, mut tile_count) = read_cache_meta_totals(tx)?;
             let mut batch_start_ts: Option<i64> = None;
             let mut last_id: Option<i64> = None;
@@ -405,7 +421,6 @@ impl TileDiskCache {
                 return Ok((Vec::new(), false));
             };
 
-            set_cache_meta_totals(tx, total_bytes, tile_count)?;
             let evicted_ids = evict_in_tx(
                 tx,
                 total_bytes,
@@ -413,6 +428,7 @@ impl TileDiskCache {
                 max_bytes,
                 Some(last_inserted),
                 batch_start_ts,
+                true,
             )?;
             Ok((evicted_ids, true))
         })?;
@@ -427,28 +443,23 @@ impl TileDiskCache {
         Ok(())
     }
 
-    /// Delete one tile entry (e.g. if a cached payload fails decode validation).
-    pub fn delete(&self, key: &DiskTileKey) -> Result<bool, StorageError> {
-        let enc = EncodedKey::from_key(key)?;
-        let mut conn = lock_unpoisoned(&self.writer);
-        let deleted_id = self.with_write_tx(&mut conn, |tx| delete_tile_in_tx(tx, &enc))?;
-        let Some(tile_id) = deleted_id else {
-            return Ok(false);
-        };
-        self.touches.prune(&[tile_id]);
-        self.write_generation.fetch_add(1, Ordering::AcqRel);
-        Ok(true)
-    }
-
     /// Update the configured byte budget, immediately evicting oldest tiles,
     /// reclaiming freed pages, and truncating WAL when utilization exceeds the
     /// new cap.
     pub fn set_max_bytes(&self, max_bytes: u64) -> Result<(), StorageError> {
         let mut conn = lock_unpoisoned(&self.writer);
         self.max_bytes.store(max_bytes, Ordering::Release);
-        let evicted_ids = self.with_write_tx(&mut conn, |tx| {
+        let evicted_ids = self.with_write_tx_flushing_touches(&mut conn, |tx| {
             let (current_bytes, current_count) = read_cache_meta_totals(tx)?;
-            evict_in_tx(tx, current_bytes, current_count, max_bytes, None, None)
+            evict_in_tx(
+                tx,
+                current_bytes,
+                current_count,
+                max_bytes,
+                None,
+                None,
+                false,
+            )
         })?;
         self.touches.prune(&evicted_ids);
         if !evicted_ids.is_empty() {
@@ -465,7 +476,7 @@ impl TileDiskCache {
             return Err(StorageError::InvalidSourceKey(source_key.to_owned()));
         }
         let mut conn = lock_unpoisoned(&self.writer);
-        let deleted_ids = self.with_write_tx(&mut conn, |tx| clear_source_in_tx(tx, source_key))?;
+        let deleted_ids = Self::with_write_tx(&mut conn, |tx| clear_source_in_tx(tx, source_key))?;
         self.touches.prune(&deleted_ids);
         let deleted = deleted_ids.len();
         if deleted > 0 {

@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -33,19 +35,60 @@ pub enum BlobStoreError {
     Backend(String),
 }
 
+/// Opaque backend receipt returned alongside cached bytes by
+/// [`TileBlobStore::get`], allowing [`LiveTilePipeline`] to record an LRU touch
+/// ([`TileBlobStore::touch`]) only after decode validation succeeds or delete
+/// the exact read row version ([`TileBlobStore::delete`]) on corrupt payloads
+/// without ABA overwrite races.
+pub struct BlobLease(Box<dyn Any + Send + Sync>);
+
+impl BlobLease {
+    /// Wrap a concrete backend lease value into an opaque [`BlobLease`].
+    pub fn new<T: Send + Sync + 'static>(inner: T) -> Self {
+        Self(Box::new(inner))
+    }
+
+    /// Downcast back to the concrete backend lease type.
+    pub fn downcast<T: Send + Sync + 'static>(self) -> Option<T> {
+        self.0.downcast::<T>().ok().map(|b| *b)
+    }
+}
+
+impl fmt::Debug for BlobLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BlobLease(..)")
+    }
+}
+
 /// Minimal encoded-tile persistence boundary injected into
 /// [`LiveTilePipeline`], keeping `veldmap-net` decoupled from concrete disk-cache
 /// backends (implementations may enforce source-key formatting rules and
 /// maximum blob-size limits).
 pub trait TileBlobStore: Send + Sync + 'static {
-    /// Fetch cached encoded tile bytes for `(source_key, id)`, if present.
-    fn get(&self, source_key: &str, id: QuadTileId) -> Result<Option<Vec<u8>>, BlobStoreError>;
+    /// Fetch cached encoded tile bytes and an opaque [`BlobLease`] for
+    /// `(source_key, id)`, without bumping LRU recency yet.
+    fn get(
+        &self,
+        source_key: &str,
+        id: QuadTileId,
+    ) -> Result<Option<(Vec<u8>, BlobLease)>, BlobStoreError>;
 
-    /// Persist decode-validated encoded tile bytes for `(source_key, id)`.
-    fn put(&self, source_key: &str, id: QuadTileId, payload: &[u8]) -> Result<(), BlobStoreError>;
+    /// Record an LRU recency touch for a decode-validated [`BlobLease`].
+    fn touch(&self, lease: BlobLease);
 
-    /// Delete one cached tile entry (e.g. if a cached payload fails decode).
-    fn delete(&self, source_key: &str, id: QuadTileId) -> Result<(), BlobStoreError>;
+    /// Persist decode-validated encoded tile bytes for `(source_key, id)` unless
+    /// `cancel` has been triggered.
+    fn put(
+        &self,
+        source_key: &str,
+        id: QuadTileId,
+        payload: &[u8],
+        cancel: &CancelToken,
+    ) -> Result<(), BlobStoreError>;
+
+    /// Delete the exact cached tile entry represented by `lease` (e.g. if a
+    /// cached payload fails decode validation).
+    fn delete(&self, lease: BlobLease) -> Result<(), BlobStoreError>;
 }
 
 /// Typed decode failure reported through [`DecodeCompletion`].

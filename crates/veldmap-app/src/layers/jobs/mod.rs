@@ -1,6 +1,7 @@
 //! Two-lane pointwise/pass decode scheduling, RAII flight guards, and worker
 //! execution over [`super::disk_cache`].
 
+pub(super) mod band_stats;
 mod pass;
 mod pointwise;
 

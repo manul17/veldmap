@@ -3,6 +3,7 @@
 //! built over the stateless direct raw-chunk decoder.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::budget::DecodeBudgetTracker;
@@ -21,27 +22,82 @@ use crate::pipeline::singleflight::{SingleflightRole, SingleflightSlot, run_sing
 use super::ifd::{CachedIfd, Photometric, PlanarConfig, TiffByteOrder};
 use super::raw_decode::{RawChunkPayload, decode_raw_chunk};
 
-type StretchSlot = SingleflightSlot<DisplayMapping>;
+enum SlotEntry<V> {
+    InFlight(Arc<SingleflightSlot<V>>),
+    Ready(V),
+}
 
-enum CacheState {
-    Uncomputed,
-    InFlight(Arc<StretchSlot>),
-    Ready(DisplayMapping),
+/// Keyed lazy singleflight cache deduplicating concurrent computations per key
+/// while allowing uncancelled followers to take over cleanly if a leader cancels.
+struct SingleflightMap<K, V> {
+    entries: Mutex<HashMap<K, SlotEntry<V>>>,
+}
+
+impl<K: Copy + Eq + Hash, V: Clone + Send + 'static> SingleflightMap<K, V> {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with_ready(key: K, value: V) -> Self {
+        let mut map = HashMap::with_capacity(1);
+        map.insert(key, SlotEntry::Ready(value));
+        Self {
+            entries: Mutex::new(map),
+        }
+    }
+
+    fn get_or_compute(
+        &self,
+        key: K,
+        cancel: &CancelToken,
+        panic_label: &'static str,
+        compute: impl FnOnce() -> Result<V, RasterError>,
+    ) -> Result<V, RasterError> {
+        run_singleflight(
+            cancel,
+            panic_label,
+            || {
+                let mut guard = lock_unpoisoned(&self.entries);
+                match guard.get(&key) {
+                    Some(SlotEntry::Ready(val)) => SingleflightRole::Ready(val.clone()),
+                    Some(SlotEntry::InFlight(slot)) => SingleflightRole::Follower(Arc::clone(slot)),
+                    None => {
+                        let slot = Arc::new(SingleflightSlot::new());
+                        guard.insert(key, SlotEntry::InFlight(Arc::clone(&slot)));
+                        SingleflightRole::Leader(slot)
+                    }
+                }
+            },
+            compute,
+            |_slot, computed| {
+                let mut guard = lock_unpoisoned(&self.entries);
+                guard.insert(key, SlotEntry::Ready(computed.clone()));
+            },
+            |slot| {
+                let mut guard = lock_unpoisoned(&self.entries);
+                if let Some(SlotEntry::InFlight(cur)) = guard.get(&key)
+                    && Arc::ptr_eq(cur, slot)
+                {
+                    guard.remove(&key);
+                }
+            },
+        )
+    }
 }
 
 pub(super) struct StretchCache {
-    state: Mutex<CacheState>,
+    map: SingleflightMap<(), DisplayMapping>,
 }
 
 impl StretchCache {
     pub(super) fn new(initial: Option<DisplayMapping>) -> Self {
-        let state = match initial {
-            Some(mapping) => CacheState::Ready(mapping),
-            None => CacheState::Uncomputed,
+        let map = match initial {
+            Some(mapping) => SingleflightMap::with_ready((), mapping),
+            None => SingleflightMap::new(),
         };
-        Self {
-            state: Mutex::new(state),
-        }
+        Self { map }
     }
 
     pub(super) fn get_or_compute(
@@ -56,35 +112,38 @@ impl StretchCache {
         cancel: &CancelToken,
         compute: impl FnOnce() -> Result<DisplayMapping, RasterError>,
     ) -> Result<DisplayMapping, RasterError> {
-        run_singleflight(
+        self.map.get_or_compute(
+            (),
             cancel,
             "display-mapping sampling leader panicked",
-            || {
-                let mut guard = lock_unpoisoned(&self.state);
-                match &*guard {
-                    CacheState::Ready(ready) => SingleflightRole::Ready(*ready),
-                    CacheState::InFlight(slot) => SingleflightRole::Follower(Arc::clone(slot)),
-                    CacheState::Uncomputed => {
-                        let slot = Arc::new(SingleflightSlot::new());
-                        *guard = CacheState::InFlight(Arc::clone(&slot));
-                        SingleflightRole::Leader(slot)
-                    }
-                }
-            },
             compute,
-            |_slot, &computed| {
-                let mut cache = lock_unpoisoned(&self.state);
-                *cache = CacheState::Ready(computed);
-            },
-            |slot| {
-                let mut cache = lock_unpoisoned(&self.state);
-                if let CacheState::InFlight(cur) = &*cache
-                    && Arc::ptr_eq(cur, slot)
-                {
-                    *cache = CacheState::Uncomputed;
-                }
-            },
         )
+    }
+}
+
+/// Per-band physical statistics & histogram cache with singleflight dedup.
+pub(super) struct BandStatsCache {
+    map: SingleflightMap<u16, Option<BandStats>>,
+}
+
+impl BandStatsCache {
+    pub(super) fn new() -> Self {
+        Self {
+            map: SingleflightMap::new(),
+        }
+    }
+
+    pub(super) fn get_or_compute(
+        &self,
+        band: u16,
+        scale: f64,
+        offset: f64,
+        req: &StretchRequest<'_>,
+    ) -> Result<Option<BandStats>, RasterError> {
+        self.map
+            .get_or_compute(band, req.cancel, "band stats leader panicked", || {
+                compute_single_band_stats(band, scale, offset, req)
+            })
     }
 }
 
@@ -118,17 +177,16 @@ fn pick_sample_chunks(total: u32) -> Vec<u32> {
     picks
 }
 
-fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterError> {
+/// Iterate up to 9 evenly spaced chunks in `req.stats_ifd` under cancellation
+/// checks and per-chunk working-memory budget leases.
+fn for_each_sampled_chunk(
+    req: &StretchRequest<'_>,
+    raw_depth: u32,
+    mut visit: impl FnMut(u32, usize, usize) -> Result<(), RasterError>,
+) -> Result<(), RasterError> {
     let ifd = req.stats_ifd;
-    let invert = ifd.photometric == Photometric::WhiteIsZero;
-    if ifd.sample_type == SampleType::U8 {
-        return Ok(DisplayMapping::identity(req.nodata_f64).with_invert(invert));
-    }
     let picks = pick_sample_chunks(ifd.chunks_per_plane);
-    let colors = ifd.pixel_layout.colors().max(1);
     let target_per_chunk = (radiometry::STRETCH_SAMPLES / picks.len().max(1)).max(1);
-    let mut values = Vec::new();
-
     for index in picks {
         if req.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
@@ -137,141 +195,93 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
             continue;
         };
         let (stored_w, stored_h) = ifd.chunk_stored_dims(index).unwrap_or((dw, dh));
-        let est_bytes = grid::chunk_working_bytes(stored_w, stored_h, ifd.raw_pixel_bytes(), 0);
+        let est_bytes = grid::chunk_working_bytes(stored_w, stored_h, raw_depth, 0);
         let _lease = req.budget_tracker.reserve_blocking(est_bytes, req.cancel)?;
+        let pixels = (dw as usize) * (dh as usize);
+        visit(index, pixels, target_per_chunk)?;
+    }
+    Ok(())
+}
 
-        match ifd.planar {
-            PlanarConfig::Chunky => {
-                let (_, _, payload) = decode_raw_chunk(
-                    req.byte_source.as_ref(),
-                    ifd,
-                    req.byte_order,
-                    0,
-                    index,
-                    req.max_chunk_bytes,
-                    req.cancel,
-                )?;
-                let RawChunkPayload::Bytes(data) = payload else {
-                    continue;
-                };
-                let spp = usize::from(ifd.samples_per_pixel);
-                let pixels = (dw as usize) * (dh as usize);
-                let step = (pixels * colors).div_ceil(target_per_chunk).max(1);
-                for at in (0..pixels).step_by(step) {
-                    for ch in 0..colors {
-                        if let Some(v) =
-                            read_native_sample_f64(&data, ifd.sample_type, at * spp + ch)
-                            && is_data_f64(v, req.nodata_f64)
-                        {
-                            let f = v as f32;
-                            if f.is_finite() {
-                                values.push(f);
-                            }
-                        }
-                    }
-                }
-            }
-            PlanarConfig::Planar => {
-                let pixels = (dw as usize) * (dh as usize);
-                let step = (pixels * colors).div_ceil(target_per_chunk).max(1);
-                for ch in 0..colors {
+fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterError> {
+    let ifd = req.stats_ifd;
+    let invert = ifd.photometric == Photometric::WhiteIsZero;
+    if ifd.sample_type == SampleType::U8 {
+        return Ok(DisplayMapping::identity(req.nodata_f64).with_invert(invert));
+    }
+    let colors = ifd.pixel_layout.colors().max(1);
+    let mut values = Vec::new();
+
+    for_each_sampled_chunk(
+        req,
+        ifd.raw_pixel_bytes(),
+        |index, pixels, target_per_chunk| {
+            let step = (pixels * colors).div_ceil(target_per_chunk).max(1);
+            match ifd.planar {
+                PlanarConfig::Chunky => {
                     let (_, _, payload) = decode_raw_chunk(
                         req.byte_source.as_ref(),
                         ifd,
                         req.byte_order,
-                        ch,
+                        0,
                         index,
                         req.max_chunk_bytes,
                         req.cancel,
                     )?;
                     let RawChunkPayload::Bytes(data) = payload else {
-                        continue;
+                        return Ok(());
                     };
+                    let spp = usize::from(ifd.samples_per_pixel);
                     for at in (0..pixels).step_by(step) {
-                        if let Some(v) = read_native_sample_f64(&data, ifd.sample_type, at)
-                            && is_data_f64(v, req.nodata_f64)
-                        {
-                            let f = v as f32;
-                            if f.is_finite() {
-                                values.push(f);
+                        for ch in 0..colors {
+                            if let Some(v) =
+                                read_native_sample_f64(&data, ifd.sample_type, at * spp + ch)
+                                && is_data_f64(v, req.nodata_f64)
+                            {
+                                let f = v as f32;
+                                if f.is_finite() {
+                                    values.push(f);
+                                }
+                            }
+                        }
+                    }
+                }
+                PlanarConfig::Planar => {
+                    for ch in 0..colors {
+                        let (_, _, payload) = decode_raw_chunk(
+                            req.byte_source.as_ref(),
+                            ifd,
+                            req.byte_order,
+                            ch,
+                            index,
+                            req.max_chunk_bytes,
+                            req.cancel,
+                        )?;
+                        let RawChunkPayload::Bytes(data) = payload else {
+                            continue;
+                        };
+                        for at in (0..pixels).step_by(step) {
+                            if let Some(v) = read_native_sample_f64(&data, ifd.sample_type, at)
+                                && is_data_f64(v, req.nodata_f64)
+                            {
+                                let f = v as f32;
+                                if f.is_finite() {
+                                    values.push(f);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     values.truncate(radiometry::STRETCH_SAMPLES);
 
     Ok(match percentile_stretch(&mut values) {
         Some((lo, hi)) => DisplayMapping::stretched(lo, hi, req.nodata_f64).with_invert(invert),
         None => DisplayMapping::identity(req.nodata_f64).with_invert(invert),
     })
-}
-
-type BandStatsSlot = SingleflightSlot<Option<BandStats>>;
-
-enum BandStatsEntry {
-    InFlight(Arc<BandStatsSlot>),
-    Ready(Option<Box<BandStats>>),
-}
-
-/// Per-band physical statistics & histogram cache with singleflight dedup.
-pub(super) struct BandStatsCache {
-    entries: Mutex<HashMap<u16, BandStatsEntry>>,
-}
-
-impl BandStatsCache {
-    pub(super) fn new() -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub(super) fn get_or_compute(
-        &self,
-        band: u16,
-        scale: f64,
-        offset: f64,
-        req: &StretchRequest<'_>,
-    ) -> Result<Option<BandStats>, RasterError> {
-        run_singleflight(
-            req.cancel,
-            "band stats leader panicked",
-            || {
-                let mut guard = lock_unpoisoned(&self.entries);
-                match guard.get(&band) {
-                    Some(BandStatsEntry::Ready(stats)) => {
-                        SingleflightRole::Ready(stats.as_deref().cloned())
-                    }
-                    Some(BandStatsEntry::InFlight(slot)) => {
-                        SingleflightRole::Follower(Arc::clone(slot))
-                    }
-                    None => {
-                        let slot = Arc::new(SingleflightSlot::new());
-                        guard.insert(band, BandStatsEntry::InFlight(Arc::clone(&slot)));
-                        SingleflightRole::Leader(slot)
-                    }
-                }
-            },
-            || compute_single_band_stats(band, scale, offset, req),
-            |_slot, computed| {
-                let mut guard = lock_unpoisoned(&self.entries);
-                guard.insert(
-                    band,
-                    BandStatsEntry::Ready(computed.as_ref().cloned().map(Box::new)),
-                );
-            },
-            |slot| {
-                let mut guard = lock_unpoisoned(&self.entries);
-                if let Some(BandStatsEntry::InFlight(cur)) = guard.get(&band)
-                    && Arc::ptr_eq(cur, slot)
-                {
-                    guard.remove(&band);
-                }
-            },
-        )
-    }
 }
 
 fn compute_single_band_stats(
@@ -285,77 +295,58 @@ fn compute_single_band_stats(
     if band_idx >= usize::from(ifd.samples_per_pixel) {
         return Ok(None);
     }
-    let picks = pick_sample_chunks(ifd.chunks_per_plane);
-    let target_per_chunk = (radiometry::STRETCH_SAMPLES / picks.len().max(1)).max(1);
+    let plane = ifd.band_plane(band_idx);
+    let (stride, ch_off) = ifd.band_stride_offset(band_idx);
     let mut values = Vec::new();
-    let plane = match ifd.planar {
-        PlanarConfig::Planar => band_idx,
-        PlanarConfig::Chunky => 0,
-    };
-    let (stride, ch_off) = match ifd.planar {
-        PlanarConfig::Planar => (1usize, 0usize),
-        PlanarConfig::Chunky => (usize::from(ifd.samples_per_pixel), band_idx),
-    };
 
-    for index in picks {
-        if req.cancel.is_cancelled() {
-            return Err(RasterError::Cancelled);
-        }
-        let Some((dw, dh)) = ifd.chunk_data_dims(index) else {
-            continue;
-        };
-        let (stored_w, stored_h) = ifd.chunk_stored_dims(index).unwrap_or((dw, dh));
-        let raw_depth = match ifd.planar {
-            PlanarConfig::Planar => ifd.sample_type.byte_size() as u32,
-            PlanarConfig::Chunky => ifd.raw_pixel_bytes(),
-        };
-        let est_bytes = grid::chunk_working_bytes(stored_w, stored_h, raw_depth, 0);
-        let _lease = req.budget_tracker.reserve_blocking(est_bytes, req.cancel)?;
-        let (_, _, payload) = decode_raw_chunk(
-            req.byte_source.as_ref(),
-            ifd,
-            req.byte_order,
-            plane,
-            index,
-            req.max_chunk_bytes,
-            req.cancel,
-        )?;
-        let RawChunkPayload::Bytes(data) = payload else {
-            continue;
-        };
-        let pixels = (dw as usize) * (dh as usize);
-        let step = pixels.div_ceil(target_per_chunk).max(1);
-        if let Some(params) = ifd.ycbcr
-            && ifd.sample_type == SampleType::U8
-            && band_idx < 3
-        {
-            for at in (0..pixels).step_by(step) {
-                let off = at * 3;
-                if off + 3 <= data.len() {
-                    let rgb =
-                        params.convert_u8_pixel_to_rgb(data[off], data[off + 1], data[off + 2]);
-                    let raw = f64::from(rgb[band_idx]);
-                    if is_data_f64(raw, req.nodata_f64) {
-                        let phys = raw.mul_add(scale, offset);
-                        if phys.is_finite() {
-                            values.push(phys);
+    for_each_sampled_chunk(
+        req,
+        ifd.band_raw_pixel_bytes(),
+        |index, pixels, target_per_chunk| {
+            let (_, _, payload) = decode_raw_chunk(
+                req.byte_source.as_ref(),
+                ifd,
+                req.byte_order,
+                plane,
+                index,
+                req.max_chunk_bytes,
+                req.cancel,
+            )?;
+            let RawChunkPayload::Bytes(data) = payload else {
+                return Ok(());
+            };
+            let step = pixels.div_ceil(target_per_chunk).max(1);
+            if let Some(params) = ifd.ycbcr_band_params(band_idx) {
+                for at in (0..pixels).step_by(step) {
+                    let off = at * 3;
+                    if off + 3 <= data.len() {
+                        let rgb =
+                            params.convert_u8_pixel_to_rgb(data[off], data[off + 1], data[off + 2]);
+                        let raw = f64::from(rgb[band_idx]);
+                        if is_data_f64(raw, req.nodata_f64) {
+                            let phys = raw.mul_add(scale, offset);
+                            if phys.is_finite() {
+                                values.push(phys);
+                            }
                         }
                     }
                 }
+                return Ok(());
             }
-            continue;
-        }
-        for at in (0..pixels).step_by(step) {
-            if let Some(raw) = read_native_sample_f64(&data, ifd.sample_type, at * stride + ch_off)
-                && is_data_f64(raw, req.nodata_f64)
-            {
-                let phys = raw.mul_add(scale, offset);
-                if phys.is_finite() {
-                    values.push(phys);
+            for at in (0..pixels).step_by(step) {
+                if let Some(raw) =
+                    read_native_sample_f64(&data, ifd.sample_type, at * stride + ch_off)
+                    && is_data_f64(raw, req.nodata_f64)
+                {
+                    let phys = raw.mul_add(scale, offset);
+                    if phys.is_finite() {
+                        values.push(phys);
+                    }
                 }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     values.truncate(radiometry::STRETCH_SAMPLES);
     Ok(compute_band_stats(&mut values))
 }

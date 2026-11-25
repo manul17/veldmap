@@ -10,6 +10,7 @@ use super::super::adapters::RasterDecodeExecutor;
 use super::super::policy::{bundled_tile_key, source_tile_key};
 use super::*;
 use crate::storage::AppStorage;
+use crate::storage::settings::AppSettings;
 
 struct BasemapTestHarness {
     _root: Option<TestTempDir>,
@@ -38,7 +39,7 @@ impl BasemapTestHarness {
             decode_shutdown.clone(),
         );
         let manager = BasemapManager::new(
-            storage.settings(),
+            storage.settings().basemap_config(),
             storage.disk_cache(),
             tx.clone(),
             wakeup,
@@ -66,7 +67,7 @@ impl BasemapTestHarness {
             decode_shutdown.clone(),
         );
         let manager = BasemapManager::new(
-            settings,
+            settings.basemap_config(),
             None,
             tx.clone(),
             wakeup,
@@ -129,7 +130,7 @@ fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
         s.active_basemap = BasemapSelection::NasaGibsViirs;
         s.gibs_date = "2024-02-30".to_owned();
     });
-    let outcome = h.manager.sync_settings(storage.settings());
+    let outcome = h.manager.sync_settings(storage.settings().basemap_config());
     assert!(outcome.changed);
     assert_eq!(outcome.evict_source, None);
     assert!(h.manager.status_snapshot().config_error.is_some());
@@ -141,7 +142,7 @@ fn ellipsoid_only_avoids_bundled_decode_and_invalid_configs_fall_back() {
         s.active_basemap = BasemapSelection::CustomXyz;
         s.custom_xyz.url_template = "ftp://bad/{z}/{x}/{y}".to_owned();
     });
-    let outcome = h.manager.sync_settings(storage.settings());
+    let outcome = h.manager.sync_settings(storage.settings().basemap_config());
     assert!(outcome.changed);
     assert!(h.manager.status_snapshot().config_error.is_some());
     assert_eq!(h.manager.active_source(), SourceId::BUNDLED_BASEMAP);
@@ -181,7 +182,7 @@ fn unavailable_live_pipeline_degrades_cleanly_to_full_bundled_basemap() {
         active_basemap: BasemapSelection::EoxSentinel2Cloudless,
         ..AppSettings::default()
     };
-    manager.sync_active_spec(&settings);
+    manager.sync_active_spec(settings.basemap_config());
 
     assert_eq!(manager.active_source(), SourceId::BUNDLED_BASEMAP);
     assert_eq!(manager.attribution(), Some(BUNDLED_ATTRIBUTION));
@@ -220,7 +221,7 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_evict
 
     let storage = h.storage.as_mut().expect("storage");
     storage.mutate_settings(|s| s.active_basemap = BasemapSelection::NasaGibsBlueMarble);
-    let first_switch = h.manager.sync_settings(storage.settings());
+    let first_switch = h.manager.sync_settings(storage.settings().basemap_config());
     assert!(first_switch.changed);
     assert_eq!(first_switch.evict_source, None);
     let gibs_source = h.manager.active_source();
@@ -269,21 +270,13 @@ fn schedule_for_tiles_enforces_polar_exclusion_max_level_and_source_switch_evict
     .expect("send stale");
     h.manager.record_upload_report(&UploadBatchReport {
         uploaded: 1,
-        max_tile_bytes_by_stream: vec![(
-            veldmap_core::tile::StreamKey::new(
-                gibs_source,
-                veldmap_core::tile::BandKey::Display,
-                PixelFormat::Rgba8UnormSrgb,
-                0,
-            ),
-            2 * 1024 * 1024,
-        )],
+        max_tile_bytes_by_stream: vec![(StreamKey::display(gibs_source), 2 * 1024 * 1024)],
         ..UploadBatchReport::default()
     });
     assert_eq!(h.manager.observed_live_tile_bytes, 2 * 1024 * 1024);
 
     storage.mutate_settings(|s| s.active_basemap = BasemapSelection::EoxSentinel2Cloudless);
-    let second_switch = h.manager.sync_settings(storage.settings());
+    let second_switch = h.manager.sync_settings(storage.settings().basemap_config());
     assert!(second_switch.changed);
     assert_eq!(second_switch.evict_source, Some(gibs_source));
     if let Some(evict) = second_switch.evict_source {
@@ -364,7 +357,7 @@ fn in_place_custom_xyz_spec_edit_marks_changed_without_evicting_source() {
     settings.custom_xyz.max_level = 14;
     settings.custom_xyz.api_key = "new-secret".to_string();
     settings.custom_xyz.attribution = "Example v2".to_string();
-    let outcome = h.manager.sync_settings(&settings);
+    let outcome = h.manager.sync_settings(settings.basemap_config());
     assert_eq!(h.manager.active_source(), initial_source);
     assert!(
         outcome.changed,
@@ -377,7 +370,7 @@ fn in_place_custom_xyz_spec_edit_marks_changed_without_evicting_source() {
     assert_eq!(h.manager.quadtree_config().max_tex_level, 14);
 
     // Repeating sync with identical settings must be a no-op.
-    let noop = h.manager.sync_settings(&settings);
+    let noop = h.manager.sync_settings(settings.basemap_config());
     assert!(!noop.changed);
     assert_eq!(noop.evict_source, None);
 }

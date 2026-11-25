@@ -1,6 +1,6 @@
 //! Single-pass pyramid band cascade (`Cascade`): builds every coarser pyramid
 //! level from a top-to-bottom stream of base-level row bands with exact 2x2
-//! block alignment and predictable working memory (`bytes_for_format`) across
+//! block alignment and predictable working memory (`bytes`) across
 //! `Rgba8UnormSrgb`, `R32Float`, `R8Uint`, and `R16Uint` tracks.
 
 use veldmap_core::tile::{PixelFormat, RASTER_TILE_SIZE, grid_dim, tile_extent};
@@ -54,14 +54,8 @@ impl CascadeBand {
 }
 
 /// Exact working memory in bytes required by [`Cascade`] for `(base_w, base_h)`
-/// in RGBA8 display format.
-pub(crate) fn bytes(base_w: u32, base_h: u32) -> u64 {
-    bytes_for_format(base_w, base_h, PixelFormat::Rgba8UnormSrgb)
-}
-
-/// Exact working memory in bytes required by [`Cascade`] for `(base_w, base_h)`
 /// in `format`.
-pub(crate) fn bytes_for_format(base_w: u32, base_h: u32, format: PixelFormat) -> u64 {
+pub(crate) fn bytes(base_w: u32, base_h: u32, format: PixelFormat) -> u64 {
     let bpp = format.bytes_per_pixel() as u64;
     bands_bytes(base_w, base_h, bpp).saturating_add(flush_bytes(base_w, base_h, bpp))
 }
@@ -112,20 +106,9 @@ pub(crate) struct Cascade {
 }
 
 impl Cascade {
-    /// Allocate display (`Rgba8UnormSrgb`) cascade bands from `base_level` up
-    /// to the single-tile apex.
-    pub(crate) fn new(base_level: u8, base_w: u32, base_h: u32) -> Self {
-        Self::new_for_format(base_level, base_w, base_h, PixelFormat::Rgba8UnormSrgb)
-    }
-
     /// Allocate cascade bands for `format` from `base_level` up to the
     /// single-tile apex.
-    pub(crate) fn new_for_format(
-        base_level: u8,
-        base_w: u32,
-        base_h: u32,
-        format: PixelFormat,
-    ) -> Self {
+    pub(crate) fn new(base_level: u8, base_w: u32, base_h: u32, format: PixelFormat) -> Self {
         let bpp = format.bytes_per_pixel();
         let bands = levels(base_w, base_h)
             .enumerate()

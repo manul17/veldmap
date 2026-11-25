@@ -5,11 +5,13 @@
 
 use std::sync::Arc;
 
-use veldmap_app::render::{DrawVectorId, DrawVectorLayer, GlobeRenderer};
+use veldmap_app::render::{DrawVectorId, DrawVectorLayer};
 use veldmap_core::geo::{Camera, DEFAULT_VECTOR_MAX_CHORD_DEG, VectorMesh, parse_geojson};
 use veldmap_core::tile::QuadtreeConfig;
 
-use crate::common::{build_empty_snapshot, pixel_at, render_srgb, shared_headless_device};
+use crate::common::{
+    TestGlobe, build_empty_snapshot, pixel_at, render_srgb, shared_headless_device,
+};
 
 #[test]
 fn draped_geojson_polygon_with_hole_renders_fill_and_excludes_hole_in_pass2() {
@@ -38,7 +40,7 @@ fn draped_geojson_polygon_with_hole_renders_fill_and_excludes_hole_in_pass2() {
     ));
 
     let (width, height) = (128u32, 128u32);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let cam = Camera::at(48.0, 40.0, 450_000.0);
     let config = QuadtreeConfig::default();
 
@@ -102,7 +104,7 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
     assert_eq!(mesh.line_segment_count(), 0);
 
     let (width, height) = (128u32, 128u32);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let cam = Camera::at(48.0, 40.0, 200_000.0);
     let config = QuadtreeConfig::default();
 
@@ -174,7 +176,7 @@ fn draped_geojson_linestring_respects_layer_opacity_in_pass2() {
     assert_eq!(mesh.point_count(), 0);
 
     let (width, height) = (128u32, 128u32);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let cam = Camera::at(48.0, 40.0, 250_000.0);
     let config = QuadtreeConfig::default();
 
@@ -268,7 +270,7 @@ fn draped_geojson_midtone_srgb_color_reads_back_without_double_gamma_washout() {
     ));
 
     let (width, height) = (128u32, 128u32);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let cam = Camera::at(48.0, 40.0, 350_000.0);
     let config = QuadtreeConfig::default();
 

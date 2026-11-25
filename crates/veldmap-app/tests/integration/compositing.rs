@@ -2,12 +2,13 @@
 //! graticule horizon discard & polar sharpness, and dropped-encoder recovery.
 
 use veldmap_app::BUNDLED_MAX_LEVEL;
-use veldmap_app::render::{GlobeRenderer, RenderParams};
+use veldmap_app::render::RenderParams;
 use veldmap_core::geo::{Camera, MIN_HEIGHT_M};
 use veldmap_core::tile::{QuadtreeConfig, SourceId};
 
 use crate::common::{
-    build_snapshot, is_clear_background, pixel_at, render_srgb, render_with, shared_headless_device,
+    TestGlobe, build_snapshot, is_clear_background, pixel_at, render_srgb, render_with,
+    shared_headless_device,
 };
 
 #[test]
@@ -34,8 +35,8 @@ fn srgb_and_unorm_compositing_parity_and_zero_idle_rerender() {
         snapshot: &snap,
     };
 
-    let mut srgb_renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
-    let mut unorm_renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut srgb_renderer = TestGlobe::new_srgb(device);
+    let mut unorm_renderer = TestGlobe::new(device, wgpu::TextureFormat::Rgba8Unorm);
 
     let srgb_pixels = render_with(
         &mut srgb_renderer,
@@ -103,7 +104,7 @@ fn graticule_toggle_horizon_discard_and_zoomed_polar_meridians() {
 
     let (w, h) = (129, 129);
     let cfg = QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
 
     let orbital_cam = Camera::default();
     let with_grid_snap = build_snapshot(
@@ -191,7 +192,7 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
     };
 
     let cfg = QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
     let cam = Camera::at(37.5, 52.5, 14_000_000.0);
     let empty_snap = build_snapshot(cam, 0, 0, true, SourceId::BUNDLED_BASEMAP, &cfg, None);
 

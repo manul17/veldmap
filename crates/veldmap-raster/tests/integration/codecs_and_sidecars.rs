@@ -11,12 +11,14 @@ use veldmap_core::io::testing::MemoryByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::SourceFingerprint;
 use veldmap_raster::{
-    DecodeContext, GeoPlacement, JpegSource, PlacementCrs, PngSource, RasterError, RasterSource,
-    SharedChunkCache, TiffSource, frame_from_description, has_jpeg_magic, has_png_magic,
-    parse_prj_text, parse_world_file,
+    DISPLAY_STREAM_SPEC, DecodeContext, GeoPlacement, JpegSource, PlacementCrs, PngSource,
+    RasterError, RasterSource, SharedChunkCache, TiffSource, frame_from_description,
+    has_jpeg_magic, has_png_magic, parse_prj_text, parse_world_file,
 };
 
-use crate::common::{build_raw_tiff, tag_rational_vec, tag_u16, tag_u16_vec, tag_u32};
+use crate::common::{
+    build_raw_tiff, sample_display_rgba, tag_rational_vec, tag_u16, tag_u16_vec, tag_u32,
+};
 
 #[test]
 fn decodes_ycbcr_444_tiff_with_bt601_and_reference_black_white() {
@@ -68,14 +70,12 @@ fn decodes_ycbcr_444_tiff_with_bt601_and_reference_black_white() {
         cancel: &cancel,
     };
 
-    let white = tiff
-        .sample_display_rgba(0, 0, &ctx)
+    let white = sample_display_rgba(&tiff, 0, 0, &ctx)
         .expect("probe")
         .expect("white");
     assert_eq!(white, [255, 255, 255, 255]);
 
-    let red = tiff
-        .sample_display_rgba(1, 0, &ctx)
+    let red = sample_display_rgba(&tiff, 1, 0, &ctx)
         .expect("probe")
         .expect("red");
     assert!(
@@ -83,8 +83,7 @@ fn decodes_ycbcr_444_tiff_with_bt601_and_reference_black_white() {
         "got {red:?}"
     );
 
-    let gray = tiff
-        .sample_display_rgba(2, 2, &ctx)
+    let gray = sample_display_rgba(&tiff, 2, 2, &ctx)
         .expect("probe")
         .expect("gray");
     assert_eq!(gray, [128, 128, 128, 255]);
@@ -139,8 +138,7 @@ fn decodes_webp_compressed_0xc351_rgb_tiff() {
         cancel: &cancel,
     };
 
-    let px = tiff
-        .sample_display_rgba(3, 1, &ctx)
+    let px = sample_display_rgba(&tiff, 3, 1, &ctx)
         .expect("probe")
         .expect("pixel");
     // Index 7 -> R = 7*15 = 105, G = 200, B = 50
@@ -191,15 +189,18 @@ fn png_and_jpeg_adapters_decode_world_file_and_enforce_memory_budget() {
     };
     let mut emitted_png = 0usize;
     png_src
-        .produce_pass(&ctx, &mut |_lvl, _x, _y, tw, th, rgba| {
-            assert_eq!(rgba.len(), (tw * th * 4) as usize);
-            emitted_png += 1;
-            Ok(())
-        })
+        .produce_pass(
+            DISPLAY_STREAM_SPEC,
+            &ctx,
+            &mut |_lvl, _x, _y, tw, th, rgba| {
+                assert_eq!(rgba.len(), (tw * th * 4) as usize);
+                emitted_png += 1;
+                Ok(())
+            },
+        )
         .expect("PNG pass succeeds");
     assert_eq!(emitted_png, 1);
-    let probe = png_src
-        .sample_display_rgba(2, 3, &ctx)
+    let probe = sample_display_rgba(&png_src, 2, 3, &ctx)
         .expect("png probe")
         .expect("pixel");
     assert_eq!(probe, [32, 48, 128, 255]);
@@ -222,11 +223,15 @@ fn png_and_jpeg_adapters_decode_world_file_and_enforce_memory_budget() {
     assert!(jpg_frame.measurable());
     let mut emitted_jpg = 0usize;
     jpg_src
-        .produce_pass(&ctx, &mut |_lvl, _x, _y, tw, th, rgba| {
-            assert_eq!(rgba.len(), (tw * th * 4) as usize);
-            emitted_jpg += 1;
-            Ok(())
-        })
+        .produce_pass(
+            DISPLAY_STREAM_SPEC,
+            &ctx,
+            &mut |_lvl, _x, _y, tw, th, rgba| {
+                assert_eq!(rgba.len(), (tw * th * 4) as usize);
+                emitted_jpg += 1;
+                Ok(())
+            },
+        )
         .expect("JPEG pass succeeds");
     assert_eq!(emitted_jpg, 1);
     assert_eq!(

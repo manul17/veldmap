@@ -16,6 +16,22 @@ use super::projection::{Projection, System};
 
 pub use presets::{CrsPreset, builtin_crs_presets, search_crs_presets};
 
+/// Strip any leading UTF-8 BOM and surrounding whitespace from a CRS definition.
+pub(super) fn trim_crs_text(text: &str) -> &str {
+    text.trim().trim_start_matches('\u{FEFF}').trim()
+}
+
+/// Parse an `EPSG:<code>`, `epsg:<code>`, or bare numeric EPSG shorthand.
+pub(super) fn parse_epsg_shorthand(trimmed: &str) -> Option<u32> {
+    if let Some(rest) = trimmed
+        .strip_prefix("EPSG:")
+        .or_else(|| trimmed.strip_prefix("epsg:"))
+    {
+        return rest.trim().parse::<u32>().ok();
+    }
+    trimmed.parse::<u32>().ok()
+}
+
 /// Return whether `text` begins with a WKT1/WKT2 CRS root keyword (ignoring a
 /// leading UTF-8 BOM and ASCII whitespace).
 fn looks_like_wkt(text: &str) -> bool {
@@ -29,7 +45,7 @@ fn looks_like_wkt(text: &str) -> bool {
         "COMPD_CS[",
         "LOCAL_CS[",
     ];
-    let trimmed = text.trim_start_matches('\u{FEFF}').trim_start();
+    let trimmed = trim_crs_text(text);
     WKT_PREFIXES.iter().any(|prefix| {
         trimmed
             .get(..prefix.len())
@@ -42,8 +58,10 @@ fn looks_like_wkt(text: &str) -> bool {
 pub enum CrsTextKind {
     /// WKT1 or WKT2 CRS definition.
     Wkt,
-    /// PROJ.4 string or `EPSG:<code>` shorthand.
-    UserString,
+    /// `EPSG:<code>` or bare numeric EPSG shorthand.
+    Epsg(u32),
+    /// PROJ.4 parameter string.
+    Proj,
 }
 
 /// Parsed CRS specification covering both projected and geographic coordinate
@@ -98,15 +116,8 @@ impl CrsSpec {
 
     /// Parse a PROJ.4 string (or `EPSG:<code>` shorthand).
     pub fn from_user_string(input: &str) -> Result<Self, CrsError> {
-        let trimmed = input.trim().trim_start_matches('\u{FEFF}').trim();
-        if let Some(rest) = trimmed
-            .strip_prefix("EPSG:")
-            .or_else(|| trimmed.strip_prefix("epsg:"))
-            && let Ok(code) = rest.trim().parse::<u32>()
-        {
-            return Self::from_epsg(code);
-        }
-        if let Ok(code) = trimmed.parse::<u32>() {
+        let trimmed = trim_crs_text(input);
+        if let Some(code) = parse_epsg_shorthand(trimmed) {
             return Self::from_epsg(code);
         }
         Self::from_proj_string_labeled(trimmed, None)
@@ -120,14 +131,21 @@ impl CrsSpec {
     /// malformed WKT definitions report [`CrsError::InvalidWkt`] rather than a
     /// misleading PROJ error.
     pub fn parse_text(input: &str) -> Result<(Self, CrsTextKind), CrsError> {
-        let trimmed = input.trim().trim_start_matches('\u{FEFF}').trim();
+        let trimmed = trim_crs_text(input);
         if looks_like_wkt(trimmed) {
             return Self::from_wkt(trimmed).map(|crs| (crs, CrsTextKind::Wkt));
+        }
+        if let Some(code) = parse_epsg_shorthand(trimmed) {
+            return Self::from_epsg(code).map(|crs| (crs, CrsTextKind::Epsg(code)));
+        }
+        if trimmed.starts_with('+') {
+            return Self::from_proj_string_labeled(trimmed, None)
+                .map(|crs| (crs, CrsTextKind::Proj));
         }
         if let Ok(crs) = Self::from_wkt(trimmed) {
             return Ok((crs, CrsTextKind::Wkt));
         }
-        Self::from_user_string(trimmed).map(|crs| (crs, CrsTextKind::UserString))
+        Self::from_proj_string_labeled(trimmed, None).map(|crs| (crs, CrsTextKind::Proj))
     }
 
     fn from_proj4(p4: Proj4Projection) -> Self {

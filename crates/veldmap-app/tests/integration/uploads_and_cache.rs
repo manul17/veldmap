@@ -7,16 +7,16 @@ use std::time::Duration;
 use veldmap_app::BUNDLED_MAX_LEVEL;
 use veldmap_app::basemap_policy::{bundled_tile_key, source_tile_key};
 use veldmap_app::gpu_tiles::{GpuTileCache, PendingUploads, UploadPassParams};
-use veldmap_app::render::GlobeRenderer;
 use veldmap_core::geo::Camera;
 use veldmap_core::tile::{
     DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId,
     mip_chain_byte_size,
 };
-use veldmap_raster::generate_linear_mipmaps;
+use veldmap_raster::generate_tile_mipmaps;
 
 use crate::common::{
-    build_snapshot, pixel_at, render_srgb, shared_bundled_basemap, shared_headless_device,
+    TestGlobe, build_snapshot, pixel_at, render_srgb, shared_bundled_basemap,
+    shared_headless_device,
 };
 
 #[test]
@@ -68,7 +68,7 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
     // Cap cache to exactly 2 tiles (32 KiB) so uploading 4 tiles triggers real LRU eviction.
     let tile_bytes = 64 * 64 * 4;
     let mut cache = GpuTileCache::new(tile_bytes * 2);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
 
     // Budget of 1 byte must STILL upload 1 coarsest tile (anti-starvation).
     let r1 = pending.drain_and_upload(
@@ -101,7 +101,7 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
             Some(&mut cache),
         );
         let _ = render_srgb(&mut renderer, device, queue, 65, 65, &snap1);
-        assert_eq!(renderer.cached_tile_bind_group_count(), 1);
+        assert_eq!(renderer.bind_groups.len(), 1);
     }
 
     // Upload the remaining 3 tiles -> evicts earlier tiles from GpuTileCache.
@@ -146,9 +146,9 @@ fn pending_uploads_budget_and_end_to_end_weak_bind_group_sweeping() {
     assert_eq!(r_dup.uploaded, 0);
 
     // Sweeping stale Weak<GpuTile> entries drops the evicted tile's BindGroup automatically.
-    renderer.sweep_stale_bind_groups();
+    renderer.bind_groups.sweep_stale();
     assert_eq!(
-        renderer.cached_tile_bind_group_count(),
+        renderer.bind_groups.len(),
         0,
         "evicted tile BindGroup was not swept via Weak<GpuTile>"
     );
@@ -162,7 +162,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
 
     let live_source = SourceId::from_stable_key("eox-s2cloudless-test");
     let merc_cfg = QuadtreeConfig::web_mercator(14);
-    let mut renderer = GlobeRenderer::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut renderer = TestGlobe::new_srgb(device);
 
     // 1. CPU linear-light mipmaps upload into GpuTileCache with exact mip byte accounting.
     let mut bundled_wm = DecodedTile::try_new(
@@ -172,7 +172,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         [40, 80, 210, 255].repeat(64 * 64),
     )
     .expect("valid bundled wm tile");
-    generate_linear_mipmaps(&mut bundled_wm);
+    generate_tile_mipmaps(&mut bundled_wm);
     assert_eq!(bundled_wm.mip_level_count(), 7);
     let expected_bytes = mip_chain_byte_size(64, 64, PixelFormat::Rgba8UnormSrgb, 7);
     assert_eq!(bundled_wm.byte_size(), expected_bytes);
@@ -184,7 +184,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         [235, 235, 235, 255].repeat(64 * 64),
     )
     .expect("valid bundled polar tile");
-    generate_linear_mipmaps(&mut bundled_polar);
+    generate_tile_mipmaps(&mut bundled_polar);
 
     let mut live_tile = DecodedTile::try_new(
         64,
@@ -193,7 +193,7 @@ fn live_source_mipmaps_polar_fallback_and_active_frame_protection() {
         [40, 200, 70, 255].repeat(64 * 64),
     )
     .expect("valid live tile");
-    generate_linear_mipmaps(&mut live_tile);
+    generate_tile_mipmaps(&mut live_tile);
 
     // Budget holds exactly 2 mipmapped 64x64 tiles so Step 4 genuinely
     // exercises active-frame eviction protection and refusal deferral.

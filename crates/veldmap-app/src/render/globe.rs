@@ -31,39 +31,16 @@ pub struct GlobeRenderer {
     overlay: OverlayRenderer,
     /// Post-body draped vector geometry renderer (GeoJSON + measurements).
     vector: VectorRenderer,
-    /// Optional owned fallback `TileBindGroupCache` for standalone headless
-    /// rendering (`None` when using a hoisted `CallbackResources` cache).
-    owned_bind_groups: Option<TileBindGroupCache>,
     /// Per-frame dynamic uniform byte offsets for `snapshot.tiles`.
     tile_uniform_offsets: Vec<u32>,
     viewport: ViewportState,
 }
 
 impl GlobeRenderer {
-    /// Create a standalone `GlobeRenderer` owning its own internal
-    /// [`TileBindGroupCache`] (convenient for headless tests).
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let bind_groups = TileBindGroupCache::new(device);
-        let pipelines = GlobePipelines::new(device, target_format, &bind_groups);
-        let meshes = TileMeshCache::new(device);
-        let overlay = OverlayRenderer::new();
-        let vector = VectorRenderer::new();
-        let viewport = ViewportState::new(device, target_format, &pipelines);
-
-        Self {
-            pipelines,
-            meshes,
-            overlay,
-            vector,
-            owned_bind_groups: Some(bind_groups),
-            tile_uniform_offsets: Vec::new(),
-            viewport,
-        }
-    }
-
-    /// Create a `GlobeRenderer` sharing a hoisted [`TileBindGroupCache`]
-    /// stored in `egui_wgpu::CallbackResources`.
-    pub fn new_with_shared_bind_groups(
+    /// Create a `GlobeRenderer` using the hoisted [`TileBindGroupCache`]
+    /// (stored in `egui_wgpu::CallbackResources` in the app, or owned by a
+    /// test harness in headless tests).
+    pub fn new(
         device: &wgpu::Device,
         target_format: wgpu::TextureFormat,
         shared_bind_groups: &TileBindGroupCache,
@@ -79,50 +56,15 @@ impl GlobeRenderer {
             meshes,
             overlay,
             vector,
-            owned_bind_groups: None,
             tile_uniform_offsets: Vec::new(),
             viewport,
         }
     }
 
-    /// Drop cached `BindGroup` entries in the internal fallback cache whose
-    /// backing `GpuTile` has been evicted.
-    pub fn sweep_stale_bind_groups(&mut self) {
-        if let Some(bg) = &mut self.owned_bind_groups {
-            bg.sweep_stale();
-        }
-    }
-
-    /// Number of currently cached tile texture bind groups in the internal
-    /// fallback cache.
-    pub fn cached_tile_bind_group_count(&self) -> usize {
-        self.owned_bind_groups
-            .as_ref()
-            .map_or(0, TileBindGroupCache::len)
-    }
-
-    /// Render using the internal fallback [`TileBindGroupCache`].
-    pub fn render_if_dirty(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        params: RenderParams<'_>,
-    ) -> bool {
-        let mut owned = self
-            .owned_bind_groups
-            .take()
-            .unwrap_or_else(|| TileBindGroupCache::new(device));
-        let rendered =
-            self.render_if_dirty_with_bind_groups(device, queue, encoder, params, &mut owned);
-        self.owned_bind_groups = Some(owned);
-        rendered
-    }
-
     /// Ensure the offscreen target matches `(params.width, params.height)`
     /// clamped to device limits and re-render the globe if the target or draw
     /// snapshot changed, sharing the hoisted `bind_groups` cache.
-    pub fn render_if_dirty_with_bind_groups(
+    pub fn render_if_dirty(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,

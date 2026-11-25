@@ -28,7 +28,7 @@ pub use adapters::{JpegSource, PngSource};
 pub use display::{
     BundledBasemap, BundledBasemapConfig, MAX_LZ4_RAW_DECODED_BYTES, MAX_QOI_DECODED_BYTES,
     decode_lz4_raw_tile, decode_map_tile_with_mipmaps, decode_qoi_rgba8, encode_lz4_raw_tile,
-    encode_qoi_rgba8, generate_linear_mipmaps, generate_scientific_mipmaps, generate_tile_mipmaps,
+    encode_qoi_rgba8, generate_tile_mipmaps,
 };
 pub use image_codec::{has_jpeg_magic, has_png_magic};
 pub use pipeline::{

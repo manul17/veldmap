@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 
 use super::DrawSnapshot;
 use super::pipelines::GlobePipelines;
-use super::uniforms::{CameraUniform, DynamicUniformArena};
+use super::uniforms::{CameraUniform, DynamicUniformArena, DynamicUniformLayouts};
 
 /// Parameters for a single offscreen globe frame.
 #[derive(Clone, Copy, Debug)]
@@ -89,11 +89,13 @@ impl ViewportState {
 
         let uniform_arena = DynamicUniformArena::new(
             device,
-            &pipelines.layouts.tile_uniform_layout,
-            &pipelines.layouts.overlay_uniform_layout,
-            &pipelines.layouts.scientific_uniform_layout,
-            &pipelines.layouts.categorical_uniform_layout,
-            &pipelines.layouts.vector_uniform_layout,
+            DynamicUniformLayouts {
+                tile: &pipelines.layouts.tile_uniform_layout,
+                overlay: &pipelines.layouts.overlay_uniform_layout,
+                scientific: &pipelines.layouts.scientific_uniform_layout,
+                categorical: &pipelines.layouts.categorical_uniform_layout,
+                vector: &pipelines.layouts.vector_uniform_layout,
+            },
         );
 
         Self {

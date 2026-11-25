@@ -41,6 +41,9 @@ pub(crate) const MIN_GPU_CACHE_MAX_MB: u64 = 128;
 /// Maximum optional user override for the GPU tile cache cap (`4096 MiB`).
 pub(crate) const MAX_GPU_CACHE_MAX_MB: u64 = 4096;
 
+/// Default value pre-filled when the user enables a custom GPU VRAM cap (`512 MiB`).
+pub(crate) const DEFAULT_CUSTOM_GPU_CACHE_MAX_MB: u64 = 512;
+
 /// Allowed slider range for optional user GPU tile VRAM cap in MiB.
 pub(crate) const GPU_CACHE_MAX_MB_RANGE: RangeInclusive<u64> =
     MIN_GPU_CACHE_MAX_MB..=MAX_GPU_CACHE_MAX_MB;
@@ -242,6 +245,16 @@ impl BasemapSettingsDraft {
     }
 }
 
+/// Borrowed basemap-specific view of [`AppSettings`] passed into
+/// `BasemapManager` so the basemap coordinator stays decoupled from unrelated
+/// UI and cache-budget preferences.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BasemapConfigView<'a> {
+    pub(crate) active_basemap: BasemapSelection,
+    pub(crate) gibs_date: &'a str,
+    pub(crate) custom_xyz: &'a CustomXyzSettings,
+}
+
 /// Durable user application settings saved at `StoragePaths::settings_path()`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -271,6 +284,15 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// Borrow the basemap-specific subset of settings for `BasemapManager`.
+    pub(crate) fn basemap_config(&self) -> BasemapConfigView<'_> {
+        BasemapConfigView {
+            active_basemap: self.active_basemap,
+            gibs_date: &self.gibs_date,
+            custom_xyz: &self.custom_xyz,
+        }
+    }
+
     /// Clamp numeric settings and sanitize fields loaded from disk.
     pub(super) fn normalize(&mut self) {
         self.version = SETTINGS_SCHEMA_VERSION;

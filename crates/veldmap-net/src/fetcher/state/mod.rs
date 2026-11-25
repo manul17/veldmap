@@ -1,18 +1,24 @@
-//! Queue, in-flight tracking, dispatch planning, and failure/backoff state
-//! machine for [`crate::LiveTilePipeline`].
+//! Pure synchronous queue, in-flight tracking, dispatch planning, and
+//! failure/backoff state machine for [`crate::LiveTilePipeline`].
+
+mod failures;
+mod in_flight;
+mod plan;
+mod queue;
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{QuadTileId, SourceId, TileKey};
+use veldmap_core::tile::{SourceId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
 
-use super::failures::{BackoffEntry, FailureMarker, FailureTracker, is_wanted_or_root};
-use super::in_flight::InFlightTable;
-use super::queue::PendingQueues;
+use self::failures::{BackoffEntry, FailureMarker, FailureTracker};
+use self::in_flight::InFlightTable;
+pub(in crate::fetcher) use self::plan::TileTarget;
+use self::queue::PendingQueues;
 
 /// Observable status snapshot of the live tile pipeline for the GIS HUD / UI.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -26,49 +32,19 @@ pub struct NetworkStatus {
     pub last_error: Option<String>,
 }
 
-/// Shared tile metadata passed from dispatch planning to disk/HTTP workers.
-pub(super) struct TileTarget {
-    pub(super) key: TileKey,
-    pub(super) id: QuadTileId,
-    pub(super) spec: Arc<LiveBasemapSpec>,
-    pub(super) cancel: CancelToken,
-}
-
-/// Raw disk-lookup task planned under `PipelineState`'s mutex, to be wrapped
-/// in RAII guards immediately upon unlocking `state` (preventing
-/// Drop-on-unwind self-deadlock).
-pub(super) struct PlannedDiskTask {
-    pub(super) target: TileTarget,
-    pub(super) generation: u64,
-}
-
-/// Raw HTTP fetch task planned under `PipelineState`'s mutex, to be wrapped
-/// in RAII guards immediately upon unlocking `state` (preventing
-/// Drop-on-unwind self-deadlock).
-pub(super) struct PlannedHttpTask<P> {
-    pub(super) target: TileTarget,
-    pub(super) generation: u64,
-    pub(super) host: String,
-    pub(super) permit: P,
-}
-
-/// Dispatch batch planned atomically under `PipelineState`'s mutex.
-pub(super) struct PlannedDispatch<P> {
-    pub(super) disk_tasks: Vec<PlannedDiskTask>,
-    pub(super) http_tasks: Vec<PlannedHttpTask<P>>,
-    pub(super) earliest_wakeup: Option<Instant>,
-}
-
-fn min_instant(current: Option<Instant>, candidate: Instant) -> Option<Instant> {
-    Some(match current {
-        Some(cur) if cur < candidate => cur,
-        _ => candidate,
-    })
+/// Returns `true` when `key` is currently requested in `wanted` or is a pinned
+/// coarsest root tile of `active_source`.
+pub(super) fn is_wanted_or_root(
+    wanted: &HashSet<TileKey>,
+    key: &TileKey,
+    active_source: SourceId,
+) -> bool {
+    wanted.contains(key) || key.is_root_of(active_source)
 }
 
 /// Explicit side-effect summary returned by in-flight state transitions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Transition {
+pub(in crate::fetcher) enum Transition {
     /// The tile's generation was already removed or no longer belonged to the
     /// active source; no state mutation or side effect applies.
     Stale,
@@ -81,14 +57,14 @@ pub(super) enum Transition {
 }
 
 impl Transition {
-    pub(super) const APPLIED_SILENT: Self = Self::Applied { wakeup: false };
-    pub(super) const APPLIED_WAKEUP: Self = Self::Applied { wakeup: true };
+    pub(in crate::fetcher) const APPLIED_SILENT: Self = Self::Applied { wakeup: false };
+    pub(in crate::fetcher) const APPLIED_WAKEUP: Self = Self::Applied { wakeup: true };
 
-    pub(super) const fn is_applied(self) -> bool {
+    pub(in crate::fetcher) const fn is_applied(self) -> bool {
         matches!(self, Self::Applied { .. })
     }
 
-    pub(super) const fn should_wakeup(self) -> bool {
+    pub(in crate::fetcher) const fn should_wakeup(self) -> bool {
         matches!(self, Self::Applied { wakeup: true })
     }
 }
@@ -143,18 +119,27 @@ fn is_pending_eligible(
 }
 
 #[derive(Default)]
-pub(super) struct PipelineState {
+pub(in crate::fetcher) struct PipelineState {
+    has_disk_cache: bool,
     active_spec: Option<Arc<LiveBasemapSpec>>,
     /// Unready, active-source, contract-valid keys from the most recent
     /// `reconcile_wanted`, used by idle backoff retries and `retry_failed`.
     last_wanted: HashSet<TileKey>,
     pending: PendingQueues,
     in_flight: InFlightTable,
+    disk_in_flight: usize,
     failures: FailureTracker,
     counters: StatusCounters,
 }
 
 impl PipelineState {
+    pub(in crate::fetcher) fn new(has_disk_cache: bool) -> Self {
+        Self {
+            has_disk_cache,
+            ..Self::default()
+        }
+    }
+
     fn is_active_source(&self, source: SourceId) -> bool {
         self.active_spec
             .as_ref()
@@ -179,6 +164,7 @@ impl PipelineState {
         entries: impl IntoIterator<Item = (TileKey, bool)>,
         is_ready: impl Fn(&TileKey) -> bool,
     ) {
+        let has_disk_cache = self.has_disk_cache;
         for (key, retry_disk) in entries {
             if is_pending_eligible(
                 &self.in_flight,
@@ -189,12 +175,13 @@ impl PipelineState {
                 &is_ready,
             ) && !self.pending.contains(&key)
             {
-                self.pending.insert_unique(key, retry_disk);
+                self.pending
+                    .insert_unique(key, retry_disk && has_disk_cache);
             }
         }
     }
 
-    pub(super) fn set_active_spec(
+    pub(in crate::fetcher) fn set_active_spec(
         &mut self,
         spec: Option<LiveBasemapSpec>,
     ) -> Option<Vec<CancelToken>> {
@@ -209,7 +196,7 @@ impl PipelineState {
         Some(self.in_flight.drain_tokens())
     }
 
-    pub(super) fn reconcile_wanted<F>(
+    pub(in crate::fetcher) fn reconcile_wanted<F>(
         &mut self,
         wanted: &HashSet<TileKey>,
         is_ready: &F,
@@ -260,20 +247,21 @@ impl PipelineState {
         });
 
         // Drain expired backoffs (`until <= now`), routing `retry_disk: false`
-        // directly to `pending.http` while keeping `retry_disk: true` on disk.
+        // (or all entries when no disk cache is configured) directly to `http`.
         let expired = self.failures.drain_expired_backoffs(now);
         self.requeue_eligible_entries(active_source, expired, is_ready);
 
+        let has_disk_cache = self.has_disk_cache;
         for &key in &self.last_wanted {
             if self.is_queue_eligible(&key, active_source) {
-                self.pending.insert_disk(key);
+                self.pending.insert_unique(key, has_disk_cache);
             }
         }
 
         Some(cancelled)
     }
 
-    pub(super) fn retry_failed(&mut self) {
+    pub(in crate::fetcher) fn retry_failed(&mut self) {
         let entries = self.failures.drain_for_retry();
         self.counters.reset_errors();
 
@@ -284,7 +272,7 @@ impl PipelineState {
         self.requeue_eligible_entries(active_source, entries, |_| false);
     }
 
-    pub(super) fn status(&self) -> NetworkStatus {
+    pub(in crate::fetcher) fn status(&self) -> NetworkStatus {
         NetworkStatus {
             in_flight: self.in_flight.len(),
             queued: self.pending.len(),
@@ -296,162 +284,14 @@ impl PipelineState {
         }
     }
 
-    pub(super) fn signal_shutdown(&mut self) -> Vec<CancelToken> {
+    pub(in crate::fetcher) fn signal_shutdown(&mut self) -> Vec<CancelToken> {
         self.last_wanted.clear();
         self.pending.clear();
         self.in_flight.drain_tokens()
     }
 
-    /// Prune expired backoff entries and atomically plan the next disk-lookup
-    /// and HTTP-fetch dispatch batch, enforcing `pending -> in_flight`
-    /// transitions and `key.quad_id()` filtering inside one state-machine step.
-    ///
-    /// `try_acquire_permit` returns `Ok(permit)` when a host may dispatch
-    /// immediately, `Err(Some(until))` when the host is in rate-limit cooldown
-    /// until `until`, or `Err(None)` when the host's concurrency slots are
-    /// saturated.
-    pub(super) fn plan_dispatch<P>(
-        &mut self,
-        has_disk_cache: bool,
-        max_concurrent_disk: usize,
-        shutdown: &CancelToken,
-        now: Instant,
-        mut try_acquire_permit: impl FnMut(&str) -> Result<P, Option<Instant>>,
-    ) -> PlannedDispatch<P> {
-        self.prune_expired_backoffs(now);
-        let Some(spec) = self.active_spec.clone() else {
-            self.pending.clear();
-            return PlannedDispatch {
-                disk_tasks: Vec::new(),
-                http_tasks: Vec::new(),
-                earliest_wakeup: None,
-            };
-        };
-
-        let mut earliest_wakeup = None;
-        let disk_tasks = self.plan_disk_tasks(&spec, has_disk_cache, max_concurrent_disk, shutdown);
-        let http_tasks = self.plan_http_tasks(
-            &spec,
-            shutdown,
-            &mut try_acquire_permit,
-            &mut earliest_wakeup,
-        );
-
-        if let Some(backoff_at) =
-            self.failures
-                .earliest_wanted_backoff(now, spec.source_id(), &self.last_wanted)
-        {
-            earliest_wakeup = min_instant(earliest_wakeup, backoff_at);
-        }
-
-        PlannedDispatch {
-            disk_tasks,
-            http_tasks,
-            earliest_wakeup,
-        }
-    }
-
-    fn plan_disk_tasks(
-        &mut self,
-        spec: &Arc<LiveBasemapSpec>,
-        has_disk_cache: bool,
-        max_concurrent_disk: usize,
-        shutdown: &CancelToken,
-    ) -> Vec<PlannedDiskTask> {
-        let active_source = spec.source_id();
-        if !has_disk_cache {
-            let in_flight = &self.in_flight;
-            let failures = &self.failures;
-            self.pending
-                .drain_disk_to_http(|key| is_key_eligible(in_flight, failures, key, active_source));
-            return Vec::new();
-        }
-
-        let mut tasks = Vec::new();
-        while self.in_flight.disk_in_flight() < max_concurrent_disk {
-            let Some(key) = self.pending.pop_disk() else {
-                break;
-            };
-            if !self.is_queue_eligible(&key, active_source) {
-                continue;
-            }
-            let Some(id) = key.quad_id() else {
-                continue;
-            };
-            let (generation, cancel) = self.in_flight.register(key, shutdown);
-            self.in_flight.acquire_disk_slot();
-            tasks.push(PlannedDiskTask {
-                target: TileTarget {
-                    key,
-                    id,
-                    spec: Arc::clone(spec),
-                    cancel,
-                },
-                generation,
-            });
-        }
-        tasks
-    }
-
-    fn plan_http_tasks<P>(
-        &mut self,
-        spec: &Arc<LiveBasemapSpec>,
-        shutdown: &CancelToken,
-        try_acquire_permit: &mut impl FnMut(&str) -> Result<P, Option<Instant>>,
-        earliest_wakeup: &mut Option<Instant>,
-    ) -> Vec<PlannedHttpTask<P>> {
-        let active_source = spec.source_id();
-        let total_hosts = spec.host_count();
-        let mut denied_hosts: HashSet<&str> = HashSet::with_capacity(total_hosts);
-        let mut deferred_http = Vec::new();
-        let mut tasks = Vec::new();
-
-        while let Some(key) = self.pending.pop_http() {
-            if !self.is_queue_eligible(&key, active_source) {
-                continue;
-            }
-            let Some(id) = key.quad_id() else {
-                continue;
-            };
-            let host = spec.host_for(id);
-            if denied_hosts.contains(host) {
-                deferred_http.push(key);
-                continue;
-            }
-            match try_acquire_permit(host) {
-                Ok(permit) => {
-                    let (generation, cancel) = self.in_flight.register(key, shutdown);
-                    tasks.push(PlannedHttpTask {
-                        target: TileTarget {
-                            key,
-                            id,
-                            spec: Arc::clone(spec),
-                            cancel,
-                        },
-                        generation,
-                        host: host.to_owned(),
-                        permit,
-                    });
-                }
-                Err(cooldown_until) => {
-                    if let Some(until) = cooldown_until {
-                        *earliest_wakeup = min_instant(*earliest_wakeup, until);
-                    }
-                    deferred_http.push(key);
-                    denied_hosts.insert(host);
-                    if denied_hosts.len() >= total_hosts {
-                        break;
-                    }
-                }
-            }
-        }
-
-        self.pending.push_http(deferred_http);
-        tasks
-    }
-
     #[cfg(test)]
-    pub(super) fn register_in_flight_for_test(
+    pub(in crate::fetcher) fn register_in_flight_for_test(
         &mut self,
         key: TileKey,
         shutdown: &CancelToken,
@@ -459,11 +299,15 @@ impl PipelineState {
         self.in_flight.register(key, shutdown)
     }
 
-    pub(super) fn remove_in_flight_if_gen(&mut self, key: &TileKey, generation: u64) -> bool {
+    pub(in crate::fetcher) fn remove_in_flight_if_gen(
+        &mut self,
+        key: &TileKey,
+        generation: u64,
+    ) -> bool {
         self.in_flight.remove_if_gen(key, generation)
     }
 
-    pub(super) fn promote_disk_miss_to_http(
+    pub(in crate::fetcher) fn promote_disk_miss_to_http(
         &mut self,
         key: TileKey,
         generation: u64,
@@ -478,11 +322,11 @@ impl PipelineState {
         Transition::APPLIED_SILENT
     }
 
-    pub(super) fn release_disk_slot(&mut self) {
-        self.in_flight.release_disk_slot();
+    pub(in crate::fetcher) fn release_disk_slot(&mut self) {
+        self.disk_in_flight = self.disk_in_flight.saturating_sub(1);
     }
 
-    pub(super) fn mark_completed(
+    pub(in crate::fetcher) fn mark_completed(
         &mut self,
         key: TileKey,
         generation: u64,
@@ -502,7 +346,11 @@ impl PipelineState {
         Transition::APPLIED_SILENT
     }
 
-    pub(super) fn mark_empty_204(&mut self, key: TileKey, generation: u64) -> Transition {
+    pub(in crate::fetcher) fn mark_empty_204(
+        &mut self,
+        key: TileKey,
+        generation: u64,
+    ) -> Transition {
         if !self.finish_in_flight(&key, generation) {
             return Transition::Stale;
         }
@@ -513,7 +361,7 @@ impl PipelineState {
         Transition::APPLIED_WAKEUP
     }
 
-    pub(super) fn mark_terminal_failure(
+    pub(in crate::fetcher) fn mark_terminal_failure(
         &mut self,
         key: TileKey,
         generation: u64,
@@ -528,7 +376,7 @@ impl PipelineState {
         Transition::APPLIED_WAKEUP
     }
 
-    pub(super) fn mark_transient_backoff(
+    pub(in crate::fetcher) fn mark_transient_backoff(
         &mut self,
         key: TileKey,
         generation: u64,
@@ -550,7 +398,7 @@ impl PipelineState {
         Transition::APPLIED_WAKEUP
     }
 
-    pub(super) fn schedule_decode_backpressure(
+    pub(in crate::fetcher) fn schedule_decode_backpressure(
         &mut self,
         key: TileKey,
         generation: u64,
@@ -569,7 +417,7 @@ impl PipelineState {
                 key,
                 BackoffEntry {
                     until: now + backoff,
-                    retry_disk,
+                    retry_disk: retry_disk && self.has_disk_cache,
                 },
             );
         }

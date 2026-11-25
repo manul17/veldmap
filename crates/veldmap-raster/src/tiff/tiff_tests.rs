@@ -10,11 +10,13 @@ use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::io::testing::MemoryByteSource;
 use veldmap_core::io::{ByteSource, IoError};
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::SourceFingerprint;
+use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint};
 
 use super::TiffSource;
 use crate::RasterError;
 use crate::pipeline::chunk_cache::SharedChunkCache;
+use crate::pipeline::metadata::BandSample;
+use crate::pipeline::plan::DISPLAY_STREAM_SPEC;
 use crate::pipeline::{DecodeContext, RasterSource};
 
 struct ControlledTailSource {
@@ -287,7 +289,7 @@ fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
                 budget: &b,
                 cancel: &cancel,
             };
-            src.decode_pointwise_tile(0, 0, 0, &ctx)
+            src.decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         })
     };
 
@@ -309,7 +311,7 @@ fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
                 budget: &b,
                 cancel: &c,
             };
-            src.decode_pointwise_tile(0, 0, 0, &ctx)
+            src.decode_pointwise_tile(DISPLAY_STREAM_SPEC, 0, 0, 0, &ctx)
         })
     };
     thread::sleep(Duration::from_millis(15));
@@ -319,4 +321,63 @@ fn waiting_for_display_mapping_wakes_immediately_on_caller_cancel() {
 
     release.cancel();
     assert!(leader.join().expect("join leader").is_ok());
+}
+
+#[test]
+fn sample_band_rejects_unsupported_spec_without_io_and_enforces_output_working_cap() {
+    let raw = tiny_u16_tiff_bytes();
+    let gate = Arc::new(ControlledTailSource {
+        inner: MemoryByteSource::from_vec(raw),
+        threshold: 64 * 1024,
+        armed: AtomicBool::new(false),
+        hit: AtomicBool::new(false),
+        fail_tail: AtomicBool::new(false),
+        tail_reads: AtomicUsize::new(0),
+        release: CancelToken::new(),
+    });
+    let budget = MemoryBudget::default();
+    let src = TiffSource::open(
+        Arc::clone(&gate) as Arc<dyn ByteSource>,
+        SourceFingerprint::from_digest([10u8; 32]),
+        &budget,
+        &CancelToken::new(),
+    )
+    .expect("open u16");
+    gate.armed.store(true, Ordering::Release);
+
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let cancel = CancelToken::new();
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
+    // U16 source queried as R8Uint is incompatible: must return Unavailable
+    // upfront without touching the underlying chunk data.
+    assert_eq!(
+        src.sample_band(BandKey::Index(0), PixelFormat::R8Uint, 0, 0, &ctx)
+            .expect("unsupported spec returns Unavailable"),
+        BandSample::Unavailable
+    );
+    assert_eq!(gate.tail_reads.load(Ordering::Acquire), 0);
+
+    // 256x256 U16 raw chunk is 128 KiB, but decoded R32Float output is 256 KiB.
+    // A chunk cache cap of 192 KiB sits between raw (128 KiB) and decoded
+    // (256 KiB) and must reject upfront with LimitExceeded.
+    let mut tight_budget = budget;
+    tight_budget.decoded_chunk_cache_bytes = 192 * 1024;
+    let tight_ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &tight_budget,
+        cancel: &cancel,
+    };
+    assert!(matches!(
+        src.sample_band(BandKey::Index(0), PixelFormat::R32Float, 0, 0, &tight_ctx),
+        Err(RasterError::LimitExceeded { .. })
+    ));
+    assert_eq!(gate.tail_reads.load(Ordering::Acquire), 0);
 }

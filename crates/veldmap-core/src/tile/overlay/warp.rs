@@ -6,7 +6,7 @@ use glam::DVec3;
 use crate::geo::{Frame, SEMI_MAJOR_M};
 
 use super::super::pyramid::{RASTER_TILE_SIZE, level_px};
-use super::{FrameGridSpec, sample_frame_grid};
+use super::grid::{FrameGridSpec, MAX_WARP_SEGMENTS, sample_frame_grid};
 
 /// Minimum segments per warp-mesh cell side.
 ///
@@ -14,10 +14,6 @@ use super::{FrameGridSpec, sample_frame_grid};
 /// and chord placement error strictly `< 2 cm` on UTM-scale pyramid cells
 /// (`~110 km`) near zone edges (`±3 deg` from the central meridian).
 pub const MIN_WARP_SEGMENTS: u32 = 16;
-
-/// Upper bound on segments per warp-mesh cell side (covers global cells up to
-/// `360 deg` without exploding vertex counts).
-pub const MAX_WARP_SEGMENTS: u32 = 64;
 
 /// Target maximum surface arc per warp-mesh segment in degrees before clamping
 /// to `[MIN_WARP_SEGMENTS, MAX_WARP_SEGMENTS]`.
