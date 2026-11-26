@@ -1,10 +1,13 @@
 //! Offscreen `wgpu` WGS84 quadtree globe renderer decoupled from `egui`.
 //!
 //! Renders per-tile CPU `f64` RTC quadtree meshes (textured sRGB basemap or
-//! untextured WGS84 ellipsoid shading) and the post-overlay procedural
-//! `fwidth()` graticule into an offscreen `Rgba8UnormSrgb` + `Depth32Float`
-//! Reverse-Z target, then composites 1:1 with `FilterMode::Nearest` onto
-//! `egui_wgpu`'s target format via `view_formats`.
+//! untextured WGS84 ellipsoid shading) in Pass 1 (`Rgba8UnormSrgb` +
+//! `Depth32Float` Reverse-Z), followed by depth-less Pass 2 draped display /
+//! scientific (`R32Float`) / categorical (`R8Uint`/`R16Uint`) raster overlays,
+//! draped GeoJSON / measurement / STAC AOI & HiDPI ribbon/hatch vector
+//! overlays, and the post-overlay procedural `fwidth()` graticule, then
+//! composites 1:1 with `FilterMode::Nearest` onto `egui_wgpu`'s target format
+//! via `view_formats`.
 
 mod bind_groups;
 mod globe;

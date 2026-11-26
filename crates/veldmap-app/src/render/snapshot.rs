@@ -142,8 +142,8 @@ pub struct DrawVectorLayer {
     /// `VectorRenderer::push_uniforms` before writing to the `Rgba8UnormSrgb`
     /// offscreen target.
     pub line_color: [f32; 4],
-    /// Logical stroke width in points (scaled by `pixels_per_point` on GPU for
-    /// crisp HiDPI screen-space ribbon outlines).
+    /// Logical stroke width in points (scaled by `pixels_per_point` on CPU in
+    /// `VectorRenderer::push_uniforms` for crisp HiDPI screen-space ribbon outlines).
     pub stroke_width_px: f32,
     /// Optional diagonal screen-space hatch period in logical points (`0.0` =
     /// solid polygon fill; `> 0.0` = hatched fill for AOI / selected footprints).

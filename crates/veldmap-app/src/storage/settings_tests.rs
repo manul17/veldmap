@@ -190,3 +190,41 @@ fn stac_settings_round_trip_and_redact_secrets_in_debug() {
         StacAuth::Bearer("stac-bearer-secret-xyz".to_owned())
     );
 }
+
+#[test]
+fn stac_settings_forward_compat_normalization_validation_and_secret_scrub() {
+    // Unknown future StacAuthKind deserializes forward-compatibly to None.
+    let dir = TestTempDir::new("settings-stac-compat");
+    let paths = StoragePaths::with_root(dir.path());
+    let settings_path = paths.settings_path();
+    std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &settings_path,
+        br#"{"stac":{"custom_endpoint":"  https://stac.example/v1  ","auth_kind":"sigv4_future","auth_secret":"leftover"}}"#,
+    )
+    .expect("write future auth");
+    let loaded = AppSettings::load_or_default(&paths);
+    assert_eq!(loaded.stac.auth_kind, StacAuthKind::None);
+    assert_eq!(loaded.stac.custom_endpoint, "https://stac.example/v1");
+    assert!(
+        loaded.stac.auth_secret.is_empty(),
+        "switching/falling back to None must scrub auth_secret"
+    );
+
+    // Invalid STAC endpoint or forbidden header fails validation and does not
+    // clobber previously saved valid STAC settings via BasemapSettingsDraft.
+    let mut settings = loaded;
+    let saved = settings.stac.clone();
+    let mut draft = BasemapSettingsDraft::from_settings(&settings);
+    draft.stac.custom_endpoint = "ftp://not-http.example/v1".to_owned();
+    assert!(draft.stac.validation_error().is_some());
+    draft.apply_into(&mut settings);
+    assert_eq!(settings.stac, saved);
+
+    draft.stac.custom_endpoint = "https://stac.example/v1".to_owned();
+    draft.stac.auth_kind = StacAuthKind::ApiKey;
+    draft.stac.auth_header_name = "Range".to_owned(); // protocol-owned
+    assert!(draft.stac.validation_error().is_some());
+    draft.stac.auth_header_name = "x-api-key".to_owned();
+    assert!(draft.stac.validation_error().is_none());
+}

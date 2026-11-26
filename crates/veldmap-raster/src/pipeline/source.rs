@@ -39,7 +39,9 @@ pub fn coalesce_byte_ranges(ranges: &mut Vec<ByteRange>, max_gap: u64, max_merge
         let next_end = next.offset.saturating_add(next.len);
         let merged_end = cur_end.max(next_end);
         let merged_len = merged_end.saturating_sub(cur.offset);
-        if next.offset <= cur_end.saturating_add(max_gap) && merged_len <= max_merged_len {
+        if (next.offset <= cur_end.saturating_add(max_gap) && merged_len <= max_merged_len)
+            || next_end <= cur_end
+        {
             ranges[write].len = merged_len;
         } else {
             write += 1;

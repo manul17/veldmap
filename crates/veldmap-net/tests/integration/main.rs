@@ -1,6 +1,7 @@
 //! Grouped public-API integration tests for `veldmap-net` (mock HTTP
-//! streaming pipeline, host concurrency limits, disk cache integration, error
-//! handling, and cancellation).
+//! streaming pipeline, HTTP Range COG `ByteSource`, STAC API client, host
+//! concurrency limits, disk cache integration, error handling, and
+//! cancellation).
 
 #![expect(
     clippy::expect_used,

@@ -516,11 +516,37 @@ const IFD_LAYOUT_AND_TABLE_TAGS: &[u16] = &[
     TAG_REFERENCE_BLACK_WHITE,
 ];
 
+/// Small fixed-schema scalar/layout tags capped before prefetching so a
+/// crafted TIFF cannot point them at megabytes of out-of-line data.
+const MAX_SMALL_SCHEMA_TAG_BYTES: u64 = 64 * 1024;
+
+/// Maximum wire size for TIFF `ColorMap` (tag 320: at most `65536 * 3 * 2 = 384 KiB`).
+const MAX_COLOR_MAP_TAG_BYTES: u64 = 512 * 1024;
+
+const SMALL_SCHEMA_TAGS: &[u16] = &[
+    TAG_IMAGE_WIDTH,
+    TAG_IMAGE_LENGTH,
+    TAG_BITS_PER_SAMPLE,
+    TAG_COMPRESSION,
+    TAG_PHOTOMETRIC,
+    TAG_SAMPLES_PER_PIXEL,
+    TAG_ROWS_PER_STRIP,
+    TAG_PLANAR_CONFIG,
+    TAG_PREDICTOR,
+    TAG_TILE_WIDTH,
+    TAG_TILE_LENGTH,
+    TAG_EXTRA_SAMPLES,
+    TAG_SAMPLE_FORMAT,
+    TAG_YCBCR_COEFFICIENTS,
+    TAG_YCBCR_SUBSAMPLING,
+    TAG_REFERENCE_BLACK_WHITE,
+];
+
 /// Parse and validate all chunk/tag metadata for `dir` while enforcing
 /// `MemoryBudget` before allocating out-of-line offset/table arrays.
 pub(super) fn parse_cached_ifd(
     dir: &mut IfdDirectory,
-    reader: &SinglePassIfdReader,
+    reader: &mut SinglePassIfdReader,
     image: usize,
     budget: &MemoryBudget,
     table_bytes_used: u64,
@@ -529,6 +555,26 @@ pub(super) fn parse_cached_ifd(
 ) -> Result<CachedIfd, RasterError> {
     let table_cap = max_cached_ifd_table_bytes(budget, is_remote);
     let remaining_table_cap = table_cap.saturating_sub(table_bytes_used);
+
+    // Pre-check fixed-schema scalar/layout tags and ColorMap wire size BEFORE prefetching.
+    for &tag in SMALL_SCHEMA_TAGS {
+        if let Some(e) = dir.entry(tag)
+            && e.byte_len() > MAX_SMALL_SCHEMA_TAG_BYTES
+        {
+            return Err(RasterError::DecoderLimitsExceeded(format!(
+                "TIFF layout tag {tag} payload {} B exceeds limit {MAX_SMALL_SCHEMA_TAG_BYTES} B",
+                e.byte_len()
+            )));
+        }
+    }
+    if let Some(e) = dir.entry(TAG_COLOR_MAP)
+        && e.byte_len() > MAX_COLOR_MAP_TAG_BYTES
+    {
+        return Err(RasterError::DecoderLimitsExceeded(format!(
+            "TIFF ColorMap payload {} B exceeds limit {MAX_COLOR_MAP_TAG_BYTES} B",
+            e.byte_len()
+        )));
+    }
 
     // Pre-check estimated table memory BEFORE prefetching large out-of-line offset arrays.
     let mut est_table_bytes = 0u64;
@@ -546,7 +592,6 @@ pub(super) fn parse_cached_ifd(
                 | TAG_TILE_BYTE_COUNTS
                 | TAG_STRIP_OFFSETS
                 | TAG_STRIP_BYTE_COUNTS => e.count.saturating_mul(8),
-                TAG_COLOR_MAP => (e.count / 3).saturating_mul(4),
                 _ => e.byte_len(),
             };
             est_table_bytes = est_table_bytes.saturating_add(scaled);
@@ -563,11 +608,15 @@ pub(super) fn parse_cached_ifd(
         });
     }
 
-    let payload_cap = budget
-        .decode_working_bytes
-        .clamp(4 * 1024 * 1024, 128 * 1024 * 1024)
+    let payload_cap = remaining_table_cap
+        .saturating_add(1024 * 1024)
+        .min(
+            budget
+                .decode_working_bytes
+                .clamp(4 * 1024 * 1024, 128 * 1024 * 1024),
+        )
         .min(if is_remote {
-            budget.remote_ifd_limit_bytes
+            reader.remaining_fetch_budget()
         } else {
             u64::MAX
         });

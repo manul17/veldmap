@@ -196,8 +196,6 @@ impl TiffSource {
         chunk_indices: &[u32],
     ) -> Result<Vec<ByteRange>, RasterError> {
         let file_len = self.access.byte_source.len();
-        let samples_in_chunk = ifd.samples_in_chunk();
-        let sample_bytes = ifd.sample_type.byte_size();
         let max_uncompressed_bytes = self.access.max_chunk_bytes;
         let mut ranges = Vec::with_capacity(planes.len() * chunk_indices.len());
 
@@ -205,48 +203,15 @@ impl TiffSource {
             let Some(dims) = ifd.chunk_dims(idx) else {
                 continue;
             };
-            let stored_bytes = (dims.stored_w as usize)
-                .checked_mul(samples_in_chunk)
-                .and_then(|n| n.checked_mul(sample_bytes))
-                .and_then(|n| n.checked_mul(dims.stored_h as usize))
-                .ok_or_else(|| RasterError::Decode("TIFF chunk byte size overflow".to_owned()))?;
-            if stored_bytes > max_uncompressed_bytes {
-                return Err(RasterError::LimitExceeded {
-                    width: dims.stored_w,
-                    height: dims.stored_h,
-                    estimated_bytes: stored_bytes as u64,
-                    limit_bytes: max_uncompressed_bytes as u64,
-                });
-            }
-            let max_compressed = stored_bytes
-                .saturating_mul(2)
-                .max(4 * 1024 * 1024)
-                .min(max_uncompressed_bytes.saturating_mul(2).max(64 * 1024))
-                as u64;
             for &plane in planes {
-                let (offset, byte_count) = ifd.chunk_span(plane, idx)?;
-                if offset == 0 || byte_count == 0 {
+                let Some(span) =
+                    ifd.validated_chunk_span(plane, idx, dims, max_uncompressed_bytes, file_len)?
+                else {
                     continue;
-                }
-                if byte_count > max_compressed {
-                    return Err(RasterError::LimitExceeded {
-                        width: dims.stored_w,
-                        height: dims.stored_h,
-                        estimated_bytes: byte_count,
-                        limit_bytes: max_compressed,
-                    });
-                }
-                if offset
-                    .checked_add(byte_count)
-                    .is_none_or(|end| end > file_len)
-                {
-                    return Err(RasterError::Decode(format!(
-                        "TIFF chunk span {offset}..+{byte_count} exceeds file length {file_len}"
-                    )));
-                }
+                };
                 ranges.push(ByteRange {
-                    offset,
-                    len: byte_count,
+                    offset: span.offset,
+                    len: span.byte_count,
                 });
             }
         }
@@ -334,7 +299,10 @@ impl RasterSource for TiffSource {
     }
 
     fn plan_stretch_byte_ranges(&self) -> Result<Vec<ByteRange>, RasterError> {
-        if self.stretch.is_ready() || self.base_ifd().sample_type == SampleType::U8 {
+        if self.stretch.is_ready()
+            || self.base_ifd().sample_type == SampleType::U8
+            || self.base_ifd().photometric == Photometric::Palette
+        {
             return Ok(Vec::new());
         }
         let ifd = self.stats_ifd_ref();

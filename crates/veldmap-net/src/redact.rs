@@ -1,5 +1,5 @@
 //! Secret percent-encoding and credential / query-string URL redaction helpers
-//! shared across live basemaps and future authenticated cloud archive streams.
+//! shared across live basemaps, HTTP Range COGs, and STAC API streams.
 
 use std::fmt::Write as _;
 
@@ -75,6 +75,61 @@ pub(crate) fn redact_text(text: &str, secret: Option<&EncodedSecret>) -> String 
         Some(secret) => secret.redact_in(out),
         None => out,
     }
+}
+
+/// Redact inline URL credentials, `?query` tokens, and all `secrets` from
+/// `text` in a single URL-sanitization pass.
+pub(crate) fn redact_text_many(text: &str, secrets: &[EncodedSecret]) -> String {
+    let mut out = sanitize_urls_in_text(text);
+    for secret in secrets {
+        out = secret.redact_in(out);
+    }
+    out
+}
+
+/// Extract an [`EncodedSecret`] from a custom HTTP header `(name, value)`:
+/// strips common auth scheme prefixes (`Bearer `, `Basic `, `Token `) so raw
+/// tokens are redacted even if logged without the prefix, and avoids registering
+/// tiny non-sensitive values (`< 6` bytes) from generic non-auth headers.
+pub(crate) fn extract_header_secret(header_name: &str, value: &str) -> Option<EncodedSecret> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let token = strip_auth_scheme_prefix(trimmed).unwrap_or(trimmed);
+    if token.is_empty() {
+        return None;
+    }
+    let lower_name = header_name.trim().to_ascii_lowercase();
+    let is_auth_header = matches!(
+        lower_name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "x-api-key"
+            | "api-key"
+            | "x-auth-token"
+            | "ocp-apim-subscription-key"
+    ) || lower_name.contains("auth")
+        || lower_name.contains("token")
+        || lower_name.contains("key")
+        || lower_name.contains("secret");
+    if !is_auth_header && token.len() < 6 {
+        return None;
+    }
+    Some(EncodedSecret::new(token.to_owned()))
+}
+
+fn strip_auth_scheme_prefix(value: &str) -> Option<&str> {
+    for prefix in ["bearer ", "basic ", "token "] {
+        let len = prefix.len();
+        if value.len() > len && value.as_bytes()[..len].eq_ignore_ascii_case(prefix.as_bytes()) {
+            let rest = value[len..].trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
+        }
+    }
+    None
 }
 
 fn is_valid_url_scheme(scheme: &str) -> bool {

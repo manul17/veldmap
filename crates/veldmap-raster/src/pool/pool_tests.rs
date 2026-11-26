@@ -490,8 +490,9 @@ fn probe_job_key_deduplicates_prioritizes_ahead_of_tiles_and_respects_root_rank(
     let (second, _) = queue.pop_coarsest_or_drain_cancelled();
     assert_eq!(second.expect("pop second").key, root);
 
-    // Priority order is strictly Probe < BandStats < Tile < Pass.
-    let mut tier_queue = DecodeQueue::new(4, 1024);
+    // Priority order is strictly Open < Probe < BandStats < Tile < Pass.
+    let mut tier_queue = DecodeQueue::new(5, 1024);
+    let open_key = DecodeJobKey::Open(42);
     let stats_key = DecodeJobKey::BandStats {
         source: SourceId::new(7),
         band: veldmap_core::tile::BandKey::Index(0),
@@ -501,7 +502,7 @@ fn probe_job_key_deduplicates_prioritizes_ahead_of_tiles_and_respects_root_rank(
         unreachable!("root is a Tile key");
     };
     let pass_key = DecodeJobKey::Pass(root_tk.stream_key());
-    for key in [pass_key, root, stats_key, probe_a] {
+    for key in [pass_key, root, stats_key, probe_a, open_key] {
         tier_queue
             .admit_job(
                 DecodeJob {
@@ -514,6 +515,14 @@ fn probe_job_key_deduplicates_prioritizes_ahead_of_tiles_and_respects_root_rank(
             )
             .expect("admit tier job");
     }
+    assert_eq!(
+        tier_queue
+            .pop_coarsest_or_drain_cancelled()
+            .0
+            .expect("0")
+            .key,
+        open_key
+    );
     assert_eq!(
         tier_queue
             .pop_coarsest_or_drain_cancelled()

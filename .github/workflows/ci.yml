@@ -53,13 +53,15 @@ jobs:
             libxrandr-dev \
             pkg-config
 
-      - name: Run Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Run Clippy (production targets without test-support, then all targets)
+        run: |
+          cargo clippy --locked --workspace --lib --bins -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Check rustdoc builds cleanly
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --locked --workspace --no-deps --document-private-items
+        run: cargo doc --locked --workspace --no-deps --all-features --document-private-items
 
       - name: Install and run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -140,7 +142,9 @@ jobs:
 
       - name: Run Clippy (Windows/macOS; Linux covered in hygiene-and-dag)
         if: runner.os != 'Linux'
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --locked --workspace --lib --bins -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run workspace unit, shader codegen, and headless GPU smoke tests
         env:

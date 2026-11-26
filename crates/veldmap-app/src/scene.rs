@@ -1,9 +1,10 @@
 //! Scene, tile-upload, and two-lane decode-pool orchestration (`SceneState`).
 //!
 //! Owns the GPU tile cache, bounded upload queue, shared two-lane CPU decode
-//! pool (`TwoLaneDecodePool`), [`BasemapManager`], raster [`OverlayManager`],
-//! GeoJSON [`VectorManager`], interactive geodesic [`MeasureSession`], cached
-//! immutable [`DrawSnapshot`], and monotonic `scene_generation`.
+//! pool (`TwoLaneDecodePool`), shared [`NetContext`], [`BasemapManager`],
+//! raster [`OverlayManager`], GeoJSON [`VectorManager`], interactive geodesic
+//! [`MeasureSession`], Cloud/STAC [`StacSession`], cached immutable
+//! [`DrawSnapshot`], and monotonic `scene_generation`.
 
 use std::collections::HashSet;
 use std::path::Path;

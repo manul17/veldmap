@@ -5,7 +5,8 @@
 use reqwest::header::HeaderMap;
 use veldmap_core::tile::SourceFingerprint;
 
-/// Domain separation prefix matching `veldmap-storage::fingerprint_remote_source`.
+/// Domain separation prefix for remote HTTP source fingerprints so they can
+/// never collide with local `len || head || mid || tail` digests.
 const REMOTE_FINGERPRINT_DOMAIN: &[u8] = b"veldmap-remote-v1\0";
 
 /// Head window size (`64 KiB`) hashed when a server omits or weakens `ETag`.
@@ -20,15 +21,18 @@ pub(crate) enum ContentRange {
     Unsatisfied { total: u64 },
 }
 
-/// Extract a validated strong RFC 9110 `ETag` (`"..."`, never weak `W/"..."`).
+/// Extract a validated strong RFC 9110 `ETag` (`"..."`, never weak `W/"..."`
+/// or multi-quoted/control-byte values).
 pub(crate) fn parse_strong_etag(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(reqwest::header::ETAG)?.to_str().ok()?.trim();
-    if raw.len() < 2
-        || raw.starts_with("W/")
-        || raw.starts_with("w/")
-        || !raw.starts_with('"')
-        || !raw.ends_with('"')
-        || raw.bytes().any(|b| b.is_ascii_control())
+    if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
+        return None;
+    }
+    let inner = &raw.as_bytes()[1..raw.len() - 1];
+    // RFC 9110 §8.8.3 `etagc = %x21 / %x23-7E / obs-text` (forbids `"`, SP, CTL).
+    if !inner
+        .iter()
+        .all(|&b| b == 0x21 || (0x23..=0x7E).contains(&b) || b >= 0x80)
     {
         return None;
     }
@@ -57,11 +61,11 @@ pub(crate) fn validate_identity_content_encoding(headers: &HeaderMap) -> Result<
 /// Parse an RFC 9110 `Content-Range` header with an explicit total byte length.
 pub(crate) fn parse_content_range(raw: &str) -> Result<ContentRange, String> {
     let trimmed = raw.trim();
-    let rest = trimmed
-        .strip_prefix("bytes ")
-        .or_else(|| trimmed.strip_prefix("BYTES "))
-        .ok_or_else(|| format!("unsupported Content-Range unit: '{trimmed}'"))?
-        .trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 6 || !bytes[..5].eq_ignore_ascii_case(b"bytes") || bytes[5] != b' ' {
+        return Err(format!("unsupported Content-Range unit: '{trimmed}'"));
+    }
+    let rest = trimmed[6..].trim();
     let (range_part, total_part) = rest
         .split_once('/')
         .ok_or_else(|| format!("malformed Content-Range (missing '/'): '{trimmed}'"))?;
@@ -143,12 +147,15 @@ mod tests {
 
         h.insert(ETAG, HeaderValue::from_static("unquoted"));
         assert_eq!(parse_strong_etag(&h), None);
+
+        h.insert(ETAG, HeaderValue::from_static("\"a\", \"b\""));
+        assert_eq!(parse_strong_etag(&h), None);
     }
 
     #[test]
     fn parses_content_range_and_enforces_identity_encoding() {
         assert_eq!(
-            parse_content_range("bytes 0-65535/1048576").unwrap(),
+            parse_content_range("Bytes 0-65535/1048576").unwrap(),
             ContentRange::Span {
                 start: 0,
                 end: 65535,

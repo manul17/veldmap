@@ -2,23 +2,32 @@
 //! & COP-DEM GLO-30 asset/band metadata parser (`raster:bands` `scale`/`offset`),
 //! and built-in zero-auth onboarding sample scenes.
 
+mod parse;
 mod samples;
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue, RETRY_AFTER};
-use serde_json::{Map, Value};
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use serde_json::Value;
 use thiserror::Error;
-use veldmap_core::geo::{GeoJsonGeometry, export_geojson_geometry, parse_geojson};
+use veldmap_core::geo::GeoJsonGeometry;
 use veldmap_core::sync::CancelToken;
 
 use crate::context::NetContext;
-use crate::http::parse_retry_after_seconds;
-use crate::redact::{EncodedSecret, redact_secret_label, redact_text, sanitize_url_for_display};
-use crate::url::{extract_host, parse_http_authority, strip_http_scheme};
+use crate::http::{
+    BodyReadError, HostLimiters, link_cancel_token, parse_custom_headers, read_body_capped,
+    record_rate_limit_cooldown,
+};
+use crate::redact::{
+    EncodedSecret, redact_secret_label, redact_text_many, sanitize_url_for_display,
+};
+use crate::url::{
+    extract_host, is_valid_http_endpoint, split_url_query_fragment, strip_http_scheme,
+};
 
+use self::parse::{build_search_payload, parse_search_response};
 pub use self::samples::{SampleScene, builtin_sample_scenes};
 
 /// Element84 AWS Earth Search v1 public zero-auth STAC API endpoint.
@@ -33,8 +42,14 @@ pub const COLLECTION_COP_DEM_GLO30: &str = "cop-dem-glo-30";
 /// Hard response body size cap for STAC JSON search responses (`16 MiB`).
 const MAX_STAC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum error body snippet bytes read on non-2xx STAC responses.
+const MAX_STAC_ERROR_SNIPPET_BYTES: usize = 512;
+
 /// Maximum items requested in a single STAC search call.
 pub const MAX_STAC_SEARCH_LIMIT: usize = 100;
+
+/// Additional protocol-owned headers forbidden in STAC custom auth headers.
+const STAC_EXTRA_FORBIDDEN_HEADERS: &[&str] = &["content-type", "accept"];
 
 /// Errors returned by STAC catalog search requests.
 #[derive(Debug, Error)]
@@ -116,7 +131,8 @@ impl StacAuth {
         }
     }
 
-    /// Append a configured SAS query string to `url` when using [`Self::SasQuery`].
+    /// Append a configured SAS query string to `url` when using [`Self::SasQuery`],
+    /// preserving any existing `?query` and `#fragment`.
     pub fn apply_to_url(&self, url: &str) -> String {
         let Self::SasQuery(sas) = self else {
             return url.to_owned();
@@ -125,11 +141,16 @@ impl StacAuth {
         if token.is_empty() {
             return url.to_owned();
         }
-        if url.contains('?') {
-            format!("{url}&{token}")
-        } else {
-            format!("{url}?{token}")
+        let (base, query, frag) = split_url_query_fragment(url);
+        let mut out = match query {
+            Some(q) if !q.is_empty() => format!("{base}?{q}&{token}"),
+            _ => format!("{base}?{token}"),
+        };
+        if let Some(f) = frag {
+            out.push('#');
+            out.push_str(f);
         }
+        out
     }
 
     fn encoded_secret(&self) -> Option<EncodedSecret> {
@@ -189,6 +210,8 @@ pub struct StacSearchQuery {
     /// Optional RFC 3339 interval string (`"start/end"`, e.g. `"2024-06-01T00:00:00Z/2024-09-01T23:59:59Z"`).
     pub datetime: Option<String>,
     /// Optional upper bound on `eo:cloud_cover` percentage (`0.0..=100.0`).
+    /// Callers querying optical collections (e.g. Sentinel-2 L2A) should set
+    /// this explicitly; `None` omits the `eo:cloud_cover` query filter.
     pub max_cloud_cover: Option<f32>,
     /// Maximum items to return (`1..=100`).
     pub limit: usize,
@@ -200,7 +223,7 @@ impl Default for StacSearchQuery {
             bbox: None,
             intersects: None,
             datetime: None,
-            max_cloud_cover: Some(25.0),
+            max_cloud_cover: None,
             limit: 20,
         }
     }
@@ -322,15 +345,27 @@ pub struct StacSearchResult {
 }
 
 /// Asynchronous STAC API search client sharing [`NetContext`]'s gzip-enabled
-/// HTTP client and per-host concurrency/cooldown limiters.
+/// HTTP clients and per-host concurrency/cooldown limiters.
+///
+/// Intentionally holds cloned inner `Arc`s / clients rather than
+/// `Arc<NetContext>` so spawned Tokio tasks can never drop `NetContext` on a
+/// Tokio worker thread.
 #[derive(Clone)]
 pub struct StacClient {
-    net: Arc<NetContext>,
+    api_client: reqwest::Client,
+    api_auth_client: reqwest::Client,
+    host_limiters: Arc<HostLimiters>,
+    shutdown: CancelToken,
 }
 
 impl StacClient {
     pub fn new(net: Arc<NetContext>) -> Self {
-        Self { net }
+        Self {
+            api_client: net.api_client().clone(),
+            api_auth_client: net.api_auth_client().clone(),
+            host_limiters: net.host_limiters(),
+            shutdown: net.shutdown_token().clone(),
+        }
     }
 
     /// Execute a STAC `/search` query asynchronously against `catalog`.
@@ -340,73 +375,47 @@ impl StacClient {
         query: &StacSearchQuery,
         cancel: &CancelToken,
     ) -> Result<StacSearchResult, StacError> {
-        if cancel.is_cancelled() {
+        let (linked_cancel, _cancel_guard) = link_cancel_token(&self.shutdown, cancel);
+        if linked_cancel.is_cancelled() {
             return Err(StacError::Cancelled);
         }
 
-        let endpoint = catalog.endpoint.trim().trim_end_matches('/');
-        if strip_http_scheme(endpoint).is_none() || parse_http_authority(endpoint).is_none() {
+        let endpoint = catalog.endpoint.trim();
+        if !is_valid_http_endpoint(endpoint) {
             return Err(StacError::InvalidEndpoint(sanitize_url_for_display(
                 endpoint,
             )));
         }
-        let search_base = if endpoint.ends_with("/search") {
-            endpoint.to_owned()
-        } else {
-            format!("{endpoint}/search")
-        };
+        let search_base = append_search_path(endpoint);
         let search_url = catalog.auth.apply_to_url(&search_base);
         let host = extract_host(&search_url);
-        let secret = catalog.auth.encoded_secret();
-        let redact_msg = |msg: &str| redact_text(msg, secret.as_ref());
+
+        let raw_headers = catalog.auth.extra_headers();
+        let parsed = parse_custom_headers(&raw_headers, STAC_EXTRA_FORBIDDEN_HEADERS)
+            .map_err(|(name, reason)| StacError::InvalidAuthHeader { name, reason })?;
+        let custom_headers = parsed.headers;
+        let mut secrets = parsed.secrets;
+        if let Some(s) = catalog.auth.encoded_secret() {
+            secrets.push(s);
+        }
+        let redact_msg = |msg: &str| redact_text_many(msg, &secrets);
 
         let body_json = build_search_payload(&catalog.collection, query);
         let body_bytes =
             serde_json::to_vec(&body_json).map_err(|e| StacError::InvalidJson(e.to_string()))?;
 
-        let mut custom_headers = Vec::new();
-        match &catalog.auth {
-            StacAuth::None | StacAuth::SasQuery(_) => {}
-            StacAuth::Bearer(tok) if !tok.trim().is_empty() => {
-                let val =
-                    HeaderValue::from_str(&format!("Bearer {}", tok.trim())).map_err(|_| {
-                        StacError::InvalidAuthHeader {
-                            name: "Authorization".to_owned(),
-                            reason: "invalid bearer token header value".to_owned(),
-                        }
-                    })?;
-                custom_headers.push((AUTHORIZATION, val));
-            }
-            StacAuth::ApiKey { header_name, value }
-                if !header_name.trim().is_empty() && !value.trim().is_empty() =>
-            {
-                let name = HeaderName::from_bytes(header_name.trim().as_bytes()).map_err(|e| {
-                    StacError::InvalidAuthHeader {
-                        name: header_name.clone(),
-                        reason: e.to_string(),
-                    }
-                })?;
-                let val = HeaderValue::from_str(value.trim()).map_err(|_| {
-                    StacError::InvalidAuthHeader {
-                        name: header_name.clone(),
-                        reason: "invalid API key header value".to_owned(),
-                    }
-                })?;
-                custom_headers.push((name, val));
-            }
-            _ => {}
-        }
-
         let permit = self
-            .net
-            .host_limiters()
-            .acquire_permit(&host, cancel)
+            .host_limiters
+            .acquire_permit(&host, &linked_cancel)
             .await
             .map_err(|_| StacError::Cancelled)?;
 
-        let mut req = self
-            .net
-            .api_client()
+        let client = if custom_headers.is_empty() {
+            &self.api_client
+        } else {
+            &self.api_auth_client
+        };
+        let mut req = client
             .post(&search_url)
             .header(ACCEPT, "application/geo+json, application/json")
             .header(CONTENT_TYPE, "application/json")
@@ -417,16 +426,12 @@ impl StacClient {
 
         let resp_res = tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
-                drop(permit);
-                return Err(StacError::Cancelled);
-            }
+            _ = linked_cancel.cancelled() => return Err(StacError::Cancelled),
             res = req.send() => res,
         };
         let mut resp = match resp_res {
             Ok(resp) => resp,
             Err(err) => {
-                drop(permit);
                 return Err(StacError::Network(redact_msg(&err.to_string())));
             }
         };
@@ -434,54 +439,64 @@ impl StacClient {
         let status = resp.status();
         let code = status.as_u16();
         if matches!(code, 429 | 503) {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| parse_retry_after_seconds(Some(s)))
-                .unwrap_or(Duration::from_secs(5));
-            self.net
-                .host_limiters()
-                .record_cooldown(&host, Instant::now() + retry_after);
+            record_rate_limit_cooldown(
+                &self.host_limiters,
+                &host,
+                resp.headers(),
+                Duration::from_secs(5),
+            );
         }
         if !status.is_success() {
-            drop(permit);
-            return Err(StacError::HttpStatus {
-                code,
-                detail: status
-                    .canonical_reason()
-                    .unwrap_or("request failed")
-                    .to_owned(),
-            });
+            let reason = status
+                .canonical_reason()
+                .unwrap_or("request failed")
+                .to_owned();
+            let snippet = match read_body_capped(
+                &mut resp,
+                MAX_STAC_ERROR_SNIPPET_BYTES,
+                MAX_STAC_ERROR_SNIPPET_BYTES,
+                &linked_cancel,
+            )
+            .await
+            {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(redact_msg(trimmed))
+                    }
+                }
+                Err(BodyReadError::Cancelled) => return Err(StacError::Cancelled),
+                Err(_) => None,
+            };
+            let detail = match snippet {
+                Some(s) => format!("{reason} ({s})"),
+                None => reason,
+            };
+            return Err(StacError::HttpStatus { code, detail });
         }
 
-        let mut raw = Vec::new();
-        loop {
-            let chunk_res = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    drop(permit);
-                    return Err(StacError::Cancelled);
-                }
-                chunk = resp.chunk() => chunk,
-            };
-            match chunk_res {
-                Ok(Some(chunk)) => {
-                    if raw.len().saturating_add(chunk.len()) > MAX_STAC_RESPONSE_BYTES {
-                        drop(permit);
-                        return Err(StacError::ResponseTooLarge {
-                            limit: MAX_STAC_RESPONSE_BYTES,
-                        });
-                    }
-                    raw.extend_from_slice(&chunk);
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    drop(permit);
-                    return Err(StacError::Network(redact_msg(&err.to_string())));
-                }
+        let raw = match read_body_capped(
+            &mut resp,
+            MAX_STAC_RESPONSE_BYTES,
+            16 * 1024,
+            &linked_cancel,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(BodyReadError::Cancelled) => return Err(StacError::Cancelled),
+            Err(BodyReadError::TooLarge) => {
+                return Err(StacError::ResponseTooLarge {
+                    limit: MAX_STAC_RESPONSE_BYTES,
+                });
             }
-        }
+            Err(BodyReadError::Network(err)) => {
+                return Err(StacError::Network(redact_msg(&err.to_string())));
+            }
+        };
         drop(permit);
 
         let value: Value = serde_json::from_slice(&raw)
@@ -490,274 +505,48 @@ impl StacClient {
     }
 }
 
-fn build_search_payload(collection: &str, query: &StacSearchQuery) -> Value {
-    let mut obj = Map::new();
-    let col = collection.trim();
-    if !col.is_empty() {
-        obj.insert(
-            "collections".to_owned(),
-            Value::Array(vec![Value::String(col.to_owned())]),
+fn append_search_path(endpoint: &str) -> String {
+    let (base, query, frag) = split_url_query_fragment(endpoint);
+    let trimmed_base = base.trim_end_matches('/');
+    let mut out = if trimmed_base.ends_with("/search") {
+        trimmed_base.to_owned()
+    } else {
+        format!("{trimmed_base}/search")
+    };
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    if let Some(f) = frag {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_search_path_and_sas_preserve_query_and_fragment() {
+        assert_eq!(
+            append_search_path("https://example.org/stac/v1/?api=1#top"),
+            "https://example.org/stac/v1/search?api=1#top"
+        );
+        assert_eq!(
+            append_search_path("https://example.org/stac/v1/search?api=1"),
+            "https://example.org/stac/v1/search?api=1"
+        );
+
+        let sas = StacAuth::SasQuery("?sv=2024&sig=abc".to_owned());
+        assert_eq!(
+            sas.apply_to_url("https://blob.example/a.tif#band1"),
+            "https://blob.example/a.tif?sv=2024&sig=abc#band1"
+        );
+        assert_eq!(
+            sas.apply_to_url("https://blob.example/a.tif?x=1#band1"),
+            "https://blob.example/a.tif?x=1&sv=2024&sig=abc#band1"
         );
     }
-    let limit = query.limit.clamp(1, MAX_STAC_SEARCH_LIMIT);
-    obj.insert("limit".to_owned(), Value::from(limit as u64));
-
-    if let Some(geom) = &query.intersects {
-        let geom_str = export_geojson_geometry(geom);
-        if let Ok(geom_val) = serde_json::from_str::<Value>(&geom_str) {
-            obj.insert("intersects".to_owned(), geom_val);
-        }
-    } else if let Some([min_lon, min_lat, max_lon, max_lat]) = query.bbox {
-        obj.insert(
-            "bbox".to_owned(),
-            serde_json::json!([min_lon, min_lat, max_lon, max_lat]),
-        );
-    }
-
-    if let Some(dt) = &query.datetime {
-        let trimmed = dt.trim();
-        if !trimmed.is_empty() {
-            obj.insert("datetime".to_owned(), Value::String(trimmed.to_owned()));
-        }
-    }
-
-    if let Some(max_cc) = query.max_cloud_cover
-        && max_cc.is_finite()
-        && col != COLLECTION_COP_DEM_GLO30
-    {
-        let clamped = f64::from(max_cc.clamp(0.0, 100.0));
-        obj.insert(
-            "query".to_owned(),
-            serde_json::json!({
-                "eo:cloud_cover": { "lte": clamped }
-            }),
-        );
-    }
-
-    Value::Object(obj)
-}
-
-fn parse_search_response(val: &Value) -> Result<StacSearchResult, StacError> {
-    let obj = val.as_object().ok_or_else(|| {
-        StacError::InvalidJson("STAC response root is not a JSON object".to_owned())
-    })?;
-    let matched = obj
-        .get("numberMatched")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            obj.get("context")
-                .and_then(|c| c.get("matched"))
-                .and_then(Value::as_u64)
-        });
-    let features = obj
-        .get("features")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            StacError::InvalidJson("STAC response missing 'features' array".to_owned())
-        })?;
-
-    let mut items = Vec::with_capacity(features.len());
-    for feat in features {
-        if let Some(item) = parse_stac_item(feat) {
-            items.push(item);
-        }
-    }
-    Ok(StacSearchResult { items, matched })
-}
-
-fn parse_stac_item(val: &Value) -> Option<StacItem> {
-    let obj = val.as_object()?;
-    let id = obj.get("id")?.as_str()?.to_owned();
-    let collection = obj
-        .get("collection")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let props = obj.get("properties").and_then(Value::as_object);
-
-    let datetime = props
-        .and_then(|p| p.get("datetime"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let cloud_cover = props
-        .and_then(|p| p.get("eo:cloud_cover"))
-        .and_then(Value::as_f64)
-        .map(|v| v as f32);
-    let platform = props
-        .and_then(|p| p.get("platform"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let mgrs_tile = props.and_then(|p| {
-        p.get("grid:code")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                let zone = p.get("mgrs:utm_zone").and_then(Value::as_u64)?;
-                let lat_band = p.get("mgrs:latitude_band").and_then(Value::as_str)?;
-                let sq = p.get("mgrs:grid_square").and_then(Value::as_str)?;
-                Some(format!("{zone:02}{lat_band}{sq}"))
-            })
-            .or_else(|| {
-                p.get("s2:mgrs_tile")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-    });
-    let processing_level = props
-        .and_then(|p| {
-            p.get("s2:product_type")
-                .or_else(|| p.get("processing:level"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            collection.as_deref().and_then(|c| {
-                if c.contains("l2a") {
-                    Some("L2A (BOA)".to_owned())
-                } else if c.contains("l1c") {
-                    Some("L1C (TOA)".to_owned())
-                } else {
-                    None
-                }
-            })
-        });
-
-    let bbox = obj.get("bbox").and_then(Value::as_array).and_then(|arr| {
-        if arr.len() >= 4 {
-            let a = arr[0].as_f64()?;
-            let b = arr[1].as_f64()?;
-            let c = arr[2].as_f64()?;
-            let d = arr[3].as_f64()?;
-            if a.is_finite() && b.is_finite() && c.is_finite() && d.is_finite() {
-                Some([a, b, c, d])
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    });
-
-    let geometry = obj.get("geometry").and_then(|g| {
-        if g.is_null() {
-            return None;
-        }
-        let wrapped = serde_json::json!({
-            "type": "Feature",
-            "properties": {},
-            "geometry": g,
-        });
-        let text = serde_json::to_string(&wrapped).ok()?;
-        let fc = parse_geojson(&text).ok()?;
-        fc.features.into_iter().next().map(|f| f.geometry)
-    });
-
-    let mut assets = Vec::new();
-    if let Some(asset_map) = obj.get("assets").and_then(Value::as_object) {
-        for (key, a_val) in asset_map {
-            if let Some(asset) = parse_stac_asset(key, a_val) {
-                assets.push(asset);
-            }
-        }
-    }
-    assets.sort_by_key(|a| (asset_sort_rank(&a.key), a.key.clone()));
-
-    Some(StacItem {
-        id,
-        collection,
-        datetime,
-        cloud_cover,
-        platform,
-        mgrs_tile,
-        processing_level,
-        bbox,
-        geometry,
-        assets,
-    })
-}
-
-fn asset_sort_rank(key: &str) -> u8 {
-    match key.to_ascii_lowercase().as_str() {
-        "visual" | "tci" => 0,
-        "data" => 1,
-        "red" | "b04" => 2,
-        "green" | "b03" => 3,
-        "blue" | "b02" => 4,
-        "nir" | "b08" => 5,
-        "nir08" | "b8a" => 6,
-        "swir16" | "b11" => 7,
-        "swir22" | "b12" => 8,
-        "scl" => 9,
-        _ => 20,
-    }
-}
-
-fn parse_stac_asset(key: &str, val: &Value) -> Option<StacAsset> {
-    let obj = val.as_object()?;
-    let href = obj.get("href")?.as_str()?.to_owned();
-    let title = obj.get("title").and_then(Value::as_str).map(str::to_owned);
-    let media_type = obj.get("type").and_then(Value::as_str).map(str::to_owned);
-    let roles = obj
-        .get("roles")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let eo_bands = obj
-        .get("eo:bands")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|b| {
-                    b.get("common_name")
-                        .or_else(|| b.get("name"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let gsd = obj.get("gsd").and_then(Value::as_f64);
-    let raster_bands = obj
-        .get("raster:bands")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(parse_raster_band_meta).collect())
-        .unwrap_or_default();
-
-    Some(StacAsset {
-        key: key.to_owned(),
-        title,
-        href,
-        media_type,
-        roles,
-        eo_bands,
-        gsd,
-        raster_bands,
-    })
-}
-
-fn parse_raster_band_meta(val: &Value) -> Option<StacRasterBandMeta> {
-    let obj = val.as_object()?;
-    let nodata = obj.get("nodata").and_then(|v| {
-        v.as_f64().or_else(|| {
-            v.as_str()
-                .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
-                    "nan" => Some(f64::NAN),
-                    other => other.parse::<f64>().ok(),
-                })
-        })
-    });
-    Some(StacRasterBandMeta {
-        scale: obj.get("scale").and_then(Value::as_f64),
-        offset: obj.get("offset").and_then(Value::as_f64),
-        nodata,
-        data_type: obj
-            .get("data_type")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        spatial_resolution: obj.get("spatial_resolution").and_then(Value::as_f64),
-        unit: obj.get("unit").and_then(Value::as_str).map(str::to_owned),
-    })
 }

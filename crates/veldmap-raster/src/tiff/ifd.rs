@@ -54,6 +54,14 @@ pub(super) struct ChunkPixelLoc {
     pub(super) dims: ChunkDims,
 }
 
+/// Validated non-sparse TIFF chunk byte span and uncompressed storage size.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ValidatedChunkSpan {
+    pub(super) offset: u64,
+    pub(super) byte_count: u64,
+    pub(super) stored_bytes: usize,
+}
+
 /// Supported TIFF compression codecs for direct raw-chunk decoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TiffCompression {
@@ -314,12 +322,8 @@ impl CachedIfd {
                         None => vec![0],
                     });
                 }
-                Ok(match (self.pixel_layout.colors(), self.alpha_channel()) {
-                    (1, None) => vec![0],
-                    (1, Some(a)) => vec![0, a],
-                    (_, None) => vec![0, 1, 2],
-                    (_, Some(a)) => vec![0, 1, 2, a],
-                })
+                let (planes, len) = self.planar_display_planes();
+                Ok(planes[..len].to_vec())
             }
             PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => {
                 let band_idx = match spec.band {
@@ -340,6 +344,80 @@ impl CachedIfd {
                 Ok(vec![self.band_plane(band_idx)])
             }
         }
+    }
+
+    /// Return the planar (`PlanarConfiguration = 2`) source planes required
+    /// for non-palette Display RGBA8 rendering, avoiding heap allocation.
+    pub(super) const fn planar_display_planes(&self) -> ([usize; 4], usize) {
+        match (self.pixel_layout.colors(), self.alpha_channel()) {
+            (1, None) => ([0, 0, 0, 0], 1),
+            (1, Some(a)) => ([0, a, 0, 0], 2),
+            (_, None) => ([0, 1, 2, 0], 3),
+            (_, Some(a)) => ([0, 1, 2, a], 4),
+        }
+    }
+
+    /// Validate a chunk's uncompressed size, compression-bomb cap, and backing
+    /// file bounds, returning `Ok(None)` for sparse (`offset == 0 || len == 0`)
+    /// chunks. Shared between remote range planning and raw-chunk decoding.
+    pub(super) fn validated_chunk_span(
+        &self,
+        plane: usize,
+        chunk_index: u32,
+        dims: ChunkDims,
+        max_uncompressed_bytes: usize,
+        file_len: u64,
+    ) -> Result<Option<ValidatedChunkSpan>, RasterError> {
+        let (offset, byte_count) = self.chunk_span(plane, chunk_index)?;
+        if offset == 0 || byte_count == 0 {
+            return Ok(None);
+        }
+        let samples_in_chunk = self.samples_in_chunk();
+        let sample_bytes = self.sample_type.byte_size();
+        let stored_row_bytes = (dims.stored_w as usize)
+            .checked_mul(samples_in_chunk)
+            .and_then(|n| n.checked_mul(sample_bytes))
+            .ok_or_else(|| RasterError::Decode("TIFF chunk row byte size overflow".to_owned()))?;
+        let stored_bytes = stored_row_bytes
+            .checked_mul(dims.stored_h as usize)
+            .ok_or_else(|| RasterError::Decode("TIFF chunk total byte size overflow".to_owned()))?;
+        if stored_bytes > max_uncompressed_bytes {
+            return Err(RasterError::LimitExceeded {
+                width: dims.stored_w,
+                height: dims.stored_h,
+                estimated_bytes: stored_bytes as u64,
+                limit_bytes: max_uncompressed_bytes as u64,
+            });
+        }
+        // Cap compressed input read size relative to this chunk's `stored_bytes`
+        // (never the global 256 MiB chunk cap) to prevent crafted multi-hundred-MiB
+        // allocations on tiny tiles.
+        let max_compressed = stored_bytes
+            .saturating_mul(2)
+            .max(4 * 1024 * 1024)
+            .min(max_uncompressed_bytes.saturating_mul(2).max(64 * 1024))
+            as u64;
+        if byte_count > max_compressed {
+            return Err(RasterError::LimitExceeded {
+                width: dims.stored_w,
+                height: dims.stored_h,
+                estimated_bytes: byte_count,
+                limit_bytes: max_compressed,
+            });
+        }
+        if offset
+            .checked_add(byte_count)
+            .is_none_or(|end| end > file_len)
+        {
+            return Err(RasterError::Decode(format!(
+                "TIFF chunk span {offset}..+{byte_count} exceeds file length {file_len}"
+            )));
+        }
+        Ok(Some(ValidatedChunkSpan {
+            offset,
+            byte_count,
+            stored_bytes,
+        }))
     }
 
     /// Look up `(offset, byte_count)` for `(plane, chunk_index)`.

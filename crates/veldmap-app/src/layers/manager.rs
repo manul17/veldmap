@@ -1,5 +1,7 @@
-//! High-level [`OverlayManager`] facade coordinating [`LayerStack`],
-//! [`OverlayRuntime`], [`CursorProber`], and the overlay I/O worker.
+//! High-level [`OverlayManager`] facade coordinating `LayerStack`,
+//! `OverlayRuntime`, `CursorProber`, `BandStatsTracker`, isolated remote I/O
+//! (`veldmap-remote-io`), offloaded tile persistence (`veldmap-tile-write`),
+//! and the local overlay I/O worker.
 //!
 //! Returns [`OverlayMutation`] records rather than mutating `GpuTileCache` /
 //! `PendingUploads` directly, matching `BasemapManager`'s clean boundary with
@@ -92,9 +94,10 @@ pub(crate) struct OverlayMutation {
     pub(crate) purge_sources: Vec<SourceId>,
 }
 
-/// Coordinates local raster overlays: non-blocking open/reload via the overlay
-/// I/O worker, `StreamKey`-scoped two-lane scheduling, lossless QOI & `Lz4Raw`
-/// disk caching, and zoom-invariant CPU cursor readouts.
+/// Coordinates local and remote COG raster overlays: non-blocking local open/reload
+/// via the overlay I/O worker, isolated remote HTTP Range open/prefetch via
+/// `NetContext` + `veldmap-remote-io`, `StreamKey`-scoped two-lane scheduling,
+/// offloaded lossless QOI & `Lz4Raw` disk caching, and zoom-invariant CPU cursor readouts.
 pub(crate) struct OverlayManager {
     stack: LayerStack,
     next_layer_id: u64,
@@ -405,8 +408,9 @@ impl OverlayManager {
             prev.cancel();
         }
 
-        // Cancel in-flight jobs and clear runtime caches for `old_source` immediately
-        // so no worker can write stale pixels while reload runs.
+        // Cancel in-flight jobs, rotate source write tokens, purge queued disk
+        // writes, and clear runtime caches for `old_source` BEFORE `io_worker`
+        // runs `clear_source` so no pre-reload tile can poison SQLite.
         self.purge_source(prep.old_source);
 
         if !self.io_worker.send(OverlayIoCmd::Reload(request)) {
@@ -759,8 +763,16 @@ impl OverlayManager {
 
     pub(crate) fn record_upload_report(&mut self, report: &UploadBatchReport) {
         for &(stream_key, max_bytes) in &report.max_tile_bytes_by_stream {
+            let mut is_remote = false;
             for layer in self.stack.layers_mut() {
                 layer.observe_stream_tile_bytes(stream_key, max_bytes);
+                if layer.source_id() == stream_key.source && layer.source().is_remote() {
+                    is_remote = true;
+                }
+            }
+            if is_remote {
+                self.cursor
+                    .invalidate_unavailable_for_source(stream_key.source);
             }
         }
     }

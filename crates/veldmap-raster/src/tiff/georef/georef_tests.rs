@@ -14,12 +14,27 @@ fn geokey_parse_respects_count_and_nul_stripped_ascii_tail() {
         0, 0, 0, 0, // trailing padding ignored
     ];
     let doubles = [39.0_f64, f64::NAN];
-    let ascii = "Foo|Zone 37";
+    let ascii = b"Foo|Zone 37";
     let parsed = parse_geokeys(&raw_keys, &doubles, ascii);
     assert_eq!(parsed.model_type, Some(1));
     assert_eq!(parsed.get_ascii(3073), Some("Zone 37"));
     assert_eq!(parsed.get_f64(3080), Some(39.0));
     assert_eq!(parsed.keys.len(), 3);
+}
+
+#[test]
+fn geokey_parse_preserves_byte_offsets_after_latin1_bytes() {
+    // First ASCII key contains a 1-byte Latin-1 degree sign (`0xB0`), followed
+    // at exact byte offset 6 by the second ASCII key (`Zone 37|`).
+    let ascii = b"39\xb0E||Zone 37|";
+    let raw_keys = [
+        1, 1, 0, 2, // header
+        1026, 34737, 6, 0, // GTCitationGeoKey: "39\xb0E||" (6 bytes)
+        3073, 34737, 8, 6, // PCSCitationGeoKey: "Zone 37|" at byte offset 6
+    ];
+    let parsed = parse_geokeys(&raw_keys, &[], ascii);
+    assert_eq!(parsed.get_ascii(1026), Some("39\u{FFFD}E"));
+    assert_eq!(parsed.get_ascii(3073), Some("Zone 37"));
 }
 
 #[test]

@@ -1,8 +1,8 @@
 //! Shared overlay runtime handles, scheduler reconciliation helpers, and
 //! [`DecodeContext`] construction.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,31 @@ use super::disk_cache::TileWriteHandle;
 /// so the UI retries cleanly without spinning at 100% CPU.
 const SUBMIT_BACKOFF_DELAY: Duration = Duration::from_millis(50);
 
+/// Maximum concurrent asynchronous remote COG pointwise prefetch tasks spawned
+/// onto [`NetContext`] so zooming into remote scenes applies bounded
+/// backpressure instead of spawning unbounded Tokio / SQLite blocking tasks.
+const MAX_REMOTE_PREFETCH_IN_FLIGHT: usize = 32;
+
+/// RAII permit bounding concurrent remote COG pointwise prefetch tasks.
+pub(super) struct RemotePrefetchPermit {
+    runtime: Arc<OverlayRuntime>,
+}
+
+impl Drop for RemotePrefetchPermit {
+    fn drop(&mut self) {
+        self.runtime
+            .remote_prefetch_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+        if self
+            .runtime
+            .remote_prefetch_saturated
+            .swap(false, Ordering::AcqRel)
+        {
+            self.runtime.request_reschedule();
+        }
+    }
+}
+
 /// Shared runtime dependencies for overlay scheduling, decoding, caching, and
 /// wakeups. Held behind `Arc` so worker closures and helpers stay concise.
 pub(super) struct OverlayRuntime {
@@ -32,6 +57,8 @@ pub(super) struct OverlayRuntime {
     pub(super) budget_tracker: Arc<DecodeBudgetTracker>,
     pub(super) fingerprint_cache: Arc<LocalFingerprintCache>,
     scheduler: Mutex<TileScheduler>,
+    source_write_tokens: Mutex<HashMap<SourceId, (u64, CancelToken)>>,
+    next_write_gen: AtomicU64,
     pub(super) disk_cache: Option<Arc<TileDiskCache>>,
     pub(super) tile_writer: Option<TileWriteHandle>,
     pub(super) net: Option<Arc<NetContext>>,
@@ -43,6 +70,8 @@ pub(super) struct OverlayRuntime {
     pub(super) shutdown: CancelToken,
     reschedule_needed: AtomicBool,
     submit_backoff_until: Mutex<Option<Instant>>,
+    remote_prefetch_in_flight: AtomicUsize,
+    remote_prefetch_saturated: AtomicBool,
 }
 
 impl OverlayRuntime {
@@ -68,6 +97,8 @@ impl OverlayRuntime {
             budget_tracker: Arc::new(DecodeBudgetTracker::new(budget.decode_working_bytes)),
             fingerprint_cache: Arc::new(LocalFingerprintCache::new()),
             scheduler: Mutex::new(TileScheduler::default()),
+            source_write_tokens: Mutex::new(HashMap::new()),
+            next_write_gen: AtomicU64::new(1),
             disk_cache,
             tile_writer,
             net,
@@ -79,6 +110,47 @@ impl OverlayRuntime {
             shutdown,
             reschedule_needed: AtomicBool::new(false),
             submit_backoff_until: Mutex::new(None),
+            remote_prefetch_in_flight: AtomicUsize::new(0),
+            remote_prefetch_saturated: AtomicBool::new(false),
+        }
+    }
+
+    /// Return the current source-scoped `(write_gen, cancel_token)` pair for
+    /// `TileWriteWorker` commits, allocating a fresh child of `self.shutdown`
+    /// on first use or after a source purge/reload.
+    pub(super) fn write_token_for_source(&self, source_id: SourceId) -> (u64, CancelToken) {
+        let mut map = lock_unpoisoned(&self.source_write_tokens);
+        if let Some((write_gen, tok)) = map.get(&source_id) {
+            return (*write_gen, tok.clone());
+        }
+        let write_gen = self.next_write_gen.fetch_add(1, Ordering::Relaxed);
+        let tok = self.shutdown.child_token();
+        map.insert(source_id, (write_gen, tok.clone()));
+        (write_gen, tok)
+    }
+
+    /// Attempt to acquire a bounded remote pointwise prefetch slot.
+    pub(super) fn try_acquire_remote_prefetch(self: &Arc<Self>) -> Option<RemotePrefetchPermit> {
+        let mut cur = self.remote_prefetch_in_flight.load(Ordering::Acquire);
+        loop {
+            if cur >= MAX_REMOTE_PREFETCH_IN_FLIGHT {
+                self.remote_prefetch_saturated
+                    .store(true, Ordering::Release);
+                return None;
+            }
+            match self.remote_prefetch_in_flight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(RemotePrefetchPermit {
+                        runtime: Arc::clone(self),
+                    });
+                }
+                Err(actual) => cur = actual,
+            }
         }
     }
 
@@ -98,10 +170,21 @@ impl OverlayRuntime {
         (self.wakeup)();
     }
 
-    fn note_submit_backoff(&self) {
-        let mut until = lock_unpoisoned(&self.submit_backoff_until);
-        let next = Instant::now() + SUBMIT_BACKOFF_DELAY;
-        *until = Some(until.map_or(next, |prev| prev.min(next)));
+    pub(super) fn note_submit_backoff(&self) {
+        let now = Instant::now();
+        let should_wake = {
+            let mut until = lock_unpoisoned(&self.submit_backoff_until);
+            let was_idle = until.is_none_or(|prev| prev <= now);
+            let next = now + SUBMIT_BACKOFF_DELAY;
+            *until = Some(until.map_or(next, |prev| prev.min(next)));
+            was_idle
+        };
+        // Wake an idle UI loop once per backoff window so background pool
+        // rejections (e.g. remote pointwise handoff to `fast_pool`) schedule a
+        // timed repaint via `retry_delay()`.
+        if should_wake {
+            (self.wakeup)();
+        }
     }
 
     /// Submit `job` to `pool`, guaranteeing that on rejection `on_reject` runs
@@ -299,15 +382,28 @@ impl OverlayRuntime {
         }
     }
 
-    /// Cancel all pointwise and pass jobs for every source in `sources` under a
-    /// single scheduler lock acquisition, cancelling tokens strictly outside
-    /// the lock.
+    /// Cancel all pointwise, pass, and deferred disk-write jobs for every source
+    /// in `sources`, cancelling tokens strictly outside internal locks.
     pub(super) fn cancel_sources(&self, sources: impl IntoIterator<Item = SourceId>) {
+        let sources: Vec<SourceId> = sources.into_iter().collect();
         let mut tokens = Vec::new();
         {
             let mut sched = lock_unpoisoned(&self.scheduler);
-            for source_id in sources {
+            for &source_id in &sources {
                 tokens.extend(sched.reset_source(source_id));
+            }
+        }
+        {
+            let mut write_tokens = lock_unpoisoned(&self.source_write_tokens);
+            for &source_id in &sources {
+                if let Some((_, tok)) = write_tokens.remove(&source_id) {
+                    tokens.push(tok);
+                }
+            }
+        }
+        if let Some(writer) = &self.tile_writer {
+            for &source_id in &sources {
+                writer.purge_source(source_id);
             }
         }
         for tok in tokens {

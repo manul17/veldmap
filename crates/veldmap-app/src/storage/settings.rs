@@ -1,11 +1,12 @@
 //! Persistent user application settings (active basemap, NASA GIBS date,
-//! Custom XYZ/TMS template & API key, disk cache budget, graticule toggle)
-//! stored via `veldmap-storage`'s durable private atomic JSON I/O.
+//! Custom XYZ/TMS template & API key, disk/GPU cache budgets, graticule toggle,
+//! and Custom STAC endpoint & auth credentials) stored via `veldmap-storage`'s
+//! durable private atomic JSON I/O.
 //!
 //! Kept in `veldmap-app` rather than `veldmap-storage` so the low-level
 //! persistence crate stays free of UI and basemap domain schemas while
 //! settings normalization and redacted `Debug` formatting delegate directly to
-//! `veldmap-net`'s canonical constants and [`CustomBasemapConfig`].
+//! `veldmap-net`'s canonical constants and validators.
 
 use std::fmt;
 use std::ops::RangeInclusive;
@@ -13,7 +14,8 @@ use std::ops::RangeInclusive;
 use serde::{Deserialize, Deserializer, Serialize};
 use veldmap_net::{
     CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, StacAuth, StacCatalogConfig,
-    is_valid_gibs_date, sanitize_url_for_display,
+    is_valid_custom_header_name, is_valid_gibs_date, is_valid_http_endpoint,
+    sanitize_url_for_display,
 };
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
@@ -197,7 +199,7 @@ impl fmt::Debug for CustomXyzSettings {
 }
 
 /// Authentication mechanism for custom STAC API catalogs and their COG assets.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StacAuthKind {
     #[default]
@@ -205,6 +207,25 @@ pub(crate) enum StacAuthKind {
     Bearer,
     ApiKey,
     SasQuery,
+}
+
+impl<'de> Deserialize<'de> for StacAuthKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "none" => Self::None,
+            "bearer" => Self::Bearer,
+            "api_key" => Self::ApiKey,
+            "sas_query" => Self::SasQuery,
+            other => {
+                tracing::warn!(
+                    auth_kind = %other,
+                    "Unknown STAC auth_kind in settings.json; falling back to none"
+                );
+                Self::None
+            }
+        })
+    }
 }
 
 impl StacAuthKind {
@@ -245,6 +266,37 @@ impl Default for StacSettings {
 }
 
 impl StacSettings {
+    /// Trim whitespace and scrub unused secret material when `auth_kind == None`.
+    pub(crate) fn normalize(&mut self) {
+        self.custom_endpoint = self.custom_endpoint.trim().to_owned();
+        self.custom_collection = self.custom_collection.trim().to_owned();
+        self.auth_header_name = self.auth_header_name.trim().to_owned();
+        if self.auth_kind == StacAuthKind::None {
+            self.auth_secret.clear();
+        } else {
+            self.auth_secret = self.auth_secret.trim().to_owned();
+        }
+    }
+
+    /// Return a human-readable validation error if the configured Custom STAC
+    /// endpoint URL or API-key header name is invalid.
+    pub(crate) fn validation_error(&self) -> Option<String> {
+        let ep = self.custom_endpoint.trim();
+        if !ep.is_empty() && !is_valid_http_endpoint(ep) {
+            return Some("STAC API URL must be a valid http:// or https:// URL.".to_owned());
+        }
+        if self.auth_kind == StacAuthKind::ApiKey {
+            let hdr = self.auth_header_name.trim();
+            if hdr.is_empty() || !is_valid_custom_header_name(hdr) {
+                return Some(
+                    "API key header name must be a valid non-protocol HTTP header (e.g. x-api-key)."
+                        .to_owned(),
+                );
+            }
+        }
+        None
+    }
+
     pub(crate) fn to_stac_auth(&self) -> StacAuth {
         let secret = self.auth_secret.trim();
         if secret.is_empty() {
@@ -339,7 +391,11 @@ impl BasemapSettingsDraft {
         }
         target.disk_cache_max_mb = self.disk_cache_max_mb;
         target.gpu_tile_cache_max_mb = self.gpu_tile_cache_max_mb;
-        target.stac = self.stac.clone();
+        if self.stac.validation_error().is_none() {
+            let mut stac = self.stac.clone();
+            stac.normalize();
+            target.stac = stac;
+        }
     }
 }
 
@@ -412,6 +468,7 @@ impl AppSettings {
         } else if trimmed.len() != self.gibs_date.len() {
             self.gibs_date = trimmed.to_owned();
         }
+        self.stac.normalize();
     }
 
     /// Resolve effective GPU tile cache byte cap from user override or auto
@@ -443,7 +500,8 @@ impl AppSettings {
     }
 
     /// Persist settings durably via `write_json_durable_private` (`0600` on
-    /// Unix so optional Custom XYZ API keys are owner-readable only).
+    /// Unix so optional Custom XYZ API keys and Custom STAC auth secrets are
+    /// owner-readable only).
     pub(super) fn save(&self, paths: &StoragePaths) -> Result<(), StorageError> {
         let mut normalized = self.clone();
         normalized.normalize();

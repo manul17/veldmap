@@ -1,5 +1,7 @@
-//! Shared URL authority and userinfo parsing helpers for `veldmap-net`
-//! (used by live basemap validation/host extraction and URL credential redaction).
+//! Shared URL authority, origin comparison, canonicalization, and userinfo
+//! parsing helpers for `veldmap-net` (used by live basemap validation,
+//! `HttpRangeSource` fingerprinting, STAC origin checks, and URL credential
+//! redaction).
 
 use std::net::Ipv6Addr;
 
@@ -136,68 +138,68 @@ pub(crate) fn canonical_url_without_query(url: &str) -> Option<String> {
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Return whether `url` is a syntactically valid `http://` or `https://` URL
+/// with a valid authority and no ASCII whitespace or control bytes.
+pub fn is_valid_http_endpoint(url: &str) -> bool {
+    let trimmed = url.trim();
+    !trimmed.is_empty()
+        && !trimmed
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        && strip_http_scheme(trimmed).is_some()
+        && parse_http_authority(trimmed).is_some()
+}
 
-    #[test]
-    fn split_authority_and_userinfo_handles_credentials_ipv6_and_tails() {
-        assert_eq!(
-            split_authority_and_userinfo("user:p@ss@[::1]:8080/tiles?k=1#f"),
-            AuthorityParts {
-                userinfo: Some("user:p@ss"),
-                host_port: "[::1]:8080",
-                tail: "/tiles?k=1#f",
-            }
-        );
-        assert_eq!(
-            split_authority_and_userinfo("tiles.example.org?token=abc"),
-            AuthorityParts {
-                userinfo: None,
-                host_port: "tiles.example.org",
-                tail: "?token=abc",
-            }
-        );
-        assert_eq!(
-            split_authority_and_userinfo("tiles.example.org"),
-            AuthorityParts {
-                userinfo: None,
-                host_port: "tiles.example.org",
-                tail: "",
-            }
-        );
+/// Split `url` into `(base_without_query_or_fragment, optional_query_without_qmark,
+/// optional_fragment_without_hash)`.
+pub(crate) fn split_url_query_fragment(url: &str) -> (&str, Option<&str>, Option<&str>) {
+    let (before_frag, frag) = match url.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (url, None),
+    };
+    let (base, query) = match before_frag.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (before_frag, None),
+    };
+    (base, query, frag)
+}
+
+fn normalized_http_origin(url: &str) -> Option<(&'static str, String, u16)> {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return None;
     }
+    let (scheme, default_port) =
+        if trimmed.len() >= 8 && trimmed.as_bytes()[..8].eq_ignore_ascii_case(b"https://") {
+            ("https", 443u16)
+        } else if trimmed.len() >= 7 && trimmed.as_bytes()[..7].eq_ignore_ascii_case(b"http://") {
+            ("http", 80u16)
+        } else {
+            return None;
+        };
+    let auth = parse_http_authority(trimmed)?;
+    let port_suffix = &auth.host_port[auth.host.len()..];
+    let port = if let Some(p) = port_suffix.strip_prefix(':') {
+        p.parse::<u16>().ok()?
+    } else {
+        default_port
+    };
+    Some((scheme, auth.host.to_ascii_lowercase(), port))
+}
 
-    #[test]
-    fn url_authority_parsing_and_host_extraction_handle_edge_cases() {
-        assert_eq!(
-            extract_host("HTTPS://GIBS.Earthdata.NASA.gov/wmts/1/2/3.jpg"),
-            "gibs.earthdata.nasa.gov"
-        );
-        // Multi-byte UTF-8 straddling byte offsets 7..8 must never panic.
-        assert_eq!(
-            strip_http_scheme("http://\u{00e9}/{z}/{x}/{y}.png"),
-            Some("\u{00e9}/{z}/{x}/{y}.png")
-        );
-        assert_eq!(
-            strip_http_scheme("\u{00e9}\u{00e9}\u{00e9}\u{00e9}://example.com"),
-            None
-        );
-        assert_eq!(extract_host("http://\u{00e9}/0/0/0.png"), "\u{00e9}");
-        assert_eq!(
-            extract_host("http://user:pass@127.0.0.1:8080/0/0/0.png?key=1"),
-            "127.0.0.1:8080"
-        );
-        assert_eq!(extract_host("http://[::1]:8080/0/0/0.png"), "[::1]:8080");
-        let ipv6 = parse_http_authority("http://user:pw@[::1]:8080/0/0/0.png").expect("ipv6");
-        assert_eq!(ipv6.host, "[::1]");
-        assert_eq!(ipv6.host_port, "[::1]:8080");
-
-        // Reject invalid ports and malformed IPv6 brackets.
-        assert!(parse_http_authority("http://example.com:notaport/0/0/0.png").is_none());
-        assert!(parse_http_authority("http://example.com:70000/0/0/0.png").is_none());
-        assert!(parse_http_authority("http://example.com:/0/0/0.png").is_none());
-        assert!(parse_http_authority("http://[invalid]/0/0/0.png").is_none());
-        assert!(parse_http_authority("http://[::1]:bad/0/0/0.png").is_none());
+/// Return whether two HTTP(S) URLs share the exact same `(scheme, host, port)`
+/// origin (normalizing default ports `http -> 80` and `https -> 443`).
+pub fn same_http_origin(a: &str, b: &str) -> bool {
+    match (normalized_http_origin(a), normalized_http_origin(b)) {
+        (Some(oa), Some(ob)) => oa == ob,
+        _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "url_tests.rs"]
+mod tests;

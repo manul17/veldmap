@@ -77,44 +77,6 @@ pub fn fingerprint_byte_source(
     ))
 }
 
-/// Domain separation prefix for remote HTTP source fingerprints so they can
-/// never collide with local `len || head || mid || tail` digests.
-const REMOTE_FINGERPRINT_DOMAIN: &[u8] = b"veldmap-remote-v1\0";
-
-/// Derive a deterministic [`SourceFingerprint`] for a remote HTTP object
-/// without issuing extra `mid_64k`/`tail_64k` range requests.
-///
-/// - When `strong_etag` is `Some` (a validated strong RFC 9110 ETag), hashes
-///   `(canonical_url_without_query, strong_etag, content_length)`.
-/// - Otherwise hashes `(canonical_url_without_query, content_length, blake3(head_64k))`
-///   using at most the first `64 KiB` already fetched during the open probe.
-///
-/// The resulting 64-character lowercase hex string always satisfies
-/// [`crate::TileDiskCache`]'s `<= 128`-byte ASCII source-key allowlist.
-pub fn fingerprint_remote_source(
-    canonical_url_without_query: &str,
-    content_length: u64,
-    strong_etag: Option<&str>,
-    head_bytes: &[u8],
-) -> SourceFingerprint {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(REMOTE_FINGERPRINT_DOMAIN);
-    hasher.update(&(canonical_url_without_query.len() as u64).to_le_bytes());
-    hasher.update(canonical_url_without_query.as_bytes());
-    hasher.update(&content_length.to_le_bytes());
-    if let Some(etag) = strong_etag {
-        hasher.update(&[1u8]);
-        hasher.update(&(etag.len() as u64).to_le_bytes());
-        hasher.update(etag.as_bytes());
-    } else {
-        hasher.update(&[0u8]);
-        let prefix = &head_bytes[..head_bytes.len().min(FINGERPRINT_SAMPLE_BYTES as usize)];
-        let head_hash = blake3::hash(prefix);
-        hasher.update(head_hash.as_bytes());
-    }
-    SourceFingerprint::from_digest(*hasher.finalize().as_bytes())
-}
-
 #[derive(Clone, Copy)]
 struct CachedStat {
     len: u64,
@@ -333,26 +295,5 @@ mod tests {
         std::fs::remove_file(&path).expect("remove");
         cache.invalidate(&path);
         assert!(lock_unpoisoned(&cache.entries).is_empty());
-    }
-
-    #[test]
-    fn remote_fingerprint_uses_strong_etag_or_head_fallback_and_stays_ascii_valid() {
-        let head_a = vec![0xAAu8; 4096];
-        let head_b = vec![0xBBu8; 4096];
-        let url = "https://example.org/sentinel2/B04.tif";
-
-        let fp_etag_a = fingerprint_remote_source(url, 1_000_000, Some("\"abc123\""), &head_a);
-        let fp_etag_b = fingerprint_remote_source(url, 1_000_000, Some("\"abc123\""), &head_b);
-        assert_eq!(fp_etag_a, fp_etag_b);
-        assert!(valid_source_key(&fp_etag_a.to_hex()));
-
-        let fp_etag_diff = fingerprint_remote_source(url, 1_000_000, Some("\"def456\""), &head_a);
-        assert_ne!(fp_etag_a, fp_etag_diff);
-
-        let fp_head_a = fingerprint_remote_source(url, 1_000_000, None, &head_a);
-        let fp_head_b = fingerprint_remote_source(url, 1_000_000, None, &head_b);
-        assert_ne!(fp_head_a, fp_head_b);
-        assert_ne!(fp_head_a, fp_etag_a);
-        assert!(valid_source_key(&fp_head_a.to_hex()));
     }
 }

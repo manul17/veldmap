@@ -6,31 +6,29 @@
 mod pool;
 mod protocol;
 mod singleflight;
+mod transport;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use reqwest::header::{ACCEPT_ENCODING, HeaderName, HeaderValue, IF_MATCH, RANGE, RETRY_AFTER};
+use reqwest::header::{HeaderName, HeaderValue};
 use thiserror::Error;
 use veldmap_core::io::{ByteSource, IoError};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::SourceFingerprint;
 
 use crate::context::NetContext;
-use crate::http::parse_retry_after_seconds;
-use crate::redact::{EncodedSecret, redact_text, sanitize_url_for_display};
+use crate::http::{HostLimiters, link_cancel_token, parse_custom_headers};
+use crate::redact::{EncodedSecret, sanitize_url_for_display};
 use crate::url::{canonical_url_without_query, extract_host};
 
 pub use self::pool::RANGE_BLOCK_SIZE;
 pub(crate) use self::pool::{BlockPoolKey, PrefetchBudget, PrefetchBudgetLease, RangeBlockPool};
-use self::protocol::{
-    ContentRange, fingerprint_remote_source, parse_content_range, parse_strong_etag,
-    validate_identity_content_encoding,
-};
+use self::protocol::fingerprint_remote_source;
 use self::singleflight::{BlockFlight, LeaderCleanupGuard, SharedRangeError, SingleflightTable};
+use self::transport::{RangeFetchMode, RangeFetchRequest, fetch_range_http};
 
 /// Default initial head probe window (`256 KiB`), covering typical 128–300 KiB
 /// Sentinel-2 COG IFD and tile-offset headers in a single RTT.
@@ -48,10 +46,6 @@ const DEFAULT_MAX_READAHEAD_BLOCKS: u64 = 4;
 
 /// Default transient retry limit for HTTP Range requests.
 const DEFAULT_MAX_RETRIES: usize = 2;
-
-/// Default fallback retry delay when a server returns `429`/`503` without
-/// `Retry-After`.
-const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Errors returned when opening an [`HttpRangeSource`].
 #[derive(Debug, Error)]
@@ -160,27 +154,44 @@ struct ReadaheadTracker {
 
 impl ReadaheadTracker {
     fn extra_blocks(&mut self, first_block: u64, last_block: u64, max_ra: u64) -> u64 {
-        let extra = if max_ra == 0 {
-            0
-        } else if self
+        if self
             .last_consumed_block
             .is_some_and(|prev| first_block == prev.saturating_add(1))
         {
             self.sequential_streak = self.sequential_streak.saturating_add(1);
-            (1u64 << (self.sequential_streak.min(4) - 1)).min(max_ra)
+        } else if self
+            .last_consumed_block
+            .is_some_and(|prev| first_block == prev && last_block == prev)
+        {
+            // Repeated sub-block read within the same 64 KiB block keeps the
+            // current sequential streak intact without advancing it.
         } else {
             self.sequential_streak = 0;
-            0
-        };
+        }
         self.last_consumed_block = Some(last_block);
-        extra
+
+        if max_ra == 0 || self.sequential_streak == 0 {
+            0
+        } else {
+            (1u64 << (self.sequential_streak.min(4) - 1)).min(max_ra)
+        }
     }
 }
 
 type ActivePinMap = HashMap<u64, (usize, Arc<[u8]>)>;
 
+/// Internal shared state for [`HttpRangeSource`].
+///
+/// Intentionally holds cloned inner `Arc`s / handles rather than
+/// `Arc<NetContext>` so spawned Tokio singleflight tasks can never drop the
+/// last `NetContext` (and its `tokio::runtime::Runtime`) on a Tokio worker.
 struct RangeInner {
-    net: Arc<NetContext>,
+    handle: tokio::runtime::Handle,
+    shutdown: CancelToken,
+    client: reqwest::Client,
+    host_limiters: Arc<HostLimiters>,
+    range_pool: Arc<RangeBlockPool>,
+    prefetch_budget: Arc<PrefetchBudget>,
     url: String,
     canonical_url: Arc<str>,
     host: String,
@@ -227,14 +238,6 @@ impl RangeInner {
         (self.len - start).min(RANGE_BLOCK_SIZE as u64) as usize
     }
 
-    fn redact(&self, text: &str) -> String {
-        let mut out = redact_text(text, None);
-        for secret in &self.secrets {
-            out = redact_text(&out, Some(secret));
-        }
-        out
-    }
-
     fn lookup_cached_block(&self, block_idx: u64) -> Option<Arc<[u8]>> {
         let start = block_idx.saturating_mul(RANGE_BLOCK_SIZE as u64);
         let expected_len = self.expected_block_len(block_idx);
@@ -248,12 +251,11 @@ impl RangeInner {
         if let Some((_, data)) = lock_unpoisoned(&self.active_pins).get(&block_idx) {
             return Some(Arc::clone(data));
         }
-        self.net.range_pool().get(&self.pool_key(block_idx))
+        self.range_pool.get(&self.pool_key(block_idx))
     }
 
     fn insert_into_pool(&self, block_idx: u64, data: &Arc<[u8]>) {
-        self.net
-            .range_pool()
+        self.range_pool
             .insert(self.pool_key(block_idx), Arc::clone(data));
     }
 
@@ -272,210 +274,42 @@ impl RangeInner {
             return Ok(HashMap::new());
         }
         let byte_end_incl = byte_end_excl - 1;
-        let expected_total = (byte_end_excl - byte_start) as usize;
-        let range_hdr = format!("bytes={byte_start}-{byte_end_incl}");
 
-        let mut attempt = 0usize;
-        'retry: loop {
-            if cancel.is_cancelled() {
-                return Err(SharedRangeError::Cancelled);
-            }
+        let req_cfg = RangeFetchRequest {
+            client: &self.client,
+            host_limiters: &self.host_limiters,
+            url: &self.url,
+            host: &self.host,
+            extra_headers: &self.extra_headers,
+            secrets: &self.secrets,
+            max_retries: self.max_retries,
+            mode: RangeFetchMode::BlockSpan {
+                byte_start,
+                byte_end_incl,
+                total_len: self.len,
+                strong_etag: self.strong_etag.as_deref(),
+            },
+            request_counter: Some(&self.http_requests),
+        };
+        let resp = fetch_range_http(&req_cfg, cancel).await?;
+        let body = resp.body;
 
-            let permit = self
-                .net
-                .host_limiters()
-                .acquire_permit(&self.host, cancel)
-                .await
-                .map_err(|_| SharedRangeError::Cancelled)?;
+        self.bytes_delivered
+            .fetch_add(body.len() as u64, Ordering::Relaxed);
 
-            let mut req = self
-                .net
-                .range_client()
-                .get(&self.url)
-                .header(RANGE, &range_hdr)
-                .header(ACCEPT_ENCODING, "identity");
-            if let Some(etag) = &self.strong_etag {
-                req = req.header(IF_MATCH, etag.as_ref());
+        let mut blocks = HashMap::with_capacity((end_block - start_block + 1) as usize);
+        let mut cursor = 0usize;
+        for blk in start_block..=end_block {
+            let blen = self.expected_block_len(blk);
+            if blen == 0 || cursor + blen > body.len() {
+                break;
             }
-            for (name, value) in &self.extra_headers {
-                req = req.header(name, value);
-            }
-
-            self.http_requests.fetch_add(1, Ordering::Relaxed);
-            let resp_res = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    drop(permit);
-                    return Err(SharedRangeError::Cancelled);
-                }
-                res = req.send() => res,
-            };
-
-            let resp = match resp_res {
-                Ok(resp) => resp,
-                Err(err) => {
-                    drop(permit);
-                    if attempt < self.max_retries && !cancel.is_cancelled() {
-                        attempt += 1;
-                        sleep_cancel(Duration::from_millis(150 * attempt as u64), cancel).await?;
-                        continue;
-                    }
-                    return Err(SharedRangeError::Network(self.redact(&err.to_string())));
-                }
-            };
-
-            let status = resp.status();
-            let code = status.as_u16();
-            if code == 200 {
-                drop(permit);
-                return Err(SharedRangeError::RangeNotSupported(
-                    "server responded with 200 OK instead of 206 Partial Content".to_owned(),
-                ));
-            }
-            if code == 412 {
-                drop(permit);
-                return Err(SharedRangeError::PreconditionFailed(
-                    "ETag mismatch during byte-range fetch".to_owned(),
-                ));
-            }
-            if matches!(code, 429 | 503) {
-                let retry_after = resp
-                    .headers()
-                    .get(RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| parse_retry_after_seconds(Some(s)))
-                    .unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF);
-                self.net
-                    .host_limiters()
-                    .record_cooldown(&self.host, Instant::now() + retry_after);
-                drop(permit);
-                if attempt < self.max_retries && !cancel.is_cancelled() {
-                    attempt += 1;
-                    continue;
-                }
-                return Err(SharedRangeError::HttpStatus {
-                    code,
-                    detail: "rate limited".to_owned(),
-                });
-            }
-            if status.is_server_error() || code == 408 {
-                drop(permit);
-                if attempt < self.max_retries && !cancel.is_cancelled() {
-                    attempt += 1;
-                    sleep_cancel(Duration::from_millis(150 * attempt as u64), cancel).await?;
-                    continue;
-                }
-                return Err(SharedRangeError::HttpStatus {
-                    code,
-                    detail: status
-                        .canonical_reason()
-                        .unwrap_or("server error")
-                        .to_owned(),
-                });
-            }
-            if code != 206 {
-                drop(permit);
-                return Err(SharedRangeError::HttpStatus {
-                    code,
-                    detail: status
-                        .canonical_reason()
-                        .unwrap_or("unexpected status")
-                        .to_owned(),
-                });
-            }
-
-            if let Err(msg) = validate_identity_content_encoding(resp.headers()) {
-                drop(permit);
-                return Err(SharedRangeError::InvalidResponse(msg));
-            }
-
-            let cr_raw = resp
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    SharedRangeError::InvalidResponse(
-                        "206 response missing Content-Range header".to_owned(),
-                    )
-                })?;
-            let cr = parse_content_range(cr_raw).map_err(SharedRangeError::InvalidResponse)?;
-            match cr {
-                ContentRange::Span { start, end, total }
-                    if start == byte_start && end == byte_end_incl && total == self.len => {}
-                other => {
-                    drop(permit);
-                    return Err(SharedRangeError::InvalidResponse(format!(
-                        "Content-Range mismatch: expected {byte_start}-{byte_end_incl}/{}, got {other:?}",
-                        self.len
-                    )));
-                }
-            }
-
-            let mut body = Vec::with_capacity(expected_total);
-            let mut resp = resp;
-            loop {
-                let chunk_res = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        drop(permit);
-                        return Err(SharedRangeError::Cancelled);
-                    }
-                    chunk = resp.chunk() => chunk,
-                };
-                match chunk_res {
-                    Ok(Some(chunk)) => {
-                        if body.len().saturating_add(chunk.len()) > expected_total {
-                            drop(permit);
-                            return Err(SharedRangeError::InvalidResponse(format!(
-                                "206 body exceeded Content-Range length ({expected_total} B)"
-                            )));
-                        }
-                        body.extend_from_slice(&chunk);
-                    }
-                    Ok(None) => break,
-                    Err(err) => {
-                        drop(permit);
-                        if attempt < self.max_retries && !cancel.is_cancelled() {
-                            attempt += 1;
-                            sleep_cancel(Duration::from_millis(150 * attempt as u64), cancel)
-                                .await?;
-                            continue 'retry;
-                        }
-                        return Err(SharedRangeError::Network(self.redact(&err.to_string())));
-                    }
-                }
-            }
-            drop(permit);
-
-            if body.len() != expected_total {
-                if attempt < self.max_retries && !cancel.is_cancelled() {
-                    attempt += 1;
-                    sleep_cancel(Duration::from_millis(150 * attempt as u64), cancel).await?;
-                    continue;
-                }
-                return Err(SharedRangeError::InvalidResponse(format!(
-                    "truncated 206 body: expected {expected_total} B, received {} B",
-                    body.len()
-                )));
-            }
-
-            self.bytes_delivered
-                .fetch_add(body.len() as u64, Ordering::Relaxed);
-
-            let mut blocks = HashMap::with_capacity((end_block - start_block + 1) as usize);
-            let mut cursor = 0usize;
-            for blk in start_block..=end_block {
-                let blen = self.expected_block_len(blk);
-                if blen == 0 || cursor + blen > body.len() {
-                    break;
-                }
-                let slice: Arc<[u8]> = Arc::from(&body[cursor..cursor + blen]);
-                self.insert_into_pool(blk, &slice);
-                blocks.insert(blk, slice);
-                cursor += blen;
-            }
-            return Ok(blocks);
+            let slice: Arc<[u8]> = Arc::from(&body[cursor..cursor + blen]);
+            self.insert_into_pool(blk, &slice);
+            blocks.insert(blk, slice);
+            cursor += blen;
         }
+        Ok(blocks)
     }
 
     async fn fetch_blocks_singleflight(
@@ -491,7 +325,7 @@ impl RangeInner {
             missing_blocks,
             max_gap_blocks,
             MAX_COALESCED_SPAN_BLOCKS,
-            self.net.shutdown_token(),
+            &self.shutdown,
         );
 
         let mut flights_to_wait: Vec<(Arc<BlockFlight>, singleflight::WaiterGuard)> = plan.joined;
@@ -502,7 +336,7 @@ impl RangeInner {
             let inner = Arc::clone(self);
             let flight = Arc::clone(&span.flight);
             let leader_guard: LeaderCleanupGuard = span.leader_guard;
-            self.net.handle().spawn(async move {
+            self.handle.spawn(async move {
                 let outcome = inner
                     .fetch_block_span_http(start_block, end_block, flight.cancel_token())
                     .await
@@ -522,14 +356,6 @@ impl RangeInner {
             }
         }
         Ok(collected)
-    }
-}
-
-async fn sleep_cancel(dur: Duration, cancel: &CancelToken) -> Result<(), SharedRangeError> {
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(SharedRangeError::Cancelled),
-        _ = tokio::time::sleep(dur) => Ok(()),
     }
 }
 
@@ -559,7 +385,8 @@ impl HttpRangeSource {
         config: HttpRangeConfig,
         cancel: &CancelToken,
     ) -> Result<Self, RangeOpenError> {
-        if cancel.is_cancelled() {
+        let (linked_cancel, _cancel_guard) = link_cancel_token(net.shutdown_token(), cancel);
+        if linked_cancel.is_cancelled() {
             return Err(RangeOpenError::Cancelled);
         }
         let trimmed_url = url.trim();
@@ -567,260 +394,52 @@ impl HttpRangeSource {
             .ok_or_else(|| RangeOpenError::InvalidUrl(sanitize_url_for_display(trimmed_url)))?;
         let host = extract_host(trimmed_url);
 
-        let mut parsed_headers = Vec::with_capacity(config.extra_headers.len());
-        let mut secrets = Vec::with_capacity(config.extra_headers.len());
-        for (k, v) in &config.extra_headers {
-            let name = HeaderName::from_bytes(k.trim().as_bytes()).map_err(|e| {
-                RangeOpenError::InvalidHeader {
-                    name: k.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
-            let value =
-                HeaderValue::from_str(v.trim()).map_err(|_| RangeOpenError::InvalidHeader {
-                    name: k.clone(),
-                    reason: "invalid header value".to_owned(),
-                })?;
-            if !v.trim().is_empty() {
-                secrets.push(EncodedSecret::new(v.trim().to_owned()));
-            }
-            parsed_headers.push((name, value));
-        }
+        let parsed = parse_custom_headers(&config.extra_headers, &[])
+            .map_err(|(name, reason)| RangeOpenError::InvalidHeader { name, reason })?;
+        let parsed_headers = parsed.headers;
+        let secrets = parsed.secrets;
 
-        let probe_len = config.head_probe_bytes.max(1);
-        let range_hdr = format!("bytes=0-{}", probe_len - 1);
-        let redact_msg = |text: &str| {
-            let mut out = redact_text(text, None);
-            for s in &secrets {
-                out = redact_text(&out, Some(s));
-            }
-            out
+        let client = net.range_client_for(!parsed_headers.is_empty()).clone();
+        let host_limiters = net.host_limiters();
+        let req_cfg = RangeFetchRequest {
+            client: &client,
+            host_limiters: &host_limiters,
+            url: trimmed_url,
+            host: &host,
+            extra_headers: &parsed_headers,
+            secrets: &secrets,
+            max_retries: config.max_retries,
+            mode: RangeFetchMode::OpenProbe {
+                probe_len: config.head_probe_bytes.max(1),
+            },
+            request_counter: None,
         };
+        let resp = fetch_range_http(&req_cfg, &linked_cancel).await?;
 
-        let mut attempt = 0usize;
-        let mut requests_made = 0u64;
-        let (total_len, strong_etag, pinned_head) = loop {
-            if cancel.is_cancelled() {
-                return Err(RangeOpenError::Cancelled);
-            }
-            let permit = net
-                .host_limiters()
-                .acquire_permit(&host, cancel)
-                .await
-                .map_err(|_| RangeOpenError::Cancelled)?;
-
-            let mut req = net
-                .range_client()
-                .get(trimmed_url)
-                .header(RANGE, &range_hdr)
-                .header(ACCEPT_ENCODING, "identity");
-            for (name, value) in &parsed_headers {
-                req = req.header(name, value);
-            }
-            requests_made += 1;
-
-            let resp_res = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    drop(permit);
-                    return Err(RangeOpenError::Cancelled);
-                }
-                res = req.send() => res,
-            };
-
-            let resp = match resp_res {
-                Ok(resp) => resp,
-                Err(err) => {
-                    drop(permit);
-                    if attempt < config.max_retries && !cancel.is_cancelled() {
-                        attempt += 1;
-                        sleep_cancel(Duration::from_millis(150 * attempt as u64), cancel)
-                            .await
-                            .map_err(|_| RangeOpenError::Cancelled)?;
-                        continue;
-                    }
-                    return Err(RangeOpenError::Network(redact_msg(&err.to_string())));
-                }
-            };
-
-            let status = resp.status();
-            let code = status.as_u16();
-
-            if code == 200 {
-                drop(permit);
-                return Err(RangeOpenError::RangeNotSupported(
-                    "server responded with 200 OK instead of 206 Partial Content".to_owned(),
-                ));
-            }
-            if code == 416 {
-                let cr = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_RANGE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(parse_content_range)
-                    .transpose()
-                    .map_err(RangeOpenError::InvalidResponse)?;
-                let etag = parse_strong_etag(resp.headers());
-                drop(permit);
-                if matches!(cr, Some(ContentRange::Unsatisfied { total: 0 })) {
-                    break (0u64, etag, Vec::new());
-                }
-                return Err(RangeOpenError::HttpStatus {
-                    code,
-                    detail: "Range Not Satisfiable".to_owned(),
-                });
-            }
-            if matches!(code, 429 | 503) {
-                let retry_after = resp
-                    .headers()
-                    .get(RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| parse_retry_after_seconds(Some(s)))
-                    .unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF);
-                net.host_limiters()
-                    .record_cooldown(&host, Instant::now() + retry_after);
-                drop(permit);
-                if attempt < config.max_retries && !cancel.is_cancelled() {
-                    attempt += 1;
-                    continue;
-                }
-                return Err(RangeOpenError::HttpStatus {
-                    code,
-                    detail: "rate limited".to_owned(),
-                });
-            }
-            if status.is_server_error() || code == 408 {
-                drop(permit);
-                if attempt < config.max_retries && !cancel.is_cancelled() {
-                    attempt += 1;
-                    sleep_cancel(Duration::from_millis(150 * attempt as u64), cancel)
-                        .await
-                        .map_err(|_| RangeOpenError::Cancelled)?;
-                    continue;
-                }
-                return Err(RangeOpenError::HttpStatus {
-                    code,
-                    detail: status
-                        .canonical_reason()
-                        .unwrap_or("server error")
-                        .to_owned(),
-                });
-            }
-            if code != 206 {
-                drop(permit);
-                return Err(RangeOpenError::HttpStatus {
-                    code,
-                    detail: status
-                        .canonical_reason()
-                        .unwrap_or("unexpected status")
-                        .to_owned(),
-                });
-            }
-
-            if let Err(msg) = validate_identity_content_encoding(resp.headers()) {
-                drop(permit);
-                return Err(RangeOpenError::InvalidResponse(msg));
-            }
-            let strong_etag = parse_strong_etag(resp.headers());
-            let cr_raw = resp
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    RangeOpenError::InvalidResponse(
-                        "206 open probe missing Content-Range header".to_owned(),
-                    )
-                })?;
-            let cr = parse_content_range(cr_raw).map_err(RangeOpenError::InvalidResponse)?;
-            let (expected_len, total_len) = match cr {
-                ContentRange::Span {
-                    start: 0,
-                    end,
-                    total,
-                } => {
-                    let expected = end.saturating_add(1);
-                    if expected > probe_len as u64 {
-                        drop(permit);
-                        return Err(RangeOpenError::InvalidResponse(format!(
-                            "206 open probe returned {expected} B exceeding requested {probe_len} B"
-                        )));
-                    }
-                    (expected as usize, total)
-                }
-                other => {
-                    drop(permit);
-                    return Err(RangeOpenError::InvalidResponse(format!(
-                        "206 open probe Content-Range did not start at byte 0: {other:?}"
-                    )));
-                }
-            };
-
-            let mut body = Vec::with_capacity(expected_len);
-            let mut resp = resp;
-            let mut body_err: Option<String> = None;
-            loop {
-                let chunk_res = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        drop(permit);
-                        return Err(RangeOpenError::Cancelled);
-                    }
-                    chunk = resp.chunk() => chunk,
-                };
-                match chunk_res {
-                    Ok(Some(chunk)) => {
-                        if body.len().saturating_add(chunk.len()) > expected_len {
-                            drop(permit);
-                            return Err(RangeOpenError::InvalidResponse(format!(
-                                "206 open probe body exceeded {expected_len} B"
-                            )));
-                        }
-                        body.extend_from_slice(&chunk);
-                    }
-                    Ok(None) => break,
-                    Err(err) => {
-                        body_err = Some(redact_msg(&err.to_string()));
-                        break;
-                    }
-                }
-            }
-            drop(permit);
-
-            if let Some(err_msg) = body_err {
-                if attempt < config.max_retries {
-                    attempt += 1;
-                    continue;
-                }
-                return Err(RangeOpenError::Network(err_msg));
-            }
-            if body.len() != expected_len {
-                if attempt < config.max_retries {
-                    attempt += 1;
-                    continue;
-                }
-                return Err(RangeOpenError::InvalidResponse(format!(
-                    "truncated 206 open probe: expected {expected_len} B, received {} B",
-                    body.len()
-                )));
-            }
-            break (total_len, strong_etag, body);
-        };
-
-        let fingerprint =
-            fingerprint_remote_source(&canonical, total_len, strong_etag.as_deref(), &pinned_head);
+        let fingerprint = fingerprint_remote_source(
+            &canonical,
+            resp.total_len,
+            resp.strong_etag.as_deref(),
+            &resp.body,
+        );
         let instance_id = net.alloc_source_instance_id();
-        let delivered = pinned_head.len() as u64;
+        let delivered = resp.body.len() as u64;
 
         let inner = Arc::new(RangeInner {
-            net,
+            handle: net.handle().clone(),
+            shutdown: net.shutdown_token().clone(),
+            client,
+            host_limiters,
+            range_pool: net.range_pool(),
+            prefetch_budget: net.prefetch_budget(),
             url: trimmed_url.to_owned(),
             canonical_url: Arc::from(canonical),
             host,
-            len: total_len,
-            strong_etag: strong_etag.map(Arc::from),
+            len: resp.total_len,
+            strong_etag: resp.strong_etag.map(Arc::from),
             instance_id,
             fingerprint,
-            pinned_head: Arc::from(pinned_head),
+            pinned_head: Arc::from(resp.body),
             extra_headers: parsed_headers,
             secrets,
             max_readahead_blocks: config.max_readahead_blocks,
@@ -828,7 +447,7 @@ impl HttpRangeSource {
             singleflight: Arc::new(SingleflightTable::new()),
             active_pins: Mutex::new(HashMap::new()),
             readahead: Mutex::new(ReadaheadTracker::default()),
-            http_requests: AtomicU64::new(requests_made),
+            http_requests: AtomicU64::new(resp.requests_made),
             bytes_delivered: AtomicU64::new(delivered),
         });
 
@@ -894,10 +513,16 @@ impl HttpRangeSource {
         ranges: &[(u64, u64)],
         cancel: &CancelToken,
     ) -> Result<PrefetchPin, IoError> {
-        if cancel.is_cancelled() {
+        let (linked_cancel, _cancel_guard) = link_cancel_token(&self.inner.shutdown, cancel);
+        if linked_cancel.is_cancelled() {
             return Err(IoError::Cancelled);
         }
-        let mut needed_blocks = Vec::new();
+
+        let cap_bytes = self.inner.prefetch_budget.cap_bytes();
+        let max_blocks_in_cap = (cap_bytes.div_ceil(RANGE_BLOCK_SIZE) as u64).saturating_add(1);
+        let mut unique_blocks = BTreeSet::new();
+        let mut total_pin_bytes = 0usize;
+
         for &(offset, len) in ranges {
             if len == 0 || offset >= self.inner.len {
                 continue;
@@ -908,28 +533,33 @@ impl HttpRangeSource {
             }
             let first = offset / RANGE_BLOCK_SIZE as u64;
             let last = (clamped_end - 1) / RANGE_BLOCK_SIZE as u64;
+            if last.saturating_sub(first).saturating_add(1) > max_blocks_in_cap {
+                return Err(IoError::InvalidInput(format!(
+                    "remote prefetch range ({len} B) exceeds cap ({cap_bytes} B)"
+                )));
+            }
             for blk in first..=last {
                 let start = blk.saturating_mul(RANGE_BLOCK_SIZE as u64);
-                let blen = self.inner.expected_block_len(blk) as u64;
-                if start.saturating_add(blen) <= self.inner.pinned_head.len() as u64 {
+                let blen = self.inner.expected_block_len(blk);
+                if start.saturating_add(blen as u64) <= self.inner.pinned_head.len() as u64 {
                     continue;
                 }
-                needed_blocks.push(blk);
+                if unique_blocks.insert(blk) {
+                    total_pin_bytes = total_pin_bytes.saturating_add(blen);
+                    if total_pin_bytes > cap_bytes {
+                        return Err(IoError::InvalidInput(format!(
+                            "remote prefetch batch ({total_pin_bytes} B) exceeds cap ({cap_bytes} B)"
+                        )));
+                    }
+                }
             }
         }
-        needed_blocks.sort_unstable();
-        needed_blocks.dedup();
-
-        let total_pin_bytes: usize = needed_blocks
-            .iter()
-            .map(|&blk| self.inner.expected_block_len(blk))
-            .sum();
+        let needed_blocks: Vec<u64> = unique_blocks.into_iter().collect();
 
         let budget_lease = self
             .inner
-            .net
-            .prefetch_budget()
-            .reserve(total_pin_bytes, cancel)
+            .prefetch_budget
+            .reserve(total_pin_bytes, &linked_cancel)
             .await?;
 
         let mut resolved: HashMap<u64, Arc<[u8]>> = HashMap::with_capacity(needed_blocks.len());
@@ -945,7 +575,7 @@ impl HttpRangeSource {
         if !missing.is_empty() {
             let fetched = self
                 .inner
-                .fetch_blocks_singleflight(&missing, MAX_PREFETCH_GAP_BLOCKS, cancel)
+                .fetch_blocks_singleflight(&missing, MAX_PREFETCH_GAP_BLOCKS, &linked_cancel)
                 .await?;
             for (blk, data) in fetched {
                 resolved.insert(blk, data);
@@ -985,8 +615,7 @@ impl HttpRangeSource {
             ));
         }
         self.inner
-            .net
-            .handle()
+            .handle
             .block_on(self.prefetch_ranges_async(ranges, cancel))
     }
 }
@@ -1001,7 +630,7 @@ impl ByteSource for HttpRangeSource {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8], cancel: &CancelToken) -> Result<usize, IoError> {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || self.inner.shutdown.is_cancelled() {
             return Err(IoError::Cancelled);
         }
         if buf.is_empty() || offset >= self.inner.len {
@@ -1041,6 +670,8 @@ impl ByteSource for HttpRangeSource {
                 ));
             }
 
+            let (linked_cancel, _cancel_guard) = link_cancel_token(&self.inner.shutdown, cancel);
+
             // Consumed-only sequential readahead: only extend past `last_block`
             // when sequential block progression is observed.
             let extra = lock_unpoisoned(&self.inner.readahead).extra_blocks(
@@ -1062,9 +693,11 @@ impl ByteSource for HttpRangeSource {
 
             let fetched = self
                 .inner
-                .net
-                .handle()
-                .block_on(self.inner.fetch_blocks_singleflight(&missing, 0, cancel))?;
+                .handle
+                .block_on(
+                    self.inner
+                        .fetch_blocks_singleflight(&missing, 0, &linked_cancel),
+                )?;
             for (i, slot) in cached.iter_mut().enumerate() {
                 if slot.is_none() {
                     let blk = first_block + i as u64;
@@ -1076,8 +709,8 @@ impl ByteSource for HttpRangeSource {
                 }
             }
         } else {
-            // Even on cache hit, advance the sequential tracker so readahead
-            // engages smoothly once the read walks past cached blocks.
+            // Even on cache hit, advance or reset the sequential tracker so
+            // readahead engages smoothly on sequential walks and resets on random jumps.
             let _ = lock_unpoisoned(&self.inner.readahead).extra_blocks(first_block, last_block, 0);
         }
 
@@ -1105,5 +738,27 @@ impl ByteSource for HttpRangeSource {
             cursor += take as u64;
         }
         Ok(dst_pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readahead_tracker_ramps_sequentially_and_resets_on_random_cache_hits() {
+        let mut tr = ReadaheadTracker::default();
+        // Initial miss starts at 0.
+        assert_eq!(tr.extra_blocks(10, 10, 4), 0);
+        // Sequential misses ramp 1 -> 2 -> 4.
+        assert_eq!(tr.extra_blocks(11, 11, 4), 1);
+        assert_eq!(tr.extra_blocks(12, 12, 4), 2);
+        // Intra-block repeat keeps streak alive.
+        assert_eq!(tr.extra_blocks(12, 12, 0), 0);
+        assert_eq!(tr.extra_blocks(13, 13, 4), 4);
+        // Random jump on a cache hit (`max_ra == 0`) must reset streak.
+        assert_eq!(tr.extra_blocks(50, 50, 0), 0);
+        // Next sequential miss after the jump starts back at 1 (not 4).
+        assert_eq!(tr.extra_blocks(51, 51, 4), 1);
     }
 }

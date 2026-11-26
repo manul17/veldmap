@@ -96,7 +96,7 @@ fn describing_reads_only_header_and_ifds_and_pointwise_avoids_rereading_ifds() {
         );
     }
 
-    // Pointwise read of tile (0, 1, 1) touches only chunk (1, 1) + IFDs and decodes expected pixels.
+    // Pointwise read of tile (0, 1, 1) touches only chunk (1, 1) and decodes expected pixels.
     counting.reset();
     let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
     let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
@@ -133,7 +133,7 @@ fn describing_reads_only_header_and_ifds_and_pointwise_avoids_rereading_ifds() {
         );
     }
 
-    // A second pointwise miss on the SAME IFD reuses the pooled Decoder without
+    // A second pointwise miss on the SAME IFD reuses the cached IFD tables without
     // re-reading offset 0 (TIFF header) or re-walking IFDs.
     counting.reset();
     let tile2 = src
@@ -146,7 +146,7 @@ fn describing_reads_only_header_and_ifds_and_pointwise_avoids_rereading_ifds() {
     let second_stats = counting.snapshot();
     assert!(
         !second_stats.spans.iter().any(|s| s.offset == 0),
-        "pooled Decoder must not re-read TIFF header on same-IFD miss: {:?}",
+        "cached IFD decoder must not re-read TIFF header on same-IFD miss: {:?}",
         second_stats.spans
     );
     // Direct path also tracks `region + tile` working bytes on `DecodeBudgetTracker`.
@@ -1348,7 +1348,7 @@ fn remote_cog_enforces_pointwise_plans_single_pass_ifd_ranges_and_cache_only_hov
     assert!(matches!(err, RasterError::RemotePassUnsupported(_)));
     assert!(err.is_terminal());
 
-    // 2. Remote tiled Float64 COG opens in <= 2 reads (sniff + single 128 KiB IFD prefix),
+    // 2. Remote tiled Float64 COG opens in <= 2 reads (sniff + single 256 KiB IFD prefix),
     //    plans pointwise + band-stats byte ranges, rejects produce_pass, and keeps sample_band cache-only.
     let mut cog_buf = Cursor::new(Vec::new());
     {

@@ -1,5 +1,6 @@
 //! Read-only GeoJSON parsing, RFC 7946 GeoJSON export (with right-hand
-//! winding), and WGS84 globe vector mesh tessellation ([`VectorMesh`]).
+//! winding), OGC WKT geometry export, and WGS84 globe vector mesh tessellation
+//! ([`VectorMesh`]).
 
 mod cluster;
 mod export;
@@ -132,45 +133,57 @@ impl GeoJsonFeatureCollection {
     /// Axis-aligned WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]`
     /// across all finite vertices in the collection.
     pub fn bbox(&self) -> Option<[f64; 4]> {
-        let mut pts = Vec::new();
-        for feature in &self.features {
-            collect_geometry_points(&feature.geometry, &mut pts);
-        }
         let mut min_lon = f64::INFINITY;
         let mut min_lat = f64::INFINITY;
         let mut max_lon = f64::NEG_INFINITY;
         let mut max_lat = f64::NEG_INFINITY;
-        for p in pts {
-            if !p.lat.is_finite() || !p.lon.is_finite() {
-                continue;
-            }
-            min_lon = min_lon.min(p.lon);
-            min_lat = min_lat.min(p.lat);
-            max_lon = max_lon.max(p.lon);
-            max_lat = max_lat.max(p.lat);
+        for feature in &self.features {
+            for_each_geometry_point(&feature.geometry, |p| {
+                if !p.lat.is_finite() || !p.lon.is_finite() {
+                    return;
+                }
+                min_lon = min_lon.min(p.lon);
+                min_lat = min_lat.min(p.lat);
+                max_lon = max_lon.max(p.lon);
+                max_lat = max_lat.max(p.lat);
+            });
         }
         (min_lon.is_finite() && min_lat.is_finite()).then_some([min_lon, min_lat, max_lon, max_lat])
     }
 }
 
-fn collect_geometry_points(geom: &GeoJsonGeometry, out: &mut Vec<GeoPoint>) {
+fn for_each_geometry_point(geom: &GeoJsonGeometry, mut visit: impl FnMut(GeoPoint)) {
     match geom {
-        GeoJsonGeometry::Point(p) => out.push(*p),
+        GeoJsonGeometry::Point(p) => visit(*p),
         GeoJsonGeometry::MultiPoint(pts) | GeoJsonGeometry::LineString(pts) => {
-            out.extend_from_slice(pts);
+            for &p in pts {
+                visit(p);
+            }
         }
         GeoJsonGeometry::MultiLineString(lines) => {
             for line in lines {
-                out.extend_from_slice(line);
+                for &p in line {
+                    visit(p);
+                }
             }
         }
-        GeoJsonGeometry::Polygon(poly) => out.extend_from_slice(&poly.exterior.points),
+        GeoJsonGeometry::Polygon(poly) => {
+            for &p in &poly.exterior.points {
+                visit(p);
+            }
+        }
         GeoJsonGeometry::MultiPolygon(polys) => {
             for poly in polys {
-                out.extend_from_slice(&poly.exterior.points);
+                for &p in &poly.exterior.points {
+                    visit(p);
+                }
             }
         }
     }
+}
+
+fn collect_geometry_points(geom: &GeoJsonGeometry, out: &mut Vec<GeoPoint>) {
+    for_each_geometry_point(geom, |p| out.push(p));
 }
 
 fn extract_feature_name(props: &Map<String, Value>) -> Option<String> {

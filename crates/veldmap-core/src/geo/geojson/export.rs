@@ -46,54 +46,97 @@ pub fn export_geojson_geometry(geom: &GeoJsonGeometry) -> String {
 /// `lon lat` coordinate order.
 pub fn export_wkt_geometry(geom: &GeoJsonGeometry) -> String {
     match geom {
-        GeoJsonGeometry::Point(p) => format!("POINT ({:.6} {:.6})", p.lon, p.lat),
-        GeoJsonGeometry::MultiPoint(pts) => {
-            if pts.is_empty() {
-                return "MULTIPOINT EMPTY".to_string();
+        GeoJsonGeometry::Point(p) => {
+            if is_finite_point(*p) {
+                format!("POINT ({})", format_wkt_point(*p))
+            } else {
+                "POINT EMPTY".to_string()
             }
+        }
+        GeoJsonGeometry::MultiPoint(pts) => {
             let inner: Vec<String> = pts
                 .iter()
-                .map(|p| format!("({:.6} {:.6})", p.lon, p.lat))
+                .copied()
+                .filter(|&p| is_finite_point(p))
+                .map(|p| format!("({})", format_wkt_point(p)))
                 .collect();
-            format!("MULTIPOINT ({})", inner.join(", "))
+            if inner.is_empty() {
+                "MULTIPOINT EMPTY".to_string()
+            } else {
+                format!("MULTIPOINT ({})", inner.join(", "))
+            }
         }
         GeoJsonGeometry::LineString(pts) => {
-            if pts.is_empty() {
-                return "LINESTRING EMPTY".to_string();
+            let coords = format_wkt_coords(pts);
+            if coords.is_empty() {
+                "LINESTRING EMPTY".to_string()
+            } else {
+                format!("LINESTRING ({coords})")
             }
-            format!("LINESTRING ({})", format_wkt_coords(pts))
         }
         GeoJsonGeometry::MultiLineString(lines) => {
-            if lines.is_empty() {
-                return "MULTILINESTRING EMPTY".to_string();
-            }
             let inner: Vec<String> = lines
                 .iter()
-                .map(|line| format!("({})", format_wkt_coords(line)))
+                .map(|line| format_wkt_coords(line))
+                .filter(|coords| !coords.is_empty())
+                .map(|coords| format!("({coords})"))
                 .collect();
-            format!("MULTILINESTRING ({})", inner.join(", "))
-        }
-        GeoJsonGeometry::Polygon(poly) => format!("POLYGON {}", format_wkt_polygon(poly)),
-        GeoJsonGeometry::MultiPolygon(polys) => {
-            if polys.is_empty() {
-                return "MULTIPOLYGON EMPTY".to_string();
+            if inner.is_empty() {
+                "MULTILINESTRING EMPTY".to_string()
+            } else {
+                format!("MULTILINESTRING ({})", inner.join(", "))
             }
-            let inner: Vec<String> = polys.iter().map(format_wkt_polygon).collect();
-            format!("MULTIPOLYGON ({})", inner.join(", "))
+        }
+        GeoJsonGeometry::Polygon(poly) => match format_wkt_polygon(poly) {
+            Some(rings) => format!("POLYGON {rings}"),
+            None => "POLYGON EMPTY".to_string(),
+        },
+        GeoJsonGeometry::MultiPolygon(polys) => {
+            let inner: Vec<String> = polys.iter().filter_map(format_wkt_polygon).collect();
+            if inner.is_empty() {
+                "MULTIPOLYGON EMPTY".to_string()
+            } else {
+                format!("MULTIPOLYGON ({})", inner.join(", "))
+            }
         }
     }
 }
 
+fn is_finite_point(p: GeoPoint) -> bool {
+    p.lat.is_finite() && p.lon.is_finite()
+}
+
+fn normalize_wkt_coord(v: f64) -> f64 {
+    if v.abs() < 0.5e-8 { 0.0 } else { v }
+}
+
+fn format_wkt_point(p: GeoPoint) -> String {
+    format!(
+        "{:.8} {:.8}",
+        normalize_wkt_coord(p.lon),
+        normalize_wkt_coord(p.lat)
+    )
+}
+
 fn format_wkt_coords(pts: &[GeoPoint]) -> String {
     pts.iter()
-        .filter(|p| p.lat.is_finite() && p.lon.is_finite())
-        .map(|p| format!("{:.6} {:.6}", p.lon, p.lat))
+        .copied()
+        .filter(|&p| is_finite_point(p))
+        .map(format_wkt_point)
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn format_wkt_ring(points: &[GeoPoint], want_ccw: bool) -> String {
-    let mut cleaned = dedup_geo_ring(points);
+/// Normalize a ring to RFC 7946 right-hand winding (`want_ccw = true` for
+/// exterior rings, `want_ccw = false` for interior holes), filtering non-finite
+/// vertices and closing the ring.
+fn normalize_ring(points: &[GeoPoint], want_ccw: bool) -> Vec<GeoPoint> {
+    let finite: Vec<GeoPoint> = points
+        .iter()
+        .copied()
+        .filter(|&p| is_finite_point(p))
+        .collect();
+    let mut cleaned = dedup_geo_ring(&finite);
     if cleaned.len() >= 3 {
         let is_ccw = ring_signed_area_m2(&cleaned) >= 0.0;
         if is_ccw != want_ccw {
@@ -103,16 +146,27 @@ fn format_wkt_ring(points: &[GeoPoint], want_ccw: bool) -> String {
     if let Some(&first) = cleaned.first() {
         cleaned.push(first);
     }
-    format!("({})", format_wkt_coords(&cleaned))
+    cleaned
 }
 
-fn format_wkt_polygon(poly: &Polygon) -> String {
-    let mut rings = Vec::with_capacity(1 + poly.holes.len());
-    rings.push(format_wkt_ring(&poly.exterior.points, true));
-    for hole in &poly.holes {
-        rings.push(format_wkt_ring(&hole.points, false));
+fn format_wkt_ring(points: &[GeoPoint], want_ccw: bool) -> Option<String> {
+    let cleaned = normalize_ring(points, want_ccw);
+    if cleaned.is_empty() {
+        return None;
     }
-    format!("({})", rings.join(", "))
+    Some(format!("({})", format_wkt_coords(&cleaned)))
+}
+
+fn format_wkt_polygon(poly: &Polygon) -> Option<String> {
+    let exterior = format_wkt_ring(&poly.exterior.points, true)?;
+    let mut rings = Vec::with_capacity(1 + poly.holes.len());
+    rings.push(exterior);
+    for hole in &poly.holes {
+        if let Some(ring) = format_wkt_ring(&hole.points, false) {
+            rings.push(ring);
+        }
+    }
+    Some(format!("({})", rings.join(", ")))
 }
 
 fn point_to_json(p: GeoPoint) -> Option<Value> {
@@ -167,16 +221,6 @@ fn polygon_to_rfc7946_rings(poly: &Polygon) -> Vec<Value> {
 /// Normalize a ring to RFC 7946 right-hand winding (`want_ccw = true` for
 /// exterior rings, `want_ccw = false` for interior holes) and close the ring.
 fn ring_to_rfc7946(points: &[GeoPoint], want_ccw: bool) -> Value {
-    let mut cleaned = dedup_geo_ring(points);
-    if cleaned.len() >= 3 {
-        let signed_area = ring_signed_area_m2(&cleaned);
-        let is_ccw = signed_area >= 0.0;
-        if is_ccw != want_ccw {
-            cleaned.reverse();
-        }
-    }
-    if let Some(&first) = cleaned.first() {
-        cleaned.push(first);
-    }
+    let cleaned = normalize_ring(points, want_ccw);
     Value::Array(points_to_json(&cleaned))
 }

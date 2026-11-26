@@ -1,5 +1,6 @@
 //! Viewport pointer probing, camera drag/heading-rotation/zoom/keyboard input
-//! handling, measurement vertex clicks, and viewport/compass geometry tracking
+//! handling, measurement vertex clicks, STAC AOI box drag capture / viewport
+//! bounding-box extraction, and viewport/compass geometry tracking
 //! (`ViewportInteraction`).
 
 use eframe::egui;
@@ -33,6 +34,68 @@ fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
     }
 }
 
+/// Compute the minimal RFC 7946 `[west, south, east, north]` bounding box
+/// covering `points` (supporting both wide hemispheric extents and antimeridian
+/// crossings where `west > east` via the largest circular longitude gap).
+fn minimal_circular_bbox(points: &[(f64, f64)]) -> Option<[f64; 4]> {
+    if points.len() < 2 {
+        return None;
+    }
+    let mut min_lat = f64::INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    let mut lons = Vec::with_capacity(points.len());
+    for &(lat, lon) in points {
+        if !lat.is_finite() || !lon.is_finite() {
+            continue;
+        }
+        min_lat = min_lat.min(lat);
+        max_lat = max_lat.max(lat);
+        lons.push(lon);
+    }
+    if lons.len() < 2 || (max_lat - min_lat) < 1e-6 {
+        return None;
+    }
+    lons.sort_by(f64::total_cmp);
+
+    let mut max_gap = (lons[0] + 360.0) - lons[lons.len() - 1];
+    let mut gap_after_idx: Option<usize> = None;
+    for i in 0..lons.len() - 1 {
+        let gap = lons[i + 1] - lons[i];
+        if gap > max_gap {
+            max_gap = gap;
+            gap_after_idx = Some(i);
+        }
+    }
+    let lon_span = 360.0 - max_gap;
+    if lon_span < 1e-6 {
+        return None;
+    }
+    let (west, east) = match gap_after_idx {
+        None => (lons[0], lons[lons.len() - 1]),
+        Some(k) => (lons[k + 1], lons[k]),
+    };
+    Some([west, min_lat, east, max_lat])
+}
+
+/// Compute an RFC 7946 `[west, south, east, north]` drag rectangle between two
+/// globe points using the shortest longitude arc (handling ±180° crossings).
+fn aoi_drag_bbox(start: (f64, f64), end: (f64, f64)) -> Option<[f64; 4]> {
+    let (start_lat, start_lon) = start;
+    let (end_lat, end_lon) = end;
+    let dlon = (end_lon - start_lon + 540.0).rem_euclid(360.0) - 180.0;
+    let south = start_lat.min(end_lat);
+    let north = start_lat.max(end_lat);
+    if dlon.abs() <= 1e-4 || (north - south) <= 1e-4 {
+        return None;
+    }
+    let (west, east) = if dlon >= 0.0 {
+        (start_lon, end_lon)
+    } else {
+        (end_lon, start_lon)
+    };
+    Some([west, south, east, north])
+}
+
 /// Active primary-pointer interaction mode on the 3D globe viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum ViewportToolMode {
@@ -47,6 +110,7 @@ pub(super) enum ViewportToolMode {
 pub(super) enum ViewportEvent {
     MeasurePoint(GeoPoint),
     AoiBox { bbox: [f64; 4], finished: bool },
+    AoiBoxCancelled,
 }
 
 /// Tracks globe viewport geometry, HUD overlay bounds, hovered geodetic
@@ -232,43 +296,26 @@ impl ViewportInteraction {
         active
     }
 
-    /// Approximate `[min_lon, min_lat, max_lon, max_lat]` covering the current
-    /// visible globe viewport by probing a 5×5 screen grid, or `None` if fewer
-    /// than two rays intersect the WGS84 ellipsoid.
+    /// Cancel any in-progress AOI box drag anchor.
+    pub(super) fn cancel_aoi_drag(&mut self) {
+        self.aoi_drag_start = None;
+    }
+
+    /// Approximate `[west, south, east, north]` covering the current visible
+    /// globe viewport by probing a 5×5 screen grid, or `None` if fewer than
+    /// two rays intersect the WGS84 ellipsoid.
     pub(super) fn viewport_bbox(&self, camera: &Camera) -> Option<[f64; 4]> {
-        let mut min_lon = f64::INFINITY;
-        let mut max_lon = f64::NEG_INFINITY;
-        let mut min_lat = f64::INFINITY;
-        let mut max_lat = f64::NEG_INFINITY;
-        let mut hits = 0usize;
+        let mut hits = Vec::with_capacity(25);
         for gy in 0..=4 {
             let ny = 0.08 + 0.84 * (f64::from(gy) / 4.0);
             for gx in 0..=4 {
                 let nx = 0.08 + 0.84 * (f64::from(gx) / 4.0);
-                if let Some((lat, lon)) = camera.probe(nx, ny, self.last_viewport_aspect) {
-                    min_lon = min_lon.min(lon);
-                    max_lon = max_lon.max(lon);
-                    min_lat = min_lat.min(lat);
-                    max_lat = max_lat.max(lat);
-                    hits += 1;
+                if let Some(pt) = camera.probe(nx, ny, self.last_viewport_aspect) {
+                    hits.push(pt);
                 }
             }
         }
-        if hits < 2 || (max_lon - min_lon) < 1e-6 || (max_lat - min_lat) < 1e-6 {
-            return None;
-        }
-        // Guard against antimeridian wrap-around producing a bogus >180 deg span.
-        if (max_lon - min_lon) > 180.0 {
-            let (lat, lon) = camera.probe(0.5, 0.5, self.last_viewport_aspect)?;
-            let half = 5.0;
-            return Some([
-                (lon - half).clamp(-180.0, 180.0),
-                (lat - half).clamp(-89.5, 89.5),
-                (lon + half).clamp(-180.0, 180.0),
-                (lat + half).clamp(-89.5, 89.5),
-            ]);
-        }
-        Some([min_lon, min_lat, max_lon, max_lat])
+        minimal_circular_bbox(&hits)
     }
 
     /// Apply primary-button orbit dragging, secondary / `Shift+Primary` manual
@@ -298,18 +345,12 @@ impl ViewportInteraction {
             {
                 self.aoi_drag_start = self.probe_pointer(camera, rect, pos);
             }
-            if let Some((start_lat, start_lon)) = self.aoi_drag_start {
+            if let Some(start) = self.aoi_drag_start {
                 if response.dragged_by(egui::PointerButton::Primary)
                     && let Some(pos) = response.interact_pointer_pos()
-                    && let Some((cur_lat, cur_lon)) = self.probe_pointer(camera, rect, pos)
+                    && let Some(cur) = self.probe_pointer(camera, rect, pos)
                 {
-                    let bbox = [
-                        start_lon.min(cur_lon),
-                        start_lat.min(cur_lat),
-                        start_lon.max(cur_lon),
-                        start_lat.max(cur_lat),
-                    ];
-                    if (bbox[2] - bbox[0]) > 1e-4 && (bbox[3] - bbox[1]) > 1e-4 {
+                    if let Some(bbox) = aoi_drag_bbox(start, cur) {
                         captured_event = Some(ViewportEvent::AoiBox {
                             bbox,
                             finished: false,
@@ -319,40 +360,31 @@ impl ViewportInteraction {
                     || !ctx.input(|i| i.pointer.primary_down())
                 {
                     self.aoi_drag_start = None;
-                    if let Some(pos) = response.interact_pointer_pos()
-                        && let Some((end_lat, end_lon)) = self.probe_pointer(camera, rect, pos)
-                    {
-                        let bbox = [
-                            start_lon.min(end_lon),
-                            start_lat.min(end_lat),
-                            start_lon.max(end_lon),
-                            start_lat.max(end_lat),
-                        ];
-                        if (bbox[2] - bbox[0]) > 1e-4 && (bbox[3] - bbox[1]) > 1e-4 {
-                            captured_event = Some(ViewportEvent::AoiBox {
-                                bbox,
-                                finished: true,
-                            });
-                        }
-                    }
+                    let final_bbox = response
+                        .interact_pointer_pos()
+                        .and_then(|pos| self.probe_pointer(camera, rect, pos))
+                        .and_then(|end| aoi_drag_bbox(start, end));
+                    captured_event = Some(match final_bbox {
+                        Some(bbox) => ViewportEvent::AoiBox {
+                            bbox,
+                            finished: true,
+                        },
+                        None => ViewportEvent::AoiBoxCancelled,
+                    });
                 }
             }
-            if rotating {
-                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                let delta = response.drag_delta();
-                if delta.x != 0.0 {
-                    camera.rotate_heading(f64::from(delta.x) * ROTATE_RAD_PER_PT);
-                }
+        } else if self.aoi_drag_start.take().is_some() {
+            captured_event = Some(ViewportEvent::AoiBoxCancelled);
+        }
+
+        if rotating {
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            let delta = response.drag_delta();
+            if delta.x != 0.0 {
+                camera.rotate_heading(f64::from(delta.x) * ROTATE_RAD_PER_PT);
             }
-        } else {
-            self.aoi_drag_start = None;
-            if rotating {
-                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                let delta = response.drag_delta();
-                if delta.x != 0.0 {
-                    camera.rotate_heading(f64::from(delta.x) * ROTATE_RAD_PER_PT);
-                }
-            } else if response.dragged_by(egui::PointerButton::Primary) {
+        } else if tool_mode != ViewportToolMode::DrawAoiBox {
+            if response.dragged_by(egui::PointerButton::Primary) {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 let delta = response.drag_delta();
                 if delta != egui::Vec2::ZERO {
@@ -415,5 +447,36 @@ mod tests {
         assert!((pinch - 1.0).abs() < 1e-6, "pinch={pinch}");
         assert_eq!(zoom_steps_from_input(f32::NAN, 1.0), 0.0);
         assert_eq!(zoom_steps_from_input(0.0, f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn circular_bbox_and_aoi_drag_handle_wide_views_and_antimeridian() {
+        // Wide non-antimeridian view (-95..+95 = 190 deg) must stay [-95, +95],
+        // never collapsing to a 10 deg patch.
+        let wide = minimal_circular_bbox(&[
+            (-20.0, -95.0),
+            (-20.0, -30.0),
+            (0.0, 0.0),
+            (20.0, 30.0),
+            (20.0, 95.0),
+        ])
+        .expect("wide");
+        assert_eq!(wide, [-95.0, -20.0, 95.0, 20.0]);
+
+        // True antimeridian crossing (+170..-170 = 20 deg span across 180).
+        let pac =
+            minimal_circular_bbox(&[(-10.0, 170.0), (0.0, 178.0), (10.0, -172.0), (10.0, -170.0)])
+                .expect("antimeridian");
+        assert_eq!(pac, [170.0, -10.0, -170.0, 10.0]);
+
+        // Antimeridian drag eastbound and westbound.
+        assert_eq!(
+            aoi_drag_bbox((-5.0, 175.0), (5.0, -175.0)),
+            Some([175.0, -5.0, -175.0, 5.0])
+        );
+        assert_eq!(
+            aoi_drag_bbox((5.0, -175.0), (-5.0, 175.0)),
+            Some([175.0, -5.0, -175.0, 5.0])
+        );
     }
 }

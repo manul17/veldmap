@@ -1,10 +1,14 @@
-//! Asynchronous HTTP tile streaming, live basemap specifications, per-host
-//! concurrency limiting, and immediate `CancelToken` abort for VeldMap.
+//! Asynchronous HTTP networking for VeldMap: shared [`NetContext`], live
+//! basemap streaming ([`LiveTilePipeline`]), HTTP Range COG random-access
+//! reading ([`HttpRangeSource`]), and zero-auth/custom-auth STAC search
+//! ([`StacClient`]).
 //!
 //! Uses `reqwest` + `rustls` with the explicit `ring` cryptography provider
-//! (zero OpenSSL or `aws-lc-sys` CMake/NASM build requirements), stays
-//! decoupled from `veldmap-storage` via [`TileBlobStore`], and stays decoupled
-//! from `veldmap-raster` codecs via [`TileDecodeExecutor`].
+//! (zero OpenSSL or `aws-lc-sys` CMake/NASM build requirements), enforces
+//! per-host concurrency and rate-limit cooldowns, supports immediate
+//! `CancelToken` abort, stays decoupled from `veldmap-storage` via
+//! [`TileBlobStore`], and stays decoupled from `veldmap-raster` codecs via
+//! [`TileDecodeExecutor`].
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +35,7 @@ pub use basemap::{
 };
 pub use context::{NetConfig, NetContext};
 pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
+pub use http::is_valid_custom_header_name;
 pub use range::{
     DEFAULT_HEAD_PROBE_BYTES, HttpRangeConfig, HttpRangeSource, PrefetchPin, RANGE_BLOCK_SIZE,
     RangeOpenError,
@@ -42,6 +47,7 @@ pub use stac::{
     StacError, StacItem, StacRasterBandMeta, StacSearchQuery, StacSearchResult,
     builtin_sample_scenes,
 };
+pub use url::{is_valid_http_endpoint, same_http_origin};
 
 /// Structured error returned across the [`TileBlobStore`] seam.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]

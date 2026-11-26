@@ -1,6 +1,7 @@
 //! Format-dispatched lossless disk-cache helpers (`TileBlobEncoding::Qoi` for
 //! `Rgba8UnormSrgb` display tiles; byte-shuffled `TileBlobEncoding::Lz4Raw` for
-//! `R32Float` / `R8Uint` / `R16Uint` scientific & categorical tiles).
+//! `R32Float` / `R8Uint` / `R16Uint` scientific & categorical tiles) and the
+//! offloaded [`TileWriteWorker`] / [`TileWriteHandle`] persistence pipeline.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -8,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned, wait_unpoisoned};
-use veldmap_core::tile::{DecodedTile, PixelFormat};
+use veldmap_core::tile::{DecodedTile, PixelFormat, SourceId};
 use veldmap_raster::{
     MAX_LZ4_RAW_DECODED_BYTES, MAX_QOI_DECODED_BYTES, decode_lz4_raw_tile, decode_qoi_rgba8,
     encode_lz4_raw_tile, encode_qoi_rgba8, generate_tile_mipmaps,
@@ -172,9 +173,11 @@ impl TileWriteBatch {
 }
 
 struct PendingTileWrite {
+    source_id: SourceId,
     disk_key: DiskTileKey,
     tile: DecodedTile,
-    cancel: CancelToken,
+    write_gen: u64,
+    source_cancel: CancelToken,
 }
 
 struct WriteQueueInner {
@@ -194,14 +197,16 @@ pub(super) struct TileWriteHandle {
 impl TileWriteHandle {
     /// Enqueue a pre-cloned mip-0 [`DecodedTile`] for off-thread encoding and
     /// SQLite persistence. Strictly non-blocking: drops the write if the
-    /// bounded queue (`64` tiles) is saturated, closed, or `cancel` fired.
+    /// bounded queue (`64` tiles) is saturated, closed, or `source_cancel` fired.
     pub(super) fn enqueue_mip0_tile(
         &self,
+        source_id: SourceId,
         disk_key: DiskTileKey,
         mip0: DecodedTile,
-        cancel: &CancelToken,
+        write_gen: u64,
+        source_cancel: CancelToken,
     ) {
-        if cancel.is_cancelled() {
+        if source_cancel.is_cancelled() {
             return;
         }
         let (lock, cvar) = &*self.shared;
@@ -210,11 +215,22 @@ impl TileWriteHandle {
             return;
         }
         queue.items.push_back(PendingTileWrite {
+            source_id,
             disk_key,
             tile: mip0,
-            cancel: cancel.clone(),
+            write_gen,
+            source_cancel,
         });
         cvar.notify_one();
+    }
+
+    /// Immediately discard any queued but unencoded writes for `source_id`
+    /// (paired with cancelling the source's write token before `clear_source`
+    /// so pre-reload tiles can never race into SQLite).
+    pub(super) fn purge_source(&self, source_id: SourceId) {
+        let (lock, _) = &*self.shared;
+        let mut queue = lock_unpoisoned(lock);
+        queue.items.retain(|item| item.source_id != source_id);
     }
 }
 
@@ -287,7 +303,7 @@ fn run_tile_write_worker(
     shutdown: CancelToken,
 ) {
     let mut batch: Vec<PendingTileWrite> = Vec::with_capacity(PASS_BATCH_MAX_TILES);
-    let mut encoded: Vec<(DiskTileKey, TileBlobEncoding, Vec<u8>, CancelToken)> =
+    let mut encoded: Vec<(DiskTileKey, TileBlobEncoding, Vec<u8>, u64, CancelToken)> =
         Vec::with_capacity(PASS_BATCH_MAX_TILES);
 
     loop {
@@ -347,12 +363,18 @@ fn run_tile_write_worker(
         encoded.clear();
         let mut encoded_bytes = 0usize;
         for item in batch.drain(..) {
-            if shutdown.is_cancelled() || item.cancel.is_cancelled() {
+            if shutdown.is_cancelled() || item.source_cancel.is_cancelled() {
                 continue;
             }
             if let Some((enc, bytes)) = encode_tile_blob(&item.tile) {
                 encoded_bytes = encoded_bytes.saturating_add(bytes.len());
-                encoded.push((item.disk_key, enc, bytes, item.cancel));
+                encoded.push((
+                    item.disk_key,
+                    enc,
+                    bytes,
+                    item.write_gen,
+                    item.source_cancel,
+                ));
                 if encoded_bytes >= PASS_BATCH_MAX_BYTES {
                     flush_encoded_batch(&disk, &mut encoded, &shutdown);
                     encoded_bytes = 0;
@@ -365,20 +387,33 @@ fn run_tile_write_worker(
 
 fn flush_encoded_batch(
     disk: &TileDiskCache,
-    encoded: &mut Vec<(DiskTileKey, TileBlobEncoding, Vec<u8>, CancelToken)>,
+    encoded: &mut Vec<(DiskTileKey, TileBlobEncoding, Vec<u8>, u64, CancelToken)>,
     shutdown: &CancelToken,
 ) {
     if encoded.is_empty() || shutdown.is_cancelled() || disk.max_bytes() == 0 {
         encoded.clear();
         return;
     }
-    let refs: Vec<(&DiskTileKey, TileBlobEncoding, &[u8])> = encoded
-        .iter()
-        .filter(|(_, _, _, cancel)| !cancel.is_cancelled())
-        .map(|(k, enc, bytes, _)| (k, *enc, bytes.as_slice()))
-        .collect();
-    if !refs.is_empty() {
-        let _ = disk.put_encoded_batch_if_uncancelled(&refs, shutdown);
+    // Group by `(write_gen, source_cancel)` so each source generation passes
+    // its own child-of-shutdown token into `put_encoded_batch_if_uncancelled`,
+    // enforcing reload/purge cancellation strictly under SQLite's writer lock.
+    encoded.sort_unstable_by_key(|(_, _, _, write_gen, _)| *write_gen);
+    let mut start = 0usize;
+    while start < encoded.len() {
+        let write_gen = encoded[start].3;
+        let mut end = start + 1;
+        while end < encoded.len() && encoded[end].3 == write_gen {
+            end += 1;
+        }
+        let source_cancel = &encoded[start].4;
+        if !source_cancel.is_cancelled() {
+            let refs: Vec<(&DiskTileKey, TileBlobEncoding, &[u8])> = encoded[start..end]
+                .iter()
+                .map(|(k, enc, bytes, _, _)| (k, *enc, bytes.as_slice()))
+                .collect();
+            let _ = disk.put_encoded_batch_if_uncancelled(&refs, source_cancel);
+        }
+        start = end;
     }
     encoded.clear();
 }

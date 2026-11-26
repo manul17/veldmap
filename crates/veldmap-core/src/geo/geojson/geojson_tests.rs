@@ -297,7 +297,111 @@ fn feature_properties_bbox_and_wkt_export_round_trip() {
 
     let wkt = export_wkt_geometry(&GeoJsonGeometry::Polygon(poly.clone()));
     assert!(wkt.starts_with("POLYGON (("));
-    assert!(wkt.contains("37.000000 55.000000"));
+    assert!(wkt.contains("37.00000000 55.00000000"));
     let geojson_geom = export_geojson_geometry(&GeoJsonGeometry::Polygon(poly));
     assert!(geojson_geom.contains("\"Polygon\""));
+}
+
+#[test]
+fn wkt_export_handles_all_geometry_types_empty_non_finite_and_negative_zero() {
+    let nan_pt = GeoPoint {
+        lat: f64::NAN,
+        lon: 10.0,
+    };
+    let neg_zero_pt = GeoPoint {
+        lat: -0.0,
+        lon: -1e-10,
+    };
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::Point(neg_zero_pt)),
+        "POINT (0.00000000 0.00000000)"
+    );
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::Point(nan_pt)),
+        "POINT EMPTY"
+    );
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::MultiPoint(vec![nan_pt])),
+        "MULTIPOINT EMPTY"
+    );
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::MultiPoint(vec![
+            nan_pt,
+            GeoPoint {
+                lat: 1.5,
+                lon: 2.25
+            }
+        ])),
+        "MULTIPOINT ((2.25000000 1.50000000))"
+    );
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::LineString(vec![nan_pt])),
+        "LINESTRING EMPTY"
+    );
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::MultiLineString(vec![
+            vec![],
+            vec![nan_pt]
+        ])),
+        "MULTILINESTRING EMPTY"
+    );
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::MultiLineString(vec![
+            vec![nan_pt],
+            vec![
+                GeoPoint { lat: 0.0, lon: 1.0 },
+                GeoPoint { lat: 2.0, lon: 3.0 },
+            ]
+        ])),
+        "MULTILINESTRING ((1.00000000 0.00000000, 3.00000000 2.00000000))"
+    );
+
+    // Polygon with empty/non-finite exterior and a non-empty hole must emit POLYGON EMPTY.
+    let orphan_hole_poly = Polygon {
+        exterior: Ring {
+            points: vec![nan_pt],
+        },
+        holes: vec![Ring {
+            points: vec![
+                GeoPoint { lat: 0.0, lon: 0.0 },
+                GeoPoint { lat: 0.0, lon: 1.0 },
+                GeoPoint { lat: 1.0, lon: 1.0 },
+            ],
+        }],
+    };
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::Polygon(orphan_hole_poly.clone())),
+        "POLYGON EMPTY"
+    );
+    assert_eq!(
+        export_wkt_geometry(&GeoJsonGeometry::MultiPolygon(vec![orphan_hole_poly])),
+        "MULTIPOLYGON EMPTY"
+    );
+
+    // Holed polygon: CW exterior is reversed to CCW, CCW hole is reversed to CW, empty hole skipped.
+    let holed = Polygon {
+        exterior: Ring {
+            points: vec![
+                GeoPoint { lat: 0.0, lon: 0.0 },
+                GeoPoint { lat: 2.0, lon: 0.0 },
+                GeoPoint { lat: 2.0, lon: 2.0 },
+                GeoPoint { lat: 0.0, lon: 2.0 },
+            ],
+        },
+        holes: vec![
+            Ring { points: vec![] },
+            Ring {
+                points: vec![
+                    GeoPoint { lat: 0.5, lon: 0.5 },
+                    GeoPoint { lat: 0.5, lon: 1.5 },
+                    GeoPoint { lat: 1.5, lon: 1.5 },
+                    GeoPoint { lat: 1.5, lon: 0.5 },
+                ],
+            },
+        ],
+    };
+    let holed_wkt = export_wkt_geometry(&GeoJsonGeometry::Polygon(holed));
+    assert!(holed_wkt.starts_with("POLYGON (("));
+    assert!(!holed_wkt.contains("()"));
+    assert_eq!(holed_wkt.matches("), (").count(), 1);
 }

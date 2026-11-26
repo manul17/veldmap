@@ -75,6 +75,7 @@ pub(crate) fn is_geojson_path(path: &Path) -> bool {
 struct LoadedVectorData {
     path: PathBuf,
     feature_count: usize,
+    has_polygons: bool,
     collection: Arc<GeoJsonFeatureCollection>,
     mesh: Arc<VectorMesh>,
 }
@@ -86,6 +87,12 @@ fn load_vector_file(path: &Path) -> Result<LoadedVectorData, String> {
     let collection = parse_geojson(&text)
         .map_err(|e| format!("failed to parse GeoJSON '{}': {e}", path.display()))?;
     let feature_count = collection.features.len();
+    let has_polygons = collection.features.iter().any(|f| {
+        matches!(
+            f.geometry,
+            GeoJsonGeometry::Polygon(_) | GeoJsonGeometry::MultiPolygon(_)
+        )
+    });
     let mesh = Arc::new(VectorMesh::from_collection(
         &collection,
         DEFAULT_VECTOR_MAX_CHORD_DEG,
@@ -99,6 +106,7 @@ fn load_vector_file(path: &Path) -> Result<LoadedVectorData, String> {
     Ok(LoadedVectorData {
         path: path.to_path_buf(),
         feature_count,
+        has_polygons,
         collection: Arc::new(collection),
         mesh,
     })
@@ -160,6 +168,7 @@ struct VectorLayer {
     line_color: [f32; 4],
     color_rgb: [u8; 3],
     feature_count: usize,
+    has_polygons: bool,
     collection: Arc<GeoJsonFeatureCollection>,
     mesh: Arc<VectorMesh>,
 }
@@ -236,6 +245,7 @@ impl VectorLayerStack {
             line_color,
             color_rgb,
             feature_count: data.feature_count,
+            has_polygons: data.has_polygons,
             collection: data.collection,
             mesh: data.mesh,
         });
@@ -291,12 +301,7 @@ impl VectorLayerStack {
                 line_segment_count: l.mesh.line_segment_count(),
                 point_count: l.mesh.point_count(),
                 footprint: l.mesh.bounds,
-                has_polygons: l.collection.features.iter().any(|f| {
-                    matches!(
-                        f.geometry,
-                        GeoJsonGeometry::Polygon(_) | GeoJsonGeometry::MultiPolygon(_)
-                    )
-                }),
+                has_polygons: l.has_polygons,
                 color_rgb: l.color_rgb,
             })
             .collect()
@@ -429,8 +434,17 @@ impl VectorManager {
             .map(|l| Arc::clone(&l.collection))
     }
 
-    /// Return the first polygon/multipolygon geometry in `id` (or its bbox
-    /// fallback) suitable for STAC AOI intersection queries.
+    /// Return the display name for `id` without allocating summaries.
+    pub(crate) fn layer_name(&self, id: VectorLayerId) -> Option<&str> {
+        self.stack
+            .layers
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| l.name.as_str())
+    }
+
+    /// Return the first polygon or multipolygon geometry in `id` suitable for
+    /// STAC AOI intersection queries (or `None` if `id` contains no polygons).
     pub(crate) fn first_polygon_geometry(&self, id: VectorLayerId) -> Option<GeoJsonGeometry> {
         let fc = self.collection(id)?;
         fc.features.iter().find_map(|f| match &f.geometry {
@@ -472,6 +486,7 @@ mod tests {
                 DEFAULT_VECTOR_MAX_CHORD_DEG,
             )),
             collection: fc,
+            has_polygons: false,
         }
     }
 

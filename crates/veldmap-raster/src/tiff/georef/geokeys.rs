@@ -132,11 +132,11 @@ impl GeoKeyParams {
 }
 
 /// Parse raw `GeoKeyDirectoryTag` (`34735`), `GeoDoubleParamsTag` (`34736`),
-/// and `GeoAsciiParamsTag` (`34737`) payloads.
+/// and `GeoAsciiParamsTag` (`34737`) raw byte payloads.
 pub(super) fn parse_geokeys(
     raw_keys: &[u16],
     double_params: &[f64],
-    ascii_params: &str,
+    ascii_bytes: &[u8],
 ) -> GeoKeyParams {
     let mut out = GeoKeyParams::default();
 
@@ -148,7 +148,6 @@ pub(super) fn parse_geokeys(
     };
 
     let num_keys = usize::from(num_keys_raw);
-    let ascii_bytes = ascii_params.as_bytes();
 
     for entry in entries.chunks_exact(4).take(num_keys) {
         let id = entry[0];
@@ -169,15 +168,18 @@ pub(super) fn parse_geokeys(
             TAG_GEO_ASCII_PARAMS => {
                 let start = usize::from(offset_or_val);
                 let end = start.saturating_add(count);
-                // `tiff::Decoder::get_tag_ascii_string` truncates at the first NUL byte,
-                // so the final key's `count` may extend 1 byte past `ascii_bytes.len()`.
+                // `read_ascii_bytes_opt` truncates at the first NUL byte, so the
+                // final key's `count` may extend 1 byte past `ascii_bytes.len()`.
+                // Slice raw byte offsets BEFORE lossy UTF-8 conversion so a
+                // single Latin-1 byte in an earlier key never shifts later keys.
                 let slice = ascii_bytes.get(start..end).or_else(|| {
                     (start <= ascii_bytes.len() && end == ascii_bytes.len() + 1)
                         .then(|| &ascii_bytes[start..])
                 });
-                slice
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                    .map(|s| GeoKeyValue::Ascii(s.trim_end_matches(['|', '\0']).trim().to_string()))
+                slice.map(|bytes| {
+                    let s = String::from_utf8_lossy(bytes);
+                    GeoKeyValue::Ascii(s.trim_end_matches(['|', '\0']).trim().to_string())
+                })
             }
             _ => None,
         };

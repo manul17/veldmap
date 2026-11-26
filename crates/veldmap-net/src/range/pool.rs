@@ -181,8 +181,13 @@ pub(crate) struct RangeBlockPool {
 
 impl RangeBlockPool {
     pub(crate) fn new(cap_bytes: usize) -> Self {
+        let clamped = if cap_bytes == 0 {
+            0
+        } else {
+            cap_bytes.max(RANGE_BLOCK_SIZE)
+        };
         Self {
-            inner: Mutex::new(LruInner::new(cap_bytes)),
+            inner: Mutex::new(LruInner::new(clamped)),
         }
     }
 
@@ -220,6 +225,10 @@ impl PrefetchBudget {
             state: Mutex::new(PrefetchBudgetState { active_bytes: 0 }),
             notify: Notify::new(),
         }
+    }
+
+    pub(crate) const fn cap_bytes(&self) -> usize {
+        self.cap_bytes
     }
 
     pub(crate) async fn reserve(
@@ -312,5 +321,50 @@ mod tests {
         assert!(pool.get(&k1).is_none());
         assert!(pool.get(&k2).is_some());
         assert_eq!(pool.stats(), (2, 2 * RANGE_BLOCK_SIZE));
+    }
+
+    #[test]
+    fn prefetch_budget_enforces_cap_wakes_waiters_and_honors_cancel() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let budget = Arc::new(PrefetchBudget::new(2 * RANGE_BLOCK_SIZE));
+            let cancel = CancelToken::new();
+
+            // Exceeding cap returns InvalidInput immediately.
+            let over = budget
+                .reserve(3 * RANGE_BLOCK_SIZE, &cancel)
+                .await
+                .err()
+                .expect("over cap");
+            assert!(matches!(over, IoError::InvalidInput(_)));
+
+            // Acquire full budget, verify cancelled waiter aborts, then release wakes waiter.
+            let lease_a = budget
+                .reserve(2 * RANGE_BLOCK_SIZE, &cancel)
+                .await
+                .expect("lease_a");
+
+            let cancel_waiter = CancelToken::new();
+            let b_clone = Arc::clone(&budget);
+            let cw_clone = cancel_waiter.clone();
+            let cancelled_task =
+                tokio::spawn(async move { b_clone.reserve(RANGE_BLOCK_SIZE, &cw_clone).await });
+            tokio::task::yield_now().await;
+            cancel_waiter.cancel();
+            let res = cancelled_task.await.expect("join");
+            assert!(matches!(res, Err(IoError::Cancelled)));
+
+            let b_clone2 = Arc::clone(&budget);
+            let ok_cancel = CancelToken::new();
+            let ok_task =
+                tokio::spawn(async move { b_clone2.reserve(RANGE_BLOCK_SIZE, &ok_cancel).await });
+            tokio::task::yield_now().await;
+            drop(lease_a);
+            let lease_b = ok_task.await.expect("join").expect("woken lease");
+            drop(lease_b);
+        });
     }
 }

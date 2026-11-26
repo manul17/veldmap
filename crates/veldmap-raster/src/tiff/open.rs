@@ -59,7 +59,11 @@ fn scan_overviews(
         }
         let mut dir = match reader.read_directory(next_ifd, cancel) {
             Ok(dir) => dir,
-            Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
+            Err(
+                err @ (RasterError::Cancelled
+                | RasterError::Io(_)
+                | RasterError::DecoderLimitsExceeded(_)),
+            ) => return Err(err),
             Err(err) => {
                 tracing::debug!(error = %err, "Stopped scanning TIFF overviews");
                 break;
@@ -84,7 +88,12 @@ fn scan_overviews(
             cancel,
         ) {
             Ok(ifd) => ifd,
-            Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
+            Err(
+                err @ (RasterError::Cancelled
+                | RasterError::Io(_)
+                | RasterError::DecoderLimitsExceeded(_)),
+            ) => return Err(err),
+            Err(RasterError::LimitExceeded { .. }) => break,
             Err(_) => continue,
         };
         let photo_compat = overview_ifd.photometric == base_ifd.photometric
@@ -224,14 +233,21 @@ impl TiffSource {
             return Err(RasterError::Cancelled);
         }
         let is_remote = byte_source.is_remote();
-        let mut reader = SinglePassIfdReader::open(Arc::clone(&byte_source), cancel)?;
+        let max_fetch_bytes = if is_remote {
+            budget.remote_ifd_limit_bytes
+        } else {
+            u64::MAX
+        };
+        let mut reader =
+            SinglePassIfdReader::open(Arc::clone(&byte_source), max_fetch_bytes, cancel)?;
         let byte_order = reader.byte_order;
         let first_ifd = reader.first_ifd;
 
         let mut base_dir = reader.read_directory(first_ifd, cancel)?;
         let next_ifd = base_dir.next_ifd;
 
-        let base_ifd = parse_cached_ifd(&mut base_dir, &reader, 0, budget, 0, is_remote, cancel)?;
+        let base_ifd =
+            parse_cached_ifd(&mut base_dir, &mut reader, 0, budget, 0, is_remote, cancel)?;
         if !base_ifd.tiled {
             if is_remote {
                 return Err(RasterError::RemotePassUnsupported(
@@ -242,8 +258,14 @@ impl TiffSource {
             check_max_source_side(base_ifd.width, base_ifd.height)?;
         }
 
-        let meta_cap = max_cached_ifd_table_bytes(budget, is_remote);
-        base_dir.prefetch_tags(&reader, BASE_METADATA_TAGS, meta_cap, cancel)?;
+        let meta_cap = max_cached_ifd_table_bytes(budget, is_remote)
+            .saturating_sub(base_ifd.table_bytes())
+            .min(if is_remote {
+                reader.remaining_fetch_budget()
+            } else {
+                u64::MAX
+            });
+        base_dir.prefetch_tags(&mut reader, BASE_METADATA_TAGS, meta_cap, cancel)?;
 
         let nodata_raw = base_dir.read_ascii_opt(&reader, TAG_GDAL_NODATA);
         let nodata_f64 = parse_gdal_nodata(&nodata_raw);
@@ -306,7 +328,7 @@ impl TiffSource {
                     .any(|row| !matches!(row.serve, ServeMode::Pointwise) || !row.fits))
         {
             return Err(RasterError::RemotePassUnsupported(
-                "remote GeoTIFF lacks coarse overviews required for pointwise COG streaming"
+                "remote GeoTIFF cannot be streamed pointwise within memory budget (missing coarse overviews or unsupported tile geometry)"
                     .to_owned(),
             ));
         }
@@ -327,10 +349,12 @@ impl TiffSource {
             .map_or(0, |o| o.image);
 
         let bands = build_band_infos(&base_ifd, nodata_f64, &gdal_meta);
-        let initial_mapping = (base_ifd.sample_type == SampleType::U8).then(|| {
-            DisplayMapping::identity(nodata_f64)
-                .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
-        });
+        let initial_mapping = (base_ifd.sample_type == SampleType::U8
+            || base_ifd.photometric == Photometric::Palette)
+            .then(|| {
+                DisplayMapping::identity(nodata_f64)
+                    .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
+            });
 
         let mut ifds = Vec::with_capacity(1 + cached_overviews.len());
         ifds.push(base_ifd);

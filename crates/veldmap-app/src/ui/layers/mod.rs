@@ -1,7 +1,8 @@
-//! Collapsible Layer List side panel for local raster overlays (GeoTIFF/COG,
-//! PNG/JPEG + world files) and read-only GeoJSON vector overlays, with layer
-//! reordering, CRS/radiometry metadata inspection, diagnostic banners, detail
-//! limit captions, and loading shimmer indicators.
+//! `Layers` workbench tab for local and remote HTTP Range COG raster overlays
+//! (GeoTIFF/BigTIFF/COG, PNG/JPEG + world files) and read-only GeoJSON vector
+//! overlays, with layer reordering, analytical track/stretch/palette controls,
+//! CRS/radiometry metadata inspection, diagnostic banners, and loading shimmer
+//! indicators.
 
 mod raster_card;
 mod style_controls;
@@ -84,10 +85,9 @@ impl LayerUiAction {
     }
 }
 
-/// Transient UI state for the Layer List side panel and File Open input.
+/// Transient UI state for the Layer List tab and File Open input.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LayersPanelState {
-    open: bool,
     open_prompt_visible: bool,
     focus_path_input: bool,
     path_input: String,
@@ -96,34 +96,19 @@ pub(crate) struct LayersPanelState {
 }
 
 impl LayersPanelState {
-    pub(crate) fn is_open(&self) -> bool {
-        self.open
-    }
-
-    pub(crate) fn toggle_open(&mut self) {
-        self.open = !self.open;
-    }
-
-    pub(crate) fn open_panel(&mut self) {
-        self.open = true;
-    }
-
     pub(crate) fn on_layer_opened(&mut self) {
-        self.open = true;
         self.path_input.clear();
         self.open_prompt_visible = false;
         self.failed_unbound_path = None;
     }
 
     pub(crate) fn show_open_prompt(&mut self) {
-        self.open = true;
         self.open_prompt_visible = true;
         self.focus_path_input = true;
         self.error = None;
     }
 
     pub(crate) fn push_error(&mut self, msg: String) {
-        self.open = true;
         match &mut self.error {
             Some(existing) if !existing.is_empty() => {
                 existing.push('\n');

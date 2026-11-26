@@ -215,6 +215,7 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
         while !stop_srv.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                     let mut reader = BufReader::new(&stream);
                     let mut line = String::new();
@@ -316,6 +317,10 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
     assert!(mgr.layer_summaries()[0].is_remote);
     assert!(mgr.begin_reload_bypass_cache(layer_id).is_err());
 
+    // Cache-only remote cursor probe resolves `Unavailable` before level-0 tiles stream.
+    let pre_readout = wait_for_cursor_readout(&mgr, bounds.lat, bounds.lon);
+    assert_eq!(pre_readout.value, CursorReadoutValue::Unavailable);
+
     let mut gpu_cache = GpuTileCache::new(budget.gpu_tile_cache_bytes);
     let cam = Camera::at(bounds.lat, bounds.lon, 5_000.0);
     let mut carriers = std::collections::HashSet::new();
@@ -338,6 +343,21 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
         pending.queued_bytes() > 0,
         "remote COG tile should prefetch and decode into PendingUploads"
     );
+    // Simulate upload completion report: must invalidate the sticky `Unavailable`
+    // cursor entry so the next hover probe reads [90, 160, 230, 255] from chunk cache.
+    let stream_key = mgr.stack.layers()[0].meta().stream_key();
+    let upload_report = crate::gpu_tiles::UploadBatchReport {
+        uploaded: 1,
+        max_tile_bytes_by_stream: vec![(stream_key, 512 * 512 * 4)],
+        ..Default::default()
+    };
+    mgr.record_upload_report(&upload_report);
+    let post_readout = wait_for_cursor_readout(&mgr, bounds.lat, bounds.lon);
+    assert_eq!(
+        post_readout.value,
+        CursorReadoutValue::Rgba([90, 160, 230, 255])
+    );
+
     while disk_cache.stats().expect("stats").tile_count == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -355,4 +375,87 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
     net.shutdown();
     stop.store(true, Ordering::Relaxed);
     let _ = srv_handle.join();
+}
+
+#[test]
+fn tile_write_worker_honors_source_purge_and_backoff_wakes_idle_ui() {
+    use veldmap_core::tile::{
+        DecodedTile, PixelFormat, SourceId, TileKey, TileScheme, TileStreamSpec,
+    };
+    use veldmap_storage::DiskTileKey;
+
+    let dir = TestTempDir::new("tile-write-purge");
+    let paths = veldmap_storage::StoragePaths::with_root(dir.path());
+    let disk_cache = Arc::new(
+        TileDiskCache::open(paths.tile_cache_db_path(), 32 * 1024 * 1024).expect("disk cache"),
+    );
+    let budget = MemoryBudget::default();
+    let shutdown = CancelToken::new();
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let wake_clone = Arc::clone(&wake_count);
+    let wakeup: veldmap_core::sync::Wakeup = Arc::new(move || {
+        wake_clone.fetch_add(1, Ordering::Relaxed);
+    });
+    let mut pending = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
+    let done_tx = pending.sender().expect("upload sender");
+    let pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig::from_budget(&budget),
+        shutdown.clone(),
+    );
+    let mut mgr = OverlayManager::new(
+        &budget,
+        Some(Arc::clone(&disk_cache)),
+        None,
+        pool.fast_handle(),
+        pool.bulk_handle(),
+        done_tx,
+        wakeup,
+        shutdown.clone(),
+    );
+
+    // `note_submit_backoff` must wake an idle UI once when entering backoff.
+    let before = wake_count.load(Ordering::Relaxed);
+    mgr.runtime.note_submit_backoff();
+    assert_eq!(wake_count.load(Ordering::Relaxed), before + 1);
+    mgr.runtime.note_submit_backoff();
+    assert_eq!(
+        wake_count.load(Ordering::Relaxed),
+        before + 1,
+        "repeated backoff within active window must not spam wakeups"
+    );
+
+    // Enqueue a tile under a source write token, then immediately purge the
+    // source before the 50 ms coalescing window elapses: SQLite must stay empty.
+    let src = SourceId::new(999);
+    let (write_gen, source_cancel) = mgr.runtime.write_token_for_source(src);
+    let tk = TileKey::from_stream(
+        src,
+        TileStreamSpec::DISPLAY,
+        TileScheme::RasterPyramid { max_level: 0 },
+        0,
+        0,
+        0,
+    );
+    let disk_key = DiskTileKey::from_tile_key("deadbeef".to_owned(), &tk);
+    let tile = DecodedTile::try_new(4, 4, PixelFormat::Rgba8UnormSrgb, vec![255u8; 4 * 4 * 4])
+        .expect("tile");
+    mgr.runtime
+        .tile_writer
+        .as_ref()
+        .expect("writer")
+        .enqueue_mip0_tile(src, disk_key, tile, write_gen, source_cancel);
+    mgr.runtime.purge_source_runtime(src);
+
+    std::thread::sleep(Duration::from_millis(80));
+    assert_eq!(
+        disk_cache.stats().expect("stats").tile_count,
+        0,
+        "purged pre-reload tile must not flush into SQLite"
+    );
+
+    mgr.begin_shutdown();
+    shutdown.cancel();
+    pending.close();
+    pool.shutdown();
+    mgr.finish_shutdown();
 }

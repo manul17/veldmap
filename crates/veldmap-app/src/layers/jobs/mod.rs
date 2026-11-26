@@ -8,7 +8,7 @@ mod pointwise;
 use std::sync::Arc;
 
 use veldmap_core::tile::TileKey;
-use veldmap_raster::ServeMode;
+use veldmap_raster::{ByteRange, ServeMode, coalesce_byte_ranges};
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 
@@ -17,6 +17,23 @@ use super::stack::OverlayLayer;
 
 use self::pass::{PassJobSpec, submit_pass_job};
 use self::pointwise::submit_pointwise_job;
+
+/// Gap threshold (`64 KiB`) when coalescing remote COG chunk byte ranges.
+const REMOTE_COALESCE_GAP_BYTES: u64 = 64 * 1024;
+
+/// Maximum span (`4 MiB`) of a single coalesced remote COG byte range.
+const REMOTE_COALESCE_MAX_SPAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Coalesce remote COG chunk byte ranges into `(offset, len)` spans ready for
+/// `HttpRangeSource::prefetch_ranges_async`.
+pub(super) fn coalesce_remote_ranges(mut ranges: Vec<ByteRange>) -> Vec<(u64, u64)> {
+    coalesce_byte_ranges(
+        &mut ranges,
+        REMOTE_COALESCE_GAP_BYTES,
+        REMOTE_COALESCE_MAX_SPAN_BYTES,
+    );
+    ranges.into_iter().map(|r| (r.offset, r.len)).collect()
+}
 
 pub(super) fn schedule_layer_rungs(
     layer: &OverlayLayer,

@@ -1,7 +1,7 @@
-//! Raster overlay subsystem: ordered multi-stream raster overlay stack,
-//! two-lane `StreamKey`-scoped scheduling with QOI + byte-shuffled LZ4 disk
-//! caching, non-blocking local file open/reload I/O, background band statistics,
-//! and typed zoom-invariant CPU cursor readouts.
+//! Raster overlay subsystem: ordered multi-stream local & remote COG overlay
+//! stack, two-lane `StreamKey`-scoped scheduling with offloaded QOI +
+//! byte-shuffled LZ4 disk caching, non-blocking local/remote open & reload I/O,
+//! background band statistics, and typed zoom-invariant CPU cursor readouts.
 
 mod crs_override;
 mod cursor;

@@ -23,7 +23,7 @@ pub use atomic::{
     read_json_or_default_with_backup, write_atomic_durable, write_json_durable_private,
 };
 pub use file_source::{LocalFileSource, read_regular_file_utf8_limited};
-pub use fingerprint::{LocalFingerprintCache, fingerprint_byte_source, fingerprint_remote_source};
+pub use fingerprint::{LocalFingerprintCache, fingerprint_byte_source};
 pub use host::detect_memory_budget;
 pub use paths::StoragePaths;
 pub use tile_cache::{DiskCacheStats, DiskTileEntry, DiskTileKey, TileBlobEncoding, TileDiskCache};

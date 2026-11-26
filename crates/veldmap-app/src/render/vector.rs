@@ -1,6 +1,7 @@
-//! Depth-less post-body GPU vector renderer for GeoJSON overlays and
-//! interactive geodesic measurement geometries with per-cluster CPU `f64` RTC
-//! offsets and GPU-instanced altitude-scaled point markers.
+//! Depth-less post-body GPU vector renderer for GeoJSON overlays, interactive
+//! geodesic measurement geometries, and STAC AOI / scene-footprint overlays
+//! with per-cluster CPU `f64` RTC offsets, HiDPI screen-space ribbon outlines,
+//! diagonal hatch fills, and GPU-instanced altitude-scaled point markers.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -357,6 +358,11 @@ impl VectorRenderer {
             }
             let packed = pack_layer_buffers(device, layer);
             let byte_size = packed.byte_size;
+            // Evict superseded revisions for this vector layer ID so interactive
+            // dynamic layers (AOI drag, STAC highlight, measurement) never accumulate
+            // dead GPU buffers and evict warm static GeoJSON layers.
+            self.buffers
+                .remove_where(|k| k.0 == layer.id && k.1 != layer.rev);
             self.buffers.insert(key, packed, byte_size);
         }
 

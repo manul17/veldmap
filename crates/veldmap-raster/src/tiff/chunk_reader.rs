@@ -167,12 +167,8 @@ impl<'a> TiffChunkReader<'a> {
             return self.decode_palette_display_chunk(ifd, index, pixels, cancel);
         }
         if ifd.planar == PlanarConfig::Planar {
-            let need_planes: &[usize] = match (ifd.pixel_layout.colors(), ifd.alpha_channel()) {
-                (1, None) => &[0],
-                (1, Some(a)) => &[0, a],
-                (_, None) => &[0, 1, 2],
-                (_, Some(a)) => &[0, 1, 2, a],
-            };
+            let (plane_buf, plane_len) = ifd.planar_display_planes();
+            let need_planes = &plane_buf[..plane_len];
             let sample_bytes = ifd.sample_type.byte_size();
             let interleaved_spp = need_planes.len();
             let mut interleaved: Option<Vec<u8>> = None;

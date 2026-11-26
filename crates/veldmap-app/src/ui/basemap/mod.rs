@@ -24,7 +24,7 @@ pub(crate) enum BasemapUiAction {
     /// Switch the active basemap from the toolbar without clobbering unsaved
     /// draft edits in an open Settings window.
     SelectBasemap(BasemapSelection),
-    /// Commit edited basemap/cache settings from the Settings window.
+    /// Commit edited basemap, cache/GPU, and STAC settings from the Settings window.
     ApplyDraft(Box<BasemapSettingsDraft>),
     /// Settings window opened this frame (triggers event-driven cache stats refresh).
     SettingsOpened,

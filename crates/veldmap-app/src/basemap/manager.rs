@@ -487,7 +487,8 @@ impl BasemapManager {
     }
 
     /// Phase 2 of deterministic shutdown (after `PendingUploads::close()` and
-    /// joining the shared decode pool): shut down `tokio::Runtime`.
+    /// joining the shared decode pool): drop `LiveTilePipeline` ahead of
+    /// `NetContext::shutdown()`.
     pub(crate) fn finish_shutdown(&mut self) {
         if let Some(pipeline) = self.live_pipeline.take() {
             pipeline.shutdown();

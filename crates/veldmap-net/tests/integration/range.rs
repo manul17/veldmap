@@ -557,3 +557,105 @@ fn pinned_coalesced_prefetch_survives_lru_thrashing_and_tokio_thread_guard_holds
         "blocking read inside Tokio worker must be rejected by guard"
     );
 }
+
+#[test]
+fn rejects_forbidden_custom_headers_cross_origin_auth_redirects_and_response_etag_mismatch() {
+    let payload = pattern_bytes(256 * 1024);
+    let state = MockRangeState::new(payload, Some("\"v1\""));
+    let server = MockRangeServer::start(Arc::clone(&state));
+    let net = test_net(4 * RANGE_BLOCK_SIZE);
+    let cancel = CancelToken::new();
+
+    // Forbidden protocol-owned headers must be rejected on open.
+    for forbidden in ["Range", "Accept-Encoding", "If-Match", "Host"] {
+        let err = HttpRangeSource::open(
+            Arc::clone(&net),
+            &server.url,
+            HttpRangeConfig {
+                extra_headers: vec![(forbidden.to_owned(), "evil".to_owned())],
+                ..HttpRangeConfig::default()
+            },
+            &cancel,
+        )
+        .expect_err("forbidden header must fail");
+        assert!(matches!(err, RangeOpenError::InvalidHeader { .. }));
+    }
+
+    // Response ETag mismatch on a 206 (proxy ignoring If-Match) must fail with InvalidInput/Precondition.
+    state.enforce_if_match.store(false, Ordering::SeqCst);
+    let src = HttpRangeSource::open(
+        Arc::clone(&net),
+        &server.url,
+        HttpRangeConfig {
+            head_probe_bytes: 16 * 1024,
+            max_readahead_blocks: 0,
+            ..HttpRangeConfig::default()
+        },
+        &cancel,
+    )
+    .expect("open v1");
+    *state.etag.lock().expect("lock") = Some("\"v2\"".to_owned());
+    let mut buf = [0u8; 64];
+    let err = src
+        .read_at(128 * 1024, &mut buf, &cancel)
+        .expect_err("response ETag mismatch must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("412") && msg.contains("ETag mismatch"),
+        "expected 412 ETag mismatch error, got: {msg}"
+    );
+
+    // Dropping the last NetContext inside a Tokio runtime must not panic.
+    let net2 = Arc::new(NetContext::new(NetConfig::default()).expect("net2"));
+    let handle2 = net2.handle().clone();
+    let jh = handle2.spawn(async move {
+        drop(net2);
+    });
+    let _ = handle2.block_on(jh);
+}
+
+#[test]
+fn custom_auth_headers_refuse_cross_origin_redirect() {
+    let shutdown = CancelToken::new();
+    let stop = shutdown.clone();
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let _ = addr_tx.send(addr);
+            if let Ok((mut stream, _)) = tokio::select! {
+                _ = stop.cancelled() => Err(std::io::Error::other("stop")),
+                res = listener.accept() => res,
+            } {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let resp = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/evil.tif\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+    });
+    let addr = addr_rx.recv().expect("addr");
+    let net = test_net(2 * RANGE_BLOCK_SIZE);
+    let cancel = CancelToken::new();
+    let err = HttpRangeSource::open(
+        Arc::clone(&net),
+        &format!("http://{addr}/asset.tif"),
+        HttpRangeConfig {
+            max_retries: 0,
+            extra_headers: vec![("x-api-key".to_owned(), "secret-token".to_owned())],
+            ..HttpRangeConfig::default()
+        },
+        &cancel,
+    )
+    .expect_err("cross-origin redirect with custom header must be refused");
+    let msg = err.to_string();
+    assert!(!msg.contains("secret-token"), "secret leaked: {msg}");
+    assert!(matches!(err, RangeOpenError::Network(_)));
+    shutdown.cancel();
+    let _ = handle.join();
+}

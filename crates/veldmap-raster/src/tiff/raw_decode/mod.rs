@@ -44,66 +44,33 @@ pub(super) fn decode_raw_chunk(
             ifd.image
         ))
     })?;
-    let (offset, byte_count) = ifd.chunk_span(plane, chunk_index)?;
-    if offset == 0 || byte_count == 0 {
+    let Some(span) = ifd.validated_chunk_span(
+        plane,
+        chunk_index,
+        dims,
+        access.max_chunk_bytes,
+        access.byte_source.len(),
+    )?
+    else {
         return Ok((dims.data_w, dims.data_h, RawChunkPayload::Sparse));
-    }
+    };
 
-    let samples_in_chunk = ifd.samples_in_chunk();
-    let sample_bytes = ifd.sample_type.byte_size();
-    let stored_row_bytes = (dims.stored_w as usize)
-        .checked_mul(samples_in_chunk)
-        .and_then(|n| n.checked_mul(sample_bytes))
-        .ok_or_else(|| RasterError::Decode("TIFF chunk row byte size overflow".to_owned()))?;
-    let stored_bytes = stored_row_bytes
-        .checked_mul(dims.stored_h as usize)
-        .ok_or_else(|| RasterError::Decode("TIFF chunk total byte size overflow".to_owned()))?;
-    let max_uncompressed_bytes = access.max_chunk_bytes;
-    if stored_bytes > max_uncompressed_bytes {
-        return Err(RasterError::LimitExceeded {
-            width: dims.stored_w,
-            height: dims.stored_h,
-            estimated_bytes: stored_bytes as u64,
-            limit_bytes: max_uncompressed_bytes as u64,
-        });
-    }
-
-    // Cap compressed input read size relative to this chunk's `stored_bytes`
-    // (never the global 256 MiB chunk cap) to prevent crafted multi-hundred-MiB
-    // allocations on tiny tiles.
-    let max_compressed = stored_bytes
-        .saturating_mul(2)
-        .max(4 * 1024 * 1024)
-        .min(max_uncompressed_bytes.saturating_mul(2).max(64 * 1024))
-        as u64;
-    if byte_count > max_compressed {
-        return Err(RasterError::LimitExceeded {
-            width: dims.stored_w,
-            height: dims.stored_h,
-            estimated_bytes: byte_count,
-            limit_bytes: max_compressed,
-        });
-    }
-    let file_len = access.byte_source.len();
-    if offset
-        .checked_add(byte_count)
-        .is_none_or(|end| end > file_len)
-    {
-        return Err(RasterError::Decode(format!(
-            "TIFF chunk span {offset}..+{} exceeds file length {file_len}",
-            byte_count
-        )));
-    }
-
-    let mut compressed = vec![0u8; byte_count as usize];
+    let mut compressed = vec![0u8; span.byte_count as usize];
     access
         .byte_source
-        .read_exact_at(offset, &mut compressed, cancel)?;
+        .read_exact_at(span.offset, &mut compressed, cancel)?;
     if cancel.is_cancelled() {
         return Err(RasterError::Cancelled);
     }
 
-    decode_compressed_chunk_bytes(compressed, access, ifd, chunk_index, dims, stored_bytes)
+    decode_compressed_chunk_bytes(
+        compressed,
+        access,
+        ifd,
+        chunk_index,
+        dims,
+        span.stored_bytes,
+    )
 }
 
 fn decode_compressed_chunk_bytes(

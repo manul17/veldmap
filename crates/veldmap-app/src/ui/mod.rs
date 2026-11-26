@@ -1,4 +1,6 @@
-//! `egui` UI chrome, floating GIS HUD widgets, and basemap settings panels.
+//! `egui` workstation UI chrome: top toolbar, collapsible `Layers` | `Cloud /
+//! STAC` workbench, 3-tab Settings modal, CRS picker, geodesic measurement
+//! panel, status bar, and floating GIS HUD widgets.
 
 pub(crate) mod basemap;
 pub(crate) mod crs_picker;
@@ -10,6 +12,7 @@ pub(crate) mod stac;
 pub(crate) mod status_bar;
 pub(crate) mod toolbar;
 pub(crate) mod widgets;
+pub(crate) mod workbench;
 
 use eframe::egui;
 

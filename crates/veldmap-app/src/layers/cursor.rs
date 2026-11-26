@@ -210,6 +210,20 @@ impl CursorProber {
         }
     }
 
+    /// Clear a cached `Unavailable` probe for `source_id` so newly uploaded
+    /// remote COG chunks are picked up on the next hover frame without
+    /// discarding valid resolved readouts or cancelling in-flight probes.
+    pub(super) fn invalidate_unavailable_for_source(&self, source_id: SourceId) {
+        let mut state = lock_unpoisoned(&self.cache);
+        if state
+            .resolved_key
+            .is_some_and(|(src, _, _, _, _)| src == source_id)
+            && matches!(state.resolved_value, CursorReadoutValue::Unavailable)
+        {
+            state.resolved_key = None;
+        }
+    }
+
     fn submit_probe(
         &self,
         layer: &OverlayLayer,

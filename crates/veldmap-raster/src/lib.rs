@@ -1,6 +1,8 @@
-//! Native raster decoding, bounded CPU decode pools, linear-light mipmap
-//! generation, virtual offline equirectangular basemap tiling, and analytical
-//! GeoTIFF/BigTIFF/COG pyramid decoding for VeldMap.
+//! Native raster decoding, bounded CPU decode pools, linear-light &
+//! NaN-skipping mipmap generation, lossless `Qoi` / byte-shuffled `Lz4Raw`
+//! tile codecs, virtual offline equirectangular basemap tiling, PNG/JPEG
+//! world-file adapters, and analytical GeoTIFF/BigTIFF/COG pyramid decoding
+//! for VeldMap.
 //!
 //! Keeps `veldmap-core` permanently free of image/codec dependencies and keeps
 //! `veldmap-net` decoupled from raster codecs via an injected decode executor.
@@ -187,6 +189,7 @@ mod tests {
                 y: 9,
             },
             RasterError::Binding("bad crs".to_owned()),
+            RasterError::RemotePassUnsupported("stripped remote".to_owned()),
         ];
         for err in &terminal {
             assert!(err.is_terminal(), "expected terminal for {err:?}");

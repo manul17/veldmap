@@ -227,6 +227,7 @@ fn show_stac_section(ui: &mut egui::Ui, ui_state: &mut BasemapUiState) {
             ui.end_row();
 
             ui.label("Auth mode:");
+            let prev_auth_kind = ui_state.draft.stac.auth_kind;
             egui::ComboBox::from_id_salt("stac_auth_kind")
                 .selected_text(ui_state.draft.stac.auth_kind.label())
                 .width(170.0)
@@ -235,6 +236,12 @@ fn show_stac_section(ui: &mut egui::Ui, ui_state: &mut BasemapUiState) {
                         ui.selectable_value(&mut ui_state.draft.stac.auth_kind, kind, kind.label());
                     }
                 });
+            if ui_state.draft.stac.auth_kind != prev_auth_kind {
+                // Scrub the hidden secret whenever auth mode changes so a Bearer
+                // token can never leak into a SAS query string or linger on disk
+                // after switching to `None`.
+                ui_state.draft.stac.auth_secret.clear();
+            }
             ui.end_row();
 
             if ui_state.draft.stac.auth_kind == StacAuthKind::ApiKey {
@@ -270,6 +277,17 @@ fn show_stac_section(ui: &mut egui::Ui, ui_state: &mut BasemapUiState) {
                 ui.end_row();
             }
         });
+
+    if let Some(err) = ui_state.draft.stac.validation_error() {
+        ui.colored_label(ERROR_TEXT_COLOR, egui::RichText::new(err).small());
+    } else if ui_state.draft.stac.auth_kind != StacAuthKind::None
+        && ui_state.draft.stac.auth_secret.trim().is_empty()
+    {
+        ui.colored_label(
+            crate::ui::WARN_TEXT_COLOR,
+            egui::RichText::new("Secret is empty — requests will be sent without auth.").small(),
+        );
+    }
 }
 
 /// Render the floating unified Settings modal when open, returning any user
@@ -307,9 +325,6 @@ pub(crate) fn show_settings_window(
             });
             ui.separator();
 
-            let date_valid = validate_gibs_date(&ui_state.draft.gibs_date);
-            let custom_valid = ui_state.custom_validation().is_ok();
-
             match ui_state.active_tab {
                 SettingsTab::Basemap => {
                     let _ = show_gibs_section(ui, ui_state);
@@ -330,10 +345,17 @@ pub(crate) fn show_settings_window(
                 }
             }
 
-            ui.separator();
-            let can_apply = (ui_state.draft.active_basemap != BasemapSelection::NasaGibsViirs
+            // Evaluate validation AFTER tab widgets mutate `ui_state.draft` so
+            // button enablement is always fresh on the same frame.
+            let date_valid = validate_gibs_date(&ui_state.draft.gibs_date);
+            let custom_valid = ui_state.custom_validation().is_ok();
+            let basemap_valid = (ui_state.draft.active_basemap != BasemapSelection::NasaGibsViirs
                 || date_valid)
                 && (ui_state.draft.active_basemap != BasemapSelection::CustomXyz || custom_valid);
+            let stac_valid = ui_state.draft.stac.validation_error().is_none();
+            let can_apply = basemap_valid && stac_valid;
+
+            ui.separator();
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(can_apply, egui::Button::new("Apply & Save"))
@@ -345,12 +367,27 @@ pub(crate) fn show_settings_window(
                 }
                 if ui_state.active_tab == SettingsTab::Basemap
                     && ui
-                        .add_enabled(custom_valid, egui::Button::new("Use Custom XYZ"))
+                        .add_enabled(
+                            custom_valid && stac_valid,
+                            egui::Button::new("Use Custom XYZ"),
+                        )
                         .clicked()
                 {
                     let mut next = ui_state.draft.clone();
                     next.active_basemap = BasemapSelection::CustomXyz;
                     actions.push(BasemapUiAction::ApplyDraft(Box::new(next)));
+                }
+                if !basemap_valid && ui_state.active_tab != SettingsTab::Basemap {
+                    ui.colored_label(
+                        ERROR_TEXT_COLOR,
+                        egui::RichText::new("Fix invalid Basemap settings before saving.").small(),
+                    );
+                } else if !stac_valid && ui_state.active_tab != SettingsTab::StacCloud {
+                    ui.colored_label(
+                        ERROR_TEXT_COLOR,
+                        egui::RichText::new("Fix invalid STAC / Cloud settings before saving.")
+                            .small(),
+                    );
                 }
             });
         });

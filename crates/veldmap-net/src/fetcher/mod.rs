@@ -98,6 +98,11 @@ impl LiveTilePipeline {
 
     /// Spawn a live tile pipeline sharing an existing [`NetContext`]'s Tokio
     /// runtime, HTTP client pool, and per-host limiters.
+    ///
+    /// Note: transport-level settings (`user_agent`, `max_concurrent_per_host`,
+    /// `connect_timeout`, and `request_timeout`) are governed by the shared
+    /// [`NetContext`]; `config.max_tile_bytes` and `config.transient_retry_backoff`
+    /// still apply per pipeline.
     pub fn spawn_with_context(
         net: Arc<NetContext>,
         config: FetcherConfig,

@@ -10,6 +10,7 @@ use crate::layers::OverlayIoEvent;
 use crate::scene::SceneIoEvent;
 use crate::storage::session::{SavedCameraPose, SavedLayerEntry, SavedVectorEntry};
 use crate::ui::layers::UnavailableLayerNotice;
+use crate::ui::workbench::WorkbenchTab;
 use crate::vectors::VectorIoEvent;
 
 use super::VeldmapApp;
@@ -300,6 +301,7 @@ impl VeldmapApp {
         session_changed: &mut bool,
     ) {
         self.panels.layers.on_layer_opened();
+        self.open_workbench_tab(WorkbenchTab::Layers);
         self.restore_tracker.on_opened(kind, &path);
         newly_opened_paths.push(path);
         *session_changed = true;
@@ -335,11 +337,17 @@ impl VeldmapApp {
             self.panels
                 .layers
                 .note_failed_path(path, error, can_assign_crs);
+            self.open_workbench_tab(WorkbenchTab::Layers);
         }
     }
 
     pub(super) fn drain_scene_io_events(&mut self) -> bool {
         let (events, stac_changed) = self.scene.poll_io_events();
+        if stac_changed && self.scene.stac().last_error().is_some() {
+            // Clear any older local STAC error so a fresh async search error
+            // is never shadowed.
+            self.panels.stac.local_error = None;
+        }
         if events.is_empty() {
             return stac_changed;
         }
@@ -380,6 +388,7 @@ impl VeldmapApp {
                     self.panels
                         .layers
                         .note_failed_path(path, error, can_assign_crs);
+                    self.open_workbench_tab(WorkbenchTab::Layers);
                 }
                 SceneIoEvent::Raster(OverlayIoEvent::Failed {
                     path,
@@ -396,7 +405,9 @@ impl VeldmapApp {
                     fly_to,
                 }) => {
                     tracing::info!(?id, title = %title, url = %display_url, "Opened remote COG overlay layer");
-                    self.panels.layers.on_layer_opened();
+                    if !self.panels.workbench_open {
+                        self.open_workbench_tab(WorkbenchTab::Layers);
+                    }
                     if fly_to && let Some(b) = bounds {
                         self.focus_footprint(b);
                     }
@@ -412,9 +423,19 @@ impl VeldmapApp {
                         error = %error,
                         "Failed to open remote COG overlay layer"
                     );
-                    self.panels
-                        .layers
-                        .push_error(format!("Remote COG '{title}': {error}"));
+                    let msg = format!("Remote COG '{title}': {error}");
+                    if self.panels.workbench_open
+                        && self.panels.workbench_tab == WorkbenchTab::CloudStac
+                    {
+                        self.scene.mutate_stac(|s| {
+                            s.clear_error();
+                            ((), false)
+                        });
+                        self.panels.stac.local_error = Some(msg);
+                    } else {
+                        self.panels.layers.push_error(msg);
+                        self.open_workbench_tab(WorkbenchTab::Layers);
+                    }
                 }
                 SceneIoEvent::Vector(VectorIoEvent::Opened {
                     id,

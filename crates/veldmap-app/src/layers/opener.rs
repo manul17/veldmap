@@ -1,4 +1,5 @@
-//! Local raster opener seam (`open_local_raster`).
+//! Local and remote Cloud-Optimized GeoTIFF raster opener seams
+//! (`open_local_raster`, `open_remote_cog_source`).
 //!
 //! Opens and fingerprints the local file handle once via `veldmap-storage`
 //! (closing TOCTOU windows), delegates format sniffing and sidecar precedence

@@ -1,6 +1,6 @@
 //! Top workstation toolbar (native File Open, Recent files, Bookmarks,
-//! Layers toggle, Geodesic Measure toggle, Go-To navigation, basemap selector,
-//! graticule toggle, and GPU adapter badge).
+//! `Layers` and `Cloud / STAC` workbench toggles, Geodesic Measure toggle,
+//! Go-To navigation, basemap selector, graticule toggle, and GPU adapter badge).
 //!
 //! Strictly action-only: emits [`ToolbarAction`] values back to `VeldmapApp`
 //! without mutating `Camera`, storage, or scene state directly from UI layout
@@ -213,11 +213,7 @@ pub(crate) fn show_top_toolbar(
 
             show_recent_menu(ui, inputs.recent_files, &mut actions);
 
-            let layers_label = if inputs.layer_count > 0 {
-                format!("Layers ({})", inputs.layer_count)
-            } else {
-                "Layers".to_owned()
-            };
+            let layers_label = super::workbench::format_layers_tab_label(inputs.layer_count);
             if ui
                 .selectable_label(inputs.layers_open, layers_label)
                 .on_hover_text("Toggle Layers workbench tab")

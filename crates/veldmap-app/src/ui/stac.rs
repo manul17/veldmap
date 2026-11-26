@@ -9,44 +9,16 @@ use std::fmt;
 use eframe::egui;
 use veldmap_core::geo::FootprintBounds;
 use veldmap_net::{
-    SampleScene, StacCatalogConfig, StacItem, StacSearchQuery, builtin_sample_scenes,
-    sanitize_url_for_display,
+    SampleScene, StacItem, StacSearchQuery, builtin_sample_scenes, sanitize_url_for_display,
 };
 
-use crate::stac::{StacSession, footprint_bounds_from_bbox};
+use crate::stac::{
+    StacCatalogPreset, StacCogAuthMode, StacSession, footprint_bounds_from_bbox, geometry_bbox,
+};
 use crate::storage::settings::AppSettings;
 use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
 use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, submitted_with_enter};
-
-/// Selectable STAC catalog preset inside the Cloud / STAC panel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum StacCatalogPreset {
-    #[default]
-    AwsSentinel2L2a,
-    AwsCopDemGlo30,
-    Custom,
-}
-
-impl StacCatalogPreset {
-    const ALL: [Self; 3] = [Self::AwsSentinel2L2a, Self::AwsCopDemGlo30, Self::Custom];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::AwsSentinel2L2a => "AWS Sentinel-2 L2A (Zero-Auth)",
-            Self::AwsCopDemGlo30 => "AWS COP-DEM GLO-30 (Zero-Auth)",
-            Self::Custom => "Custom STAC Endpoint",
-        }
-    }
-
-    pub(crate) fn to_catalog_config(self, settings: &AppSettings) -> StacCatalogConfig {
-        match self {
-            Self::AwsSentinel2L2a => StacCatalogConfig::aws_sentinel2_l2a(),
-            Self::AwsCopDemGlo30 => StacCatalogConfig::aws_cop_dem_glo30(),
-            Self::Custom => settings.stac.to_custom_catalog(),
-        }
-    }
-}
 
 /// User intent emitted by the Cloud / STAC panel, applied by `VeldmapApp`.
 #[derive(Clone)]
@@ -57,6 +29,7 @@ pub(crate) enum StacUiAction {
     },
     CancelSearch,
     ClearResults,
+    DismissError,
     CaptureViewportAoi,
     ToggleDrawAoiBox,
     UseVectorAoi(VectorLayerId),
@@ -69,7 +42,7 @@ pub(crate) enum StacUiAction {
     StreamCog {
         url: String,
         title: String,
-        use_custom_auth: bool,
+        auth_mode: StacCogAuthMode,
         scale_offset: Option<(f64, f64)>,
     },
     OpenStacSettings,
@@ -85,6 +58,7 @@ impl fmt::Debug for StacUiAction {
                 .finish(),
             Self::CancelSearch => f.write_str("CancelSearch"),
             Self::ClearResults => f.write_str("ClearResults"),
+            Self::DismissError => f.write_str("DismissError"),
             Self::CaptureViewportAoi => f.write_str("CaptureViewportAoi"),
             Self::ToggleDrawAoiBox => f.write_str("ToggleDrawAoiBox"),
             Self::UseVectorAoi(id) => f.debug_tuple("UseVectorAoi").field(id).finish(),
@@ -97,13 +71,13 @@ impl fmt::Debug for StacUiAction {
             Self::StreamCog {
                 url,
                 title,
-                use_custom_auth,
+                auth_mode,
                 scale_offset,
             } => f
                 .debug_struct("StreamCog")
                 .field("url", &sanitize_url_for_display(url))
                 .field("title", title)
-                .field("use_custom_auth", use_custom_auth)
+                .field("auth_mode", auth_mode)
                 .field("scale_offset", scale_offset)
                 .finish(),
             Self::OpenStacSettings => f.write_str("OpenStacSettings"),
@@ -121,6 +95,7 @@ pub(crate) struct StacUiState {
     pub(crate) limit: usize,
     pub(crate) direct_cog_url: String,
     pub(crate) direct_cog_title: String,
+    pub(crate) direct_cog_use_custom_auth: bool,
     pub(crate) copy_notice: Option<String>,
     pub(crate) local_error: Option<String>,
 }
@@ -138,6 +113,10 @@ impl fmt::Debug for StacUiState {
                 &sanitize_url_for_display(&self.direct_cog_url),
             )
             .field("direct_cog_title", &self.direct_cog_title)
+            .field(
+                "direct_cog_use_custom_auth",
+                &self.direct_cog_use_custom_auth,
+            )
             .finish()
     }
 }
@@ -152,6 +131,7 @@ impl Default for StacUiState {
             limit: 15,
             direct_cog_url: String::new(),
             direct_cog_title: String::new(),
+            direct_cog_use_custom_auth: false,
             copy_notice: None,
             local_error: None,
         }
@@ -177,7 +157,7 @@ fn show_sample_scenes_section(ui: &mut egui::Ui, actions: &mut Vec<StacUiAction>
                                 actions.push(StacUiAction::StreamCog {
                                     url: sample.cog_url.to_owned(),
                                     title: sample.title.to_owned(),
-                                    use_custom_auth: false,
+                                    auth_mode: StacCogAuthMode::None,
                                     scale_offset: sample.scale_offset(),
                                 });
                             }
@@ -194,7 +174,7 @@ fn show_direct_cog_section(
     state: &mut StacUiState,
     actions: &mut Vec<StacUiAction>,
 ) {
-    egui::CollapsingHeader::new(egui::RichText::new("Open Public COG URL").strong())
+    egui::CollapsingHeader::new(egui::RichText::new("Open Direct COG URL").strong())
         .id_salt("stac_direct_cog")
         .default_open(false)
         .show(ui, |ui| {
@@ -218,14 +198,23 @@ fn show_direct_cog_section(
                 {
                     let url = state.direct_cog_url.trim().to_owned();
                     let title = state.direct_cog_title.trim().to_owned();
+                    let auth_mode = if state.direct_cog_use_custom_auth {
+                        StacCogAuthMode::DirectCustom
+                    } else {
+                        StacCogAuthMode::None
+                    };
                     actions.push(StacUiAction::StreamCog {
                         url,
                         title,
-                        use_custom_auth: state.preset == StacCatalogPreset::Custom,
+                        auth_mode,
                         scale_offset: None,
                     });
                 }
             });
+            ui.checkbox(&mut state.direct_cog_use_custom_auth, "Use Custom STAC auth")
+                .on_hover_text(
+                    "Attach credentials configured in Settings → STAC / Cloud (leave off for public URLs)",
+                );
         });
 }
 
@@ -249,7 +238,9 @@ fn show_aoi_section(
         }
         if ui
             .selectable_label(draw_aoi_active, "Draw Box")
-            .on_hover_text("Click and drag on the globe to draw a search AOI rectangle")
+            .on_hover_text(
+                "Click and drag on the globe to draw a search AOI rectangle (Esc cancels)",
+            )
             .clicked()
         {
             state.copy_notice = None;
@@ -307,7 +298,7 @@ fn show_aoi_section(
     } else if draw_aoi_active {
         ui.colored_label(
             WARN_TEXT_COLOR,
-            egui::RichText::new("Drag on the globe to draw an AOI box.").small(),
+            egui::RichText::new("Drag on the globe to draw an AOI box (Esc to cancel).").small(),
         );
     } else {
         ui.weak(
@@ -347,16 +338,16 @@ fn show_search_form(
         );
     }
 
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Dates:").small());
-        ui.add(
-            egui::TextEdit::singleline(&mut state.datetime_input)
-                .desired_width(ui.available_width())
-                .hint_text("YYYY-MM-DD/YYYY-MM-DD (optional)"),
-        );
-    });
+    if state.preset.supports_temporal_and_cloud_filters() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Dates:").small());
+            ui.add(
+                egui::TextEdit::singleline(&mut state.datetime_input)
+                    .desired_width(ui.available_width())
+                    .hint_text("YYYY-MM-DD/YYYY-MM-DD (optional)"),
+            );
+        });
 
-    if state.preset != StacCatalogPreset::AwsCopDemGlo30 {
         ui.horizontal(|ui| {
             ui.checkbox(&mut state.filter_clouds, "Max cloud %:");
             ui.add_enabled(
@@ -385,21 +376,13 @@ fn show_search_form(
                 .clicked()
             {
                 state.local_error = None;
-                let dt = state.datetime_input.trim();
-                let query = StacSearchQuery {
-                    bbox: if stac.aoi_geometry().is_some() {
-                        None
-                    } else {
-                        stac.aoi_bbox()
-                    },
-                    intersects: stac.aoi_geometry().cloned(),
-                    datetime: (!dt.is_empty() && state.preset != StacCatalogPreset::AwsCopDemGlo30)
-                        .then(|| dt.to_owned()),
-                    max_cloud_cover: (state.filter_clouds
-                        && state.preset != StacCatalogPreset::AwsCopDemGlo30)
-                        .then_some(state.max_cloud_cover),
-                    limit: state.limit,
-                };
+                let query = state.preset.build_search_query(
+                    stac.aoi_geometry().cloned(),
+                    &state.datetime_input,
+                    state.filter_clouds,
+                    state.max_cloud_cover,
+                    state.limit,
+                );
                 actions.push(StacUiAction::Search {
                     preset: state.preset,
                     query,
@@ -411,8 +394,13 @@ fn show_search_form(
         }
     });
 
-    if let Some(err) = stac.last_error().or(state.local_error.as_deref()) {
-        ui.colored_label(ERROR_TEXT_COLOR, egui::RichText::new(err).small());
+    if let Some(err) = state.local_error.as_deref().or(stac.last_error()) {
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(ERROR_TEXT_COLOR, egui::RichText::new(err).small());
+            if ui.small_button("Dismiss").clicked() {
+                actions.push(StacUiAction::DismissError);
+            }
+        });
     }
 }
 
@@ -421,7 +409,6 @@ fn show_item_card(
     idx: usize,
     item: &StacItem,
     selected: bool,
-    use_custom_auth: bool,
     hovered_any: &mut Option<usize>,
     actions: &mut Vec<StacUiAction>,
 ) {
@@ -465,11 +452,14 @@ fn show_item_card(
                     actions.push(StacUiAction::StreamCog {
                         url: asset.href.clone(),
                         title: format!("{} ({})", item.id, asset.key),
-                        use_custom_auth,
+                        auth_mode: StacCogAuthMode::FromSearchResult,
                         scale_offset: asset.primary_scale_offset(),
                     });
                 }
-                if let Some(bbox) = item.bbox
+                let zoom_bbox = item
+                    .bbox
+                    .or_else(|| item.geometry.as_ref().and_then(geometry_bbox));
+                if let Some(bbox) = zoom_bbox
                     && let Some(bounds) = footprint_bounds_from_bbox(bbox)
                     && ui
                         .small_button("Zoom")
@@ -497,7 +487,7 @@ fn show_item_card(
                                 actions.push(StacUiAction::StreamCog {
                                     url: asset.href.clone(),
                                     title: format!("{} ({})", item.id, asset.key),
-                                    use_custom_auth,
+                                    auth_mode: StacCogAuthMode::FromSearchResult,
                                     scale_offset: asset.primary_scale_offset(),
                                 });
                             }
@@ -507,7 +497,7 @@ fn show_item_card(
             }
         })
         .response;
-    if resp.hovered() {
+    if resp.contains_pointer() {
         *hovered_any = Some(idx);
     }
 }
@@ -543,7 +533,6 @@ pub(crate) fn show_stac_tab_contents(
                     None => format!("Results ({})", items.len()),
                 };
                 ui.strong(header);
-                let use_custom_auth = state.preset == StacCatalogPreset::Custom;
                 let selected_idx = stac.selected_idx();
                 let mut hovered_any = None;
                 for (idx, item) in items.iter().enumerate() {
@@ -552,14 +541,47 @@ pub(crate) fn show_stac_tab_contents(
                         idx,
                         item,
                         selected_idx == Some(idx),
-                        use_custom_auth,
                         &mut hovered_any,
                         &mut actions,
                     );
                 }
-                actions.push(StacUiAction::HoverItem(hovered_any));
+                if hovered_any != stac.hovered_idx() {
+                    actions.push(StacUiAction::HoverItem(hovered_any));
+                }
             }
         });
 
     actions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stac_ui_debug_redacts_url_userinfo_and_query_tokens() {
+        let state = StacUiState {
+            direct_cog_url: "https://user:pw@blob.example/a.tif?sig=top_secret".to_owned(),
+            ..StacUiState::default()
+        };
+        let state_dbg = format!("{state:?}");
+        assert!(
+            !state_dbg.contains("top_secret"),
+            "leaked query: {state_dbg}"
+        );
+        assert!(!state_dbg.contains("pw"), "leaked userinfo: {state_dbg}");
+
+        let action = StacUiAction::StreamCog {
+            url: "https://user:pw@blob.example/a.tif?sig=top_secret".to_owned(),
+            title: "Test".to_owned(),
+            auth_mode: StacCogAuthMode::DirectCustom,
+            scale_offset: None,
+        };
+        let action_dbg = format!("{action:?}");
+        assert!(
+            !action_dbg.contains("top_secret"),
+            "leaked query: {action_dbg}"
+        );
+        assert!(!action_dbg.contains("pw"), "leaked userinfo: {action_dbg}");
+    }
 }

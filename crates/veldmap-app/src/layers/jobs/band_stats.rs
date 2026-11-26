@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use veldmap_core::tile::{BandKey, SourceId};
 use veldmap_net::PrefetchPin;
-use veldmap_raster::{BandStats, DecodeJob, DecodeJobKey, RasterError, coalesce_byte_ranges};
+use veldmap_raster::{BandStats, DecodeJob, DecodeJobKey, RasterError};
 
 use super::super::LayerId;
 use super::super::runtime::OverlayRuntime;
@@ -25,6 +25,25 @@ struct BandStatsMsg {
     source_id: SourceId,
     band: BandKey,
     outcome: BandStatsOutcome,
+}
+
+fn compute_band_stats_outcome(
+    rt: &OverlayRuntime,
+    source: &dyn veldmap_raster::RasterSource,
+    band: BandKey,
+    cancel: &veldmap_core::sync::CancelToken,
+) -> BandStatsOutcome {
+    if cancel.is_cancelled() {
+        return BandStatsOutcome::Cancelled;
+    }
+    let ctx = rt.decode_context(cancel);
+    match source.band_stats(band, &ctx) {
+        Ok(Some(stats)) => BandStatsOutcome::Ready(Box::new(stats)),
+        Ok(None) => BandStatsOutcome::Empty,
+        Err(RasterError::Cancelled) => BandStatsOutcome::Cancelled,
+        Err(_) if cancel.is_cancelled() => BandStatsOutcome::Cancelled,
+        Err(_) => BandStatsOutcome::Empty,
+    }
 }
 
 struct StatsCompletionGuard {
@@ -55,8 +74,9 @@ impl Drop for StatsCompletionGuard {
     }
 }
 
-/// Manages background sampled physical [`BandStats`] jobs submitted on the
-/// fast decode pool and applies completions back onto matching layers.
+/// Manages background sampled physical [`BandStats`] jobs submitted on
+/// `fast_pool` (local rasters) or `NetContext` prefetch + `remote_pool`
+/// (remote COGs) and applies completions back onto matching layers.
 pub(in crate::layers) struct BandStatsTracker {
     next_job_id: u64,
     tx: Sender<BandStatsMsg>,
@@ -122,10 +142,18 @@ impl BandStatsTracker {
                     guard.outcome = Some(BandStatsOutcome::Cancelled);
                     return;
                 }
-                let ranges: Vec<(u64, u64)> = {
-                    let mut raw = source.plan_band_stats_byte_ranges(band).unwrap_or_default();
-                    coalesce_byte_ranges(&mut raw, 64 * 1024, 4 * 1024 * 1024);
-                    raw.into_iter().map(|r| (r.offset, r.len)).collect()
+                let ranges: Vec<(u64, u64)> = match source.plan_band_stats_byte_ranges(band) {
+                    Ok(raw) => super::coalesce_remote_ranges(raw),
+                    Err(err) => {
+                        tracing::warn!(
+                            source = ?source_id,
+                            ?band,
+                            error = %err,
+                            "Remote COG band-stats range planning failed"
+                        );
+                        guard.outcome = Some(BandStatsOutcome::Empty);
+                        return;
+                    }
                 };
                 let pin: Option<PrefetchPin> = if ranges.is_empty() {
                     None
@@ -171,18 +199,12 @@ impl BandStatsTracker {
                     work: Box::new(move || {
                         let _pin = pin;
                         let mut guard = guard;
-                        if job_cancel.is_cancelled() {
-                            guard.outcome = Some(BandStatsOutcome::Cancelled);
-                            return;
-                        }
-                        let ctx = job_rt.decode_context(&job_cancel);
-                        guard.outcome = Some(match source.band_stats(band, &ctx) {
-                            Ok(Some(stats)) => BandStatsOutcome::Ready(Box::new(stats)),
-                            Ok(None) => BandStatsOutcome::Empty,
-                            Err(RasterError::Cancelled) => BandStatsOutcome::Cancelled,
-                            Err(_) if job_cancel.is_cancelled() => BandStatsOutcome::Cancelled,
-                            Err(_) => BandStatsOutcome::Empty,
-                        });
+                        guard.outcome = Some(compute_band_stats_outcome(
+                            &job_rt,
+                            source.as_ref(),
+                            band,
+                            &job_cancel,
+                        ));
                     }),
                 };
                 let disarm_on_reject = Arc::clone(&disarmed);
@@ -212,18 +234,12 @@ impl BandStatsTracker {
             cancel: cancel.clone(),
             work: Box::new(move || {
                 let mut guard = guard;
-                if cancel.is_cancelled() {
-                    guard.outcome = Some(BandStatsOutcome::Cancelled);
-                    return;
-                }
-                let ctx = rt.decode_context(&cancel);
-                guard.outcome = Some(match source.band_stats(band, &ctx) {
-                    Ok(Some(stats)) => BandStatsOutcome::Ready(Box::new(stats)),
-                    Ok(None) => BandStatsOutcome::Empty,
-                    Err(RasterError::Cancelled) => BandStatsOutcome::Cancelled,
-                    Err(_) if cancel.is_cancelled() => BandStatsOutcome::Cancelled,
-                    Err(_) => BandStatsOutcome::Empty,
-                });
+                guard.outcome = Some(compute_band_stats_outcome(
+                    &rt,
+                    source.as_ref(),
+                    band,
+                    &cancel,
+                ));
             }),
         };
         let pool = if is_remote {

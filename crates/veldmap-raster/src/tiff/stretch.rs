@@ -142,7 +142,7 @@ fn for_each_sampled_chunk(
 fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterError> {
     let ifd = req.stats_ifd;
     let invert = ifd.photometric == Photometric::WhiteIsZero;
-    if ifd.sample_type == SampleType::U8 {
+    if ifd.sample_type == SampleType::U8 || ifd.photometric == Photometric::Palette {
         return Ok(DisplayMapping::identity(req.nodata_f64).with_invert(invert));
     }
     let colors = ifd.pixel_layout.colors().max(1);

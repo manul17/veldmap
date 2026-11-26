@@ -20,7 +20,10 @@ use geokeys::{
 pub(super) struct RawGeoTiffTags {
     pub(super) raw_keys: Vec<u16>,
     pub(super) double_params: Vec<f64>,
-    pub(super) ascii_params: String,
+    /// Raw NUL-truncated bytes of `GeoAsciiParamsTag` (`34737`), preserved as
+    /// bytes until `GeoKeyDirectoryTag` byte-offset slicing completes so
+    /// non-UTF-8 Latin-1 bytes never shift subsequent key offsets.
+    pub(super) ascii_params: Vec<u8>,
     pub(super) points: Vec<f64>,
     pub(super) scale: Vec<f64>,
     pub(super) matrix: Vec<f64>,

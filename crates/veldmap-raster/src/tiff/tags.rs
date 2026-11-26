@@ -17,9 +17,10 @@ use crate::RasterError;
 use super::georef::RawGeoTiffTags;
 use super::ifd::TiffByteOrder;
 
-/// Initial header prefix window (`128 KiB`) read once on open so typical COG
-/// headers, GeoKeys, and tile offset tables resolve in zero extra `read_at`s.
-const INITIAL_HEADER_PREFIX_BYTES: usize = 128 * 1024;
+/// Initial header prefix window (`256 KiB`, matching `HttpRangeSource`'s head
+/// probe) read once on open so typical COG headers, GeoKeys, and tile offset
+/// tables resolve in zero extra `read_at`s.
+const INITIAL_HEADER_PREFIX_BYTES: usize = 256 * 1024;
 
 /// Maximum number of tag entries admitted in a single IFD directory.
 const MAX_IFD_ENTRIES: usize = 4096;
@@ -206,11 +207,11 @@ impl IfdDirectory {
     }
 
     /// Coalesce and fetch all out-of-line payloads for `tags` that are not
-    /// already covered by `reader.prefix`, enforcing `max_payload_bytes` BEFORE
-    /// allocation or I/O.
+    /// already covered by `reader.prefix`, enforcing `max_payload_bytes` and
+    /// `reader`'s cumulative byte budget BEFORE allocation or I/O.
     pub(super) fn prefetch_tags(
         &mut self,
-        reader: &SinglePassIfdReader,
+        reader: &mut SinglePassIfdReader,
         tags: &[u16],
         max_payload_bytes: u64,
         cancel: &CancelToken,
@@ -261,19 +262,36 @@ impl IfdDirectory {
         }
         needed.sort_unstable_by_key(|&(off, len)| (off, len));
 
-        // Merge nearby spans into minimal contiguous reads.
+        // Merge nearby spans into minimal contiguous reads without exceeding
+        // either `max_payload_bytes` or `reader`'s remaining cumulative budget.
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(needed.len());
+        let mut merged_total = 0u64;
         for (off, len) in needed {
+            let next_end = off.saturating_add(len);
             if let Some(last) = merged.last_mut() {
                 let last_end = last.0.saturating_add(last.1);
-                let new_end = last_end.max(off.saturating_add(len));
-                let new_len = new_end.saturating_sub(last.0);
-                if off <= last_end.saturating_add(OUT_OF_LINE_COALESCE_GAP)
-                    && new_len <= OUT_OF_LINE_COALESCE_MAX_LEN
-                {
-                    last.1 = new_len;
+                if next_end <= last_end {
                     continue;
                 }
+                let new_end = last_end.max(next_end);
+                let new_len = new_end.saturating_sub(last.0);
+                let added = new_len.saturating_sub(last.1);
+                let next_total = merged_total.saturating_add(added);
+                if off <= last_end.saturating_add(OUT_OF_LINE_COALESCE_GAP)
+                    && new_len <= OUT_OF_LINE_COALESCE_MAX_LEN
+                    && next_total <= max_payload_bytes
+                    && next_total <= reader.remaining_fetch_budget()
+                {
+                    last.1 = new_len;
+                    merged_total = next_total;
+                    continue;
+                }
+            }
+            merged_total = merged_total.saturating_add(len);
+            if merged_total > max_payload_bytes {
+                return Err(RasterError::DecoderLimitsExceeded(format!(
+                    "TIFF IFD tag payloads {merged_total} B exceed limit {max_payload_bytes} B"
+                )));
             }
             merged.push((off, len));
         }
@@ -282,7 +300,13 @@ impl IfdDirectory {
             if cancel.is_cancelled() {
                 return Err(RasterError::Cancelled);
             }
-            let mut buf = vec![0u8; len as usize];
+            reader.charge_fetch(len)?;
+            let len_usize = usize::try_from(len).map_err(|_| {
+                RasterError::DecoderLimitsExceeded(format!(
+                    "TIFF IFD tag span {len} B overflows usize"
+                ))
+            })?;
+            let mut buf = vec![0u8; len_usize];
             reader.source.read_exact_at(off, &mut buf, cancel)?;
             self.loaded_spans.push((off, buf));
         }
@@ -362,10 +386,22 @@ impl IfdDirectory {
         let Some(entry) = self.entry(tag) else {
             return Ok(None);
         };
+        let elem_size = match entry.field_type {
+            1 => 1usize,
+            3 => 2,
+            4 | 13 => 4,
+            16 | 18 => 8,
+            other => {
+                return Err(RasterError::Decode(format!(
+                    "TIFF tag {tag} has unexpected non-unsigned field type {other}"
+                )));
+            }
+        };
         let bytes = self.resolve_bytes(&entry, reader)?;
-        let count = usize::try_from(entry.count).map_err(|_| {
+        let raw_count = usize::try_from(entry.count).map_err(|_| {
             RasterError::DecoderLimitsExceeded(format!("TIFF tag {tag} count overflow"))
         })?;
+        let count = raw_count.min(bytes.len() / elem_size);
         let mut out = Vec::with_capacity(count);
         let order = self.byte_order;
         match entry.field_type {
@@ -389,11 +425,7 @@ impl IfdDirectory {
                     out.push(read_u64(order, chunk));
                 }
             }
-            other => {
-                return Err(RasterError::Decode(format!(
-                    "TIFF tag {tag} has unexpected non-unsigned field type {other}"
-                )));
-            }
+            _ => unreachable!("field_type validated above"),
         }
         Ok(Some(out))
     }
@@ -422,8 +454,17 @@ impl IfdDirectory {
         tag: u16,
     ) -> Option<Vec<f64>> {
         let entry = self.entry(tag)?;
+        let elem_size = match entry.field_type {
+            1 | 6 => 1usize,
+            3 | 8 => 2,
+            4 | 9 | 11 | 13 => 4,
+            5 | 10 | 12 | 16 | 17 | 18 => 8,
+            _ => return None,
+        };
         let bytes = self.resolve_bytes(&entry, reader).ok()?;
-        let count = usize::try_from(entry.count).ok()?;
+        let count = usize::try_from(entry.count)
+            .ok()?
+            .min(bytes.len() / elem_size);
         let order = self.byte_order;
         let mut out = Vec::with_capacity(count);
         match entry.field_type {
@@ -504,33 +545,40 @@ impl IfdDirectory {
         let Some(entry) = self.entry(tag) else {
             return Vec::new();
         };
-        if entry.field_type != 12 {
+        if !matches!(entry.field_type, 11 | 12) {
             return Vec::new();
         }
         self.read_numeric_f64_vec_opt(reader, tag)
             .unwrap_or_default()
     }
 
-    pub(super) fn read_ascii_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> String {
+    pub(super) fn read_ascii_bytes_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> Vec<u8> {
         let Some(entry) = self.entry(tag) else {
-            return String::new();
+            return Vec::new();
         };
         if !matches!(entry.field_type, 2 | 1 | 7) {
-            return String::new();
+            return Vec::new();
         }
         let Ok(bytes) = self.resolve_bytes(&entry, reader) else {
-            return String::new();
+            return Vec::new();
         };
         // Match `tiff::Decoder::get_tag_ascii_string`: truncate at the first NUL byte.
-        let slice = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
-        std::str::from_utf8(slice).unwrap_or("").to_owned()
+        bytes.split(|&b| b == 0).next().unwrap_or(&[]).to_vec()
+    }
+
+    pub(super) fn read_ascii_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> String {
+        let raw = self.read_ascii_bytes_opt(reader, tag);
+        if raw.is_empty() {
+            return String::new();
+        }
+        String::from_utf8_lossy(&raw).into_owned()
     }
 
     pub(super) fn read_geotiff_tags(&self, reader: &SinglePassIfdReader) -> RawGeoTiffTags {
         RawGeoTiffTags {
             raw_keys: self.read_u16_vec_opt(reader, TAG_GEO_KEY_DIRECTORY),
             double_params: self.read_f64_vec_opt(reader, TAG_GEO_DOUBLE_PARAMS),
-            ascii_params: self.read_ascii_opt(reader, TAG_GEO_ASCII_PARAMS),
+            ascii_params: self.read_ascii_bytes_opt(reader, TAG_GEO_ASCII_PARAMS),
             points: self.read_f64_vec_opt(reader, TAG_MODEL_TIEPOINT),
             scale: self.read_f64_vec_opt(reader, TAG_MODEL_PIXEL_SCALE),
             matrix: self.read_f64_vec_opt(reader, TAG_MODEL_TRANSFORMATION),
@@ -543,6 +591,8 @@ pub(super) struct SinglePassIfdReader {
     source: Arc<dyn ByteSource>,
     file_len: u64,
     prefix: Vec<u8>,
+    bytes_fetched: u64,
+    max_total_bytes: u64,
     pub(super) byte_order: TiffByteOrder,
     big_tiff: bool,
     pub(super) first_ifd: u64,
@@ -551,9 +601,12 @@ pub(super) struct SinglePassIfdReader {
 
 impl SinglePassIfdReader {
     /// Read the initial header prefix once and validate the Classic/BigTIFF
-    /// signature and first IFD offset.
+    /// signature and first IFD offset, enforcing a cumulative fetch budget of
+    /// `max_total_bytes` across the prefix, all IFD directories, and prefetched
+    /// tag payloads.
     pub(super) fn open(
         source: Arc<dyn ByteSource>,
+        max_total_bytes: u64,
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
         if cancel.is_cancelled() {
@@ -563,7 +616,14 @@ impl SinglePassIfdReader {
         if file_len < 8 {
             return Err(RasterError::UnsupportedFormat);
         }
-        let prefix_len = file_len.min(INITIAL_HEADER_PREFIX_BYTES as u64) as usize;
+        if max_total_bytes < 8 {
+            return Err(RasterError::DecoderLimitsExceeded(format!(
+                "TIFF IFD fetch budget {max_total_bytes} B is smaller than 8 B header"
+            )));
+        }
+        let prefix_len = file_len
+            .min(INITIAL_HEADER_PREFIX_BYTES as u64)
+            .min(max_total_bytes) as usize;
         let mut prefix = vec![0u8; prefix_len];
         source.read_exact_at(0, &mut prefix, cancel)?;
 
@@ -576,8 +636,13 @@ impl SinglePassIfdReader {
         let (big_tiff, first_ifd) = match version {
             42 => (false, u64::from(read_u32(byte_order, &prefix[4..8]))),
             43 => {
-                if prefix.len() < 16 {
+                if file_len < 16 {
                     return Err(RasterError::Decode("truncated BigTIFF header".to_owned()));
+                }
+                if prefix.len() < 16 {
+                    return Err(RasterError::DecoderLimitsExceeded(format!(
+                        "TIFF IFD fetch budget {max_total_bytes} B is smaller than 16 B BigTIFF header"
+                    )));
                 }
                 let offset_size = read_u16(byte_order, &prefix[4..6]);
                 let reserved = read_u16(byte_order, &prefix[6..8]);
@@ -594,6 +659,8 @@ impl SinglePassIfdReader {
         Ok(Self {
             source,
             file_len,
+            bytes_fetched: prefix.len() as u64,
+            max_total_bytes,
             prefix,
             byte_order,
             big_tiff,
@@ -602,8 +669,24 @@ impl SinglePassIfdReader {
         })
     }
 
+    pub(super) const fn remaining_fetch_budget(&self) -> u64 {
+        self.max_total_bytes.saturating_sub(self.bytes_fetched)
+    }
+
+    fn charge_fetch(&mut self, bytes: u64) -> Result<(), RasterError> {
+        let next = self.bytes_fetched.saturating_add(bytes);
+        if next > self.max_total_bytes {
+            return Err(RasterError::DecoderLimitsExceeded(format!(
+                "cumulative TIFF IFD/tag fetch {next} B exceeds limit {} B",
+                self.max_total_bytes
+            )));
+        }
+        self.bytes_fetched = next;
+        Ok(())
+    }
+
     fn read_bytes_into(
-        &self,
+        &mut self,
         offset: u64,
         out: &mut [u8],
         cancel: &CancelToken,
@@ -623,12 +706,14 @@ impl SinglePassIfdReader {
             out.copy_from_slice(&self.prefix[s..s + out.len()]);
             return Ok(());
         }
+        self.charge_fetch(len)?;
         self.source.read_exact_at(offset, out, cancel)?;
         Ok(())
     }
 
-    /// Read one IFD entry table + `next_ifd` pointer at `ifd_offset` in a single
-    /// contiguous read (or zero reads when inside the initial header prefix).
+    /// Read one IFD entry table + `next_ifd` pointer at `ifd_offset` (zero
+    /// extra reads when inside the initial header prefix, or at most two
+    /// positioned reads—entry count then table—when out-of-prefix).
     pub(super) fn read_directory(
         &mut self,
         ifd_offset: u64,
@@ -691,6 +776,21 @@ impl SinglePassIfdReader {
                 (u64::from(read_u32(order, &e[4..8])), &e[8..12])
             };
             let Some(type_sz) = field_type_size(field_type) else {
+                // Preserve unknown field types with zero inline payload so
+                // unread private tags remain harmless while strict tag readers
+                // reject corrupt required/layout tags instead of defaulting.
+                entries.insert(
+                    tag,
+                    IfdEntry {
+                        tag,
+                        field_type,
+                        count: 0,
+                        inline_bytes: [0u8; 8],
+                        offset: 0,
+                        byte_len: 0,
+                        is_inline: true,
+                    },
+                );
                 continue;
             };
             let Some(byte_len) = elem_count.checked_mul(type_sz) else {
@@ -739,13 +839,5 @@ impl SinglePassIfdReader {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn overview_bit_filters_reduced_resolution_and_excludes_masks() {
-        assert!(!is_overview(0));
-        assert!(is_overview(1));
-        assert!(!is_overview(5)); // mask bit set
-    }
-}
+#[path = "tags_tests.rs"]
+mod tests;

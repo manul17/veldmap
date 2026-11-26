@@ -67,7 +67,9 @@ pub struct NetContext {
     shutdown: CancelToken,
     host_limiters: Arc<HostLimiters>,
     range_client: reqwest::Client,
+    range_auth_client: reqwest::Client,
     api_client: reqwest::Client,
+    api_auth_client: reqwest::Client,
     range_pool: Arc<RangeBlockPool>,
     prefetch_budget: Arc<PrefetchBudget>,
     next_instance_id: AtomicU64,
@@ -75,7 +77,8 @@ pub struct NetContext {
 
 impl NetContext {
     /// Initialize a shared [`NetContext`] with a multi-thread Tokio runtime,
-    /// non-decompressing range/tile client, gzip-capable JSON API client,
+    /// non-decompressing range/tile clients, gzip-capable JSON API clients
+    /// (with same-origin redirect guards when custom auth headers are sent),
     /// shared per-host limiters, and bounded range block / prefetch pools.
     pub fn new(config: NetConfig) -> Result<Self, NetError> {
         let range_client = build_http_client(&HttpClientConfig {
@@ -84,6 +87,15 @@ impl NetContext {
             read_timeout: config.read_timeout,
             max_concurrent_per_host: config.max_concurrent_per_host,
             enable_gzip: false,
+            same_origin_redirects: false,
+        })?;
+        let range_auth_client = build_http_client(&HttpClientConfig {
+            user_agent: &config.user_agent,
+            connect_timeout: config.connect_timeout,
+            read_timeout: config.read_timeout,
+            max_concurrent_per_host: config.max_concurrent_per_host,
+            enable_gzip: false,
+            same_origin_redirects: true,
         })?;
         let api_client = build_http_client(&HttpClientConfig {
             user_agent: &config.user_agent,
@@ -91,6 +103,15 @@ impl NetContext {
             read_timeout: config.read_timeout,
             max_concurrent_per_host: config.max_concurrent_per_host,
             enable_gzip: true,
+            same_origin_redirects: false,
+        })?;
+        let api_auth_client = build_http_client(&HttpClientConfig {
+            user_agent: &config.user_agent,
+            connect_timeout: config.connect_timeout,
+            read_timeout: config.read_timeout,
+            max_concurrent_per_host: config.max_concurrent_per_host,
+            enable_gzip: true,
+            same_origin_redirects: true,
         })?;
 
         let workers = config.worker_threads.max(DEFAULT_RUNTIME_WORKER_THREADS);
@@ -107,7 +128,9 @@ impl NetContext {
             shutdown: CancelToken::new(),
             host_limiters: Arc::new(HostLimiters::new(config.max_concurrent_per_host)),
             range_client,
+            range_auth_client,
             api_client,
+            api_auth_client,
             range_pool: Arc::new(RangeBlockPool::new(config.range_block_pool_bytes)),
             prefetch_budget: Arc::new(PrefetchBudget::new(config.remote_prefetch_bytes)),
             next_instance_id: AtomicU64::new(1),
@@ -130,9 +153,26 @@ impl NetContext {
         &self.range_client
     }
 
+    /// Borrow the non-decompressing HTTP client appropriate for requests with or
+    /// without custom auth headers (custom-header requests forbid cross-origin
+    /// redirects so secrets never leak to third-party origins).
+    pub(crate) fn range_client_for(&self, has_custom_headers: bool) -> &reqwest::Client {
+        if has_custom_headers {
+            &self.range_auth_client
+        } else {
+            &self.range_client
+        }
+    }
+
     /// Borrow the gzip-capable HTTP client used by JSON metadata / STAC APIs.
     pub(crate) fn api_client(&self) -> &reqwest::Client {
         &self.api_client
+    }
+
+    /// Borrow the same-origin-redirect-guarded gzip HTTP client used by STAC
+    /// requests carrying custom auth headers.
+    pub(crate) fn api_auth_client(&self) -> &reqwest::Client {
+        &self.api_auth_client
     }
 
     /// Clone the shared per-host concurrency and cooldown limiters.
@@ -175,7 +215,11 @@ impl NetContext {
         self.signal_shutdown();
         let rt = lock_unpoisoned(&self.runtime).take();
         if let Some(rt) = rt {
-            rt.shutdown_timeout(Duration::from_secs(2));
+            if tokio::runtime::Handle::try_current().is_ok() {
+                rt.shutdown_background();
+            } else {
+                rt.shutdown_timeout(Duration::from_secs(2));
+            }
         }
     }
 }

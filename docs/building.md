@@ -21,11 +21,15 @@ For headless GPU tests on Linux CI or machines without a hardware GPU, install `
 # Run the desktop application
 cargo run -p veldmap-app
 
-# Run formatting, lints, rustdoc, and full test suite (matching CI)
+# Run formatting, lints (production + all targets), rustdoc, and full test suite (matching CI)
 cargo fmt --all -- --check
+cargo clippy --locked --workspace --lib --bins -- -D warnings
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --all-features --document-private-items
+
+# Require hardware/software GPU smoke tests to run instead of skipping (matches Linux/Windows CI)
+VELDMAP_REQUIRE_GPU_TEST=1 cargo test --locked -p veldmap-app --test integration
 
 # Verify headless non-UI crates in isolation
 cargo test --locked -p veldmap-core --no-default-features

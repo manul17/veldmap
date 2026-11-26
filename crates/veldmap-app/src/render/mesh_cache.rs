@@ -37,6 +37,10 @@ impl<K: Eq + Hash + Copy, V> ElasticMeshCache<K, V> {
         let _ = self.inner.insert(key, value, byte_size);
     }
 
+    pub(super) fn remove_where(&mut self, predicate: impl FnMut(&K) -> bool) {
+        let _ = self.inner.remove_where(predicate);
+    }
+
     pub(super) fn clear_and_reset_cap(&mut self) {
         let _ = self.inner.clear();
         if self.inner.max_bytes() > self.default_cap_bytes {

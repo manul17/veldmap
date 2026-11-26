@@ -311,3 +311,91 @@ fn stac_search_parses_sentinel2_assets_raster_bands_auth_and_redacts_secrets() {
         assert!(s.cog_url.ends_with(".tif"));
     }
 }
+
+#[test]
+fn stac_rejects_invalid_endpoint_forbidden_header_and_redacts_error_snippets() {
+    let net = Arc::new(NetContext::new(NetConfig::default()).expect("net"));
+    let client = StacClient::new(Arc::clone(&net));
+    let cancel = CancelToken::new();
+
+    // Invalid endpoint with whitespace.
+    let bad_ep = StacCatalogConfig {
+        endpoint: "https://example.org/stac v1".to_owned(),
+        collection: "sentinel-2-l2a".to_owned(),
+        auth: StacAuth::None,
+    };
+    let err = net
+        .handle()
+        .block_on(client.search_async(&bad_ep, &StacSearchQuery::default(), &cancel))
+        .expect_err("bad endpoint");
+    assert!(matches!(err, veldmap_net::StacError::InvalidEndpoint(_)));
+
+    // Forbidden header override.
+    let bad_hdr = StacCatalogConfig {
+        endpoint: "https://example.org/stac".to_owned(),
+        collection: "sentinel-2-l2a".to_owned(),
+        auth: StacAuth::ApiKey {
+            header_name: "Content-Type".to_owned(),
+            value: "text/plain".to_owned(),
+        },
+    };
+    let err = net
+        .handle()
+        .block_on(client.search_async(&bad_hdr, &StacSearchQuery::default(), &cancel))
+        .expect_err("forbidden header");
+    assert!(matches!(
+        err,
+        veldmap_net::StacError::InvalidAuthHeader { .. }
+    ));
+
+    // Non-2xx response includes redacted diagnostic body snippet.
+    let shutdown = CancelToken::new();
+    let stop = shutdown.clone();
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let _ = addr_tx.send(addr);
+            if let Ok((mut stream, _)) = tokio::select! {
+                _ = stop.cancelled() => Err(std::io::Error::other("stop")),
+                res = listener.accept() => res,
+            } {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"code":"BadRequest","description":"invalid datetime for secret-tok"}"#;
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+    });
+    let addr = addr_rx.recv().expect("addr");
+    let cat = StacCatalogConfig {
+        endpoint: format!("http://{addr}/v1"),
+        collection: "sentinel-2-l2a".to_owned(),
+        auth: StacAuth::Bearer("secret-tok".to_owned()),
+    };
+    let err = net
+        .handle()
+        .block_on(client.search_async(&cat, &StacSearchQuery::default(), &cancel))
+        .expect_err("400 status");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid datetime"),
+        "expected error snippet: {msg}"
+    );
+    assert!(
+        !msg.contains("secret-tok"),
+        "secret leaked in snippet: {msg}"
+    );
+    shutdown.cancel();
+    let _ = handle.join();
+}
