@@ -220,6 +220,8 @@ impl MeasureSession {
             opacity: 1.0,
             fill_color: [1.0, 0.72, 0.14, 0.25],
             line_color: [1.0, 0.85, 0.20, 0.98],
+            stroke_width_px: 2.5,
+            hatch_spacing_px: 0.0,
             mesh,
         });
     }

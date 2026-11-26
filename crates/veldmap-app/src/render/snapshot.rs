@@ -120,6 +120,9 @@ pub struct DrawOverlayLayer {
 pub enum DrawVectorId {
     Layer(u64),
     Measurement,
+    StacAoi,
+    StacFootprints,
+    StacHighlight,
 }
 
 /// Draped GeoJSON / measurement vector layer drawn in Pass 2 above raster
@@ -139,6 +142,12 @@ pub struct DrawVectorLayer {
     /// `VectorRenderer::push_uniforms` before writing to the `Rgba8UnormSrgb`
     /// offscreen target.
     pub line_color: [f32; 4],
+    /// Logical stroke width in points (scaled by `pixels_per_point` on GPU for
+    /// crisp HiDPI screen-space ribbon outlines).
+    pub stroke_width_px: f32,
+    /// Optional diagonal screen-space hatch period in logical points (`0.0` =
+    /// solid polygon fill; `> 0.0` = hatched fill for AOI / selected footprints).
+    pub hatch_spacing_px: f32,
     pub mesh: Arc<VectorMesh>,
 }
 
@@ -161,6 +170,7 @@ pub struct DrawSnapshot {
     pub show_graticule: bool,
     pub grid_step_deg: f64,
     pub grid_width_px: f32,
+    pub pixels_per_point: f32,
 }
 
 impl DrawSnapshot {
@@ -218,6 +228,7 @@ impl DrawSnapshot {
             show_graticule: params.show_graticule,
             grid_step_deg,
             grid_width_px,
+            pixels_per_point: params.pixels_per_point.max(0.5),
         };
         (snapshot, carrier_keys)
     }

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-test-support = []
+test-support = ["dep:tiff"]
 
 [dependencies]
 flate2.workspace = true
@@ -16,7 +16,7 @@ lz4_flex.workspace = true
 png.workspace = true
 qoi.workspace = true
 thiserror.workspace = true
-tiff.workspace = true
+tiff = { workspace = true, optional = true }
 tracing.workspace = true
 veldmap-core = { path = "../veldmap-core" }
 weezl.workspace = true
@@ -24,6 +24,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+tiff.workspace = true
 veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
 
 [lints]

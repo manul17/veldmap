@@ -249,7 +249,12 @@ impl CursorProber {
             }),
         };
 
-        runtime.try_submit_guarded(&runtime.fast_pool, job, false, || {
+        let pool = if layer.source().is_remote() {
+            &runtime.remote_pool
+        } else {
+            &runtime.fast_pool
+        };
+        runtime.try_submit_guarded(pool, job, false, || {
             let mut state = lock_unpoisoned(&self.cache);
             if state.active_key == Some(probe_key) {
                 state.active_key = None;

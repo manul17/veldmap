@@ -15,7 +15,7 @@ use super::cascade::{Cascade, TileEmit, bleed_display_emit};
 use super::chunk_cache::DecodedChunk;
 use super::grid::{Grid, Region, region_of};
 use super::resample::{
-    bleed_alpha, resample_f32_window, resample_rgba8_window, resample_uint_nearest_window,
+    Window, bleed_alpha, resample_f32_window, resample_rgba8_window, resample_uint_nearest_window,
 };
 
 /// Chunked raster backend driving [`direct`] and [`pass`].
@@ -92,6 +92,136 @@ fn blit_chunk(
     }
 }
 
+/// Pure per-tile chunk geometry plan extracted from [`direct`] so remote COG
+/// prefetch planners and pointwise execution share identical math.
+pub(crate) struct TileChunkPlan {
+    pub(crate) tx: u32,
+    pub(crate) ty: u32,
+    pub(crate) tw: u32,
+    pub(crate) th: u32,
+    pub(crate) sx0: u32,
+    pub(crate) sy0: u32,
+    pub(crate) rw: u32,
+    pub(crate) rh: u32,
+    pub(crate) window: Window,
+    pub(crate) cx_start: u32,
+    pub(crate) cx_end: u32,
+    pub(crate) cy_start: u32,
+    pub(crate) cy_end: u32,
+}
+
+/// Pure pointwise read plan for one level & `wants` tile batch.
+pub(crate) struct DirectPlan {
+    pub(crate) image: usize,
+    pub(crate) cw: u32,
+    pub(crate) ch: u32,
+    pub(crate) across: u32,
+    pub(crate) tiles: Vec<TileChunkPlan>,
+}
+
+impl DirectPlan {
+    /// Sorted, deduplicated list of chunk indices touched by this plan.
+    pub(crate) fn unique_chunk_indices(&self) -> Vec<u32> {
+        let mut indices = Vec::new();
+        for tile in &self.tiles {
+            for cy in tile.cy_start..=tile.cy_end {
+                for cx in tile.cx_start..=tile.cx_end {
+                    if let Some(idx) = cy.checked_mul(self.across).and_then(|r| r.checked_add(cx)) {
+                        indices.push(idx);
+                    }
+                }
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+}
+
+/// Compute the pure chunk-index plan for a pointwise read without issuing I/O.
+pub(crate) fn plan_direct(
+    grid: &Grid,
+    base: (u32, u32),
+    format: PixelFormat,
+    level: u8,
+    wants: &[(u32, u32)],
+    budget: &MemoryBudget,
+) -> Result<DirectPlan, RasterError> {
+    if base.0 == 0 || base.1 == 0 {
+        return Err(RasterError::InvalidDimensions {
+            width: base.0,
+            height: base.1,
+        });
+    }
+    let bpp_u64 = format.bytes_per_pixel() as u64;
+    let lw = level_size(base.0, u32::from(level));
+    let lh = level_size(base.1, u32::from(level));
+    let (image, sw, sh) = grid.source_for(base, lw, lh);
+    let (cw, ch) = grid.chunk_of(image);
+    if cw == 0 || ch == 0 {
+        return Err(RasterError::InvalidDimensions {
+            width: cw,
+            height: ch,
+        });
+    }
+    let across = sw.div_ceil(cw);
+    let region_cap_pixels = budget.region_cap_pixels_for(format);
+    let mut tiles = Vec::with_capacity(wants.len());
+
+    for &(tx, ty) in wants {
+        let tw = tile_extent(tx, lw);
+        let th = tile_extent(ty, lh);
+        if tw == 0 || th == 0 {
+            continue;
+        }
+        let Region {
+            sx0,
+            sx1,
+            sy0,
+            sy1,
+            window,
+        } = region_of((tx, ty), (tw, th), base, (sw, sh), level);
+        let (rw, rh) = ((sx1 - sx0) as u32, (sy1 - sy0) as u32);
+        if rw == 0 || rh == 0 {
+            return Err(RasterError::Decode(format!(
+                "tile ({tx}, {ty}) at level {level} produced empty source region"
+            )));
+        }
+        if u64::from(rw) * u64::from(rh) > region_cap_pixels {
+            return Err(RasterError::LimitExceeded {
+                width: rw,
+                height: rh,
+                estimated_bytes: u64::from(rw) * u64::from(rh) * bpp_u64,
+                limit_bytes: budget.region_cap_bytes,
+            });
+        }
+        let (sx0, sy0) = (sx0 as u32, sy0 as u32);
+        tiles.push(TileChunkPlan {
+            tx,
+            ty,
+            tw,
+            th,
+            sx0,
+            sy0,
+            rw,
+            rh,
+            window,
+            cx_start: sx0 / cw,
+            cx_end: (sx0 + rw - 1) / cw,
+            cy_start: sy0 / ch,
+            cy_end: (sy0 + rh - 1) / ch,
+        });
+    }
+
+    Ok(DirectPlan {
+        image,
+        cw,
+        ch,
+        across,
+        tiles,
+    })
+}
+
 /// Pointwise reading: decode only the chunks intersecting `req.wants` at
 /// `req.level`, reserving `region + tile` working memory against
 /// `req.budget_tracker` without nesting leases across chunk singleflight.
@@ -100,73 +230,42 @@ pub(crate) fn direct<S: Chunked>(
     req: &DirectRead<'_>,
     emit: TileEmit<'_>,
 ) -> Result<(), RasterError> {
-    if req.base.0 == 0 || req.base.1 == 0 {
-        return Err(RasterError::InvalidDimensions {
-            width: req.base.0,
-            height: req.base.1,
-        });
-    }
     let format = req.format;
     let bpp = format.bytes_per_pixel();
     let bpp_u64 = bpp as u64;
-    let lw = level_size(req.base.0, u32::from(req.level));
-    let lh = level_size(req.base.1, u32::from(req.level));
-    let (image, sw, sh) = req.grid.source_for(req.base, lw, lh);
-    let (cw, ch) = req.grid.chunk_of(image);
-    if cw == 0 || ch == 0 {
-        return Err(RasterError::InvalidDimensions {
-            width: cw,
-            height: ch,
-        });
-    }
-    let across = sw.div_ceil(cw);
-    let region_cap_pixels = req.budget.region_cap_pixels_for(format);
+    let plan = plan_direct(req.grid, req.base, format, req.level, req.wants, req.budget)?;
 
-    for &(tx, ty) in req.wants {
+    for tile_plan in plan.tiles {
         if req.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
-        let tw = tile_extent(tx, lw);
-        let th = tile_extent(ty, lh);
-        if tw == 0 || th == 0 {
-            continue;
-        }
-
-        let Region {
+        let TileChunkPlan {
+            tx,
+            ty,
+            tw,
+            th,
             sx0,
-            sx1,
             sy0,
-            sy1,
+            rw,
+            rh,
             window,
-        } = region_of((tx, ty), (tw, th), req.base, (sw, sh), req.level);
-        let (rw, rh) = ((sx1 - sx0) as u32, (sy1 - sy0) as u32);
-        if rw == 0 || rh == 0 {
-            return Err(RasterError::Decode(format!(
-                "tile ({tx}, {ty}) at level {} produced empty source region",
-                req.level
-            )));
-        }
-        if u64::from(rw) * u64::from(rh) > region_cap_pixels {
-            return Err(RasterError::LimitExceeded {
-                width: rw,
-                height: rh,
-                estimated_bytes: u64::from(rw) * u64::from(rh) * bpp_u64,
-                limit_bytes: req.budget.region_cap_bytes,
-            });
-        }
-        let (sx0, sy0) = (sx0 as u32, sy0 as u32);
+            cx_start,
+            cx_end,
+            cy_start,
+            cy_end,
+        } = tile_plan;
 
         // Fetch intersecting chunks BEFORE acquiring the region+tile working
         // lease so chunk singleflight and per-chunk reservations never nest
         // leases or risk AB-BA deadlock under tight decode budgets.
         let mut chunks = Vec::new();
-        for cy in sy0 / ch..=(sy0 + rh - 1) / ch {
-            for cx in sx0 / cw..=(sx0 + rw - 1) / cw {
+        for cy in cy_start..=cy_end {
+            for cx in cx_start..=cx_end {
                 if req.cancel.is_cancelled() {
                     return Err(RasterError::Cancelled);
                 }
-                let chunk = source.chunk(image, cy * across + cx, req.cancel)?;
-                chunks.push((cx * cw, cy * ch, chunk));
+                let chunk = source.chunk(plan.image, cy * plan.across + cx, req.cancel)?;
+                chunks.push((cx * plan.cw, cy * plan.ch, chunk));
             }
         }
 

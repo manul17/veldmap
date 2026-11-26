@@ -33,10 +33,27 @@ fn zoom_steps_from_input(scroll_y: f32, zoom_delta: f32) -> f64 {
     }
 }
 
+/// Active primary-pointer interaction mode on the 3D globe viewport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ViewportToolMode {
+    #[default]
+    Navigate,
+    Measure,
+    DrawAoiBox,
+}
+
+/// Interactive geodetic event captured by [`ViewportInteraction::handle_viewport_input`].
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ViewportEvent {
+    MeasurePoint(GeoPoint),
+    AoiBox { bbox: [f64; 4], finished: bool },
+}
+
 /// Tracks globe viewport geometry, HUD overlay bounds, hovered geodetic
 /// cursor coordinates, and pointer/keyboard navigation gestures.
 pub(super) struct ViewportInteraction {
     cursor_geo: Option<(f64, f64)>,
+    aoi_drag_start: Option<(f64, f64)>,
     last_viewport_rect: Option<egui::Rect>,
     last_compass_rect: Option<egui::Rect>,
     last_scale_bar_rect: Option<egui::Rect>,
@@ -50,6 +67,7 @@ impl Default for ViewportInteraction {
     fn default() -> Self {
         Self {
             cursor_geo: None,
+            aoi_drag_start: None,
             last_viewport_rect: None,
             last_compass_rect: None,
             last_scale_bar_rect: None,
@@ -214,46 +232,142 @@ impl ViewportInteraction {
         active
     }
 
+    /// Approximate `[min_lon, min_lat, max_lon, max_lat]` covering the current
+    /// visible globe viewport by probing a 5×5 screen grid, or `None` if fewer
+    /// than two rays intersect the WGS84 ellipsoid.
+    pub(super) fn viewport_bbox(&self, camera: &Camera) -> Option<[f64; 4]> {
+        let mut min_lon = f64::INFINITY;
+        let mut max_lon = f64::NEG_INFINITY;
+        let mut min_lat = f64::INFINITY;
+        let mut max_lat = f64::NEG_INFINITY;
+        let mut hits = 0usize;
+        for gy in 0..=4 {
+            let ny = 0.08 + 0.84 * (f64::from(gy) / 4.0);
+            for gx in 0..=4 {
+                let nx = 0.08 + 0.84 * (f64::from(gx) / 4.0);
+                if let Some((lat, lon)) = camera.probe(nx, ny, self.last_viewport_aspect) {
+                    min_lon = min_lon.min(lon);
+                    max_lon = max_lon.max(lon);
+                    min_lat = min_lat.min(lat);
+                    max_lat = max_lat.max(lat);
+                    hits += 1;
+                }
+            }
+        }
+        if hits < 2 || (max_lon - min_lon) < 1e-6 || (max_lat - min_lat) < 1e-6 {
+            return None;
+        }
+        // Guard against antimeridian wrap-around producing a bogus >180 deg span.
+        if (max_lon - min_lon) > 180.0 {
+            let (lat, lon) = camera.probe(0.5, 0.5, self.last_viewport_aspect)?;
+            let half = 5.0;
+            return Some([
+                (lon - half).clamp(-180.0, 180.0),
+                (lat - half).clamp(-89.5, 89.5),
+                (lon + half).clamp(-180.0, 180.0),
+                (lat + half).clamp(-89.5, 89.5),
+            ]);
+        }
+        Some([min_lon, min_lat, max_lon, max_lat])
+    }
+
     /// Apply primary-button orbit dragging, secondary / `Shift+Primary` manual
     /// heading rotation, scroll/pinch cursor-anchored zoom, and optional
-    /// measurement click capture to `camera`.
-    ///
-    /// Returns `Some(GeoPoint)` if `measure_active` is `true` and the user
-    /// clicked a point on the globe without dragging.
+    /// measurement click or AOI box drag capture to `camera`.
     pub(super) fn handle_viewport_input(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         camera: &mut Camera,
         response: &egui::Response,
         rect: egui::Rect,
         height_pt: f64,
-        measure_active: bool,
-    ) -> Option<GeoPoint> {
+        tool_mode: ViewportToolMode,
+    ) -> Option<ViewportEvent> {
         let shift_held = ctx.input(|i| i.modifiers.shift);
         let rotating = response.dragged_by(egui::PointerButton::Secondary)
             || (shift_held && response.dragged_by(egui::PointerButton::Primary));
 
-        if rotating {
-            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            let delta = response.drag_delta();
-            if delta.x != 0.0 {
-                camera.rotate_heading(f64::from(delta.x) * ROTATE_RAD_PER_PT);
+        let mut captured_event = None;
+        if tool_mode == ViewportToolMode::DrawAoiBox && !shift_held {
+            if response.hovered() || self.aoi_drag_start.is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
             }
-        } else if response.dragged_by(egui::PointerButton::Primary) {
-            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            let delta = response.drag_delta();
-            if delta != egui::Vec2::ZERO {
-                camera.orbit(
-                    f64::from(delta.x) / height_pt,
-                    f64::from(delta.y) / height_pt,
-                );
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pos) = response.interact_pointer_pos()
+                && !self.is_over_hud(pos)
+            {
+                self.aoi_drag_start = self.probe_pointer(camera, rect, pos);
             }
-        } else if response.hovered() {
-            ctx.set_cursor_icon(if measure_active {
-                egui::CursorIcon::Crosshair
-            } else {
-                egui::CursorIcon::Grab
-            });
+            if let Some((start_lat, start_lon)) = self.aoi_drag_start {
+                if response.dragged_by(egui::PointerButton::Primary)
+                    && let Some(pos) = response.interact_pointer_pos()
+                    && let Some((cur_lat, cur_lon)) = self.probe_pointer(camera, rect, pos)
+                {
+                    let bbox = [
+                        start_lon.min(cur_lon),
+                        start_lat.min(cur_lat),
+                        start_lon.max(cur_lon),
+                        start_lat.max(cur_lat),
+                    ];
+                    if (bbox[2] - bbox[0]) > 1e-4 && (bbox[3] - bbox[1]) > 1e-4 {
+                        captured_event = Some(ViewportEvent::AoiBox {
+                            bbox,
+                            finished: false,
+                        });
+                    }
+                } else if response.drag_stopped_by(egui::PointerButton::Primary)
+                    || !ctx.input(|i| i.pointer.primary_down())
+                {
+                    self.aoi_drag_start = None;
+                    if let Some(pos) = response.interact_pointer_pos()
+                        && let Some((end_lat, end_lon)) = self.probe_pointer(camera, rect, pos)
+                    {
+                        let bbox = [
+                            start_lon.min(end_lon),
+                            start_lat.min(end_lat),
+                            start_lon.max(end_lon),
+                            start_lat.max(end_lat),
+                        ];
+                        if (bbox[2] - bbox[0]) > 1e-4 && (bbox[3] - bbox[1]) > 1e-4 {
+                            captured_event = Some(ViewportEvent::AoiBox {
+                                bbox,
+                                finished: true,
+                            });
+                        }
+                    }
+                }
+            }
+            if rotating {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                let delta = response.drag_delta();
+                if delta.x != 0.0 {
+                    camera.rotate_heading(f64::from(delta.x) * ROTATE_RAD_PER_PT);
+                }
+            }
+        } else {
+            self.aoi_drag_start = None;
+            if rotating {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                let delta = response.drag_delta();
+                if delta.x != 0.0 {
+                    camera.rotate_heading(f64::from(delta.x) * ROTATE_RAD_PER_PT);
+                }
+            } else if response.dragged_by(egui::PointerButton::Primary) {
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                let delta = response.drag_delta();
+                if delta != egui::Vec2::ZERO {
+                    camera.orbit(
+                        f64::from(delta.x) / height_pt,
+                        f64::from(delta.y) / height_pt,
+                    );
+                }
+            } else if response.hovered() {
+                ctx.set_cursor_icon(if tool_mode == ViewportToolMode::Measure {
+                    egui::CursorIcon::Crosshair
+                } else {
+                    egui::CursorIcon::Grab
+                });
+            }
         }
 
         // Scroll-wheel and trackpad pinch / Ctrl+scroll zoom holding ground under cursor.
@@ -272,14 +386,18 @@ impl ViewportInteraction {
             }
         }
 
-        if measure_active
+        if captured_event.is_some() {
+            return captured_event;
+        }
+
+        if tool_mode == ViewportToolMode::Measure
             && response.clicked_by(egui::PointerButton::Primary)
             && !shift_held
             && let Some(pos) = response.interact_pointer_pos()
             && !self.is_over_hud(pos)
             && let Some((lat, lon)) = self.probe_pointer(camera, rect, pos)
         {
-            return Some(GeoPoint::new(lat, lon));
+            return Some(ViewportEvent::MeasurePoint(GeoPoint::new(lat, lon)));
         }
         None
     }

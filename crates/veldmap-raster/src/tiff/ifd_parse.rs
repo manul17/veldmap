@@ -1,16 +1,9 @@
-//! Open-time `tiff::decoder::Decoder` IFD tag parser producing validated,
-//! budget-bounded [`CachedIfd`] descriptors.
-//!
-//! Kept separate from [`super::ifd`] so runtime decoding modules stay
-//! completely free of `tiff::decoder::Decoder` (preparing cleanly for a future
-//! single-pass `ByteSource` IFD reader).
+//! Open-time IFD tag parser over [`super::tags::SinglePassIfdReader`] producing
+//! validated, budget-bounded [`CachedIfd`] descriptors without `tiff::Decoder`.
 
 use std::sync::Arc;
 
-use tiff::decoder::Decoder;
-use tiff::tags::Tag;
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::io::BufferedByteReader;
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
@@ -23,13 +16,21 @@ use super::ifd::{
     CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, PlanarConfig, TiffCompression, TiffPredictor,
 };
 use super::tags::{
-    map_tiff_error, opt_tag, opt_tag_strict, read_tag_numeric_f64_vec_opt, read_tag_u8_vec_strict,
-    read_tag_u16_vec_strict, read_tag_u64_vec_strict,
+    IfdDirectory, SinglePassIfdReader, TAG_BITS_PER_SAMPLE, TAG_COLOR_MAP, TAG_COMPRESSION,
+    TAG_EXTRA_SAMPLES, TAG_IMAGE_LENGTH, TAG_IMAGE_WIDTH, TAG_JPEG_TABLES, TAG_PHOTOMETRIC,
+    TAG_PLANAR_CONFIG, TAG_PREDICTOR, TAG_ROWS_PER_STRIP, TAG_SAMPLE_FORMAT, TAG_SAMPLES_PER_PIXEL,
+    TAG_STRIP_BYTE_COUNTS, TAG_STRIP_OFFSETS, TAG_TILE_BYTE_COUNTS, TAG_TILE_LENGTH,
+    TAG_TILE_OFFSETS, TAG_TILE_WIDTH, TAG_YCBCR_SUBSAMPLING,
 };
 use super::ycbcr::{TAG_REFERENCE_BLACK_WHITE, TAG_YCBCR_COEFFICIENTS, YCbCrParams};
 
-fn max_cached_ifd_table_bytes(budget: &MemoryBudget) -> u64 {
-    (budget.decode_working_bytes / 16).max(4 * 1024 * 1024)
+pub(super) fn max_cached_ifd_table_bytes(budget: &MemoryBudget, is_remote: bool) -> u64 {
+    let base = (budget.decode_working_bytes / 16).max(4 * 1024 * 1024);
+    if is_remote {
+        base.min(budget.remote_ifd_limit_bytes)
+    } else {
+        base
+    }
 }
 
 fn resolve_sample_type(sample_format: u16, bits: u8) -> Result<SampleType, RasterError> {
@@ -50,9 +51,9 @@ fn resolve_sample_type(sample_format: u16, bits: u8) -> Result<SampleType, Raste
 }
 
 fn parse_color_map(
-    decoder: &mut Decoder<BufferedByteReader>,
+    dir: &IfdDirectory,
+    reader: &SinglePassIfdReader,
     sample_type: SampleType,
-    cancel: &CancelToken,
 ) -> Result<Arc<[[u8; 4]]>, RasterError> {
     let expected_entries = match sample_type {
         SampleType::U8 => 256usize,
@@ -63,7 +64,9 @@ fn parse_color_map(
             )));
         }
     };
-    let raw = read_tag_u16_vec_strict(decoder, Tag::ColorMap, cancel)?.unwrap_or_default();
+    let raw = dir
+        .read_u16_vec_strict(reader, TAG_COLOR_MAP)?
+        .unwrap_or_default();
     if raw.len() != expected_entries * 3 {
         return Err(RasterError::Decode(format!(
             "invalid TIFF ColorMap length {} for {sample_type:?} Palette (expected {})",
@@ -72,7 +75,6 @@ fn parse_color_map(
         )));
     }
     let n = expected_entries;
-    // Some legacy writers store 8-bit values [0..=255] directly in u16 ColorMap slots.
     let is_8bit_scaled = raw.iter().all(|&v| v <= 255);
     let to_u8 = |v: u16| -> u8 {
         if is_8bit_scaled {
@@ -109,8 +111,6 @@ fn resolve_pixel_layout(
             } else if spp == 2 && extra_samples.first().is_some_and(|&v| v == 1 || v == 2) {
                 Ok((PixelLayout::named(2), 1))
             } else {
-                // Multi-band stack (e.g., Sentinel-2 / hyperspectral): check if
-                // an explicit alpha ExtraSamples entry exists.
                 let base_count = spp.saturating_sub(extra_samples.len()).max(1);
                 let alpha_ch = extra_samples
                     .iter()
@@ -134,10 +134,6 @@ fn resolve_pixel_layout(
             if spp == 3 {
                 return Ok((PixelLayout::named(3), 3));
             }
-            // 4+ band RGB (e.g., RGBA vs 4-band RGB+NIR with ExtraSamples = 0):
-            // Only ExtraSamples == 1 (Associated) or 2 (Unassociated) is alpha!
-            // ExtraSamples == 0 (Unspecified) or missing ExtraSamples keeps all
-            // bands as opaque data bands so NIR is never mistaken for alpha.
             let alpha_ch = extra_samples
                 .iter()
                 .position(|&v| v == 1 || v == 2)
@@ -177,11 +173,12 @@ fn resolve_pixel_layout(
 }
 
 fn read_sample_type(
-    decoder: &mut Decoder<BufferedByteReader>,
-    cancel: &CancelToken,
+    dir: &IfdDirectory,
+    reader: &SinglePassIfdReader,
 ) -> Result<SampleType, RasterError> {
-    // TIFF 6.0 Baseline defaults omitted BitsPerSample to 1 (bi-level, unsupported).
-    let bps_vec = read_tag_u16_vec_strict(decoder, Tag::BitsPerSample, cancel)?.unwrap_or_default();
+    let bps_vec = dir
+        .read_u16_vec_strict(reader, TAG_BITS_PER_SAMPLE)?
+        .unwrap_or_default();
     let sample_bits_u16 = bps_vec.first().copied().unwrap_or(1);
     if bps_vec.iter().any(|&b| b != sample_bits_u16) {
         return Err(RasterError::Decode(format!(
@@ -191,8 +188,9 @@ fn read_sample_type(
     let sample_bits = u8::try_from(sample_bits_u16)
         .map_err(|_| RasterError::Decode(format!("unsupported BitsPerSample {sample_bits_u16}")))?;
 
-    let sample_fmt_vec =
-        read_tag_u16_vec_strict(decoder, Tag::SampleFormat, cancel)?.unwrap_or_default();
+    let sample_fmt_vec = dir
+        .read_u16_vec_strict(reader, TAG_SAMPLE_FORMAT)?
+        .unwrap_or_default();
     let sample_fmt_code = sample_fmt_vec.first().copied().unwrap_or(1);
     if sample_fmt_vec.iter().any(|&f| f != sample_fmt_code) {
         return Err(RasterError::Decode(format!(
@@ -272,30 +270,36 @@ struct ChunkTables {
 }
 
 fn read_chunk_tables(
-    decoder: &mut Decoder<BufferedByteReader>,
+    dir: &IfdDirectory,
+    reader: &SinglePassIfdReader,
     image: usize,
     width: u32,
     height: u32,
     planar: PlanarConfig,
     samples_per_pixel: u16,
-    cancel: &CancelToken,
 ) -> Result<ChunkTables, RasterError> {
-    let tile_w = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::TileWidth), cancel)?;
+    let tile_w = dir.read_u32_opt(reader, TAG_TILE_WIDTH);
     let (tiled, chunk_w, chunk_h, offsets, byte_counts) = if let Some(tw) = tile_w {
-        let th = opt_tag_strict(decoder.get_tag_unsigned::<u32>(Tag::TileLength), cancel)?
+        let th = dir
+            .read_u32_strict(reader, TAG_TILE_LENGTH)?
             .ok_or_else(|| RasterError::Decode("tiled TIFF missing TileLength".to_owned()))?;
-        let offsets = read_tag_u64_vec_strict(decoder, Tag::TileOffsets, cancel)?
+        let offsets = dir
+            .read_u64_vec_strict(reader, TAG_TILE_OFFSETS)?
             .ok_or_else(|| RasterError::Decode("tiled TIFF missing TileOffsets".to_owned()))?;
-        let byte_counts = read_tag_u64_vec_strict(decoder, Tag::TileByteCounts, cancel)?
+        let byte_counts = dir
+            .read_u64_vec_strict(reader, TAG_TILE_BYTE_COUNTS)?
             .ok_or_else(|| RasterError::Decode("tiled TIFF missing TileByteCounts".to_owned()))?;
         (true, tw, th, offsets, byte_counts)
     } else {
-        let rows_per_strip = opt_tag(decoder.get_tag_unsigned::<u32>(Tag::RowsPerStrip), cancel)?
+        let rows_per_strip = dir
+            .read_u32_opt(reader, TAG_ROWS_PER_STRIP)
             .unwrap_or(height)
             .clamp(1, height);
-        let offsets = read_tag_u64_vec_strict(decoder, Tag::StripOffsets, cancel)?
+        let offsets = dir
+            .read_u64_vec_strict(reader, TAG_STRIP_OFFSETS)?
             .ok_or_else(|| RasterError::Decode("stripped TIFF missing StripOffsets".to_owned()))?;
-        let byte_counts = read_tag_u64_vec_strict(decoder, Tag::StripByteCounts, cancel)?
+        let byte_counts = dir
+            .read_u64_vec_strict(reader, TAG_STRIP_BYTE_COUNTS)?
             .ok_or_else(|| {
                 RasterError::Decode("stripped TIFF missing StripByteCounts".to_owned())
             })?;
@@ -342,17 +346,17 @@ fn read_chunk_tables(
 }
 
 fn read_ycbcr_if_needed(
-    decoder: &mut Decoder<BufferedByteReader>,
+    dir: &IfdDirectory,
+    reader: &SinglePassIfdReader,
     photometric: Photometric,
     compression: TiffCompression,
-    cancel: &CancelToken,
 ) -> Result<Option<YCbCrParams>, RasterError> {
     if photometric != Photometric::YCbCr {
         return Ok(None);
     }
     if compression != TiffCompression::Jpeg {
-        // TIFF 6.0 Section 21 defaults omitted YCbCrSubSampling to [2, 2].
-        let sub = read_tag_u16_vec_strict(decoder, Tag::ChromaSubsampling, cancel)?
+        let sub = dir
+            .read_u16_vec_strict(reader, TAG_YCBCR_SUBSAMPLING)?
             .unwrap_or_else(|| vec![2, 2]);
         if sub.as_slice() != [1, 1] {
             return Err(RasterError::Decode(format!(
@@ -360,10 +364,8 @@ fn read_ycbcr_if_needed(
             )));
         }
     }
-    let coeffs =
-        read_tag_numeric_f64_vec_opt(decoder, Tag::Unknown(TAG_YCBCR_COEFFICIENTS), cancel)?;
-    let rbw =
-        read_tag_numeric_f64_vec_opt(decoder, Tag::Unknown(TAG_REFERENCE_BLACK_WHITE), cancel)?;
+    let coeffs = dir.read_numeric_f64_vec_opt(reader, TAG_YCBCR_COEFFICIENTS);
+    let rbw = dir.read_numeric_f64_vec_opt(reader, TAG_REFERENCE_BLACK_WHITE);
     Ok(Some(YCbCrParams::from_tags(
         coeffs.as_deref(),
         rbw.as_deref(),
@@ -371,14 +373,14 @@ fn read_ycbcr_if_needed(
 }
 
 fn read_jpeg_tables_if_needed(
-    decoder: &mut Decoder<BufferedByteReader>,
+    dir: &IfdDirectory,
+    reader: &SinglePassIfdReader,
     compression: TiffCompression,
-    cancel: &CancelToken,
 ) -> Result<Option<Arc<[u8]>>, RasterError> {
     if compression != TiffCompression::Jpeg {
         return Ok(None);
     }
-    match read_tag_u8_vec_strict(decoder, Tag::JPEGTables, cancel)? {
+    match dir.read_u8_vec_strict(reader, TAG_JPEG_TABLES)? {
         Some(tables) => {
             if tables.len() < 4 {
                 return Err(RasterError::Decode(
@@ -403,36 +405,25 @@ struct IfdLayoutTags {
 }
 
 fn read_ifd_layout_tags(
-    decoder: &mut Decoder<BufferedByteReader>,
-    cancel: &CancelToken,
+    dir: &IfdDirectory,
+    reader: &SinglePassIfdReader,
 ) -> Result<IfdLayoutTags, RasterError> {
-    let compression_code =
-        opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Compression), cancel)?.unwrap_or(1);
+    let compression_code = dir.read_u16_strict(reader, TAG_COMPRESSION)?.unwrap_or(1);
     let compression = TiffCompression::from_code(compression_code)?;
 
-    let photometric_code = opt_tag_strict(
-        decoder.get_tag_unsigned::<u16>(Tag::PhotometricInterpretation),
-        cancel,
-    )?
-    .unwrap_or(1);
+    let photometric_code = dir.read_u16_strict(reader, TAG_PHOTOMETRIC)?.unwrap_or(1);
     let photometric = Photometric::from_code(photometric_code);
 
-    let samples_per_pixel = opt_tag_strict(
-        decoder.get_tag_unsigned::<u16>(Tag::SamplesPerPixel),
-        cancel,
-    )?
-    .unwrap_or(1);
+    let samples_per_pixel = dir
+        .read_u16_strict(reader, TAG_SAMPLES_PER_PIXEL)?
+        .unwrap_or(1);
     if samples_per_pixel == 0 {
         return Err(RasterError::Decode("TIFF SamplesPerPixel is 0".to_owned()));
     }
 
-    let sample_type = read_sample_type(decoder, cancel)?;
+    let sample_type = read_sample_type(dir, reader)?;
 
-    let planar_code = opt_tag_strict(
-        decoder.get_tag_unsigned::<u16>(Tag::PlanarConfiguration),
-        cancel,
-    )?
-    .unwrap_or(1);
+    let planar_code = dir.read_u16_strict(reader, TAG_PLANAR_CONFIG)?.unwrap_or(1);
     let planar = match planar_code {
         1 => PlanarConfig::Chunky,
         2 => PlanarConfig::Planar,
@@ -451,12 +442,12 @@ fn read_ifd_layout_tags(
         sample_type,
     )?;
 
-    let predictor_code =
-        opt_tag_strict(decoder.get_tag_unsigned::<u16>(Tag::Predictor), cancel)?.unwrap_or(1);
+    let predictor_code = dir.read_u16_strict(reader, TAG_PREDICTOR)?.unwrap_or(1);
     let predictor = TiffPredictor::from_code(predictor_code, sample_type)?;
 
-    let extra_samples =
-        read_tag_u16_vec_strict(decoder, Tag::ExtraSamples, cancel)?.unwrap_or_default();
+    let extra_samples = dir
+        .read_u16_vec_strict(reader, TAG_EXTRA_SAMPLES)?
+        .unwrap_or_default();
     let (pixel_layout, data_bands) =
         resolve_pixel_layout(photometric, samples_per_pixel, &extra_samples)?;
 
@@ -476,6 +467,7 @@ fn admit_ifd_budget(
     cached: &CachedIfd,
     budget: &MemoryBudget,
     table_bytes_used: u64,
+    is_remote: bool,
 ) -> Result<(), RasterError> {
     let chunk_cap = budget.decode_working_bytes.min(MAX_SINGLE_CHUNK_BYTES);
     DecodePeak::new()
@@ -485,7 +477,7 @@ fn admit_ifd_budget(
         )
         .admit(chunk_cap)?;
 
-    let table_cap = max_cached_ifd_table_bytes(budget);
+    let table_cap = max_cached_ifd_table_bytes(budget, is_remote);
     let new_total = table_bytes_used.saturating_add(cached.table_bytes());
     if new_total > table_cap {
         return Err(RasterError::LimitExceeded {
@@ -498,38 +490,116 @@ fn admit_ifd_budget(
     Ok(())
 }
 
-/// Parse and validate all chunk/tag metadata for the currently aimed IFD.
+/// Tags required to build a [`CachedIfd`] (excluding GeoTIFF/GDAL base-only tags).
+const IFD_LAYOUT_AND_TABLE_TAGS: &[u16] = &[
+    TAG_IMAGE_WIDTH,
+    TAG_IMAGE_LENGTH,
+    TAG_BITS_PER_SAMPLE,
+    TAG_COMPRESSION,
+    TAG_PHOTOMETRIC,
+    TAG_STRIP_OFFSETS,
+    TAG_SAMPLES_PER_PIXEL,
+    TAG_ROWS_PER_STRIP,
+    TAG_STRIP_BYTE_COUNTS,
+    TAG_PLANAR_CONFIG,
+    TAG_PREDICTOR,
+    TAG_COLOR_MAP,
+    TAG_TILE_WIDTH,
+    TAG_TILE_LENGTH,
+    TAG_TILE_OFFSETS,
+    TAG_TILE_BYTE_COUNTS,
+    TAG_EXTRA_SAMPLES,
+    TAG_SAMPLE_FORMAT,
+    TAG_JPEG_TABLES,
+    TAG_YCBCR_COEFFICIENTS,
+    TAG_YCBCR_SUBSAMPLING,
+    TAG_REFERENCE_BLACK_WHITE,
+];
+
+/// Parse and validate all chunk/tag metadata for `dir` while enforcing
+/// `MemoryBudget` before allocating out-of-line offset/table arrays.
 pub(super) fn parse_cached_ifd(
-    decoder: &mut Decoder<BufferedByteReader>,
+    dir: &mut IfdDirectory,
+    reader: &SinglePassIfdReader,
     image: usize,
     budget: &MemoryBudget,
     table_bytes_used: u64,
+    is_remote: bool,
     cancel: &CancelToken,
 ) -> Result<CachedIfd, RasterError> {
-    let (width, height) = decoder
-        .dimensions()
-        .map_err(|e| map_tiff_error(e, cancel))?;
+    let table_cap = max_cached_ifd_table_bytes(budget, is_remote);
+    let remaining_table_cap = table_cap.saturating_sub(table_bytes_used);
+
+    // Pre-check estimated table memory BEFORE prefetching large out-of-line offset arrays.
+    let mut est_table_bytes = 0u64;
+    for &tag in &[
+        TAG_TILE_OFFSETS,
+        TAG_TILE_BYTE_COUNTS,
+        TAG_STRIP_OFFSETS,
+        TAG_STRIP_BYTE_COUNTS,
+        TAG_JPEG_TABLES,
+        TAG_COLOR_MAP,
+    ] {
+        if let Some(e) = dir.entry(tag) {
+            let scaled = match tag {
+                TAG_TILE_OFFSETS
+                | TAG_TILE_BYTE_COUNTS
+                | TAG_STRIP_OFFSETS
+                | TAG_STRIP_BYTE_COUNTS => e.count.saturating_mul(8),
+                TAG_COLOR_MAP => (e.count / 3).saturating_mul(4),
+                _ => e.byte_len(),
+            };
+            est_table_bytes = est_table_bytes.saturating_add(scaled);
+        }
+    }
+    if est_table_bytes > remaining_table_cap {
+        let w = dir.read_u32_opt(reader, TAG_IMAGE_WIDTH).unwrap_or(0);
+        let h = dir.read_u32_opt(reader, TAG_IMAGE_LENGTH).unwrap_or(0);
+        return Err(RasterError::LimitExceeded {
+            width: w,
+            height: h,
+            estimated_bytes: table_bytes_used.saturating_add(est_table_bytes),
+            limit_bytes: table_cap,
+        });
+    }
+
+    let payload_cap = budget
+        .decode_working_bytes
+        .clamp(4 * 1024 * 1024, 128 * 1024 * 1024)
+        .min(if is_remote {
+            budget.remote_ifd_limit_bytes
+        } else {
+            u64::MAX
+        });
+    dir.prefetch_tags(reader, IFD_LAYOUT_AND_TABLE_TAGS, payload_cap, cancel)?;
+
+    let width = dir
+        .read_u32_strict(reader, TAG_IMAGE_WIDTH)?
+        .ok_or_else(|| RasterError::Decode("TIFF missing ImageWidth".to_owned()))?;
+    let height = dir
+        .read_u32_strict(reader, TAG_IMAGE_LENGTH)?
+        .ok_or_else(|| RasterError::Decode("TIFF missing ImageLength".to_owned()))?;
     if width == 0 || height == 0 {
         return Err(RasterError::InvalidDimensions { width, height });
     }
 
-    let layout = read_ifd_layout_tags(decoder, cancel)?;
-    let ycbcr = read_ycbcr_if_needed(decoder, layout.photometric, layout.compression, cancel)?;
+    let layout = read_ifd_layout_tags(dir, reader)?;
+    let ycbcr = read_ycbcr_if_needed(dir, reader, layout.photometric, layout.compression)?;
     let color_map = if layout.photometric == Photometric::Palette {
-        Some(parse_color_map(decoder, layout.sample_type, cancel)?)
+        Some(parse_color_map(dir, reader, layout.sample_type)?)
     } else {
         None
     };
     let tables = read_chunk_tables(
-        decoder,
+        dir,
+        reader,
         image,
         width,
         height,
         layout.planar,
         layout.samples_per_pixel,
-        cancel,
     )?;
-    let jpeg_tables = read_jpeg_tables_if_needed(decoder, layout.compression, cancel)?;
+    let jpeg_tables = read_jpeg_tables_if_needed(dir, reader, layout.compression)?;
 
     let cached = CachedIfd {
         image,
@@ -555,7 +625,7 @@ pub(super) fn parse_cached_ifd(
         color_map,
     };
 
-    admit_ifd_budget(&cached, budget, table_bytes_used)?;
+    admit_ifd_budget(&cached, budget, table_bytes_used, is_remote)?;
     Ok(cached)
 }
 
@@ -565,20 +635,17 @@ mod tests {
 
     #[test]
     fn pixel_layout_handles_rgbn_and_non_last_alpha_consistently() {
-        // 4-band RGB+NIR with ExtraSamples = [0] (Unspecified): NOT alpha.
         let (layout, data_bands) = resolve_pixel_layout(Photometric::Rgb, 4, &[0]).expect("rgbn");
         assert_eq!(layout.alpha_channel(), None);
         assert_eq!(layout.colors(), 3);
         assert_eq!(layout.channels, 4);
         assert_eq!(data_bands, 4);
 
-        // 5-band RGB+Alpha+NIR with ExtraSamples = [2, 0]: alpha at channel 3.
         let (layout5, data_bands5) =
             resolve_pixel_layout(Photometric::Rgb, 5, &[2, 0]).expect("rgb+a+nir");
         assert_eq!(layout5.alpha_channel(), Some(3));
         assert_eq!(data_bands5, 4);
 
-        // 3-band BlackIsZero + Unassociated Alpha: alpha at channel 2.
         let (layout_gray3, data_bands_g3) =
             resolve_pixel_layout(Photometric::BlackIsZero, 3, &[2]).expect("gray3+a");
         assert_eq!(layout_gray3.alpha_channel(), Some(2));

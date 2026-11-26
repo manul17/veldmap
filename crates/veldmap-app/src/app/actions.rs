@@ -3,18 +3,21 @@
 
 use std::path::{Path, PathBuf};
 
+use eframe::egui;
+
 use crate::layers::CrsOverride;
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::storage::session::SavedCameraPose;
-use crate::ui::basemap::BasemapUiAction;
+use crate::ui::basemap::{BasemapUiAction, SettingsTab};
 use crate::ui::crs_picker::CrsPickerAction;
 use crate::ui::format;
 use crate::ui::layers::{EditPersist, LayerUiAction};
 use crate::ui::measure::MeasureAction;
+use crate::ui::stac::StacUiAction;
 use crate::ui::toolbar::ToolbarAction;
 
-use super::VeldmapApp;
 use super::dialogs::{DialogSpawnError, FileDialogEvent};
+use super::{VeldmapApp, WorkbenchTab};
 
 impl VeldmapApp {
     /// Open a user-initiated batch of local paths (drag-and-drop, native file
@@ -161,10 +164,168 @@ impl VeldmapApp {
                     needs_repaint |= changed;
                     session_dirty |= changed;
                 }
+                LayerUiAction::UseVectorAsStacAoi(id) => {
+                    self.use_vector_as_stac_aoi(id);
+                    self.panels.open_workbench_tab(WorkbenchTab::CloudStac);
+                    needs_repaint = true;
+                }
             }
         }
         if session_dirty {
             self.persist_session_snapshot(false, &[]);
+        }
+        needs_repaint
+    }
+
+    fn use_vector_as_stac_aoi(&mut self, id: crate::vectors::VectorLayerId) {
+        if let Some(geom) = self.scene.vectors().first_polygon_geometry(id) {
+            let label = self
+                .scene
+                .vectors()
+                .summaries()
+                .into_iter()
+                .find(|v| v.id == id)
+                .map_or_else(|| "GeoJSON AOI".to_owned(), |v| v.name);
+            self.panels.draw_aoi_active = false;
+            self.panels.stac.copy_notice = None;
+            self.scene.mutate_stac(|s| {
+                s.set_aoi_geometry(geom, label);
+                ((), true)
+            });
+        }
+    }
+
+    pub(super) fn apply_stac_actions(
+        &mut self,
+        actions: Vec<StacUiAction>,
+        ctx: &egui::Context,
+    ) -> bool {
+        let mut needs_repaint = false;
+        for action in actions {
+            match action {
+                StacUiAction::Search { preset, query } => {
+                    let catalog = preset.to_catalog_config(self.storage.settings());
+                    self.panels.stac.local_error = None;
+                    let res = self
+                        .scene
+                        .mutate_stac(|s| (s.begin_search(catalog, query), false));
+                    if let Err(err) = res {
+                        self.panels.stac.local_error = Some(err);
+                    }
+                    needs_repaint = true;
+                }
+                StacUiAction::CancelSearch => {
+                    self.scene.mutate_stac(|s| {
+                        s.cancel();
+                        ((), false)
+                    });
+                    needs_repaint = true;
+                }
+                StacUiAction::ClearResults => {
+                    self.scene.mutate_stac(|s| {
+                        let changed = s.clear_results();
+                        ((), changed)
+                    });
+                    needs_repaint = true;
+                }
+                StacUiAction::CaptureViewportAoi => {
+                    if let Some(bbox) = self.viewport.viewport_bbox(&self.camera) {
+                        self.panels.draw_aoi_active = false;
+                        self.scene.mutate_stac(|s| {
+                            s.set_aoi_bbox(bbox, "Viewport".to_owned());
+                            ((), true)
+                        });
+                    } else {
+                        self.panels.stac.local_error =
+                            Some("Zoom onto the globe before capturing Viewport AOI.".to_owned());
+                    }
+                    needs_repaint = true;
+                }
+                StacUiAction::ToggleDrawAoiBox => {
+                    self.panels.draw_aoi_active = !self.panels.draw_aoi_active;
+                    if self.panels.draw_aoi_active {
+                        // Mutually exclusive with geodesic Measure mode.
+                        self.scene.mutate_measure(|m| m.set_mode(MeasureMode::Off));
+                    }
+                    needs_repaint = true;
+                }
+                StacUiAction::UseVectorAoi(id) => {
+                    self.use_vector_as_stac_aoi(id);
+                    needs_repaint = true;
+                }
+                StacUiAction::ClearAoi => {
+                    self.panels.draw_aoi_active = false;
+                    self.scene.mutate_stac(|s| {
+                        let changed = s.clear_aoi();
+                        ((), changed)
+                    });
+                    needs_repaint = true;
+                }
+                StacUiAction::CopyAoiGeoJson => {
+                    if let Some(json) = self.scene.stac().export_aoi_geojson() {
+                        ctx.copy_text(json);
+                        self.panels.stac.copy_notice = Some("Copied AOI GeoJSON.".to_owned());
+                        needs_repaint = true;
+                    }
+                }
+                StacUiAction::CopyAoiWkt => {
+                    if let Some(wkt) = self.scene.stac().export_aoi_wkt() {
+                        ctx.copy_text(wkt);
+                        self.panels.stac.copy_notice = Some("Copied AOI WKT.".to_owned());
+                        needs_repaint = true;
+                    }
+                }
+                StacUiAction::SelectItem(idx) => {
+                    let changed = self.scene.mutate_stac(|s| {
+                        let c = s.set_selected(Some(idx));
+                        (c, c)
+                    });
+                    needs_repaint |= changed;
+                }
+                StacUiAction::HoverItem(idx) => {
+                    let changed = self.scene.mutate_stac(|s| {
+                        let c = s.set_hovered(idx);
+                        (c, c)
+                    });
+                    needs_repaint |= changed;
+                }
+                StacUiAction::ZoomToExtent(bounds) => {
+                    self.focus_footprint(bounds);
+                    needs_repaint = true;
+                }
+                StacUiAction::StreamCog {
+                    url,
+                    title,
+                    use_custom_auth,
+                    scale_offset,
+                } => {
+                    let (final_url, headers) = if use_custom_auth {
+                        let auth = self.storage.settings().stac.to_stac_auth();
+                        (auth.apply_to_url(&url), auth.extra_headers())
+                    } else {
+                        (url, Vec::new())
+                    };
+                    if let Err(err) = self.scene.begin_open_remote_cog(
+                        final_url,
+                        title,
+                        headers,
+                        scale_offset,
+                        true,
+                    ) {
+                        self.panels.stac.local_error = Some(err);
+                    } else {
+                        self.panels.stac.local_error = None;
+                    }
+                    needs_repaint = true;
+                }
+                StacUiAction::OpenStacSettings => {
+                    self.panels
+                        .basemap
+                        .open_settings_tab(self.storage.settings(), SettingsTab::StacCloud);
+                    self.storage.maybe_refresh_disk_stats(true);
+                    needs_repaint = true;
+                }
+            }
         }
         needs_repaint
     }
@@ -243,6 +404,7 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 ToolbarAction::OpenPathPrompt => {
+                    self.panels.open_workbench_tab(WorkbenchTab::Layers);
                     self.panels.layers.show_open_prompt();
                     needs_repaint = true;
                 }
@@ -255,16 +417,23 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 ToolbarAction::ToggleLayersPanel => {
-                    self.panels.layers.toggle_open();
+                    self.panels.toggle_workbench_tab(WorkbenchTab::Layers);
+                    needs_repaint = true;
+                }
+                ToolbarAction::ToggleCloudPanel => {
+                    self.panels.toggle_workbench_tab(WorkbenchTab::CloudStac);
                     needs_repaint = true;
                 }
                 ToolbarAction::ShowUnavailableSessionLayers => {
                     self.restore_tracker.unhide_notices();
-                    self.panels.layers.open_panel();
+                    self.panels.open_workbench_tab(WorkbenchTab::Layers);
                     needs_repaint = true;
                 }
                 ToolbarAction::ToggleMeasureTool => {
                     self.scene.mutate_measure(MeasureSession::toggle);
+                    if self.scene.measure().is_active() {
+                        self.panels.draw_aoi_active = false;
+                    }
                     needs_repaint = true;
                 }
                 ToolbarAction::SaveBookmark(raw_name) => {

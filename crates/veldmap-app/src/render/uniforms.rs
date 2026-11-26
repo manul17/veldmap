@@ -89,6 +89,9 @@ pub(super) struct VectorUniform {
     pub(super) offset_eye: [f32; 3],
     pub(super) point_radius_m: f32,
     pub(super) color: [f32; 4],
+    pub(super) viewport_inv_size: [f32; 2],
+    pub(super) stroke_half_width_px: f32,
+    pub(super) hatch_spacing_px: f32,
 }
 
 const _: () = {
@@ -118,10 +121,13 @@ const _: () = {
 
     assert!(std::mem::size_of::<PaletteUniform>() == 4096);
 
-    assert!(std::mem::size_of::<VectorUniform>() == 32);
+    assert!(std::mem::size_of::<VectorUniform>() == 48);
     assert!(std::mem::offset_of!(VectorUniform, offset_eye) == 0);
     assert!(std::mem::offset_of!(VectorUniform, point_radius_m) == 12);
     assert!(std::mem::offset_of!(VectorUniform, color) == 16);
+    assert!(std::mem::offset_of!(VectorUniform, viewport_inv_size) == 32);
+    assert!(std::mem::offset_of!(VectorUniform, stroke_half_width_px) == 40);
+    assert!(std::mem::offset_of!(VectorUniform, hatch_spacing_px) == 44);
 };
 
 struct UniformSlotEntry {

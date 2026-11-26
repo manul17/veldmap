@@ -89,6 +89,12 @@ pub fn open_raster(
             })
         }
         RasterFormat::Png => {
+            if source.is_remote() {
+                return Err(RasterError::RemotePassUnsupported(
+                    "PNG requires whole-file decoding and cannot be streamed over HTTP Range"
+                        .to_owned(),
+                ));
+            }
             let placement = sidecar_res
                 .transpose()?
                 .and_then(SidecarGeoref::into_placement);
@@ -99,6 +105,12 @@ pub fn open_raster(
             })
         }
         RasterFormat::Jpeg => {
+            if source.is_remote() {
+                return Err(RasterError::RemotePassUnsupported(
+                    "JPEG requires whole-file decoding and cannot be streamed over HTTP Range"
+                        .to_owned(),
+                ));
+            }
             let placement = sidecar_res
                 .transpose()?
                 .and_then(SidecarGeoref::into_placement);

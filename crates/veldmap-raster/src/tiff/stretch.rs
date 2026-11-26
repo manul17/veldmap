@@ -31,6 +31,10 @@ impl StretchCache {
         Self { map }
     }
 
+    pub(super) fn is_ready(&self) -> bool {
+        self.map.is_ready(&())
+    }
+
     pub(super) fn get_or_compute(
         &self,
         req: &StretchRequest<'_>,
@@ -64,6 +68,10 @@ impl BandStatsCache {
         }
     }
 
+    pub(super) fn is_ready(&self, band: u16) -> bool {
+        self.map.is_ready(&band)
+    }
+
     pub(super) fn get_or_compute(
         &self,
         band: u16,
@@ -86,7 +94,7 @@ pub(super) struct StretchRequest<'a> {
     pub(super) cancel: &'a CancelToken,
 }
 
-fn pick_sample_chunks(total: u32) -> Vec<u32> {
+pub(super) fn pick_sample_chunks(total: u32) -> Vec<u32> {
     let mut picks = Vec::new();
     if total == 0 {
         return picks;

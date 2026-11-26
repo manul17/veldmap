@@ -183,12 +183,17 @@ impl PyramidMeta {
 
 /// Build the per-level serving plan (`0..level_count`) for a chunked raster in
 /// `format`.
+///
+/// When `allow_pass` is `false` (remote HTTP COGs), levels that cannot be
+/// served pointwise are marked `fits = false` so the scheduler never falls back
+/// to whole-file sequential downloads.
 pub(crate) fn build_chunked_level_table(
     grid: &Grid,
     width: u32,
     height: u32,
     format: PixelFormat,
     budget: &MemoryBudget,
+    allow_pass: bool,
 ) -> Vec<LevelPlan> {
     let base = (width, height);
     let count = level_count(width, height).min(u32::from(u8::MAX));
@@ -210,7 +215,7 @@ pub(crate) fn build_chunked_level_table(
                     LevelPlan {
                         serve: ServeMode::Pass { from: 0 },
                         estimated_peak_bytes: peak,
-                        fits: peak <= budget.decode_working_bytes,
+                        fits: allow_pass && peak <= budget.decode_working_bytes,
                     }
                 }
             }
@@ -230,9 +235,25 @@ mod tests {
             overviews: Vec::new(),
             depth: 3,
         };
-        let tbl =
-            build_chunked_level_table(&grid, 8192, 8192, PixelFormat::Rgba8UnormSrgb, &tiny_budget);
+        let tbl = build_chunked_level_table(
+            &grid,
+            8192,
+            8192,
+            PixelFormat::Rgba8UnormSrgb,
+            &tiny_budget,
+            true,
+        );
         assert!(!tbl.is_empty());
         assert!(matches!(tbl[0].serve, ServeMode::Pass { from: 0 }));
+
+        let remote_tbl = build_chunked_level_table(
+            &grid,
+            8192,
+            8192,
+            PixelFormat::Rgba8UnormSrgb,
+            &tiny_budget,
+            false,
+        );
+        assert!(remote_tbl.iter().all(|row| !row.fits));
     }
 }

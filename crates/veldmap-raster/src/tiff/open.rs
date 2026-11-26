@@ -1,12 +1,11 @@
-//! Header/IFD discovery, cached chunk-table validation, `GDAL_METADATA`
-//! parsing, and overview scanning for [`super::TiffSource::open`].
+//! Single-pass header/IFD discovery, cached chunk-table validation,
+//! `GDAL_METADATA` parsing, remote COG enforcement, and overview scanning for
+//! [`super::TiffSource::open`].
 
 use std::sync::Arc;
 
-use tiff::decoder::{Decoder, Limits};
-use tiff::tags::Tag;
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::io::{BufferedByteReader, ByteSource};
+use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{PixelFormat, SourceFingerprint, SourceId};
 
@@ -15,92 +14,79 @@ use crate::pipeline::grid::{Grid, Overview};
 use crate::pipeline::metadata::{
     BandInfo, GeoPlacement, PlacementCrs, RasterDescription, SampleType,
 };
-use crate::pipeline::plan::{build_chunked_level_table, check_max_source_side};
+use crate::pipeline::plan::{ServeMode, build_chunked_level_table, check_max_source_side};
 use crate::pipeline::radiometry::DisplayMapping;
 
 use super::gdal_meta::{GdalMetadata, TAG_GDAL_METADATA, parse_gdal_metadata, parse_gdal_nodata};
 use super::georef::{ParsedGeoref, parse_georef};
-use super::ifd::{CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, RawTiffAccess, TiffByteOrder};
-use super::ifd_parse::parse_cached_ifd;
+use super::ifd::{CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, RawTiffAccess};
+use super::ifd_parse::{max_cached_ifd_table_bytes, parse_cached_ifd};
 use super::stretch::{BandStatsCache, StretchCache};
-use super::tags::{is_overview, map_tiff_error, opt_tag, read_geotiff_tags, read_tag_ascii_opt};
+use super::tags::{
+    SinglePassIfdReader, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
+    TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, TAG_MODEL_TRANSFORMATION,
+    TAG_NEW_SUBFILE_TYPE, is_overview,
+};
 use super::{MAX_IFDS, TiffSource};
 
-fn build_tiff_limits(budget: &MemoryBudget) -> Limits {
-    let mut limits = Limits::default();
-    // Enforced by `tiff 0.11.3` during open-time IFD tag value reads
-    // (TileOffsets, ColorMap, JPEGTables, ASCII tags).
-    limits.decoding_buffer_size = budget.decode_working_bytes.min(MAX_SINGLE_CHUNK_BYTES) as usize;
-    limits.intermediate_buffer_size = budget
-        .decode_working_bytes
-        .clamp(4 * 1024 * 1024, 128 * 1024 * 1024) as usize;
-    limits
-}
-
-fn open_tag_decoder(
-    byte_source: &Arc<dyn ByteSource>,
-    limits: &Limits,
-    cancel: &CancelToken,
-) -> Result<(TiffByteOrder, Decoder<BufferedByteReader>), RasterError> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut reader = BufferedByteReader::new(Arc::clone(byte_source), cancel.clone());
-    let mut magic = [0u8; 2];
-    reader
-        .read_exact(&mut magic)
-        .map_err(|e| crate::map_std_io_error(e, cancel))?;
-    let byte_order = match &magic {
-        b"II" => TiffByteOrder::Little,
-        b"MM" => TiffByteOrder::Big,
-        _ => return Err(RasterError::UnsupportedFormat),
-    };
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|e| crate::map_std_io_error(e, cancel))?;
-    let decoder = Decoder::new(reader)
-        .map_err(|e| map_tiff_error(e, cancel))?
-        .with_limits(limits.clone());
-    Ok((byte_order, decoder))
-}
+const BASE_METADATA_TAGS: &[u16] = &[
+    TAG_GDAL_NODATA,
+    TAG_GDAL_METADATA,
+    TAG_GEO_KEY_DIRECTORY,
+    TAG_GEO_DOUBLE_PARAMS,
+    TAG_GEO_ASCII_PARAMS,
+    TAG_MODEL_TIEPOINT,
+    TAG_MODEL_PIXEL_SCALE,
+    TAG_MODEL_TRANSFORMATION,
+];
 
 fn scan_overviews(
-    decoder: &mut Decoder<BufferedByteReader>,
+    reader: &mut SinglePassIfdReader,
+    mut next_ifd: u64,
     base_ifd: &CachedIfd,
     budget: &MemoryBudget,
     mut table_bytes_used: u64,
+    is_remote: bool,
     cancel: &CancelToken,
 ) -> Result<(Vec<Overview>, Vec<CachedIfd>), RasterError> {
     let mut overviews = Vec::new();
     let mut cached_overviews = Vec::new();
     let mut ifd_index = 0usize;
-    while ifd_index + 1 < MAX_IFDS && decoder.more_images() {
+
+    while ifd_index + 1 < MAX_IFDS && next_ifd != 0 {
         if cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
-        if let Err(err) = decoder.next_image() {
-            if cancel.is_cancelled() {
-                return Err(RasterError::Cancelled);
-            }
-            tracing::debug!(error = %err, "Stopped scanning TIFF overviews");
-            break;
-        }
-        ifd_index += 1;
-        let subfile = match opt_tag(decoder.get_tag_unsigned::<u32>(Tag::NewSubfileType), cancel) {
-            Ok(v) => v.unwrap_or(0),
+        let mut dir = match reader.read_directory(next_ifd, cancel) {
+            Ok(dir) => dir,
             Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
-            Err(_) => continue,
+            Err(err) => {
+                tracing::debug!(error = %err, "Stopped scanning TIFF overviews");
+                break;
+            }
         };
+        next_ifd = dir.next_ifd;
+        ifd_index += 1;
+
+        // `NewSubfileType` is inline; skip non-overview IFDs (e.g. transparency
+        // masks) before fetching any out-of-line offset/table tags.
+        let subfile = dir.read_u32_opt(reader, TAG_NEW_SUBFILE_TYPE).unwrap_or(0);
         if !is_overview(subfile) {
             continue;
         }
-        let overview_ifd =
-            match parse_cached_ifd(decoder, ifd_index, budget, table_bytes_used, cancel) {
-                Ok(ifd) => ifd,
-                Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
-                Err(_) => continue,
-            };
-        // Overviews must match base sample count, bits, sample type, and photometric
-        // compatibility (allowing YCbCr overviews on RGB base images).
+        let overview_ifd = match parse_cached_ifd(
+            &mut dir,
+            reader,
+            ifd_index,
+            budget,
+            table_bytes_used,
+            is_remote,
+            cancel,
+        ) {
+            Ok(ifd) => ifd,
+            Err(RasterError::Cancelled) => return Err(RasterError::Cancelled),
+            Err(_) => continue,
+        };
         let photo_compat = overview_ifd.photometric == base_ifd.photometric
             || (base_ifd.photometric == Photometric::Rgb
                 && overview_ifd.photometric == Photometric::YCbCr);
@@ -237,24 +223,38 @@ impl TiffSource {
         if cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
-        let limits = build_tiff_limits(budget);
-        let (byte_order, mut decoder) = open_tag_decoder(&byte_source, &limits, cancel)?;
+        let is_remote = byte_source.is_remote();
+        let mut reader = SinglePassIfdReader::open(Arc::clone(&byte_source), cancel)?;
+        let byte_order = reader.byte_order;
+        let first_ifd = reader.first_ifd;
 
-        let base_ifd = parse_cached_ifd(&mut decoder, 0, budget, 0, cancel)?;
+        let mut base_dir = reader.read_directory(first_ifd, cancel)?;
+        let next_ifd = base_dir.next_ifd;
+
+        let base_ifd = parse_cached_ifd(&mut base_dir, &reader, 0, budget, 0, is_remote, cancel)?;
         if !base_ifd.tiled {
+            if is_remote {
+                return Err(RasterError::RemotePassUnsupported(
+                    "remote GeoTIFF is stripped rather than tiled (not a Cloud-Optimized GeoTIFF)"
+                        .to_owned(),
+                ));
+            }
             check_max_source_side(base_ifd.width, base_ifd.height)?;
         }
 
-        let nodata_raw = read_tag_ascii_opt(&mut decoder, Tag::GdalNodata, cancel)?;
+        let meta_cap = max_cached_ifd_table_bytes(budget, is_remote);
+        base_dir.prefetch_tags(&reader, BASE_METADATA_TAGS, meta_cap, cancel)?;
+
+        let nodata_raw = base_dir.read_ascii_opt(&reader, TAG_GDAL_NODATA);
         let nodata_f64 = parse_gdal_nodata(&nodata_raw);
-        let gdal_xml = read_tag_ascii_opt(&mut decoder, Tag::Unknown(TAG_GDAL_METADATA), cancel)?;
+        let gdal_xml = base_dir.read_ascii_opt(&reader, TAG_GDAL_METADATA);
         let gdal_meta = if gdal_xml.is_empty() {
             GdalMetadata::default()
         } else {
             parse_gdal_metadata(&gdal_xml)
         };
 
-        let raw_geotiff_tags = read_geotiff_tags(&mut decoder, cancel)?;
+        let raw_geotiff_tags = base_dir.read_geotiff_tags(&reader);
         let ParsedGeoref {
             ties,
             placement,
@@ -272,12 +272,16 @@ impl TiffSource {
         );
 
         let table_bytes_used = base_ifd.table_bytes();
-        let (overviews, cached_overviews) =
-            scan_overviews(&mut decoder, &base_ifd, budget, table_bytes_used, cancel)?;
-
-        // Drop `tiff::decoder::Decoder` immediately after open — all subsequent
-        // chunk reads execute directly via `raw_decode` over `byte_source`.
-        drop(decoder);
+        let (overviews, cached_overviews) = scan_overviews(
+            &mut reader,
+            next_ifd,
+            &base_ifd,
+            budget,
+            table_bytes_used,
+            is_remote,
+            cancel,
+        )?;
+        drop(reader);
 
         let width = base_ifd.width;
         let height = base_ifd.height;
@@ -291,9 +295,21 @@ impl TiffSource {
             &grid,
             width,
             height,
-            veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
+            PixelFormat::Rgba8UnormSrgb,
             budget,
+            !is_remote,
         );
+        if is_remote
+            && (levels.is_empty()
+                || levels
+                    .iter()
+                    .any(|row| !matches!(row.serve, ServeMode::Pointwise) || !row.fits))
+        {
+            return Err(RasterError::RemotePassUnsupported(
+                "remote GeoTIFF lacks coarse overviews required for pointwise COG streaming"
+                    .to_owned(),
+            ));
+        }
         if levels.is_empty() || levels.iter().all(|row| !row.fits) {
             let max_peak = levels.last().map_or(0, |row| row.estimated_peak_bytes);
             return Err(RasterError::LimitExceeded {
@@ -311,8 +327,6 @@ impl TiffSource {
             .map_or(0, |o| o.image);
 
         let bands = build_band_infos(&base_ifd, nodata_f64, &gdal_meta);
-        // Only unsigned 8-bit rasters use identity [0, 255] display mapping; signed
-        // `I8` (-128..=127) and >8-bit / float types compute a percentile stretch.
         let initial_mapping = (base_ifd.sample_type == SampleType::U8).then(|| {
             DisplayMapping::identity(nodata_f64)
                 .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
@@ -360,11 +374,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tiff_limits_clamp_intermediate_buffer_to_safe_bounds() {
+    fn ifd_table_budget_clamps_remote_limit_safely() {
         let tiny_budget = MemoryBudget::for_host_ram(1024 * 1024 * 1024);
-        let limits = build_tiff_limits(&tiny_budget);
-        assert!(limits.intermediate_buffer_size >= 4 * 1024 * 1024);
-        assert!(limits.intermediate_buffer_size <= 128 * 1024 * 1024);
+        assert!(max_cached_ifd_table_bytes(&tiny_budget, false) >= 4 * 1024 * 1024);
+        assert!(
+            max_cached_ifd_table_bytes(&tiny_budget, true) <= tiny_budget.remote_ifd_limit_bytes
+        );
     }
 
     #[test]

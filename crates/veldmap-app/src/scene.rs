@@ -14,6 +14,7 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileStreamSpec};
+use veldmap_net::NetContext;
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
@@ -28,6 +29,7 @@ use crate::layers::{
 };
 use crate::measure::MeasureSession;
 use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
+use crate::stac::StacSession;
 use crate::storage::settings::AppSettings;
 use crate::vectors::{VectorIoEvent, VectorLayerId, VectorManager, is_geojson_path};
 
@@ -110,10 +112,12 @@ pub(crate) struct SceneState {
     pending_uploads: PendingUploads,
     decode_shutdown: CancelToken,
     decode_pool: Option<TwoLaneDecodePool>,
+    net: Option<Arc<NetContext>>,
     basemap: BasemapManager,
     overlays: OverlayManager,
     vectors: VectorManager,
     measure: MeasureSession,
+    stac: StacSession,
     cached_snapshot: Option<CachedFrameSnapshot>,
     scene_generation: u64,
     active_frame: Option<FrameState>,
@@ -121,11 +125,14 @@ pub(crate) struct SceneState {
 
 impl SceneState {
     /// Initialize GPU/upload caches, the shared two-lane CPU decode pool,
-    /// basemap streaming, local raster overlay management, and the GeoJSON
-    /// vector manager from startup `budget` and persisted `settings`.
+    /// basemap streaming, local + remote raster overlay management, STAC
+    /// controller, and the GeoJSON vector manager from startup `budget`,
+    /// shared [`NetContext`], and persisted `settings`.
     pub(crate) fn new(
         settings: &AppSettings,
         disk_cache: Option<Arc<TileDiskCache>>,
+        net: Option<Arc<NetContext>>,
+        net_init_error: Option<String>,
         wakeup: Wakeup,
         budget: &MemoryBudget,
     ) -> Result<Self, UploadChannelClosed> {
@@ -143,15 +150,19 @@ impl SceneState {
         let basemap = BasemapManager::new(
             settings.basemap_config(),
             disk_cache.clone(),
+            net.clone(),
+            net_init_error,
             done_tx.clone(),
             Arc::clone(&wakeup),
             decode_pool.fast_handle(),
             decode_shutdown.clone(),
         );
         let vectors = VectorManager::new(Arc::clone(&wakeup), decode_shutdown.clone());
+        let stac = StacSession::new(net.clone(), Arc::clone(&wakeup), decode_shutdown.clone());
         let overlays = OverlayManager::new(
             budget,
             disk_cache,
+            net.clone(),
             decode_pool.fast_handle(),
             decode_pool.bulk_handle(),
             done_tx,
@@ -166,10 +177,12 @@ impl SceneState {
             pending_uploads,
             decode_shutdown,
             decode_pool: Some(decode_pool),
+            net,
             basemap,
             overlays,
             vectors,
             measure: MeasureSession::default(),
+            stac,
             cached_snapshot: None,
             scene_generation: 1,
             active_frame: None,
@@ -243,6 +256,32 @@ impl SceneState {
     /// Read-only access to the interactive geodesic measurement session.
     pub(crate) fn measure(&self) -> &MeasureSession {
         &self.measure
+    }
+
+    /// Read-only access to the STAC catalog & AOI controller.
+    pub(crate) fn stac(&self) -> &StacSession {
+        &self.stac
+    }
+
+    /// Mutate the STAC catalog & AOI controller and mark the scene dirty
+    /// whenever the callback returns `true`.
+    pub(crate) fn mutate_stac<R>(&mut self, f: impl FnOnce(&mut StacSession) -> (R, bool)) -> R {
+        let (out, changed) = f(&mut self.stac);
+        self.mark_dirty_if(changed);
+        out
+    }
+
+    /// Queue a non-blocking remote Cloud-Optimized GeoTIFF open.
+    pub(crate) fn begin_open_remote_cog(
+        &self,
+        url: String,
+        title: String,
+        extra_headers: Vec<(String, String)>,
+        scale_offset: Option<(f64, f64)>,
+        fly_to: bool,
+    ) -> Result<(), String> {
+        self.overlays
+            .begin_open_remote_cog(url, title, extra_headers, scale_offset, fly_to)
     }
 
     /// Mutate the geodesic measurement session and mark the scene dirty
@@ -373,8 +412,9 @@ impl SceneState {
         Ok(())
     }
 
-    /// Drain completed background raster and vector I/O events in a single batch.
-    pub(crate) fn poll_io_events(&mut self) -> Vec<SceneIoEvent> {
+    /// Drain completed background raster, vector, and STAC I/O events in a
+    /// single batch.
+    pub(crate) fn poll_io_events(&mut self) -> (Vec<SceneIoEvent>, bool) {
         let (raster_events, mutation) = self.overlays.poll_io_events();
         let _ = self.apply_overlay_mutation(mutation);
 
@@ -386,10 +426,15 @@ impl SceneState {
             self.mark_dirty();
         }
 
+        let stac_changed = self.stac.poll_results();
+        if stac_changed {
+            self.mark_dirty();
+        }
+
         let mut events = Vec::with_capacity(raster_events.len() + vector_events.len());
         events.extend(raster_events.into_iter().map(SceneIoEvent::Raster));
         events.extend(vector_events.into_iter().map(SceneIoEvent::Vector));
-        events
+        (events, stac_changed)
     }
 
     pub(crate) fn set_overlay_stream(
@@ -547,6 +592,7 @@ impl SceneState {
         });
         snapshot_inner.overlays = overlay_layers;
         let mut draw_vectors = self.vectors.draw_layers();
+        self.stac.push_draw_layers(&mut draw_vectors);
         if let Some(measure_layer) = self.measure.draw_layer() {
             draw_vectors.push(measure_layer);
         }
@@ -596,12 +642,17 @@ impl SceneState {
     }
 
     /// Phase 1 of deterministic shutdown: cancel all worker tokens and signal
-    /// live/bundled/overlay/vector pipelines BEFORE closing `PendingUploads`.
+    /// live/bundled/overlay/vector/STAC pipelines and `NetContext` BEFORE
+    /// closing `PendingUploads`.
     pub(crate) fn begin_shutdown(&mut self) {
         self.overlays.begin_shutdown();
         self.vectors.begin_shutdown();
         self.basemap.begin_shutdown();
+        self.stac.cancel();
         self.decode_shutdown.cancel();
+        if let Some(net) = &self.net {
+            net.signal_shutdown();
+        }
     }
 
     /// Phase 2 of deterministic shutdown: close bounded upload queue so
@@ -610,9 +661,9 @@ impl SceneState {
         self.pending_uploads.close();
     }
 
-    /// Phase 3 of deterministic shutdown: join the shared CPU decode pool
-    /// and local I/O workers BEFORE shutting down `LiveTilePipeline`'s
-    /// `tokio::Runtime`.
+    /// Phase 3 of deterministic shutdown: join the shared CPU decode pool,
+    /// remote I/O pool, local I/O + tile-write workers, and basemap pipeline
+    /// BEFORE shutting down the shared `NetContext` `tokio::Runtime`.
     pub(crate) fn finish_shutdown(&mut self) {
         if let Some(pool) = self.decode_pool.take() {
             pool.shutdown();
@@ -620,6 +671,9 @@ impl SceneState {
         self.overlays.finish_shutdown();
         self.vectors.finish_shutdown();
         self.basemap.finish_shutdown();
+        if let Some(net) = self.net.take() {
+            net.shutdown();
+        }
     }
 }
 

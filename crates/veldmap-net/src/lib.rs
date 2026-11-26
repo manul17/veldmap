@@ -17,16 +17,31 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{QuadTileId, TileKey};
 
 mod basemap;
+mod context;
 mod fetcher;
 mod http;
+mod range;
 mod redact;
+mod stac;
 mod url;
 
 pub use basemap::{
     CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, LiveBasemapSpec,
     is_valid_gibs_date, validate_custom_url_template,
 };
+pub use context::{NetConfig, NetContext};
 pub use fetcher::{FetcherConfig, LiveTilePipeline, NetworkStatus};
+pub use range::{
+    DEFAULT_HEAD_PROBE_BYTES, HttpRangeConfig, HttpRangeSource, PrefetchPin, RANGE_BLOCK_SIZE,
+    RangeOpenError,
+};
+pub use redact::sanitize_url_for_display;
+pub use stac::{
+    AWS_EARTH_SEARCH_V1_ENDPOINT, COLLECTION_COP_DEM_GLO30, COLLECTION_SENTINEL2_L2A,
+    MAX_STAC_SEARCH_LIMIT, SampleScene, StacAsset, StacAuth, StacCatalogConfig, StacClient,
+    StacError, StacItem, StacRasterBandMeta, StacSearchQuery, StacSearchResult,
+    builtin_sample_scenes,
+};
 
 /// Structured error returned across the [`TileBlobStore`] seam.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]

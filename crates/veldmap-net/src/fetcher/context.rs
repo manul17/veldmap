@@ -25,7 +25,7 @@ use super::state::PipelineState;
 pub(super) struct PipelineShared {
     pub(super) shutdown: CancelToken,
     pub(super) state: Mutex<PipelineState>,
-    pub(super) host_limiters: HostLimiters,
+    pub(super) host_limiters: Arc<HostLimiters>,
     pub(super) notify: Notify,
 }
 

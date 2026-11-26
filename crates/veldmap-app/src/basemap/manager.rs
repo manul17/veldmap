@@ -9,7 +9,8 @@ use veldmap_core::tile::{
     PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, StreamKey, TileKey,
 };
 use veldmap_net::{
-    FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetError, TileBlobStore, TileDecodeExecutor,
+    FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetContext, NetError, TileBlobStore,
+    TileDecodeExecutor,
 };
 use veldmap_raster::DecodePoolHandle;
 use veldmap_storage::TileDiskCache;
@@ -75,9 +76,15 @@ impl BasemapManager {
     /// fast-lane [`DecodePoolHandle`] + `decode_shutdown` token from
     /// [`crate::scene::SceneState`], and an optional shared SQLite
     /// [`TileDiskCache`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "basemap coordinator wires explicit shared runtime subsystems"
+    )]
     pub(crate) fn new(
         config: BasemapConfigView<'_>,
         disk_cache: Option<Arc<TileDiskCache>>,
+        net: Option<Arc<NetContext>>,
+        net_init_error: Option<String>,
         done_tx: UploadSender,
         wakeup: Wakeup,
         decode_handle: DecodePoolHandle,
@@ -98,17 +105,21 @@ impl BasemapManager {
         let blob_store: Option<Arc<dyn TileBlobStore>> =
             disk_cache.map(|cache| Arc::new(SqliteBlobStore(cache)) as Arc<dyn TileBlobStore>);
 
-        let (live_pipeline, live_pipeline_error) = match LiveTilePipeline::spawn(
-            FetcherConfig::default(),
-            blob_store,
-            decode_executor,
-            wakeup,
-        ) {
-            Ok(pipeline) => (Some(pipeline), None),
-            Err(err) => {
-                tracing::error!(error = %err, "Failed to start live HTTP tile pipeline; falling back to offline basemap");
-                (None, Some(err.to_string()))
-            }
+        let (live_pipeline, live_pipeline_error) = match net {
+            Some(net_ctx) => (
+                Some(LiveTilePipeline::spawn_with_context(
+                    net_ctx,
+                    FetcherConfig::default(),
+                    blob_store,
+                    decode_executor,
+                    wakeup,
+                )),
+                None,
+            ),
+            None => (
+                None,
+                Some(net_init_error.unwrap_or_else(|| "network context unavailable".to_owned())),
+            ),
         };
 
         let mut manager = Self {

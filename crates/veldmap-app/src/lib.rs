@@ -18,6 +18,7 @@ mod layers;
 mod measure;
 pub mod render;
 mod scene;
+mod stac;
 mod storage;
 mod ui;
 mod vectors;

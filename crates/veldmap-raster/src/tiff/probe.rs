@@ -11,6 +11,7 @@ use veldmap_core::tile::{PixelFormat, SourceId, TileStreamSpec};
 
 use crate::RasterError;
 use crate::pipeline::DecodeContext;
+use crate::pipeline::chunk_cache::ChunkKey;
 use crate::pipeline::driver::Chunked as _;
 use crate::pipeline::grid::chunk_working_bytes;
 use crate::pipeline::metadata::{BandSample, SampleType};
@@ -129,10 +130,23 @@ pub(super) fn sample_display_rgba(
     let base = probe.base_ifd();
     let loc = base.chunk_loc(px, py)?;
     admit_cursor_chunk_bytes(ctx, loc.dims, base.raw_pixel_bytes(), 4)?;
-    let mapping = get_mapping()?;
 
-    let mut reader = probe.make_pointwise_reader(DISPLAY_STREAM_SPEC, Some(mapping), ctx);
-    let chunk = reader.chunk(0, loc.chunk_index, ctx.cancel)?;
+    let chunk = if probe.access.byte_source.is_remote() {
+        let key = ChunkKey {
+            source: probe.source_id,
+            spec: DISPLAY_STREAM_SPEC,
+            image: 0,
+            chunk_index: loc.chunk_index,
+        };
+        let Some(hit) = ctx.chunk_cache.get_cached(&key) else {
+            return Ok(BandSample::Unavailable);
+        };
+        hit
+    } else {
+        let mapping = get_mapping()?;
+        let mut reader = probe.make_pointwise_reader(DISPLAY_STREAM_SPEC, Some(mapping), ctx);
+        reader.chunk(0, loc.chunk_index, ctx.cancel)?
+    };
     if loc.local_x >= chunk.width || loc.local_y >= chunk.height {
         return Ok(BandSample::Nodata);
     }
@@ -153,7 +167,10 @@ pub(super) fn sample_display_rgba(
 
 /// Sample one scientific or categorical band pixel at `(px, py)` from the base
 /// IFD, using `SharedChunkCache` whenever lossless and falling back to direct
-/// native `f64` reads for `U32`/`I32`/`F64` scientific rasters.
+/// native `f64` reads for local `U32`/`I32`/`F64` scientific rasters.
+///
+/// Remote sources stay strictly cache-only so interactive hover probes never
+/// block the fast decode pool on uncached HTTP Range reads.
 pub(super) fn sample_indexed_band(
     probe: &ProbeContext<'_>,
     spec: TileStreamSpec,
@@ -165,7 +182,9 @@ pub(super) fn sample_indexed_band(
 ) -> Result<BandSample, RasterError> {
     let base = probe.base_ifd();
     let loc = base.chunk_loc(px, py)?;
-    let needs_raw_f64 = spec.format == PixelFormat::R32Float
+    let is_remote = probe.access.byte_source.is_remote();
+    let needs_raw_f64 = !is_remote
+        && spec.format == PixelFormat::R32Float
         && matches!(
             base.sample_type,
             SampleType::U32 | SampleType::I32 | SampleType::F64
@@ -173,7 +192,7 @@ pub(super) fn sample_indexed_band(
     if needs_raw_f64 {
         sample_raw_f64_band(probe, base, band_idx, scale_offset, loc, ctx)
     } else {
-        sample_cached_band(probe, base, spec, scale_offset, loc, ctx)
+        sample_cached_band(probe, base, spec, scale_offset, loc, is_remote, ctx)
     }
 }
 
@@ -183,6 +202,7 @@ fn sample_cached_band(
     spec: TileStreamSpec,
     (scale, offset): (f64, f64),
     loc: ChunkPixelLoc,
+    cache_only: bool,
     ctx: &DecodeContext<'_>,
 ) -> Result<BandSample, RasterError> {
     admit_cursor_chunk_bytes(
@@ -191,8 +211,21 @@ fn sample_cached_band(
         base.band_raw_pixel_bytes(),
         spec.format.bytes_per_pixel() as u32,
     )?;
-    let mut reader = probe.make_pointwise_reader(spec, None, ctx);
-    let chunk = reader.chunk(0, loc.chunk_index, ctx.cancel)?;
+    let chunk = if cache_only {
+        let key = ChunkKey {
+            source: probe.source_id,
+            spec,
+            image: 0,
+            chunk_index: loc.chunk_index,
+        };
+        let Some(hit) = ctx.chunk_cache.get_cached(&key) else {
+            return Ok(BandSample::Unavailable);
+        };
+        hit
+    } else {
+        let mut reader = probe.make_pointwise_reader(spec, None, ctx);
+        reader.chunk(0, loc.chunk_index, ctx.cancel)?
+    };
     if loc.local_x >= chunk.width || loc.local_y >= chunk.height {
         return Ok(BandSample::Unavailable);
     }

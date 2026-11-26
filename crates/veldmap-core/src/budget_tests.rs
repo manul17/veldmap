@@ -13,12 +13,18 @@ fn host_ram_budget_scales_within_bounds_and_default_is_deterministic() {
     );
     assert_eq!(small.region_cap_pixels_for(PixelFormat::R8Uint), 32 * MIB);
     assert_eq!(small.gpu_tile_cache_bytes, 256 * MIB as usize);
+    assert_eq!(small.range_block_pool_bytes, 32 * MIB as usize);
+    assert_eq!(small.remote_prefetch_bytes, 16 * MIB as usize);
+    assert_eq!(small.remote_ifd_limit_bytes, 16 * MIB);
 
     let mid = MemoryBudget::for_host_ram(16 * GIB);
     assert_eq!(mid.decode_working_bytes, 2 * GIB);
     assert_eq!(mid.decoded_chunk_cache_bytes, 512 * MIB as usize);
     assert_eq!(mid.region_cap_bytes, 256 * MIB);
     assert_eq!(mid.gpu_tile_cache_bytes, GIB as usize);
+    assert_eq!(mid.range_block_pool_bytes, 256 * MIB as usize);
+    assert_eq!(mid.remote_prefetch_bytes, 128 * MIB as usize);
+    assert_eq!(mid.remote_ifd_limit_bytes, 64 * MIB);
 
     assert_eq!(
         MemoryBudget::default(),

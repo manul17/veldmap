@@ -53,7 +53,7 @@ pub(super) fn show_vector_card(
                 actions.push(LayerUiAction::SetVectorOpacity(layer.id, opacity, commit));
             }
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if let Some(bounds) = layer.footprint
                     && ui
                         .small_button("Zoom")
@@ -61,6 +61,14 @@ pub(super) fn show_vector_card(
                         .clicked()
                 {
                     actions.push(LayerUiAction::ZoomToExtent(bounds));
+                }
+                if layer.has_polygons
+                    && ui
+                        .small_button("STAC AOI")
+                        .on_hover_text("Use this polygon layer as the Cloud / STAC search AOI")
+                        .clicked()
+                {
+                    actions.push(LayerUiAction::UseVectorAsStacAoi(layer.id));
                 }
                 if ui.small_button("Remove").clicked() {
                     actions.push(LayerUiAction::RemoveVector(layer.id));

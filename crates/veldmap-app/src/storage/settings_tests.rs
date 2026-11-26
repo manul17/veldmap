@@ -157,4 +157,36 @@ fn gpu_tile_cache_cap_clamps_persists_and_loads_legacy_settings() {
     .expect("write legacy settings");
     let legacy = AppSettings::load_or_default(&paths);
     assert_eq!(legacy.gpu_tile_cache_max_mb, None);
+    assert_eq!(legacy.stac, StacSettings::default());
+}
+
+#[test]
+fn stac_settings_round_trip_and_redact_secrets_in_debug() {
+    let dir = TestTempDir::new("settings-stac");
+    let paths = StoragePaths::with_root(dir.path());
+
+    let mut settings = AppSettings::default();
+    let mut draft = BasemapSettingsDraft::from_settings(&settings);
+    draft.stac = StacSettings {
+        custom_endpoint: "https://user:pw@stac.example.org/v1?sig=hidden-query".to_owned(),
+        custom_collection: "sentinel-2-l2a".to_owned(),
+        auth_kind: StacAuthKind::Bearer,
+        auth_header_name: "x-api-key".to_owned(),
+        auth_secret: "stac-bearer-secret-xyz".to_owned(),
+    };
+    draft.apply_into(&mut settings);
+
+    let dbg = format!("{settings:?}");
+    assert!(!dbg.contains("stac-bearer-secret-xyz"));
+    assert!(!dbg.contains("user:pw"));
+    assert!(!dbg.contains("hidden-query"));
+    assert!(dbg.contains("<redacted>"));
+
+    settings.save(&paths).expect("save stac settings");
+    let loaded = AppSettings::load_or_default(&paths);
+    assert_eq!(loaded.stac, settings.stac);
+    assert_eq!(
+        loaded.stac.to_stac_auth(),
+        StacAuth::Bearer("stac-bearer-secret-xyz".to_owned())
+    );
 }

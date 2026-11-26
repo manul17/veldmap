@@ -105,6 +105,37 @@ pub(crate) fn extract_host(url: &str) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Normalize an HTTP(S) URL into `scheme://host[:port]/path` with lowercased
+/// scheme and authority, stripping any inline `user:pass@`, `?query`, and
+/// `#fragment` so presigned URLs for the same immutable object share a stable
+/// cache identity.
+pub(crate) fn canonical_url_without_query(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return None;
+    }
+    let after_scheme = strip_http_scheme(trimmed)?;
+    let scheme = if trimmed.len() >= 8 && trimmed.as_bytes()[..8].eq_ignore_ascii_case(b"https://")
+    {
+        "https"
+    } else {
+        "http"
+    };
+    let authority = parse_http_authority(trimmed)?;
+    let parts = split_authority_and_userinfo(after_scheme);
+    let path_end = parts.tail.find(['?', '#']).unwrap_or(parts.tail.len());
+    let path = &parts.tail[..path_end];
+    let normalized_path = if path.is_empty() { "/" } else { path };
+    Some(format!(
+        "{scheme}://{}{normalized_path}",
+        authority.host_port.to_ascii_lowercase()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

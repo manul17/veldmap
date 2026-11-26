@@ -40,6 +40,12 @@ pub struct MemoryBudget {
     pub gpu_tile_cache_bytes: usize,
     /// CPU-side queued decoded-tile byte cap awaiting GPU upload.
     pub queued_upload_bytes: usize,
+    /// Host-RAM-scaled byte cap for the shared 64 KiB HTTP Range LRU block pool.
+    pub range_block_pool_bytes: usize,
+    /// Upfront memory-permit ceiling for pinned coalesced remote COG prefetch batches.
+    pub remote_prefetch_bytes: usize,
+    /// Upper bound on cached remote TIFF/BigTIFF IFD & offset-table bytes on open.
+    pub remote_ifd_limit_bytes: u64,
 }
 
 impl MemoryBudget {
@@ -52,6 +58,9 @@ impl MemoryBudget {
         let lane_pending = (ram / 128).clamp(32 * MIB, 128 * MIB) as usize;
         let gpu_tile_cache_bytes = (ram / 16).clamp(256 * MIB, GIB) as usize;
         let queued_upload_bytes = (ram / 128).clamp(64 * MIB, 128 * MIB) as usize;
+        let range_block_pool_bytes = (ram / 64).clamp(32 * MIB, 256 * MIB) as usize;
+        let remote_prefetch_bytes = (ram / 128).clamp(16 * MIB, 128 * MIB) as usize;
+        let remote_ifd_limit_bytes = (decode_working_bytes / 16).clamp(4 * MIB, 64 * MIB);
 
         Self {
             host_ram_bytes: ram,
@@ -62,6 +71,9 @@ impl MemoryBudget {
             bulk_lane_pending_bytes: lane_pending,
             gpu_tile_cache_bytes,
             queued_upload_bytes,
+            range_block_pool_bytes,
+            remote_prefetch_bytes,
+            remote_ifd_limit_bytes,
         }
     }
 

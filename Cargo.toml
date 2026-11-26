@@ -35,9 +35,9 @@ pollster = "1.0.3"
 proj4rs = "0.3.1"
 proj4wkt = "0.2.0"
 qoi = "0.4.1"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "gzip"] }
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal", "wayland"] }
-rusqlite = { version = "0.43.0", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled", "cache"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = "1.0.229"
 serde_json = "1.0.154"

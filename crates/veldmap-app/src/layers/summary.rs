@@ -81,6 +81,8 @@ impl OverlayLayer {
             id: self.id(),
             name: self.name().to_owned(),
             path: self.path().to_path_buf(),
+            is_remote: self.is_remote(),
+            remote_url: self.remote_url().map(str::to_owned),
             visible: self.is_visible(),
             opacity: self.opacity(),
             width: desc.width,

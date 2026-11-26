@@ -5,10 +5,12 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{BandKey, PixelFormat, SourceId, StreamKey, TileKey};
 
 /// Deduplication and scheduling identity for a [`DecodeJob`], cleanly
-/// distinguishing interactive cursor probes, background band-statistics scans,
-/// single-tile fast jobs, and `StreamKey`-scoped bulk cascade jobs.
+/// distinguishing remote opens, interactive cursor probes, background
+/// band-statistics scans, single-tile fast jobs, and `StreamKey`-scoped bulk
+/// cascade jobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodeJobKey {
+    Open(u64),
     Probe {
         source: SourceId,
         band: BandKey,
@@ -31,10 +33,11 @@ pub(super) struct DecodeJobPriority(DecodeJobKey);
 impl DecodeJobKey {
     const fn priority_tier(self) -> u8 {
         match self {
-            Self::Probe { .. } => 0,
-            Self::BandStats { .. } => 1,
-            Self::Tile(_) => 2,
-            Self::Pass(_) => 3,
+            Self::Open(_) => 0,
+            Self::Probe { .. } => 1,
+            Self::BandStats { .. } => 2,
+            Self::Tile(_) => 3,
+            Self::Pass(_) => 4,
         }
     }
 }
@@ -46,6 +49,7 @@ impl Ord for DecodeJobPriority {
             return tier_cmp;
         }
         match (self.0, other.0) {
+            (DecodeJobKey::Open(a), DecodeJobKey::Open(b)) => a.cmp(&b),
             (
                 DecodeJobKey::Probe {
                     source: s1,
@@ -90,12 +94,13 @@ impl PartialOrd for DecodeJobPriority {
 }
 
 impl DecodeJobKey {
-    /// Coarseness rank (smaller = higher priority). Pass, Probe, and BandStats
-    /// jobs run at equal rank `0` and never evict one another or root tiles.
+    /// Coarseness rank (smaller = higher priority). Open, Pass, Probe, and
+    /// BandStats jobs run at equal rank `0` and never evict one another or root
+    /// tiles.
     pub(super) const fn coarseness_rank(self) -> u8 {
         match self {
             Self::Tile(key) => key.scheme.coarseness_rank(key.level),
-            Self::Pass(_) | Self::Probe { .. } | Self::BandStats { .. } => 0,
+            Self::Open(_) | Self::Pass(_) | Self::Probe { .. } | Self::BandStats { .. } => 0,
         }
     }
 

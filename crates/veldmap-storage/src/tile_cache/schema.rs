@@ -54,6 +54,7 @@ pub(super) fn remove_sqlite_files(path: &Path) {
 pub(super) fn open_read_only_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
+    conn.set_prepared_statement_cache_capacity(32);
     conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
     Ok(conn)
 }
@@ -65,6 +66,7 @@ fn query_page_count_and_version(conn: &Connection) -> Result<(i64, i64), rusqlit
 }
 
 fn init_connection(conn: &Connection, is_empty: bool) -> Result<i64, rusqlite::Error> {
+    conn.set_prepared_statement_cache_capacity(32);
     conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
 

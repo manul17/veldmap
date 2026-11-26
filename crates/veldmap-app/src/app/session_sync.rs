@@ -339,9 +339,9 @@ impl VeldmapApp {
     }
 
     pub(super) fn drain_scene_io_events(&mut self) -> bool {
-        let events = self.scene.poll_io_events();
+        let (events, stac_changed) = self.scene.poll_io_events();
         if events.is_empty() {
-            return false;
+            return stac_changed;
         }
         let mut session_changed = false;
         let mut newly_opened_paths: Vec<PathBuf> = Vec::new();
@@ -387,6 +387,34 @@ impl VeldmapApp {
                     can_assign_crs,
                 }) => {
                     self.handle_layer_failed(LayerKind::Raster, path, error, can_assign_crs);
+                }
+                SceneIoEvent::Raster(OverlayIoEvent::RemoteOpened {
+                    id,
+                    title,
+                    display_url,
+                    bounds,
+                    fly_to,
+                }) => {
+                    tracing::info!(?id, title = %title, url = %display_url, "Opened remote COG overlay layer");
+                    self.panels.layers.on_layer_opened();
+                    if fly_to && let Some(b) = bounds {
+                        self.focus_footprint(b);
+                    }
+                }
+                SceneIoEvent::Raster(OverlayIoEvent::RemoteFailed {
+                    title,
+                    display_url,
+                    error,
+                }) => {
+                    tracing::warn!(
+                        title = %title,
+                        url = %display_url,
+                        error = %error,
+                        "Failed to open remote COG overlay layer"
+                    );
+                    self.panels
+                        .layers
+                        .push_error(format!("Remote COG '{title}': {error}"));
                 }
                 SceneIoEvent::Vector(VectorIoEvent::Opened {
                     id,

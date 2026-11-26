@@ -1,12 +1,13 @@
 //! GeoTIFF / BigTIFF / Cloud-Optimized GeoTIFF (COG) reader built over
 //! positioned [`veldmap_core::io::ByteSource`].
 //!
-//! Uses `tiff 0.11.3` strictly for IFD/tag parsing on open (caching bounded
-//! per-IFD chunk offset/byte-count/table metadata) and executes all chunk reads
-//! through the stateless direct raw-chunk decoder (`raw_decode/`), supporting
-//! `PlanarConfiguration = 1 & 2`, `Palette` (`ColorMap`), 4-band RGB+NIR
-//! (`ExtraSamples = 0`), `YCbCr`, `ZSTD`, `WebP`, `LZW`, `Deflate`, `PackBits`,
-//! `JPEG` (`JPEGTables`), `Predictor = 2 & 3`, and typed `Display`, `Scientific`
+//! Uses a single-pass `ByteSource` Classic+BigTIFF IFD reader on open (caching
+//! bounded per-IFD chunk offset/byte-count/table metadata) and executes all
+//! chunk reads through the stateless direct raw-chunk decoder (`raw_decode/`),
+//! supporting `PlanarConfiguration = 1 & 2`, `Palette` (`ColorMap`), 4-band
+//! RGB+NIR (`ExtraSamples = 0`), `YCbCr`, `ZSTD`, `WebP`, `LZW`, `Deflate`,
+//! `PackBits`, `JPEG` (`JPEGTables`), `Predictor = 2 & 3`, sync byte-range
+//! planning for remote COG prefetch, and typed `Display`, `Scientific`
 //! (`R32Float`), and `Categorical` (`R8Uint`/`R16Uint`) streams.
 
 mod chunk_convert;
@@ -28,19 +29,20 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint, SourceId, TileStreamSpec};
 
 use crate::RasterError;
-use crate::pipeline::driver::{self, DirectRead};
+use crate::pipeline::chunk_cache::{ChunkKey, SharedChunkCache};
+use crate::pipeline::driver::{self, DirectRead, plan_direct};
 use crate::pipeline::grid::Grid;
 use crate::pipeline::metadata::{BandSample, BandStats, RasterDescription, SampleType};
 use crate::pipeline::plan::{
     DISPLAY_STREAM_SPEC, PyramidMeta, build_chunked_level_table, stream_spec_for_band,
 };
 use crate::pipeline::radiometry::DisplayMapping;
-use crate::pipeline::{DecodeContext, RasterSource, TileEmit};
+use crate::pipeline::{ByteRange, DecodeContext, RasterSource, TileEmit, coalesce_byte_ranges};
 
 use chunk_reader::{ChunkReadMode, TiffChunkReader};
-use ifd::{CachedIfd, Photometric, RawTiffAccess};
+use ifd::{CachedIfd, Photometric, PlanarConfig, RawTiffAccess};
 use probe::{ProbeContext, sample_display_rgba, sample_indexed_band};
-use stretch::{BandStatsCache, StretchCache, StretchRequest};
+use stretch::{BandStatsCache, StretchCache, StretchRequest, pick_sample_chunks};
 
 /// BigTIFF file header signatures (`version = 43`).
 const BIG_MAGIC: [&[u8]; 2] = [b"II\x2b\x00", b"MM\x00\x2b"];
@@ -85,6 +87,24 @@ impl TiffSource {
     /// Return whether the base IFD uses tiled TIFF storage (`TileWidth`).
     pub fn is_tiled(&self) -> bool {
         self.base_ifd().tiled
+    }
+
+    /// Apply external per-band `(scale, offset)` metadata (e.g., from STAC
+    /// `raster:bands`) to indexed bands whose embedded TIFF metadata left
+    /// scaling at identity `(1.0, 0.0)`.
+    pub fn apply_external_scale_offset(&mut self, scale: f64, offset: f64) {
+        if !scale.is_finite() || !offset.is_finite() {
+            return;
+        }
+        for band in &mut self.description.bands {
+            if matches!(band.band_key, BandKey::Index(_))
+                && (band.scale - 1.0).abs() <= 1e-12
+                && band.offset.abs() <= 1e-12
+            {
+                band.scale = scale;
+                band.offset = offset;
+            }
+        }
     }
 
     fn base_ifd(&self) -> &CachedIfd {
@@ -169,6 +189,72 @@ impl TiffSource {
         }
     }
 
+    fn collect_validated_spans(
+        &self,
+        ifd: &CachedIfd,
+        planes: &[usize],
+        chunk_indices: &[u32],
+    ) -> Result<Vec<ByteRange>, RasterError> {
+        let file_len = self.access.byte_source.len();
+        let samples_in_chunk = ifd.samples_in_chunk();
+        let sample_bytes = ifd.sample_type.byte_size();
+        let max_uncompressed_bytes = self.access.max_chunk_bytes;
+        let mut ranges = Vec::with_capacity(planes.len() * chunk_indices.len());
+
+        for &idx in chunk_indices {
+            let Some(dims) = ifd.chunk_dims(idx) else {
+                continue;
+            };
+            let stored_bytes = (dims.stored_w as usize)
+                .checked_mul(samples_in_chunk)
+                .and_then(|n| n.checked_mul(sample_bytes))
+                .and_then(|n| n.checked_mul(dims.stored_h as usize))
+                .ok_or_else(|| RasterError::Decode("TIFF chunk byte size overflow".to_owned()))?;
+            if stored_bytes > max_uncompressed_bytes {
+                return Err(RasterError::LimitExceeded {
+                    width: dims.stored_w,
+                    height: dims.stored_h,
+                    estimated_bytes: stored_bytes as u64,
+                    limit_bytes: max_uncompressed_bytes as u64,
+                });
+            }
+            let max_compressed = stored_bytes
+                .saturating_mul(2)
+                .max(4 * 1024 * 1024)
+                .min(max_uncompressed_bytes.saturating_mul(2).max(64 * 1024))
+                as u64;
+            for &plane in planes {
+                let (offset, byte_count) = ifd.chunk_span(plane, idx)?;
+                if offset == 0 || byte_count == 0 {
+                    continue;
+                }
+                if byte_count > max_compressed {
+                    return Err(RasterError::LimitExceeded {
+                        width: dims.stored_w,
+                        height: dims.stored_h,
+                        estimated_bytes: byte_count,
+                        limit_bytes: max_compressed,
+                    });
+                }
+                if offset
+                    .checked_add(byte_count)
+                    .is_none_or(|end| end > file_len)
+                {
+                    return Err(RasterError::Decode(format!(
+                        "TIFF chunk span {offset}..+{byte_count} exceeds file length {file_len}"
+                    )));
+                }
+                ranges.push(ByteRange {
+                    offset,
+                    len: byte_count,
+                });
+            }
+        }
+
+        coalesce_byte_ranges(&mut ranges, 64 * 1024, 4 * 1024 * 1024);
+        Ok(ranges)
+    }
+
     fn make_reader<'a>(
         &'a self,
         spec: TileStreamSpec,
@@ -198,6 +284,83 @@ impl RasterSource for TiffSource {
 
     fn description(&self) -> &RasterDescription {
         &self.description
+    }
+
+    fn is_remote(&self) -> bool {
+        self.access.byte_source.is_remote()
+    }
+
+    fn needs_display_stretch(&self) -> bool {
+        !self.stretch.is_ready()
+    }
+
+    fn plan_pointwise_byte_ranges(
+        &self,
+        spec: TileStreamSpec,
+        level: u8,
+        wants: &[(u32, u32)],
+        budget: &MemoryBudget,
+        chunk_cache: &SharedChunkCache,
+    ) -> Result<Vec<ByteRange>, RasterError> {
+        self.validate_stream_spec(spec)?;
+        let plan = plan_direct(
+            &self.grid,
+            (self.description.width, self.description.height),
+            spec.format,
+            level,
+            wants,
+            budget,
+        )?;
+        let ifd = self
+            .ifds
+            .iter()
+            .find(|i| i.image == plan.image)
+            .ok_or_else(|| RasterError::Decode(format!("TIFF IFD {} is not cached", plan.image)))?;
+        let planes = ifd.planes_for_stream(spec)?;
+        let uncached: Vec<u32> = plan
+            .unique_chunk_indices()
+            .into_iter()
+            .filter(|&chunk_index| {
+                let key = ChunkKey {
+                    source: self.source_id,
+                    spec,
+                    image: plan.image,
+                    chunk_index,
+                };
+                !chunk_cache.contains(&key)
+            })
+            .collect();
+        self.collect_validated_spans(ifd, &planes, &uncached)
+    }
+
+    fn plan_stretch_byte_ranges(&self) -> Result<Vec<ByteRange>, RasterError> {
+        if self.stretch.is_ready() || self.base_ifd().sample_type == SampleType::U8 {
+            return Ok(Vec::new());
+        }
+        let ifd = self.stats_ifd_ref();
+        let picks = pick_sample_chunks(ifd.chunks_per_plane);
+        let planes: Vec<usize> = match ifd.planar {
+            PlanarConfig::Chunky => vec![0],
+            PlanarConfig::Planar => (0..ifd.pixel_layout.colors().max(1)).collect(),
+        };
+        self.collect_validated_spans(ifd, &planes, &picks)
+    }
+
+    fn plan_band_stats_byte_ranges(&self, band: BandKey) -> Result<Vec<ByteRange>, RasterError> {
+        let BandKey::Index(b) = band else {
+            return Ok(Vec::new());
+        };
+        if self.band_stats.is_ready(b) {
+            return Ok(Vec::new());
+        }
+        let ifd = self.stats_ifd_ref();
+        let band_idx = usize::from(b);
+        if band_idx >= usize::from(ifd.samples_per_pixel) {
+            return Ok(Vec::new());
+        }
+        let picks = pick_sample_chunks(ifd.chunks_per_plane);
+        let plane = ifd.band_plane(band_idx);
+        self.collect_validated_spans(ifd, &[plane], &picks)
     }
 
     fn default_stream_spec(&self) -> TileStreamSpec {
@@ -231,6 +394,7 @@ impl RasterSource for TiffSource {
                 self.description.height,
                 spec.format,
                 &self.budget_snapshot,
+                !self.is_remote(),
             )
         };
         Ok(PyramidMeta {
@@ -290,6 +454,11 @@ impl RasterSource for TiffSource {
         ctx: &DecodeContext<'_>,
         emit: TileEmit<'_>,
     ) -> Result<(), RasterError> {
+        if self.is_remote() {
+            return Err(RasterError::RemotePassUnsupported(
+                "whole-file sequential pass is forbidden on remote HTTP sources".to_owned(),
+            ));
+        }
         self.validate_stream_spec(spec)?;
         let mapping = if spec.format == PixelFormat::Rgba8UnormSrgb {
             Some(self.display_mapping(ctx)?)

@@ -252,3 +252,52 @@ fn per_cluster_rtc_preserves_submillimetre_precision_across_continents_and_tiny_
         );
     }
 }
+
+#[test]
+fn feature_properties_bbox_and_wkt_export_round_trip() {
+    let poly = Polygon {
+        exterior: Ring {
+            points: vec![
+                GeoPoint {
+                    lat: 55.0,
+                    lon: 37.0,
+                },
+                GeoPoint {
+                    lat: 55.0,
+                    lon: 38.0,
+                },
+                GeoPoint {
+                    lat: 56.0,
+                    lon: 38.0,
+                },
+                GeoPoint {
+                    lat: 56.0,
+                    lon: 37.0,
+                },
+            ],
+        },
+        holes: Vec::new(),
+    };
+    let feat = GeoJsonFeature::new(
+        Some("AOI".to_string()),
+        GeoJsonGeometry::Polygon(poly.clone()),
+    )
+    .with_string_prop("sensor", "S2")
+    .with_f64_prop("cloud", 12.5);
+    assert_eq!(feat.property_count(), 2);
+    assert_eq!(feat.property_str("sensor"), Some("S2"));
+    assert_eq!(feat.property_f64("cloud"), Some(12.5));
+    let pairs = feat.property_display_pairs();
+    assert!(pairs.iter().any(|(k, v)| k == "sensor" && v == "S2"));
+
+    let fc = GeoJsonFeatureCollection {
+        features: vec![feat],
+    };
+    assert_eq!(fc.bbox(), Some([37.0, 55.0, 38.0, 56.0]));
+
+    let wkt = export_wkt_geometry(&GeoJsonGeometry::Polygon(poly.clone()));
+    assert!(wkt.starts_with("POLYGON (("));
+    assert!(wkt.contains("37.000000 55.000000"));
+    let geojson_geom = export_geojson_geometry(&GeoJsonGeometry::Polygon(poly));
+    assert!(geojson_geom.contains("\"Polygon\""));
+}

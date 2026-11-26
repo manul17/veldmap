@@ -32,7 +32,7 @@ pub use geodesy::{Ellipsoid, Geodetic, SEMI_MAJOR_M, WGS84};
 pub use geojson::{
     DEFAULT_VECTOR_MAX_CHORD_DEG, GeoJsonError, GeoJsonFeature, GeoJsonFeatureCollection,
     GeoJsonGeometry, MAX_GEOJSON_BYTES, VectorCluster, VectorMesh, VectorVertex,
-    export_geojson_feature_collection, parse_geojson,
+    export_geojson_feature_collection, export_geojson_geometry, export_wkt_geometry, parse_geojson,
 };
 pub use shapes::{GeoPoint, Polygon, Ring};
 

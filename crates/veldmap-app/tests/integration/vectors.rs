@@ -60,6 +60,8 @@ fn draped_geojson_polygon_with_hole_renders_fill_and_excludes_hole_in_pass2() {
         opacity: 1.0,
         fill_color: [1.0, 0.0, 0.0, 0.9],
         line_color: [1.0, 1.0, 0.0, 1.0],
+        stroke_width_px: 1.5,
+        hatch_spacing_px: 0.0,
         mesh,
     });
     let with_vec = render_srgb(&mut renderer, device, queue, width, height, &Arc::new(snap));
@@ -115,6 +117,8 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
         opacity: 1.0,
         fill_color: [0.0, 0.0, 1.0, 0.3],
         line_color: [0.0, 1.0, 0.0, 1.0],
+        stroke_width_px: 1.5,
+        hatch_spacing_px: 0.0,
         mesh: Arc::clone(&mesh),
     });
     let pixels = render_srgb(&mut renderer, device, queue, width, height, &Arc::new(snap));
@@ -135,6 +139,8 @@ fn draped_geojson_point_only_layer_renders_visible_markers_in_pass2() {
         opacity: 1.0,
         fill_color: [0.0, 0.0, 1.0, 0.3],
         line_color: [0.0, 1.0, 0.0, 1.0],
+        stroke_width_px: 1.5,
+        hatch_spacing_px: 0.0,
         mesh,
     });
     let close_pixels = render_srgb(
@@ -196,6 +202,8 @@ fn draped_geojson_linestring_respects_layer_opacity_in_pass2() {
         opacity: 1.0,
         fill_color: [0.0, 0.0, 0.0, 0.0],
         line_color: [0.0, 0.2, 1.0, 1.0],
+        stroke_width_px: 2.0,
+        hatch_spacing_px: 0.0,
         mesh: Arc::clone(&mesh),
     });
     let full_px = render_srgb(
@@ -214,6 +222,8 @@ fn draped_geojson_linestring_respects_layer_opacity_in_pass2() {
         opacity: 0.35,
         fill_color: [0.0, 0.0, 0.0, 0.0],
         line_color: [0.0, 0.2, 1.0, 1.0],
+        stroke_width_px: 2.0,
+        hatch_spacing_px: 0.0,
         mesh,
     });
     let half_px = render_srgb(
@@ -281,6 +291,8 @@ fn draped_geojson_midtone_srgb_color_reads_back_without_double_gamma_washout() {
         opacity: 1.0,
         fill_color: [0.28, 0.78, 1.0, 1.0],
         line_color: [0.0, 0.0, 0.0, 0.0],
+        stroke_width_px: 1.5,
+        hatch_spacing_px: 0.0,
         mesh,
     });
 
@@ -292,5 +304,64 @@ fn draped_geojson_midtone_srgb_color_reads_back_without_double_gamma_washout() {
             && center[2] == 255
             && center[3] == 255,
         "mid-tone sRGB vector fill [0.28, 0.78, 1.0, 1.0] must read back [70..=73, 198..=200, 255, 255], got {center:?}"
+    );
+}
+
+#[test]
+fn draped_stac_highlight_renders_hidpi_ribbon_outline_and_diagonal_hatch_fill() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let raw = r#"{
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {"name": "STAC Scene"},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [38.0, 46.0], [42.0, 46.0], [42.0, 50.0], [38.0, 50.0], [38.0, 46.0]
+                ]]
+            }
+        }]
+    }"#;
+    let fc = parse_geojson(raw).expect("parse stac footprint");
+    let mesh = Arc::new(VectorMesh::from_collection(
+        &fc,
+        DEFAULT_VECTOR_MAX_CHORD_DEG,
+    ));
+
+    let (width, height) = (128u32, 128u32);
+    let mut renderer = TestGlobe::new_srgb(device);
+    let cam = Camera::at(48.0, 40.0, 450_000.0);
+    let config = QuadtreeConfig::default();
+
+    let mut snap = build_empty_snapshot(cam, width, height, &config);
+    snap.pixels_per_point = 2.0;
+    snap.vectors.push(DrawVectorLayer {
+        id: DrawVectorId::StacHighlight,
+        rev: 1,
+        opacity: 1.0,
+        fill_color: [1.0, 0.0, 0.0, 0.85],
+        line_color: [0.0, 0.0, 1.0, 1.0],
+        stroke_width_px: 3.0,
+        hatch_spacing_px: 8.0,
+        mesh,
+    });
+
+    let pixels = render_srgb(&mut renderer, device, queue, width, height, &Arc::new(snap));
+    // Diagonal hatch inside the polygon interior should produce alternating
+    // stripe/gap green-channel intensities across a 16px horizontal span.
+    let mut min_g = u8::MAX;
+    let mut max_g = 0u8;
+    for x in (width / 2 - 8)..=(width / 2 + 8) {
+        let g = pixel_at(&pixels, width, x, height / 2)[1];
+        min_g = min_g.min(g);
+        max_g = max_g.max(g);
+    }
+    assert!(
+        max_g > min_g.saturating_add(40),
+        "hatched STAC highlight fill should modulate interior intensity across stripes (min_g={min_g}, max_g={max_g})"
     );
 }

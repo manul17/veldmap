@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use veldmap_core::tile::{BandKey, SourceId};
-use veldmap_raster::{BandStats, DecodeJob, DecodeJobKey, RasterError};
+use veldmap_net::PrefetchPin;
+use veldmap_raster::{BandStats, DecodeJob, DecodeJobKey, RasterError, coalesce_byte_ranges};
 
 use super::super::LayerId;
 use super::super::runtime::OverlayRuntime;
@@ -109,6 +110,98 @@ impl BandStatsTracker {
             band,
             outcome: None,
         };
+
+        if source.is_remote()
+            && let (Some(range_src), Some(net)) =
+                (layer.remote_range().cloned(), runtime.net.clone())
+        {
+            let handle = net.handle().clone();
+            handle.spawn(async move {
+                let mut guard = guard;
+                if cancel.is_cancelled() {
+                    guard.outcome = Some(BandStatsOutcome::Cancelled);
+                    return;
+                }
+                let ranges: Vec<(u64, u64)> = {
+                    let mut raw = source.plan_band_stats_byte_ranges(band).unwrap_or_default();
+                    coalesce_byte_ranges(&mut raw, 64 * 1024, 4 * 1024 * 1024);
+                    raw.into_iter().map(|r| (r.offset, r.len)).collect()
+                };
+                let pin: Option<PrefetchPin> = if ranges.is_empty() {
+                    None
+                } else {
+                    match range_src.prefetch_ranges_async(&ranges, &cancel).await {
+                        Ok(pin) => Some(pin),
+                        Err(err) if err.is_cancelled() => {
+                            guard.outcome = Some(BandStatsOutcome::Cancelled);
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                source = ?source_id,
+                                ?band,
+                                error = %err,
+                                "Remote COG band-stats range prefetch failed"
+                            );
+                            guard.outcome = Some(BandStatsOutcome::Empty);
+                            return;
+                        }
+                    }
+                };
+                if cancel.is_cancelled() {
+                    guard.outcome = Some(BandStatsOutcome::Cancelled);
+                    return;
+                }
+
+                // Route remote band_stats strictly to `remote_pool` (never `fast_pool`).
+                // On rejection, send `Cancelled` rather than disarming so
+                // `BandStatsState` returns to `NotLoaded` and retries cleanly.
+                let job_rt = Arc::clone(&rt);
+                let job_cancel = cancel.clone();
+                let reject_tx = guard.tx.clone();
+                let reject_wakeup = Arc::clone(&guard.wakeup);
+                let job = DecodeJob {
+                    key: DecodeJobKey::BandStats {
+                        source: source_id,
+                        band,
+                        layer_tag: id.0,
+                    },
+                    queued_bytes: 16 * 1024,
+                    cancel,
+                    work: Box::new(move || {
+                        let _pin = pin;
+                        let mut guard = guard;
+                        if job_cancel.is_cancelled() {
+                            guard.outcome = Some(BandStatsOutcome::Cancelled);
+                            return;
+                        }
+                        let ctx = job_rt.decode_context(&job_cancel);
+                        guard.outcome = Some(match source.band_stats(band, &ctx) {
+                            Ok(Some(stats)) => BandStatsOutcome::Ready(Box::new(stats)),
+                            Ok(None) => BandStatsOutcome::Empty,
+                            Err(RasterError::Cancelled) => BandStatsOutcome::Cancelled,
+                            Err(_) if job_cancel.is_cancelled() => BandStatsOutcome::Cancelled,
+                            Err(_) => BandStatsOutcome::Empty,
+                        });
+                    }),
+                };
+                let disarm_on_reject = Arc::clone(&disarmed);
+                let _ = rt.try_submit_guarded(&rt.remote_pool, job, true, move || {
+                    disarm_on_reject.store(true, Ordering::Release);
+                    let _ = reject_tx.send(BandStatsMsg {
+                        layer_id: id,
+                        job_id,
+                        source_id,
+                        band,
+                        outcome: BandStatsOutcome::Cancelled,
+                    });
+                    (reject_wakeup)();
+                });
+            });
+            return;
+        }
+
+        let is_remote = source.is_remote();
         let job = DecodeJob {
             key: DecodeJobKey::BandStats {
                 source: source_id,
@@ -133,8 +226,13 @@ impl BandStatsTracker {
                 });
             }),
         };
+        let pool = if is_remote {
+            &runtime.remote_pool
+        } else {
+            &runtime.fast_pool
+        };
         let disarm_on_reject = Arc::clone(&disarmed);
-        let submitted = runtime.try_submit_guarded(&runtime.fast_pool, job, true, move || {
+        let submitted = runtime.try_submit_guarded(pool, job, true, move || {
             disarm_on_reject.store(true, Ordering::Release);
         });
         if !submitted {

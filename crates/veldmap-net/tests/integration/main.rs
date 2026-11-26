@@ -8,3 +8,5 @@
 )]
 
 mod fetcher;
+mod range;
+mod stac;

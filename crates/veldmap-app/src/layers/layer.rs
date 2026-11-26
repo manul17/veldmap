@@ -11,6 +11,7 @@ use veldmap_core::tile::{
     BandKey, OverlayCullTree, PixelFormat, RASTER_TILE_SIZE, SourceId, StreamKey, TileKey,
     TileStreamSpec,
 };
+use veldmap_net::HttpRangeSource;
 use veldmap_raster::{BandStats, PyramidMeta, RasterSource};
 
 use crate::colormap::{CategoricalPaletteId, ColormapId};
@@ -110,6 +111,9 @@ pub(super) struct OverlayLayer {
     id: LayerId,
     name: String,
     path: PathBuf,
+    is_remote: bool,
+    remote_url: Option<String>,
+    remote_range: Option<HttpRangeSource>,
     source: Arc<dyn RasterSource>,
     streams: Vec<LayerStream>,
     band_options: Vec<LayerBandOption>,
@@ -187,6 +191,9 @@ impl OverlayLayer {
             id,
             name,
             path,
+            is_remote: false,
+            remote_url: None,
+            remote_range: None,
             source,
             streams: vec![LayerStream::new(meta)],
             band_options,
@@ -209,12 +216,54 @@ impl OverlayLayer {
         }
     }
 
+    /// Construct a remote Cloud-Optimized GeoTIFF overlay layer. Remote layers
+    /// do not pin root tiles in `PendingUploads` (`pin_root = false`) and carry
+    /// their [`HttpRangeSource`] for asynchronous pinned prefetching.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "remote layer constructor captures explicit remote metadata alongside decoded source"
+    )]
+    pub(super) fn from_remote_source(
+        id: LayerId,
+        title: String,
+        display_url: String,
+        range_source: HttpRangeSource,
+        source: Arc<dyn RasterSource>,
+        frame: Frame,
+        options: LayerInitOptions,
+        relaid: u64,
+    ) -> Self {
+        let mut layer = Self::from_source(id, PathBuf::new(), source, frame, options, relaid);
+        layer.name = if title.trim().is_empty() {
+            display_url.clone()
+        } else {
+            title
+        };
+        layer.is_remote = true;
+        layer.remote_url = Some(display_url);
+        layer.remote_range = Some(range_source);
+        layer.pin_root = false;
+        layer
+    }
+
     pub(super) fn id(&self) -> LayerId {
         self.id
     }
 
     pub(super) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(super) fn is_remote(&self) -> bool {
+        self.is_remote
+    }
+
+    pub(super) fn remote_url(&self) -> Option<&str> {
+        self.remote_url.as_deref()
+    }
+
+    pub(super) fn remote_range(&self) -> Option<&HttpRangeSource> {
+        self.remote_range.as_ref()
     }
 
     pub(super) fn source(&self) -> &Arc<dyn RasterSource> {

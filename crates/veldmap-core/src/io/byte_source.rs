@@ -62,6 +62,13 @@ pub trait ByteSource: Send + Sync {
         self.len() == 0
     }
 
+    /// Return `true` when reads cross a high-latency remote transport (such as
+    /// HTTP Range streaming), allowing decoders and schedulers to reject
+    /// whole-file sequential passes and avoid un-prefetched hover I/O.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     /// Read up to `buf.len()` bytes starting at `offset`, returning the number
     /// of bytes read (`0` only when `buf` is empty or `offset >= len()`).
     fn read_at(&self, offset: u64, buf: &mut [u8], cancel: &CancelToken) -> Result<usize, IoError>;

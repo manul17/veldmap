@@ -1277,3 +1277,179 @@ fn direct_raw_decoder_handles_jpeg_ycbcr_white_is_zero_i8_sparse_and_compressed_
         Err(RasterError::LimitExceeded { .. })
     ));
 }
+
+#[test]
+fn remote_cog_enforces_pointwise_plans_single_pass_ifd_ranges_and_cache_only_hover() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use veldmap_core::io::{ByteSource, IoError};
+    use veldmap_core::tile::SourceFingerprint;
+    use veldmap_raster::open_raster;
+
+    struct RemoteMockSource {
+        bytes: Vec<u8>,
+        reads: AtomicUsize,
+    }
+
+    impl ByteSource for RemoteMockSource {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn is_remote(&self) -> bool {
+            true
+        }
+
+        fn read_at(
+            &self,
+            offset: u64,
+            buf: &mut [u8],
+            cancel: &CancelToken,
+        ) -> Result<usize, IoError> {
+            if cancel.is_cancelled() {
+                return Err(IoError::Cancelled);
+            }
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let off = usize::try_from(offset).unwrap_or(self.bytes.len());
+            if off >= self.bytes.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            let n = (self.bytes.len() - off).min(buf.len());
+            buf[..n].copy_from_slice(&self.bytes[off..off + n]);
+            Ok(n)
+        }
+    }
+
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+
+    // 1. Remote stripped (untiled) TIFF is rejected with terminal RemotePassUnsupported.
+    let mut stripped_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut stripped_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(&mut dir, &TiffIfdHeader::gray8(16, 16));
+        write_single_strip_u32(&mut dir, 16, &[42u8; 256]);
+        dir.finish().expect("finish");
+    }
+    let stripped_remote = Arc::new(RemoteMockSource {
+        bytes: stripped_buf.into_inner(),
+        reads: AtomicUsize::new(0),
+    });
+    let err = match open_raster(
+        stripped_remote,
+        SourceFingerprint::from_digest([9; 32]),
+        None,
+        &budget,
+        &cancel,
+    ) {
+        Ok(_) => panic!("remote stripped TIFF must fail"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, RasterError::RemotePassUnsupported(_)));
+    assert!(err.is_terminal());
+
+    // 2. Remote tiled Float64 COG opens in <= 2 reads (sniff + single 128 KiB IFD prefix),
+    //    plans pointwise + band-stats byte ranges, rejects produce_pass, and keeps sample_band cache-only.
+    let mut cog_buf = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut cog_buf).expect("enc");
+        let mut dir = enc.image_directory().expect("dir");
+        write_ifd_header(
+            &mut dir,
+            &TiffIfdHeader {
+                width: 64,
+                height: 64,
+                samples_per_pixel: 1,
+                bits_per_sample: &[64],
+                photometric: 1,
+                compression: 1,
+                planar_configuration: 1,
+                sample_format: Some(3), // IEEEFP f64
+                is_overview: false,
+            },
+        );
+        dir.write_tag(Tag::TileWidth, 64u32).expect("tw");
+        dir.write_tag(Tag::TileLength, 64u32).expect("th");
+        let vals = vec![12.5f64; 64 * 64];
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let off = dir.write_data(&raw[..]).expect("tile") as u32;
+        dir.write_tag(Tag::TileOffsets, &[off][..]).expect("offs");
+        dir.write_tag(Tag::TileByteCounts, &[raw.len() as u32][..])
+            .expect("cnts");
+        dir.finish().expect("finish");
+    }
+    let cog_remote = Arc::new(RemoteMockSource {
+        bytes: cog_buf.into_inner(),
+        reads: AtomicUsize::new(0),
+    });
+    let cog_src = TiffSource::open(
+        Arc::clone(&cog_remote) as Arc<dyn ByteSource>,
+        SourceFingerprint::from_digest([10; 32]),
+        &budget,
+        &cancel,
+    )
+    .expect("remote tiled COG opens");
+    assert!(cog_src.is_remote());
+    assert_eq!(
+        cog_remote.reads.load(Ordering::SeqCst),
+        1,
+        "single-pass IFD reader must open compact COG in exactly 1 prefix read"
+    );
+
+    let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+
+    // Remote sample_band on uncached F64 COG must NOT hit ByteSource (0 extra reads!).
+    let hover_miss = cog_src
+        .sample_band(BandKey::Index(0), PixelFormat::R32Float, 10, 10, &ctx)
+        .expect("cache-only hover");
+    assert_eq!(hover_miss, BandSample::Unavailable);
+    assert_eq!(
+        cog_remote.reads.load(Ordering::SeqCst),
+        1,
+        "remote hover must never trigger network reads on cache miss"
+    );
+
+    // Sync byte-range planners return the exact tile span before decode and empty after caching.
+    let sci_spec = stream_spec_for_band(BandKey::Index(0), PixelFormat::R32Float);
+    let ranges = cog_src
+        .plan_pointwise_byte_ranges(sci_spec, 0, &[(0, 0)], &budget, &chunk_cache)
+        .expect("plan pointwise ranges");
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].len, (64 * 64 * 8) as u64);
+
+    let stats_ranges = cog_src
+        .plan_band_stats_byte_ranges(BandKey::Index(0))
+        .expect("plan stats ranges");
+    assert_eq!(stats_ranges.len(), 1);
+
+    // Decoding populates SharedChunkCache; subsequent plan is empty and cache-only hover hits!
+    let _tile = cog_src
+        .decode_pointwise_tile(sci_spec, 0, 0, 0, &ctx)
+        .expect("decode tile");
+    assert!(
+        cog_src
+            .plan_pointwise_byte_ranges(sci_spec, 0, &[(0, 0)], &budget, &chunk_cache)
+            .expect("cached plan")
+            .is_empty()
+    );
+    let reads_after_decode = cog_remote.reads.load(Ordering::SeqCst);
+    let hover_hit = cog_src
+        .sample_band(BandKey::Index(0), PixelFormat::R32Float, 10, 10, &ctx)
+        .expect("cached hover");
+    assert!(matches!(hover_hit, BandSample::Scalar { raw, .. } if (raw - 12.5).abs() < 1e-6));
+    assert_eq!(cog_remote.reads.load(Ordering::SeqCst), reads_after_decode);
+
+    // Remote produce_pass is rejected as terminal.
+    let mut noop = |_l: u8, _x: u32, _y: u32, _w: u32, _h: u32, _b: Vec<u8>| Ok(());
+    let pass_err = cog_src
+        .produce_pass(sci_spec, &ctx, &mut noop)
+        .expect_err("remote pass forbidden");
+    assert!(matches!(pass_err, RasterError::RemotePassUnsupported(_)));
+}

@@ -178,7 +178,8 @@ impl GlobeRenderer {
         }
 
         self.overlay.push_uniforms(arena, snapshot, eye);
-        self.vector.push_uniforms(arena, snapshot, eye);
+        self.vector
+            .push_uniforms(arena, snapshot, eye, width, height);
 
         arena.flush(device, queue);
     }

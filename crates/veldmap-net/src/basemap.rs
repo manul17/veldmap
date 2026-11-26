@@ -274,6 +274,11 @@ impl LiveBasemapSpec {
         self.hosts.len()
     }
 
+    /// Precomputed lowercased `host[:port]` entries owned by this basemap spec.
+    pub(crate) fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+
     fn preset(cache_key: String, attribution: String, max_level: u8, url_template: String) -> Self {
         let hosts = precompute_hosts(&url_template);
         Self {

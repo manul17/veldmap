@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
-use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
+use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 use veldmap_core::tile::TileKey;
 
 use crate::basemap::LiveBasemapSpec;
-use crate::http::{HostLimiters, HttpClientConfig, build_http_client, default_user_agent};
+use crate::context::{NetConfig, NetContext};
+use crate::http::default_user_agent;
 use crate::{NetError, TileBlobStore, TileDecodeExecutor};
 
 use self::context::{PipelineContext, PipelineShared};
@@ -62,51 +63,60 @@ impl Default for FetcherConfig {
     }
 }
 
-/// Complete live HTTP tile streaming pipeline owning:
-/// 1. Shared control state (`CancelToken`, queue/in-flight state, host limiters)
-/// 2. Dedicated `tokio::runtime::Runtime` running HTTP fetches
+/// Complete live HTTP tile streaming pipeline sharing a [`NetContext`] (or
+/// owning a private one when constructed via [`Self::spawn`]).
 ///
 /// Decodes encoded tile payloads via the caller-injected [`TileDecodeExecutor`],
 /// keeping `veldmap-net` free of `veldmap-raster` and image codecs.
 /// Shuts down deterministically via [`Self::signal_shutdown`] / [`Self::shutdown`].
 pub struct LiveTilePipeline {
     shared: Arc<PipelineShared>,
-    runtime: Option<tokio::runtime::Runtime>,
+    owned_net: Option<Arc<NetContext>>,
 }
 
 impl LiveTilePipeline {
-    /// Spawn a live tile pipeline forwarding encoded tile payloads to `decoder`
-    /// and invoking `wakeup` on status changes.
+    /// Spawn a live tile pipeline backed by a dedicated [`NetContext`].
     pub fn spawn(
         config: FetcherConfig,
         disk_cache: Option<Arc<dyn TileBlobStore>>,
         decoder: Arc<dyn TileDecodeExecutor>,
         wakeup: Wakeup,
     ) -> Result<Self, NetError> {
-        let client = build_http_client(&HttpClientConfig {
-            user_agent: &config.user_agent,
-            connect_timeout: config.connect_timeout,
-            request_timeout: config.request_timeout,
+        let net_cfg = NetConfig {
+            user_agent: config.user_agent.clone(),
             max_concurrent_per_host: config.max_concurrent_per_host,
-        })?;
-        let shutdown = CancelToken::new();
+            connect_timeout: config.connect_timeout,
+            read_timeout: config.request_timeout,
+            ..NetConfig::default()
+        };
+        let net = Arc::new(NetContext::new(net_cfg)?);
+        let mut pipeline =
+            Self::spawn_with_context(Arc::clone(&net), config, disk_cache, decoder, wakeup);
+        pipeline.owned_net = Some(net);
+        Ok(pipeline)
+    }
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("veldmap-net")
-            .enable_all()
-            .build()?;
+    /// Spawn a live tile pipeline sharing an existing [`NetContext`]'s Tokio
+    /// runtime, HTTP client pool, and per-host limiters.
+    pub fn spawn_with_context(
+        net: Arc<NetContext>,
+        config: FetcherConfig,
+        disk_cache: Option<Arc<dyn TileBlobStore>>,
+        decoder: Arc<dyn TileDecodeExecutor>,
+        wakeup: Wakeup,
+    ) -> Self {
+        let shutdown = net.shutdown_token().child_token();
 
         let shared = Arc::new(PipelineShared {
             shutdown,
             state: Mutex::new(PipelineState::new(disk_cache.is_some())),
-            host_limiters: HostLimiters::new(config.max_concurrent_per_host),
+            host_limiters: net.host_limiters(),
             notify: Notify::new(),
         });
 
         let ctx = Arc::new(PipelineContext {
             shared: Arc::clone(&shared),
-            client,
+            client: net.range_client().clone(),
             disk_cache: disk_cache.map(DiskCacheGate::new),
             decoder,
             wakeup,
@@ -114,14 +124,14 @@ impl LiveTilePipeline {
             transient_retry_backoff: config.transient_retry_backoff,
         });
 
-        runtime.spawn(async move {
+        net.handle().spawn(async move {
             dispatcher_loop(ctx).await;
         });
 
-        Ok(Self {
+        Self {
             shared,
-            runtime: Some(runtime),
-        })
+            owned_net: None,
+        }
     }
 
     /// Switch the active live basemap specification (or `None` when viewing
@@ -130,10 +140,12 @@ impl LiveTilePipeline {
     pub fn set_active_spec(&self, spec: Option<LiveBasemapSpec>) {
         let to_cancel = {
             let mut st = lock_unpoisoned(&self.shared.state);
-            let Some(tokens) = st.set_active_spec(spec) else {
+            let Some((tokens, hosts)) = st.set_active_spec(spec) else {
                 return;
             };
-            self.shared.host_limiters.clear_cooldowns();
+            self.shared
+                .host_limiters
+                .clear_cooldowns_for(hosts.iter().map(String::as_str));
             tokens
         };
 
@@ -169,13 +181,16 @@ impl LiveTilePipeline {
         self.shared.notify.notify_one();
     }
 
-    /// Clear failure / offline markers and per-host cooldowns, immediately
-    /// re-queueing any previously failed keys still in `last_wanted`.
+    /// Clear failure / offline markers and per-host cooldowns strictly for the
+    /// active basemap's hosts, immediately re-queueing any previously failed
+    /// keys still in `last_wanted`.
     pub fn retry_failed(&self) {
         {
             let mut st = lock_unpoisoned(&self.shared.state);
-            self.shared.host_limiters.clear_cooldowns();
-            st.retry_failed();
+            let hosts = st.retry_failed();
+            self.shared
+                .host_limiters
+                .clear_cooldowns_for(hosts.iter().map(String::as_str));
         }
         self.shared.notify.notify_one();
     }
@@ -197,16 +212,16 @@ impl LiveTilePipeline {
         self.shared.notify.notify_waiters();
     }
 
-    /// Deterministically shut down the async runtime after signalling
-    /// cancellation (`CancelToken` -> `runtime.shutdown_timeout`).
+    /// Deterministically shut down the pipeline (and its private async runtime
+    /// when constructed via [`Self::spawn`]).
     pub fn shutdown(mut self) {
         self.shutdown_inner();
     }
 
     fn shutdown_inner(&mut self) {
         self.signal_shutdown();
-        if let Some(rt) = self.runtime.take() {
-            rt.shutdown_timeout(Duration::from_secs(2));
+        if let Some(net) = self.owned_net.take() {
+            net.shutdown();
         }
     }
 }

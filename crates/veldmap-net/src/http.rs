@@ -5,18 +5,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use veldmap_core::sync::lock_unpoisoned;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
 use crate::NetError;
 
-/// Parameters for constructing a `rustls` + `ring` HTTP tile client without
-/// coupling `http` back to [`crate::fetcher::FetcherConfig`].
+/// Parameters for constructing a `rustls` + `ring` HTTP client with split
+/// connect/read timeouts and explicit compression control.
 pub(crate) struct HttpClientConfig<'a> {
     pub user_agent: &'a str,
     pub connect_timeout: Duration,
-    pub request_timeout: Duration,
+    pub read_timeout: Duration,
     pub max_concurrent_per_host: usize,
+    pub enable_gzip: bool,
 }
 
 /// Cap initial buffer pre-allocation from untrusted `Content-Length` headers so
@@ -51,7 +52,8 @@ pub(crate) fn build_http_client(cfg: &HttpClientConfig<'_>) -> Result<reqwest::C
     reqwest::Client::builder()
         .user_agent(cfg.user_agent)
         .connect_timeout(cfg.connect_timeout)
-        .timeout(cfg.request_timeout)
+        .read_timeout(cfg.read_timeout)
+        .gzip(cfg.enable_gzip)
         .pool_max_idle_per_host(cfg.max_concurrent_per_host.max(1))
         .build()
         .map_err(|err| NetError::HttpClient(err.to_string()))
@@ -60,6 +62,7 @@ pub(crate) fn build_http_client(cfg: &HttpClientConfig<'_>) -> Result<reqwest::C
 struct HostEntry {
     semaphore: Arc<Semaphore>,
     cooldown_until: Option<Instant>,
+    cooldown_notify: Arc<Notify>,
 }
 
 /// Reason a per-host HTTP permit could not be acquired immediately.
@@ -68,6 +71,10 @@ pub(crate) enum PermitDenied {
     Cooldown(Instant),
     Saturated,
 }
+
+/// Async cancellation marker returned by [`HostLimiters::acquire_permit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PermitCancelled;
 
 /// Per-host concurrency semaphores and rate-limit cooldown tracking (`429` /
 /// `503` `Retry-After`).
@@ -96,6 +103,7 @@ impl HostLimiters {
         let entry = map.entry(host.to_owned()).or_insert_with(|| HostEntry {
             semaphore: Arc::new(Semaphore::new(self.max_per_host)),
             cooldown_until: None,
+            cooldown_notify: Arc::new(Notify::new()),
         });
         f(entry)
     }
@@ -118,6 +126,58 @@ impl HostLimiters {
         })
     }
 
+    /// Asynchronously wait out any active host cooldown and acquire a per-host
+    /// HTTP concurrency permit, aborting immediately if `cancel` triggers.
+    pub(crate) async fn acquire_permit(
+        &self,
+        host: &str,
+        cancel: &CancelToken,
+    ) -> Result<OwnedSemaphorePermit, PermitCancelled> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(PermitCancelled);
+            }
+            let cooldown_notify = self.with_entry(host, |entry| Arc::clone(&entry.cooldown_notify));
+            let notified = cooldown_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let (semaphore, cooldown_until) = self.with_entry(host, |entry| {
+                (Arc::clone(&entry.semaphore), entry.cooldown_until)
+            });
+
+            if let Some(until) = cooldown_until.filter(|&u| u > Instant::now()) {
+                let deadline = tokio::time::Instant::from_std(until);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(PermitCancelled),
+                    _ = notified => continue,
+                    _ = tokio::time::sleep_until(deadline) => continue,
+                }
+            }
+
+            let permit = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(PermitCancelled),
+                res = semaphore.acquire_owned() => match res {
+                    Ok(permit) => permit,
+                    Err(_) => return Err(PermitCancelled),
+                },
+            };
+
+            // Re-check whether a `429`/`503` cooldown started while we waited
+            // on the semaphore; if so, release the permit and honor cooldown.
+            let active_cooldown = self.with_entry(host, |entry| {
+                entry.cooldown_until.filter(|&u| u > Instant::now())
+            });
+            if active_cooldown.is_some() {
+                drop(permit);
+                continue;
+            }
+            return Ok(permit);
+        }
+    }
+
     /// Record or extend a per-host cooldown window (e.g. on HTTP `429`/`503`),
     /// avoiding string allocation when `host` is already tracked.
     pub(crate) fn record_cooldown(&self, host: &str, until: Instant) {
@@ -129,20 +189,37 @@ impl HostLimiters {
         });
     }
 
-    /// Clear all host cooldowns (e.g. on explicit user Retry or basemap switch)
-    /// and prune idle host entries with no outstanding permits.
-    pub(crate) fn clear_cooldowns(&self) {
-        let mut map = lock_unpoisoned(&self.map);
-        let max_per_host = self.max_per_host;
-        map.retain(|_, entry| {
-            entry.cooldown_until = None;
-            Arc::strong_count(&entry.semaphore) > 1
-                || entry.semaphore.available_permits() < max_per_host
-        });
+    /// Clear cooldowns strictly for `hosts` (leaving unrelated hosts untouched)
+    /// and prune idle entries with no active permits or active cooldowns.
+    pub(crate) fn clear_cooldowns_for<'a>(&self, hosts: impl IntoIterator<Item = &'a str>) {
+        let mut to_notify = Vec::new();
+        {
+            let mut map = lock_unpoisoned(&self.map);
+            let now = Instant::now();
+            for host in hosts {
+                if let Some(entry) = map.get_mut(host)
+                    && entry.cooldown_until.take().is_some()
+                {
+                    to_notify.push(Arc::clone(&entry.cooldown_notify));
+                }
+            }
+            let max_per_host = self.max_per_host;
+            map.retain(|_, entry| {
+                let has_cooldown = entry.cooldown_until.is_some_and(|u| u > now);
+                has_cooldown
+                    || Arc::strong_count(&entry.semaphore) > 1
+                    || entry.semaphore.available_permits() < max_per_host
+                    || Arc::strong_count(&entry.cooldown_notify) > 1
+            });
+        }
+        // Notify outside `self.map` so `HostLimiters` remains a strict leaf lock.
+        for notify in to_notify {
+            notify.notify_waiters();
+        }
     }
 }
 
-fn parse_retry_after_seconds(header: Option<&str>) -> Option<Duration> {
+pub(crate) fn parse_retry_after_seconds(header: Option<&str>) -> Option<Duration> {
     let raw = header?.trim();
     let secs = raw.parse::<u64>().ok()?;
     Some(Duration::from_secs(secs).clamp(MIN_RETRY_AFTER, MAX_RETRY_AFTER))
@@ -304,8 +381,14 @@ mod tests {
             Some(PermitDenied::Cooldown(later))
         );
 
-        limiters.clear_cooldowns();
+        limiters.record_cooldown("other.org", later);
+        limiters.clear_cooldowns_for(["example.org"]);
         assert!(limiters.try_acquire_permit("example.org", now).is_ok());
+        assert_eq!(
+            limiters.try_acquire_permit("other.org", now).err(),
+            Some(PermitDenied::Cooldown(later)),
+            "clearing example.org must leave unrelated host cooldowns intact"
+        );
     }
 
     #[test]

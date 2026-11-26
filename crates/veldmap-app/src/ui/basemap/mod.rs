@@ -25,7 +25,7 @@ pub(crate) enum BasemapUiAction {
     /// draft edits in an open Settings window.
     SelectBasemap(BasemapSelection),
     /// Commit edited basemap/cache settings from the Settings window.
-    ApplyDraft(BasemapSettingsDraft),
+    ApplyDraft(Box<BasemapSettingsDraft>),
     /// Settings window opened this frame (triggers event-driven cache stats refresh).
     SettingsOpened,
     /// Request an asynchronous SQLite disk cache clear off the UI thread.
@@ -36,10 +36,20 @@ pub(crate) enum BasemapUiAction {
     RetryLive,
 }
 
-/// Transient UI editing state for the Basemap & Cache Settings window.
+/// Active tab inside the unified Settings modal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SettingsTab {
+    #[default]
+    Basemap,
+    CacheGpu,
+    StacCloud,
+}
+
+/// Transient UI editing state for the unified Settings window.
 #[derive(Clone, Debug)]
 pub(crate) struct BasemapUiState {
     settings_open: bool,
+    active_tab: SettingsTab,
     draft: BasemapSettingsDraft,
     cached_custom_validation: Option<(String, Result<(), String>)>,
 }
@@ -48,14 +58,24 @@ impl BasemapUiState {
     pub(crate) fn new(initial: &AppSettings) -> Self {
         Self {
             settings_open: false,
+            active_tab: SettingsTab::Basemap,
             draft: BasemapSettingsDraft::from_settings(initial),
             cached_custom_validation: None,
         }
     }
 
-    /// Whether the Basemap & Cache Settings window is currently open.
+    /// Whether the Settings window is currently open.
     pub(crate) fn is_settings_open(&self) -> bool {
         self.settings_open
+    }
+
+    /// Open the Settings window focused on `tab`.
+    pub(crate) fn open_settings_tab(&mut self, settings: &AppSettings, tab: SettingsTab) {
+        if !self.settings_open {
+            self.sync_from_settings(settings);
+            self.settings_open = true;
+        }
+        self.active_tab = tab;
     }
 
     /// Update only the draft's `active_basemap` selection (preserving unsaved
@@ -194,8 +214,8 @@ pub(super) fn show_toolbar_controls(
         });
 
     if ui
-        .button("Basemap…")
-        .on_hover_text("Configure NASA GIBS date, Custom XYZ/TMS URL & API key, and disk cache")
+        .button("Settings…")
+        .on_hover_text("Configure basemaps, disk/GPU cache budgets, and custom STAC endpoints")
         .clicked()
     {
         if !ui_state.settings_open {

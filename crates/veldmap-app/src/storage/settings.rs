@@ -12,7 +12,8 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use veldmap_net::{
-    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, is_valid_gibs_date,
+    CUSTOM_MAX_LEVEL_MAX, CUSTOM_MAX_LEVEL_MIN, CustomBasemapConfig, StacAuth, StacCatalogConfig,
+    is_valid_gibs_date, sanitize_url_for_display,
 };
 use veldmap_storage::{
     StorageError, StoragePaths, read_json_or_default_with_backup, write_json_durable_private,
@@ -195,13 +196,107 @@ impl fmt::Debug for CustomXyzSettings {
     }
 }
 
-/// Scoped editable slice of [`AppSettings`] for the Basemap & Tile Cache
-/// Settings window.
+/// Authentication mechanism for custom STAC API catalogs and their COG assets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StacAuthKind {
+    #[default]
+    None,
+    Bearer,
+    ApiKey,
+    SasQuery,
+}
+
+impl StacAuthKind {
+    pub(crate) const ALL: [Self; 4] = [Self::None, Self::Bearer, Self::ApiKey, Self::SasQuery];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None (Public)",
+            Self::Bearer => "Bearer Token",
+            Self::ApiKey => "API Key Header",
+            Self::SasQuery => "SAS Query Token",
+        }
+    }
+}
+
+/// Persisted Custom STAC API endpoint and optional authentication settings.
+/// Secrets and URL credentials/query parameters are redacted in `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct StacSettings {
+    pub(crate) custom_endpoint: String,
+    pub(crate) custom_collection: String,
+    pub(crate) auth_kind: StacAuthKind,
+    pub(crate) auth_header_name: String,
+    pub(crate) auth_secret: String,
+}
+
+impl Default for StacSettings {
+    fn default() -> Self {
+        Self {
+            custom_endpoint: String::new(),
+            custom_collection: String::new(),
+            auth_kind: StacAuthKind::None,
+            auth_header_name: "x-api-key".to_owned(),
+            auth_secret: String::new(),
+        }
+    }
+}
+
+impl StacSettings {
+    pub(crate) fn to_stac_auth(&self) -> StacAuth {
+        let secret = self.auth_secret.trim();
+        if secret.is_empty() {
+            return StacAuth::None;
+        }
+        match self.auth_kind {
+            StacAuthKind::None => StacAuth::None,
+            StacAuthKind::Bearer => StacAuth::Bearer(secret.to_owned()),
+            StacAuthKind::ApiKey => StacAuth::ApiKey {
+                header_name: self.auth_header_name.trim().to_owned(),
+                value: secret.to_owned(),
+            },
+            StacAuthKind::SasQuery => StacAuth::SasQuery(secret.to_owned()),
+        }
+    }
+
+    pub(crate) fn to_custom_catalog(&self) -> StacCatalogConfig {
+        StacCatalogConfig {
+            endpoint: self.custom_endpoint.trim().to_owned(),
+            collection: self.custom_collection.trim().to_owned(),
+            auth: self.to_stac_auth(),
+        }
+    }
+}
+
+impl fmt::Debug for StacSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secret_label = if self.auth_secret.trim().is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("StacSettings")
+            .field(
+                "custom_endpoint",
+                &sanitize_url_for_display(&self.custom_endpoint),
+            )
+            .field("custom_collection", &self.custom_collection)
+            .field("auth_kind", &self.auth_kind)
+            .field("auth_header_name", &self.auth_header_name)
+            .field("auth_secret", &secret_label)
+            .finish()
+    }
+}
+
+/// Scoped editable slice of [`AppSettings`] for the unified Settings modal
+/// (Basemap, Cache & GPU, and STAC / Cloud tabs).
 ///
 /// Keeping this slice and its merge/validation rules alongside [`AppSettings`]
-/// guarantees saving basemap settings can never silently clobber unrelated
-/// fields (such as `show_graticule`) or overwrite valid saved values with
-/// half-typed invalid inputs while keeping `ui/` free of persistence rules.
+/// guarantees saving settings can never silently clobber unrelated fields
+/// (such as `show_graticule`) or overwrite valid saved values with half-typed
+/// invalid inputs while keeping `ui/` free of persistence rules.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BasemapSettingsDraft {
     pub(crate) active_basemap: BasemapSelection,
@@ -209,6 +304,7 @@ pub(crate) struct BasemapSettingsDraft {
     pub(crate) custom_xyz: CustomXyzSettings,
     pub(crate) disk_cache_max_mb: u64,
     pub(crate) gpu_tile_cache_max_mb: Option<u64>,
+    pub(crate) stac: StacSettings,
 }
 
 impl BasemapSettingsDraft {
@@ -219,6 +315,7 @@ impl BasemapSettingsDraft {
             custom_xyz: settings.custom_xyz.clone(),
             disk_cache_max_mb: settings.disk_cache_max_mb,
             gpu_tile_cache_max_mb: settings.gpu_tile_cache_max_mb,
+            stac: settings.stac.clone(),
         }
     }
 
@@ -242,6 +339,7 @@ impl BasemapSettingsDraft {
         }
         target.disk_cache_max_mb = self.disk_cache_max_mb;
         target.gpu_tile_cache_max_mb = self.gpu_tile_cache_max_mb;
+        target.stac = self.stac.clone();
     }
 }
 
@@ -267,6 +365,7 @@ pub(crate) struct AppSettings {
     /// Optional user GPU tile cache cap in MiB (`None` = host-RAM-scaled auto cap).
     pub(crate) gpu_tile_cache_max_mb: Option<u64>,
     pub(crate) show_graticule: bool,
+    pub(crate) stac: StacSettings,
 }
 
 impl Default for AppSettings {
@@ -279,6 +378,7 @@ impl Default for AppSettings {
             disk_cache_max_mb: DEFAULT_DISK_CACHE_MAX_MB,
             gpu_tile_cache_max_mb: None,
             show_graticule: true,
+            stac: StacSettings::default(),
         }
     }
 }

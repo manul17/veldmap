@@ -2,6 +2,7 @@
 //! decoders ([`crate::TiffSource`], [`crate::PngSource`], [`crate::JpegSource`],
 //! and future mission codecs).
 
+use veldmap_core::budget::MemoryBudget;
 use veldmap_core::tile::{
     BandKey, DecodedTile, PixelFormat, SourceFingerprint, SourceId, TileStreamSpec,
 };
@@ -10,8 +11,43 @@ use crate::RasterError;
 
 use super::DecodeContext;
 use super::cascade::TileEmit;
+use super::chunk_cache::SharedChunkCache;
 use super::metadata::{BandSample, BandStats, RasterDescription};
 use super::plan::{DISPLAY_STREAM_SPEC, PyramidMeta};
+
+/// Contiguous byte span `(offset, len)` inside a raster's backing
+/// [`veldmap_core::io::ByteSource`], used by remote COG batch prefetchers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteRange {
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Sort `ranges` by `offset` and coalesce overlapping or nearby spans whose
+/// gap is `<= max_gap` and merged span length stays `<= max_merged_len`.
+pub fn coalesce_byte_ranges(ranges: &mut Vec<ByteRange>, max_gap: u64, max_merged_len: u64) {
+    ranges.retain(|r| r.len > 0);
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_unstable_by_key(|r| (r.offset, r.len));
+    let mut write = 0usize;
+    for read in 1..ranges.len() {
+        let cur = ranges[write];
+        let next = ranges[read];
+        let cur_end = cur.offset.saturating_add(cur.len);
+        let next_end = next.offset.saturating_add(next.len);
+        let merged_end = cur_end.max(next_end);
+        let merged_len = merged_end.saturating_sub(cur.offset);
+        if next.offset <= cur_end.saturating_add(max_gap) && merged_len <= max_merged_len {
+            ranges[write].len = merged_len;
+        } else {
+            write += 1;
+            ranges[write] = next;
+        }
+    }
+    ranges.truncate(write + 1);
+}
 
 /// Format-agnostic opened analytical raster source capable of describing its
 /// pyramid, producing pointwise or sequential-pass tiles across `Display`,
@@ -26,6 +62,46 @@ pub trait RasterSource: Send + Sync {
 
     /// Parsed header metadata, georeference binding info, and pyramid plan.
     fn description(&self) -> &RasterDescription;
+
+    /// Return `true` when this source reads over a high-latency remote
+    /// transport (e.g., HTTP Range COGs).
+    fn is_remote(&self) -> bool {
+        false
+    }
+
+    /// Return `true` when `Display` (`Rgba8UnormSrgb`) rendering still requires
+    /// computing an initial percentile stretch before tile decode.
+    fn needs_display_stretch(&self) -> bool {
+        false
+    }
+
+    /// Plan coalesced source byte ranges required for pointwise decoding of
+    /// `wants` at `level` for stream `spec`, skipping chunks already present
+    /// in `chunk_cache`.
+    fn plan_pointwise_byte_ranges(
+        &self,
+        spec: TileStreamSpec,
+        level: u8,
+        wants: &[(u32, u32)],
+        budget: &MemoryBudget,
+        chunk_cache: &SharedChunkCache,
+    ) -> Result<Vec<ByteRange>, RasterError> {
+        let _ = (spec, level, wants, budget, chunk_cache);
+        Ok(Vec::new())
+    }
+
+    /// Plan coalesced source byte ranges needed to compute the initial display
+    /// percentile stretch (empty when already computed or 8-bit identity).
+    fn plan_stretch_byte_ranges(&self) -> Result<Vec<ByteRange>, RasterError> {
+        Ok(Vec::new())
+    }
+
+    /// Plan coalesced source byte ranges needed to compute sampled statistics
+    /// for `band` (empty when already cached or unsupported).
+    fn plan_band_stats_byte_ranges(&self, band: BandKey) -> Result<Vec<ByteRange>, RasterError> {
+        let _ = band;
+        Ok(Vec::new())
+    }
 
     /// Default [`TileStreamSpec`] recommended when first opening this raster.
     fn default_stream_spec(&self) -> TileStreamSpec {

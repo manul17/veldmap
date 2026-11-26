@@ -63,6 +63,7 @@ pub(crate) enum LayerUiAction {
     ToggleVectorVisibility(VectorLayerId, bool),
     SetVectorOpacity(VectorLayerId, f32, bool),
     RemoveVector(VectorLayerId),
+    UseVectorAsStacAoi(VectorLayerId),
 }
 
 impl LayerUiAction {
@@ -152,11 +153,8 @@ fn show_panel_header(
     actions: &mut Vec<LayerUiAction>,
 ) {
     ui.horizontal(|ui| {
-        ui.strong(format!("Layers ({layer_count})"));
+        ui.strong(format!("Loaded ({layer_count})"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("×").on_hover_text("Hide Layers").clicked() {
-                state.open = false;
-            }
             if ui
                 .small_button("Path…")
                 .on_hover_text("Type a local file path (fallback for minimal WMs)")
@@ -269,8 +267,9 @@ fn show_unavailable_session_banner(
     ui.separator();
 }
 
-/// Render the collapsible left Layer List panel and return user actions.
-pub(crate) fn show_layers_panel(
+/// Render the Layers tab contents inside the left workbench panel and return
+/// user actions.
+pub(crate) fn show_layers_tab_contents(
     ui: &mut egui::Ui,
     layers: &[LayerSummary],
     vectors: &[VectorLayerSummary],
@@ -278,74 +277,66 @@ pub(crate) fn show_layers_panel(
     state: &mut LayersPanelState,
 ) -> Vec<LayerUiAction> {
     let mut actions = Vec::new();
-    if !state.open {
+    let total = layers.len() + vectors.len();
+
+    show_panel_header(ui, total, state, &mut actions);
+
+    if state.open_prompt_visible {
+        show_open_prompt(ui, state, &mut actions);
+    }
+
+    if let Some(err) = &state.error {
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(ERROR_TEXT_COLOR, err);
+        });
+        ui.horizontal(|ui| {
+            if let Some(path) = state.failed_unbound_path.clone()
+                && ui
+                    .small_button("Assign CRS…")
+                    .on_hover_text("Pick a CRS and retry opening this file")
+                    .clicked()
+            {
+                actions.push(LayerUiAction::OpenCrsPickerForPendingPath(path));
+            }
+            if ui.small_button("Dismiss").clicked() {
+                state.clear_error();
+            }
+        });
+        ui.separator();
+    }
+
+    show_unavailable_session_banner(ui, unavailable_session_layers, &mut actions);
+
+    if total == 0 {
+        ui.weak("No raster or GeoJSON layers loaded.");
+        ui.weak(
+            "Drop a GeoTIFF/PNG/JPEG/GeoJSON onto the globe, click Open…, or stream a public COG from the Cloud / STAC tab.",
+        );
         return actions;
     }
 
-    let total = layers.len() + vectors.len();
-    egui::Panel::left("layer_list_panel")
-        .resizable(true)
-        .default_size(285.0)
-        .min_size(220.0)
-        .max_size(440.0)
+    egui::ScrollArea::vertical()
+        .id_salt("layers_tab_scroll")
         .show(ui, |ui| {
-            show_panel_header(ui, total, state, &mut actions);
-
-            if state.open_prompt_visible {
-                show_open_prompt(ui, state, &mut actions);
-            }
-
-            if let Some(err) = &state.error {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(ERROR_TEXT_COLOR, err);
-                });
-                ui.horizontal(|ui| {
-                    if let Some(path) = state.failed_unbound_path.clone()
-                        && ui
-                            .small_button("Assign CRS…")
-                            .on_hover_text("Pick a CRS and retry opening this file")
-                            .clicked()
-                    {
-                        actions.push(LayerUiAction::OpenCrsPickerForPendingPath(path));
-                    }
-                    if ui.small_button("Dismiss").clicked() {
-                        state.clear_error();
-                    }
-                });
-                ui.separator();
-            }
-
-            show_unavailable_session_banner(ui, unavailable_session_layers, &mut actions);
-
-            if total == 0 {
-                ui.weak("No raster or GeoJSON layers loaded.");
-                ui.weak(
-                    "Drop a GeoTIFF/PNG/JPEG/GeoJSON onto the globe, pass a path on the CLI, or click Open….",
-                );
-                return;
-            }
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if !vectors.is_empty() {
-                    ui.small(egui::RichText::new("Vector Overlays (GeoJSON)").strong());
-                    ui.add_space(2.0);
-                    for vec_layer in vectors.iter().rev() {
-                        show_vector_card(ui, vec_layer, &mut actions);
-                    }
-                    if !layers.is_empty() {
-                        ui.separator();
-                    }
+            if !vectors.is_empty() {
+                ui.small(egui::RichText::new("Vector Overlays (GeoJSON)").strong());
+                ui.add_space(2.0);
+                for vec_layer in vectors.iter().rev() {
+                    show_vector_card(ui, vec_layer, &mut actions);
                 }
                 if !layers.is_empty() {
-                    ui.small(egui::RichText::new("Raster Overlays").strong());
-                    ui.add_space(2.0);
-                    // Display top-to-bottom (reverse of painter's order), keyed
-                    // strictly by `LayerId` so removals/reorders never shift widget state.
-                    for layer in layers.iter().rev() {
-                        show_raster_card(ui, layer, &mut actions);
-                    }
+                    ui.separator();
                 }
-            });
+            }
+            if !layers.is_empty() {
+                ui.small(egui::RichText::new("Raster Overlays").strong());
+                ui.add_space(2.0);
+                // Display top-to-bottom (reverse of painter's order), keyed
+                // strictly by `LayerId` so removals/reorders never shift widget state.
+                for layer in layers.iter().rev() {
+                    show_raster_card(ui, layer, &mut actions);
+                }
+            }
         });
 
     actions

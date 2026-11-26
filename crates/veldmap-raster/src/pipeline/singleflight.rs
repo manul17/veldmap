@@ -219,6 +219,13 @@ impl<K: Copy + Eq + Hash, V: Clone + Send + 'static> SingleflightMap<K, V> {
         }
     }
 
+    pub(crate) fn is_ready(&self, key: &K) -> bool {
+        matches!(
+            lock_unpoisoned(&self.entries).get(key),
+            Some(SlotEntry::Ready(_))
+        )
+    }
+
     pub(crate) fn get_or_compute(
         &self,
         key: K,

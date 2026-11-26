@@ -72,6 +72,8 @@ pub(crate) struct LayerSummary {
     pub(crate) id: LayerId,
     pub(crate) name: String,
     pub(crate) path: PathBuf,
+    pub(crate) is_remote: bool,
+    pub(crate) remote_url: Option<String>,
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
     pub(crate) width: u32,
@@ -154,5 +156,17 @@ pub(crate) enum OverlayIoEvent {
         path: PathBuf,
         error: String,
         can_assign_crs: bool,
+    },
+    RemoteOpened {
+        id: LayerId,
+        title: String,
+        display_url: String,
+        bounds: Option<FootprintBounds>,
+        fly_to: bool,
+    },
+    RemoteFailed {
+        title: String,
+        display_url: String,
+        error: String,
     },
 }

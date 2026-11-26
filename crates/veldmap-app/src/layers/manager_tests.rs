@@ -68,6 +68,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     let mut mgr = OverlayManager::new(
         &budget,
         Some(Arc::clone(&disk_cache)),
+        None,
         pool.fast_handle(),
         pool.bulk_handle(),
         done_tx,
@@ -119,7 +120,8 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
             .collect::<std::collections::HashSet<_>>()
     );
 
-    // Wait for coarsest rung 2 to decode and land in `PendingUploads` + QOI disk cache.
+    // Wait for coarsest rung 2 to decode and land in `PendingUploads`, then
+    // wait for the offloaded `TileWriteWorker` batch to flush into SQLite.
     let deadline = Instant::now() + Duration::from_secs(5);
     while pending.queued_bytes() == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
@@ -128,9 +130,12 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         pending.queued_bytes() > 0,
         "coarsest rung tile should enqueue"
     );
+    while disk_cache.stats().expect("stats").tile_count == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         disk_cache.stats().expect("stats").tile_count > 0,
-        "decoded tile should populate QOI disk cache"
+        "offloaded tile writer should populate QOI disk cache"
     );
 
     // 3. Zoom-invariant CPU cursor readout resolves exact RGB [42, 128, 210, 255].
@@ -185,4 +190,169 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     pending.close();
     pool.shutdown();
     mgr.finish_shutdown();
+}
+
+#[test]
+fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use veldmap_net::{NetConfig, NetContext};
+
+    let dir = TestTempDir::new("remote-cog-lifecycle");
+    let tif_path = dir.path().join("remote_scene.tif");
+    write_tiled_geotiff_cog(&tif_path, 512, 512, [90, 160, 230]).expect("write geotiff");
+    let payload = Arc::new(std::fs::read(&tif_path).expect("read geotiff"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock range server");
+    let addr = listener.local_addr().expect("local addr");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = Arc::clone(&stop);
+    let data_srv = Arc::clone(&payload);
+
+    let srv_handle = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut reader = BufReader::new(&stream);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    let mut range_hdr: Option<String> = None;
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0
+                            || line == "\r\n"
+                            || line == "\n"
+                        {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("range")
+                        {
+                            range_hdr = Some(v.trim().to_owned());
+                        }
+                    }
+                    let total = data_srv.len();
+                    let (start, end) = range_hdr
+                        .as_deref()
+                        .and_then(|r| r.strip_prefix("bytes="))
+                        .and_then(|s| s.split_once('-'))
+                        .and_then(|(a, b)| {
+                            let s: usize = a.parse().ok()?;
+                            let e: usize = b.parse().ok()?;
+                            Some((s, e.min(total.saturating_sub(1))))
+                        })
+                        .unwrap_or((0, total.saturating_sub(1)));
+                    let slice = &data_srv[start..=end];
+                    let header = format!(
+                        "HTTP/1.1 206 Partial Content\r\n\
+                         Content-Range: bytes {start}-{end}/{total}\r\n\
+                         Content-Length: {}\r\n\
+                         ETag: \"cog-v1\"\r\n\
+                         Connection: close\r\n\r\n",
+                        slice.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(slice);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let disk_cache = Arc::new(
+        TileDiskCache::open(dir.path().join("tiles.sqlite"), 32 * 1024 * 1024).expect("disk cache"),
+    );
+    let budget = MemoryBudget::default();
+    let net = Arc::new(NetContext::new(NetConfig::from_budget(&budget)).expect("net ctx"));
+    let shutdown = CancelToken::new();
+    let pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig::from_budget(&budget),
+        shutdown.clone(),
+    );
+    let mut pending = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
+    let done_tx = pending.sender().expect("upload sender");
+    let wakeup: veldmap_core::sync::Wakeup = Arc::new(|| {});
+
+    let mut mgr = OverlayManager::new(
+        &budget,
+        Some(Arc::clone(&disk_cache)),
+        Some(Arc::clone(&net)),
+        pool.fast_handle(),
+        pool.bulk_handle(),
+        done_tx,
+        wakeup,
+        shutdown.clone(),
+    );
+
+    let url = format!("http://{addr}/scene.tif?token=secret-query");
+    mgr.begin_open_remote_cog(url, "Test Remote COG".to_owned(), Vec::new(), None, true)
+        .expect("queue remote open");
+
+    let (layer_id, bounds) = match wait_for_io_event(&mut mgr) {
+        OverlayIoEvent::RemoteOpened {
+            id,
+            title,
+            display_url,
+            bounds,
+            fly_to,
+        } => {
+            assert_eq!(title, "Test Remote COG");
+            assert!(!display_url.contains("secret-query"));
+            assert!(fly_to);
+            (id, bounds.expect("valid remote footprint"))
+        }
+        other => panic!("expected RemoteOpened, got {other:?}"),
+    };
+
+    // Remote layers must NEVER leak into local session persistence and must
+    // reject local disk reload cleanly.
+    assert_eq!(mgr.saved_entries_iter().count(), 0);
+    assert!(mgr.layer_summaries()[0].is_remote);
+    assert!(mgr.begin_reload_bypass_cache(layer_id).is_err());
+
+    let mut gpu_cache = GpuTileCache::new(budget.gpu_tile_cache_bytes);
+    let cam = Camera::at(bounds.lat, bounds.lon, 5_000.0);
+    let mut carriers = std::collections::HashSet::new();
+    let total_weight = mgr.total_appetite_weight_bytes().max(1);
+    let _ = mgr.build_and_schedule(&mut OverlayFrameCtx {
+        camera: &cam,
+        width_px: 1024,
+        height_px: 1024,
+        gpu_cache: &mut gpu_cache,
+        pending: &pending,
+        total_appetite_weight: total_weight,
+        carrier_keys: &mut carriers,
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pending.queued_bytes() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        pending.queued_bytes() > 0,
+        "remote COG tile should prefetch and decode into PendingUploads"
+    );
+    while disk_cache.stats().expect("stats").tile_count == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        disk_cache.stats().expect("stats").tile_count > 0,
+        "remote COG decoded tile should persist into QOI disk cache"
+    );
+
+    mgr.begin_shutdown();
+    shutdown.cancel();
+    net.signal_shutdown();
+    pending.close();
+    pool.shutdown();
+    mgr.finish_shutdown();
+    net.shutdown();
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv_handle.join();
 }

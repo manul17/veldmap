@@ -111,7 +111,11 @@ impl DecodePool {
 
     /// Spawn a bounded CPU decode pool with explicit worker thread name prefix
     /// (`"{thread_prefix}-{idx}"`).
-    fn spawn_named(thread_prefix: &str, config: DecodePoolConfig, shutdown: CancelToken) -> Self {
+    pub fn spawn_named(
+        thread_prefix: &str,
+        config: DecodePoolConfig,
+        shutdown: CancelToken,
+    ) -> Self {
         let count = config.worker_count.clamp(1, 8);
         let shared = Arc::new((
             Mutex::new(DecodeQueue::new(

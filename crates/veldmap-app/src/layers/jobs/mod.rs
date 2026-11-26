@@ -51,8 +51,13 @@ pub(super) fn schedule_layer_rungs(
                     pending,
                 );
                 for tile in admitted {
-                    if !submit_pointwise_job(tile, layer.source(), layer.fingerprint_hex(), runtime)
-                    {
+                    if !submit_pointwise_job(
+                        tile,
+                        layer.source(),
+                        layer.remote_range(),
+                        layer.fingerprint_hex(),
+                        runtime,
+                    ) {
                         break;
                     }
                 }

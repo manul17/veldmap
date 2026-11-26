@@ -35,6 +35,86 @@ pub fn export_geojson_feature_collection(collection: &GeoJsonFeatureCollection) 
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string()) + "\n"
 }
 
+/// Export a standalone RFC 7946 GeoJSON geometry object (suitable for STAC
+/// `intersects` queries or AOI clipboard export).
+pub fn export_geojson_geometry(geom: &GeoJsonGeometry) -> String {
+    let val = geometry_to_rfc7946_value(geom);
+    serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Export a [`GeoJsonGeometry`] as OGC Well-Known Text (WKT) in WGS84
+/// `lon lat` coordinate order.
+pub fn export_wkt_geometry(geom: &GeoJsonGeometry) -> String {
+    match geom {
+        GeoJsonGeometry::Point(p) => format!("POINT ({:.6} {:.6})", p.lon, p.lat),
+        GeoJsonGeometry::MultiPoint(pts) => {
+            if pts.is_empty() {
+                return "MULTIPOINT EMPTY".to_string();
+            }
+            let inner: Vec<String> = pts
+                .iter()
+                .map(|p| format!("({:.6} {:.6})", p.lon, p.lat))
+                .collect();
+            format!("MULTIPOINT ({})", inner.join(", "))
+        }
+        GeoJsonGeometry::LineString(pts) => {
+            if pts.is_empty() {
+                return "LINESTRING EMPTY".to_string();
+            }
+            format!("LINESTRING ({})", format_wkt_coords(pts))
+        }
+        GeoJsonGeometry::MultiLineString(lines) => {
+            if lines.is_empty() {
+                return "MULTILINESTRING EMPTY".to_string();
+            }
+            let inner: Vec<String> = lines
+                .iter()
+                .map(|line| format!("({})", format_wkt_coords(line)))
+                .collect();
+            format!("MULTILINESTRING ({})", inner.join(", "))
+        }
+        GeoJsonGeometry::Polygon(poly) => format!("POLYGON {}", format_wkt_polygon(poly)),
+        GeoJsonGeometry::MultiPolygon(polys) => {
+            if polys.is_empty() {
+                return "MULTIPOLYGON EMPTY".to_string();
+            }
+            let inner: Vec<String> = polys.iter().map(format_wkt_polygon).collect();
+            format!("MULTIPOLYGON ({})", inner.join(", "))
+        }
+    }
+}
+
+fn format_wkt_coords(pts: &[GeoPoint]) -> String {
+    pts.iter()
+        .filter(|p| p.lat.is_finite() && p.lon.is_finite())
+        .map(|p| format!("{:.6} {:.6}", p.lon, p.lat))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_wkt_ring(points: &[GeoPoint], want_ccw: bool) -> String {
+    let mut cleaned = dedup_geo_ring(points);
+    if cleaned.len() >= 3 {
+        let is_ccw = ring_signed_area_m2(&cleaned) >= 0.0;
+        if is_ccw != want_ccw {
+            cleaned.reverse();
+        }
+    }
+    if let Some(&first) = cleaned.first() {
+        cleaned.push(first);
+    }
+    format!("({})", format_wkt_coords(&cleaned))
+}
+
+fn format_wkt_polygon(poly: &Polygon) -> String {
+    let mut rings = Vec::with_capacity(1 + poly.holes.len());
+    rings.push(format_wkt_ring(&poly.exterior.points, true));
+    for hole in &poly.holes {
+        rings.push(format_wkt_ring(&hole.points, false));
+    }
+    format!("({})", rings.join(", "))
+}
+
 fn point_to_json(p: GeoPoint) -> Option<Value> {
     (p.lat.is_finite() && p.lon.is_finite()).then(|| json!([p.lon, p.lat]))
 }

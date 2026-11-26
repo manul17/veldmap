@@ -83,6 +83,21 @@ impl SharedChunkCache {
         drop(removed);
     }
 
+    /// Return whether `key` is already present in the decoded-chunk LRU cache
+    /// (without touching recency or triggering a decode).
+    pub(crate) fn contains(&self, key: &ChunkKey) -> bool {
+        lock_unpoisoned(&self.state).lru.contains(key)
+    }
+
+    /// Non-blocking cache lookup returning an already-decoded chunk if present
+    /// in the LRU cache, without initiating I/O or singleflight waits.
+    pub(crate) fn get_cached(&self, key: &ChunkKey) -> Option<Arc<DecodedChunk>> {
+        let mut guard = lock_unpoisoned(&self.state);
+        let chunk = guard.lru.get(key).map(Arc::clone)?;
+        guard.hits += 1;
+        Some(chunk)
+    }
+
     /// Look up `key` in the cache, join an active singleflight decode if one is
     /// already running, or run `decode` once as the leader and publish to all
     /// waiters.

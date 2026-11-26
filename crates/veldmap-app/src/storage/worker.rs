@@ -126,7 +126,7 @@ enum DiskCacheCmd {
     RefreshStats,
     SetMaxBytes(u64),
     Clear,
-    SaveSettings(AppSettings),
+    SaveSettings(Box<AppSettings>),
     SaveSession(AppSession),
 }
 
@@ -227,7 +227,7 @@ fn handle_disk_cmd(
             });
             ctx.persist_json(
                 "user settings",
-                &latest,
+                latest.as_ref(),
                 AppSettings::save,
                 PersistenceFaults::set_settings_result,
             );
@@ -321,7 +321,7 @@ impl DiskCacheWorker {
 
     pub(super) fn request_save_settings(&self, settings: AppSettings) -> bool {
         self.worker
-            .send(DiskCacheCmd::SaveSettings(settings))
+            .send(DiskCacheCmd::SaveSettings(Box::new(settings)))
             .is_ok()
     }
 

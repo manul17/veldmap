@@ -56,10 +56,42 @@ impl GpuVectorVertex {
         };
 }
 
+/// Compact 48-byte instanced line-segment record matching `RibbonIn` in
+/// `shaders/vector.wgsl` (`@location(0..3)`), extruded on GPU into a
+/// HiDPI-scaled screen-space ribbon quad.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct GpuRibbonSegment {
+    p0: [f32; 3],
+    n0: [f32; 3],
+    p1: [f32; 3],
+    n1: [f32; 3],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<GpuRibbonSegment>() == 48);
+};
+
+impl GpuRibbonSegment {
+    const ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x3,
+        2 => Float32x3,
+        3 => Float32x3,
+    ];
+
+    pub(super) const INSTANCE_LAYOUT: wgpu::VertexBufferLayout<'static> =
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRS,
+        };
+}
+
 struct ClusterDrawRange {
     origin_ecef_m: DVec3,
     fill_indices: Range<u32>,
-    line_vertices: Range<u32>,
+    line_segments: Range<u32>,
     point_instances: Range<u32>,
 }
 
@@ -75,20 +107,20 @@ struct CachedVectorBuffers {
 fn estimate_layer_gpu_bytes(layer: &DrawVectorLayer) -> usize {
     let mut fill_verts = 0usize;
     let mut fill_indices = 0usize;
-    let mut line_verts = 0usize;
+    let mut line_segments = 0usize;
     let mut point_verts = 0usize;
     for cluster in &layer.mesh.clusters {
         if !cluster.fill_vertices.is_empty() && !cluster.fill_indices.is_empty() {
             fill_verts = fill_verts.saturating_add(cluster.fill_vertices.len());
             fill_indices = fill_indices.saturating_add(cluster.fill_indices.len());
         }
-        line_verts = line_verts.saturating_add(cluster.line_vertices.len());
+        line_segments = line_segments.saturating_add(cluster.line_vertices.len() / 2);
         point_verts = point_verts.saturating_add(cluster.point_vertices.len());
     }
     fill_verts
         .saturating_mul(std::mem::size_of::<GpuVectorVertex>())
         .saturating_add(fill_indices.saturating_mul(std::mem::size_of::<u32>()))
-        .saturating_add(line_verts.saturating_mul(std::mem::size_of::<GpuVectorVertex>()))
+        .saturating_add(line_segments.saturating_mul(std::mem::size_of::<GpuRibbonSegment>()))
         .saturating_add(point_verts.saturating_mul(std::mem::size_of::<GpuVectorVertex>()))
 }
 
@@ -136,7 +168,7 @@ fn create_checked_buffer<T: Pod>(
 fn pack_layer_buffers(device: &wgpu::Device, layer: &DrawVectorLayer) -> CachedVectorBuffers {
     let mut all_fill_verts: Vec<GpuVectorVertex> = Vec::new();
     let mut all_fill_indices: Vec<u32> = Vec::new();
-    let mut all_line_verts: Vec<GpuVectorVertex> = Vec::new();
+    let mut all_line_segments: Vec<GpuRibbonSegment> = Vec::new();
     let mut all_point_verts: Vec<GpuVectorVertex> = Vec::new();
     let mut clusters = Vec::with_capacity(layer.mesh.clusters.len());
 
@@ -152,12 +184,16 @@ fn pack_layer_buffers(device: &wgpu::Device, layer: &DrawVectorLayer) -> CachedV
         }
         let fill_end = all_fill_indices.len() as u32;
 
-        let line_start = all_line_verts.len() as u32;
-        all_line_verts.extend(cluster.line_vertices.iter().map(|v| GpuVectorVertex {
-            rel_pos: v.rel_pos,
-            normal: v.normal,
-        }));
-        let line_end = all_line_verts.len() as u32;
+        let line_start = all_line_segments.len() as u32;
+        for pair in cluster.line_vertices.chunks_exact(2) {
+            all_line_segments.push(GpuRibbonSegment {
+                p0: pair[0].rel_pos,
+                n0: pair[0].normal,
+                p1: pair[1].rel_pos,
+                n1: pair[1].normal,
+            });
+        }
+        let line_end = all_line_segments.len() as u32;
 
         let point_start = all_point_verts.len() as u32;
         for v in &cluster.point_vertices {
@@ -175,7 +211,7 @@ fn pack_layer_buffers(device: &wgpu::Device, layer: &DrawVectorLayer) -> CachedV
         clusters.push(ClusterDrawRange {
             origin_ecef_m: cluster.origin_ecef_m,
             fill_indices: fill_start..fill_end,
-            line_vertices: line_start..line_end,
+            line_segments: line_start..line_end,
             point_instances: point_start..point_end,
         });
     }
@@ -198,8 +234,8 @@ fn pack_layer_buffers(device: &wgpu::Device, layer: &DrawVectorLayer) -> CachedV
     };
     let line_vb = create_checked_buffer(
         device,
-        "vector line vertex buffer",
-        &all_line_verts,
+        "vector ribbon segment instance buffer",
+        &all_line_segments,
         wgpu::BufferUsages::VERTEX,
     );
     let point_vb = create_checked_buffer(
@@ -247,7 +283,7 @@ fn record_cluster_draws<'a>(
     for (cluster, off) in clusters.iter().zip(offsets.iter()) {
         let (dyn_off, range) = match target.kind {
             VectorDrawKind::Fill { .. } => (off.fill_offset, cluster.fill_indices.clone()),
-            VectorDrawKind::Line => (off.line_offset, cluster.line_vertices.clone()),
+            VectorDrawKind::Line => (off.line_offset, cluster.line_segments.clone()),
             VectorDrawKind::Point => (off.line_offset, cluster.point_instances.clone()),
         };
         let Some(dyn_off) = dyn_off else {
@@ -267,8 +303,7 @@ fn record_cluster_draws<'a>(
         pass.set_bind_group(1, arena.vector_bind_group(), &[dyn_off]);
         match target.kind {
             VectorDrawKind::Fill { .. } => pass.draw_indexed(range, 0, 0..1),
-            VectorDrawKind::Line => pass.draw(range, 0..1),
-            VectorDrawKind::Point => pass.draw(0..6, range),
+            VectorDrawKind::Line | VectorDrawKind::Point => pass.draw(0..6, range),
         }
     }
 }
@@ -336,10 +371,17 @@ impl VectorRenderer {
         arena: &mut DynamicUniformArena,
         snapshot: &DrawSnapshot,
         eye: DVec3,
+        width_px: u32,
+        height_px: u32,
     ) {
         self.draw_offsets.clear();
         self.layer_offset_ranges.clear();
         let marker_radius_m = point_marker_radius_m(snapshot.camera.height_m());
+        let ppp = snapshot.pixels_per_point.max(0.5);
+        let viewport_inv_size = [
+            2.0 / (width_px.max(1) as f32),
+            2.0 / (height_px.max(1) as f32),
+        ];
 
         for layer in &snapshot.vectors {
             let start = self.draw_offsets.len();
@@ -348,6 +390,13 @@ impl VectorRenderer {
             let line_linear = srgb_rgba_f32_to_linear(layer.line_color, opacity);
             let fill_alpha = fill_linear[3];
             let line_alpha = line_linear[3];
+            let stroke_half_width_px =
+                (layer.stroke_width_px.max(1.0) * ppp * 0.5).clamp(0.5, 16.0);
+            let hatch_spacing_px = if layer.hatch_spacing_px > 0.5 {
+                (layer.hatch_spacing_px * ppp).clamp(4.0, 128.0)
+            } else {
+                0.0
+            };
 
             let Some(bufs) = self.buffers.peek(&(layer.id, layer.rev)) else {
                 self.layer_offset_ranges.push(start..start);
@@ -364,16 +413,22 @@ impl VectorRenderer {
                             offset_eye,
                             point_radius_m: 0.0,
                             color: fill_linear,
+                            viewport_inv_size,
+                            stroke_half_width_px: 0.0,
+                            hatch_spacing_px,
                         })
                     });
 
                 let has_strokes_or_points =
-                    !cluster.line_vertices.is_empty() || !cluster.point_instances.is_empty();
+                    !cluster.line_segments.is_empty() || !cluster.point_instances.is_empty();
                 let line_offset = (line_alpha > 0.001 && has_strokes_or_points).then(|| {
                     arena.push(&VectorUniform {
                         offset_eye,
                         point_radius_m: marker_radius_m,
                         color: line_linear,
+                        viewport_inv_size,
+                        stroke_half_width_px,
+                        hatch_spacing_px: 0.0,
                     })
                 });
 

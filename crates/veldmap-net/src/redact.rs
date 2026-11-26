@@ -90,7 +90,7 @@ fn is_valid_url_scheme(scheme: &str) -> bool {
 /// Redact `user:pass@` authority credentials and `?query` strings from a URL
 /// or URL template so inline secrets never appear in `Debug` output, logs, or
 /// UI tooltips.
-pub(crate) fn sanitize_url_for_display(url: &str) -> String {
+pub fn sanitize_url_for_display(url: &str) -> String {
     let trimmed = url.trim();
     let scheme_end = trimmed
         .find("://")

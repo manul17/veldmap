@@ -179,7 +179,14 @@ fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
     assert_struct_layout(
         &vector,
         "VectorUniform",
-        32,
-        &[("offset_eye", 0), ("point_radius_m", 12), ("color", 16)],
+        48,
+        &[
+            ("offset_eye", 0),
+            ("point_radius_m", 12),
+            ("color", 16),
+            ("viewport_inv_size", 32),
+            ("stroke_half_width_px", 40),
+            ("hatch_spacing_px", 44),
+        ],
     );
 }

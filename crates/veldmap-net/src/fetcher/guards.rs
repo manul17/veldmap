@@ -128,7 +128,7 @@ mod tests {
         let shared = Arc::new(PipelineShared {
             shutdown: CancelToken::new(),
             state: Mutex::new(PipelineState::default()),
-            host_limiters: HostLimiters::new(4),
+            host_limiters: Arc::new(HostLimiters::new(4)),
             notify: Notify::new(),
         });
         let spec = LiveBasemapSpec::eox_sentinel2_cloudless();

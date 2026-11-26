@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use veldmap_core::geo::{
-    DEFAULT_VECTOR_MAX_CHORD_DEG, FootprintBounds, MAX_GEOJSON_BYTES, VectorMesh, parse_geojson,
+    DEFAULT_VECTOR_MAX_CHORD_DEG, FootprintBounds, GeoJsonFeatureCollection, GeoJsonGeometry,
+    MAX_GEOJSON_BYTES, VectorMesh, parse_geojson,
 };
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_storage::read_regular_file_utf8_limited;
@@ -32,6 +33,7 @@ pub(crate) struct VectorLayerSummary {
     pub(crate) line_segment_count: usize,
     pub(crate) point_count: usize,
     pub(crate) footprint: Option<FootprintBounds>,
+    pub(crate) has_polygons: bool,
     pub(crate) color_rgb: [u8; 3],
 }
 
@@ -67,10 +69,13 @@ pub(crate) fn is_geojson_path(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("geojson") || e.eq_ignore_ascii_case("json"))
 }
 
-/// Pre-parsed and CPU-tessellated GeoJSON payload produced off the UI thread.
+/// Pre-parsed and CPU-tessellated GeoJSON payload produced off the UI thread,
+/// retaining the parsed feature geometries & properties for STAC AOI search
+/// and future AOI zonal statistics.
 struct LoadedVectorData {
     path: PathBuf,
     feature_count: usize,
+    collection: Arc<GeoJsonFeatureCollection>,
     mesh: Arc<VectorMesh>,
 }
 
@@ -94,6 +99,7 @@ fn load_vector_file(path: &Path) -> Result<LoadedVectorData, String> {
     Ok(LoadedVectorData {
         path: path.to_path_buf(),
         feature_count,
+        collection: Arc::new(collection),
         mesh,
     })
 }
@@ -154,6 +160,7 @@ struct VectorLayer {
     line_color: [f32; 4],
     color_rgb: [u8; 3],
     feature_count: usize,
+    collection: Arc<GeoJsonFeatureCollection>,
     mesh: Arc<VectorMesh>,
 }
 
@@ -229,6 +236,7 @@ impl VectorLayerStack {
             line_color,
             color_rgb,
             feature_count: data.feature_count,
+            collection: data.collection,
             mesh: data.mesh,
         });
         (id, bounds)
@@ -283,6 +291,12 @@ impl VectorLayerStack {
                 line_segment_count: l.mesh.line_segment_count(),
                 point_count: l.mesh.point_count(),
                 footprint: l.mesh.bounds,
+                has_polygons: l.collection.features.iter().any(|f| {
+                    matches!(
+                        f.geometry,
+                        GeoJsonGeometry::Polygon(_) | GeoJsonGeometry::MultiPolygon(_)
+                    )
+                }),
                 color_rgb: l.color_rgb,
             })
             .collect()
@@ -298,6 +312,8 @@ impl VectorLayerStack {
                 opacity: l.opacity,
                 fill_color: l.fill_color,
                 line_color: l.line_color,
+                stroke_width_px: 1.5,
+                hatch_spacing_px: 0.0,
                 mesh: Arc::clone(&l.mesh),
             })
             .collect()
@@ -402,6 +418,29 @@ impl VectorManager {
         self.stack.draw_layers()
     }
 
+    /// Return the retained parsed GeoJSON feature collection (geometries +
+    /// properties) for `id`, shared by STAC AOI search and future AOI zonal
+    /// statistics.
+    pub(crate) fn collection(&self, id: VectorLayerId) -> Option<Arc<GeoJsonFeatureCollection>> {
+        self.stack
+            .layers
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| Arc::clone(&l.collection))
+    }
+
+    /// Return the first polygon/multipolygon geometry in `id` (or its bbox
+    /// fallback) suitable for STAC AOI intersection queries.
+    pub(crate) fn first_polygon_geometry(&self, id: VectorLayerId) -> Option<GeoJsonGeometry> {
+        let fc = self.collection(id)?;
+        fc.features.iter().find_map(|f| match &f.geometry {
+            GeoJsonGeometry::Polygon(_) | GeoJsonGeometry::MultiPolygon(_) => {
+                Some(f.geometry.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// Phase 1 shutdown: close the background worker command channel.
     pub(crate) fn begin_shutdown(&mut self) {
         self.io.close_channel();
@@ -419,12 +458,12 @@ mod tests {
     use veldmap_core::geo::{GeoJsonFeature, GeoJsonFeatureCollection, GeoJsonGeometry, GeoPoint};
 
     fn sample_loaded(name: &str) -> LoadedVectorData {
-        let fc = GeoJsonFeatureCollection {
+        let fc = Arc::new(GeoJsonFeatureCollection {
             features: vec![GeoJsonFeature::new(
                 Some(name.to_owned()),
                 GeoJsonGeometry::Point(GeoPoint::new(47.2, 39.7)),
             )],
-        };
+        });
         LoadedVectorData {
             path: PathBuf::from(format!("/tmp/{name}.geojson")),
             feature_count: 1,
@@ -432,6 +471,7 @@ mod tests {
                 &fc,
                 DEFAULT_VECTOR_MAX_CHORD_DEG,
             )),
+            collection: fc,
         }
     }
 

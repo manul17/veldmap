@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use veldmap_core::io::ByteSource;
+use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
 
 use crate::RasterError;
 use crate::pipeline::metadata::SampleType;
@@ -293,6 +294,52 @@ impl CachedIfd {
     /// Explicit alpha channel index within a pixel, if present.
     pub(super) const fn alpha_channel(&self) -> Option<usize> {
         self.pixel_layout.alpha_channel()
+    }
+
+    /// Resolve the TIFF planes read for `spec`, shared across
+    /// [`super::chunk_reader::TiffChunkReader`] and remote COG byte-range
+    /// planners so plane selection never diverges.
+    pub(super) fn planes_for_stream(
+        &self,
+        spec: TileStreamSpec,
+    ) -> Result<Vec<usize>, RasterError> {
+        match spec.format {
+            PixelFormat::Rgba8UnormSrgb => {
+                if self.planar == PlanarConfig::Chunky {
+                    return Ok(vec![0]);
+                }
+                if self.photometric == Photometric::Palette {
+                    return Ok(match self.alpha_channel() {
+                        Some(a) => vec![0, a],
+                        None => vec![0],
+                    });
+                }
+                Ok(match (self.pixel_layout.colors(), self.alpha_channel()) {
+                    (1, None) => vec![0],
+                    (1, Some(a)) => vec![0, a],
+                    (_, None) => vec![0, 1, 2],
+                    (_, Some(a)) => vec![0, 1, 2, a],
+                })
+            }
+            PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => {
+                let band_idx = match spec.band {
+                    BandKey::Display => 0usize,
+                    BandKey::Index(i) => usize::from(i),
+                    BandKey::NamedHash(_) => {
+                        return Err(RasterError::Decode(
+                            "named band hash is not supported by TiffSource".to_owned(),
+                        ));
+                    }
+                };
+                if band_idx >= usize::from(self.samples_per_pixel) {
+                    return Err(RasterError::Decode(format!(
+                        "band index {band_idx} out of range for TIFF with {} samples/pixel",
+                        self.samples_per_pixel
+                    )));
+                }
+                Ok(vec![self.band_plane(band_idx)])
+            }
+        }
     }
 
     /// Look up `(offset, byte_count)` for `(plane, chunk_index)`.

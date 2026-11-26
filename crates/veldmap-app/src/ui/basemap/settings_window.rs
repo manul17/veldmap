@@ -1,4 +1,4 @@
-//! Basemap & Tile Disk Cache Settings modal window.
+//! Unified Settings modal window (Basemap, Cache & GPU, and STAC / Cloud tabs).
 //!
 //! Strictly action-only: emits [`BasemapUiAction`] values back to `VeldmapApp`
 //! without mutating storage, managers, or GPU caches directly.
@@ -6,10 +6,10 @@
 use eframe::egui;
 
 use super::super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
-use super::{BasemapUiAction, BasemapUiState};
+use super::{BasemapUiAction, BasemapUiState, SettingsTab};
 use crate::storage::settings::{
     AppSettings, BasemapSelection, CUSTOM_MAX_LEVEL_RANGE, DEFAULT_CUSTOM_GPU_CACHE_MAX_MB,
-    DISK_CACHE_MAX_MB_RANGE, GPU_CACHE_MAX_MB_RANGE, validate_gibs_date,
+    DISK_CACHE_MAX_MB_RANGE, GPU_CACHE_MAX_MB_RANGE, StacAuthKind, validate_gibs_date,
 };
 use crate::storage::{DiskCacheNotice, DiskCacheStatus};
 
@@ -194,8 +194,86 @@ fn show_disk_cache_section(
     });
 }
 
-/// Render the floating Basemap & Disk Cache Settings window when open,
-/// returning any user actions to apply in `VeldmapApp`.
+fn show_stac_section(ui: &mut egui::Ui, ui_state: &mut BasemapUiState) {
+    ui.heading("Custom STAC API Endpoint & Auth");
+    ui.label(
+        egui::RichText::new(
+            "Built-in AWS Earth Search Sentinel-2 L2A and COP-DEM GLO-30 work with zero auth. \
+             Configure a custom STAC API endpoint and optional credentials below.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.add_space(4.0);
+
+    egui::Grid::new("custom_stac_grid")
+        .num_columns(2)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("STAC API URL:");
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.draft.stac.custom_endpoint)
+                    .desired_width(270.0)
+                    .hint_text("https://earth-search.aws.element84.com/v1"),
+            );
+            ui.end_row();
+
+            ui.label("Collection ID:");
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.draft.stac.custom_collection)
+                    .desired_width(270.0)
+                    .hint_text("sentinel-2-l2a (optional)"),
+            );
+            ui.end_row();
+
+            ui.label("Auth mode:");
+            egui::ComboBox::from_id_salt("stac_auth_kind")
+                .selected_text(ui_state.draft.stac.auth_kind.label())
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    for kind in StacAuthKind::ALL {
+                        ui.selectable_value(&mut ui_state.draft.stac.auth_kind, kind, kind.label());
+                    }
+                });
+            ui.end_row();
+
+            if ui_state.draft.stac.auth_kind == StacAuthKind::ApiKey {
+                ui.label("Header name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut ui_state.draft.stac.auth_header_name)
+                        .desired_width(270.0)
+                        .hint_text("x-api-key"),
+                );
+                ui.end_row();
+            }
+
+            if ui_state.draft.stac.auth_kind != StacAuthKind::None {
+                let label = match ui_state.draft.stac.auth_kind {
+                    StacAuthKind::Bearer => "Bearer token:",
+                    StacAuthKind::ApiKey => "API key value:",
+                    StacAuthKind::SasQuery => "SAS query:",
+                    StacAuthKind::None => "Secret:",
+                };
+                let hint = match ui_state.draft.stac.auth_kind {
+                    StacAuthKind::Bearer => "Paste bearer token",
+                    StacAuthKind::ApiKey => "Paste API key",
+                    StacAuthKind::SasQuery => "sv=2022-...&sig=...",
+                    StacAuthKind::None => "",
+                };
+                ui.label(label);
+                ui.add(
+                    egui::TextEdit::singleline(&mut ui_state.draft.stac.auth_secret)
+                        .password(true)
+                        .desired_width(270.0)
+                        .hint_text(hint),
+                );
+                ui.end_row();
+            }
+        });
+}
+
+/// Render the floating unified Settings modal when open, returning any user
+/// actions to apply in `VeldmapApp`.
 pub(crate) fn show_settings_window(
     ctx: &egui::Context,
     settings: &AppSettings,
@@ -209,24 +287,48 @@ pub(crate) fn show_settings_window(
     let mut actions = Vec::new();
     let mut open = ui_state.settings_open;
 
-    egui::Window::new("Basemap & Tile Cache Settings")
+    egui::Window::new("Settings")
         .open(&mut open)
         .resizable(false)
-        .default_width(420.0)
+        .default_width(450.0)
         .show(ctx, |ui| {
-            let date_valid = show_gibs_section(ui, ui_state);
-
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut ui_state.active_tab, SettingsTab::Basemap, "Basemap");
+                ui.selectable_value(
+                    &mut ui_state.active_tab,
+                    SettingsTab::CacheGpu,
+                    "Cache & GPU",
+                );
+                ui.selectable_value(
+                    &mut ui_state.active_tab,
+                    SettingsTab::StacCloud,
+                    "STAC / Cloud",
+                );
+            });
             ui.separator();
-            let custom_valid = show_custom_xyz_section(ui, settings, ui_state);
 
-            ui.separator();
-            show_disk_cache_section(
-                ui,
-                disk_status,
-                &mut ui_state.draft.disk_cache_max_mb,
-                &mut ui_state.draft.gpu_tile_cache_max_mb,
-                &mut actions,
-            );
+            let date_valid = validate_gibs_date(&ui_state.draft.gibs_date);
+            let custom_valid = ui_state.custom_validation().is_ok();
+
+            match ui_state.active_tab {
+                SettingsTab::Basemap => {
+                    let _ = show_gibs_section(ui, ui_state);
+                    ui.separator();
+                    let _ = show_custom_xyz_section(ui, settings, ui_state);
+                }
+                SettingsTab::CacheGpu => {
+                    show_disk_cache_section(
+                        ui,
+                        disk_status,
+                        &mut ui_state.draft.disk_cache_max_mb,
+                        &mut ui_state.draft.gpu_tile_cache_max_mb,
+                        &mut actions,
+                    );
+                }
+                SettingsTab::StacCloud => {
+                    show_stac_section(ui, ui_state);
+                }
+            }
 
             ui.separator();
             let can_apply = (ui_state.draft.active_basemap != BasemapSelection::NasaGibsViirs
@@ -237,15 +339,18 @@ pub(crate) fn show_settings_window(
                     .add_enabled(can_apply, egui::Button::new("Apply & Save"))
                     .clicked()
                 {
-                    actions.push(BasemapUiAction::ApplyDraft(ui_state.draft.clone()));
+                    actions.push(BasemapUiAction::ApplyDraft(Box::new(
+                        ui_state.draft.clone(),
+                    )));
                 }
-                if ui
-                    .add_enabled(custom_valid, egui::Button::new("Use Custom XYZ"))
-                    .clicked()
+                if ui_state.active_tab == SettingsTab::Basemap
+                    && ui
+                        .add_enabled(custom_valid, egui::Button::new("Use Custom XYZ"))
+                        .clicked()
                 {
                     let mut next = ui_state.draft.clone();
                     next.active_basemap = BasemapSelection::CustomXyz;
-                    actions.push(BasemapUiAction::ApplyDraft(next));
+                    actions.push(BasemapUiAction::ApplyDraft(Box::new(next)));
                 }
             });
         });

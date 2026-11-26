@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{SourceId, StreamKey, TileKey};
+use veldmap_net::NetContext;
 use veldmap_raster::{
     AdmittedPass, AdmittedTile, DecodeContext, DecodeJob, DecodePoolHandle, PyramidMeta,
     SharedChunkCache, SubmitError, TileFailureOutcome, TileScheduler,
@@ -16,6 +17,8 @@ use veldmap_raster::{
 use veldmap_storage::{LocalFingerprintCache, TileDiskCache};
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadSender};
+
+use super::disk_cache::TileWriteHandle;
 
 /// Backoff window applied when a decode lane queue is saturated (`SubmitError::Full`)
 /// so the UI retries cleanly without spinning at 100% CPU.
@@ -30,8 +33,11 @@ pub(super) struct OverlayRuntime {
     pub(super) fingerprint_cache: Arc<LocalFingerprintCache>,
     scheduler: Mutex<TileScheduler>,
     pub(super) disk_cache: Option<Arc<TileDiskCache>>,
+    pub(super) tile_writer: Option<TileWriteHandle>,
+    pub(super) net: Option<Arc<NetContext>>,
     pub(super) fast_pool: DecodePoolHandle,
     pub(super) bulk_pool: DecodePoolHandle,
+    pub(super) remote_pool: DecodePoolHandle,
     pub(super) done_tx: UploadSender,
     pub(super) wakeup: Wakeup,
     pub(super) shutdown: CancelToken,
@@ -40,11 +46,18 @@ pub(super) struct OverlayRuntime {
 }
 
 impl OverlayRuntime {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal runtime wiring injects all explicit shared subsystems"
+    )]
     pub(super) fn new(
         budget: &MemoryBudget,
         disk_cache: Option<Arc<TileDiskCache>>,
+        tile_writer: Option<TileWriteHandle>,
+        net: Option<Arc<NetContext>>,
         fast_pool: DecodePoolHandle,
         bulk_pool: DecodePoolHandle,
+        remote_pool: DecodePoolHandle,
         done_tx: UploadSender,
         wakeup: Wakeup,
         shutdown: CancelToken,
@@ -56,8 +69,11 @@ impl OverlayRuntime {
             fingerprint_cache: Arc::new(LocalFingerprintCache::new()),
             scheduler: Mutex::new(TileScheduler::default()),
             disk_cache,
+            tile_writer,
+            net,
             fast_pool,
             bulk_pool,
+            remote_pool,
             done_tx,
             wakeup,
             shutdown,

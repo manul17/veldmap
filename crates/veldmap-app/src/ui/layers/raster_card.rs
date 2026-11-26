@@ -109,7 +109,11 @@ fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Ve
                     ui.small(format!("Scale: {} · Offset: {}", sci.scale, sci.offset));
                 }
             }
-            ui.small(format!("Path: {}", layer.path.display()));
+            if let Some(ref url) = layer.remote_url {
+                ui.small(format!("URL: {url}"));
+            } else {
+                ui.small(format!("Path: {}", layer.path.display()));
+            }
         });
 }
 
@@ -123,7 +127,8 @@ fn show_layer_actions(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec
         {
             actions.push(LayerUiAction::ZoomToExtent(bounds));
         }
-        if layer.can_override_crs
+        if !layer.is_remote
+            && layer.can_override_crs
             && ui
                 .small_button("CRS…")
                 .on_hover_text("Override CRS or custom Transverse Mercator parameters")
@@ -131,10 +136,11 @@ fn show_layer_actions(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec
         {
             actions.push(LayerUiAction::OpenCrsPicker(layer.id, layer.name.clone()));
         }
-        if ui
-            .add_enabled(!layer.reloading, egui::Button::new("Reload").small())
-            .on_hover_text("Reload from disk (bypass fingerprint & tile cache)")
-            .clicked()
+        if !layer.is_remote
+            && ui
+                .add_enabled(!layer.reloading, egui::Button::new("Reload").small())
+                .on_hover_text("Reload from disk (bypass fingerprint & tile cache)")
+                .clicked()
         {
             actions.push(LayerUiAction::ReloadBypassCache(layer.id));
         }
@@ -163,8 +169,12 @@ pub(super) fn show_raster_card(
                         OverlayEdit::SetVisible(visible),
                     ));
                 }
+                let hover_tip = layer
+                    .remote_url
+                    .clone()
+                    .unwrap_or_else(|| layer.path.display().to_string());
                 ui.add(egui::Label::new(egui::RichText::new(&layer.name).strong()).truncate())
-                    .on_hover_text(layer.path.display().to_string());
+                    .on_hover_text(hover_tip);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(layer.can_move_down, egui::Button::new("↓").small())
@@ -195,6 +205,12 @@ pub(super) fn show_raster_card(
             let is_loading =
                 layer.reloading || (layer.visible && (layer.pass_active || layer.in_flight > 0));
             ui.horizontal(|ui| {
+                if layer.is_remote {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(100, 195, 255),
+                        egui::RichText::new("Cloud COG").small().strong(),
+                    );
+                }
                 ui.weak(egui::RichText::new(px_label).small());
                 if layer.reloading {
                     ui.weak(egui::RichText::new("· reloading…").small());

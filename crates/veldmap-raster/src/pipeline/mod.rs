@@ -30,7 +30,7 @@ pub use plan::{
     DISPLAY_STREAM_SPEC, LevelPlan, MAX_SOURCE_SIDE, PyramidMeta, ServeMode, stream_spec_for_band,
 };
 pub use scheduler::{AdmittedPass, AdmittedTile, TileFailureOutcome, TileScheduler};
-pub use source::RasterSource;
+pub use source::{ByteRange, RasterSource, coalesce_byte_ranges};
 
 /// Shared runtime context passed into analytical raster decoding calls.
 pub struct DecodeContext<'a> {

@@ -28,6 +28,7 @@ pub(crate) enum ToolbarAction {
     OpenRecentFile(PathBuf),
     ClearRecentFiles,
     ToggleLayersPanel,
+    ToggleCloudPanel,
     ShowUnavailableSessionLayers,
     ToggleMeasureTool,
     SaveBookmark(String),
@@ -47,6 +48,7 @@ pub(crate) struct ToolbarInputs<'a> {
     pub(crate) layer_count: usize,
     pub(crate) unavailable_layer_count: usize,
     pub(crate) layers_open: bool,
+    pub(crate) cloud_open: bool,
     pub(crate) measure_active: bool,
     pub(crate) recent_files: &'a [PathBuf],
     pub(crate) bookmarks: &'a [CameraBookmark],
@@ -218,10 +220,18 @@ pub(crate) fn show_top_toolbar(
             };
             if ui
                 .selectable_label(inputs.layers_open, layers_label)
-                .on_hover_text("Toggle Layer List panel")
+                .on_hover_text("Toggle Layers workbench tab")
                 .clicked()
             {
                 actions.push(ToolbarAction::ToggleLayersPanel);
+            }
+
+            if ui
+                .selectable_label(inputs.cloud_open, "Cloud / STAC")
+                .on_hover_text("Browse public STAC catalogs (Sentinel-2, COP-DEM) and stream COGs")
+                .clicked()
+            {
+                actions.push(ToolbarAction::ToggleCloudPanel);
             }
 
             if inputs.unavailable_layer_count > 0 {

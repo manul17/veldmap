@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{Connection, OptionalExtension, Params, Statement, Transaction, params};
+use rusqlite::{
+    CachedStatement, Connection, OptionalExtension, Params, Statement, Transaction, params,
+};
 
 use super::key::{EncodedKey, TileBlobEncoding};
 
@@ -108,7 +110,7 @@ pub(super) fn select_tile_blob(
     conn: &Connection,
     enc: &EncodedKey<'_>,
 ) -> Result<Option<SelectedTileBlob>, rusqlite::Error> {
-    let mut stmt = conn.prepare(SELECT_TILE_BLOB_SQL)?;
+    let mut stmt = conn.prepare_cached(SELECT_TILE_BLOB_SQL)?;
     stmt.query_row(enc.key_params(), |r| {
         Ok(SelectedTileBlob {
             tile_id: r.get(0)?,
@@ -120,20 +122,20 @@ pub(super) fn select_tile_blob(
     .optional()
 }
 
-/// Transaction-scoped prepared statements for upserting one or more tiles
-/// without re-preparing SQL on each entry.
+/// Transaction-scoped cached prepared statements for upserting one or more
+/// tiles without re-preparing SQL on each entry or transaction.
 pub(super) struct TileUpserter<'tx> {
-    select_byte_size: Statement<'tx>,
-    upsert_meta: Statement<'tx>,
-    upsert_blob: Statement<'tx>,
+    select_byte_size: CachedStatement<'tx>,
+    upsert_meta: CachedStatement<'tx>,
+    upsert_blob: CachedStatement<'tx>,
 }
 
 impl<'tx> TileUpserter<'tx> {
     pub(super) fn new(tx: &'tx Transaction<'_>) -> Result<Self, rusqlite::Error> {
         Ok(Self {
-            select_byte_size: tx.prepare(SELECT_META_BYTE_SIZE_SQL)?,
-            upsert_meta: tx.prepare(UPSERT_META_SQL)?,
-            upsert_blob: tx.prepare(UPSERT_BLOB_SQL)?,
+            select_byte_size: tx.prepare_cached(SELECT_META_BYTE_SIZE_SQL)?,
+            upsert_meta: tx.prepare_cached(UPSERT_META_SQL)?,
+            upsert_blob: tx.prepare_cached(UPSERT_BLOB_SQL)?,
         })
     }
 
@@ -174,7 +176,7 @@ pub(super) fn flush_touches_in_tx(
     // Updates `tile_meta` only (never `tile_blobs`), so read-hit LRU touches
     // never rewrite BLOB overflow pages. Guarded with `last_used_ms < ?1` so a
     // buffered touch can never roll back a newer timestamp on a reused tile_id.
-    let mut stmt = tx.prepare(TOUCH_META_SQL)?;
+    let mut stmt = tx.prepare_cached(TOUCH_META_SQL)?;
     for (&tile_id, &ts) in touches {
         stmt.execute(params![ts, tile_id])?;
     }
@@ -186,7 +188,7 @@ pub(super) fn delete_entry_in_tx(
     tile_id: i64,
     expected_last_used_ms: i64,
 ) -> Result<bool, rusqlite::Error> {
-    let mut stmt = tx.prepare(DELETE_META_BY_ID_AND_TS_SQL)?;
+    let mut stmt = tx.prepare_cached(DELETE_META_BY_ID_AND_TS_SQL)?;
     let deleted_sz: Option<i64> = stmt
         .query_row(params![tile_id, expected_last_used_ms], |r| r.get(0))
         .optional()?;
@@ -202,7 +204,7 @@ pub(super) fn clear_source_in_tx(
     source_key: &str,
 ) -> Result<Vec<i64>, rusqlite::Error> {
     let (ids, removed_bytes) = {
-        let mut stmt = tx.prepare(DELETE_SOURCE_META_SQL)?;
+        let mut stmt = tx.prepare_cached(DELETE_SOURCE_META_SQL)?;
         let rows = stmt.query_map(params![source_key], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
         })?;
@@ -248,11 +250,11 @@ fn collect_evict_rows(
     Ok(batch)
 }
 
-/// Transaction-scoped prepared statements for batched LRU eviction, avoiding
-/// re-preparing the `SELECT` and `DELETE` SQL inside multi-batch loops.
+/// Transaction-scoped cached prepared statements for batched LRU eviction,
+/// avoiding re-preparing the `SELECT` and `DELETE` SQL across batches.
 pub(super) struct TileEvictor<'tx> {
-    select_batch: Statement<'tx>,
-    delete_meta: Statement<'tx>,
+    select_batch: CachedStatement<'tx>,
+    delete_meta: CachedStatement<'tx>,
     protect_id: Option<i64>,
 }
 
@@ -271,8 +273,8 @@ impl<'tx> TileEvictor<'tx> {
             SELECT_EVICT_BATCH_SQL
         };
         Ok(Self {
-            select_batch: tx.prepare(select_sql)?,
-            delete_meta: tx.prepare(DELETE_META_BY_ID_SQL)?,
+            select_batch: tx.prepare_cached(select_sql)?,
+            delete_meta: tx.prepare_cached(DELETE_META_BY_ID_SQL)?,
             protect_id,
         })
     }
@@ -298,7 +300,7 @@ impl<'tx> TileEvictor<'tx> {
 }
 
 pub(super) fn read_cache_meta_totals(conn: &Connection) -> Result<(u64, u64), rusqlite::Error> {
-    let mut stmt = conn.prepare(READ_CACHE_META_SQL)?;
+    let mut stmt = conn.prepare_cached(READ_CACHE_META_SQL)?;
     let (total_bytes, tile_count): (i64, i64) =
         stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok((total_bytes.max(0) as u64, tile_count.max(0) as u64))
@@ -309,7 +311,7 @@ pub(super) fn set_cache_meta_totals(
     total_bytes: u64,
     tile_count: u64,
 ) -> Result<(), rusqlite::Error> {
-    let mut stmt = tx.prepare(SET_CACHE_META_SQL)?;
+    let mut stmt = tx.prepare_cached(SET_CACHE_META_SQL)?;
     stmt.execute(params![total_bytes as i64, tile_count as i64])?;
     Ok(())
 }
@@ -319,7 +321,7 @@ fn decrement_cache_meta(
     removed_bytes: i64,
     removed_count: i64,
 ) -> Result<(), rusqlite::Error> {
-    let mut stmt = tx.prepare(DECREMENT_CACHE_META_SQL)?;
+    let mut stmt = tx.prepare_cached(DECREMENT_CACHE_META_SQL)?;
     stmt.execute(params![removed_bytes, removed_count])?;
     Ok(())
 }

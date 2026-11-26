@@ -180,16 +180,27 @@ impl PipelineState {
     pub(in crate::fetcher) fn set_active_spec(
         &mut self,
         spec: Option<LiveBasemapSpec>,
-    ) -> Option<Vec<CancelToken>> {
+    ) -> Option<(Vec<CancelToken>, Vec<String>)> {
         if self.active_spec.as_deref() == spec.as_ref() {
             return None;
+        }
+        let mut hosts = Vec::new();
+        if let Some(old) = &self.active_spec {
+            hosts.extend(old.hosts().iter().cloned());
+        }
+        if let Some(new) = &spec {
+            for h in new.hosts() {
+                if !hosts.contains(h) {
+                    hosts.push(h.clone());
+                }
+            }
         }
         self.active_spec = spec.map(Arc::new);
         self.last_wanted.clear();
         self.pending.clear();
         self.failures.clear();
         self.counters.reset_errors();
-        Some(self.in_flight.drain_tokens())
+        Some((self.in_flight.drain_tokens(), hosts))
     }
 
     pub(in crate::fetcher) fn reconcile_wanted<F>(
@@ -257,15 +268,17 @@ impl PipelineState {
         Some(cancelled)
     }
 
-    pub(in crate::fetcher) fn retry_failed(&mut self) {
+    pub(in crate::fetcher) fn retry_failed(&mut self) -> Vec<String> {
         let entries = self.failures.drain_for_retry();
         self.counters.reset_errors();
 
         let Some(spec) = self.active_spec.as_ref() else {
-            return;
+            return Vec::new();
         };
+        let hosts = spec.hosts().to_vec();
         let active_source = spec.source_id();
         self.requeue_eligible_entries(active_source, entries, |_| false);
+        hosts
     }
 
     pub(in crate::fetcher) fn status(&self) -> NetworkStatus {

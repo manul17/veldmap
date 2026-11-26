@@ -14,7 +14,7 @@ use thiserror::Error;
 use super::footprint::{FootprintBounds, frame_coords};
 use super::shapes::{GeoPoint, Polygon};
 
-pub use export::export_geojson_feature_collection;
+pub use export::{export_geojson_feature_collection, export_geojson_geometry, export_wkt_geometry};
 pub use mesh::{DEFAULT_VECTOR_MAX_CHORD_DEG, VectorCluster, VectorMesh, VectorVertex};
 pub use parse::parse_geojson;
 
@@ -75,6 +75,42 @@ impl GeoJsonFeature {
         self.properties.insert(key.into(), Value::from(value));
         self
     }
+
+    /// Number of stored JSON properties on this feature.
+    pub fn property_count(&self) -> usize {
+        self.properties.len()
+    }
+
+    /// Read-only access to the raw JSON property map.
+    pub fn properties(&self) -> &Map<String, Value> {
+        &self.properties
+    }
+
+    /// Look up a string property by key.
+    pub fn property_str(&self, key: &str) -> Option<&str> {
+        self.properties.get(key).and_then(Value::as_str)
+    }
+
+    /// Look up a numeric property by key as `f64`.
+    pub fn property_f64(&self, key: &str) -> Option<f64> {
+        self.properties.get(key).and_then(Value::as_f64)
+    }
+
+    /// Render stored properties as `(key, display_value)` pairs for UI panels
+    /// without requiring downstream crates to depend on `serde_json`.
+    pub fn property_display_pairs(&self) -> Vec<(String, String)> {
+        self.properties
+            .iter()
+            .map(|(k, v)| {
+                let text = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Null => "null".to_string(),
+                    other => other.to_string(),
+                };
+                (k.clone(), text)
+            })
+            .collect()
+    }
 }
 
 /// Parsed collection of GeoJSON features.
@@ -91,6 +127,29 @@ impl GeoJsonFeatureCollection {
             collect_geometry_points(&feature.geometry, &mut pts);
         }
         frame_coords(pts.iter().map(|p| (p.lat, p.lon)))
+    }
+
+    /// Axis-aligned WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]`
+    /// across all finite vertices in the collection.
+    pub fn bbox(&self) -> Option<[f64; 4]> {
+        let mut pts = Vec::new();
+        for feature in &self.features {
+            collect_geometry_points(&feature.geometry, &mut pts);
+        }
+        let mut min_lon = f64::INFINITY;
+        let mut min_lat = f64::INFINITY;
+        let mut max_lon = f64::NEG_INFINITY;
+        let mut max_lat = f64::NEG_INFINITY;
+        for p in pts {
+            if !p.lat.is_finite() || !p.lon.is_finite() {
+                continue;
+            }
+            min_lon = min_lon.min(p.lon);
+            min_lat = min_lat.min(p.lat);
+            max_lon = max_lon.max(p.lon);
+            max_lat = max_lat.max(p.lat);
+        }
+        (min_lon.is_finite() && min_lat.is_finite()).then_some([min_lon, min_lat, max_lon, max_lat])
     }
 }
 

@@ -33,10 +33,10 @@ pub use image_codec::{has_jpeg_magic, has_png_magic};
 pub use mipmap::generate_tile_mipmaps;
 pub use open::{OpenedRaster, SidecarReader, open_raster};
 pub use pipeline::{
-    AdmittedPass, AdmittedTile, BandInfo, BandSample, BandStats, DISPLAY_STREAM_SPEC,
+    AdmittedPass, AdmittedTile, BandInfo, BandSample, BandStats, ByteRange, DISPLAY_STREAM_SPEC,
     DecodeContext, GeoPlacement, GeoTie, HISTOGRAM_BINS, LevelPlan, MAX_SOURCE_SIDE, PlacementCrs,
     PyramidMeta, RasterDescription, RasterSource, SampleType, ServeMode, SharedChunkCache,
-    TileEmit, TileFailureOutcome, TileScheduler, frame_from_description,
+    TileEmit, TileFailureOutcome, TileScheduler, coalesce_byte_ranges, frame_from_description,
     frame_from_description_with_override, stream_spec_for_band,
 };
 pub use pool::{
@@ -105,6 +105,8 @@ pub enum RasterError {
     },
     #[error("georeference binding error: {0}")]
     Binding(String),
+    #[error("remote raster is not cloud-optimized (requires whole-file pass): {0}")]
+    RemotePassUnsupported(String),
 }
 
 impl RasterError {
@@ -124,7 +126,8 @@ impl RasterError {
             | Self::InvalidDimensions { .. }
             | Self::LimitExceeded { .. }
             | Self::TileOutOfRange { .. }
-            | Self::Binding(_) => true,
+            | Self::Binding(_)
+            | Self::RemotePassUnsupported(_) => true,
             Self::Cancelled
             | Self::Budget(BudgetError::Cancelled)
             | Self::DecoderPanicked(_)

@@ -2,7 +2,12 @@
 //! `Rgba8UnormSrgb` display tiles; byte-shuffled `TileBlobEncoding::Lz4Raw` for
 //! `R32Float` / `R8Uint` / `R16Uint` scientific & categorical tiles).
 
-use veldmap_core::sync::CancelToken;
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use veldmap_core::sync::{CancelToken, lock_unpoisoned, wait_unpoisoned};
 use veldmap_core::tile::{DecodedTile, PixelFormat};
 use veldmap_raster::{
     MAX_LZ4_RAW_DECODED_BYTES, MAX_QOI_DECODED_BYTES, decode_lz4_raw_tile, decode_qoi_rgba8,
@@ -11,11 +16,20 @@ use veldmap_raster::{
 use veldmap_storage::{DiskTileKey, TileBlobEncoding, TileDiskCache};
 
 /// Maximum tiles buffered before committing a single SQLite batch write during
-/// `ServeMode::Pass`.
+/// `ServeMode::Pass` or offloaded pointwise tile persistence.
 const PASS_BATCH_MAX_TILES: usize = 16;
 
 /// Maximum encoded bytes buffered before flushing a batch write (`4 MiB`).
 const PASS_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum pending mip-0 tiles queued for [`TileWriteWorker`] before
+/// non-blocking enqueue drops excess persistence writes (never stalling
+/// `fast_pool`).
+const TILE_WRITE_QUEUE_CAPACITY: usize = 64;
+
+/// Maximum coalescing window waited by [`TileWriteWorker`] after receiving the
+/// first tile of a batch before committing to SQLite (`50 ms`).
+const TILE_WRITE_COALESCE_WINDOW: Duration = Duration::from_millis(50);
 
 fn encoding_for_format(format: PixelFormat) -> TileBlobEncoding {
     match format {
@@ -101,22 +115,6 @@ pub(super) fn load_cached_tile(
     }
 }
 
-/// Encode and persist one mip-0 overlay tile (`Qoi` or `Lz4Raw`) into `disk`
-/// unless caching is disabled or `cancel` has fired.
-pub(super) fn store_cached_tile(
-    disk: &TileDiskCache,
-    disk_key: &DiskTileKey,
-    tile: &DecodedTile,
-    cancel: &CancelToken,
-) {
-    if disk.max_bytes() == 0 || cancel.is_cancelled() {
-        return;
-    }
-    if let Some((encoding, encoded)) = encode_tile_blob(tile) {
-        let _ = disk.put_encoded_if_uncancelled(disk_key, encoding, &encoded, cancel);
-    }
-}
-
 /// Bounded write buffer amortizing SQLite WAL commits across sequential-pass
 /// tile emissions (`Qoi` or `Lz4Raw`).
 pub(super) struct TileWriteBatch {
@@ -171,4 +169,216 @@ impl TileWriteBatch {
         self.entries.clear();
         self.bytes = 0;
     }
+}
+
+struct PendingTileWrite {
+    disk_key: DiskTileKey,
+    tile: DecodedTile,
+    cancel: CancelToken,
+}
+
+struct WriteQueueInner {
+    items: VecDeque<PendingTileWrite>,
+    closed: bool,
+}
+
+type SharedWriteQueue = Arc<(Mutex<WriteQueueInner>, Condvar)>;
+
+/// Non-blocking handle for offloading pointwise tile QOI/LZ4 encoding and
+/// batched SQLite disk-cache persistence off `fast_pool`.
+#[derive(Clone)]
+pub(super) struct TileWriteHandle {
+    shared: SharedWriteQueue,
+}
+
+impl TileWriteHandle {
+    /// Enqueue a pre-cloned mip-0 [`DecodedTile`] for off-thread encoding and
+    /// SQLite persistence. Strictly non-blocking: drops the write if the
+    /// bounded queue (`64` tiles) is saturated, closed, or `cancel` fired.
+    pub(super) fn enqueue_mip0_tile(
+        &self,
+        disk_key: DiskTileKey,
+        mip0: DecodedTile,
+        cancel: &CancelToken,
+    ) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let (lock, cvar) = &*self.shared;
+        let mut queue = lock_unpoisoned(lock);
+        if queue.closed || queue.items.len() >= TILE_WRITE_QUEUE_CAPACITY {
+            return;
+        }
+        queue.items.push_back(PendingTileWrite {
+            disk_key,
+            tile: mip0,
+            cancel: cancel.clone(),
+        });
+        cvar.notify_one();
+    }
+}
+
+/// Dedicated background worker (`"veldmap-tile-write"`) that batches pointwise
+/// overlay tile QOI/LZ4 encoding and SQLite commits off `fast_pool`, with zero
+/// idle wakeups and deterministic shutdown joining.
+pub(super) struct TileWriteWorker {
+    shared: SharedWriteQueue,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TileWriteWorker {
+    pub(super) fn spawn(
+        disk: Arc<TileDiskCache>,
+        shutdown: CancelToken,
+    ) -> (Self, TileWriteHandle) {
+        let shared = Arc::new((
+            Mutex::new(WriteQueueInner {
+                items: VecDeque::with_capacity(PASS_BATCH_MAX_TILES),
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_shared = Arc::clone(&shared);
+        let builder = thread::Builder::new().name("veldmap-tile-write".to_owned());
+        let handle = match builder.spawn(move || {
+            run_tile_write_worker(worker_shared, disk, shutdown);
+        }) {
+            Ok(h) => Some(h),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to spawn veldmap-tile-write worker; pointwise disk caching disabled"
+                );
+                let (lock, _) = &*shared;
+                lock_unpoisoned(lock).closed = true;
+                None
+            }
+        };
+        let producer = TileWriteHandle {
+            shared: Arc::clone(&shared),
+        };
+        (Self { shared, handle }, producer)
+    }
+
+    pub(super) fn close(&self) {
+        let (lock, cvar) = &*self.shared;
+        let mut queue = lock_unpoisoned(lock);
+        queue.closed = true;
+        cvar.notify_all();
+    }
+
+    pub(super) fn join(&mut self) {
+        self.close();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for TileWriteWorker {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+fn run_tile_write_worker(
+    shared: SharedWriteQueue,
+    disk: Arc<TileDiskCache>,
+    shutdown: CancelToken,
+) {
+    let mut batch: Vec<PendingTileWrite> = Vec::with_capacity(PASS_BATCH_MAX_TILES);
+    let mut encoded: Vec<(DiskTileKey, TileBlobEncoding, Vec<u8>, CancelToken)> =
+        Vec::with_capacity(PASS_BATCH_MAX_TILES);
+
+    loop {
+        batch.clear();
+        {
+            let (lock, cvar) = &*shared;
+            let mut queue = lock_unpoisoned(lock);
+            while queue.items.is_empty() && !queue.closed && !shutdown.is_cancelled() {
+                queue = wait_unpoisoned(cvar, queue);
+            }
+            if shutdown.is_cancelled() || (queue.closed && queue.items.is_empty()) {
+                return;
+            }
+            if let Some(first) = queue.items.pop_front() {
+                batch.push(first);
+            }
+            let deadline = Instant::now() + TILE_WRITE_COALESCE_WINDOW;
+            while batch.len() < PASS_BATCH_MAX_TILES && !shutdown.is_cancelled() {
+                while batch.len() < PASS_BATCH_MAX_TILES {
+                    if let Some(next) = queue.items.pop_front() {
+                        batch.push(next);
+                    } else {
+                        break;
+                    }
+                }
+                if batch.len() >= PASS_BATCH_MAX_TILES || queue.closed {
+                    break;
+                }
+                let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                if rem.is_zero() {
+                    break;
+                }
+                let (next_guard, wait_res) = match cvar.wait_timeout(queue, rem) {
+                    Ok(pair) => pair,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                queue = next_guard;
+                if wait_res.timed_out() {
+                    while batch.len() < PASS_BATCH_MAX_TILES {
+                        if let Some(next) = queue.items.pop_front() {
+                            batch.push(next);
+                        } else {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if shutdown.is_cancelled() || disk.max_bytes() == 0 {
+            continue;
+        }
+
+        encoded.clear();
+        let mut encoded_bytes = 0usize;
+        for item in batch.drain(..) {
+            if shutdown.is_cancelled() || item.cancel.is_cancelled() {
+                continue;
+            }
+            if let Some((enc, bytes)) = encode_tile_blob(&item.tile) {
+                encoded_bytes = encoded_bytes.saturating_add(bytes.len());
+                encoded.push((item.disk_key, enc, bytes, item.cancel));
+                if encoded_bytes >= PASS_BATCH_MAX_BYTES {
+                    flush_encoded_batch(&disk, &mut encoded, &shutdown);
+                    encoded_bytes = 0;
+                }
+            }
+        }
+        flush_encoded_batch(&disk, &mut encoded, &shutdown);
+    }
+}
+
+fn flush_encoded_batch(
+    disk: &TileDiskCache,
+    encoded: &mut Vec<(DiskTileKey, TileBlobEncoding, Vec<u8>, CancelToken)>,
+    shutdown: &CancelToken,
+) {
+    if encoded.is_empty() || shutdown.is_cancelled() || disk.max_bytes() == 0 {
+        encoded.clear();
+        return;
+    }
+    let refs: Vec<(&DiskTileKey, TileBlobEncoding, &[u8])> = encoded
+        .iter()
+        .filter(|(_, _, _, cancel)| !cancel.is_cancelled())
+        .map(|(k, enc, bytes, _)| (k, *enc, bytes.as_slice()))
+        .collect();
+    if !refs.is_empty() {
+        let _ = disk.put_encoded_batch_if_uncancelled(&refs, shutdown);
+    }
+    encoded.clear();
 }

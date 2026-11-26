@@ -9,7 +9,7 @@ use super::uniforms::{
     CameraUniform, CategoricalPatchUniform, OverlayPatchUniform, PaletteUniform,
     ScientificPatchUniform, TileUniform, VectorUniform,
 };
-use super::vector::GpuVectorVertex;
+use super::vector::{GpuRibbonSegment, GpuVectorVertex};
 use super::{
     COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL, OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL,
     VECTOR_WGSL,
@@ -416,11 +416,11 @@ fn create_vector_pipelines(
         &vector_shader,
         &vector_pipeline_layout,
         GlobePipelineSpec {
-            label: "vector polyline stroke pipeline (depth-less)",
-            vertex_entry: "vs_main",
-            vertex_layout: GpuVectorVertex::LAYOUT,
+            label: "vector HiDPI ribbon stroke pipeline (depth-less)",
+            vertex_entry: "vs_ribbon",
+            vertex_layout: GpuRibbonSegment::INSTANCE_LAYOUT,
             fragment_entry: "fs_vector",
-            topology: wgpu::PrimitiveTopology::LineList,
+            topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: None,
             blend: wgpu::BlendState::ALPHA_BLENDING,
             depth_stencil: None,

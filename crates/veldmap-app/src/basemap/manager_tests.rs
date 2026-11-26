@@ -2,7 +2,7 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::tile::{DecodedTile, GlobeScheme, PixelFormat, TileScheme, traverse};
 use veldmap_net::test_support::decode_completion_channel;
-use veldmap_net::{DecodeFailure, DecodeRequest};
+use veldmap_net::{DecodeFailure, DecodeRequest, NetConfig, NetContext};
 use veldmap_raster::{DecodePool, DecodePoolConfig, TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::StoragePaths;
 use veldmap_storage::test_support::TestTempDir;
@@ -16,6 +16,7 @@ use crate::storage::settings::AppSettings;
 struct BasemapTestHarness {
     _root: Option<TestTempDir>,
     storage: Option<AppStorage>,
+    net: Option<Arc<NetContext>>,
     pending: PendingUploads,
     tx: UploadSender,
     decode_shutdown: CancelToken,
@@ -34,6 +35,7 @@ impl BasemapTestHarness {
         }
         let wakeup: Wakeup = Arc::new(|| {});
         let storage = AppStorage::open(Arc::clone(&wakeup), Some(paths));
+        let net = Arc::new(NetContext::new(NetConfig::default()).expect("net context"));
         let pending = PendingUploads::new();
         let tx = pending.sender().expect("sender");
         let decode_shutdown = CancelToken::new();
@@ -44,6 +46,8 @@ impl BasemapTestHarness {
         let manager = BasemapManager::new(
             storage.settings().basemap_config(),
             storage.disk_cache(),
+            Some(Arc::clone(&net)),
+            None,
             tx.clone(),
             wakeup,
             decode_pool.fast_handle(),
@@ -52,6 +56,7 @@ impl BasemapTestHarness {
         Self {
             _root: Some(root),
             storage: Some(storage),
+            net: Some(net),
             pending,
             tx,
             decode_shutdown,
@@ -62,6 +67,7 @@ impl BasemapTestHarness {
 
     fn without_storage(settings: &AppSettings) -> Self {
         let wakeup: Wakeup = Arc::new(|| {});
+        let net = Arc::new(NetContext::new(NetConfig::default()).expect("net context"));
         let pending = PendingUploads::new();
         let tx = pending.sender().expect("sender");
         let decode_shutdown = CancelToken::new();
@@ -72,6 +78,8 @@ impl BasemapTestHarness {
         let manager = BasemapManager::new(
             settings.basemap_config(),
             None,
+            Some(Arc::clone(&net)),
+            None,
             tx.clone(),
             wakeup,
             decode_pool.fast_handle(),
@@ -80,6 +88,7 @@ impl BasemapTestHarness {
         Self {
             _root: None,
             storage: None,
+            net: Some(net),
             pending,
             tx,
             decode_shutdown,
@@ -92,6 +101,9 @@ impl BasemapTestHarness {
 impl Drop for BasemapTestHarness {
     fn drop(&mut self) {
         self.manager.begin_shutdown();
+        if let Some(net) = &self.net {
+            net.signal_shutdown();
+        }
         if let Some(storage) = &mut self.storage {
             storage.begin_shutdown();
         }
@@ -101,6 +113,9 @@ impl Drop for BasemapTestHarness {
             pool.shutdown();
         }
         self.manager.finish_shutdown();
+        if let Some(net) = self.net.take() {
+            net.shutdown();
+        }
         if let Some(storage) = &mut self.storage {
             storage.finish_shutdown();
         }
