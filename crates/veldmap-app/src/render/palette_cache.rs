@@ -1,6 +1,6 @@
 //! Cached 256-entry linear-light GPU palette LUT uniform buffers and bind
-//! groups shared across scientific (`R32Float`) and categorical
-//! (`R8Uint`/`R16Uint`) overlay draws.
+//! groups shared across scientific (`R32Float`), categorical
+//! (`R8Uint`/`R16Uint`), and Band Math composite overlay draws.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};

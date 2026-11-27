@@ -1,5 +1,6 @@
 //! Shared cancellable, panic-safe singleflight orchestration used by
-//! [`super::chunk_cache`] and lazy display-mapping stretch computation.
+//! [`super::chunk_cache`], lazy display-mapping stretch computation, and
+//! per-band physical statistics (`BandStatsCache`).
 
 use std::collections::HashMap;
 use std::hash::Hash;

@@ -267,12 +267,6 @@ impl SceneState {
         self.mark_dirty();
     }
 
-    /// Release cached `Arc<DrawSnapshot>` references when the viewport is
-    /// collapsed/minimized so evicted `GpuTile` textures are not pinned.
-    pub(crate) fn clear_cached_snapshot(&mut self) {
-        self.cached_snapshot = None;
-    }
-
     /// Read-only access to the basemap coordinator (all mutations stay on
     /// `SceneState` to preserve `scene_generation` and cache invariants).
     pub(crate) fn basemap(&self) -> &BasemapManager {
@@ -332,10 +326,23 @@ impl SceneState {
         Ok((id, bounds))
     }
 
+    fn sync_gpu_tile_cache_cap(&mut self) -> bool {
+        let effective = effective_gpu_tile_cache_cap(
+            self.total_gpu_vram_budget_bytes,
+            self.reserved_target_vram_bytes,
+        );
+        if self.gpu_tile_cache.max_bytes() != effective {
+            self.gpu_tile_cache.set_max_bytes(effective);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Dynamically adjust `GpuTileCache`'s effective byte cap to account for
     /// the current viewport `OffscreenTarget` + active Band Math scratch pool
     /// VRAM while preserving [`MIN_GPU_TILE_CACHE_FLOOR_BYTES`].
-    pub(crate) fn update_viewport_target_vram(&mut self, width_px: u32, height_px: u32) {
+    fn update_viewport_target_vram(&mut self, width_px: u32, height_px: u32) {
         self.last_viewport_px = (width_px, height_px);
         self.sync_viewport_target_vram();
     }
@@ -348,11 +355,16 @@ impl SceneState {
             return;
         }
         self.reserved_target_vram_bytes = reserved;
-        let effective = effective_gpu_tile_cache_cap(self.total_gpu_vram_budget_bytes, reserved);
-        if self.gpu_tile_cache.max_bytes() != effective {
-            self.gpu_tile_cache.set_max_bytes(effective);
+        if self.sync_gpu_tile_cache_cap() {
             self.mark_dirty();
         }
+    }
+
+    /// Reclaim reserved viewport/scratch VRAM accounting and drop the cached
+    /// frame snapshot when the globe viewport collapses to zero area.
+    pub(crate) fn on_viewport_collapsed(&mut self) {
+        self.update_viewport_target_vram(0, 0);
+        self.cached_snapshot = None;
     }
 
     /// Mutate the geodesic measurement session and mark the scene dirty
@@ -514,13 +526,7 @@ impl SceneState {
         let next_total_vram =
             gpu_tile_cache_override_bytes.unwrap_or(self.default_gpu_tile_cache_bytes);
         self.total_gpu_vram_budget_bytes = next_total_vram;
-        let next_gpu_cap =
-            effective_gpu_tile_cache_cap(next_total_vram, self.reserved_target_vram_bytes);
-        let mut gpu_changed = false;
-        if self.gpu_tile_cache.max_bytes() != next_gpu_cap {
-            self.gpu_tile_cache.set_max_bytes(next_gpu_cap);
-            gpu_changed = true;
-        }
+        let gpu_changed = self.sync_gpu_tile_cache_cap();
         let outcome = self.basemap.sync_settings(basemap_config);
         if let Some(evict) = outcome.evict_source {
             self.purge_source_caches(evict);
@@ -607,6 +613,7 @@ impl SceneState {
         pixels_per_point: f32,
         show_graticule: bool,
     ) -> Arc<DrawSnapshot> {
+        self.update_viewport_target_vram(width_px, height_px);
         let key = SnapshotKey::new(
             &camera,
             [width_px, height_px],

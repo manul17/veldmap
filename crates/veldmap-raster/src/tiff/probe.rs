@@ -18,40 +18,39 @@ use crate::pipeline::{
 };
 
 use super::chunk_reader::{ChunkReadMode, TiffChunkReader};
-use super::ifd::{CachedIfd, ChunkDims, ChunkPixelLoc, TiffSourceView};
+use super::ifd::{CachedIfd, ChunkDims, ChunkPixelLoc};
 use super::raw_decode::{RawChunkPayload, decode_raw_chunk};
+use super::view::TiffSourceView;
 
 /// Maximum decoded bytes allowed for a single base-IFD chunk during interactive
 /// cursor readouts (`16 MiB`).
 const MAX_CURSOR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 
-impl TiffSourceView<'_> {
-    /// Fetch base-IFD chunk `chunk_index` for `spec`, staying strictly
-    /// cache-only for remote sources and evaluating `get_mapping` lazily only
-    /// on local decode paths.
-    fn fetch_base_chunk(
-        &self,
-        spec: TileStreamSpec,
-        chunk_index: u32,
-        get_mapping: impl FnOnce() -> Result<Option<DisplayMapping>, RasterError>,
-        ctx: &DecodeContext<'_>,
-    ) -> Result<Option<Arc<DecodedChunk>>, RasterError> {
-        if self.access.byte_source.is_remote() {
-            let key = ChunkKey::from_spec(self.source_id, spec, 0, chunk_index);
-            return Ok(ctx.chunk_cache.get_cached(&key));
-        }
-        let display_mapping = get_mapping()?;
-        let mut reader = TiffChunkReader::new(
-            *self,
-            spec,
-            display_mapping,
-            ChunkReadMode::Pointwise {
-                chunk_cache: ctx.chunk_cache,
-                budget_tracker: ctx.budget_tracker,
-            },
-        );
-        reader.chunk(0, chunk_index, ctx.cancel).map(Some)
+/// Fetch base-IFD chunk `chunk_index` for `spec`, staying strictly cache-only
+/// for remote sources and evaluating `get_mapping` lazily only on local decode
+/// paths.
+fn fetch_base_chunk(
+    view: TiffSourceView<'_>,
+    spec: TileStreamSpec,
+    chunk_index: u32,
+    get_mapping: impl FnOnce() -> Result<Option<DisplayMapping>, RasterError>,
+    ctx: &DecodeContext<'_>,
+) -> Result<Option<Arc<DecodedChunk>>, RasterError> {
+    if view.access.byte_source.is_remote() {
+        let key = ChunkKey::from_spec(view.source_id, spec, 0, chunk_index);
+        return Ok(ctx.chunk_cache.get_cached(&key));
     }
+    let display_mapping = get_mapping()?;
+    let mut reader = TiffChunkReader::new(
+        view,
+        spec,
+        display_mapping,
+        ChunkReadMode::Pointwise {
+            chunk_cache: ctx.chunk_cache,
+            budget_tracker: ctx.budget_tracker,
+        },
+    );
+    reader.chunk(0, chunk_index, ctx.cancel).map(Some)
 }
 
 fn admit_cursor_chunk_bytes(
@@ -133,7 +132,8 @@ pub(super) fn sample_display_rgba(
     let loc = base.chunk_loc(px, py)?;
     admit_cursor_chunk_bytes(ctx, loc.dims, base.raw_pixel_bytes(), 4)?;
 
-    let Some(chunk) = view.fetch_base_chunk(
+    let Some(chunk) = fetch_base_chunk(
+        view,
         DISPLAY_STREAM_SPEC,
         loc.chunk_index,
         || get_mapping().map(Some),
@@ -206,7 +206,7 @@ fn sample_cached_band(
         base.band_raw_pixel_bytes(),
         spec.format.bytes_per_pixel() as u32,
     )?;
-    let Some(chunk) = view.fetch_base_chunk(spec, loc.chunk_index, || Ok(None), ctx)? else {
+    let Some(chunk) = fetch_base_chunk(view, spec, loc.chunk_index, || Ok(None), ctx)? else {
         return Ok(BandSample::Unavailable);
     };
     if loc.local_x >= chunk.width || loc.local_y >= chunk.height {

@@ -21,8 +21,9 @@ use super::chunk_convert::{
     convert_interleaved_planar_display, convert_scientific_chunk, expand_palette_to_rgba,
     palette_alpha_mode, scatter_plane_into_interleaved, sparse_categorical_chunk,
 };
-use super::ifd::{CachedIfd, Photometric, PlanarConfig, TiffSourceView, find_ifd};
+use super::ifd::{CachedIfd, Photometric, PlanarConfig};
 use super::raw_decode::{RawChunkPayload, decode_raw_chunk};
+use super::view::{TiffSourceView, find_ifd};
 
 /// Explicitly models the two chunk-reading modes of [`TiffChunkReader`].
 pub(super) enum ChunkReadMode<'a> {
@@ -124,10 +125,9 @@ impl<'a> TiffChunkReader<'a> {
         pixels: usize,
         cancel: &CancelToken,
     ) -> Result<Vec<u8>, RasterError> {
-        let mapping = self.display_mapping.unwrap_or_else(|| {
-            DisplayMapping::identity(self.view.nodata_f64)
-                .with_invert(ifd.photometric == Photometric::WhiteIsZero)
-        });
+        let mapping = self
+            .display_mapping
+            .unwrap_or_else(|| ifd.identity_display_mapping(self.view.nodata_f64));
 
         if ifd.photometric == Photometric::Palette {
             return self.decode_palette_display_chunk(ifd, index, pixels, cancel);

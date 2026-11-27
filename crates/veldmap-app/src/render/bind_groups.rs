@@ -54,8 +54,8 @@ pub struct TileBindGroupCache {
 
 impl TileBindGroupCache {
     /// Allocate the shared format-specific bind-group layouts (`Rgba8UnormSrgb`
-    /// filterable + linear sampler, `R32Float` unfilterable `textureLoad`, and
-    /// `Uint` `textureLoad` for `R8Uint`/`R16Uint`).
+    /// filterable + linear sampler, single & 4-slot MRT `R32Float` unfilterable
+    /// `textureLoad`, and `Uint` `textureLoad` for `R8Uint`/`R16Uint`).
     pub fn new(device: &wgpu::Device) -> Self {
         let rgba8_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tile Rgba8UnormSrgb texture layout"),

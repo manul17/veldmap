@@ -261,7 +261,7 @@ pub(super) fn finish_scheduled_layer(
                     scl_asset.source().description(),
                     scl_asset.meta().spec.band,
                 )
-                .filter(|&nd| nd >= 32);
+                .filter(|&nd| nd >= super::band_math::MAX_SCL_MASK_CLASSES);
                 let scheduled = finish_single_asset(scl_asset, scl_plan, ctx);
                 (!scheduled.patches.is_empty()).then(|| DrawScratchMask {
                     frame: Arc::clone(scl_asset.geo().frame()),

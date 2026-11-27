@@ -115,7 +115,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         carrier_keys: &mut carriers,
     });
     let layer = &mgr.stack.layers()[0];
-    assert_eq!(layer.meta().max_level(), 2);
+    assert_eq!(layer.single_asset().expect("single").meta().max_level(), 2);
     let has_lvl2 = layer.wanted().iter().any(|k| k.level == 2);
     let has_lvl1 = layer.wanted().iter().any(|k| k.level == 1);
     let has_lvl0 = layer.wanted().iter().any(|k| k.level == 0);
@@ -361,7 +361,11 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
     );
     // Simulate upload completion report: must invalidate the sticky `Unavailable`
     // cursor entry so the next hover probe reads [90, 160, 230, 255] from chunk cache.
-    let stream_key = mgr.stack.layers()[0].meta().stream_key();
+    let stream_key = mgr.stack.layers()[0]
+        .single_asset()
+        .expect("single")
+        .meta()
+        .stream_key();
     let upload_report = crate::gpu_tiles::UploadBatchReport {
         uploaded: 1,
         max_tile_bytes_by_stream: vec![(stream_key, 512 * 512 * 4)],
@@ -481,7 +485,7 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
     use veldmap_core::tile::{BandKey, PixelFormat};
     use veldmap_raster::test_support::{write_rgbnir_u16_geotiff, write_scl_u8_geotiff};
 
-    use crate::colormap::{CategoricalPaletteId, sentinel2_scl_class_name};
+    use crate::colormap::CategoricalPaletteId;
     use crate::layers::layer::OverlayLayer;
     use crate::layers::{
         BandMathFormula, LayerId, LocalBandMathInput, LocalBandMathSpec, OverlayEdit,
@@ -582,6 +586,7 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
         .stack
         .get(bm_id)
         .expect("bm layer")
+        .primary_asset()
         .geo()
         .frame()
         .clone();
@@ -596,10 +601,7 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
             assert!(bm.channels[1].1.value().expect("Red").abs() < 1e-9);
             assert!(!bm.has_unavailable);
             assert_eq!(bm.scl_class, Some(9));
-            assert_eq!(
-                bm.scl_class.and_then(sentinel2_scl_class_name),
-                Some("Cloud High Prob.")
-            );
+            assert_eq!(bm.scl_class_name, Some("Cloud High Prob."));
             assert!(bm.scl_masked, "SCL class 9 must be masked by default");
         }
         other => panic!("expected BandMath readout on left, got {other:?}"),
@@ -611,14 +613,15 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
         CursorReadoutValue::BandMath(ref bm) => {
             assert!((bm.computed.expect("NDVI") - 1.0).abs() < 1e-9);
             assert_eq!(bm.scl_class, Some(4));
-            assert_eq!(
-                bm.scl_class.and_then(sentinel2_scl_class_name),
-                Some("Vegetation")
-            );
+            assert_eq!(bm.scl_class_name, Some("Vegetation"));
             assert!(!bm.scl_masked, "SCL class 4 must not be masked");
         }
         other => panic!("expected BandMath readout on right, got {other:?}"),
     }
+
+    // BandMath layers never expose a per-layer CRS override even if an input
+    // source layer carries one.
+    assert!(mgr.layer_crs_override(bm_id).is_none());
 
     // Disabling SCL mask triggers a topology change so VRAM reservation,
     // pinned root streams, and orphaned SCL jobs stay synchronized.
@@ -627,7 +630,13 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
 
     // Verify multi-source refcounting: removing rgbnir_id while bm_id still references its SourceId
     // MUST NOT purge its SourceId; removing bm_id afterward MUST purge it.
-    let rgbnir_src = mgr.stack.get(rgbnir_id).expect("rgbnir").source_id();
+    let rgbnir_src = mgr
+        .stack
+        .get(rgbnir_id)
+        .expect("rgbnir")
+        .single_asset()
+        .expect("single")
+        .source_id();
     let mut_rm_orig = mgr.edit_layer(rgbnir_id, OverlayEdit::Remove);
     assert!(
         !mut_rm_orig.purge_sources.contains(&rgbnir_src),
@@ -637,6 +646,36 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
     assert!(
         mut_rm_bm.purge_sources.contains(&rgbnir_src),
         "SourceId must be purged once the final referencing layer is removed"
+    );
+
+    // Verify categorical cursor probe cache honors Sentinel2Scl vs DistinctClasses
+    // palette switches on the exact same pixel (regression for ProbeKey::Single).
+    let scl_stream = veldmap_raster::stream_spec_for_band(BandKey::Index(0), PixelFormat::R8Uint);
+    mgr.set_layer_stream(scl_id, scl_stream)
+        .expect("switch scl to categorical");
+    let _ = mgr.edit_layer(
+        scl_id,
+        OverlayEdit::SetCategoricalPalette(CategoricalPaletteId::DistinctClasses),
+    );
+    let r_distinct = wait_for_cursor_readout(&mgr, lat_left, lon_left);
+    assert_eq!(
+        r_distinct.value,
+        CursorReadoutValue::Categorical {
+            class_id: 9,
+            class_name: None,
+        }
+    );
+    let _ = mgr.edit_layer(
+        scl_id,
+        OverlayEdit::SetCategoricalPalette(CategoricalPaletteId::Sentinel2Scl),
+    );
+    let r_scl = wait_for_cursor_readout(&mgr, lat_left, lon_left);
+    assert_eq!(
+        r_scl.value,
+        CursorReadoutValue::Categorical {
+            class_id: 9,
+            class_name: Some("Cloud High Prob."),
+        }
     );
 
     // Verify SCL asset with `is_scl: true` opens directly on PixelFormat::R8Uint + Sentinel2Scl

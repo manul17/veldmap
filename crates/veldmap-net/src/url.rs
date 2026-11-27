@@ -167,15 +167,23 @@ pub(crate) fn split_url_query_fragment(url: &str) -> (&str, Option<&str>, Option
     (base, query, frag)
 }
 
+/// Return whether two parsed URLs share the exact same `(scheme, host, port)`
+/// origin (normalizing default ports and comparing hosts case-insensitively).
+pub(crate) fn same_url_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str()
+            .zip(b.host_str())
+            .is_some_and(|(ha, hb)| ha.eq_ignore_ascii_case(hb))
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
 /// Return whether two HTTP(S) URLs share the exact same `(scheme, host, port)`
 /// origin (normalizing default ports `http -> 80` and `https -> 443`).
 pub fn same_http_origin(a: &str, b: &str) -> bool {
     let (Some(ua), Some(ub)) = (parse_http_url(a), parse_http_url(b)) else {
         return false;
     };
-    ua.scheme() == ub.scheme()
-        && ua.host_str() == ub.host_str()
-        && ua.port_or_known_default() == ub.port_or_known_default()
+    same_url_origin(&ua, &ub)
 }
 
 #[cfg(test)]

@@ -140,7 +140,12 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
     assert_eq!(ids, vec![LayerId(1), LayerId(2), LayerId(3)]);
 
     // Shared-source queries and topmost active pixel size.
-    let shared_src = stack.get(LayerId(1)).expect("layer 1").source_id();
+    let shared_src = stack
+        .get(LayerId(1))
+        .expect("layer 1")
+        .single_asset()
+        .expect("single")
+        .source_id();
     assert_eq!(stack.count_sharing_source(shared_src), 2);
     assert!(stack.has_visible_source(shared_src));
     let top_px = stack
@@ -150,7 +155,7 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
 
     // Visibility transition clears both `wanted` and `wanted_shared`.
     let l3 = stack.get_mut(LayerId(3)).expect("layer 3");
-    let tk = l3.meta().tile_key(0, 0, 0);
+    let tk = l3.single_asset().expect("single").meta().tile_key(0, 0, 0);
     l3.replace_wanted([tk]);
     assert_eq!(l3.wanted().len(), 1);
     assert_eq!(lock_unpoisoned(&l3.wanted_shared()).len(), 1);
@@ -169,7 +174,8 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
 
     // Reload lifecycle: begin_reload -> fail_reload -> begin_reload -> replace_reloaded.
     let l1 = stack.get_mut(LayerId(1)).expect("layer 1");
-    l1.replace_wanted([l1.meta().tile_key(0, 0, 0)]);
+    let l1_tk = l1.single_asset().expect("single").meta().tile_key(0, 0, 0);
+    l1.replace_wanted([l1_tk]);
     let prep1 = l1.begin_reload(CancelToken::new());
     assert!(prep1.old_cancel.is_none());
     assert_eq!(prep1.old_source, shared_src);
@@ -200,19 +206,24 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
         99,
     );
     assert_eq!(old_src, shared_src);
-    assert_eq!(l1.source_id(), new_src_id);
-    assert_eq!(l1.geo().relaid(), 99);
+    assert_eq!(l1.single_asset().expect("single").source_id(), new_src_id);
+    assert_eq!(l1.single_asset().expect("single").geo().relaid(), 99);
     assert_eq!(l1.local_path(), Some(Path::new("/tmp/reloaded.tif")));
     assert!(!l1.is_reloading());
     assert!(l1.matches_reload_seq(prep2.reload_seq));
     assert!(l1.to_summary(0, false, true, false).last_error.is_none());
 
     // Rebinding CRS increments epoch and clears errors.
-    let epoch_before = l1.geo().crs_override_epoch();
+    let epoch_before = l1
+        .single_asset()
+        .expect("single")
+        .geo()
+        .crs_override_epoch();
     l1.apply_rebound_frame(utm_frame(20.0), Some(CrsOverride::Epsg(32637)), 100);
-    assert_eq!(l1.geo().crs_override_epoch(), epoch_before + 1);
-    assert_eq!(l1.geo().crs_override(), Some(&CrsOverride::Epsg(32637)));
-    assert_eq!(l1.geo().relaid(), 100);
+    let l1_geo = l1.single_asset().expect("single").geo();
+    assert_eq!(l1_geo.crs_override_epoch(), epoch_before + 1);
+    assert_eq!(l1_geo.crs_override(), Some(&CrsOverride::Epsg(32637)));
+    assert_eq!(l1_geo.relaid(), 100);
 }
 
 #[test]
@@ -294,27 +305,53 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
         Some(make_asset(22, 0, PixelFormat::R8Uint)),
         BandMathStyle::from_preset(BandMathPreset::Ndvi, true),
     );
-    let k0 = bm.streams()[0].stream_key();
-    let k1 = bm.streams()[1].stream_key();
-    let kscl = bm.streams()[2].stream_key();
+    let stream_keys: Vec<_> = bm.streams().map(|s| s.stream_key()).collect();
+    assert_eq!(stream_keys.len(), 3);
+    let (k0, k1, kscl) = (stream_keys[0], stream_keys[1], stream_keys[2]);
     bm.observe_stream_tile_bytes(k0, 2_000_000);
     bm.observe_stream_tile_bytes(k1, 1_500_000);
     bm.observe_stream_tile_bytes(kscl, 262_144);
-    assert_eq!(bm.appetite_weight_bytes(), 2_000_000 + 1_500_000 + 262_144);
-    assert_eq!(bm.cell_observed_bytes(), 2_000_000 + 1_500_000 + 262_144);
 
-    // Disabling SCL removes it from active streams, appetite weight, and pinned roots.
-    bm.band_math_mut()
-        .unwrap()
-        .style
-        .set_scl_mask_enabled(false);
-    assert_eq!(bm.streams().len(), 2);
-    assert_eq!(bm.appetite_weight_bytes(), 2_000_000 + 1_500_000);
     let mut bm_stack = LayerStack::default();
     bm_stack.push(bm);
+    assert_eq!(
+        bm_stack.total_appetite_weight_bytes(),
+        2_000_000 + 1_500_000 + 262_144
+    );
+
+    // Adding a second layer sharing `k0` deduplicates shared StreamKeys and
+    // keeps the max observed tile weight per StreamKey.
+    let mut shared_dup = OverlayLayer::from_band_math(
+        LayerId(21),
+        "Shared Dup".to_owned(),
+        vec![
+            make_asset(21, 0, PixelFormat::R32Float),
+            make_asset(23, 0, PixelFormat::R32Float),
+        ],
+        None,
+        BandMathStyle::from_preset(BandMathPreset::Ndvi, false),
+    );
+    let k_unique = shared_dup.streams().nth(1).expect("band 1").stream_key();
+    shared_dup.observe_stream_tile_bytes(k0, 2_500_000);
+    shared_dup.observe_stream_tile_bytes(k_unique, 1_600_000);
+    bm_stack.push(shared_dup);
+    assert_eq!(
+        bm_stack.total_appetite_weight_bytes(),
+        2_500_000 + 1_500_000 + 262_144 + 1_600_000
+    );
+
+    // Disabling SCL removes it from active streams, appetite weight, and pinned roots.
+    let bm_ref = bm_stack.get_mut(LayerId(20)).expect("bm");
+    assert_eq!(bm_ref.set_band_math_scl_enabled(false), (true, Some(kscl)));
+    assert_eq!(bm_ref.active_stream_count(), 2);
+    assert_eq!(bm_ref.streams().count(), 2);
+    assert_eq!(
+        bm_stack.total_appetite_weight_bytes(),
+        2_500_000 + 1_500_000 + 1_600_000
+    );
     let mut bm_pinned = Vec::new();
     bm_stack.extend_pinned_root_streams(&mut bm_pinned);
-    assert_eq!(bm_pinned, vec![k0, k1]);
+    assert_eq!(bm_pinned, vec![k0, k1, k_unique]);
 }
 
 #[test]

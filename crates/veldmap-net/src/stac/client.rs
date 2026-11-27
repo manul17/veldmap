@@ -8,10 +8,8 @@ use serde_json::Value;
 use veldmap_core::sync::CancelToken;
 
 use crate::context::NetContext;
-use crate::http::{
-    BodyReadError, HostLimiters, link_cancel_token, parse_custom_headers, read_body_capped,
-    record_rate_limit_cooldown,
-};
+use crate::http::{BodyReadError, link_cancel_token, parse_custom_headers, read_body_capped};
+use crate::limiter::{HostLimiters, record_rate_limit_cooldown};
 use crate::redact::{EncodedSecret, redact_text_many, sanitize_url_for_display};
 use crate::url::{extract_host, is_valid_http_endpoint, split_url_query_fragment};
 
@@ -23,9 +21,6 @@ const MAX_STAC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum error body snippet bytes read on non-2xx STAC responses.
 const MAX_STAC_ERROR_SNIPPET_BYTES: usize = 512;
-
-/// Additional protocol-owned headers forbidden in STAC custom auth headers.
-const STAC_EXTRA_FORBIDDEN_HEADERS: &[&str] = &["content-type", "accept"];
 
 struct PreparedSearchRequest {
     search_url: String,
@@ -55,7 +50,7 @@ fn prepare_search_request(
     let host = extract_host(&search_url);
 
     let raw_headers = catalog.auth.extra_headers();
-    let parsed = parse_custom_headers(&raw_headers, STAC_EXTRA_FORBIDDEN_HEADERS)
+    let parsed = parse_custom_headers(&raw_headers)
         .map_err(|(name, reason)| StacError::InvalidAuthHeader { name, reason })?;
     let custom_headers = parsed.headers;
     let mut secrets = parsed.secrets;

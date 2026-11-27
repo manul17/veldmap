@@ -20,7 +20,8 @@ use veldmap_core::tile::TileStreamSpec;
 use crate::layers::{LayerId, LayerSummary, LocalBandMathSpec, OverlayEdit};
 use crate::vectors::{VectorEdit, VectorLayerId, VectorLayerSummary};
 
-use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, submitted_with_enter};
+use super::widgets::submitted_with_enter;
+use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 
 use band_math_builder::{BandMathBuilderState, has_band_math_inputs, show_band_math_builder};
 use raster_card::show_raster_card;

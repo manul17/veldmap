@@ -64,13 +64,6 @@ impl RemoteOpenGuard {
             cb(res);
         }
     }
-
-    fn resolve_err(self, msg: String) {
-        let cb = lock_unpoisoned(&self.done).take();
-        if let Some(cb) = cb {
-            cb(Err(msg));
-        }
-    }
 }
 
 impl Drop for RemoteOpenGuard {
@@ -84,13 +77,7 @@ impl Drop for RemoteOpenGuard {
     }
 }
 
-/// Spawn one remote COG HTTP Range probe + non-Tokio `remote_pool` IFD parse,
-/// invoking `on_done` exactly once (unless `cancel` is already triggered).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Internal spawn helper keeps single-COG and multi-asset recipe open paths unified."
-)]
-fn spawn_remote_asset_open<F>(
+struct RemoteAssetOpenSpec {
     net: Arc<NetContext>,
     rt: Arc<OverlayRuntime>,
     open_id: u64,
@@ -98,10 +85,23 @@ fn spawn_remote_asset_open<F>(
     extra_headers: Vec<(String, String)>,
     external_bands: Vec<ExternalBandMeta>,
     cancel: CancelToken,
-    on_done: F,
-) where
+}
+
+/// Spawn one remote COG HTTP Range probe + non-Tokio `remote_pool` IFD parse,
+/// invoking `on_done` exactly once (unless `cancel` is already triggered).
+fn spawn_remote_asset_open<F>(spec: RemoteAssetOpenSpec, on_done: F)
+where
     F: FnOnce(Result<(HttpRangeSource, Arc<dyn RasterSource>, Frame), String>) + Send + 'static,
 {
+    let RemoteAssetOpenSpec {
+        net,
+        rt,
+        open_id,
+        url,
+        extra_headers,
+        external_bands,
+        cancel,
+    } = spec;
     let done = Arc::new(Mutex::new(Some(Box::new(on_done) as RemoteOpenCallback)));
     let guard = RemoteOpenGuard {
         done: Arc::clone(&done),
@@ -151,7 +151,7 @@ fn spawn_remote_asset_open<F>(
                 done: reject_done,
                 cancel: reject_cancel,
             };
-            reject_guard.resolve_err("remote I/O pool is busy or shutting down".to_owned());
+            reject_guard.resolve(Err("remote I/O pool is busy or shutting down".to_owned()));
         });
     });
 }
@@ -296,13 +296,15 @@ impl RemoteOpenTracker {
         let cancel = runtime.shutdown.child_token();
 
         spawn_remote_asset_open(
-            net,
-            Arc::clone(runtime),
-            open_id,
-            trimmed,
-            extra_headers,
-            external_bands,
-            cancel,
+            RemoteAssetOpenSpec {
+                net,
+                rt: Arc::clone(runtime),
+                open_id,
+                url: trimmed,
+                extra_headers,
+                external_bands,
+                cancel,
+            },
             move |outcome| {
                 let _ = tx.send(RemoteOpenResult::Single {
                     title,
@@ -395,13 +397,15 @@ impl RemoteOpenTracker {
             let open_id = self.alloc_open_id();
             let col = Arc::clone(&collector);
             spawn_remote_asset_open(
-                net,
-                Arc::clone(runtime),
-                open_id,
-                trimmed,
-                extra_headers,
-                external_bands,
-                cancel,
+                RemoteAssetOpenSpec {
+                    net,
+                    rt: Arc::clone(runtime),
+                    open_id,
+                    url: trimmed,
+                    extra_headers,
+                    external_bands,
+                    cancel,
+                },
                 move |res| {
                     let mapped = res
                         .map(|(range_source, source, frame)| OpenedRemoteBandAsset {

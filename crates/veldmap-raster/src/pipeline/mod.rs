@@ -23,8 +23,8 @@ pub use binding::{frame_from_description, frame_from_description_with_override};
 pub use cascade::TileEmit;
 pub use chunk_cache::SharedChunkCache;
 pub use metadata::{
-    BandInfo, BandSample, BandStats, GeoPlacement, GeoTie, HISTOGRAM_BINS, PlacementCrs,
-    RasterDescription, SampleType,
+    BandInfo, BandSample, BandStats, ExternalBandMeta, GeoPlacement, GeoTie, HISTOGRAM_BINS,
+    PlacementCrs, RasterDescription, SampleType,
 };
 pub use plan::{
     DISPLAY_STREAM_SPEC, LevelPlan, MAX_SOURCE_SIDE, PyramidMeta, ServeMode, stream_spec_for_band,
@@ -43,11 +43,9 @@ pub(crate) use metadata::is_valid_lat_lon;
 pub(crate) use plan::{build_chunked_level_table, check_max_source_side};
 pub(crate) use radiometry::{
     DisplayMapping, PixelLayout, STRETCH_SAMPLES, compute_band_stats, expand_u8_into_rgba,
-    is_data_f64, percentile_stretch, raw_bytes_to_rgba, read_native_sample_f64,
+    is_data_f64, normalize_alpha_u8, percentile_stretch, raw_bytes_to_rgba, read_native_sample_f64,
 };
-pub(crate) use resample::{
-    DownsampleRounding, Window, downsample_r32f_2x, downsample_rgba8_2x, resample_rgba8_window,
-};
+pub(crate) use resample::{Window, resample_rgba8_window};
 pub(crate) use singleflight::SingleflightMap;
 
 /// Shared runtime context passed into analytical raster decoding calls.

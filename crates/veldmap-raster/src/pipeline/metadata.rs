@@ -79,6 +79,27 @@ pub struct BandStats {
     pub db_histogram: [u32; HISTOGRAM_BINS],
 }
 
+/// External per-band radiometric metadata (e.g., from STAC `raster:bands`)
+/// applied to bands of a GeoTIFF/COG source whose embedded metadata did not
+/// declare the corresponding fields.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExternalBandMeta {
+    pub scale: Option<f64>,
+    pub offset: Option<f64>,
+    pub nodata: Option<f64>,
+    pub unit: Option<String>,
+}
+
+impl ExternalBandMeta {
+    /// Return whether at least one external metadata field is populated.
+    pub fn has_any(&self) -> bool {
+        self.scale.is_some()
+            || self.offset.is_some()
+            || self.nodata.is_some()
+            || self.unit.as_deref().is_some_and(|u| !u.trim().is_empty())
+    }
+}
+
 /// Metadata for one display composite or scientific/categorical band in a
 /// raster source.
 #[derive(Clone, Debug, PartialEq)]

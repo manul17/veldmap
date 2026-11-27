@@ -13,28 +13,13 @@ use crate::url::{split_url_query_fragment, strip_http_scheme};
 const AWS_EARTH_SEARCH_V1_ENDPOINT: &str = "https://earth-search.aws.element84.com/v1";
 
 /// Sentinel-2 L2A Cloud-Optimized GeoTIFF collection ID on AWS Earth Search.
-pub(super) const COLLECTION_SENTINEL2_L2A: &str = "sentinel-2-l2a";
+const COLLECTION_SENTINEL2_L2A: &str = "sentinel-2-l2a";
 
 /// Copernicus DEM GLO-30 Cloud-Optimized GeoTIFF collection ID on AWS Earth Search.
-pub(super) const COLLECTION_COP_DEM_GLO30: &str = "cop-dem-glo-30";
+const COLLECTION_COP_DEM_GLO30: &str = "cop-dem-glo-30";
 
 /// Maximum items requested in a single STAC search call.
 pub(super) const MAX_STAC_SEARCH_LIMIT: usize = 100;
-
-/// Combine optional radiometric `(scale, offset)` metadata into a normalized
-/// pair when at least one field is declared (`scale` defaults to `1.0`,
-/// `offset` defaults to `0.0`).
-pub(super) const fn combine_scale_offset(
-    scale: Option<f64>,
-    offset: Option<f64>,
-) -> Option<(f64, f64)> {
-    match (scale, offset) {
-        (Some(s), Some(o)) => Some((s, o)),
-        (Some(s), None) => Some((s, 0.0)),
-        (None, Some(o)) => Some((1.0, o)),
-        (None, None) => None,
-    }
-}
 
 /// Errors returned by STAC catalog search requests.
 #[derive(Debug, Error)]
@@ -221,8 +206,6 @@ pub struct StacRasterBandMeta {
     pub scale: Option<f64>,
     pub offset: Option<f64>,
     pub nodata: Option<f64>,
-    pub data_type: Option<String>,
-    pub spatial_resolution: Option<f64>,
     pub unit: Option<String>,
 }
 
@@ -258,7 +241,7 @@ impl fmt::Debug for StacAsset {
 impl StacAsset {
     /// Return whether this asset points to an HTTP(S) Cloud-Optimized GeoTIFF
     /// or GeoTIFF raster.
-    pub fn is_geotiff_http(&self) -> bool {
+    fn is_geotiff_http(&self) -> bool {
         if strip_http_scheme(&self.href).is_none() {
             return false;
         }
@@ -271,12 +254,6 @@ impl StacAsset {
         let path_part = self.href.split(['?', '#']).next().unwrap_or(&self.href);
         let lower = path_part.to_ascii_lowercase();
         lower.ends_with(".tif") || lower.ends_with(".tiff")
-    }
-
-    /// Primary `(scale, offset)` metadata from `raster:bands[0]`, if declared.
-    pub fn primary_scale_offset(&self) -> Option<(f64, f64)> {
-        let b = self.raster_bands.first()?;
-        combine_scale_offset(b.scale, b.offset)
     }
 
     /// Return whether this asset represents a Sentinel-2 Scene Classification

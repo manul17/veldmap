@@ -301,15 +301,6 @@ fn parse_raster_band_meta(val: &Value) -> Option<StacRasterBandMeta> {
             .or_else(|| obj.get("raster:offset"))
             .and_then(Value::as_f64),
         nodata,
-        data_type: obj
-            .get("data_type")
-            .or_else(|| obj.get("raster:data_type"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        spatial_resolution: obj
-            .get("spatial_resolution")
-            .or_else(|| obj.get("raster:spatial_resolution"))
-            .and_then(Value::as_f64),
         unit: obj
             .get("unit")
             .or_else(|| obj.get("raster:unit"))

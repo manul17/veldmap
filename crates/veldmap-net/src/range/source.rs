@@ -14,7 +14,8 @@ use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::SourceFingerprint;
 
 use crate::context::NetContext;
-use crate::http::{HostLimiters, link_cancel_token, parse_custom_headers};
+use crate::http::{link_cancel_token, parse_custom_headers};
+use crate::limiter::HostLimiters;
 use crate::redact::{EncodedSecret, sanitize_url_for_display};
 use crate::url::{canonical_url_without_query, extract_host};
 
@@ -345,7 +346,7 @@ impl HttpRangeSource {
             .ok_or_else(|| RangeOpenError::InvalidUrl(sanitize_url_for_display(trimmed_url)))?;
         let host = extract_host(trimmed_url);
 
-        let parsed = parse_custom_headers(&config.extra_headers, &[])
+        let parsed = parse_custom_headers(&config.extra_headers)
             .map_err(|(name, reason)| RangeOpenError::InvalidHeader { name, reason })?;
         let parsed_headers = parsed.headers;
         let secrets = parsed.secrets;

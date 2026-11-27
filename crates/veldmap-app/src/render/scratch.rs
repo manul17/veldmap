@@ -421,26 +421,12 @@ pub fn compute_band_math_scissor_rect(
             true
         };
 
-    for band in &bm.bands {
-        for patch in &band.patches {
+    for set in bm.active_warp_patch_sets(false) {
+        for patch in set.patches {
             if !visit_patch(
-                &band.frame,
-                band.image_width,
-                band.image_height,
-                patch.cell_rect,
-            ) {
-                return Some(full);
-            }
-        }
-    }
-    if let Some(scl) = &bm.scl
-        && bm.scl_mask_enabled
-    {
-        for patch in &scl.patches {
-            if !visit_patch(
-                &scl.frame,
-                scl.image_width,
-                scl.image_height,
+                set.frame,
+                set.image_width,
+                set.image_height,
                 patch.cell_rect,
             ) {
                 return Some(full);

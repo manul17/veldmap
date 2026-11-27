@@ -11,18 +11,18 @@ use veldmap_raster::{RasterSource, SampleType, stream_spec_for_band};
 
 use crate::clamp_opacity;
 
-use super::asset::{GeoBinding, LayerOrigin, RasterAsset};
-use super::band_math::BandMathStyle;
-use super::io_worker::{OverlayIoCmd, OverlayIoResult, ReloadRequest, ReloadedPayload};
-use super::layer::RemoteLayerSpec;
-use super::manager::{OverlayManager, OverlayMutation, alloc_seq};
-use super::opener::{OpenRasterError, bind_frame_with_override};
-use super::remote_opener::{OpenedRemoteBandAsset, RemoteOpenResult};
-use super::stack::OverlayLayer;
-use super::{
+use super::super::asset::{GeoBinding, LayerOrigin, RasterAsset, has_affine_scaling};
+use super::super::band_math::BandMathStyle;
+use super::super::io_worker::{OverlayIoCmd, OverlayIoResult, ReloadRequest, ReloadedPayload};
+use super::super::layer::RemoteLayerSpec;
+use super::super::opener::{OpenRasterError, bind_frame_with_override};
+use super::super::remote_opener::{OpenedRemoteBandAsset, RemoteOpenResult};
+use super::super::stack::OverlayLayer;
+use super::super::{
     LayerId, LayerInitOptions, LocalBandMathSpec, OpenOverlayRequest, OverlayIoEvent,
     RemoteBandMathRequest, RemoteCogRequest,
 };
+use super::{OverlayManager, OverlayMutation, alloc_seq};
 
 fn build_remote_band_asset(
     opened: OpenedRemoteBandAsset,
@@ -60,8 +60,7 @@ fn suggest_rgb_max_hint(asset: &RasterAsset) -> Option<f64> {
         .source()
         .description()
         .band_info(asset.meta().spec.band)?;
-    let has_scaling = (band_info.scale - 1.0).abs() > 1e-12 || band_info.offset.abs() > 1e-12;
-    if has_scaling {
+    if has_affine_scaling(band_info) {
         // Scaled reflectance (e.g. Sentinel-2 L2A scale=0.0001, offset=-0.1).
         return Some(0.35);
     }
@@ -190,17 +189,25 @@ impl OverlayManager {
                     "remote COG and band-math layers do not support local disk reload".to_owned(),
                 );
             };
-            let old_stream = layer.meta().stream_key();
+            let Some(asset) = layer.single_asset() else {
+                return Err(
+                    "remote COG and band-math layers do not support local disk reload".to_owned(),
+                );
+            };
+            let old_stream = asset.meta().stream_key();
+            let crs_override_epoch = asset.geo().crs_override_epoch();
+            let old_fingerprint_hex = asset.fingerprint_hex().to_owned();
+            let crs_override = asset.geo().crs_override().cloned();
             layer.cancel_stats_job();
             let prep = layer.begin_reload(cancel.clone());
             let request = ReloadRequest {
                 id,
                 reload_seq: prep.reload_seq,
-                crs_override_epoch: layer.geo().crs_override_epoch(),
+                crs_override_epoch,
                 path: local_path,
-                old_fingerprint_hex: layer.fingerprint_hex().to_owned(),
+                old_fingerprint_hex,
                 clear_old_disk_cache: false,
-                crs_override: layer.geo().crs_override().cloned(),
+                crs_override,
                 cancel,
             };
             (request, prep, old_stream)
@@ -217,14 +224,12 @@ impl OverlayManager {
         // `clear_source` so no pre-reload tile can poison SQLite, while
         // preserving sibling layers that share `old_source`.
         let mut purge_sources = Vec::new();
-        if unshared {
-            self.purge_source(prep.old_source);
-            purge_sources.push(prep.old_source);
-        } else if !self.stack.has_visible_source(prep.old_source) {
-            self.purge_source(prep.old_source);
-        } else {
-            self.cancel_stream_if_unused(old_stream);
-        }
+        self.release_sources_and_streams(
+            &[prep.old_source],
+            &[old_stream],
+            Some(1),
+            &mut purge_sources,
+        );
 
         if !self.io_worker.send(OverlayIoCmd::Reload(request)) {
             if let Some(layer) = self.stack.get_mut(id) {
@@ -462,11 +467,19 @@ impl OverlayManager {
                     // If `override_layer_crs` ran while this reload was in flight,
                     // re-bind the reloaded source against the live `crs_override`
                     // so it never silently reverts.
-                    if slot.geo().crs_override_epoch() != crs_override_epoch {
-                        match bind_frame_with_override(
-                            source.description(),
-                            slot.geo().crs_override(),
-                        ) {
+                    let (live_epoch, live_override, old_stream) = {
+                        let Some(asset) = slot.single_asset() else {
+                            return;
+                        };
+                        (
+                            asset.geo().crs_override_epoch(),
+                            asset.geo().crs_override().cloned(),
+                            asset.meta().stream_key(),
+                        )
+                    };
+                    if live_epoch != crs_override_epoch {
+                        match bind_frame_with_override(source.description(), live_override.as_ref())
+                        {
                             Ok(rebound) => frame = rebound,
                             Err(error) => {
                                 slot.fail_reload(error.clone());
@@ -481,7 +494,6 @@ impl OverlayManager {
                             }
                         }
                     }
-                    let old_stream = slot.meta().stream_key();
                     let new_src = source.source_id();
                     let relaid = alloc_seq(&mut self.next_relaid);
                     let old_src = slot.replace_reloaded(path, source, frame, relaid);
@@ -506,21 +518,16 @@ impl OverlayManager {
         // Purge runtime/GPU state for `new_src`, and only purge `old_src` when
         // identical (`new_src == old_src`, explicit cache bypass) or when no
         // sibling layer still references `old_src`.
-        if new_src == old_src {
-            self.purge_source(new_src);
-            mutation.purge_sources.push(new_src);
-        } else {
-            if self.stack.count_sharing_source(old_src) == 0 {
-                self.purge_source(old_src);
-                mutation.purge_sources.push(old_src);
-            } else if !self.stack.has_visible_source(old_src) {
-                self.purge_source(old_src);
-            } else {
-                self.cancel_stream_if_unused(old_stream);
-            }
-            self.purge_source(new_src);
-            mutation.purge_sources.push(new_src);
+        if new_src != old_src {
+            self.release_sources_and_streams(
+                &[old_src],
+                &[old_stream],
+                Some(0),
+                &mut mutation.purge_sources,
+            );
         }
+        self.purge_source(new_src);
+        mutation.purge_sources.push(new_src);
         mutation.changed = true;
         mutation.topology_changed = true;
         self.request_band_stats_if_needed(id);

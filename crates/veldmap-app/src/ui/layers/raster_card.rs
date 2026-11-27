@@ -203,13 +203,13 @@ pub(super) fn show_raster_card(
             ui.horizontal(|ui| {
                 if let Some(ref bm) = layer.band_math {
                     ui.colored_label(
-                        egui::Color32::from_rgb(130, 220, 145),
+                        crate::ui::BADGE_RECIPE_COLOR,
                         egui::RichText::new(&bm.recipe_label).small().strong(),
                     );
                 }
                 if layer.is_remote {
                     ui.colored_label(
-                        egui::Color32::from_rgb(100, 195, 255),
+                        crate::ui::BADGE_CLOUD_COLOR,
                         egui::RichText::new("Cloud COG").small().strong(),
                     );
                 }

@@ -1,17 +1,15 @@
-//! HTTP client construction (`rustls` + `ring`), per-host concurrency &
-//! rate-limit cooldown management, and size-capped response body reading
-//! helpers.
+//! HTTP client construction (`rustls` + `ring`), custom auth header validation,
+//! cancel-token linking, and size-capped response body reading helpers.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
-use veldmap_core::sync::{CancelGuard, CancelToken, lock_unpoisoned};
+use reqwest::header::{HeaderName, HeaderValue};
+use veldmap_core::sync::{CancelGuard, CancelToken};
 
 use crate::NetError;
 use crate::redact::{EncodedSecret, extract_header_secret};
+use crate::url::same_url_origin;
 
 /// Parameters for constructing a `rustls` + `ring` HTTP client with split
 /// connect/read timeouts, explicit compression control, and redirect security.
@@ -27,12 +25,15 @@ pub(crate) struct HttpClientConfig<'a> {
 }
 
 /// Protocol-owned headers that user-configured custom headers must never
-/// overwrite (breaking HTTP framing, byte-range offsets, or ETag guards).
+/// overwrite (breaking HTTP framing, content negotiation, byte-range offsets,
+/// or ETag guards).
 const FORBIDDEN_CUSTOM_HEADERS: &[&str] = &[
     "host",
     "range",
     "if-match",
+    "accept",
     "accept-encoding",
+    "content-type",
     "content-length",
     "transfer-encoding",
     "connection",
@@ -42,23 +43,19 @@ const FORBIDDEN_CUSTOM_HEADERS: &[&str] = &[
 
 /// Return whether `name` is a valid HTTP header name permitted for user-supplied
 /// custom authentication headers (rejecting invalid syntax and protocol-owned
-/// headers such as `Host`, `Range`, `If-Match`, `Accept-Encoding`, etc.).
+/// headers such as `Host`, `Range`, `If-Match`, `Accept`, `Content-Type`, etc.).
 pub fn is_valid_custom_header_name(name: &str) -> bool {
-    validate_custom_header_name(name, &[]).is_ok()
+    validate_custom_header_name(name).is_ok()
 }
 
-fn validate_custom_header_name(name: &str, extra_forbidden: &[&str]) -> Result<HeaderName, String> {
+fn validate_custom_header_name(name: &str) -> Result<HeaderName, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("header name must not be empty".to_owned());
     }
     let parsed = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|e| e.to_string())?;
     let lower = parsed.as_str();
-    if FORBIDDEN_CUSTOM_HEADERS.contains(&lower)
-        || extra_forbidden
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(lower))
-    {
+    if FORBIDDEN_CUSTOM_HEADERS.contains(&lower) {
         return Err(format!(
             "protocol-owned header '{trimmed}' cannot be overridden"
         ));
@@ -78,13 +75,11 @@ pub(crate) struct ParsedCustomHeaders {
 /// secrets for error messages.
 pub(crate) fn parse_custom_headers(
     headers: &[(String, String)],
-    extra_forbidden: &[&str],
 ) -> Result<ParsedCustomHeaders, (String, String)> {
     let mut parsed = Vec::with_capacity(headers.len());
     let mut secrets = Vec::with_capacity(headers.len());
     for (k, v) in headers {
-        let name = validate_custom_header_name(k, extra_forbidden)
-            .map_err(|reason| (k.clone(), reason))?;
+        let name = validate_custom_header_name(k).map_err(|reason| (k.clone(), reason))?;
         let trimmed_val = v.trim();
         let mut value = HeaderValue::from_str(trimmed_val)
             .map_err(|_| (k.clone(), "invalid header value".to_owned()))?;
@@ -110,22 +105,6 @@ pub(crate) fn link_cancel_token(
     let combined_clone = combined.clone();
     let guard = caller.on_cancel_guarded(move || combined_clone.cancel());
     (combined, guard)
-}
-
-/// Record a host cooldown from an HTTP `429`/`503` response's `Retry-After`
-/// header (or `default_backoff` if missing/unparseable).
-pub(crate) fn record_rate_limit_cooldown(
-    limiters: &HostLimiters,
-    host: &str,
-    headers: &HeaderMap,
-    default_backoff: Duration,
-) {
-    let retry_after = headers
-        .get(RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| parse_retry_after_seconds(Some(s)))
-        .unwrap_or(default_backoff);
-    limiters.record_cooldown(host, Instant::now() + retry_after);
 }
 
 /// Failure modes for [`read_body_capped`].
@@ -169,10 +148,6 @@ pub(crate) async fn read_body_capped(
 /// before sending any payload bytes.
 const MAX_INITIAL_CAPACITY_BYTES: usize = 256 * 1024;
 
-/// Minimum and maximum clamped `Retry-After` cooldown window.
-const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
-
 /// Compliant HTTP `User-Agent` identifying VeldMap.
 pub(crate) fn default_user_agent() -> String {
     format!(
@@ -201,16 +176,11 @@ fn build_redirect_policy(same_origin_only: bool) -> reqwest::redirect::Policy {
         {
             return attempt.error("refused insecure HTTPS-to-HTTP redirect");
         }
-        if same_origin_only && let Some(first) = attempt.previous().first() {
-            let origin_matches = first.scheme() == attempt.url().scheme()
-                && first
-                    .host_str()
-                    .zip(attempt.url().host_str())
-                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
-                && first.port_or_known_default() == attempt.url().port_or_known_default();
-            if !origin_matches {
-                return attempt.error("refused cross-origin redirect with custom auth headers");
-            }
+        if same_origin_only
+            && let Some(first) = attempt.previous().first()
+            && !same_url_origin(first, attempt.url())
+        {
+            return attempt.error("refused cross-origin redirect with custom auth headers");
         }
         attempt.follow()
     })
@@ -229,270 +199,29 @@ pub(crate) fn build_http_client(cfg: &HttpClientConfig<'_>) -> Result<reqwest::C
         .map_err(|err| NetError::HttpClient(err.to_string()))
 }
 
-/// Lazily prune idle host entries whenever a new host is inserted while at
-/// least this many hosts are tracked, preventing unbounded map growth in long
-/// multi-host sessions.
-const HOST_LIMITER_PRUNE_THRESHOLD: usize = 64;
-
-struct HostEntry {
-    semaphore: Arc<Semaphore>,
-    cooldown_until: Option<Instant>,
-    cooldown_notify: Arc<Notify>,
-}
-
-impl HostEntry {
-    fn is_active(&self, max_per_host: usize, now: Instant) -> bool {
-        let has_cooldown = self.cooldown_until.is_some_and(|u| u > now);
-        has_cooldown
-            || Arc::strong_count(&self.semaphore) > 1
-            || self.semaphore.available_permits() < max_per_host
-            || Arc::strong_count(&self.cooldown_notify) > 1
-    }
-}
-
-/// Reason a per-host HTTP permit could not be acquired immediately.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PermitDenied {
-    Cooldown(Instant),
-    Saturated,
-}
-
-/// Async cancellation marker returned by [`HostLimiters::acquire_permit`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PermitCancelled;
-
-/// Per-host concurrency semaphores and rate-limit cooldown tracking (`429` /
-/// `503` `Retry-After`).
-///
-/// Lock ordering: `HostLimiters` is a strict leaf lock — it never acquires
-/// external mutexes or signals notifiers while locked, so callers may safely
-/// invoke it while holding higher-level scheduler locks.
-pub(crate) struct HostLimiters {
-    max_per_host: usize,
-    map: Mutex<HashMap<String, HostEntry>>,
-}
-
-impl HostLimiters {
-    pub(crate) fn new(max_per_host: usize) -> Self {
-        Self {
-            max_per_host: max_per_host.max(1),
-            map: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn with_entry<R>(&self, host: &str, f: impl FnOnce(&mut HostEntry) -> R) -> R {
-        let mut map = lock_unpoisoned(&self.map);
-        if let Some(existing) = map.get_mut(host) {
-            return f(existing);
-        }
-        if map.len() >= HOST_LIMITER_PRUNE_THRESHOLD {
-            let now = Instant::now();
-            let max_per_host = self.max_per_host;
-            map.retain(|_, entry| entry.is_active(max_per_host, now));
-        }
-        let entry = map.entry(host.to_owned()).or_insert_with(|| HostEntry {
-            semaphore: Arc::new(Semaphore::new(self.max_per_host)),
-            cooldown_until: None,
-            cooldown_notify: Arc::new(Notify::new()),
-        });
-        f(entry)
-    }
-
-    /// Atomically check host cooldown and attempt to acquire a per-host HTTP
-    /// permit under a single lock, avoiding string allocation on existing host
-    /// hits.
-    pub(crate) fn try_acquire_permit(
-        &self,
-        host: &str,
-        now: Instant,
-    ) -> Result<OwnedSemaphorePermit, PermitDenied> {
-        self.with_entry(host, |entry| {
-            if let Some(until) = entry.cooldown_until.filter(|&u| u > now) {
-                return Err(PermitDenied::Cooldown(until));
-            }
-            Arc::clone(&entry.semaphore)
-                .try_acquire_owned()
-                .map_err(|_| PermitDenied::Saturated)
-        })
-    }
-
-    /// Asynchronously wait out any active host cooldown and acquire a per-host
-    /// HTTP concurrency permit, aborting immediately if `cancel` triggers.
-    pub(crate) async fn acquire_permit(
-        &self,
-        host: &str,
-        cancel: &CancelToken,
-    ) -> Result<OwnedSemaphorePermit, PermitCancelled> {
-        loop {
-            if cancel.is_cancelled() {
-                return Err(PermitCancelled);
-            }
-            let cooldown_notify = self.with_entry(host, |entry| Arc::clone(&entry.cooldown_notify));
-            let notified = cooldown_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            let (semaphore, cooldown_until) = self.with_entry(host, |entry| {
-                (Arc::clone(&entry.semaphore), entry.cooldown_until)
-            });
-
-            if let Some(until) = cooldown_until.filter(|&u| u > Instant::now()) {
-                let deadline = tokio::time::Instant::from_std(until);
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(PermitCancelled),
-                    _ = notified => continue,
-                    _ = tokio::time::sleep_until(deadline) => continue,
-                }
-            }
-
-            let permit = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(PermitCancelled),
-                res = semaphore.acquire_owned() => match res {
-                    Ok(permit) => permit,
-                    Err(_) => return Err(PermitCancelled),
-                },
-            };
-
-            // Re-check whether a `429`/`503` cooldown started while we waited
-            // on the semaphore; if so, release the permit and honor cooldown.
-            let active_cooldown = self.with_entry(host, |entry| {
-                entry.cooldown_until.filter(|&u| u > Instant::now())
-            });
-            if active_cooldown.is_some() {
-                drop(permit);
-                continue;
-            }
-            return Ok(permit);
-        }
-    }
-
-    /// Record or extend a per-host cooldown window (e.g. on HTTP `429`/`503`),
-    /// avoiding string allocation when `host` is already tracked.
-    pub(crate) fn record_cooldown(&self, host: &str, until: Instant) {
-        self.with_entry(host, |entry| {
-            entry.cooldown_until = Some(match entry.cooldown_until {
-                Some(existing) if existing > until => existing,
-                _ => until,
-            });
-        });
-    }
-
-    /// Clear cooldowns strictly for `hosts` (leaving unrelated hosts untouched)
-    /// and prune idle entries with no active permits or active cooldowns.
-    pub(crate) fn clear_cooldowns_for<'a>(&self, hosts: impl IntoIterator<Item = &'a str>) {
-        let mut to_notify = Vec::new();
-        {
-            let mut map = lock_unpoisoned(&self.map);
-            let now = Instant::now();
-            for host in hosts {
-                if let Some(entry) = map.get_mut(host)
-                    && entry.cooldown_until.take().is_some()
-                {
-                    to_notify.push(Arc::clone(&entry.cooldown_notify));
-                }
-            }
-            let max_per_host = self.max_per_host;
-            map.retain(|_, entry| entry.is_active(max_per_host, now));
-        }
-        // Notify outside `self.map` so `HostLimiters` remains a strict leaf lock.
-        for notify in to_notify {
-            notify.notify_waiters();
-        }
-    }
-}
-
-pub(crate) fn parse_retry_after_seconds(header: Option<&str>) -> Option<Duration> {
-    let raw = header?.trim();
-    let secs = raw.parse::<u64>().ok()?;
-    Some(Duration::from_secs(secs).clamp(MIN_RETRY_AFTER, MAX_RETRY_AFTER))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn retry_after_and_host_limiters_enforce_cooldowns_and_permits() {
-        assert_eq!(
-            parse_retry_after_seconds(Some("0")),
-            Some(Duration::from_secs(1))
-        );
-        assert_eq!(
-            parse_retry_after_seconds(Some("30")),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            parse_retry_after_seconds(Some("86400")),
-            Some(Duration::from_secs(120))
-        );
-        assert_eq!(
-            parse_retry_after_seconds(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
-            None
-        );
-        assert_eq!(parse_retry_after_seconds(None), None);
-
-        let limiters = HostLimiters::new(1);
-        let now = Instant::now();
-        let permit = limiters
-            .try_acquire_permit("example.org", now)
-            .expect("first permit");
-        assert_eq!(
-            limiters.try_acquire_permit("example.org", now).err(),
-            Some(PermitDenied::Saturated)
-        );
-        drop(permit);
-
-        let later = now + Duration::from_secs(30);
-        limiters.record_cooldown("example.org", later);
-        assert_eq!(
-            limiters.try_acquire_permit("example.org", now).err(),
-            Some(PermitDenied::Cooldown(later))
-        );
-        // Shorter cooldown must not shorten an existing longer cooldown.
-        limiters.record_cooldown("example.org", now + Duration::from_secs(5));
-        assert_eq!(
-            limiters.try_acquire_permit("example.org", now).err(),
-            Some(PermitDenied::Cooldown(later))
-        );
-
-        limiters.record_cooldown("other.org", later);
-        limiters.clear_cooldowns_for(["example.org"]);
-        assert!(limiters.try_acquire_permit("example.org", now).is_ok());
-        assert_eq!(
-            limiters.try_acquire_permit("other.org", now).err(),
-            Some(PermitDenied::Cooldown(later)),
-            "clearing example.org must leave unrelated host cooldowns intact"
-        );
-
-        // Inserting past the prune threshold lazily evicts idle hosts while
-        // keeping hosts with an active permit or active cooldown.
-        let held_permit = limiters
-            .try_acquire_permit("busy.org", now)
-            .expect("busy permit");
-        for i in 0..HOST_LIMITER_PRUNE_THRESHOLD {
-            let host = format!("idle-{i}.example.org");
-            let p = limiters
-                .try_acquire_permit(&host, now)
-                .expect("idle permit");
-            drop(p);
-        }
-        let trigger = limiters
-            .try_acquire_permit("trigger.example.org", now)
-            .expect("trigger permit");
-        drop(trigger);
-        {
-            let map = lock_unpoisoned(&limiters.map);
+    fn custom_header_validation_rejects_protocol_owned_headers() {
+        assert!(is_valid_custom_header_name("x-api-key"));
+        assert!(is_valid_custom_header_name("Authorization"));
+        for forbidden in [
+            "",
+            "   ",
+            "Host",
+            "Range",
+            "If-Match",
+            "Accept",
+            "Accept-Encoding",
+            "Content-Type",
+            "Content-Length",
+        ] {
             assert!(
-                map.len() < HOST_LIMITER_PRUNE_THRESHOLD,
-                "idle entries should be pruned lazily, got {}",
-                map.len()
+                !is_valid_custom_header_name(forbidden),
+                "expected '{forbidden}' to be rejected"
             );
-            assert!(map.contains_key("busy.org"));
-            assert!(map.contains_key("other.org"));
-            assert!(map.contains_key("trigger.example.org"));
         }
-        drop(held_permit);
     }
 }

@@ -225,7 +225,7 @@ impl Drop for DecodePool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TwoLaneDecodePoolConfig {
     /// Fast pointwise tile lane (worker count clamped to `1..=8` by
-    /// [`DecodePool::spawn`]).
+    /// [`DecodePool::spawn_named`]).
     pub fast: DecodePoolConfig,
     /// Bulk sequential-pass lane (worker count clamped to `1..=4` by
     /// [`TwoLaneDecodePool::spawn`] so long-running passes do not saturate

@@ -12,22 +12,20 @@ use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint, SourceId};
 
 use crate::RasterError;
 use crate::pipeline::{
-    BandInfo, DisplayMapping, GeoPlacement, GeoTie, Grid, LevelPlan, Overview, PlacementCrs,
-    RasterDescription, ServeMode, build_chunked_level_table, check_max_source_side,
+    BandInfo, DisplayMapping, ExternalBandMeta, GeoPlacement, GeoTie, Grid, LevelPlan, Overview,
+    PlacementCrs, RasterDescription, ServeMode, build_chunked_level_table, check_max_source_side,
 };
 
 use super::gdal_meta::{GdalMetadata, parse_gdal_metadata, parse_gdal_nodata};
 use super::georef::{ParsedGeoref, RawGeoTiffTags, parse_georef};
-use super::ifd::budget::IfdParseBudget;
-use super::ifd::parse::parse_cached_ifd;
-use super::ifd::tag_ids::{
-    TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
-    TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, TAG_MODEL_TRANSFORMATION,
-    TAG_NEW_SUBFILE_TYPE,
+use super::ifd::{
+    CachedIfd, IfdDirectory, IfdParseBudget, MAX_SINGLE_CHUNK_BYTES, Photometric,
+    SinglePassIfdReader, TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS,
+    TAG_GEO_DOUBLE_PARAMS, TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT,
+    TAG_MODEL_TRANSFORMATION, TAG_NEW_SUBFILE_TYPE, is_overview, parse_cached_ifd,
 };
-use super::ifd::wire::{IfdDirectory, SinglePassIfdReader};
-use super::ifd::{CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, RawTiffAccess, is_overview};
 use super::stretch::{BandStatsCache, StretchCache};
+use super::view::{RawTiffAccess, uniform_display_nodata};
 use super::{MAX_IFDS, TiffSource};
 
 const BASE_METADATA_TAGS: &[u16] = &[
@@ -311,6 +309,77 @@ fn build_band_infos(
     bands
 }
 
+struct BandsAndStretch {
+    bands: Vec<BandInfo>,
+    per_band_nodata: Vec<Option<f64>>,
+    display_nodata: Option<f64>,
+    initial_mapping: Option<DisplayMapping>,
+}
+
+fn build_bands_and_stretch(
+    base_ifd: &CachedIfd,
+    file_nodata: Option<f64>,
+    gdal_meta: &GdalMetadata,
+    external_bands: &[ExternalBandMeta],
+) -> BandsAndStretch {
+    let mut bands = build_band_infos(base_ifd, file_nodata, gdal_meta);
+    if !external_bands.is_empty() {
+        for band in &mut bands {
+            let BandKey::Index(b) = band.band_key else {
+                continue;
+            };
+            let Some(ext) = external_bands.get(usize::from(b)) else {
+                continue;
+            };
+            if !band.has_embedded_scale_offset && (ext.scale.is_some() || ext.offset.is_some()) {
+                let scale = ext.scale.unwrap_or(1.0);
+                let offset = ext.offset.unwrap_or(0.0);
+                if scale.is_finite() && scale != 0.0 && offset.is_finite() {
+                    band.scale = scale;
+                    band.offset = offset;
+                }
+            }
+            if band.nodata.is_none()
+                && let Some(nd) = ext.nodata
+                && (nd.is_finite() || nd.is_nan())
+            {
+                band.nodata = Some(nd);
+            }
+            if band.units.is_none()
+                && let Some(unit) = ext.unit.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                band.units = Some(unit.to_owned());
+            }
+        }
+    }
+
+    let mut per_band_nodata = vec![file_nodata; usize::from(base_ifd.samples_per_pixel)];
+    for info in &bands {
+        if let BandKey::Index(b) = info.band_key
+            && let Some(slot) = per_band_nodata.get_mut(usize::from(b))
+        {
+            *slot = info.nodata;
+        }
+    }
+    let display_nodata = file_nodata.or_else(|| {
+        uniform_display_nodata(&per_band_nodata, base_ifd.pixel_layout.colors().max(1))
+    });
+    if let Some(nd) = display_nodata
+        && let Some(display) = bands.iter_mut().find(|b| b.band_key == BandKey::Display)
+        && display.nodata.is_none()
+    {
+        display.nodata = Some(nd);
+    }
+    let initial_mapping = (!base_ifd.needs_display_stretch())
+        .then(|| base_ifd.identity_display_mapping(display_nodata));
+    BandsAndStretch {
+        bands,
+        per_band_nodata,
+        display_nodata,
+        initial_mapping,
+    }
+}
+
 impl TiffSource {
     /// Open and describe a GeoTIFF/BigTIFF/COG from `byte_source` using
     /// `fingerprint`, `budget`, and `cancel` without reading base-level pixels.
@@ -320,7 +389,7 @@ impl TiffSource {
         budget: &MemoryBudget,
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
-        Self::open_with_sidecar(byte_source, fingerprint, None, budget, cancel)
+        Self::open_with_options(byte_source, fingerprint, None, &[], budget, cancel)
     }
 
     /// Open a GeoTIFF/BigTIFF/COG with optional external [`crate::SidecarGeoref`]
@@ -329,6 +398,20 @@ impl TiffSource {
         byte_source: Arc<dyn ByteSource>,
         fingerprint: SourceFingerprint,
         sidecar: Option<crate::sidecar::SidecarGeoref>,
+        budget: &MemoryBudget,
+        cancel: &CancelToken,
+    ) -> Result<Self, RasterError> {
+        Self::open_with_options(byte_source, fingerprint, sidecar, &[], budget, cancel)
+    }
+
+    /// Open a GeoTIFF/BigTIFF/COG with optional sidecar georeferencing and
+    /// external per-band radiometric metadata merged before nodata and stretch
+    /// initialization.
+    pub(crate) fn open_with_options(
+        byte_source: Arc<dyn ByteSource>,
+        fingerprint: SourceFingerprint,
+        sidecar: Option<crate::sidecar::SidecarGeoref>,
+        external_bands: &[ExternalBandMeta],
         budget: &MemoryBudget,
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
@@ -387,31 +470,12 @@ impl TiffSource {
             .min_by_key(|o| o.width)
             .map_or(0, |o| o.image);
 
-        let mut bands = build_band_infos(&base_ifd, meta.nodata_f64, &meta.gdal_meta);
-        let mut per_band_nodata = vec![meta.nodata_f64; usize::from(base_ifd.samples_per_pixel)];
-        for info in &bands {
-            if let BandKey::Index(b) = info.band_key
-                && let Some(slot) = per_band_nodata.get_mut(usize::from(b))
-            {
-                *slot = info.nodata;
-            }
-        }
-        let display_nodata = meta.nodata_f64.or_else(|| {
-            super::ifd::uniform_display_nodata(
-                &per_band_nodata,
-                base_ifd.pixel_layout.colors().max(1),
-            )
-        });
-        if let Some(nd) = display_nodata
-            && let Some(display) = bands.iter_mut().find(|b| b.band_key == BandKey::Display)
-            && display.nodata.is_none()
-        {
-            display.nodata = Some(nd);
-        }
-        let initial_mapping = (!base_ifd.needs_display_stretch()).then(|| {
-            DisplayMapping::identity(display_nodata)
-                .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
-        });
+        let BandsAndStretch {
+            bands,
+            per_band_nodata,
+            display_nodata,
+            initial_mapping,
+        } = build_bands_and_stretch(&base_ifd, meta.nodata_f64, &meta.gdal_meta, external_bands);
 
         let mut ifds = Vec::with_capacity(1 + cached_overviews.len());
         ifds.push(base_ifd);

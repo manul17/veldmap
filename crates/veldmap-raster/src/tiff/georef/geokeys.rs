@@ -1,7 +1,8 @@
 //! GeoTIFF GeoKey types, constants, and binary `GeoKeyDirectoryTag`
 //! (`34735`–`34737`) decoder.
 
-use super::super::ifd::tag_ids::{TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS};
+const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
+const TAG_GEO_ASCII_PARAMS: u16 = 34737;
 
 const GEOKEY_LOCATION_SHORT: u16 = 0;
 

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use veldmap_core::tile::{PlanetaryScheme, QuadTileId};
 
-use crate::http::PermitDenied;
+use crate::limiter::PermitDenied;
 
 use super::failures::MAX_FAILURE_ENTRIES;
 use super::*;

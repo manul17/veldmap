@@ -21,18 +21,24 @@ use eframe::egui;
 const ERROR_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 110, 95);
 /// Warning / offline fallback badge text color (`#F0B955`).
 const WARN_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(240, 185, 85);
-
-/// Return `true` when a single-line `egui::TextEdit` was submitted by pressing
-/// `Enter`.
-fn submitted_with_enter(ui: &egui::Ui, resp: &egui::Response) -> bool {
-    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-}
+/// Positive / Band Math recipe / L2A BOA badge text color (`#82DC91`).
+const BADGE_RECIPE_COLOR: egui::Color32 = egui::Color32::from_rgb(130, 220, 145);
+/// Cloud COG / L1C TOA badge text color (`#64C3FF`).
+const BADGE_CLOUD_COLOR: egui::Color32 = egui::Color32::from_rgb(100, 195, 255);
+/// Selected STAC item highlight border color (`#FFC840`).
+const SELECTION_ACCENT_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 200, 64);
 
 /// User dismissal intents returned by [`show_system_fault_banner`].
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FaultBannerAction {
     pub(crate) dismiss_gpu: bool,
     pub(crate) dismiss_storage: bool,
+}
+
+fn show_fault_item(ui: &mut egui::Ui, msg: &str, color: egui::Color32) -> bool {
+    ui.add(egui::Label::new(egui::RichText::new(msg).color(color).small()).truncate())
+        .on_hover_text(msg);
+    ui.small_button("Dismiss").clicked()
 }
 
 /// Render a slim top warning/error banner when a GPU or persistence fault is
@@ -54,24 +60,13 @@ pub(crate) fn show_system_fault_banner(
                 } else {
                     WARN_TEXT_COLOR
                 };
-                ui.add(egui::Label::new(egui::RichText::new(msg).color(color).small()).truncate())
-                    .on_hover_text(msg);
-                if ui.small_button("Dismiss").clicked() {
-                    action.dismiss_gpu = true;
-                }
+                action.dismiss_gpu = show_fault_item(ui, msg, color);
             }
             if gpu_fault.is_some() && storage_fault.is_some() {
                 ui.separator();
             }
             if let Some(msg) = storage_fault {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(msg).color(WARN_TEXT_COLOR).small())
-                        .truncate(),
-                )
-                .on_hover_text(msg);
-                if ui.small_button("Dismiss").clicked() {
-                    action.dismiss_storage = true;
-                }
+                action.dismiss_storage = show_fault_item(ui, msg, WARN_TEXT_COLOR);
             }
         });
     });

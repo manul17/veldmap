@@ -18,7 +18,7 @@ use super::CLEAR_COLOR_LINEAR;
 use super::bind_groups::TileBindGroupCache;
 use super::graticule::{TILE_KIND_GEO, tile_graticule_uniform};
 use super::mesh::TileMeshCache;
-use super::overlay::OverlayRenderer;
+use super::overlay::{BandMathPassCtx, OverlayRenderer};
 use super::pipelines::GlobePipelines;
 use super::scratch::ScratchDemand;
 use super::snapshot::{DrawOverlayContent, DrawSnapshot};
@@ -34,7 +34,8 @@ pub struct GlobeRenderer {
     meshes: TileMeshCache,
     /// Extracted post-body warp-mesh overlay renderer.
     overlay: OverlayRenderer,
-    /// Post-body draped vector geometry renderer (GeoJSON + measurements).
+    /// Post-body draped vector geometry renderer (GeoJSON, measurements, and
+    /// STAC AOI / footprints / highlights).
     vector: VectorRenderer,
     /// Per-frame dynamic uniform byte offsets for `snapshot.tiles`.
     tile_uniform_offsets: Vec<u32>,
@@ -373,20 +374,20 @@ impl GlobeRenderer {
                 let Some(scratch) = self.viewport.scratch() else {
                     continue;
                 };
-                let drawn = self.overlay.record_band_math_scratch_passes(
-                    encoder,
-                    bm_idx,
-                    bm,
-                    self.viewport.camera_bind_group(),
-                    &self.pipelines.band_math,
+                let bm_ctx = BandMathPassCtx {
+                    camera_bg: self.viewport.camera_bind_group(),
+                    pipelines: &self.pipelines.band_math,
                     scratch,
-                    self.viewport.uniform_arena(),
+                    arena: self.viewport.uniform_arena(),
                     bind_groups,
-                );
+                };
+                let drawn = self
+                    .overlay
+                    .record_band_math_scratch_passes(encoder, bm_idx, bm, &bm_ctx);
                 if !drawn {
                     continue;
                 }
-                Some((bm_idx, scratch))
+                Some((bm_idx, bm_ctx))
             } else {
                 None
             };
@@ -395,15 +396,13 @@ impl GlobeRenderer {
             // immediately following direct overlays (and final vectors /
             // graticule if this reaches the tail) into one `LoadOp::Load` pass.
             let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
-            if let Some((bm_idx, scratch)) = bm_to_composite {
+            if let Some((bm_idx, bm_ctx)) = bm_to_composite {
                 self.overlay.record_band_math_composite(
                     &mut post_pass,
                     bm_idx,
                     target.width,
                     target.height,
-                    &self.pipelines.band_math,
-                    scratch,
-                    self.viewport.uniform_arena(),
+                    &bm_ctx,
                 );
             }
             post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);

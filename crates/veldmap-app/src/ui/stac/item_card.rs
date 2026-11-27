@@ -6,6 +6,7 @@
 use eframe::egui;
 
 use crate::stac::{StacCogAuthMode, StacItemView};
+use crate::ui::{BADGE_CLOUD_COLOR, BADGE_RECIPE_COLOR, SELECTION_ACCENT_COLOR};
 
 use super::StacUiAction;
 
@@ -18,7 +19,7 @@ pub(super) fn show_item_card(
     actions: &mut Vec<StacUiAction>,
 ) {
     let frame = egui::Frame::group(ui.style()).stroke(if selected {
-        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 200, 64))
+        egui::Stroke::new(1.5, SELECTION_ACCENT_COLOR)
     } else {
         ui.style().visuals.widgets.noninteractive.bg_stroke
     });
@@ -32,12 +33,10 @@ pub(super) fn show_item_card(
                     actions.push(StacUiAction::SelectItem(idx));
                 }
                 if let Some(level) = &item.processing_level {
-                    let badge_color = if level.to_ascii_lowercase().contains("l2a")
-                        || level.to_ascii_lowercase().contains("boa")
-                    {
-                        egui::Color32::from_rgb(120, 220, 150)
+                    let badge_color = if item.is_surface_reflectance {
+                        BADGE_RECIPE_COLOR
                     } else {
-                        egui::Color32::from_rgb(130, 195, 255)
+                        BADGE_CLOUD_COLOR
                     };
                     ui.colored_label(badge_color, egui::RichText::new(level).small().strong());
                 }
@@ -45,18 +44,8 @@ pub(super) fn show_item_card(
                     ui.weak(egui::RichText::new(platform).small());
                 }
             });
-            let mut meta_parts = Vec::new();
-            if let Some(short_date) = &item.short_date {
-                meta_parts.push(short_date.clone());
-            }
-            if let Some(cc) = item.cloud_cover {
-                meta_parts.push(format!("{cc:.1}% cloud"));
-            }
-            if let Some(tile) = &item.mgrs_tile {
-                meta_parts.push(tile.clone());
-            }
-            if !meta_parts.is_empty() {
-                ui.weak(egui::RichText::new(meta_parts.join(" · ")).small());
+            if let Some(meta_line) = &item.meta_line {
+                ui.weak(egui::RichText::new(meta_line).small());
             }
 
             ui.horizontal_wrapped(|ui| {

@@ -10,6 +10,12 @@ use eframe::egui;
 
 use crate::colormap::{ColormapId, sample_colormap_srgb};
 
+/// Return `true` when a single-line `egui::TextEdit` was submitted by pressing
+/// `Enter`.
+pub(crate) fn submitted_with_enter(ui: &egui::Ui, resp: &egui::Response) -> bool {
+    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
 /// Outcome of tracking a drag-editable control (`Slider`, `DragValue`, etc.)
 /// so dragging previews continuously without thrashing `session.json` and a
 /// no-op click/release without value changes never emits a spurious commit.

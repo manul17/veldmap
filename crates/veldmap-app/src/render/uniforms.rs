@@ -16,14 +16,6 @@ pub(super) struct CameraUniform {
     pub(super) _pad0: f32,
 }
 
-const _: () = {
-    assert!(std::mem::size_of::<CameraUniform>() == 80);
-    assert!(std::mem::offset_of!(CameraUniform, view_proj) == 0);
-    assert!(std::mem::offset_of!(CameraUniform, grid_step_deg) == 64);
-    assert!(std::mem::offset_of!(CameraUniform, grid_width_px) == 68);
-    assert!(std::mem::offset_of!(CameraUniform, polar_r_cap) == 72);
-};
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct TileUniform {
@@ -32,14 +24,6 @@ pub(super) struct TileUniform {
     pub(super) uv_rect: [f32; 4],
     pub(super) grid_anchor: [f32; 4],
 }
-
-const _: () = {
-    assert!(std::mem::size_of::<TileUniform>() == 48);
-    assert!(std::mem::offset_of!(TileUniform, offset_eye) == 0);
-    assert!(std::mem::offset_of!(TileUniform, tile_kind) == 12);
-    assert!(std::mem::offset_of!(TileUniform, uv_rect) == 16);
-    assert!(std::mem::offset_of!(TileUniform, grid_anchor) == 32);
-};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -140,72 +124,6 @@ pub(super) struct BandMathCompositeUniform {
     pub(super) _pad0: u32,
 }
 
-const _: () = {
-    assert!(std::mem::size_of::<OverlayPatchUniform>() == 32);
-    assert!(std::mem::offset_of!(OverlayPatchUniform, offset_eye) == 0);
-    assert!(std::mem::offset_of!(OverlayPatchUniform, opacity) == 12);
-    assert!(std::mem::offset_of!(OverlayPatchUniform, uv_rect) == 16);
-
-    assert!(std::mem::size_of::<ScientificPatchUniform>() == 64);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, offset_eye) == 0);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, opacity) == 12);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, uv_rect) == 16);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, scale) == 32);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, offset) == 36);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, stretch_min) == 40);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, stretch_inv_range) == 44);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, stretch_mode) == 48);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, invert_colormap) == 52);
-    assert!(std::mem::offset_of!(ScientificPatchUniform, mip_count) == 56);
-
-    assert!(std::mem::size_of::<CategoricalPatchUniform>() == 48);
-    assert!(std::mem::offset_of!(CategoricalPatchUniform, offset_eye) == 0);
-    assert!(std::mem::offset_of!(CategoricalPatchUniform, opacity) == 12);
-    assert!(std::mem::offset_of!(CategoricalPatchUniform, uv_rect) == 16);
-    assert!(std::mem::offset_of!(CategoricalPatchUniform, has_nodata) == 32);
-    assert!(std::mem::offset_of!(CategoricalPatchUniform, nodata_value) == 36);
-
-    assert!(std::mem::size_of::<PaletteUniform>() == 4096);
-
-    assert!(std::mem::size_of::<VectorUniform>() == 48);
-    assert!(std::mem::offset_of!(VectorUniform, offset_eye) == 0);
-    assert!(std::mem::offset_of!(VectorUniform, point_radius_m) == 12);
-    assert!(std::mem::offset_of!(VectorUniform, color) == 16);
-    assert!(std::mem::offset_of!(VectorUniform, viewport_inv_size) == 32);
-    assert!(std::mem::offset_of!(VectorUniform, stroke_half_width_px) == 40);
-    assert!(std::mem::offset_of!(VectorUniform, hatch_spacing_px) == 44);
-
-    assert!(std::mem::size_of::<ScratchClearUniform>() == 16);
-    assert!(std::mem::offset_of!(ScratchClearUniform, nan_bits) == 0);
-
-    assert!(std::mem::size_of::<ScratchSinglePatchUniform>() == 48);
-    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, offset_eye) == 0);
-    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, scale) == 12);
-    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, uv_rect) == 16);
-    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, offset) == 32);
-    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, mip_count) == 36);
-    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, has_nodata) == 40);
-    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, nodata_value) == 44);
-
-    assert!(std::mem::size_of::<ScratchMrtPatchUniform>() == 160);
-    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, offset_eye) == 0);
-    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, nan_bits) == 12);
-    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, uv_rects) == 16);
-    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, scale_offsets) == 80);
-    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, mip_counts) == 144);
-
-    assert!(std::mem::size_of::<BandMathCompositeUniform>() == 64);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, opacity) == 0);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, mode) == 4);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, stretch_min) == 8);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, stretch_inv_range) == 12);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, rgb_min) == 16);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, rgb_inv_range) == 32);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, invert_colormap) == 48);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, scl_mask_enabled) == 52);
-    assert!(std::mem::offset_of!(BandMathCompositeUniform, scl_mask_bits) == 56);
-};
-
 /// Rust-side WGSL uniform struct layout descriptor computed directly from
 /// `std::mem::size_of` and `std::mem::offset_of!` for `naga` layout parity
 /// verification in integration tests.
@@ -220,269 +138,121 @@ pub struct UniformLayoutSpec {
     pub fields: &'static [(&'static str, usize)],
 }
 
-/// Canonical Rust-side uniform layout table verified against all WGSL shaders
-/// by the `shader_codegen` integration test.
-#[cfg(any(test, feature = "test-support"))]
-pub const UNIFORM_LAYOUT_SPECS: &[UniformLayoutSpec] = &[
-    UniformLayoutSpec {
-        wgsl_name: "CameraUniform",
-        size: std::mem::size_of::<CameraUniform>(),
-        fields: &[
-            ("view_proj", std::mem::offset_of!(CameraUniform, view_proj)),
-            (
-                "grid_step_deg",
-                std::mem::offset_of!(CameraUniform, grid_step_deg),
-            ),
-            (
-                "grid_width_px",
-                std::mem::offset_of!(CameraUniform, grid_width_px),
-            ),
-            (
-                "polar_r_cap",
-                std::mem::offset_of!(CameraUniform, polar_r_cap),
-            ),
-        ],
+/// Emit both compile-time `size_of` / `offset_of!` assertions and the
+/// test-only [`UNIFORM_LAYOUT_SPECS`] table from a single canonical definition.
+macro_rules! define_uniform_layouts {
+    (
+        $(
+            $ty:ident ($size:expr) {
+                $( $field:ident => $offset:expr ),* $(,)?
+            }
+        ),* $(,)?
+    ) => {
+        const _: () = {
+            $(
+                assert!(std::mem::size_of::<$ty>() == $size);
+                $(
+                    assert!(std::mem::offset_of!($ty, $field) == $offset);
+                )*
+            )*
+        };
+
+        /// Canonical Rust-side uniform layout table verified against all WGSL
+        /// shaders by the `shader_codegen` integration test.
+        #[cfg(any(test, feature = "test-support"))]
+        pub const UNIFORM_LAYOUT_SPECS: &[UniformLayoutSpec] = &[
+            $(
+                UniformLayoutSpec {
+                    wgsl_name: stringify!($ty),
+                    size: std::mem::size_of::<$ty>(),
+                    fields: &[
+                        $( (stringify!($field), std::mem::offset_of!($ty, $field)) ),*
+                    ],
+                },
+            )*
+        ];
+    };
+}
+
+define_uniform_layouts! {
+    CameraUniform (80) {
+        view_proj => 0,
+        grid_step_deg => 64,
+        grid_width_px => 68,
+        polar_r_cap => 72,
     },
-    UniformLayoutSpec {
-        wgsl_name: "TileUniform",
-        size: std::mem::size_of::<TileUniform>(),
-        fields: &[
-            ("offset_eye", std::mem::offset_of!(TileUniform, offset_eye)),
-            ("tile_kind", std::mem::offset_of!(TileUniform, tile_kind)),
-            ("uv_rect", std::mem::offset_of!(TileUniform, uv_rect)),
-            (
-                "grid_anchor",
-                std::mem::offset_of!(TileUniform, grid_anchor),
-            ),
-        ],
+    TileUniform (48) {
+        offset_eye => 0,
+        tile_kind => 12,
+        uv_rect => 16,
+        grid_anchor => 32,
     },
-    UniformLayoutSpec {
-        wgsl_name: "OverlayPatchUniform",
-        size: std::mem::size_of::<OverlayPatchUniform>(),
-        fields: &[
-            (
-                "offset_eye",
-                std::mem::offset_of!(OverlayPatchUniform, offset_eye),
-            ),
-            (
-                "opacity",
-                std::mem::offset_of!(OverlayPatchUniform, opacity),
-            ),
-            (
-                "uv_rect",
-                std::mem::offset_of!(OverlayPatchUniform, uv_rect),
-            ),
-        ],
+    OverlayPatchUniform (32) {
+        offset_eye => 0,
+        opacity => 12,
+        uv_rect => 16,
     },
-    UniformLayoutSpec {
-        wgsl_name: "ScientificPatchUniform",
-        size: std::mem::size_of::<ScientificPatchUniform>(),
-        fields: &[
-            (
-                "offset_eye",
-                std::mem::offset_of!(ScientificPatchUniform, offset_eye),
-            ),
-            (
-                "opacity",
-                std::mem::offset_of!(ScientificPatchUniform, opacity),
-            ),
-            (
-                "uv_rect",
-                std::mem::offset_of!(ScientificPatchUniform, uv_rect),
-            ),
-            ("scale", std::mem::offset_of!(ScientificPatchUniform, scale)),
-            (
-                "offset",
-                std::mem::offset_of!(ScientificPatchUniform, offset),
-            ),
-            (
-                "stretch_min",
-                std::mem::offset_of!(ScientificPatchUniform, stretch_min),
-            ),
-            (
-                "stretch_inv_range",
-                std::mem::offset_of!(ScientificPatchUniform, stretch_inv_range),
-            ),
-            (
-                "stretch_mode",
-                std::mem::offset_of!(ScientificPatchUniform, stretch_mode),
-            ),
-            (
-                "invert_colormap",
-                std::mem::offset_of!(ScientificPatchUniform, invert_colormap),
-            ),
-            (
-                "mip_count",
-                std::mem::offset_of!(ScientificPatchUniform, mip_count),
-            ),
-        ],
+    ScientificPatchUniform (64) {
+        offset_eye => 0,
+        opacity => 12,
+        uv_rect => 16,
+        scale => 32,
+        offset => 36,
+        stretch_min => 40,
+        stretch_inv_range => 44,
+        stretch_mode => 48,
+        invert_colormap => 52,
+        mip_count => 56,
     },
-    UniformLayoutSpec {
-        wgsl_name: "CategoricalPatchUniform",
-        size: std::mem::size_of::<CategoricalPatchUniform>(),
-        fields: &[
-            (
-                "offset_eye",
-                std::mem::offset_of!(CategoricalPatchUniform, offset_eye),
-            ),
-            (
-                "opacity",
-                std::mem::offset_of!(CategoricalPatchUniform, opacity),
-            ),
-            (
-                "uv_rect",
-                std::mem::offset_of!(CategoricalPatchUniform, uv_rect),
-            ),
-            (
-                "has_nodata",
-                std::mem::offset_of!(CategoricalPatchUniform, has_nodata),
-            ),
-            (
-                "nodata_value",
-                std::mem::offset_of!(CategoricalPatchUniform, nodata_value),
-            ),
-        ],
+    CategoricalPatchUniform (48) {
+        offset_eye => 0,
+        opacity => 12,
+        uv_rect => 16,
+        has_nodata => 32,
+        nodata_value => 36,
     },
-    UniformLayoutSpec {
-        wgsl_name: "PaletteUniform",
-        size: std::mem::size_of::<PaletteUniform>(),
-        fields: &[("entries", std::mem::offset_of!(PaletteUniform, entries))],
+    PaletteUniform (4096) {
+        entries => 0,
     },
-    UniformLayoutSpec {
-        wgsl_name: "VectorUniform",
-        size: std::mem::size_of::<VectorUniform>(),
-        fields: &[
-            (
-                "offset_eye",
-                std::mem::offset_of!(VectorUniform, offset_eye),
-            ),
-            (
-                "point_radius_m",
-                std::mem::offset_of!(VectorUniform, point_radius_m),
-            ),
-            ("color", std::mem::offset_of!(VectorUniform, color)),
-            (
-                "viewport_inv_size",
-                std::mem::offset_of!(VectorUniform, viewport_inv_size),
-            ),
-            (
-                "stroke_half_width_px",
-                std::mem::offset_of!(VectorUniform, stroke_half_width_px),
-            ),
-            (
-                "hatch_spacing_px",
-                std::mem::offset_of!(VectorUniform, hatch_spacing_px),
-            ),
-        ],
+    VectorUniform (48) {
+        offset_eye => 0,
+        point_radius_m => 12,
+        color => 16,
+        viewport_inv_size => 32,
+        stroke_half_width_px => 40,
+        hatch_spacing_px => 44,
     },
-    UniformLayoutSpec {
-        wgsl_name: "ScratchClearUniform",
-        size: std::mem::size_of::<ScratchClearUniform>(),
-        fields: &[(
-            "nan_bits",
-            std::mem::offset_of!(ScratchClearUniform, nan_bits),
-        )],
+    ScratchClearUniform (16) {
+        nan_bits => 0,
     },
-    UniformLayoutSpec {
-        wgsl_name: "ScratchSinglePatchUniform",
-        size: std::mem::size_of::<ScratchSinglePatchUniform>(),
-        fields: &[
-            (
-                "offset_eye",
-                std::mem::offset_of!(ScratchSinglePatchUniform, offset_eye),
-            ),
-            (
-                "scale",
-                std::mem::offset_of!(ScratchSinglePatchUniform, scale),
-            ),
-            (
-                "uv_rect",
-                std::mem::offset_of!(ScratchSinglePatchUniform, uv_rect),
-            ),
-            (
-                "offset",
-                std::mem::offset_of!(ScratchSinglePatchUniform, offset),
-            ),
-            (
-                "mip_count",
-                std::mem::offset_of!(ScratchSinglePatchUniform, mip_count),
-            ),
-            (
-                "has_nodata",
-                std::mem::offset_of!(ScratchSinglePatchUniform, has_nodata),
-            ),
-            (
-                "nodata_value",
-                std::mem::offset_of!(ScratchSinglePatchUniform, nodata_value),
-            ),
-        ],
+    ScratchSinglePatchUniform (48) {
+        offset_eye => 0,
+        scale => 12,
+        uv_rect => 16,
+        offset => 32,
+        mip_count => 36,
+        has_nodata => 40,
+        nodata_value => 44,
     },
-    UniformLayoutSpec {
-        wgsl_name: "ScratchMrtPatchUniform",
-        size: std::mem::size_of::<ScratchMrtPatchUniform>(),
-        fields: &[
-            (
-                "offset_eye",
-                std::mem::offset_of!(ScratchMrtPatchUniform, offset_eye),
-            ),
-            (
-                "nan_bits",
-                std::mem::offset_of!(ScratchMrtPatchUniform, nan_bits),
-            ),
-            (
-                "uv_rects",
-                std::mem::offset_of!(ScratchMrtPatchUniform, uv_rects),
-            ),
-            (
-                "scale_offsets",
-                std::mem::offset_of!(ScratchMrtPatchUniform, scale_offsets),
-            ),
-            (
-                "mip_counts",
-                std::mem::offset_of!(ScratchMrtPatchUniform, mip_counts),
-            ),
-        ],
+    ScratchMrtPatchUniform (160) {
+        offset_eye => 0,
+        nan_bits => 12,
+        uv_rects => 16,
+        scale_offsets => 80,
+        mip_counts => 144,
     },
-    UniformLayoutSpec {
-        wgsl_name: "BandMathCompositeUniform",
-        size: std::mem::size_of::<BandMathCompositeUniform>(),
-        fields: &[
-            (
-                "opacity",
-                std::mem::offset_of!(BandMathCompositeUniform, opacity),
-            ),
-            ("mode", std::mem::offset_of!(BandMathCompositeUniform, mode)),
-            (
-                "stretch_min",
-                std::mem::offset_of!(BandMathCompositeUniform, stretch_min),
-            ),
-            (
-                "stretch_inv_range",
-                std::mem::offset_of!(BandMathCompositeUniform, stretch_inv_range),
-            ),
-            (
-                "rgb_min",
-                std::mem::offset_of!(BandMathCompositeUniform, rgb_min),
-            ),
-            (
-                "rgb_inv_range",
-                std::mem::offset_of!(BandMathCompositeUniform, rgb_inv_range),
-            ),
-            (
-                "invert_colormap",
-                std::mem::offset_of!(BandMathCompositeUniform, invert_colormap),
-            ),
-            (
-                "scl_mask_enabled",
-                std::mem::offset_of!(BandMathCompositeUniform, scl_mask_enabled),
-            ),
-            (
-                "scl_mask_bits",
-                std::mem::offset_of!(BandMathCompositeUniform, scl_mask_bits),
-            ),
-        ],
+    BandMathCompositeUniform (64) {
+        opacity => 0,
+        mode => 4,
+        stretch_min => 8,
+        stretch_inv_range => 12,
+        rgb_min => 16,
+        rgb_inv_range => 32,
+        invert_colormap => 48,
+        scl_mask_enabled => 52,
+        scl_mask_bits => 56,
     },
-];
+}
 
 /// Number of typed dynamic-uniform bind-group slots backed by
 /// [`DynamicUniformArena`].
@@ -596,7 +366,8 @@ fn dynamic_uniform_bind_group(
 }
 
 /// Frame-wide dynamic uniform arena shared across globe body, post-body
-/// display/scientific/categorical raster overlays, vector overlays, and
+/// display/scientific/categorical raster overlays, Band Math scratch
+/// (`ScratchSingle`, `ScratchMrt`) and composite passes, vector overlays, and
 /// graticule passes.
 pub(super) struct DynamicUniformArena {
     alignment: u32,

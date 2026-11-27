@@ -13,34 +13,13 @@ use veldmap_core::tile::SourceFingerprint;
 use crate::RasterError;
 use crate::adapters::{JpegSource, PngSource};
 use crate::image_codec::{has_jpeg_magic, has_png_magic};
-use crate::pipeline::RasterSource;
+use crate::pipeline::{ExternalBandMeta, RasterSource};
 use crate::sidecar::{SidecarGeoref, load_sidecar_georef_with};
 use crate::tiff::{TiffSource, has_tiff_magic};
 
 /// Callback signature for caller-injected sidecar text reads, keeping
 /// `veldmap-raster` free of filesystem dependencies.
 pub type SidecarReader<'a> = &'a mut dyn FnMut(&Path, u64) -> Result<Option<String>, String>;
-
-/// External per-band radiometric metadata (e.g., from STAC `raster:bands`)
-/// applied to bands of a GeoTIFF/COG source whose embedded metadata did not
-/// declare the corresponding fields.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ExternalBandMeta {
-    pub scale: Option<f64>,
-    pub offset: Option<f64>,
-    pub nodata: Option<f64>,
-    pub unit: Option<String>,
-}
-
-impl ExternalBandMeta {
-    /// Return whether at least one external metadata field is populated.
-    pub fn has_any(&self) -> bool {
-        self.scale.is_some()
-            || self.offset.is_some()
-            || self.nodata.is_some()
-            || self.unit.as_deref().is_some_and(|u| !u.trim().is_empty())
-    }
-}
 
 /// Optional sidecar georeferencing and external per-band metadata applied when
 /// opening a raster via [`open_raster_with_options`].
@@ -105,11 +84,14 @@ fn open_classified_raster(
     match format {
         RasterFormat::Tiff => {
             let sidecar = options.sidecars.filter(|sc| !sc.is_empty()).cloned();
-            let mut src =
-                TiffSource::open_with_sidecar(source, fingerprint, sidecar, budget, cancel)?;
-            if !options.external_bands.is_empty() {
-                src.apply_external_band_meta(options.external_bands);
-            }
+            let src = TiffSource::open_with_options(
+                source,
+                fingerprint,
+                sidecar,
+                options.external_bands,
+                budget,
+                cancel,
+            )?;
             Ok(OpenedRaster {
                 source: Arc::new(src),
                 ignored_sidecar_error: None,

@@ -1,29 +1,24 @@
-//! STAC catalog presets, async search orchestration (`StacSession`), cached
-//! UI-facing view projections, and Pass-2 footprint/highlight overlay caches.
+//! STAC catalog presets, async search orchestration (`StacSession`), and Pass-2
+//! footprint/highlight overlay caches.
 
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, OnceLock};
 
 use veldmap_core::geo::GeoJsonGeometry;
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_net::{
-    NetContext, SampleRecipeBand, SampleRecipeKind, StacAsset, StacCatalogConfig, StacClient,
-    StacItem, StacSearchQuery, StacSearchResult, builtin_sample_recipes, builtin_sample_scenes,
+    NetContext, StacCatalogConfig, StacClient, StacItem, StacSearchQuery, StacSearchResult,
 };
-use veldmap_raster::ExternalBandMeta;
 
-use crate::layers::BandMathPreset;
 use crate::render::{DrawVectorId, DrawVectorLayer};
 use crate::storage::settings::StacSettings;
 
-use super::aoi::{
-    AoiState, build_vector_layer, footprint_bounds_from_bbox, polygon_geometry_from_bbox,
-};
+use super::aoi::{AoiState, build_vector_layer};
 use super::auth::{StacCogAuthMode, resolve_cog_auth};
-use super::{
-    RedactedUrl, SampleRecipeView, SampleSceneView, StacCogAssetView, StacItemView,
-    StacRecipeAssetView, StacRecipeView, StacViewSnapshot,
+use super::views::{
+    build_item_view, builtin_sample_recipe_views, builtin_sample_scene_views, item_geometry,
 };
+use super::{StacItemView, StacViewSnapshot};
 
 /// Default visual colors (sRGB RGB + linear alpha) for STAC overlays on globe.
 const STAC_FOOTPRINT_FILL: [f32; 4] = [0.22, 0.62, 0.96, 0.08];
@@ -96,258 +91,6 @@ pub(crate) struct StacSearchRequest {
     pub(crate) filter_clouds: bool,
     pub(crate) max_cloud_cover: f32,
     pub(crate) limit: usize,
-}
-
-fn external_bands_from_asset(asset: &StacAsset) -> Vec<ExternalBandMeta> {
-    asset
-        .raster_bands
-        .iter()
-        .map(|b| ExternalBandMeta {
-            scale: b.scale,
-            offset: b.offset,
-            nodata: b.nodata,
-            unit: b.unit.clone(),
-        })
-        .collect()
-}
-
-fn external_bands_from_sample(
-    band_count: u8,
-    scale: Option<f64>,
-    offset: Option<f64>,
-    nodata: Option<f64>,
-    unit: Option<&str>,
-) -> Vec<ExternalBandMeta> {
-    let meta = ExternalBandMeta {
-        scale,
-        offset,
-        nodata,
-        unit: unit.map(str::to_owned),
-    };
-    if meta.has_any() {
-        vec![meta; usize::from(band_count.max(1))]
-    } else {
-        Vec::new()
-    }
-}
-
-fn recipe_asset_from_sample(band: &SampleRecipeBand) -> StacRecipeAssetView {
-    StacRecipeAssetView {
-        label: band.label.to_owned(),
-        href: RedactedUrl::new(band.url),
-        external_bands: external_bands_from_sample(
-            1,
-            band.scale,
-            band.offset,
-            band.nodata,
-            band.unit,
-        ),
-    }
-}
-
-/// Cached UI-facing projection of built-in zero-auth COG sample scenes.
-fn builtin_sample_scene_views() -> &'static [SampleSceneView] {
-    static VIEWS: OnceLock<Vec<SampleSceneView>> = OnceLock::new();
-    VIEWS.get_or_init(|| {
-        builtin_sample_scenes()
-            .iter()
-            .map(|sample| SampleSceneView {
-                title: sample.title,
-                description: sample.description,
-                cog_url: sample.cog_url,
-                external_bands: external_bands_from_sample(
-                    sample.band_count,
-                    sample.scale,
-                    sample.offset,
-                    sample.nodata,
-                    sample.unit,
-                ),
-            })
-            .collect()
-    })
-}
-
-const fn preset_from_sample_kind(kind: SampleRecipeKind) -> BandMathPreset {
-    match kind {
-        SampleRecipeKind::TrueColor => BandMathPreset::TrueColor,
-        SampleRecipeKind::Ndvi => BandMathPreset::Ndvi,
-        SampleRecipeKind::Ndwi => BandMathPreset::Ndwi,
-        SampleRecipeKind::FalseColorNir => BandMathPreset::FalseColorNir,
-        SampleRecipeKind::Swir => BandMathPreset::Swir,
-    }
-}
-
-/// Cached UI-facing projection of built-in zero-auth multi-band sample recipes.
-fn builtin_sample_recipe_views() -> &'static [SampleRecipeView] {
-    static VIEWS: OnceLock<Vec<SampleRecipeView>> = OnceLock::new();
-    VIEWS.get_or_init(|| {
-        builtin_sample_recipes()
-            .iter()
-            .map(|recipe| SampleRecipeView {
-                title: recipe.title,
-                description: recipe.description,
-                preset: preset_from_sample_kind(recipe.kind),
-                bands: recipe.bands.iter().map(recipe_asset_from_sample).collect(),
-                scl: recipe.scl.as_ref().map(recipe_asset_from_sample),
-            })
-            .collect()
-    })
-}
-
-fn format_recipe_band_label(key: &str, role: &str) -> String {
-    if key.eq_ignore_ascii_case(role) {
-        role.to_owned()
-    } else {
-        format!("{key} ({role})")
-    }
-}
-
-fn build_asset_view(asset: &StacAsset) -> StacCogAssetView {
-    StacCogAssetView {
-        key: asset.key.clone(),
-        title: asset.title.clone(),
-        href: RedactedUrl::new(asset.href.clone()),
-        gsd: asset.gsd,
-        external_bands: external_bands_from_asset(asset),
-        is_scl: asset.is_scl_asset(),
-    }
-}
-
-fn recipe_asset_from_stac(label: &str, asset: &StacAsset) -> StacRecipeAssetView {
-    StacRecipeAssetView {
-        label: label.to_owned(),
-        href: RedactedUrl::new(asset.href.clone()),
-        external_bands: external_bands_from_asset(asset),
-    }
-}
-
-fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
-    let red = item.find_band_asset(&["red", "B04", "b04"]);
-    let green = item.find_band_asset(&["green", "B03", "b03"]);
-    let blue = item.find_band_asset(&["blue", "B02", "b02"]);
-    let nir = item.find_band_asset(&["nir", "B08", "b08", "nir08", "B8A", "b8a"]);
-    let swir = item.find_band_asset(&["swir22", "B12", "b12", "swir16", "B11", "b11"]);
-    let scl = item.scl_asset().map(|a| recipe_asset_from_stac("SCL", a));
-    let scl_tag = if scl.is_some() { " + SCL" } else { "" };
-
-    let mut recipes = Vec::new();
-    if let (Some(r), Some(g), Some(b)) = (red, green, blue) {
-        recipes.push(StacRecipeView {
-            preset: BandMathPreset::TrueColor,
-            button_label: format!("True Color{scl_tag}"),
-            tooltip: format!(
-                "Physical reflectance True Color ({}, {}, {}){scl_tag}",
-                r.key, g.key, b.key
-            ),
-            bands: vec![
-                recipe_asset_from_stac(&format_recipe_band_label(&r.key, "Red"), r),
-                recipe_asset_from_stac(&format_recipe_band_label(&g.key, "Green"), g),
-                recipe_asset_from_stac(&format_recipe_band_label(&b.key, "Blue"), b),
-            ],
-            scl: scl.clone(),
-        });
-    }
-    if let (Some(n), Some(r)) = (nir, red) {
-        recipes.push(StacRecipeView {
-            preset: BandMathPreset::Ndvi,
-            button_label: format!("NDVI{scl_tag}"),
-            tooltip: format!(
-                "Normalized Difference Vegetation Index ({} − {}) / ({} + {}){scl_tag}",
-                n.key, r.key, n.key, r.key
-            ),
-            bands: vec![
-                recipe_asset_from_stac(&format_recipe_band_label(&n.key, "NIR"), n),
-                recipe_asset_from_stac(&format_recipe_band_label(&r.key, "Red"), r),
-            ],
-            scl: scl.clone(),
-        });
-    }
-    if let (Some(g), Some(n)) = (green, nir) {
-        recipes.push(StacRecipeView {
-            preset: BandMathPreset::Ndwi,
-            button_label: format!("NDWI{scl_tag}"),
-            tooltip: format!(
-                "Normalized Difference Water Index ({} − {}) / ({} + {}){scl_tag}",
-                g.key, n.key, g.key, n.key
-            ),
-            bands: vec![
-                recipe_asset_from_stac(&format_recipe_band_label(&g.key, "Green"), g),
-                recipe_asset_from_stac(&format_recipe_band_label(&n.key, "NIR"), n),
-            ],
-            scl: scl.clone(),
-        });
-    }
-    if let (Some(n), Some(r), Some(g)) = (nir, red, green) {
-        recipes.push(StacRecipeView {
-            preset: BandMathPreset::FalseColorNir,
-            button_label: format!("False Color NIR{scl_tag}"),
-            tooltip: format!(
-                "False Color Infrared composite ({}, {}, {}){scl_tag}",
-                n.key, r.key, g.key
-            ),
-            bands: vec![
-                recipe_asset_from_stac(&format_recipe_band_label(&n.key, "NIR"), n),
-                recipe_asset_from_stac(&format_recipe_band_label(&r.key, "Red"), r),
-                recipe_asset_from_stac(&format_recipe_band_label(&g.key, "Green"), g),
-            ],
-            scl: scl.clone(),
-        });
-    }
-    if let (Some(s), Some(n), Some(r)) = (swir, nir, red) {
-        recipes.push(StacRecipeView {
-            preset: BandMathPreset::Swir,
-            button_label: format!("SWIR{scl_tag}"),
-            tooltip: format!(
-                "Short-Wave Infrared composite ({}, {}, {}){scl_tag}",
-                s.key, n.key, r.key
-            ),
-            bands: vec![
-                recipe_asset_from_stac(&format_recipe_band_label(&s.key, "SWIR"), s),
-                recipe_asset_from_stac(&format_recipe_band_label(&n.key, "NIR"), n),
-                recipe_asset_from_stac(&format_recipe_band_label(&r.key, "Red"), r),
-            ],
-            scl,
-        });
-    }
-    recipes
-}
-
-fn build_item_view(item: &StacItem) -> StacItemView {
-    let short_date = item
-        .datetime
-        .as_deref()
-        .map(|dt| dt.split('T').next().unwrap_or(dt).to_owned());
-    let preferred_cog = item.preferred_cog_asset().map(build_asset_view);
-    let recipes = build_item_recipes(item);
-    let cog_assets = item
-        .cog_assets()
-        .into_iter()
-        .map(build_asset_view)
-        .collect();
-    let zoom_bounds = item
-        .bbox
-        .or_else(|| item.geometry.as_ref().and_then(GeoJsonGeometry::bbox))
-        .and_then(footprint_bounds_from_bbox);
-    StacItemView {
-        id: item.id.clone(),
-        short_date,
-        cloud_cover: item.cloud_cover,
-        mgrs_tile: item.mgrs_tile.clone(),
-        platform: item.platform.clone(),
-        processing_level: item.processing_level.clone(),
-        preferred_cog,
-        recipes,
-        cog_assets,
-        zoom_bounds,
-    }
-}
-
-fn item_geometry(item: &StacItem) -> Option<GeoJsonGeometry> {
-    if let Some(geom) = &item.geometry {
-        Some(geom.clone())
-    } else {
-        item.bbox.and_then(polygon_geometry_from_bbox)
-    }
 }
 
 struct SearchDoneMsg {
@@ -566,8 +309,11 @@ impl StacSession {
         if self.selected_idx == clamped {
             return false;
         }
+        let prev_active = self.hovered_idx.or(self.selected_idx);
         self.selected_idx = clamped;
-        self.rebuild_highlight();
+        if self.hovered_idx.or(self.selected_idx) != prev_active {
+            self.rebuild_highlight();
+        }
         true
     }
 
@@ -576,8 +322,11 @@ impl StacSession {
         if self.hovered_idx == clamped {
             return false;
         }
+        let prev_active = self.hovered_idx.or(self.selected_idx);
         self.hovered_idx = clamped;
-        self.rebuild_highlight();
+        if self.hovered_idx.or(self.selected_idx) != prev_active {
+            self.rebuild_highlight();
+        }
         true
     }
 
@@ -746,89 +495,5 @@ impl StacSession {
         if let Some(aoi) = self.aoi.draw_layer() {
             out.push(aoi.clone());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use veldmap_net::{StacAsset, StacItem, StacRasterBandMeta};
-
-    use super::*;
-
-    fn cog_asset(key: &str, eo_bands: &[&str], roles: &[&str]) -> StacAsset {
-        StacAsset {
-            key: key.to_owned(),
-            title: Some(key.to_owned()),
-            href: format!("https://example.org/{key}.tif"),
-            media_type: Some("image/tiff; application=geotiff; profile=cloud-optimized".to_owned()),
-            roles: roles.iter().map(|s| (*s).to_owned()).collect(),
-            eo_bands: eo_bands.iter().map(|s| (*s).to_owned()).collect(),
-            gsd: Some(10.0),
-            raster_bands: vec![StacRasterBandMeta {
-                scale: Some(0.0001),
-                offset: Some(-0.1),
-                nodata: Some(0.0),
-                data_type: Some("uint16".to_owned()),
-                spatial_resolution: Some(10.0),
-                unit: Some("reflectance".to_owned()),
-            }],
-        }
-    }
-
-    #[test]
-    fn build_item_view_generates_five_stac_recipes_badges_and_scl_detection() {
-        let item = StacItem {
-            id: "S2B_32TMS_20240801_0_L2A".to_owned(),
-            collection: Some("sentinel-2-l2a".to_owned()),
-            datetime: Some("2024-08-01T10:15:00Z".to_owned()),
-            cloud_cover: Some(2.5),
-            platform: Some("sentinel-2b".to_owned()),
-            processing_level: Some("L2A".to_owned()),
-            bbox: Some([7.5, 45.8, 9.2, 47.1]),
-            geometry: None,
-            mgrs_tile: Some("32TMS".to_owned()),
-            assets: vec![
-                cog_asset("blue", &["blue", "B02"], &["data"]),
-                cog_asset("green", &["green", "B03"], &["data"]),
-                cog_asset("red", &["red", "B04"], &["data"]),
-                cog_asset("nir", &["nir", "B08"], &["data"]),
-                cog_asset("swir16", &["swir16", "B11"], &["data"]),
-                cog_asset("swir22", &["swir22", "B12"], &["data"]),
-                cog_asset("scl", &[], &["data", "scl"]),
-            ],
-        };
-
-        let view = build_item_view(&item);
-        assert_eq!(view.processing_level.as_deref(), Some("L2A"));
-        assert_eq!(view.platform.as_deref(), Some("sentinel-2b"));
-        let presets: Vec<BandMathPreset> = view.recipes.iter().map(|r| r.preset).collect();
-        assert_eq!(
-            presets,
-            vec![
-                BandMathPreset::TrueColor,
-                BandMathPreset::Ndvi,
-                BandMathPreset::Ndwi,
-                BandMathPreset::FalseColorNir,
-                BandMathPreset::Swir,
-            ]
-        );
-        let ndvi = view
-            .recipes
-            .iter()
-            .find(|r| r.preset == BandMathPreset::Ndvi)
-            .expect("ndvi recipe");
-        assert!(ndvi.button_label.contains("SCL"));
-        assert_eq!(ndvi.bands.len(), 2);
-        assert!(ndvi.scl.is_some());
-        assert!(
-            view.cog_assets
-                .iter()
-                .find(|a| a.key == "scl")
-                .is_some_and(|a| a.is_scl)
-        );
-        assert!(
-            !builtin_sample_recipe_views().is_empty(),
-            "built-in sample recipes must be projected for STAC panel"
-        );
     }
 }

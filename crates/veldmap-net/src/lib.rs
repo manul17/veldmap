@@ -18,6 +18,7 @@ mod basemap;
 mod context;
 mod fetcher;
 mod http;
+mod limiter;
 mod range;
 mod redact;
 mod stac;
@@ -40,9 +41,8 @@ pub use range::RANGE_BLOCK_SIZE;
 pub use range::{HttpRangeConfig, HttpRangeSource, PrefetchPin, RangeOpenError};
 pub use redact::sanitize_url_for_display;
 pub use stac::{
-    SampleRecipeBand, SampleRecipeKind, SampleRecipeScene, SampleScene, StacAsset, StacAuth,
-    StacCatalogConfig, StacClient, StacError, StacItem, StacRasterBandMeta, StacSearchQuery,
-    StacSearchResult, builtin_sample_recipes, builtin_sample_scenes,
+    StacAsset, StacAuth, StacCatalogConfig, StacClient, StacError, StacItem, StacRasterBandMeta,
+    StacSearchQuery, StacSearchResult,
 };
 pub use url::{is_valid_http_endpoint, same_http_origin};
 

@@ -19,6 +19,7 @@ mod open;
 mod probe;
 mod raw_decode;
 mod stretch;
+mod view;
 mod ycbcr;
 
 use std::sync::Arc;
@@ -35,9 +36,10 @@ use crate::pipeline::{
 };
 
 use chunk_reader::{ChunkReadMode, TiffChunkReader};
-use ifd::{CachedIfd, Photometric, RawTiffAccess, TiffSourceView, find_ifd};
+use ifd::{CachedIfd, Photometric};
 use probe::{sample_display_rgba, sample_indexed_band};
 use stretch::{BandStatsCache, StretchCache, StretchRequest, pick_sample_chunks};
+use view::{RawTiffAccess, TiffSourceView, find_ifd};
 
 /// BigTIFF file header signatures (`version = 43`).
 const BIG_MAGIC: [&[u8]; 2] = [b"II\x2b\x00", b"MM\x00\x2b"];
@@ -85,72 +87,6 @@ impl TiffSource {
     #[cfg(any(test, feature = "test-support"))]
     pub fn is_tiled(&self) -> bool {
         self.base_ifd().tiled
-    }
-
-    /// Apply external per-band `(scale, offset, nodata, unit)` metadata (e.g.,
-    /// from STAC `raster:bands`) to indexed bands whose embedded TIFF metadata
-    /// did not explicitly declare the corresponding fields.
-    pub(crate) fn apply_external_band_meta(&mut self, external: &[crate::ExternalBandMeta]) {
-        if external.is_empty() {
-            return;
-        }
-
-        for band in &mut self.description.bands {
-            let BandKey::Index(b) = band.band_key else {
-                continue;
-            };
-            let idx = usize::from(b);
-            let Some(ext) = external.get(idx) else {
-                continue;
-            };
-
-            if !band.has_embedded_scale_offset && (ext.scale.is_some() || ext.offset.is_some()) {
-                let scale = ext.scale.unwrap_or(1.0);
-                let offset = ext.offset.unwrap_or(0.0);
-                if scale.is_finite() && scale != 0.0 && offset.is_finite() {
-                    band.scale = scale;
-                    band.offset = offset;
-                }
-            }
-
-            if band.nodata.is_none()
-                && let Some(nd) = ext.nodata
-                && (nd.is_finite() || nd.is_nan())
-            {
-                band.nodata = Some(nd);
-                if let Some(slot) = self.per_band_nodata.get_mut(idx) {
-                    *slot = Some(nd);
-                }
-            }
-
-            if band.units.is_none()
-                && let Some(unit) = ext.unit.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            {
-                band.units = Some(unit.to_owned());
-            }
-        }
-
-        if self.nodata_f64.is_none()
-            && let Some(nd) = ifd::uniform_display_nodata(
-                &self.per_band_nodata,
-                self.base_ifd().pixel_layout.colors().max(1),
-            )
-        {
-            self.nodata_f64 = Some(nd);
-            if let Some(display) = self
-                .description
-                .bands
-                .iter_mut()
-                .find(|b| b.band_key == BandKey::Display)
-            {
-                display.nodata = Some(nd);
-            }
-            if !self.base_ifd().needs_display_stretch() {
-                let mapping = DisplayMapping::identity(Some(nd))
-                    .with_invert(self.base_ifd().photometric == Photometric::WhiteIsZero);
-                self.stretch = StretchCache::new(Some(mapping));
-            }
-        }
     }
 
     fn base_ifd(&self) -> &CachedIfd {

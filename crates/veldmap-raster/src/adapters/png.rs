@@ -131,14 +131,12 @@ impl PngSource {
     fn open_normalized_reader(
         &self,
         ctx: &DecodeContext<'_>,
-    ) -> Result<(png::Reader<BufferedByteReader>, PixelLayout), RasterError> {
+    ) -> Result<png::Reader<BufferedByteReader>, RasterError> {
         let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
         let decoder = build_normalized_png_decoder(reader, ctx.budget.decode_working_bytes);
-        let png_reader = decoder
+        decoder
             .read_info()
-            .map_err(|e| map_png_error(e, ctx.cancel))?;
-        let layout = PixelLayout::named(png_reader.output_color_type().0.samples());
-        Ok((png_reader, layout))
+            .map_err(|e| map_png_error(e, ctx.cancel))
     }
 }
 
@@ -174,7 +172,7 @@ impl RasterSource for PngSource {
             return Err(RasterError::Cancelled);
         }
 
-        let (mut png_reader, layout) = self.open_normalized_reader(ctx)?;
+        let mut png_reader = self.open_normalized_reader(ctx)?;
         let (w, h, interlaced) = {
             let info = png_reader.info();
             (info.width, info.height, info.interlaced)
@@ -217,6 +215,8 @@ impl RasterSource for PngSource {
             cascade.push_rows(&rgba, h, &mut bled_emit)?;
             return cascade.finish(&mut bled_emit);
         }
+
+        let layout = PixelLayout::named(png_reader.output_color_type().0.samples());
 
         let _lease = ctx
             .budget_tracker
@@ -269,7 +269,8 @@ impl RasterSource for PngSource {
         let _lease = ctx
             .budget_tracker
             .reserve_blocking(probe_bytes, ctx.cancel)?;
-        let (mut png_reader, layout) = self.open_normalized_reader(ctx)?;
+        let mut png_reader = self.open_normalized_reader(ctx)?;
+        let layout = PixelLayout::named(png_reader.output_color_type().0.samples());
         let mut row_rgba = Vec::new();
         for row_idx in 0..=py {
             if row_idx.is_multiple_of(128) && ctx.cancel.is_cancelled() {

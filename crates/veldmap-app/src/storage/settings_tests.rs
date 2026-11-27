@@ -233,8 +233,13 @@ fn stac_settings_forward_compat_normalization_validation_and_secret_scrub() {
 
     draft.stac.custom_endpoint = "https://stac.example/v1".to_owned();
     draft.stac.auth_kind = StacAuthKind::ApiKey;
-    draft.stac.auth_header_name = "Range".to_owned(); // protocol-owned
-    assert!(draft.stac.validation_error().is_some());
+    for forbidden in ["Range", "Content-Type", "Accept"] {
+        draft.stac.auth_header_name = forbidden.to_owned();
+        assert!(
+            draft.stac.validation_error().is_some(),
+            "expected protocol-owned header '{forbidden}' to fail validation"
+        );
+    }
     draft.stac.auth_header_name = "x-api-key".to_owned();
     assert!(draft.stac.validation_error().is_none());
 

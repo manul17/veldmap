@@ -4,7 +4,8 @@
 
 use crate::RasterError;
 use crate::pipeline::{
-    DisplayMapping, PixelLayout, SampleType, is_data_f64, raw_bytes_to_rgba, read_native_sample_f64,
+    DisplayMapping, PixelLayout, SampleType, is_data_f64, normalize_alpha_u8, raw_bytes_to_rgba,
+    read_native_sample_f64,
 };
 
 use super::ifd::{CachedIfd, PlanarConfig};
@@ -87,9 +88,10 @@ pub(super) fn expand_palette_to_rgba(
             }
         };
         if let Some(a) = alpha_val {
-            color[3] = match ifd.sample_type {
-                SampleType::U16 => ((a.clamp(0.0, 65535.0) as u16) >> 8) as u8,
-                _ => a.round().clamp(0.0, 255.0) as u8,
+            color[3] = if a.is_finite() {
+                normalize_alpha_u8(a, ifd.sample_type)
+            } else {
+                0
             };
         }
         dst.copy_from_slice(&color);

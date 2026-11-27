@@ -206,6 +206,11 @@ pub(super) struct RasterAsset {
     stream: LayerStream,
 }
 
+/// Return whether `info` declares a non-identity affine scaling (`scale != 1` or `offset != 0`).
+pub(super) fn has_affine_scaling(info: &veldmap_raster::BandInfo) -> bool {
+    (info.scale - 1.0).abs() > 1e-12 || info.offset.abs() > 1e-12
+}
+
 impl RasterAsset {
     pub(super) fn new(
         label: String,

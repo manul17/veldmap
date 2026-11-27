@@ -1,28 +1,34 @@
 //! Runtime cached per-IFD TIFF metadata (`TileOffsets`/`StripOffsets`,
 //! `TileByteCounts`/`StripByteCounts`, `JPEGTables`, `ColorMap`, layout, and
-//! compression/predictor descriptors) and raw-access value types.
+//! compression/predictor descriptors).
 //!
 //! Open-time parsing lives in [`parse`] over [`wire::SinglePassIfdReader`],
 //! allowing the direct raw-chunk decoder (`raw_decode`) to execute lock-free
-//! positioned reads over [`ByteSource`].
+//! positioned reads over [`veldmap_core::io::ByteSource`].
 
-pub(super) mod budget;
-pub(super) mod parse;
+mod budget;
+mod parse;
 mod tag_decode;
-pub(super) mod tag_ids;
-pub(super) mod wire;
+mod tag_ids;
+mod wire;
 
 use std::sync::Arc;
 
-use veldmap_core::io::ByteSource;
-use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileStreamSpec};
+use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
 
 use crate::RasterError;
-use crate::pipeline::{PixelLayout, SampleType};
+use crate::pipeline::{DisplayMapping, PixelLayout, SampleType};
 
 use super::ycbcr::YCbCrParams;
 
-pub(super) use wire::TiffByteOrder;
+pub(super) use budget::IfdParseBudget;
+pub(super) use parse::parse_cached_ifd;
+pub(super) use tag_ids::{
+    TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
+    TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, TAG_MODEL_TRANSFORMATION,
+    TAG_NEW_SUBFILE_TYPE,
+};
+pub(super) use wire::{IfdDirectory, SinglePassIfdReader, TiffByteOrder};
 
 /// Maximum uncompressed byte size admitted for any single TIFF strip/tile,
 /// matching [`crate::tiff::TiffSource`]'s per-chunk decode cap.
@@ -30,72 +36,10 @@ pub(super) const MAX_SINGLE_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Return whether `NewSubfileType` marks a reduced-resolution overview (and
 /// not a transparency mask).
-pub(in crate::tiff) fn is_overview(subfile_type: u32) -> bool {
+pub(super) fn is_overview(subfile_type: u32) -> bool {
     const REDUCED: u32 = 1;
     const MASK: u32 = 4;
     subfile_type & REDUCED != 0 && subfile_type & MASK == 0
-}
-
-/// Shared stateless raw-chunk I/O access parameters borrowed by chunk readers,
-/// stretch samplers, and cursor probes.
-pub(super) struct RawTiffAccess {
-    pub(super) byte_source: Arc<dyn ByteSource>,
-    pub(super) byte_order: TiffByteOrder,
-    pub(super) max_chunk_bytes: usize,
-}
-
-/// Borrowed immutable view of an opened [`super::TiffSource`]'s raw I/O
-/// access, cached IFD table, and nodata metadata.
-#[derive(Clone, Copy)]
-pub(super) struct TiffSourceView<'a> {
-    pub(super) access: &'a RawTiffAccess,
-    pub(super) source_id: SourceId,
-    pub(super) ifds: &'a [CachedIfd],
-    pub(super) nodata_f64: Option<f64>,
-    pub(super) per_band_nodata: &'a [Option<f64>],
-}
-
-impl<'a> TiffSourceView<'a> {
-    pub(super) fn base_ifd(&self) -> &'a CachedIfd {
-        &self.ifds[0]
-    }
-
-    /// Resolve declared nodata for 0-based band `band_index`.
-    ///
-    /// `per_band_nodata` is initialized from file-wide `GDAL_NODATA` at open
-    /// time and overlaid with per-band `GDAL_METADATA` / external overrides, so
-    /// indexed bands never inherit display-only nodata derived from color bands.
-    pub(super) fn nodata_for_band(&self, band_index: usize) -> Option<f64> {
-        self.per_band_nodata.get(band_index).copied().flatten()
-    }
-}
-
-/// Derive a uniform display nodata value across the first `colors` bands when
-/// every display color band declares the same nodata sentinel (treating two
-/// `NaN` values as equal).
-pub(super) fn uniform_display_nodata(
-    per_band_nodata: &[Option<f64>],
-    colors: usize,
-) -> Option<f64> {
-    if colors == 0 || per_band_nodata.len() < colors {
-        return None;
-    }
-    let first = per_band_nodata[0]?;
-    for &slot in &per_band_nodata[1..colors] {
-        let val = slot?;
-        let same = (first.is_nan() && val.is_nan()) || first == val;
-        if !same {
-            return None;
-        }
-    }
-    Some(first)
-}
-
-/// Look up cached IFD metadata for directory index `image`.
-pub(super) fn find_ifd(ifds: &[CachedIfd], image: usize) -> Result<&CachedIfd, RasterError> {
-    ifds.iter()
-        .find(|i| i.image == image)
-        .ok_or_else(|| RasterError::Decode(format!("TIFF IFD {image} is not cached")))
 }
 
 /// Stored (on-disk padded) and valid (cropped) dimensions of a single TIFF chunk.
@@ -237,6 +181,12 @@ pub(super) struct CachedIfd {
 }
 
 impl CachedIfd {
+    /// Build the default unstretched [`DisplayMapping`] for this IFD, inverting
+    /// photometric `WhiteIsZero` samples after raw nodata checks.
+    pub(super) fn identity_display_mapping(&self, nodata: Option<f64>) -> DisplayMapping {
+        DisplayMapping::identity(nodata).with_invert(self.photometric == Photometric::WhiteIsZero)
+    }
+
     /// Approximate heap bytes retained by this cached IFD's offset/count/table arrays.
     pub(super) fn table_bytes(&self) -> u64 {
         let offsets_bytes = (self.offsets.len() as u64).saturating_mul(8);

@@ -126,6 +126,41 @@ pub struct DrawScratchMask {
     pub patches: Vec<DrawOverlayPatch>,
 }
 
+/// Borrowed view of the warp-mesh geometry and patch list shared across direct
+/// overlays, `BandMath` float scratch bands, and `SCL` mask scratch passes.
+#[derive(Clone, Copy)]
+pub(super) struct WarpPatchSetRef<'a> {
+    pub(super) frame: &'a Frame,
+    pub(super) image_width: u32,
+    pub(super) image_height: u32,
+    pub(super) segments: u32,
+    pub(super) patches: &'a [DrawOverlayPatch],
+}
+
+impl DrawScratchBand {
+    pub(super) fn warp_patch_set(&self) -> WarpPatchSetRef<'_> {
+        WarpPatchSetRef {
+            frame: &self.frame,
+            image_width: self.image_width,
+            image_height: self.image_height,
+            segments: self.segments,
+            patches: &self.patches,
+        }
+    }
+}
+
+impl DrawScratchMask {
+    pub(super) fn warp_patch_set(&self) -> WarpPatchSetRef<'_> {
+        WarpPatchSetRef {
+            frame: &self.frame,
+            image_width: self.image_width,
+            image_height: self.image_height,
+            segments: self.segments,
+            patches: &self.patches,
+        }
+    }
+}
+
 /// Multi-band screen-space float band-math & RGB composite draw payload.
 #[derive(Clone, Debug)]
 pub struct DrawBandMathLayer {
@@ -201,6 +236,27 @@ impl DrawBandMathLayer {
                 })
         })
     }
+
+    /// Iterate over active warp-mesh patch sets needed for this layer (band 0
+    /// only when `mrt` is `true`, otherwise all float bands, followed by the
+    /// `SCL` mask when enabled).
+    pub(super) fn active_warp_patch_sets(
+        &self,
+        mrt: bool,
+    ) -> impl Iterator<Item = WarpPatchSetRef<'_>> {
+        let band_limit = if mrt { 1 } else { self.bands.len() };
+        let bands = self
+            .bands
+            .iter()
+            .take(band_limit)
+            .map(DrawScratchBand::warp_patch_set);
+        let mask = self
+            .scl
+            .as_ref()
+            .filter(|_| self.scl_mask_enabled)
+            .map(DrawScratchMask::warp_patch_set);
+        bands.chain(mask)
+    }
 }
 
 /// Direct single-asset or multi-asset scratch-backed overlay draw content.
@@ -215,6 +271,28 @@ pub enum DrawOverlayContent {
         patches: Vec<DrawOverlayPatch>,
     },
     BandMath(Box<DrawBandMathLayer>),
+}
+
+impl DrawOverlayContent {
+    pub(super) fn direct_warp_patch_set(&self) -> Option<WarpPatchSetRef<'_>> {
+        match self {
+            Self::Direct {
+                frame,
+                image_width,
+                image_height,
+                segments,
+                patches,
+                ..
+            } => Some(WarpPatchSetRef {
+                frame,
+                image_width: *image_width,
+                image_height: *image_height,
+                segments: *segments,
+                patches,
+            }),
+            Self::BandMath(_) => None,
+        }
+    }
 }
 
 /// Ordered draped raster overlay layer in painter's order (bottom-to-top).
@@ -294,9 +372,9 @@ pub struct DrawSnapshot {
     /// Pass 2 (`depth_stencil_attachment: None`) before the procedural
     /// graticule.
     pub overlays: Vec<DrawOverlayLayer>,
-    /// Ordered draped vector overlays (GeoJSON + active geodesic measurements)
-    /// rendered in Pass 2 above raster overlays and below the procedural
-    /// graticule.
+    /// Ordered draped vector overlays (GeoJSON, geodesic measurements, and
+    /// STAC AOI / footprints / highlights) rendered in Pass 2 above raster
+    /// overlays and below the procedural graticule.
     pub vectors: Vec<DrawVectorLayer>,
     pub grid_cells: u32,
     pub show_graticule: bool,

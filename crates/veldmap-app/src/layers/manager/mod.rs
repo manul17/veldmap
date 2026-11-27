@@ -4,9 +4,11 @@
 //! and the local overlay I/O worker.
 //!
 //! Asynchronous open, reload, and completion reconciliation methods live in the
-//! sibling [`super::lifecycle`] module. Returns [`OverlayMutation`] records
-//! rather than mutating `GpuTileCache` / `PendingUploads` directly, matching
+//! private [`lifecycle`] submodule. Returns [`OverlayMutation`] records rather
+//! than mutating `GpuTileCache` / `PendingUploads` directly, matching
 //! `BasemapManager`'s clean boundary with `SceneState`.
+
+mod lifecycle;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -39,7 +41,7 @@ use super::{
     StretchPreset,
 };
 
-pub(super) fn alloc_seq(counter: &mut u64) -> u64 {
+fn alloc_seq(counter: &mut u64) -> u64 {
     let value = *counter;
     *counter = counter.saturating_add(1);
     value
@@ -112,16 +114,16 @@ pub(crate) struct OverlayMutation {
 /// `NetContext` + `veldmap-remote-io`, `StreamKey`-scoped two-lane scheduling,
 /// offloaded lossless QOI & `Lz4Raw` disk caching, and zoom-invariant CPU cursor readouts.
 pub(crate) struct OverlayManager {
-    pub(super) stack: LayerStack,
-    pub(super) next_layer_id: u64,
-    pub(super) next_relaid: u64,
-    pub(super) runtime: Arc<OverlayRuntime>,
+    stack: LayerStack,
+    next_layer_id: u64,
+    next_relaid: u64,
+    runtime: Arc<OverlayRuntime>,
     remote_pool: Option<DecodePool>,
     tile_writer: Option<TileWriteWorker>,
-    pub(super) remote_opener: RemoteOpenTracker,
+    remote_opener: RemoteOpenTracker,
     cursor: CursorProber,
-    pub(super) io_worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
-    pub(super) band_stats: BandStatsTracker,
+    io_worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
+    band_stats: BandStatsTracker,
 }
 
 impl OverlayManager {
@@ -205,15 +207,52 @@ impl OverlayManager {
         self.stack.max_scratch_requirements()
     }
 
-    pub(super) fn request_band_stats_if_needed(&mut self, id: LayerId) {
+    fn request_band_stats_if_needed(&mut self, id: LayerId) {
         if let Some(layer) = self.stack.get_mut(id) {
             self.band_stats.request_if_needed(layer, &self.runtime);
         }
     }
 
-    pub(super) fn purge_source(&self, src: SourceId) {
+    fn purge_source(&self, src: SourceId) {
         self.runtime.purge_source_runtime(src);
         self.cursor.invalidate_source(src);
+    }
+
+    /// Release runtime/GPU caches and cancel orphaned streams for `sources` and
+    /// `stream_keys` after a layer is removed, hidden, or reloaded.
+    ///
+    /// - When `gpu_purge_max_refs` is `Some(max_refs)` and
+    ///   `count_sharing_source(src) <= max_refs`, purges runtime state and
+    ///   appends `src` to `purge_out` so `SceneState` clears VRAM/pending uploads.
+    /// - Otherwise, when no active visible layer references `src`, purges
+    ///   runtime state only (keeping GPU tiles warm across hide/show toggles).
+    /// - For every stream whose source was not purged, cancels its job if no
+    ///   other active layer uses that `StreamKey`.
+    fn release_sources_and_streams(
+        &self,
+        sources: &[SourceId],
+        stream_keys: &[StreamKey],
+        gpu_purge_max_refs: Option<usize>,
+        purge_out: &mut Vec<SourceId>,
+    ) {
+        let mut purged_sources = Vec::new();
+        for &src in sources {
+            if gpu_purge_max_refs
+                .is_some_and(|max_refs| self.stack.count_sharing_source(src) <= max_refs)
+            {
+                self.purge_source(src);
+                purge_out.push(src);
+                purged_sources.push(src);
+            } else if !self.stack.has_visible_source(src) {
+                self.purge_source(src);
+                purged_sources.push(src);
+            }
+        }
+        for &sk in stream_keys {
+            if !purged_sources.contains(&sk.source) {
+                self.cancel_stream_if_unused(sk);
+            }
+        }
     }
 
     /// Return immutable UI summaries of all loaded overlay layers.
@@ -221,7 +260,7 @@ impl OverlayManager {
         let layers = self.stack.layers();
         let all_stream_keys: Vec<StreamKey> = layers
             .iter()
-            .flat_map(|l| l.streams().into_iter().map(|s| s.stream_key()))
+            .flat_map(|l| l.streams().map(|s| s.stream_key()))
             .collect();
         let flat_stats = self.runtime.layer_flight_stats(all_stream_keys);
         let mut cursor_idx = 0usize;
@@ -230,7 +269,7 @@ impl OverlayManager {
             .iter()
             .enumerate()
             .map(|(idx, layer)| {
-                let count = layer.streams().len();
+                let count = layer.active_stream_count();
                 let mut in_flight = 0usize;
                 let mut pass_active = false;
                 for &(f, p) in &flat_stats[cursor_idx..cursor_idx + count] {
@@ -248,11 +287,12 @@ impl OverlayManager {
         self.stack.layers().len()
     }
 
-    /// Look up the current CRS override for `id`, if any.
+    /// Look up the current CRS override for a single-raster layer `id`, if any.
     pub(crate) fn layer_crs_override(&self, id: LayerId) -> Option<CrsOverride> {
         self.stack
             .get(id)
-            .and_then(|l| l.geo().crs_override().cloned())
+            .and_then(OverlayLayer::single_asset)
+            .and_then(|a| a.geo().crs_override().cloned())
     }
 
     /// Borrowed view of loaded local raster layers in painter's order for
@@ -305,40 +345,16 @@ impl OverlayManager {
                 self.mutate_layer(id, |layer| layer.set_categorical_palette(palette))
             }
             OverlayEdit::SetBandMathRgbStretch { min, max, gamma } => {
-                self.mutate_layer(id, |layer| {
-                    layer
-                        .band_math_mut()
-                        .is_some_and(|bm| bm.style.set_rgb_stretch(min, max, gamma))
-                })
+                self.mutate_layer(id, |layer| layer.set_band_math_rgb_stretch(min, max, gamma))
             }
-            OverlayEdit::ResetBandMathStretch => self.mutate_layer(id, |layer| {
-                layer
-                    .band_math_mut()
-                    .is_some_and(|bm| bm.style.reset_stretch())
-            }),
+            OverlayEdit::ResetBandMathStretch => {
+                self.mutate_layer(id, OverlayLayer::reset_band_math_stretch)
+            }
             OverlayEdit::SetBandMathSclEnabled(enabled) => {
-                let (changed, disabled_scl_stream) = {
-                    let Some(layer) = self.stack.get_mut(id) else {
-                        return OverlayMutation::default();
-                    };
-                    let Some(bm) = layer.band_math_mut() else {
-                        return OverlayMutation::default();
-                    };
-                    if !bm.style.set_scl_mask_enabled(enabled) {
-                        return OverlayMutation::default();
-                    }
-                    let disabled = if !enabled {
-                        if let Some(scl) = &mut bm.scl {
-                            scl.clear_wanted();
-                            Some(scl.meta().stream_key())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    (true, disabled)
-                };
+                let (changed, disabled_scl_stream) =
+                    self.stack.get_mut(id).map_or((false, None), |layer| {
+                        layer.set_band_math_scl_enabled(enabled)
+                    });
                 if let Some(sk) = disabled_scl_stream {
                     self.cancel_stream_if_unused(sk);
                 }
@@ -348,11 +364,9 @@ impl OverlayManager {
                     purge_sources: Vec::new(),
                 }
             }
-            OverlayEdit::SetBandMathSclMaskBits(bits) => self.mutate_layer(id, |layer| {
-                layer
-                    .band_math_mut()
-                    .is_some_and(|bm| bm.style.set_scl_mask_bits(bits))
-            }),
+            OverlayEdit::SetBandMathSclMaskBits(bits) => {
+                self.mutate_layer(id, |layer| layer.set_band_math_scl_mask_bits(bits))
+            }
         }
     }
 
@@ -367,10 +381,10 @@ impl OverlayManager {
         let Some(layer) = self.stack.get_mut(id) else {
             return Err("layer no longer exists".to_owned());
         };
-        if layer.single_asset().is_none() {
+        let Some(asset) = layer.single_asset() else {
             return Err("band-math layers do not support per-layer CRS overrides".to_owned());
-        }
-        let frame = bind_frame_with_override(layer.source().description(), crs_override.as_ref())?;
+        };
+        let frame = bind_frame_with_override(asset.source().description(), crs_override.as_ref())?;
         let relaid = alloc_seq(&mut self.next_relaid);
         layer.apply_rebound_frame(frame, crs_override, relaid);
         Ok((
@@ -382,12 +396,12 @@ impl OverlayManager {
         ))
     }
 
-    pub(super) fn cancel_stream_if_unused(&self, stream_key: StreamKey) {
+    fn cancel_stream_if_unused(&self, stream_key: StreamKey) {
         let still_used = self
             .stack
             .layers()
             .iter()
-            .any(|l| l.is_active() && l.streams().iter().any(|s| s.stream_key() == stream_key));
+            .any(|l| l.is_active() && l.streams().any(|s| s.stream_key() == stream_key));
         if !still_used {
             self.runtime.cancel_stream(stream_key);
         }
@@ -417,22 +431,12 @@ impl OverlayManager {
             topology_changed: true,
             purge_sources: Vec::new(),
         };
-        let mut purged_sources = Vec::new();
-        for src in sources {
-            if self.stack.count_sharing_source(src) == 0 {
-                self.purge_source(src);
-                mutation.purge_sources.push(src);
-                purged_sources.push(src);
-            } else if !self.stack.has_visible_source(src) {
-                self.purge_source(src);
-                purged_sources.push(src);
-            }
-        }
-        for sk in stream_keys {
-            if !purged_sources.contains(&sk.source) {
-                self.cancel_stream_if_unused(sk);
-            }
-        }
+        self.release_sources_and_streams(
+            &sources,
+            &stream_keys,
+            Some(0),
+            &mut mutation.purge_sources,
+        );
         mutation
     }
 
@@ -447,18 +451,8 @@ impl OverlayManager {
             (layer.all_source_ids(), layer.all_stream_keys())
         };
         if !visible {
-            let mut purged_sources = Vec::new();
-            for src in sources {
-                if !self.stack.has_visible_source(src) {
-                    self.purge_source(src);
-                    purged_sources.push(src);
-                }
-            }
-            for sk in stream_keys {
-                if !purged_sources.contains(&sk.source) {
-                    self.cancel_stream_if_unused(sk);
-                }
-            }
+            let mut unused_gpu_purge = Vec::new();
+            self.release_sources_and_streams(&sources, &stream_keys, None, &mut unused_gpu_purge);
         }
         OverlayMutation {
             changed: true,
@@ -472,21 +466,25 @@ impl OverlayManager {
         id: LayerId,
         spec: TileStreamSpec,
     ) -> Result<OverlayMutation, String> {
-        let (changed, old_stream) = {
+        let (changed, old_stream, source_id) = {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
             };
-            let prev_stream = layer.meta().stream_key();
+            let Some(asset) = layer.single_asset() else {
+                return Err(
+                    "band-math layers do not support switching single-band streams".to_owned(),
+                );
+            };
+            let prev_stream = asset.meta().stream_key();
+            let source_id = asset.source_id();
             let changed = layer.set_active_stream(spec)?;
-            (changed, prev_stream)
+            (changed, prev_stream, source_id)
         };
         if !changed {
             return Ok(OverlayMutation::default());
         }
         self.cancel_stream_if_unused(old_stream);
-        if let Some(layer) = self.stack.get(id) {
-            self.cursor.invalidate_source(layer.source_id());
-        }
+        self.cursor.invalidate_source(source_id);
         self.request_band_stats_if_needed(id);
         self.runtime.request_reschedule();
         Ok(OverlayMutation {
@@ -527,18 +525,12 @@ impl OverlayManager {
     /// cache state (called when `SceneState::reconcile_providers` runs outside a
     /// full snapshot rebuild).
     pub(crate) fn reconcile(&self, gpu_cache: &GpuTileCache, pending: &PendingUploads) {
-        let active_layers: Vec<_> = self
+        let streams = self
             .stack
             .layers()
             .iter()
             .filter(|l| l.is_active())
-            .collect();
-        let mut streams = Vec::new();
-        for layer in active_layers {
-            for s in layer.streams() {
-                streams.push((s.stream_key(), s.wanted()));
-            }
-        }
+            .flat_map(|l| l.streams().map(|s| (s.stream_key(), s.wanted())));
         self.runtime
             .reconcile_pointwise_streams(streams, gpu_cache, pending);
     }

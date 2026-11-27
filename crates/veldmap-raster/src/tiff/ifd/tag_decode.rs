@@ -19,11 +19,12 @@ fn unsigned_elem_size(tag: u16, field_type: u16) -> Result<usize, RasterError> {
 }
 
 impl IfdDirectory {
-    fn read_u64_scalar_strict(
+    fn with_unsigned_tag<R>(
         &self,
         reader: &SinglePassIfdReader,
         tag: u16,
-    ) -> Result<Option<u64>, RasterError> {
+        f: impl FnOnce(u16, &[u8], usize) -> Result<R, RasterError>,
+    ) -> Result<Option<R>, RasterError> {
         let Some(entry) = self.entry(tag) else {
             return Ok(None);
         };
@@ -34,20 +35,29 @@ impl IfdDirectory {
             RasterError::DecoderLimitsExceeded(format!("TIFF tag {tag} count overflow"))
         })?;
         let count = raw_count.min(bytes.len() / elem_size);
-        if count != 1 {
-            return Err(RasterError::Decode(format!(
-                "TIFF tag {tag} expected 1 unsigned value, got {count}"
-            )));
-        }
+        f(field_type, bytes, count).map(Some)
+    }
+
+    fn read_u64_scalar_strict(
+        &self,
+        reader: &SinglePassIfdReader,
+        tag: u16,
+    ) -> Result<Option<u64>, RasterError> {
         let order = self.byte_order();
-        let val = match field_type {
-            1 => u64::from(bytes[0]),
-            3 => u64::from(order.read_u16(&bytes[..2])),
-            4 | 13 => u64::from(order.read_u32(&bytes[..4])),
-            16 | 18 => order.read_u64(&bytes[..8]),
-            _ => unreachable!("field_type validated by unsigned_elem_size"),
-        };
-        Ok(Some(val))
+        self.with_unsigned_tag(reader, tag, |field_type, bytes, count| {
+            if count != 1 {
+                return Err(RasterError::Decode(format!(
+                    "TIFF tag {tag} expected 1 unsigned value, got {count}"
+                )));
+            }
+            Ok(match field_type {
+                1 => u64::from(bytes[0]),
+                3 => u64::from(order.read_u16(&bytes[..2])),
+                4 | 13 => u64::from(order.read_u32(&bytes[..4])),
+                16 | 18 => order.read_u64(&bytes[..8]),
+                _ => unreachable!("field_type validated by unsigned_elem_size"),
+            })
+        })
     }
 
     pub(super) fn read_u16_strict(
@@ -91,16 +101,40 @@ impl IfdDirectory {
         reader: &SinglePassIfdReader,
         tag: u16,
     ) -> Result<Option<Vec<u16>>, RasterError> {
-        let Some(vals) = self.read_u64_vec_strict(reader, tag)? else {
-            return Ok(None);
-        };
-        let mut out = Vec::with_capacity(vals.len());
-        for v in vals {
-            out.push(u16::try_from(v).map_err(|_| {
-                RasterError::Decode(format!("TIFF tag {tag} value {v} overflows u16"))
-            })?);
-        }
-        Ok(Some(out))
+        let order = self.byte_order();
+        self.with_unsigned_tag(reader, tag, |field_type, bytes, count| {
+            let mut out = Vec::with_capacity(count);
+            match field_type {
+                1 => {
+                    for &b in bytes.iter().take(count) {
+                        out.push(u16::from(b));
+                    }
+                }
+                3 => {
+                    for chunk in bytes.chunks_exact(2).take(count) {
+                        out.push(order.read_u16(chunk));
+                    }
+                }
+                4 | 13 => {
+                    for chunk in bytes.chunks_exact(4).take(count) {
+                        let v = order.read_u32(chunk);
+                        out.push(u16::try_from(v).map_err(|_| {
+                            RasterError::Decode(format!("TIFF tag {tag} value {v} overflows u16"))
+                        })?);
+                    }
+                }
+                16 | 18 => {
+                    for chunk in bytes.chunks_exact(8).take(count) {
+                        let v = order.read_u64(chunk);
+                        out.push(u16::try_from(v).map_err(|_| {
+                            RasterError::Decode(format!("TIFF tag {tag} value {v} overflows u16"))
+                        })?);
+                    }
+                }
+                _ => unreachable!("field_type validated by unsigned_elem_size"),
+            }
+            Ok(out)
+        })
     }
 
     pub(in crate::tiff) fn read_u16_vec_opt(
@@ -119,42 +153,34 @@ impl IfdDirectory {
         reader: &SinglePassIfdReader,
         tag: u16,
     ) -> Result<Option<Vec<u64>>, RasterError> {
-        let Some(entry) = self.entry(tag) else {
-            return Ok(None);
-        };
-        let field_type = entry.field_type();
-        let elem_size = unsigned_elem_size(tag, field_type)?;
-        let bytes = self.resolve_bytes(&entry, reader)?;
-        let raw_count = usize::try_from(entry.count()).map_err(|_| {
-            RasterError::DecoderLimitsExceeded(format!("TIFF tag {tag} count overflow"))
-        })?;
-        let count = raw_count.min(bytes.len() / elem_size);
-        let mut out = Vec::with_capacity(count);
         let order = self.byte_order();
-        match field_type {
-            1 => {
-                for &b in bytes.iter().take(count) {
-                    out.push(u64::from(b));
+        self.with_unsigned_tag(reader, tag, |field_type, bytes, count| {
+            let mut out = Vec::with_capacity(count);
+            match field_type {
+                1 => {
+                    for &b in bytes.iter().take(count) {
+                        out.push(u64::from(b));
+                    }
                 }
-            }
-            3 => {
-                for chunk in bytes.chunks_exact(2).take(count) {
-                    out.push(u64::from(order.read_u16(chunk)));
+                3 => {
+                    for chunk in bytes.chunks_exact(2).take(count) {
+                        out.push(u64::from(order.read_u16(chunk)));
+                    }
                 }
-            }
-            4 | 13 => {
-                for chunk in bytes.chunks_exact(4).take(count) {
-                    out.push(u64::from(order.read_u32(chunk)));
+                4 | 13 => {
+                    for chunk in bytes.chunks_exact(4).take(count) {
+                        out.push(u64::from(order.read_u32(chunk)));
+                    }
                 }
-            }
-            16 | 18 => {
-                for chunk in bytes.chunks_exact(8).take(count) {
-                    out.push(order.read_u64(chunk));
+                16 | 18 => {
+                    for chunk in bytes.chunks_exact(8).take(count) {
+                        out.push(order.read_u64(chunk));
+                    }
                 }
+                _ => unreachable!("field_type validated by unsigned_elem_size"),
             }
-            _ => unreachable!("field_type validated by unsigned_elem_size"),
-        }
-        Ok(Some(out))
+            Ok(out)
+        })
     }
 
     pub(super) fn read_u8_vec_strict(

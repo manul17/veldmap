@@ -109,7 +109,7 @@ impl LayerStack {
             .iter()
             .rev()
             .find(|l| l.is_active())
-            .and_then(|l| l.geo().source_pixel_size_m())
+            .and_then(|l| l.primary_asset().geo().source_pixel_size_m())
     }
 
     pub(super) fn topmost_colorbar_info(&self) -> Option<ColorbarInfo> {

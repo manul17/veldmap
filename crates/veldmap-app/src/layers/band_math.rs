@@ -6,10 +6,15 @@
 use crate::colormap::{ColormapId, DEFAULT_SCL_MASK_BITS};
 
 use super::asset::RasterAsset;
+use super::style::normalize_stretch_range;
 
 /// Epsilon guarding division-by-zero in `(A - B) / (A + B)` and `A / B`
 /// across both GPU (`band_math_composite.wgsl`) and CPU (`CursorProber`).
-pub(crate) const BAND_MATH_DIV_EPS: f64 = 1e-6;
+const BAND_MATH_DIV_EPS: f64 = 1e-6;
+
+/// Upper exclusive bound on discrete `SCL` class IDs representable in the
+/// 32-bit `scl_mask_bits` bitmask (`0..32`).
+pub(super) const MAX_SCL_MASK_CLASSES: u32 = 32;
 
 /// Mathematical band-combination mode evaluated in canonical physical
 /// `raw * scale + offset` space.
@@ -233,7 +238,6 @@ impl BandMathStyle {
             BandMathFormula::RgbComposite => BandMathPreset::CustomRgb,
         };
         let mut style = Self::from_preset(preset, has_scl);
-        style.formula = formula;
         style.recipe_label = match formula {
             BandMathFormula::NormalizedDiff => "Norm. Diff".to_owned(),
             BandMathFormula::Difference => "Difference".to_owned(),
@@ -257,18 +261,10 @@ impl BandMathStyle {
     }
 
     pub(super) fn set_stretch_range(&mut self, min: f64, max: f64) -> bool {
-        if !min.is_finite() || !max.is_finite() {
+        let Some((lo, hi)) = normalize_stretch_range(self.stretch_min, self.stretch_max, min, max)
+        else {
             return false;
-        }
-        let (lo, hi) = if max > min {
-            (min, max)
-        } else {
-            (min, min + min.abs().max(1.0) * 1e-6)
         };
-        let eps = lo.abs().max(hi.abs()).max(1e-30) * 1e-12;
-        if (self.stretch_min - lo).abs() <= eps && (self.stretch_max - hi).abs() <= eps {
-            return false;
-        }
         self.stretch_min = lo;
         self.stretch_max = hi;
         true
@@ -347,7 +343,7 @@ impl BandMathStyle {
 
 /// Evaluate whether `scl_class` is masked out under `enabled` + `mask_bits`.
 pub(crate) const fn is_scl_class_masked(enabled: bool, mask_bits: u32, scl_class: u16) -> bool {
-    enabled && scl_class < 32 && ((mask_bits & (1u32 << scl_class)) != 0)
+    enabled && (scl_class as u32) < MAX_SCL_MASK_CLASSES && ((mask_bits & (1u32 << scl_class)) != 0)
 }
 
 /// Multi-asset data owned by [`super::layer::LayerKind::BandMath`].
@@ -362,6 +358,12 @@ pub(super) struct BandMathLayerData {
 impl BandMathLayerData {
     pub(super) fn primary_asset(&self) -> &RasterAsset {
         &self.bands[0]
+    }
+
+    pub(super) fn output_units(&self) -> Option<String> {
+        (self.style.formula == BandMathFormula::Difference)
+            .then(|| self.bands[0].band_units())
+            .flatten()
     }
 
     pub(super) fn assets(&self) -> impl Iterator<Item = &RasterAsset> {
@@ -427,6 +429,7 @@ pub(crate) struct BandMathReadout {
     pub(crate) computed: Option<f64>,
     pub(crate) channels: Vec<(String, BandChannelSample)>,
     pub(crate) scl_class: Option<u16>,
+    pub(crate) scl_class_name: Option<&'static str>,
     pub(crate) scl_masked: bool,
     pub(crate) has_unavailable: bool,
 }

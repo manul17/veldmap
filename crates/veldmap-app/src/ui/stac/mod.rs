@@ -20,7 +20,8 @@ use crate::stac::{
 };
 use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
-use super::submitted_with_enter;
+use super::BADGE_RECIPE_COLOR;
+use super::widgets::submitted_with_enter;
 
 use aoi_section::show_aoi_section;
 use item_card::show_item_card;
@@ -107,7 +108,7 @@ fn show_sample_scenes_section(
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.colored_label(
-                            egui::Color32::from_rgb(130, 220, 145),
+                            BADGE_RECIPE_COLOR,
                             egui::RichText::new("Recipe").small().strong(),
                         );
                         ui.strong(recipe.title);

@@ -9,7 +9,7 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{QuadTileId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
-use crate::http::PermitDenied;
+use crate::limiter::PermitDenied;
 
 use super::{PipelineState, is_wanted_or_root};
 

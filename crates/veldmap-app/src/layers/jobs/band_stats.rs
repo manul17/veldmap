@@ -265,9 +265,13 @@ impl BandStatsTracker {
         let Some(band) = layer.needs_band_stats() else {
             return;
         };
+        let Some(asset) = layer.single_asset() else {
+            return;
+        };
         let id = layer.id();
-        let source = Arc::clone(layer.source());
-        let source_id = layer.source_id();
+        let source = Arc::clone(asset.source());
+        let source_id = asset.source_id();
+        let remote_range = asset.remote_range().cloned();
 
         let job_id = self.next_job_id;
         self.next_job_id = self.next_job_id.saturating_add(1);
@@ -302,8 +306,7 @@ impl BandStatsTracker {
         };
 
         if source.is_remote()
-            && let (Some(range_src), Some(net)) =
-                (layer.remote_range().cloned(), runtime.net.clone())
+            && let (Some(range_src), Some(net)) = (remote_range, runtime.net.clone())
         {
             spawn_remote_band_stats(params, range_src, net);
         } else if !submit_direct_band_stats(params) {
@@ -319,7 +322,9 @@ impl BandStatsTracker {
             match msg.outcome {
                 BandStatsOutcome::Ready(stats) => {
                     for layer in stack.layers_mut() {
-                        if layer.source_id() == msg.source_id
+                        if layer
+                            .single_asset()
+                            .is_some_and(|a| a.source_id() == msg.source_id)
                             && layer.apply_band_stats_ready(msg.band, (*stats).clone())
                         {
                             changed = true;
@@ -328,7 +333,9 @@ impl BandStatsTracker {
                 }
                 BandStatsOutcome::Empty => {
                     if let Some(layer) = stack.get_mut(msg.layer_id)
-                        && layer.source_id() == msg.source_id
+                        && layer
+                            .single_asset()
+                            .is_some_and(|a| a.source_id() == msg.source_id)
                         && layer.apply_band_stats_empty(msg.band, msg.job_id)
                     {
                         changed = true;
@@ -336,7 +343,9 @@ impl BandStatsTracker {
                 }
                 BandStatsOutcome::Cancelled => {
                     if let Some(layer) = stack.get_mut(msg.layer_id)
-                        && layer.source_id() == msg.source_id
+                        && layer
+                            .single_asset()
+                            .is_some_and(|a| a.source_id() == msg.source_id)
                     {
                         let _ = layer.apply_band_stats_cancelled(msg.band, msg.job_id);
                     }

@@ -39,15 +39,43 @@ pub fn parse_geojson(input: &str) -> Result<GeoJsonFeatureCollection, GeoJsonErr
 }
 
 /// Parse an already-deserialized GeoJSON geometry [`serde_json::Value`]
-/// (including `GeometryCollection`) directly without string round-tripping,
-/// enforcing the same vertex and nesting safety caps as [`parse_geojson`].
+/// directly without string round-tripping, enforcing the same vertex and
+/// nesting safety caps as [`parse_geojson`].
 ///
-/// Returns `Ok(None)` for an empty `GeometryCollection`.
+/// For a `GeometryCollection`, returns the first nested concrete geometry
+/// (short-circuiting without parsing subsequent entries), or `Ok(None)` if the
+/// collection contains no concrete geometries.
 pub fn parse_geojson_geometry_value(val: &Value) -> Result<Option<GeoJsonGeometry>, GeoJsonError> {
-    let mut features = Vec::new();
     let mut vertex_count = 0usize;
-    parse_geometry_value(val, None, 0, &mut features, &mut vertex_count)?;
-    Ok(features.into_iter().next().map(|f| f.geometry))
+    parse_first_geometry_value(val, 0, &mut vertex_count)
+}
+
+fn parse_first_geometry_value(
+    val: &Value,
+    depth: usize,
+    vertex_count: &mut usize,
+) -> Result<Option<GeoJsonGeometry>, GeoJsonError> {
+    let (obj, kind) = object_and_type(val, "Geometry")?;
+    if kind == "GeometryCollection" {
+        if depth >= MAX_GEOMETRY_COLLECTION_DEPTH {
+            return Err(GeoJsonError::LimitExceeded(format!(
+                "GeometryCollection nesting exceeds {MAX_GEOMETRY_COLLECTION_DEPTH}"
+            )));
+        }
+        let geoms = obj
+            .get("geometries")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                GeoJsonError::Structure("GeometryCollection missing 'geometries' array".into())
+            })?;
+        for g in geoms {
+            if let Some(found) = parse_first_geometry_value(g, depth + 1, vertex_count)? {
+                return Ok(Some(found));
+            }
+        }
+        return Ok(None);
+    }
+    parse_geometry(kind, obj, vertex_count).map(Some)
 }
 
 fn parse_root_value(

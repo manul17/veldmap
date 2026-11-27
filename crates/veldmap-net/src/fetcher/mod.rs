@@ -22,7 +22,7 @@ use veldmap_core::tile::TileKey;
 
 use crate::basemap::LiveBasemapSpec;
 use crate::context::NetContext;
-use crate::http::HostLimiters;
+use crate::limiter::HostLimiters;
 
 use self::disk::DiskCacheGate;
 use self::dispatch::dispatcher_loop;

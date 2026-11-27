@@ -11,8 +11,15 @@ use crate::ui::widgets::{DragCommit, track_drag_commit};
 use super::LayerUiAction;
 use super::style_controls::{MinMaxEvent, show_colormap_picker, show_min_max_drag};
 
-/// Quick-toggle ESA Sentinel-2 `SCL` classes (0, 1, 3, 8, 9, 10).
-const QUICK_SCL_CLASSES: [u8; 6] = [0, 1, 3, 8, 9, 10];
+/// Quick-toggle ESA Sentinel-2 `SCL` classes `(class_id, compact_label)`.
+const QUICK_SCL_CLASSES: [(u8, &str); 6] = [
+    (0, "0 NoData"),
+    (1, "1 Defective"),
+    (3, "3 Shadow"),
+    (8, "8 Cloud Med"),
+    (9, "9 Cloud High"),
+    (10, "10 Cirrus"),
+];
 /// Remaining non-quick ESA Sentinel-2 `SCL` classes shown under "Other SCL Classes".
 const OTHER_SCL_CLASSES: [u8; 6] = [2, 4, 5, 6, 7, 11];
 
@@ -142,8 +149,8 @@ pub(super) fn show_band_math_controls(
                 r_g.drag_stopped(),
             ) {
                 DragCommit::None => {}
-                DragCommit::Preview | DragCommit::Commit => {
-                    let commit = r_g.drag_stopped();
+                state @ (DragCommit::Preview | DragCommit::Commit) => {
+                    let commit = matches!(state, DragCommit::Commit);
                     actions.push(LayerUiAction::edit_raster_drag(
                         layer_id,
                         OverlayEdit::SetBandMathRgbStretch {
@@ -190,16 +197,7 @@ pub(super) fn show_band_math_controls(
             let mut bits = bm.scl_mask_bits;
             let mut changed = false;
             ui.horizontal_wrapped(|ui| {
-                for cls in QUICK_SCL_CLASSES {
-                    let short = match cls {
-                        0 => "0 NoData",
-                        1 => "1 Defective",
-                        3 => "3 Shadow",
-                        8 => "8 Cloud Med",
-                        9 => "9 Cloud High",
-                        10 => "10 Cirrus",
-                        _ => "",
-                    };
+                for (cls, short) in QUICK_SCL_CLASSES {
                     changed |= toggle_scl_checkbox(
                         ui,
                         cls,

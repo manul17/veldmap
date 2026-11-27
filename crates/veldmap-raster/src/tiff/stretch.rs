@@ -12,8 +12,9 @@ use crate::pipeline::{
 };
 
 use super::chunk_convert::for_each_band_sample_f64;
-use super::ifd::{CachedIfd, Photometric, PlanarConfig, RawTiffAccess};
+use super::ifd::{CachedIfd, Photometric, PlanarConfig};
 use super::raw_decode::{RawChunkPayload, decode_raw_chunk};
+use super::view::RawTiffAccess;
 
 pub(super) struct StretchCache {
     map: SingleflightMap<(), DisplayMapping>,
@@ -138,14 +139,42 @@ fn for_each_sampled_chunk(
     Ok(())
 }
 
+fn push_stretch_samples(
+    data: &[u8],
+    ifd: &CachedIfd,
+    band_idx: usize,
+    pixels: usize,
+    step: usize,
+    nodata: Option<f64>,
+    values: &mut Vec<f32>,
+) {
+    let (stride, ch_offset) = ifd.band_stride_offset(band_idx);
+    for at in (0..pixels).step_by(step) {
+        if let Some(v) = read_native_sample_f64(data, ifd.sample_type, at * stride + ch_offset)
+            && is_data_f64(v, nodata)
+        {
+            let f = v as f32;
+            if f.is_finite() {
+                values.push(f);
+            }
+        }
+    }
+}
+
 fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterError> {
     let ifd = req.stats_ifd;
-    let invert = ifd.photometric == Photometric::WhiteIsZero;
     if !ifd.needs_display_stretch() {
-        return Ok(DisplayMapping::identity(req.nodata_f64).with_invert(invert));
+        return Ok(ifd.identity_display_mapping(req.nodata_f64));
     }
     let colors = ifd.pixel_layout.colors().max(1);
     let mut values = Vec::new();
+    let band_nodata = |ch: usize| {
+        req.per_band_nodata
+            .get(ch)
+            .copied()
+            .flatten()
+            .or(req.nodata_f64)
+    };
 
     for_each_sampled_chunk(
         req,
@@ -158,25 +187,16 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
                     let RawChunkPayload::Bytes(data) = payload else {
                         return Ok(());
                     };
-                    let spp = usize::from(ifd.samples_per_pixel);
-                    for at in (0..pixels).step_by(step) {
-                        for ch in 0..colors {
-                            let ch_nodata = req
-                                .per_band_nodata
-                                .get(ch)
-                                .copied()
-                                .flatten()
-                                .or(req.nodata_f64);
-                            if let Some(v) =
-                                read_native_sample_f64(&data, ifd.sample_type, at * spp + ch)
-                                && is_data_f64(v, ch_nodata)
-                            {
-                                let f = v as f32;
-                                if f.is_finite() {
-                                    values.push(f);
-                                }
-                            }
-                        }
+                    for ch in 0..colors {
+                        push_stretch_samples(
+                            &data,
+                            ifd,
+                            ch,
+                            pixels,
+                            step,
+                            band_nodata(ch),
+                            &mut values,
+                        );
                     }
                 }
                 PlanarConfig::Planar => {
@@ -186,22 +206,15 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
                         let RawChunkPayload::Bytes(data) = payload else {
                             continue;
                         };
-                        let plane_nodata = req
-                            .per_band_nodata
-                            .get(plane)
-                            .copied()
-                            .flatten()
-                            .or(req.nodata_f64);
-                        for at in (0..pixels).step_by(step) {
-                            if let Some(v) = read_native_sample_f64(&data, ifd.sample_type, at)
-                                && is_data_f64(v, plane_nodata)
-                            {
-                                let f = v as f32;
-                                if f.is_finite() {
-                                    values.push(f);
-                                }
-                            }
-                        }
+                        push_stretch_samples(
+                            &data,
+                            ifd,
+                            plane,
+                            pixels,
+                            step,
+                            band_nodata(plane),
+                            &mut values,
+                        );
                     }
                 }
             }
@@ -211,8 +224,9 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
     values.truncate(STRETCH_SAMPLES);
 
     Ok(match percentile_stretch(&mut values) {
-        Some((lo, hi)) => DisplayMapping::stretched(lo, hi, req.nodata_f64).with_invert(invert),
-        None => DisplayMapping::identity(req.nodata_f64).with_invert(invert),
+        Some((lo, hi)) => DisplayMapping::stretched(lo, hi, req.nodata_f64)
+            .with_invert(ifd.photometric == Photometric::WhiteIsZero),
+        None => ifd.identity_display_mapping(req.nodata_f64),
     })
 }
 

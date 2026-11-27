@@ -12,7 +12,8 @@ use reqwest::header::{
 };
 use veldmap_core::sync::CancelToken;
 
-use crate::http::{BodyReadError, HostLimiters, read_body_capped, record_rate_limit_cooldown};
+use crate::http::{BodyReadError, read_body_capped};
+use crate::limiter::{HostLimiters, record_rate_limit_cooldown};
 use crate::redact::{EncodedSecret, redact_text_many};
 
 use super::RangeOpenError;
@@ -195,6 +196,123 @@ fn validate_206_response_headers(
     Ok((response_strong_etag, expected_len, total_len))
 }
 
+fn classify_range_status(
+    req_cfg: &RangeFetchRequest<'_>,
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+) -> Option<AttemptOutcome> {
+    let code = status.as_u16();
+
+    if code == 200 {
+        return Some(AttemptOutcome::Fatal(
+            RangeTransportError::RangeNotSupported(
+                "server responded with 200 OK instead of 206 Partial Content".to_owned(),
+            ),
+        ));
+    }
+
+    if code == 412 && matches!(req_cfg.mode, RangeFetchMode::BlockSpan { .. }) {
+        return Some(AttemptOutcome::Fatal(
+            RangeTransportError::PreconditionFailed(
+                "ETag mismatch during byte-range fetch".to_owned(),
+            ),
+        ));
+    }
+
+    if code == 416 && matches!(req_cfg.mode, RangeFetchMode::OpenProbe { .. }) {
+        return Some(match handle_416_open_probe(headers) {
+            Ok(probe) => AttemptOutcome::Done(probe),
+            Err(err) => AttemptOutcome::Fatal(err),
+        });
+    }
+
+    if matches!(code, 429 | 503) {
+        record_rate_limit_cooldown(
+            req_cfg.host_limiters,
+            req_cfg.host,
+            headers,
+            DEFAULT_RATE_LIMIT_BACKOFF,
+        );
+        return Some(AttemptOutcome::Retry {
+            sleep_backoff: false,
+            err: RangeTransportError::HttpStatus {
+                code,
+                detail: "rate limited".to_owned(),
+            },
+        });
+    }
+
+    if status.is_server_error() || code == 408 {
+        return Some(AttemptOutcome::Retry {
+            sleep_backoff: true,
+            err: RangeTransportError::HttpStatus {
+                code,
+                detail: status
+                    .canonical_reason()
+                    .unwrap_or("server error")
+                    .to_owned(),
+            },
+        });
+    }
+
+    if code != 206 {
+        return Some(AttemptOutcome::Fatal(RangeTransportError::HttpStatus {
+            code,
+            detail: status
+                .canonical_reason()
+                .unwrap_or("unexpected status")
+                .to_owned(),
+        }));
+    }
+
+    None
+}
+
+async fn read_range_body(
+    resp: &mut reqwest::Response,
+    expected_len: usize,
+    total_len: u64,
+    strong_etag: Option<String>,
+    secrets: &[EncodedSecret],
+    cancel: &CancelToken,
+) -> AttemptOutcome {
+    let body = match read_body_capped(resp, expected_len, expected_len, cancel).await {
+        Ok(body) => body,
+        Err(BodyReadError::Cancelled) => {
+            return AttemptOutcome::Fatal(RangeTransportError::Cancelled);
+        }
+        Err(BodyReadError::TooLarge) => {
+            return AttemptOutcome::Fatal(RangeTransportError::InvalidResponse(format!(
+                "206 body exceeded Content-Range length ({expected_len} B)"
+            )));
+        }
+        Err(BodyReadError::Network(err)) => {
+            return AttemptOutcome::Retry {
+                sleep_backoff: true,
+                err: RangeTransportError::Network(redact_text_many(&err.to_string(), secrets)),
+            };
+        }
+    };
+
+    if body.len() != expected_len {
+        return AttemptOutcome::Retry {
+            sleep_backoff: true,
+            err: RangeTransportError::InvalidResponse(format!(
+                "truncated 206 body: expected {expected_len} B, received {} B",
+                body.len()
+            )),
+        };
+    }
+
+    AttemptOutcome::Done(RangeFetchResponse {
+        total_len,
+        strong_etag,
+        body,
+        #[cfg(any(test, feature = "test-support"))]
+        requests_made: 0,
+    })
+}
+
 /// Execute a single HTTP Range attempt while owning the per-host semaphore
 /// permit strictly inside this function's lexical scope so the permit is
 /// guaranteed to drop before any retry backoff sleep or host cooldown wait.
@@ -251,65 +369,8 @@ async fn execute_range_attempt(
         }
     };
 
-    let status = resp.status();
-    let code = status.as_u16();
-
-    if code == 200 {
-        return AttemptOutcome::Fatal(RangeTransportError::RangeNotSupported(
-            "server responded with 200 OK instead of 206 Partial Content".to_owned(),
-        ));
-    }
-
-    if code == 412 && matches!(req_cfg.mode, RangeFetchMode::BlockSpan { .. }) {
-        return AttemptOutcome::Fatal(RangeTransportError::PreconditionFailed(
-            "ETag mismatch during byte-range fetch".to_owned(),
-        ));
-    }
-
-    if code == 416 && matches!(req_cfg.mode, RangeFetchMode::OpenProbe { .. }) {
-        return match handle_416_open_probe(resp.headers()) {
-            Ok(probe) => AttemptOutcome::Done(probe),
-            Err(err) => AttemptOutcome::Fatal(err),
-        };
-    }
-
-    if matches!(code, 429 | 503) {
-        record_rate_limit_cooldown(
-            req_cfg.host_limiters,
-            req_cfg.host,
-            resp.headers(),
-            DEFAULT_RATE_LIMIT_BACKOFF,
-        );
-        return AttemptOutcome::Retry {
-            sleep_backoff: false,
-            err: RangeTransportError::HttpStatus {
-                code,
-                detail: "rate limited".to_owned(),
-            },
-        };
-    }
-
-    if status.is_server_error() || code == 408 {
-        return AttemptOutcome::Retry {
-            sleep_backoff: true,
-            err: RangeTransportError::HttpStatus {
-                code,
-                detail: status
-                    .canonical_reason()
-                    .unwrap_or("server error")
-                    .to_owned(),
-            },
-        };
-    }
-
-    if code != 206 {
-        return AttemptOutcome::Fatal(RangeTransportError::HttpStatus {
-            code,
-            detail: status
-                .canonical_reason()
-                .unwrap_or("unexpected status")
-                .to_owned(),
-        });
+    if let Some(outcome) = classify_range_status(req_cfg, resp.status(), resp.headers()) {
+        return outcome;
     }
 
     let (response_strong_etag, expected_len, total_len) =
@@ -318,44 +379,15 @@ async fn execute_range_attempt(
             Err(err) => return AttemptOutcome::Fatal(err),
         };
 
-    let body = match read_body_capped(&mut resp, expected_len, expected_len, cancel).await {
-        Ok(body) => body,
-        Err(BodyReadError::Cancelled) => {
-            return AttemptOutcome::Fatal(RangeTransportError::Cancelled);
-        }
-        Err(BodyReadError::TooLarge) => {
-            return AttemptOutcome::Fatal(RangeTransportError::InvalidResponse(format!(
-                "206 body exceeded Content-Range length ({expected_len} B)"
-            )));
-        }
-        Err(BodyReadError::Network(err)) => {
-            return AttemptOutcome::Retry {
-                sleep_backoff: true,
-                err: RangeTransportError::Network(redact_text_many(
-                    &err.to_string(),
-                    req_cfg.secrets,
-                )),
-            };
-        }
-    };
-
-    if body.len() != expected_len {
-        return AttemptOutcome::Retry {
-            sleep_backoff: true,
-            err: RangeTransportError::InvalidResponse(format!(
-                "truncated 206 body: expected {expected_len} B, received {} B",
-                body.len()
-            )),
-        };
-    }
-
-    AttemptOutcome::Done(RangeFetchResponse {
+    read_range_body(
+        &mut resp,
+        expected_len,
         total_len,
-        strong_etag: response_strong_etag,
-        body,
-        #[cfg(any(test, feature = "test-support"))]
-        requests_made: 0,
-    })
+        response_strong_etag,
+        req_cfg.secrets,
+        cancel,
+    )
+    .await
 }
 
 pub(super) async fn fetch_range_http(

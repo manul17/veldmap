@@ -12,8 +12,10 @@ use veldmap_raster::{BandSample, DecodeJob, DecodeJobKey, RasterSource};
 
 use crate::colormap::{CategoricalPaletteId, sentinel2_scl_class_name};
 
-use super::asset::RasterAsset;
-use super::band_math::{BandChannelSample, BandMathFormula, BandMathReadout, is_scl_class_masked};
+use super::asset::{RasterAsset, has_affine_scaling};
+use super::band_math::{
+    BandChannelSample, BandMathFormula, BandMathReadout, MAX_SCL_MASK_CLASSES, is_scl_class_masked,
+};
 use super::layer::{LayerKind, OverlayLayer};
 use super::runtime::OverlayRuntime;
 use super::stack::LayerStack;
@@ -26,6 +28,7 @@ enum ProbeKey {
         source: SourceId,
         band: BandKey,
         format: PixelFormat,
+        is_scl_palette: bool,
         x: u32,
         y: u32,
     },
@@ -170,46 +173,43 @@ fn build_readout(
                 pixel,
                 source_pixel_size_m: asset.geo().source_pixel_size_m(),
                 units: band_info.and_then(|b| b.units.clone()),
-                has_affine_scaling: band_info
-                    .is_some_and(|b| (b.scale - 1.0).abs() > 1e-12 || b.offset.abs() > 1e-12),
+                has_affine_scaling: band_info.is_some_and(has_affine_scaling),
                 log10_db: spec.format == PixelFormat::R32Float
                     && style.scientific().preset.is_log10_db(),
                 value,
             }
         }
-        LayerKind::BandMath(bm) => {
-            let units = (bm.style.formula == BandMathFormula::Difference)
-                .then(|| bm.bands[0].band_units())
-                .flatten();
-            CursorReadout {
-                layer_name: layer.name().to_owned(),
-                pixel,
-                source_pixel_size_m: bm.primary_asset().geo().source_pixel_size_m(),
-                units,
-                has_affine_scaling: false,
-                log10_db: false,
-                value,
-            }
-        }
+        LayerKind::BandMath(bm) => CursorReadout {
+            layer_name: layer.name().to_owned(),
+            pixel,
+            source_pixel_size_m: bm.primary_asset().geo().source_pixel_size_m(),
+            units: bm.output_units(),
+            has_affine_scaling: false,
+            log10_db: false,
+            value,
+        },
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Internal background probe helper avoids heap-allocating a single-pixel request struct."
-)]
-fn sample_single_pixel(
-    rt: &OverlayRuntime,
-    source: &dyn RasterSource,
+struct SingleProbeJobSpec {
+    source: Arc<dyn RasterSource>,
     band: BandKey,
     format: PixelFormat,
     is_scl_palette: bool,
     pixel: (u32, u32),
+}
+
+fn sample_single_pixel(
+    rt: &OverlayRuntime,
+    spec: SingleProbeJobSpec,
     cancel: &CancelToken,
     probe_guard: CursorProbeGuard,
 ) {
     let ctx = rt.decode_context(cancel);
-    match source.sample_band(band, format, pixel.0, pixel.1, &ctx) {
+    match spec
+        .source
+        .sample_band(spec.band, spec.format, spec.pixel.0, spec.pixel.1, &ctx)
+    {
         Ok(BandSample::Rgba(rgba)) => probe_guard.resolve(CursorReadoutValue::Rgba(rgba)),
         Ok(BandSample::Scalar { raw, physical }) => {
             probe_guard.resolve(CursorReadoutValue::Scalar { raw, physical })
@@ -217,7 +217,8 @@ fn sample_single_pixel(
         Ok(BandSample::Categorical(class_id)) => {
             probe_guard.resolve(CursorReadoutValue::Categorical {
                 class_id,
-                class_name: is_scl_palette
+                class_name: spec
+                    .is_scl_palette
                     .then(|| sentinel2_scl_class_name(class_id))
                     .flatten(),
             })
@@ -251,7 +252,7 @@ fn make_band_probe_spec(
     let nodata_class_lt_32 = is_scl
         .then(|| {
             LayerStyle::categorical_nodata_value(asset.source().description(), spec.band)
-                .filter(|&nd| nd < 32)
+                .filter(|&nd| nd < MAX_SCL_MASK_CLASSES)
                 .map(|nd| nd as u16)
         })
         .flatten();
@@ -356,26 +357,31 @@ fn sample_band_math_pixel(
         computed,
         channels,
         scl_class,
+        scl_class_name: scl_class.and_then(sentinel2_scl_class_name),
         scl_masked,
         has_unavailable,
     }))
 }
 
-fn probe_key_for_layer(
-    layer: &OverlayLayer,
+#[derive(Clone, Copy)]
+struct ProbeTarget {
     pixel: (u32, u32),
     lat_deg: f64,
     lon_deg: f64,
-) -> ProbeKey {
+}
+
+fn probe_key_for_layer(layer: &OverlayLayer, target: ProbeTarget) -> ProbeKey {
     match layer.kind() {
-        LayerKind::SingleRaster { asset, .. } => {
+        LayerKind::SingleRaster { asset, style, .. } => {
             let spec = asset.meta().spec;
+            let is_scl_palette = style.categorical_palette() == CategoricalPaletteId::Sentinel2Scl;
             ProbeKey::Single {
                 source: asset.source_id(),
                 band: spec.band,
                 format: spec.format,
-                x: pixel.0,
-                y: pixel.1,
+                is_scl_palette,
+                x: target.pixel.0,
+                y: target.pixel.1,
             }
         }
         LayerKind::BandMath(bm) => {
@@ -384,9 +390,9 @@ fn probe_key_for_layer(
             for (idx, asset) in bm.assets().take(5).enumerate() {
                 sources[idx] = Some(asset.source_id());
                 pixels[idx] = if idx == 0 {
-                    Some(pixel)
+                    Some(target.pixel)
                 } else {
-                    asset_pixel_at(asset, lat_deg, lon_deg)
+                    asset_pixel_at(asset, target.lat_deg, target.lon_deg)
                 };
             }
             ProbeKey::BandMath {
@@ -465,16 +471,10 @@ impl CursorProber {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Internal probe dispatcher keeps borrowed layer, coordinates, and runtime state explicit."
-    )]
     fn submit_probe(
         &self,
         layer: &OverlayLayer,
-        pixel: (u32, u32),
-        lat_deg: f64,
-        lon_deg: f64,
+        target: ProbeTarget,
         probe_key: ProbeKey,
         cancel: CancelToken,
         runtime: &Arc<OverlayRuntime>,
@@ -492,27 +492,25 @@ impl CursorProber {
                 let is_remote = source.is_remote();
                 let is_scl_palette =
                     style.categorical_palette() == CategoricalPaletteId::Sentinel2Scl;
+                let job_spec = SingleProbeJobSpec {
+                    source,
+                    band: spec.band,
+                    format: spec.format,
+                    is_scl_palette,
+                    pixel: target.pixel,
+                };
                 let job = DecodeJob {
                     key: DecodeJobKey::Probe {
                         source: asset.source_id(),
                         band: spec.band,
                         format: spec.format,
-                        x: pixel.0,
-                        y: pixel.1,
+                        x: target.pixel.0,
+                        y: target.pixel.1,
                     },
                     queued_bytes: 4096,
                     cancel: cancel.clone(),
                     work: Box::new(move || {
-                        sample_single_pixel(
-                            &rt,
-                            source.as_ref(),
-                            spec.band,
-                            spec.format,
-                            is_scl_palette,
-                            pixel,
-                            &cancel,
-                            probe_guard,
-                        );
+                        sample_single_pixel(&rt, job_spec, &cancel, probe_guard);
                     }),
                 };
                 (job, is_remote)
@@ -522,12 +520,12 @@ impl CursorProber {
                 let bands = bm
                     .bands
                     .iter()
-                    .map(|a| make_band_probe_spec(a, lat_deg, lon_deg, false))
+                    .map(|a| make_band_probe_spec(a, target.lat_deg, target.lon_deg, false))
                     .collect();
                 let scl = bm
                     .scl
                     .as_ref()
-                    .map(|a| make_band_probe_spec(a, lat_deg, lon_deg, true));
+                    .map(|a| make_band_probe_spec(a, target.lat_deg, target.lon_deg, true));
                 let job_spec = BandMathProbeJobSpec {
                     formula: bm.style.formula,
                     formula_label: bm.style.recipe_label.clone(),
@@ -542,8 +540,8 @@ impl CursorProber {
                         source: bm.primary_asset().source_id(),
                         band: primary_spec.band,
                         format: primary_spec.format,
-                        x: pixel.0,
-                        y: pixel.1,
+                        x: target.pixel.0,
+                        y: target.pixel.1,
                     },
                     queued_bytes: 8192,
                     cancel: cancel.clone(),
@@ -581,7 +579,12 @@ impl CursorProber {
             return None;
         };
 
-        let probe_key = probe_key_for_layer(layer, pixel, lat_deg, lon_deg);
+        let target = ProbeTarget {
+            pixel,
+            lat_deg,
+            lon_deg,
+        };
+        let probe_key = probe_key_for_layer(layer, target);
         let (submit_cancel, prev_cancel) = {
             let mut state = lock_unpoisoned(&self.cache);
             if state.resolved_key == Some(probe_key) {
@@ -602,7 +605,7 @@ impl CursorProber {
         }
 
         if let Some(cancel) = submit_cancel
-            && !self.submit_probe(layer, pixel, lat_deg, lon_deg, probe_key, cancel, runtime)
+            && !self.submit_probe(layer, target, probe_key, cancel, runtime)
         {
             return Some(build_readout(layer, pixel, CursorReadoutValue::Unavailable));
         }

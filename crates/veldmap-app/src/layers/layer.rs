@@ -23,8 +23,32 @@ use crate::{clamp_opacity, display_name_from_path};
 
 use super::asset::{GeoBinding, LayerOrigin, LayerStream, RasterAsset};
 use super::band_math::{BandMathLayerData, BandMathStyle};
-use super::style::{LayerStyle, LayerStyleSpec, TrackKind};
+use super::style::{LayerStyle, LayerStyleSpec, ScientificStyle, TrackKind};
 use super::{CrsOverride, LayerId, LayerInitOptions, OverlayPersistEntry};
+
+/// Zero-allocation iterator over every actively rendered [`LayerStream`] owned
+/// by an [`OverlayLayer`] (omitting a `BandMath` layer's `SCL` stream while its
+/// cloud mask is toggled off).
+pub(super) enum ActiveStreams<'a> {
+    Single(Option<&'a LayerStream>),
+    BandMath {
+        bands: std::slice::Iter<'a, RasterAsset>,
+        scl: Option<&'a LayerStream>,
+    },
+}
+
+impl<'a> Iterator for ActiveStreams<'a> {
+    type Item = &'a LayerStream;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Single(slot) => slot.take(),
+            Self::BandMath { bands, scl } => {
+                bands.next().map(RasterAsset::stream).or_else(|| scl.take())
+            }
+        }
+    }
+}
 
 /// Layer-domain state transition record returned by [`OverlayLayer::begin_reload`].
 pub(super) struct ReloadPrep {
@@ -294,13 +318,6 @@ impl OverlayLayer {
         }
     }
 
-    pub(super) fn band_math_mut(&mut self) -> Option<&mut BandMathLayerData> {
-        match &mut self.kind {
-            LayerKind::BandMath(bm) => Some(bm),
-            LayerKind::SingleRaster { .. } => None,
-        }
-    }
-
     pub(super) fn local_path(&self) -> Option<&Path> {
         match &self.kind {
             LayerKind::SingleRaster { asset, .. } => asset.local_path(),
@@ -320,30 +337,6 @@ impl OverlayLayer {
             LayerKind::SingleRaster { asset, .. } => asset.remote_url(),
             LayerKind::BandMath(bm) => bm.bands.first().and_then(RasterAsset::remote_url),
         }
-    }
-
-    pub(super) fn remote_range(&self) -> Option<&HttpRangeSource> {
-        self.primary_asset().remote_range()
-    }
-
-    pub(super) fn source(&self) -> &Arc<dyn RasterSource> {
-        self.primary_asset().source()
-    }
-
-    pub(super) fn geo(&self) -> &GeoBinding {
-        self.primary_asset().geo()
-    }
-
-    pub(super) fn meta(&self) -> &PyramidMeta {
-        self.primary_asset().meta()
-    }
-
-    pub(super) fn source_id(&self) -> SourceId {
-        self.primary_asset().source_id()
-    }
-
-    pub(super) fn fingerprint_hex(&self) -> &str {
-        self.primary_asset().fingerprint_hex()
     }
 
     /// Collect all distinct [`SourceId`]s referenced by this layer (1 for
@@ -382,20 +375,29 @@ impl OverlayLayer {
         }
     }
 
-    /// Collect references to every actively rendered [`LayerStream`] owned by
-    /// this layer (omitting a `BandMath` layer's `SCL` stream while its cloud
-    /// mask is toggled off).
-    pub(super) fn streams(&self) -> Vec<&LayerStream> {
+    /// Iterate over every actively rendered [`LayerStream`] owned by this layer
+    /// without heap allocation (omitting a `BandMath` layer's `SCL` stream
+    /// while its cloud mask is toggled off).
+    pub(super) fn streams(&self) -> ActiveStreams<'_> {
         match &self.kind {
-            LayerKind::SingleRaster { asset, .. } => vec![asset.stream()],
+            LayerKind::SingleRaster { asset, .. } => ActiveStreams::Single(Some(asset.stream())),
+            LayerKind::BandMath(bm) => ActiveStreams::BandMath {
+                bands: bm.bands.iter(),
+                scl: bm
+                    .style
+                    .scl_mask_enabled
+                    .then(|| bm.scl.as_ref().map(RasterAsset::stream))
+                    .flatten(),
+            },
+        }
+    }
+
+    /// Number of actively rendered streams yielded by [`Self::streams`] (O(1)).
+    pub(super) fn active_stream_count(&self) -> usize {
+        match &self.kind {
+            LayerKind::SingleRaster { .. } => 1,
             LayerKind::BandMath(bm) => {
-                let mut v: Vec<&LayerStream> = bm.bands.iter().map(RasterAsset::stream).collect();
-                if bm.style.scl_mask_enabled
-                    && let Some(scl) = &bm.scl
-                {
-                    v.push(scl.stream());
-                }
-                v
+                bm.bands.len() + usize::from(bm.style.scl_mask_enabled && bm.scl.is_some())
             }
         }
     }
@@ -483,35 +485,32 @@ impl OverlayLayer {
         }
     }
 
-    pub(super) fn apply_band_stats_ready(&mut self, band: BandKey, stats: BandStats) -> bool {
+    fn matching_scientific_style_mut(&mut self, band: BandKey) -> Option<&mut ScientificStyle> {
         let LayerKind::SingleRaster { asset, style, .. } = &mut self.kind else {
-            return false;
+            return None;
         };
         if asset.meta().spec.band != band || asset.meta().spec.format != PixelFormat::R32Float {
-            return false;
+            return None;
         }
-        style.scientific_mut().apply_ready(stats);
+        Some(style.scientific_mut())
+    }
+
+    pub(super) fn apply_band_stats_ready(&mut self, band: BandKey, stats: BandStats) -> bool {
+        let Some(sci) = self.matching_scientific_style_mut(band) else {
+            return false;
+        };
+        sci.apply_ready(stats);
         true
     }
 
     pub(super) fn apply_band_stats_empty(&mut self, band: BandKey, job_id: u64) -> bool {
-        let LayerKind::SingleRaster { asset, style, .. } = &mut self.kind else {
-            return false;
-        };
-        if asset.meta().spec.band != band || asset.meta().spec.format != PixelFormat::R32Float {
-            return false;
-        }
-        style.scientific_mut().apply_empty(job_id)
+        self.matching_scientific_style_mut(band)
+            .is_some_and(|sci| sci.apply_empty(job_id))
     }
 
     pub(super) fn apply_band_stats_cancelled(&mut self, band: BandKey, job_id: u64) -> bool {
-        let LayerKind::SingleRaster { asset, style, .. } = &mut self.kind else {
-            return false;
-        };
-        if asset.meta().spec.band != band || asset.meta().spec.format != PixelFormat::R32Float {
-            return false;
-        }
-        style.scientific_mut().apply_cancelled(job_id)
+        self.matching_scientific_style_mut(band)
+            .is_some_and(|sci| sci.apply_cancelled(job_id))
     }
 
     /// Switch a single-raster layer's active stream (`Display` / `Scientific` /
@@ -602,6 +601,52 @@ impl OverlayLayer {
         }
     }
 
+    pub(super) fn set_band_math_rgb_stretch(
+        &mut self,
+        min: [f64; 3],
+        max: [f64; 3],
+        gamma: f32,
+    ) -> bool {
+        match &mut self.kind {
+            LayerKind::BandMath(bm) => bm.style.set_rgb_stretch(min, max, gamma),
+            LayerKind::SingleRaster { .. } => false,
+        }
+    }
+
+    pub(super) fn reset_band_math_stretch(&mut self) -> bool {
+        match &mut self.kind {
+            LayerKind::BandMath(bm) => bm.style.reset_stretch(),
+            LayerKind::SingleRaster { .. } => false,
+        }
+    }
+
+    pub(super) fn set_band_math_scl_enabled(&mut self, enabled: bool) -> (bool, Option<StreamKey>) {
+        let LayerKind::BandMath(bm) = &mut self.kind else {
+            return (false, None);
+        };
+        if !bm.style.set_scl_mask_enabled(enabled) {
+            return (false, None);
+        }
+        let disabled_stream = if !enabled {
+            if let Some(scl) = &mut bm.scl {
+                scl.clear_wanted();
+                Some(scl.meta().stream_key())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        (true, disabled_stream)
+    }
+
+    pub(super) fn set_band_math_scl_mask_bits(&mut self, bits: u32) -> bool {
+        match &mut self.kind {
+            LayerKind::BandMath(bm) => bm.style.set_scl_mask_bits(bits),
+            LayerKind::SingleRaster { .. } => false,
+        }
+    }
+
     pub(super) fn observe_stream_tile_bytes(&mut self, stream: StreamKey, bytes: usize) {
         match &mut self.kind {
             LayerKind::SingleRaster { asset, .. } => {
@@ -646,7 +691,7 @@ impl OverlayLayer {
         self.clear_wanted();
         ReloadPrep {
             reload_seq: self.reload.seq,
-            old_source: self.source_id(),
+            old_source: self.primary_asset().source_id(),
             old_cancel,
         }
     }
@@ -673,10 +718,11 @@ impl OverlayLayer {
         frame: Frame,
         relaid: u64,
     ) -> SourceId {
-        let old_src = self.source_id();
+        let primary = self.primary_asset();
+        let old_src = primary.source_id();
+        let old_override = primary.geo().crs_override().cloned();
+        let old_epoch = primary.geo().crs_override_epoch();
         let saved_style = self.saved_style();
-        let old_override = self.geo().crs_override().cloned();
-        let old_epoch = self.geo().crs_override_epoch();
         let mut replacement = Self::from_source(
             self.id,
             path,
@@ -701,27 +747,6 @@ impl OverlayLayer {
 
     pub(super) fn take_reload_cancel(&mut self) -> Option<CancelToken> {
         self.reload.cancel.take()
-    }
-
-    /// Total proportional VRAM appetite weight across all active streams of
-    /// this layer (summing heterogeneous multi-band / multi-format streams).
-    #[cfg(test)]
-    pub(super) fn appetite_weight_bytes(&self) -> u64 {
-        if !self.is_active() {
-            return 0;
-        }
-        self.streams().into_iter().fold(0u64, |acc, s| {
-            acc.saturating_add((s.observed_tile_bytes() as u64).max(1024))
-        })
-    }
-
-    /// Total observed bytes for one cell across all streams of this layer.
-    #[cfg(test)]
-    pub(super) fn cell_observed_bytes(&self) -> usize {
-        self.streams()
-            .into_iter()
-            .fold(0usize, |acc, s| acc.saturating_add(s.observed_tile_bytes()))
-            .max(1)
     }
 
     #[cfg(test)]

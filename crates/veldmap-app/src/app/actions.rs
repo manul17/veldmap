@@ -129,10 +129,13 @@ impl VeldmapApp {
                     }
                 }
                 LayerUiAction::SetStream(id, spec) => {
+                    let persistable = self.scene.overlays().is_layer_persistable(id);
                     match self.scene.set_overlay_stream(id, spec) {
                         Ok(changed) => {
                             needs_repaint |= changed;
-                            session_dirty |= changed;
+                            if persistable {
+                                session_dirty |= changed;
+                            }
                         }
                         Err(err) => {
                             self.panels.layers.push_error(err);

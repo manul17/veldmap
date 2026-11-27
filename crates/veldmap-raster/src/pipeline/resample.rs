@@ -6,89 +6,10 @@
 //! - Non-averaging nearest-neighbor `R8Uint`/`R16Uint` halving and window
 //!   resampling (`halve_uint_nearest`, `resample_uint_nearest_window`).
 
-use crate::color::{
-    average_srgb_rgba8_block, linear_to_srgb_lut, linear_to_srgb_u8, srgb_to_linear_lut,
+use crate::color::{linear_to_srgb_lut, linear_to_srgb_u8, srgb_to_linear_lut};
+use crate::mipmap::{
+    DownsampleRounding, downsample_r32f_2x, downsample_rgba8_2x, read_f32_ne, write_f32_ne,
 };
-
-/// Target-dimension rounding policy for 2x box downsampling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DownsampleRounding {
-    /// GPU mipmap chain convention (`max(side / 2, 1)`), folding any trailing
-    /// odd row or column into the final destination texel (`1..=3` footprint).
-    Floor,
-    /// Raster pyramid cascade convention (`ceil(side / 2)`), keeping strict
-    /// `1..=2` footprints aligned to `2^k` base-pixel blocks.
-    Ceil,
-}
-
-impl DownsampleRounding {
-    const fn target_dim(self, side: u32) -> u32 {
-        match self {
-            Self::Floor => {
-                let half = side / 2;
-                if half > 0 { half } else { 1 }
-            }
-            Self::Ceil => side.div_ceil(2),
-        }
-    }
-
-    #[inline]
-    fn span(self, d: u32, dst: u32, src: u32) -> (u32, u32) {
-        let start = d * 2;
-        let end = match self {
-            Self::Floor if d + 1 == dst => src,
-            Self::Floor | Self::Ceil => (start + 2).min(src),
-        };
-        (start, end)
-    }
-}
-
-/// Alpha-weighted linear-light 2x box downsample for `Rgba8UnormSrgb` under
-/// `rounding` (`Ceil` for `1..=2` pyramid cascades; `Floor` for `1..=3` GPU
-/// mipmap chains folding trailing odd edges).
-///
-/// Keeps fully transparent blocks deterministic `[0, 0, 0, 0]`.
-pub(crate) fn downsample_rgba8_2x(
-    src: &[u8],
-    w: u32,
-    h: u32,
-    rounding: DownsampleRounding,
-) -> Vec<u8> {
-    if w == 0 || h == 0 {
-        return Vec::new();
-    }
-    debug_assert_eq!(src.len(), (w as usize) * (h as usize) * 4);
-
-    let to_lin = srgb_to_linear_lut();
-    let to_srgb = linear_to_srgb_lut();
-    let (dw, dh) = (rounding.target_dim(w), rounding.target_dim(h));
-    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
-    for dy in 0..dh {
-        let (y0, y1) = rounding.span(dy, dh, h);
-        for dx in 0..dw {
-            let (x0, x1) = rounding.span(dx, dw, w);
-            // Both `Ceil` (`1..=2`) and `Floor` (`1..=3`) produce at most `3 * 3 = 9` samples.
-            let mut offsets = [0usize; 9];
-            let mut n = 0usize;
-            for y in y0..y1 {
-                let row = (y as usize) * (w as usize);
-                for x in x0..x1 {
-                    offsets[n] = (row + (x as usize)) * 4;
-                    n += 1;
-                }
-            }
-            let out_px = ((dy as usize) * (dw as usize) + (dx as usize)) * 4;
-            average_srgb_rgba8_block(
-                src,
-                &offsets[..n],
-                to_lin,
-                to_srgb,
-                &mut out[out_px..out_px + 4],
-            );
-        }
-    }
-    out
-}
 
 /// Alpha-weighted linear-light 2x2 sRGB block average
 /// (`w x h` -> `ceil(w/2) x ceil(h/2)`).
@@ -268,61 +189,6 @@ pub(super) fn bleed_alpha(rgba: &mut [u8], width: u32, height: u32) {
             known.copy_from_slice(&next);
         }
     }
-}
-
-#[inline]
-fn read_f32_ne(buf: &[u8], pixel_index: usize) -> f32 {
-    let off = pixel_index * 4;
-    f32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-#[inline]
-fn write_f32_ne(buf: &mut [u8], pixel_index: usize, val: f32) {
-    let off = pixel_index * 4;
-    buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
-}
-
-/// NaN-skipping 2x box downsample for `R32Float` under `rounding` (`Ceil` for
-/// `1..=2` pyramid cascades; `Floor` for `1..=3` GPU mipmap chains).
-///
-/// Finite samples are averaged in `f64`; all-non-finite blocks emit `f32::NAN`.
-pub(crate) fn downsample_r32f_2x(
-    src: &[u8],
-    w: u32,
-    h: u32,
-    rounding: DownsampleRounding,
-) -> Vec<u8> {
-    if w == 0 || h == 0 {
-        return Vec::new();
-    }
-    debug_assert_eq!(src.len(), (w as usize) * (h as usize) * 4);
-    let (dw, dh) = (rounding.target_dim(w), rounding.target_dim(h));
-    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
-    for dy in 0..dh {
-        let (y0, y1) = rounding.span(dy, dh, h);
-        for dx in 0..dw {
-            let (x0, x1) = rounding.span(dx, dw, w);
-            let mut sum = 0.0f64;
-            let mut count = 0u32;
-            for y in y0..y1 {
-                let row = (y as usize) * (w as usize);
-                for x in x0..x1 {
-                    let v = read_f32_ne(src, row + (x as usize));
-                    if v.is_finite() {
-                        sum += f64::from(v);
-                        count += 1;
-                    }
-                }
-            }
-            let val = if count > 0 {
-                (sum / f64::from(count)) as f32
-            } else {
-                f32::NAN
-            };
-            write_f32_ne(&mut out, (dy as usize) * (dw as usize) + (dx as usize), val);
-        }
-    }
-    out
 }
 
 /// NaN-skipping 2x2 block average for `R32Float` (`w x h` -> `ceil(w/2) x ceil(h/2)`).

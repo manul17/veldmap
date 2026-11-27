@@ -71,8 +71,8 @@ fn collect_band_choices(layers: &[LayerSummary]) -> Vec<BandChoice> {
 
 /// Transient UI state for the Layers-panel Band Math / RGB Composite builder.
 #[derive(Clone, Debug)]
-pub(crate) struct BandMathBuilderState {
-    pub(crate) open: bool,
+pub(super) struct BandMathBuilderState {
+    pub(super) open: bool,
     formula: BandMathFormula,
     title: String,
     slot_keys: [Option<(LayerId, u16)>; 3],

@@ -155,3 +155,44 @@ fn ui_errors_do_not_bump_rev_and_set_aoi_geometry_caches_bbox() {
     assert_ne!(session.rev(), rev0);
     assert_eq!(session.aoi_bbox(), Some([7.0, 45.0, 9.0, 47.0]));
 }
+
+#[test]
+fn hovering_already_selected_item_skips_highlight_rebuild() {
+    let mut session = test_session();
+    let mk_item = |id: &str, bbox: [f64; 4]| veldmap_net::StacItem {
+        id: id.to_owned(),
+        collection: None,
+        datetime: None,
+        cloud_cover: None,
+        platform: None,
+        mgrs_tile: None,
+        processing_level: None,
+        bbox: Some(bbox),
+        geometry: None,
+        assets: Vec::new(),
+    };
+    session.seed_queued_search_for_test(
+        1,
+        "https://example.org/v1",
+        StacSearchResult {
+            items: vec![
+                mk_item("a", [7.0, 45.0, 8.0, 46.0]),
+                mk_item("b", [8.0, 46.0, 9.0, 47.0]),
+            ],
+            matched: Some(2),
+        },
+    );
+    assert!(session.poll_results());
+    let rev_selected_0 = session.rev();
+
+    // Hovering and unhovering the already-selected item 0 notifies UI (true)
+    // without rebuilding the highlight mesh or bumping rev.
+    assert!(session.set_hovered(Some(0)));
+    assert_eq!(session.rev(), rev_selected_0);
+    assert!(session.set_hovered(None));
+    assert_eq!(session.rev(), rev_selected_0);
+
+    // Hovering a different item 1 DOES rebuild highlight and bump rev.
+    assert!(session.set_hovered(Some(1)));
+    assert_ne!(session.rev(), rev_selected_0);
+}

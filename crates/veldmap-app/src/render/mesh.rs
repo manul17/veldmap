@@ -1,10 +1,10 @@
 //! Per-tile CPU `f64` RTC WGS84 quadtree geometry with per-cell sag-scaled
 //! skirts and a single shared static index buffer.
 //!
-//! Both the globe surface (`body_*_pipeline`) and the post-overlay procedural
-//! `fwidth()` graticule (`grid_pipeline`) consume the exact same per-tile
-//! vertex buffer and shared static index buffer (`full` range for body +
-//! skirts, `surface` range for graticule).
+//! Both the globe surface (`BodyPipelines::{ellipsoid, textured}`) and the
+//! post-overlay procedural `fwidth()` graticule (`BodyPipelines::grid`) consume
+//! the exact same per-tile vertex buffer and shared static index buffer (`full`
+//! range for body + skirts, `surface` range for graticule).
 
 use std::ops::Range;
 

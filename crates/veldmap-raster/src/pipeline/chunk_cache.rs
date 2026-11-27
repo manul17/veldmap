@@ -55,7 +55,7 @@ pub(crate) struct DecodedChunk {
     pub(crate) data: Vec<u8>,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) format: veldmap_core::tile::PixelFormat,
+    pub(crate) format: PixelFormat,
 }
 
 impl DecodedChunk {

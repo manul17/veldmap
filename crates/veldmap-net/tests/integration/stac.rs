@@ -1,13 +1,12 @@
 //! Offline mock STAC API integration tests covering Sentinel-2 L2A & COP-DEM
 //! search parsing, `raster:bands` `scale`/`offset` metadata, custom Bearer /
-//! API-key / SAS auth headers, secret redaction, and built-in sample scenes.
+//! API-key / SAS auth headers, and secret redaction.
 
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::CancelToken;
 use veldmap_net::{
     NetConfig, NetContext, StacAuth, StacCatalogConfig, StacClient, StacSearchQuery,
-    builtin_sample_scenes,
 };
 
 use crate::mock_http::{MockHttpServer, write_http_response};
@@ -152,7 +151,8 @@ fn stac_search_parses_sentinel2_assets_raster_bands_auth_and_redacts_secrets() {
         .iter()
         .find(|a| a.key == "red")
         .expect("red asset");
-    assert_eq!(red.primary_scale_offset(), Some((0.0001, -0.1)));
+    assert_eq!(red.raster_bands[0].scale, Some(0.0001));
+    assert_eq!(red.raster_bands[0].offset, Some(-0.1));
     assert_eq!(red.raster_bands[0].nodata, Some(0.0));
 
     let reqs = server.recorded.lock().expect("lock");
@@ -215,14 +215,6 @@ fn stac_search_parses_sentinel2_assets_raster_bands_auth_and_redacts_secrets() {
             .path_and_query
             .contains("sig=sas_secret")
     );
-
-    // Built-in sample scenes are non-empty and use public HTTPS COG URLs.
-    let samples = builtin_sample_scenes();
-    assert!(samples.len() >= 3);
-    for s in samples {
-        assert!(s.cog_url.starts_with("https://"));
-        assert!(s.cog_url.ends_with(".tif"));
-    }
 }
 
 #[test]

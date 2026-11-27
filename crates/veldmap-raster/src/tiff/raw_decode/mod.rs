@@ -1,6 +1,6 @@
 //! Direct stateless raw-chunk GeoTIFF decompressor over [`veldmap_core::io::ByteSource`].
 //!
-//! Decodes raw TIFF strips and tiles directly using already-locked codecs
+//! Decodes raw TIFF strips and tiles directly using pure-Rust/bundled codecs
 //! (`flate2`, `weezl`, `zstd`, `jpeg-decoder`, `image-webp`) with explicit
 //! pre-allocation bounds, TIFF endianness handling, `Predictor = 2` & `3`
 //! (on full stored tile rows before edge cropping), `PlanarConfiguration = 2`
@@ -13,7 +13,8 @@ use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
 
-use super::ifd::{CachedIfd, ChunkDims, RawTiffAccess, TiffCompression};
+use super::ifd::{CachedIfd, ChunkDims, TiffCompression};
+use super::view::RawTiffAccess;
 
 /// Result of decoding one stored TIFF chunk (or one plane of a planar chunk).
 pub(super) enum RawChunkPayload {

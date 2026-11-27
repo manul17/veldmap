@@ -294,17 +294,7 @@ pub(crate) fn raw_bytes_to_rgba(
         }
         let alpha = if let Some(a_ch) = pixel.alpha_channel() {
             match read_native_sample_f64(raw, sample_type, base + a_ch) {
-                Some(a) if a.is_finite() => match sample_type {
-                    SampleType::U8 => a.round().clamp(0.0, 255.0) as u8,
-                    SampleType::I8 => ((a.clamp(0.0, 127.0) / 127.0) * 255.0).round() as u8,
-                    SampleType::U16 => ((a.clamp(0.0, 65535.0) as u16) >> 8) as u8,
-                    SampleType::I16 => ((a.clamp(0.0, 32767.0) as i16) >> 7) as u8,
-                    SampleType::U32 => ((a.clamp(0.0, f64::from(u32::MAX)) as u32) >> 24) as u8,
-                    SampleType::I32 => ((a.clamp(0.0, f64::from(i32::MAX)) as i32) >> 23) as u8,
-                    SampleType::F16 | SampleType::F32 | SampleType::F64 => {
-                        (a * 255.0).round().clamp(0.0, 255.0) as u8
-                    }
-                },
+                Some(a) if a.is_finite() => normalize_alpha_u8(a, sample_type),
                 _ => {
                     broken = true;
                     0
@@ -323,6 +313,22 @@ pub(crate) fn raw_bytes_to_rgba(
         dst[3] = alpha;
     }
     rgba
+}
+
+/// Normalize a finite numeric alpha sample in `sample_type`'s native range to `0..=255`.
+#[inline]
+pub(crate) fn normalize_alpha_u8(a: f64, sample_type: SampleType) -> u8 {
+    match sample_type {
+        SampleType::U8 => a.round().clamp(0.0, 255.0) as u8,
+        SampleType::I8 => ((a.clamp(0.0, 127.0) / 127.0) * 255.0).round() as u8,
+        SampleType::U16 => ((a.clamp(0.0, 65535.0) as u16) >> 8) as u8,
+        SampleType::I16 => ((a.clamp(0.0, 32767.0) as i16) >> 7) as u8,
+        SampleType::U32 => ((a.clamp(0.0, f64::from(u32::MAX)) as u32) >> 24) as u8,
+        SampleType::I32 => ((a.clamp(0.0, f64::from(i32::MAX)) as i32) >> 23) as u8,
+        SampleType::F16 | SampleType::F32 | SampleType::F64 => {
+            (a * 255.0).round().clamp(0.0, 255.0) as u8
+        }
+    }
 }
 
 /// Compute [`BandStats`] (min, max, p2, p98, dB stats, and 64-bin histograms)

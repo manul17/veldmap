@@ -120,7 +120,7 @@ mod tests {
     use veldmap_core::sync::CancelToken;
 
     use crate::basemap::LiveBasemapSpec;
-    use crate::http::HostLimiters;
+    use crate::limiter::HostLimiters;
 
     use super::*;
 

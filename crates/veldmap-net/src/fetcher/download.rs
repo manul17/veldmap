@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use veldmap_core::sync::CancelToken;
 
-use crate::http::{BodyReadError, parse_retry_after_seconds, read_body_capped};
+use crate::http::{BodyReadError, read_body_capped};
+use crate::limiter::parse_retry_after_seconds;
 
 pub(super) enum FetchOutcome {
     Payload(Vec<u8>),

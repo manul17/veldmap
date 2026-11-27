@@ -54,12 +54,9 @@ impl OverlayLayer {
                 if !bm.style.formula.is_scalar() {
                     return None;
                 }
-                let units = (bm.style.formula == BandMathFormula::Difference)
-                    .then(|| bm.bands[0].band_units())
-                    .flatten();
                 Some(ColorbarInfo {
                     title: format!("{} · {}", self.name(), bm.style.recipe_label),
-                    units,
+                    units: bm.output_units(),
                     min: bm.style.stretch_min,
                     max: bm.style.stretch_max,
                     log10_db: false,

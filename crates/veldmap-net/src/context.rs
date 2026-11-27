@@ -11,7 +11,8 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
 use crate::NetError;
-use crate::http::{HostLimiters, HttpClientConfig, build_http_client, default_user_agent};
+use crate::http::{HttpClientConfig, build_http_client, default_user_agent};
+use crate::limiter::HostLimiters;
 use crate::range::{PrefetchBudget, RangeBlockPool};
 
 /// Default maximum concurrent HTTP requests per remote host.

@@ -8,6 +8,7 @@
 mod aoi;
 mod auth;
 mod session;
+mod views;
 
 use std::fmt;
 
@@ -157,11 +158,10 @@ impl StacCogAssetView {
 #[derive(Clone, Debug)]
 pub(crate) struct StacItemView {
     pub(crate) id: String,
-    pub(crate) short_date: Option<String>,
-    pub(crate) cloud_cover: Option<f32>,
-    pub(crate) mgrs_tile: Option<String>,
+    pub(crate) meta_line: Option<String>,
     pub(crate) platform: Option<String>,
     pub(crate) processing_level: Option<String>,
+    pub(crate) is_surface_reflectance: bool,
     pub(crate) preferred_cog: Option<StacCogAssetView>,
     pub(crate) recipes: Vec<StacRecipeView>,
     pub(crate) cog_assets: Vec<StacCogAssetView>,

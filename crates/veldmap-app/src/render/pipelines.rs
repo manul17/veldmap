@@ -15,22 +15,48 @@ use super::{
     OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL, SCRATCH_NAN_FILL_WGSL, VECTOR_WGSL,
 };
 
-struct GlobePipelineSpec<'a> {
+fn wgsl_module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    })
+}
+
+fn pipeline_layout(
+    device: &wgpu::Device,
+    label: &str,
+    bind_group_layouts: &[Option<&wgpu::BindGroupLayout>],
+) -> wgpu::PipelineLayout {
+    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts,
+        immediate_size: 0,
+    })
+}
+
+fn srgb_target(blend: wgpu::BlendState) -> Option<wgpu::ColorTargetState> {
+    Some(wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        blend: Some(blend),
+        write_mask: wgpu::ColorWrites::ALL,
+    })
+}
+
+struct MeshPipelineSpec<'a> {
     label: &'a str,
     vertex_entry: &'a str,
     vertex_layout: wgpu::VertexBufferLayout<'static>,
     fragment_entry: &'a str,
-    topology: wgpu::PrimitiveTopology,
+    targets: &'a [Option<wgpu::ColorTargetState>],
     cull_mode: Option<wgpu::Face>,
-    blend: wgpu::BlendState,
     depth_stencil: Option<wgpu::DepthStencilState>,
 }
 
-fn create_globe_pipeline(
+fn create_mesh_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     layout: &wgpu::PipelineLayout,
-    spec: GlobePipelineSpec<'_>,
+    spec: MeshPipelineSpec<'_>,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(spec.label),
@@ -44,20 +70,47 @@ fn create_globe_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some(spec.fragment_entry),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                blend: Some(spec.blend),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: spec.targets,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
         primitive: wgpu::PrimitiveState {
-            topology: spec.topology,
+            topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: spec.cull_mode,
             front_face: wgpu::FrontFace::Ccw,
             ..Default::default()
         },
         depth_stencil: spec.depth_stencil,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_fullscreen_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    fragment_entry: &str,
+    targets: &[Option<wgpu::ColorTargetState>],
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fragment_entry),
+            targets,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -160,6 +213,22 @@ fn uniform_buffer_layout(
     })
 }
 
+fn texture_2d_layout_entry(
+    binding: u32,
+    sample_type: wgpu::TextureSampleType,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
 fn non_filtering_texture_sampler_layout(
     device: &wgpu::Device,
     label: &str,
@@ -167,16 +236,7 @@ fn non_filtering_texture_sampler_layout(
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
+            texture_2d_layout_entry(0, wgpu::TextureSampleType::Float { filterable: false }),
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -220,28 +280,22 @@ fn create_body_pipelines(
     layouts: &SharedLayouts,
     rgba8_tile_layout: &wgpu::BindGroupLayout,
 ) -> BodyPipelines {
-    let globe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("globe wgsl"),
-        source: wgpu::ShaderSource::Wgsl(GLOBE_WGSL.into()),
-    });
-
+    let globe_shader = wgsl_module(device, "globe wgsl", GLOBE_WGSL);
     let tile_layout = layouts.dynamic_uniform_layout(UniformSlot::Tile);
-    let untextured_pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("globe untextured pipeline layout"),
-            bind_group_layouts: &[Some(&layouts.camera_layout), Some(tile_layout)],
-            immediate_size: 0,
-        });
-
-    let textured_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("globe textured pipeline layout"),
-        bind_group_layouts: &[
+    let untextured_pipeline_layout = pipeline_layout(
+        device,
+        "globe untextured pipeline layout",
+        &[Some(&layouts.camera_layout), Some(tile_layout)],
+    );
+    let textured_pipeline_layout = pipeline_layout(
+        device,
+        "globe textured pipeline layout",
+        &[
             Some(&layouts.camera_layout),
             Some(tile_layout),
             Some(rgba8_tile_layout),
         ],
-        immediate_size: 0,
-    });
+    );
 
     let body_depth = || {
         Some(wgpu::DepthStencilState {
@@ -252,53 +306,51 @@ fn create_body_pipelines(
             bias: wgpu::DepthBiasState::default(),
         })
     };
+    let replace = [srgb_target(wgpu::BlendState::REPLACE)];
+    let alpha = [srgb_target(wgpu::BlendState::ALPHA_BLENDING)];
 
-    let ellipsoid = create_globe_pipeline(
+    let ellipsoid = create_mesh_pipeline(
         device,
         &globe_shader,
         &untextured_pipeline_layout,
-        GlobePipelineSpec {
+        MeshPipelineSpec {
             label: "globe body ellipsoid pipeline (Reverse-Z)",
             vertex_entry: "vs_main",
             vertex_layout: TileVertex::LAYOUT,
             fragment_entry: "fs_body_ellipsoid",
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            targets: &replace,
             cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::REPLACE,
             depth_stencil: body_depth(),
         },
     );
-
-    let textured = create_globe_pipeline(
+    let textured = create_mesh_pipeline(
         device,
         &globe_shader,
         &textured_pipeline_layout,
-        GlobePipelineSpec {
+        MeshPipelineSpec {
             label: "globe body textured pipeline (Reverse-Z)",
             vertex_entry: "vs_main",
             vertex_layout: TileVertex::LAYOUT,
             fragment_entry: "fs_body_textured",
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            targets: &replace,
             cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::REPLACE,
             depth_stencil: body_depth(),
         },
     );
 
     // Post-body graticule runs inside the depth-less (`depth_stencil_attachment: None`)
     // color pass directly above draped raster overlays and vector layers.
-    let grid = create_globe_pipeline(
+    let grid = create_mesh_pipeline(
         device,
         &globe_shader,
         &untextured_pipeline_layout,
-        GlobePipelineSpec {
+        MeshPipelineSpec {
             label: "globe post-overlay procedural graticule pipeline (depth-less)",
             vertex_entry: "vs_main",
             vertex_layout: TileVertex::LAYOUT,
             fragment_entry: "fs_grid",
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            targets: &alpha,
             cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::ALPHA_BLENDING,
             depth_stencil: None,
         },
     );
@@ -319,27 +371,20 @@ fn create_overlay_track_pipeline(
     pipeline_label: &'static str,
     fragment_entry: &'static str,
 ) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(shader_label),
-        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(layout_label),
-        bind_group_layouts,
-        immediate_size: 0,
-    });
-    create_globe_pipeline(
+    let shader = wgsl_module(device, shader_label, shader_source);
+    let layout = pipeline_layout(device, layout_label, bind_group_layouts);
+    let alpha = [srgb_target(wgpu::BlendState::ALPHA_BLENDING)];
+    create_mesh_pipeline(
         device,
         &shader,
         &layout,
-        GlobePipelineSpec {
+        MeshPipelineSpec {
             label: pipeline_label,
             vertex_entry: "vs_main",
             vertex_layout: OverlayVertex::LAYOUT,
             fragment_entry,
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            targets: &alpha,
             cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::ALPHA_BLENDING,
             depth_stencil: None,
         },
     )
@@ -400,60 +445,55 @@ fn create_overlay_pipelines(
 }
 
 fn create_vector_pipelines(device: &wgpu::Device, layouts: &SharedLayouts) -> VectorPipelines {
-    let vector_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("vector draped wgsl"),
-        source: wgpu::ShaderSource::Wgsl(VECTOR_WGSL.into()),
-    });
-    let vector_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("vector draped pipeline layout"),
-        bind_group_layouts: &[
+    let vector_shader = wgsl_module(device, "vector draped wgsl", VECTOR_WGSL);
+    let vector_pipeline_layout = pipeline_layout(
+        device,
+        "vector draped pipeline layout",
+        &[
             Some(&layouts.camera_layout),
             Some(layouts.dynamic_uniform_layout(UniformSlot::Vector)),
         ],
-        immediate_size: 0,
-    });
-    let fill = create_globe_pipeline(
+    );
+    let alpha = [srgb_target(wgpu::BlendState::ALPHA_BLENDING)];
+    let fill = create_mesh_pipeline(
         device,
         &vector_shader,
         &vector_pipeline_layout,
-        GlobePipelineSpec {
+        MeshPipelineSpec {
             label: "vector polygon fill pipeline (depth-less)",
             vertex_entry: "vs_main",
             vertex_layout: GpuVectorVertex::LAYOUT,
             fragment_entry: "fs_vector",
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            targets: &alpha,
             cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::ALPHA_BLENDING,
             depth_stencil: None,
         },
     );
-    let line = create_globe_pipeline(
+    let line = create_mesh_pipeline(
         device,
         &vector_shader,
         &vector_pipeline_layout,
-        GlobePipelineSpec {
+        MeshPipelineSpec {
             label: "vector HiDPI ribbon stroke pipeline (depth-less)",
             vertex_entry: "vs_ribbon",
             vertex_layout: GpuRibbonSegment::INSTANCE_LAYOUT,
             fragment_entry: "fs_vector",
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            targets: &alpha,
             cull_mode: None,
-            blend: wgpu::BlendState::ALPHA_BLENDING,
             depth_stencil: None,
         },
     );
-    let point = create_globe_pipeline(
+    let point = create_mesh_pipeline(
         device,
         &vector_shader,
         &vector_pipeline_layout,
-        GlobePipelineSpec {
+        MeshPipelineSpec {
             label: "vector instanced point marker pipeline (depth-less)",
             vertex_entry: "vs_point",
             vertex_layout: GpuVectorVertex::INSTANCE_LAYOUT,
             fragment_entry: "fs_vector",
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            targets: &alpha,
             cull_mode: Some(wgpu::Face::Back),
-            blend: wgpu::BlendState::ALPHA_BLENDING,
             depth_stencil: None,
         },
     );
@@ -464,13 +504,8 @@ fn create_composite_pipelines(
     device: &wgpu::Device,
     target_format: wgpu::TextureFormat,
 ) -> CompositePipelines {
-    let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("composite wgsl"),
-        source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
-    });
-
+    let composite_shader = wgsl_module(device, "composite wgsl", COMPOSITE_WGSL);
     let layout = non_filtering_texture_sampler_layout(device, "composite bind group layout");
-
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("composite nearest sampler"),
         mag_filter: wgpu::FilterMode::Nearest,
@@ -478,39 +513,20 @@ fn create_composite_pipelines(
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     });
-
     let composite_pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("composite pipeline layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("composite pipeline"),
-        layout: Some(&composite_pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &composite_shader,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &composite_shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: target_format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    });
+        pipeline_layout(device, "composite pipeline layout", &[Some(&layout)]);
+    let pipeline = create_fullscreen_pipeline(
+        device,
+        "composite pipeline",
+        &composite_pipeline_layout,
+        &composite_shader,
+        "fs_main",
+        &[Some(wgpu::ColorTargetState {
+            format: target_format,
+            blend: Some(wgpu::BlendState::REPLACE),
+            write_mask: wgpu::ColorWrites::ALL,
+        })],
+    );
 
     CompositePipelines {
         layout,
@@ -527,32 +543,20 @@ fn create_scratch_warp_pipeline(
     fragment_entry: &str,
     targets: &[Option<wgpu::ColorTargetState>],
 ) -> wgpu::RenderPipeline {
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module,
-            entry_point: Some("vs_main"),
-            buffers: &[Some(OverlayVertex::LAYOUT)],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module,
-            entry_point: Some(fragment_entry),
+    create_mesh_pipeline(
+        device,
+        module,
+        layout,
+        MeshPipelineSpec {
+            label,
+            vertex_entry: "vs_main",
+            vertex_layout: OverlayVertex::LAYOUT,
+            fragment_entry,
             targets,
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: Some(wgpu::Face::Back),
-            front_face: wgpu::FrontFace::Ccw,
-            ..Default::default()
+            depth_stencil: None,
         },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
+    )
 }
 
 fn create_band_math_pipelines(
@@ -560,10 +564,7 @@ fn create_band_math_pipelines(
     layouts: &SharedLayouts,
     tile_bind_groups: &TileBindGroupCache,
 ) -> BandMathPipelines {
-    let clear_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("scratch quiet-NaN fill wgsl"),
-        source: wgpu::ShaderSource::Wgsl(SCRATCH_NAN_FILL_WGSL.into()),
-    });
+    let clear_shader = wgsl_module(device, "scratch quiet-NaN fill wgsl", SCRATCH_NAN_FILL_WGSL);
     let clear_layout = uniform_buffer_layout(
         device,
         "scratch quiet-NaN clear uniform layout",
@@ -571,11 +572,11 @@ fn create_band_math_pipelines(
         wgpu::ShaderStages::FRAGMENT,
         false,
     );
-    let clear_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("scratch quiet-NaN clear pipeline layout"),
-        bind_group_layouts: &[Some(&clear_layout)],
-        immediate_size: 0,
-    });
+    let clear_pipeline_layout = pipeline_layout(
+        device,
+        "scratch quiet-NaN clear pipeline layout",
+        &[Some(&clear_layout)],
+    );
     let r32f_target = Some(wgpu::ColorTargetState {
         format: wgpu::TextureFormat::R32Float,
         blend: None,
@@ -591,42 +592,30 @@ fn create_band_math_pipelines(
         let (label, entry) = clear_specs[idx];
         let targets: Vec<Option<wgpu::ColorTargetState>> =
             (0..=idx).map(|_| r32f_target.clone()).collect();
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(label),
-            layout: Some(&clear_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &clear_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &clear_shader,
-                entry_point: Some(entry),
-                targets: &targets,
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        })
+        create_fullscreen_pipeline(
+            device,
+            label,
+            &clear_pipeline_layout,
+            &clear_shader,
+            entry,
+            &targets,
+        )
     });
 
-    let scratch_single_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("band-math single scratch wgsl"),
-        source: wgpu::ShaderSource::Wgsl(BAND_MATH_SCRATCH_WGSL.into()),
-    });
-    let scratch_single_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("band-math single scratch pipeline layout"),
-        bind_group_layouts: &[
+    let scratch_single_shader = wgsl_module(
+        device,
+        "band-math single scratch wgsl",
+        BAND_MATH_SCRATCH_WGSL,
+    );
+    let scratch_single_layout = pipeline_layout(
+        device,
+        "band-math single scratch pipeline layout",
+        &[
             Some(&layouts.camera_layout),
             Some(layouts.dynamic_uniform_layout(UniformSlot::ScratchSingle)),
             Some(tile_bind_groups.r32f_layout()),
         ],
-        immediate_size: 0,
-    });
+    );
     let band_single = create_scratch_warp_pipeline(
         device,
         "band-math single R32Float scratch pipeline",
@@ -636,19 +625,20 @@ fn create_band_math_pipelines(
         std::slice::from_ref(&r32f_target),
     );
 
-    let scratch_mrt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("band-math MRT scratch wgsl"),
-        source: wgpu::ShaderSource::Wgsl(BAND_MATH_SCRATCH_MRT_WGSL.into()),
-    });
-    let scratch_mrt_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("band-math MRT scratch pipeline layout"),
-        bind_group_layouts: &[
+    let scratch_mrt_shader = wgsl_module(
+        device,
+        "band-math MRT scratch wgsl",
+        BAND_MATH_SCRATCH_MRT_WGSL,
+    );
+    let scratch_mrt_layout = pipeline_layout(
+        device,
+        "band-math MRT scratch pipeline layout",
+        &[
             Some(&layouts.camera_layout),
             Some(layouts.dynamic_uniform_layout(UniformSlot::ScratchMrt)),
             Some(tile_bind_groups.r32f_mrt_layout()),
         ],
-        immediate_size: 0,
-    });
+    );
     let mrt_specs = [
         (
             "band-math MRT R32Float scratch pipeline (2x)",
@@ -677,19 +667,20 @@ fn create_band_math_pipelines(
         )
     });
 
-    let mask_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("band-math R8Uint SCL mask scratch wgsl"),
-        source: wgpu::ShaderSource::Wgsl(BAND_MATH_MASK_WGSL.into()),
-    });
-    let mask_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("band-math R8Uint mask pipeline layout"),
-        bind_group_layouts: &[
+    let mask_shader = wgsl_module(
+        device,
+        "band-math R8Uint SCL mask scratch wgsl",
+        BAND_MATH_MASK_WGSL,
+    );
+    let mask_layout = pipeline_layout(
+        device,
+        "band-math R8Uint mask pipeline layout",
+        &[
             Some(&layouts.camera_layout),
             Some(layouts.dynamic_uniform_layout(UniformSlot::ScratchSingle)),
             Some(tile_bind_groups.uint_layout()),
         ],
-        immediate_size: 0,
-    });
+    );
     let mask_u8 = create_scratch_warp_pipeline(
         device,
         "band-math R8Uint SCL mask scratch pipeline",
@@ -709,16 +700,7 @@ fn create_band_math_pipelines(
         } else {
             wgpu::TextureSampleType::Uint
         };
-        wgpu::BindGroupLayoutEntry {
-            binding: binding as u32,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type,
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        }
+        texture_2d_layout_entry(binding as u32, sample_type)
     });
     let composite_scratch_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -726,45 +708,28 @@ fn create_band_math_pipelines(
             entries: &composite_entries,
         });
 
-    let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("band-math fullscreen composite wgsl"),
-        source: wgpu::ShaderSource::Wgsl(BAND_MATH_COMPOSITE_WGSL.into()),
-    });
-    let composite_pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("band-math fullscreen composite pipeline layout"),
-            bind_group_layouts: &[
-                Some(&composite_scratch_layout),
-                Some(layouts.dynamic_uniform_layout(UniformSlot::BandMathComposite)),
-                Some(&layouts.palette_uniform_layout),
-            ],
-            immediate_size: 0,
-        });
-    let composite = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("band-math fullscreen composite pipeline (depth-less)"),
-        layout: Some(&composite_pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &composite_shader,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &composite_shader,
-            entry_point: Some("fs_composite"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    });
+    let composite_shader = wgsl_module(
+        device,
+        "band-math fullscreen composite wgsl",
+        BAND_MATH_COMPOSITE_WGSL,
+    );
+    let composite_pipeline_layout = pipeline_layout(
+        device,
+        "band-math fullscreen composite pipeline layout",
+        &[
+            Some(&composite_scratch_layout),
+            Some(layouts.dynamic_uniform_layout(UniformSlot::BandMathComposite)),
+            Some(&layouts.palette_uniform_layout),
+        ],
+    );
+    let composite = create_fullscreen_pipeline(
+        device,
+        "band-math fullscreen composite pipeline (depth-less)",
+        &composite_pipeline_layout,
+        &composite_shader,
+        "fs_composite",
+        &[srgb_target(wgpu::BlendState::ALPHA_BLENDING)],
+    );
 
     BandMathPipelines {
         clear_layout,

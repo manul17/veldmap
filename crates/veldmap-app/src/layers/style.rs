@@ -108,6 +108,30 @@ impl Default for ScientificStyle {
     }
 }
 
+/// Validate, non-degenerate-clamp, and compare a requested stretch `[min, max]`
+/// against `(cur_min, cur_max)`. Returns `Some((lo, hi))` only when finite and
+/// meaningfully different from the current bounds.
+pub(super) fn normalize_stretch_range(
+    cur_min: f64,
+    cur_max: f64,
+    min: f64,
+    max: f64,
+) -> Option<(f64, f64)> {
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    let (lo, hi) = if max > min {
+        (min, max)
+    } else {
+        (min, min + min.abs().max(1.0) * 1e-6)
+    };
+    let eps = lo.abs().max(hi.abs()).max(1e-30) * 1e-12;
+    if (cur_min - lo).abs() <= eps && (cur_max - hi).abs() <= eps {
+        return None;
+    }
+    Some((lo, hi))
+}
+
 impl ScientificStyle {
     pub(super) fn stats(&self) -> Option<&BandStats> {
         match &self.stats_state {
@@ -261,18 +285,9 @@ impl ScientificStyle {
     }
 
     pub(super) fn set_stretch_range(&mut self, min: f64, max: f64) -> bool {
-        if !min.is_finite() || !max.is_finite() {
+        let Some((lo, hi)) = normalize_stretch_range(self.min, self.max, min, max) else {
             return false;
-        }
-        let (lo, hi) = if max > min {
-            (min, max)
-        } else {
-            (min, min + min.abs().max(1.0) * 1e-6)
         };
-        let eps = lo.abs().max(hi.abs()).max(1e-30) * 1e-12;
-        if (self.min - lo).abs() <= eps && (self.max - hi).abs() <= eps {
-            return false;
-        }
         self.min = lo;
         self.max = hi;
         self.custom_range_applied = true;

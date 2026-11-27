@@ -13,7 +13,6 @@ mod frame;
 mod io_worker;
 mod jobs;
 mod layer;
-mod lifecycle;
 mod manager;
 mod opener;
 mod remote_opener;
