@@ -181,6 +181,9 @@ impl CallbackTrait for GlobePaintCallback {
         };
 
         if vp.width_px <= 0 || vp.height_px <= 0 {
+            if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
+                renderer.release_viewport_targets();
+            }
             lock_unpoisoned(&bind_groups_arc).sweep_stale();
             return Vec::new();
         }

@@ -44,6 +44,46 @@ pub(super) enum RemoteOpenResult {
     },
 }
 
+type RemoteOpenCallback =
+    Box<dyn FnOnce(Result<(HttpRangeSource, Arc<dyn RasterSource>, Frame), String>) + Send>;
+
+/// RAII drop guard guaranteeing every spawned remote COG open settles its
+/// callback even if the async task panics or the `remote_pool` queue evicts
+/// the `DecodeJob`, preventing multi-asset `BandMathOpenCollector` hangs.
+struct RemoteOpenGuard {
+    done: Arc<Mutex<Option<RemoteOpenCallback>>>,
+    cancel: CancelToken,
+}
+
+impl RemoteOpenGuard {
+    fn resolve(self, res: Result<(HttpRangeSource, Arc<dyn RasterSource>, Frame), String>) {
+        let cb = lock_unpoisoned(&self.done).take();
+        if !self.cancel.is_cancelled()
+            && let Some(cb) = cb
+        {
+            cb(res);
+        }
+    }
+
+    fn resolve_err(self, msg: String) {
+        let cb = lock_unpoisoned(&self.done).take();
+        if let Some(cb) = cb {
+            cb(Err(msg));
+        }
+    }
+}
+
+impl Drop for RemoteOpenGuard {
+    fn drop(&mut self) {
+        let cb = lock_unpoisoned(&self.done).take();
+        if !self.cancel.is_cancelled()
+            && let Some(cb) = cb
+        {
+            cb(Err("remote COG open interrupted or evicted".to_owned()));
+        }
+    }
+}
+
 /// Spawn one remote COG HTTP Range probe + non-Tokio `remote_pool` IFD parse,
 /// invoking `on_done` exactly once (unless `cancel` is already triggered).
 #[expect(
@@ -62,6 +102,11 @@ fn spawn_remote_asset_open<F>(
 ) where
     F: FnOnce(Result<(HttpRangeSource, Arc<dyn RasterSource>, Frame), String>) + Send + 'static,
 {
+    let done = Arc::new(Mutex::new(Some(Box::new(on_done) as RemoteOpenCallback)));
+    let guard = RemoteOpenGuard {
+        done: Arc::clone(&done),
+        cancel: cancel.clone(),
+    };
     let handle = net.handle().clone();
     handle.spawn(async move {
         let cfg = HttpRangeConfig {
@@ -73,7 +118,7 @@ fn spawn_remote_asset_open<F>(
                 Ok(src) => src,
                 Err(err) if err.is_cancelled() => return,
                 Err(err) => {
-                    on_done(Err(err.to_string()));
+                    guard.resolve(Err(err.to_string()));
                     return;
                 }
             };
@@ -81,11 +126,10 @@ fn spawn_remote_asset_open<F>(
             return;
         }
 
-        let done_slot = Arc::new(Mutex::new(Some(on_done)));
-        let done_work = Arc::clone(&done_slot);
-        let done_reject = Arc::clone(&done_slot);
         let job_rt = Arc::clone(&rt);
         let job_cancel = cancel.clone();
+        let reject_done = Arc::clone(&done);
+        let reject_cancel = cancel.clone();
         let job = DecodeJob {
             key: DecodeJobKey::Open(open_id),
             queued_bytes: 64 * 1024,
@@ -99,17 +143,15 @@ fn spawn_remote_asset_open<F>(
                 )
                 .map(|(source, frame)| (range_source, source, frame))
                 .map_err(|e| e.message);
-                if !job_cancel.is_cancelled()
-                    && let Some(cb) = lock_unpoisoned(&done_work).take()
-                {
-                    cb(res);
-                }
+                guard.resolve(res);
             }),
         };
         let _ = rt.try_submit_guarded(&rt.remote_pool, job, false, move || {
-            if let Some(cb) = lock_unpoisoned(&done_reject).take() {
-                cb(Err("remote I/O pool is busy or shutting down".to_owned()));
-            }
+            let reject_guard = RemoteOpenGuard {
+                done: reject_done,
+                cancel: reject_cancel,
+            };
+            reject_guard.resolve_err("remote I/O pool is busy or shutting down".to_owned());
         });
     });
 }
@@ -301,10 +343,26 @@ impl RemoteOpenTracker {
                 bands.len()
             ));
         }
+        if let Some(empty_band) = bands.iter().find(|b| b.url.trim().is_empty()) {
+            return Err(format!(
+                "band '{}' remote COG URL cannot be empty",
+                empty_band.label
+            ));
+        }
+        if let Some(scl_spec) = &scl
+            && scl_spec.url.trim().is_empty()
+        {
+            return Err("SCL remote COG URL cannot be empty".to_owned());
+        }
         let display_url = bands
             .first()
             .map(|b| sanitize_url_for_display(b.url.trim()))
             .unwrap_or_default();
+        let title = if title.trim().is_empty() {
+            preset.short_label().to_owned()
+        } else {
+            title.trim().to_owned()
+        };
         let cancel = runtime.shutdown.child_token();
         let collector = Arc::new(Mutex::new(BandMathOpenCollector {
             title,
@@ -321,41 +379,10 @@ impl RemoteOpenTracker {
             wakeup: Arc::clone(&runtime.wakeup),
         }));
 
-        for (slot, spec) in bands.into_iter().enumerate() {
-            let RemoteBandAssetSpec {
-                label,
-                url,
-                extra_headers,
-                external_bands,
-                band_index,
-            } = spec;
-            let trimmed = url.trim().to_owned();
-            let disp = sanitize_url_for_display(&trimmed);
-            let open_id = self.alloc_open_id();
-            let col = Arc::clone(&collector);
-            spawn_remote_asset_open(
-                Arc::clone(&net),
-                Arc::clone(runtime),
-                open_id,
-                trimmed,
-                extra_headers,
-                external_bands,
-                cancel.clone(),
-                move |res| {
-                    let mapped = res.map(|(range_source, source, frame)| OpenedRemoteBandAsset {
-                        label,
-                        display_url: disp,
-                        range_source,
-                        source,
-                        frame,
-                        band_index,
-                    });
-                    lock_unpoisoned(&col).on_band_done(slot, mapped);
-                },
-            );
-        }
-
-        if let Some(spec) = scl {
+        let spawn_band = |spec: RemoteBandAssetSpec,
+                          slot: Option<usize>,
+                          net: Arc<NetContext>,
+                          cancel: CancelToken| {
             let RemoteBandAssetSpec {
                 label,
                 url,
@@ -376,17 +403,30 @@ impl RemoteOpenTracker {
                 external_bands,
                 cancel,
                 move |res| {
-                    let mapped = res.map(|(range_source, source, frame)| OpenedRemoteBandAsset {
-                        label,
-                        display_url: disp,
-                        range_source,
-                        source,
-                        frame,
-                        band_index,
-                    });
-                    lock_unpoisoned(&col).on_scl_done(mapped);
+                    let mapped = res
+                        .map(|(range_source, source, frame)| OpenedRemoteBandAsset {
+                            label: label.clone(),
+                            display_url: disp,
+                            range_source,
+                            source,
+                            frame,
+                            band_index,
+                        })
+                        .map_err(|err| format!("{label}: {err}"));
+                    let mut guard = lock_unpoisoned(&col);
+                    match slot {
+                        Some(idx) => guard.on_band_done(idx, mapped),
+                        None => guard.on_scl_done(mapped),
+                    }
                 },
             );
+        };
+
+        for (slot, spec) in bands.into_iter().enumerate() {
+            spawn_band(spec, Some(slot), Arc::clone(&net), cancel.clone());
+        }
+        if let Some(spec) = scl {
+            spawn_band(spec, None, net, cancel);
         }
 
         Ok(())

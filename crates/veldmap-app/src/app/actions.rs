@@ -118,12 +118,15 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 LayerUiAction::EditRaster { id, edit, persist } => {
+                    let was_persistable = self.scene.overlays().is_layer_persistable(id);
                     let changed = self.scene.edit_overlay(id, edit);
                     needs_repaint |= changed;
-                    session_dirty |= match persist {
-                        EditPersist::OnChange => changed,
-                        EditPersist::OnCommit(commit) => commit,
-                    };
+                    if was_persistable {
+                        session_dirty |= match persist {
+                            EditPersist::OnChange => changed,
+                            EditPersist::OnCommit(commit) => commit,
+                        };
+                    }
                 }
                 LayerUiAction::SetStream(id, spec) => {
                     match self.scene.set_overlay_stream(id, spec) {
@@ -173,7 +176,7 @@ impl VeldmapApp {
                 LayerUiAction::CreateBandMath(spec) => {
                     match self.scene.create_band_math_from_loaded(spec) {
                         Ok((_id, bounds)) => {
-                            self.panels.layers.clear_error();
+                            self.panels.layers.on_band_math_created();
                             if let Some(b) = bounds {
                                 self.focus_footprint(b);
                             }
@@ -290,25 +293,19 @@ impl VeldmapApp {
                     self.focus_footprint(bounds);
                     needs_repaint = true;
                 }
-                StacUiAction::StreamCog {
-                    url,
-                    title,
-                    auth_mode,
-                    external_bands,
-                    is_scl,
-                } => {
-                    let raw_url = url.into_inner();
+                StacUiAction::StreamCog(spec) => {
+                    let raw_url = spec.url.into_inner();
                     let (final_url, headers) = self.scene.stac().resolve_cog_auth(
                         &raw_url,
-                        auth_mode,
+                        spec.auth_mode,
                         &self.storage.settings().stac,
                     );
                     if let Err(err) = self.scene.begin_open_remote_cog(RemoteCogRequest {
                         url: final_url,
-                        title,
+                        title: spec.title,
                         extra_headers: headers,
-                        external_bands,
-                        is_scl,
+                        external_bands: spec.external_bands,
+                        is_scl: spec.is_scl,
                         fly_to: true,
                     }) {
                         self.scene.mutate_stac(|s| s.set_error(err));
@@ -325,38 +322,23 @@ impl VeldmapApp {
                     scl,
                 } => {
                     let stac_settings = &self.storage.settings().stac;
-                    let resolved_bands: Vec<RemoteBandAssetSpec> = bands
-                        .into_iter()
-                        .map(|b| {
-                            let raw_url = b.href.into_inner();
-                            let (final_url, extra_headers) = self.scene.stac().resolve_cog_auth(
-                                &raw_url,
-                                auth_mode,
-                                stac_settings,
-                            );
-                            RemoteBandAssetSpec {
-                                label: b.label,
-                                url: final_url,
-                                extra_headers,
-                                external_bands: b.external_bands,
-                                band_index: 0,
-                            }
-                        })
-                        .collect();
-                    let resolved_scl = scl.map(|s| {
-                        let raw_url = s.href.into_inner();
+                    let resolve_asset = |asset: crate::stac::StacRecipeAssetView| {
+                        let raw_url = asset.href.into_inner();
                         let (final_url, extra_headers) =
                             self.scene
                                 .stac()
                                 .resolve_cog_auth(&raw_url, auth_mode, stac_settings);
                         RemoteBandAssetSpec {
-                            label: s.label,
+                            label: asset.label,
                             url: final_url,
                             extra_headers,
-                            external_bands: s.external_bands,
+                            external_bands: asset.external_bands,
                             band_index: 0,
                         }
-                    });
+                    };
+                    let resolved_bands: Vec<RemoteBandAssetSpec> =
+                        bands.into_iter().map(resolve_asset).collect();
+                    let resolved_scl = scl.map(resolve_asset);
                     if let Err(err) =
                         self.scene
                             .begin_open_remote_band_math(RemoteBandMathRequest {

@@ -76,93 +76,20 @@ fn vs_main(
     return out;
 }
 
-/// Metal fast-math safe finiteness check inspecting raw IEEE-754 exponent bits
-/// (`0x7F80_0000`) before any floating-point comparison or arithmetic.
-fn is_finite_f32(v: f32) -> bool {
-    return (bitcast<u32>(v) & 0x7F800000u) != 0x7F800000u;
-}
-
-/// 4-tap nodata-aware bilinear filter on mip level `mip` returning
-/// `vec2(normalized_value, valid_weight_sum)`.
-fn sample_bilinear_nodata(uv: vec2<f32>, mip: i32) -> vec2<f32> {
-    let dims = textureDimensions(tile_tex, mip);
-    let max_coord = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
-    let fpos = uv * vec2<f32>(dims) - vec2<f32>(0.5, 0.5);
-    let p0 = vec2<i32>(floor(fpos));
-    let frac = fpos - vec2<f32>(p0);
-
-    let x0 = clamp(p0.x, 0, max_coord.x);
-    let y0 = clamp(p0.y, 0, max_coord.y);
-    let x1 = clamp(p0.x + 1, 0, max_coord.x);
-    let y1 = clamp(p0.y + 1, 0, max_coord.y);
-
-    let v00 = textureLoad(tile_tex, vec2<i32>(x0, y0), mip).r;
-    let v10 = textureLoad(tile_tex, vec2<i32>(x1, y0), mip).r;
-    let v01 = textureLoad(tile_tex, vec2<i32>(x0, y1), mip).r;
-    let v11 = textureLoad(tile_tex, vec2<i32>(x1, y1), mip).r;
-
-    let w00 = (1.0 - frac.x) * (1.0 - frac.y);
-    let w10 = frac.x * (1.0 - frac.y);
-    let w01 = (1.0 - frac.x) * frac.y;
-    let w11 = frac.x * frac.y;
-
-    var sum = 0.0;
-    var w_sum = 0.0;
-    if is_finite_f32(v00) {
-        sum += v00 * w00;
-        w_sum += w00;
-    }
-    if is_finite_f32(v10) {
-        sum += v10 * w10;
-        w_sum += w10;
-    }
-    if is_finite_f32(v01) {
-        sum += v01 * w01;
-        w_sum += w01;
-    }
-    if is_finite_f32(v11) {
-        sum += v11 * w11;
-        w_sum += w11;
-    }
-
-    if w_sum > 0.0 {
-        return vec2<f32>(sum / w_sum, w_sum);
-    }
-    return vec2<f32>(0.0, 0.0);
-}
-
 @fragment
 fn fs_scientific(in: VsOut) -> @location(0) vec4<f32> {
     // Evaluate derivatives in uniform control flow strictly BEFORE horizon discard.
     let sample_uv = tile.uv_rect.xy + in.uv * tile.uv_rect.zw;
-    let dims0 = vec2<f32>(textureDimensions(tile_tex, 0));
-    let texel_pos = sample_uv * dims0;
-    let dx = dpdx(texel_pos);
-    let dy = dpdy(texel_pos);
-    let rho_sq = max(dot(dx, dx), dot(dy, dy));
-    let max_mip_u = max(tile.mip_count, 1u) - 1u;
-    let lod = clamp(0.5 * log2(max(rho_sq, 1e-12)), 0.0, f32(max_mip_u));
+    let duv_dx = dpdx(sample_uv);
+    let duv_dy = dpdy(sample_uv);
 
     if dot(in.normal, -in.world) <= 0.0 {
         discard;
     }
 
-    let m0 = u32(floor(lod));
-    let m1 = min(m0 + 1u, max_mip_u);
-    let mfrac = lod - f32(m0);
-
-    let s0 = sample_bilinear_nodata(sample_uv, i32(m0));
-    var raw_val = s0.x;
-    var valid_cov = s0.y;
-    if m1 != m0 && mfrac > 0.0 {
-        let s1 = sample_bilinear_nodata(sample_uv, i32(m1));
-        let w0 = s0.y * (1.0 - mfrac);
-        let w1 = s1.y * mfrac;
-        valid_cov = w0 + w1;
-        if valid_cov > 0.0 {
-            raw_val = (s0.x * w0 + s1.x * w1) / valid_cov;
-        }
-    }
+    let sample = sample_trilinear_r32f(tile_tex, sample_uv, duv_dx, duv_dy, tile.mip_count);
+    let raw_val = sample.x;
+    let valid_cov = sample.y;
 
     // Discard fragments with < 50% valid coverage (exact texel boundary at lod == 0).
     if valid_cov < 0.5 {

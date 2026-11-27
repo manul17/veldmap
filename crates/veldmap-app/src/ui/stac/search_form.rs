@@ -16,9 +16,14 @@ pub(super) fn show_search_form(
 ) {
     ui.strong("STAC Catalog Search");
     ui.horizontal(|ui| {
+        let reserve = if state.preset == StacCatalogPreset::Custom {
+            58.0
+        } else {
+            8.0
+        };
         egui::ComboBox::from_id_salt("stac_catalog_preset")
             .selected_text(state.preset.label())
-            .width(ui.available_width() - 60.0)
+            .width((ui.available_width() - reserve).max(100.0))
             .show_ui(ui, |ui| {
                 for preset in StacCatalogPreset::ALL {
                     ui.selectable_value(&mut state.preset, preset, preset.label());
@@ -58,7 +63,7 @@ pub(super) fn show_search_form(
 
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Limit:").small());
-        ui.add(egui::Slider::new(&mut state.limit, 1..=50));
+        ui.add(egui::Slider::new(&mut state.limit, 1..=100));
     });
 
     ui.horizontal(|ui| {

@@ -442,6 +442,7 @@ impl VeldmapApp {
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
+        frame: &eframe::Frame,
     ) -> Option<egui::Rect> {
         let mut viewport_rect = None;
         egui::CentralPanel::default()
@@ -520,9 +521,26 @@ impl VeldmapApp {
                     self.viewport
                         .set_hud_rects(scale_rect, attr_rect, colorbar_rect);
                 } else {
+                    let was_positive = self.viewport.viewport_rect().is_some();
                     self.scene.update_viewport_target_vram(0, 0);
                     self.scene.clear_cached_snapshot();
                     self.viewport.clear_viewport();
+                    if was_positive && let Some(render_state) = frame.wgpu_render_state() {
+                        let mut res = render_state.renderer.write();
+                        if let Some(renderer) = res
+                            .callback_resources
+                            .get_mut::<crate::render::GlobeRenderer>()
+                        {
+                            renderer.release_viewport_targets();
+                        }
+                        if let Some(bg) = res
+                            .callback_resources
+                            .get::<Arc<std::sync::Mutex<crate::render::TileBindGroupCache>>>()
+                            .cloned()
+                        {
+                            veldmap_core::sync::lock_unpoisoned(&bg).sweep_stale();
+                        }
+                    }
                 }
             });
         viewport_rect
@@ -642,7 +660,7 @@ impl eframe::App for VeldmapApp {
 
         needs_repaint |= self.show_workbench_if_open(&ctx, ui, frame);
 
-        let viewport_rect = self.show_globe_viewport(&ctx, ui);
+        let viewport_rect = self.show_globe_viewport(&ctx, ui, frame);
         let scene_hint = self.scene.end_frame();
 
         // Floating North compass in its own Background-ordered Area (above the

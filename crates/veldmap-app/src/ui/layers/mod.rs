@@ -4,6 +4,7 @@
 //! CRS/radiometry metadata inspection, diagnostic banners, and loading shimmer
 //! indicators.
 
+mod band_math_builder;
 mod band_math_card;
 mod histogram;
 mod raster_card;
@@ -21,7 +22,7 @@ use crate::vectors::{VectorEdit, VectorLayerId, VectorLayerSummary};
 
 use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, submitted_with_enter};
 
-use band_math_card::{BandMathBuilderState, show_band_math_builder};
+use band_math_builder::{BandMathBuilderState, has_band_math_inputs, show_band_math_builder};
 use raster_card::show_raster_card;
 use vector_card::show_vector_card;
 
@@ -124,6 +125,11 @@ impl LayersPanelState {
         self.path_input.clear();
         self.open_prompt_visible = false;
         self.failed_unbound_path = None;
+    }
+
+    pub(crate) fn on_band_math_created(&mut self) {
+        self.clear_error();
+        self.band_math_builder.on_created();
     }
 
     pub(crate) fn show_open_prompt(&mut self) {
@@ -299,9 +305,12 @@ pub(crate) fn show_layers_tab_contents(
 ) -> Vec<LayerUiAction> {
     let mut actions = Vec::new();
     let total = layers.len() + vectors.len();
-    let has_raster_sources = layers.iter().any(|l| l.band_math.is_none());
+    let can_build_band_math = has_band_math_inputs(layers);
+    if !can_build_band_math {
+        state.band_math_builder.open = false;
+    }
 
-    show_panel_header(ui, total, has_raster_sources, state, &mut actions);
+    show_panel_header(ui, total, can_build_band_math, state, &mut actions);
 
     if state.open_prompt_visible {
         show_open_prompt(ui, state, &mut actions);

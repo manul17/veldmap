@@ -592,8 +592,9 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
             let val = bm.computed.expect("NDVI must be valid even when Red=0.0");
             assert!((val - 1.0).abs() < 1e-9, "expected NDVI=1.0, got {val}");
             assert_eq!(bm.channels.len(), 2);
-            assert!((bm.channels[0].1.expect("NIR") - 0.5).abs() < 1e-9);
-            assert!(bm.channels[1].1.expect("Red").abs() < 1e-9);
+            assert!((bm.channels[0].1.value().expect("NIR") - 0.5).abs() < 1e-9);
+            assert!(bm.channels[1].1.value().expect("Red").abs() < 1e-9);
+            assert!(!bm.has_unavailable);
             assert_eq!(bm.scl_class, Some(9));
             assert_eq!(
                 bm.scl_class.and_then(sentinel2_scl_class_name),
@@ -618,6 +619,11 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
         }
         other => panic!("expected BandMath readout on right, got {other:?}"),
     }
+
+    // Disabling SCL mask triggers a topology change so VRAM reservation,
+    // pinned root streams, and orphaned SCL jobs stay synchronized.
+    let mut_scl_off = mgr.edit_layer(bm_id, OverlayEdit::SetBandMathSclEnabled(false));
+    assert!(mut_scl_off.changed && mut_scl_off.topology_changed);
 
     // Verify multi-source refcounting: removing rgbnir_id while bm_id still references its SourceId
     // MUST NOT purge its SourceId; removing bm_id afterward MUST purge it.

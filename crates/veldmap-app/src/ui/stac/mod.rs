@@ -3,7 +3,8 @@
 //! URL streaming, built-in sample scenes, AOI tools, and scene asset browser).
 //!
 //! Strictly presentation- and action-only: reads [`StacViewSnapshot`] and emits
-//! [`StacUiAction`] back to `VeldmapApp` with zero direct `veldmap-net` imports.
+//! [`StacUiAction`] back to `VeldmapApp` with zero direct `veldmap-net` or
+//! `veldmap-raster` imports.
 
 mod aoi_section;
 mod item_card;
@@ -11,12 +12,11 @@ mod search_form;
 
 use eframe::egui;
 use veldmap_core::geo::FootprintBounds;
-use veldmap_raster::ExternalBandMeta;
 
 use crate::layers::BandMathPreset;
 use crate::stac::{
     RedactedUrl, SampleRecipeView, SampleSceneView, StacCatalogPreset, StacCogAuthMode,
-    StacRecipeAssetView, StacSearchRequest, StacViewSnapshot,
+    StacCogStreamSpec, StacRecipeAssetView, StacSearchRequest, StacViewSnapshot,
 };
 use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
@@ -42,13 +42,7 @@ pub(crate) enum StacUiAction {
     SelectItem(usize),
     HoverItem(Option<usize>),
     ZoomToExtent(FootprintBounds),
-    StreamCog {
-        url: RedactedUrl,
-        title: String,
-        auth_mode: StacCogAuthMode,
-        external_bands: Vec<ExternalBandMeta>,
-        is_scl: bool,
-    },
+    StreamCog(StacCogStreamSpec),
     OpenRecipe {
         title: String,
         preset: BandMathPreset,
@@ -148,13 +142,7 @@ fn show_sample_scenes_section(
                                 .on_hover_text("Stream this public zero-auth COG over HTTP Range")
                                 .clicked()
                             {
-                                actions.push(StacUiAction::StreamCog {
-                                    url: RedactedUrl::new(sample.cog_url),
-                                    title: sample.title.to_owned(),
-                                    auth_mode: StacCogAuthMode::None,
-                                    external_bands: sample.external_bands.clone(),
-                                    is_scl: false,
-                                });
+                                actions.push(StacUiAction::StreamCog(sample.to_stream_spec()));
                             }
                         });
                     });
@@ -198,13 +186,9 @@ fn show_direct_cog_section(
                     } else {
                         StacCogAuthMode::None
                     };
-                    actions.push(StacUiAction::StreamCog {
-                        url,
-                        title,
-                        auth_mode,
-                        external_bands: Vec::new(),
-                        is_scl: false,
-                    });
+                    actions.push(StacUiAction::StreamCog(StacCogStreamSpec::direct(
+                        url, title, auth_mode,
+                    )));
                 }
             });
             ui.checkbox(&mut state.direct_cog_use_custom_auth, "Use Custom STAC auth")
@@ -280,13 +264,11 @@ mod tests {
         );
         assert!(!state_dbg.contains("pw"), "leaked userinfo: {state_dbg}");
 
-        let action = StacUiAction::StreamCog {
-            url: RedactedUrl::new("https://user:pw@blob.example/a.tif?sig=top_secret"),
-            title: "Test".to_owned(),
-            auth_mode: StacCogAuthMode::DirectCustom,
-            external_bands: Vec::new(),
-            is_scl: false,
-        };
+        let action = StacUiAction::StreamCog(StacCogStreamSpec::direct(
+            RedactedUrl::new("https://user:pw@blob.example/a.tif?sig=top_secret"),
+            "Test".to_owned(),
+            StacCogAuthMode::DirectCustom,
+        ));
         let action_dbg = format!("{action:?}");
         assert!(
             !action_dbg.contains("top_secret"),

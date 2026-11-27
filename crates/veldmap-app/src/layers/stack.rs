@@ -88,9 +88,23 @@ impl LayerStack {
     }
 
     pub(super) fn total_appetite_weight_bytes(&self) -> u64 {
-        self.layers
-            .iter()
-            .fold(0u64, |acc, l| acc.saturating_add(l.appetite_weight_bytes()))
+        let mut seen: Vec<(StreamKey, u64)> = Vec::new();
+        for layer in &self.layers {
+            if !layer.is_active() {
+                continue;
+            }
+            for s in layer.streams() {
+                let key = s.stream_key();
+                let weight = (s.observed_tile_bytes() as u64).max(1024);
+                if let Some((_, existing)) = seen.iter_mut().find(|(k, _)| *k == key) {
+                    *existing = (*existing).max(weight);
+                } else {
+                    seen.push((key, weight));
+                }
+            }
+        }
+        seen.into_iter()
+            .fold(0u64, |acc, (_, w)| acc.saturating_add(w))
     }
 
     pub(super) fn topmost_visible_source_pixel_size_m(&self) -> Option<(f64, f64)> {

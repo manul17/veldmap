@@ -66,13 +66,10 @@ pub(super) fn show_item_card(
                         .on_hover_text("Stream primary Cloud-Optimized GeoTIFF asset")
                         .clicked()
                 {
-                    actions.push(StacUiAction::StreamCog {
-                        url: asset.href.clone(),
-                        title: format!("{} ({})", item.id, asset.key),
-                        auth_mode: StacCogAuthMode::FromSearchResult,
-                        external_bands: asset.external_bands.clone(),
-                        is_scl: asset.is_scl,
-                    });
+                    actions.push(StacUiAction::StreamCog(asset.to_stream_spec(
+                        format!("{} ({})", item.id, asset.key),
+                        StacCogAuthMode::FromSearchResult,
+                    )));
                 }
                 if let Some(bounds) = item.zoom_bounds
                     && ui
@@ -112,20 +109,21 @@ pub(super) fn show_item_card(
                 );
                 ui.horizontal_wrapped(|ui| {
                     for asset in &item.cog_assets {
-                        let label = if let Some(gsd) = asset.gsd {
-                            format!("{} ({gsd:.0}m)", asset.key)
-                        } else {
-                            asset.key.clone()
+                        let label = match asset.gsd {
+                            Some(gsd) if gsd.is_finite() && gsd >= 1.0 => {
+                                format!("{} ({gsd:.0}m)", asset.key)
+                            }
+                            Some(gsd) if gsd.is_finite() && gsd > 0.0 => {
+                                format!("{} ({:.0}cm)", asset.key, gsd * 100.0)
+                            }
+                            _ => asset.key.clone(),
                         };
                         let tip = asset.title.as_deref().unwrap_or(&asset.key);
                         if ui.small_button(label).on_hover_text(tip).clicked() {
-                            actions.push(StacUiAction::StreamCog {
-                                url: asset.href.clone(),
-                                title: format!("{} ({})", item.id, asset.key),
-                                auth_mode: StacCogAuthMode::FromSearchResult,
-                                external_bands: asset.external_bands.clone(),
-                                is_scl: asset.is_scl,
-                            });
+                            actions.push(StacUiAction::StreamCog(asset.to_stream_spec(
+                                format!("{} ({})", item.id, asset.key),
+                                StacCogAuthMode::FromSearchResult,
+                            )));
                         }
                     }
                 });

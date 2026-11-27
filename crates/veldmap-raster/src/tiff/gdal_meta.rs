@@ -1,6 +1,6 @@
 //! Lightweight zero-dependency parsers for GeoTIFF `GDAL_METADATA` (tag
-//! `42112`) XML items (`SCALE`, `OFFSET`, `UNITTYPE`, `DESCRIPTION`) and
-//! `GDAL_NODATA` (tag `42113`) ASCII values.
+//! `42112`) XML items (`SCALE`, `OFFSET`, `NODATA`, `UNITTYPE`, `DESCRIPTION`,
+//! `BANDNAME`) and `GDAL_NODATA` (tag `42113`) ASCII values.
 
 use std::collections::HashMap;
 

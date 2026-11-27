@@ -13,10 +13,11 @@ use veldmap_raster::{BandSample, DecodeJob, DecodeJobKey, RasterSource};
 use crate::colormap::{CategoricalPaletteId, sentinel2_scl_class_name};
 
 use super::asset::RasterAsset;
-use super::band_math::{BandMathFormula, BandMathReadout};
+use super::band_math::{BandChannelSample, BandMathFormula, BandMathReadout, is_scl_class_masked};
 use super::layer::{LayerKind, OverlayLayer};
 use super::runtime::OverlayRuntime;
 use super::stack::LayerStack;
+use super::style::LayerStyle;
 use super::{CursorReadout, CursorReadoutValue, LayerId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,9 +32,8 @@ enum ProbeKey {
     BandMath {
         layer_id: LayerId,
         style_rev: u64,
-        primary_x: u32,
-        primary_y: u32,
         sources: [Option<SourceId>; 5],
+        pixels: [Option<(u32, u32)>; 5],
     },
 }
 
@@ -235,6 +235,34 @@ struct BandMathBandProbeSpec {
     band: BandKey,
     format: PixelFormat,
     pixel: Option<(u32, u32)>,
+    /// For `SCL` masks whose TIFF/STAC metadata declares a maskable class ID
+    /// (`< 32`, e.g. `nodata = 0` = ESA "No Data"), preserve that class on
+    /// `BandSample::Nodata` so CPU cursor readouts match GPU `SCL` bitmasking.
+    nodata_class_lt_32: Option<u16>,
+}
+
+fn make_band_probe_spec(
+    asset: &RasterAsset,
+    lat_deg: f64,
+    lon_deg: f64,
+    is_scl: bool,
+) -> BandMathBandProbeSpec {
+    let spec = asset.meta().spec;
+    let nodata_class_lt_32 = is_scl
+        .then(|| {
+            LayerStyle::categorical_nodata_value(asset.source().description(), spec.band)
+                .filter(|&nd| nd < 32)
+                .map(|nd| nd as u16)
+        })
+        .flatten();
+    BandMathBandProbeSpec {
+        label: asset.label().to_owned(),
+        source: Arc::clone(asset.source()),
+        band: spec.band,
+        format: spec.format,
+        pixel: asset_pixel_at(asset, lat_deg, lon_deg),
+        nodata_class_lt_32,
+    }
 }
 
 struct BandMathProbeJobSpec {
@@ -253,32 +281,32 @@ fn sample_band_math_pixel(
     probe_guard: CursorProbeGuard,
 ) {
     let ctx = rt.decode_context(cancel);
-    let mut channels: Vec<(String, Option<f64>)> = Vec::with_capacity(spec.bands.len());
-    let mut any_unavailable = false;
+    let mut channels: Vec<(String, BandChannelSample)> = Vec::with_capacity(spec.bands.len());
+    let mut has_unavailable = false;
 
     for b in &spec.bands {
         let Some((px, py)) = b.pixel else {
-            channels.push((b.label.clone(), None));
+            channels.push((b.label.clone(), BandChannelSample::Nodata));
             continue;
         };
         match b.source.sample_band(b.band, b.format, px, py, &ctx) {
             Ok(BandSample::Scalar { physical, .. }) => {
-                channels.push((b.label.clone(), Some(physical)));
+                channels.push((b.label.clone(), BandChannelSample::Value(physical)));
             }
             Ok(BandSample::Nodata) => {
-                channels.push((b.label.clone(), None));
+                channels.push((b.label.clone(), BandChannelSample::Nodata));
             }
             Ok(BandSample::Unavailable) | Ok(_) => {
-                any_unavailable = true;
-                channels.push((b.label.clone(), None));
+                has_unavailable = true;
+                channels.push((b.label.clone(), BandChannelSample::Unavailable));
             }
             Err(err) if err.is_cancelled() => {
                 probe_guard.clear_transient();
                 return;
             }
             Err(_) => {
-                any_unavailable = true;
-                channels.push((b.label.clone(), None));
+                has_unavailable = true;
+                channels.push((b.label.clone(), BandChannelSample::Unavailable));
             }
         }
     }
@@ -289,25 +317,32 @@ fn sample_band_math_pixel(
     {
         match scl.source.sample_band(scl.band, scl.format, px, py, &ctx) {
             Ok(BandSample::Categorical(c)) => scl_class = Some(c),
+            Ok(BandSample::Nodata) => scl_class = scl.nodata_class_lt_32,
             Err(err) if err.is_cancelled() => {
                 probe_guard.clear_transient();
                 return;
+            }
+            Ok(BandSample::Unavailable) | Err(_) if spec.scl_mask_enabled => {
+                has_unavailable = true;
             }
             _ => {}
         }
     }
 
-    if any_unavailable && channels.iter().all(|(_, v)| v.is_none()) {
+    if channels
+        .iter()
+        .all(|(_, v)| matches!(v, BandChannelSample::Unavailable))
+        && scl_class.is_none()
+    {
         probe_guard.resolve(CursorReadoutValue::Unavailable);
         return;
     }
 
-    let scl_masked = scl_class.is_some_and(|c| {
-        spec.scl_mask_enabled && c < 32 && ((spec.scl_mask_bits & (1u32 << c)) != 0)
-    });
+    let scl_masked = scl_class
+        .is_some_and(|c| is_scl_class_masked(spec.scl_mask_enabled, spec.scl_mask_bits, c));
 
     let computed = if spec.formula.is_scalar() && channels.len() >= 2 {
-        match (channels[0].1, channels[1].1) {
+        match (channels[0].1.value(), channels[1].1.value()) {
             (Some(a), Some(b)) => spec.formula.evaluate_scalar(a, b),
             _ => None,
         }
@@ -322,10 +357,16 @@ fn sample_band_math_pixel(
         channels,
         scl_class,
         scl_masked,
+        has_unavailable,
     }))
 }
 
-fn probe_key_for_layer(layer: &OverlayLayer, pixel: (u32, u32)) -> ProbeKey {
+fn probe_key_for_layer(
+    layer: &OverlayLayer,
+    pixel: (u32, u32),
+    lat_deg: f64,
+    lon_deg: f64,
+) -> ProbeKey {
     match layer.kind() {
         LayerKind::SingleRaster { asset, .. } => {
             let spec = asset.meta().spec;
@@ -339,15 +380,20 @@ fn probe_key_for_layer(layer: &OverlayLayer, pixel: (u32, u32)) -> ProbeKey {
         }
         LayerKind::BandMath(bm) => {
             let mut sources = [None; 5];
-            for (slot, asset) in sources.iter_mut().zip(bm.assets()) {
-                *slot = Some(asset.source_id());
+            let mut pixels = [None; 5];
+            for (idx, asset) in bm.assets().take(5).enumerate() {
+                sources[idx] = Some(asset.source_id());
+                pixels[idx] = if idx == 0 {
+                    Some(pixel)
+                } else {
+                    asset_pixel_at(asset, lat_deg, lon_deg)
+                };
             }
             ProbeKey::BandMath {
                 layer_id: layer.id(),
                 style_rev: bm.style.style_rev,
-                primary_x: pixel.0,
-                primary_y: pixel.1,
                 sources,
+                pixels,
             }
         }
     }
@@ -411,9 +457,7 @@ impl CursorProber {
             .is_some_and(|k| k.involves_source(source_id))
             && match &state.resolved_value {
                 CursorReadoutValue::Unavailable => true,
-                CursorReadoutValue::BandMath(bm) => {
-                    bm.channels.iter().any(|(_, v)| v.is_none()) || bm.scl_class.is_none()
-                }
+                CursorReadoutValue::BandMath(bm) => bm.has_unavailable,
                 _ => false,
             };
         if should_clear {
@@ -478,21 +522,12 @@ impl CursorProber {
                 let bands = bm
                     .bands
                     .iter()
-                    .map(|a| BandMathBandProbeSpec {
-                        label: a.label().to_owned(),
-                        source: Arc::clone(a.source()),
-                        band: a.meta().spec.band,
-                        format: a.meta().spec.format,
-                        pixel: asset_pixel_at(a, lat_deg, lon_deg),
-                    })
+                    .map(|a| make_band_probe_spec(a, lat_deg, lon_deg, false))
                     .collect();
-                let scl = bm.scl.as_ref().map(|a| BandMathBandProbeSpec {
-                    label: a.label().to_owned(),
-                    source: Arc::clone(a.source()),
-                    band: a.meta().spec.band,
-                    format: a.meta().spec.format,
-                    pixel: asset_pixel_at(a, lat_deg, lon_deg),
-                });
+                let scl = bm
+                    .scl
+                    .as_ref()
+                    .map(|a| make_band_probe_spec(a, lat_deg, lon_deg, true));
                 let job_spec = BandMathProbeJobSpec {
                     formula: bm.style.formula,
                     formula_label: bm.style.recipe_label.clone(),
@@ -546,7 +581,7 @@ impl CursorProber {
             return None;
         };
 
-        let probe_key = probe_key_for_layer(layer, pixel);
+        let probe_key = probe_key_for_layer(layer, pixel, lat_deg, lon_deg);
         let (submit_cancel, prev_cancel) = {
             let mut state = lock_unpoisoned(&self.cache);
             if state.resolved_key == Some(probe_key) {

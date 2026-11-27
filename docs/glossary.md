@@ -4,6 +4,7 @@ Canonical English domain terms implemented across VeldMap's code, UI, and docume
 
 | Term | Meaning |
 |---|---|
+| **Band Math / Scene Recipe** | Multi-asset GPU analytical layer evaluating physical-space indices (`NDVI`, `NDWI`, `Difference`, `Ratio`) or 3-band composites (`True Color`, `False Color NIR`, `SWIR`) over mixed-GSD bands via the shared viewport scratch pool, optionally masked by `SCL`. |
 | **ByteSource** | Synchronous, caller-buffered, positioned random-access byte reader (`read_at`) shared across local files (`LocalFileSource` via `pread`/`seek_read`, never `memmap2`) and HTTP Range readers (`HttpRangeSource`). |
 | **Carrier / Overzoom** | Finest cached ancestor tile used to texture a subdivided geometry tile via a sub-rectangle UV mapping when finer imagery is unavailable or exceeds `max_level`. |
 | **COG** | Cloud-Optimized GeoTIFF: a tiled GeoTIFF with embedded reduced-resolution overview IFDs enabling bounded random-access tile reads without decoding the full raster. |
@@ -16,6 +17,7 @@ Canonical English domain terms implemented across VeldMap's code, UI, and docume
 | **Linear-light mipmap** | CPU-downsampled `Rgba8UnormSrgb` mip chain averaged in linear light (with alpha weighting) so grazing limb angles stay anti-aliased without gamma darkening. |
 | **Lz4Raw** | Byte-shuffled, `lz4_flex`-compressed mip-0 tile blob encoding (`VML4` 24-byte self-describing header + pre-allocation bounds guard) used to cache `R32Float`/`R8Uint`/`R16Uint` tiles in SQLite. |
 | **MGRS** | Military Grid Reference System (e.g., `37UDQ`), widely used for Sentinel-2 tile indexing and coordinate jumps. |
+| **MRT (Multiple Render Targets)** | Co-grid optimization writing `2..=4` aligned `R32Float` Band Math input bands simultaneously in a single warp-mesh pass (packing up to 4 input textures into `@group(2)` to fit `downlevel_defaults()` limits). |
 | **Nadir globe** | VeldMap v1's smooth `height = 0.0` WGS84 ellipsoid camera model with zero camera pitch/tilt, avoiding renderer-induced relief parallax and keeping uniform center GSD. |
 | **Pointwise / Pass / Cascade** | Raster pyramid execution modes: `Pointwise` decodes individual tiles on demand from intersecting chunks/overviews; `Pass` streams a full-file top-to-bottom scan through a streaming `Cascade` emitting every pyramid level in one pass. |
 | **Polar Cap** | Adaptive elliptical square-to-disk Polar Stereographic quadtree cap covering `|lat| >= 85.05112878°` with zero live HTTP requests and no polar triangle slivers. |
@@ -23,6 +25,8 @@ Canonical English domain terms implemented across VeldMap's code, UI, and docume
 | **Quadtree** | Scheme-matched hierarchical WGS84 surface mesh with decoupled geometry (`z_geom <= 16–17`) vs. texture LOD, 2:1 neighbor balancing, and sag-scaled skirts. |
 | **Reverse-Z** | Depth-buffer convention mapping the near plane to `1.0` and infinity to `0.0` in `Depth32Float`, providing uniform precision from orbit down to metre-scale altitude. |
 | **Sag / Sagitta** | Maximum distance a flat chord or triangle dips below the curved ellipsoid surface between vertices. |
+| **SCL (Scene Classification Layer)** | ESA Sentinel-2 L2A categorical quality-assurance mask (`R8Uint` classes `0–11`: No Data, Defective, Dark, Cloud Shadow, Vegetation, Bare Soil, Water, Unclassified, Cloud Medium/High/Cirrus, Snow/Ice) used for discrete cloud/shadow masking in Band Math layers. |
+| **Scratch Target Pool** | Lazy viewport-sized `1..=4` `R32Float` + optional `R8Uint` offscreen buffer pool allocated only while `BandMath` layers are visible and dynamically subtracted from `GpuTileCache`'s VRAM cap above a `64 MiB` floor. |
 | **Singleflight** | In-flight request deduplication ensuring concurrent callers requesting the same chunk, stretch computation, or HTTP Range block span share one leader execution while honoring independent follower cancellation and panic recovery. |
 | **SourceFingerprint** | Opaque 256-bit content identity (sampled BLAKE3 over `len || head_64k || mid_64k || tail_64k` for local files; `veldmap-remote-v1` over canonical URL, length, and strong ETag or `blake3(head_64k)` for HTTP objects) deterministically mapped to `SourceId` and disk-cache keys. |
 | **STAC** | SpatioTemporal Asset Catalog: JSON/GeoJSON REST API specification used to search Earth-Observation imagery by AOI, datetime, and cloud cover and resolve Cloud-Optimized GeoTIFF asset URLs and `raster:bands` metadata. |

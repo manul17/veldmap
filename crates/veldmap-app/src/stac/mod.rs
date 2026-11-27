@@ -50,6 +50,29 @@ impl fmt::Debug for RedactedUrl {
     }
 }
 
+/// Opaque single-COG streaming request payload handed from `ui::stac` back to
+/// `VeldmapApp`, keeping `veldmap_raster::ExternalBandMeta` out of `ui/`.
+#[derive(Clone, Debug)]
+pub(crate) struct StacCogStreamSpec {
+    pub(crate) url: RedactedUrl,
+    pub(crate) title: String,
+    pub(crate) auth_mode: StacCogAuthMode,
+    pub(crate) external_bands: Vec<ExternalBandMeta>,
+    pub(crate) is_scl: bool,
+}
+
+impl StacCogStreamSpec {
+    pub(crate) fn direct(url: RedactedUrl, title: String, auth_mode: StacCogAuthMode) -> Self {
+        Self {
+            url,
+            title,
+            auth_mode,
+            external_bands: Vec::new(),
+            is_scl: false,
+        }
+    }
+}
+
 /// UI-facing view of a built-in zero-auth COG sample scene.
 #[derive(Clone, Debug)]
 pub(crate) struct SampleSceneView {
@@ -57,6 +80,18 @@ pub(crate) struct SampleSceneView {
     pub(crate) description: &'static str,
     pub(crate) cog_url: &'static str,
     pub(crate) external_bands: Vec<ExternalBandMeta>,
+}
+
+impl SampleSceneView {
+    pub(crate) fn to_stream_spec(&self) -> StacCogStreamSpec {
+        StacCogStreamSpec {
+            url: RedactedUrl::new(self.cog_url),
+            title: self.title.to_owned(),
+            auth_mode: StacCogAuthMode::None,
+            external_bands: self.external_bands.clone(),
+            is_scl: false,
+        }
+    }
 }
 
 /// UI-facing view of one constituent COG asset in a 1-click STAC Band Math
@@ -98,6 +133,22 @@ pub(crate) struct StacCogAssetView {
     pub(crate) gsd: Option<f64>,
     pub(crate) external_bands: Vec<ExternalBandMeta>,
     pub(crate) is_scl: bool,
+}
+
+impl StacCogAssetView {
+    pub(crate) fn to_stream_spec(
+        &self,
+        title: String,
+        auth_mode: StacCogAuthMode,
+    ) -> StacCogStreamSpec {
+        StacCogStreamSpec {
+            url: self.href.clone(),
+            title,
+            auth_mode,
+            external_bands: self.external_bands.clone(),
+            is_scl: self.is_scl,
+        }
+    }
 }
 
 /// Cached UI-facing view of a STAC search result item, rebuilt only when search

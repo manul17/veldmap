@@ -116,27 +116,13 @@ impl PaletteCache {
             }
         };
 
-        let uniform = PaletteUniform { entries: lut };
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("overlay palette LUT uniform buffer"),
-            contents: bytemuck::bytes_of(&uniform),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("overlay palette LUT bind group"),
-            layout: palette_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
-        });
-        self.entries.insert(
+        self.insert_lut(
+            device,
+            palette_layout,
             key,
-            CachedPalette {
-                _buffer: buffer,
-                bind_group,
-                custom_weak,
-            },
+            lut,
+            custom_weak,
+            "overlay palette LUT",
         );
     }
 
@@ -150,15 +136,33 @@ impl PaletteCache {
         if self.entries.get(&key).is_some_and(CachedPalette::is_live) {
             return;
         }
-        let lut = scientific_lut_linear(colormap);
-        let uniform = PaletteUniform { entries: lut };
+        self.insert_lut(
+            device,
+            palette_layout,
+            key,
+            scientific_lut_linear(colormap),
+            None,
+            "band-math palette LUT",
+        );
+    }
+
+    fn insert_lut(
+        &mut self,
+        device: &wgpu::Device,
+        palette_layout: &wgpu::BindGroupLayout,
+        key: PaletteKey,
+        entries: [[f32; 4]; 256],
+        custom_weak: Option<Weak<[[u8; 4]]>>,
+        label: &str,
+    ) {
+        let uniform = PaletteUniform { entries };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("band-math palette LUT uniform buffer"),
+            label: Some(label),
             contents: bytemuck::bytes_of(&uniform),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("band-math palette LUT bind group"),
+            label: Some(label),
             layout: palette_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -170,7 +174,7 @@ impl PaletteCache {
             CachedPalette {
                 _buffer: buffer,
                 bind_group,
-                custom_weak: None,
+                custom_weak,
             },
         );
     }

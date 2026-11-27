@@ -174,13 +174,14 @@ impl OverlayManager {
 
     /// Queue a non-blocking reload of `id` onto the overlay I/O worker,
     /// cancelling active tile jobs for `old_src` immediately so stale tiles
-    /// cannot race the reload, while preserving the layer if reopen fails.
+    /// cannot race the reload, while preserving the layer (and any sibling
+    /// layers sharing the same `SourceId`) if reopen fails.
     pub(crate) fn begin_reload_bypass_cache(
         &mut self,
         id: LayerId,
     ) -> Result<OverlayMutation, String> {
         let cancel = self.runtime.shutdown.child_token();
-        let (request, prep) = {
+        let (mut request, prep, old_stream) = {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
             };
@@ -189,6 +190,7 @@ impl OverlayManager {
                     "remote COG and band-math layers do not support local disk reload".to_owned(),
                 );
             };
+            let old_stream = layer.meta().stream_key();
             layer.cancel_stats_job();
             let prep = layer.begin_reload(cancel.clone());
             let request = ReloadRequest {
@@ -197,19 +199,32 @@ impl OverlayManager {
                 crs_override_epoch: layer.geo().crs_override_epoch(),
                 path: local_path,
                 old_fingerprint_hex: layer.fingerprint_hex().to_owned(),
+                clear_old_disk_cache: false,
                 crs_override: layer.geo().crs_override().cloned(),
                 cancel,
             };
-            (request, prep)
+            (request, prep, old_stream)
         };
         if let Some(prev) = prep.old_cancel {
             prev.cancel();
         }
 
+        let unshared = self.stack.count_sharing_source(prep.old_source) <= 1;
+        request.clear_old_disk_cache = unshared;
+
         // Cancel in-flight jobs, rotate source write tokens, purge queued disk
-        // writes, and clear runtime caches for `old_source` BEFORE `io_worker`
-        // runs `clear_source` so no pre-reload tile can poison SQLite.
-        self.purge_source(prep.old_source);
+        // writes, and clear runtime caches BEFORE `io_worker` runs
+        // `clear_source` so no pre-reload tile can poison SQLite, while
+        // preserving sibling layers that share `old_source`.
+        let mut purge_sources = Vec::new();
+        if unshared {
+            self.purge_source(prep.old_source);
+            purge_sources.push(prep.old_source);
+        } else if !self.stack.has_visible_source(prep.old_source) {
+            self.purge_source(prep.old_source);
+        } else {
+            self.cancel_stream_if_unused(old_stream);
+        }
 
         if !self.io_worker.send(OverlayIoCmd::Reload(request)) {
             if let Some(layer) = self.stack.get_mut(id) {
@@ -222,7 +237,7 @@ impl OverlayManager {
         Ok(OverlayMutation {
             changed: true,
             topology_changed: true,
-            purge_sources: vec![prep.old_source],
+            purge_sources,
         })
     }
 
@@ -434,7 +449,7 @@ impl OverlayManager {
             path,
             outcome,
         } = reloaded;
-        let (old_src, new_src) = {
+        let (old_src, new_src, old_stream) = {
             let Some(slot) = self.stack.get_mut(id) else {
                 return;
             };
@@ -466,10 +481,11 @@ impl OverlayManager {
                             }
                         }
                     }
+                    let old_stream = slot.meta().stream_key();
                     let new_src = source.source_id();
                     let relaid = alloc_seq(&mut self.next_relaid);
                     let old_src = slot.replace_reloaded(path, source, frame, relaid);
-                    (old_src, new_src)
+                    (old_src, new_src, old_stream)
                 }
                 Err(err) => {
                     slot.fail_reload(err.message.clone());
@@ -487,11 +503,21 @@ impl OverlayManager {
             }
         };
 
-        // Purge runtime/GPU state for both `old_src` and `new_src`
-        // (in case a sibling layer decoded tiles during reload).
-        self.purge_source(old_src);
-        mutation.purge_sources.push(old_src);
-        if new_src != old_src {
+        // Purge runtime/GPU state for `new_src`, and only purge `old_src` when
+        // identical (`new_src == old_src`, explicit cache bypass) or when no
+        // sibling layer still references `old_src`.
+        if new_src == old_src {
+            self.purge_source(new_src);
+            mutation.purge_sources.push(new_src);
+        } else {
+            if self.stack.count_sharing_source(old_src) == 0 {
+                self.purge_source(old_src);
+                mutation.purge_sources.push(old_src);
+            } else if !self.stack.has_visible_source(old_src) {
+                self.purge_source(old_src);
+            } else {
+                self.cancel_stream_if_unused(old_stream);
+            }
             self.purge_source(new_src);
             mutation.purge_sources.push(new_src);
         }

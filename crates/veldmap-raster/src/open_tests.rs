@@ -419,3 +419,103 @@ fn per_band_embedded_scale_offset_precedence_and_nodata_propagation() {
     assert!((stats1.min - (-0.1)).abs() < 1e-9);
     assert!((stats1.max - 0.4).abs() < 1e-9);
 }
+
+#[test]
+fn uniform_external_display_nodata_reaches_display_without_polluting_extra_bands() {
+    use std::io::Cursor;
+    use tiff::encoder::TiffEncoder;
+    use tiff::tags::Tag;
+    use veldmap_core::io::testing::MemoryByteSource;
+    use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint};
+
+    let mut cur = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut cur).expect("encoder");
+        let mut dir = enc.image_directory().expect("dir");
+        dir.write_tag(Tag::ImageWidth, 4u32).unwrap();
+        dir.write_tag(Tag::ImageLength, 4u32).unwrap();
+        dir.write_tag(Tag::BitsPerSample, &[16u16, 16, 16, 16][..])
+            .unwrap();
+        dir.write_tag(Tag::Compression, 1u16).unwrap();
+        dir.write_tag(Tag::PhotometricInterpretation, 2u16).unwrap();
+        dir.write_tag(Tag::SamplesPerPixel, 4u16).unwrap();
+        dir.write_tag(Tag::ExtraSamples, &[0u16][..]).unwrap();
+        dir.write_tag(Tag::PlanarConfiguration, 1u16).unwrap();
+        dir.write_tag(Tag::RowsPerStrip, 4u32).unwrap();
+        let data = [0u8; 4 * 4 * 4 * 2];
+        let off = dir.write_data(&data[..]).unwrap();
+        dir.write_tag(Tag::StripOffsets, &[off as u32][..]).unwrap();
+        dir.write_tag(Tag::StripByteCounts, &[data.len() as u32][..])
+            .unwrap();
+        dir.finish().unwrap();
+    }
+
+    // RGB color bands declare nodata = 0; NIR (band 3) intentionally has no nodata.
+    let ext = [
+        ExternalBandMeta {
+            nodata: Some(0.0),
+            ..Default::default()
+        },
+        ExternalBandMeta {
+            nodata: Some(0.0),
+            ..Default::default()
+        },
+        ExternalBandMeta {
+            nodata: Some(0.0),
+            ..Default::default()
+        },
+        ExternalBandMeta {
+            nodata: None,
+            ..Default::default()
+        },
+    ];
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+    let opened = open_raster_with_options(
+        Arc::new(MemoryByteSource::from_vec(cur.into_inner())),
+        SourceFingerprint::from_digest([9; 32]),
+        OpenRasterOptions {
+            sidecars: None,
+            external_bands: &ext,
+        },
+        &budget,
+        &cancel,
+    )
+    .expect("open rgbnir");
+    let desc = opened.source.description();
+    assert_eq!(
+        desc.band_info(BandKey::Display).and_then(|b| b.nodata),
+        Some(0.0),
+        "uniform RGB external nodata must propagate to BandKey::Display"
+    );
+    assert_eq!(
+        desc.band_info(BandKey::Index(3)).and_then(|b| b.nodata),
+        None,
+        "display nodata must not leak into NIR band 3"
+    );
+
+    let chunk_cache = crate::SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+    let budget_tracker =
+        veldmap_core::budget::DecodeBudgetTracker::new(budget.decode_working_bytes);
+    let ctx = crate::DecodeContext {
+        chunk_cache: &chunk_cache,
+        budget_tracker: &budget_tracker,
+        budget: &budget,
+        cancel: &cancel,
+    };
+    // Band 3 (NIR) with value 0 must remain valid scalar 0.0, not nodata.
+    let s3 = opened
+        .source
+        .sample_band(BandKey::Index(3), PixelFormat::R32Float, 0, 0, &ctx)
+        .expect("sample nir");
+    assert!(
+        matches!(s3, crate::BandSample::Scalar { raw, .. } if raw == 0.0),
+        "NIR sample 0 must not inherit RGB display nodata, got {s3:?}"
+    );
+    // Display decode treats [0, 0, 0] as transparent nodata.
+    let rgba = opened
+        .source
+        .sample_band(BandKey::Display, PixelFormat::Rgba8UnormSrgb, 0, 0, &ctx)
+        .expect("sample display");
+    assert_eq!(rgba, crate::BandSample::Nodata);
+}

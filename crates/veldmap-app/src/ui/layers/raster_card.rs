@@ -94,8 +94,16 @@ fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Ve
             }
             if let Some(ref url) = layer.remote_url {
                 ui.small(format!("URL: {url}"));
-            } else {
+            } else if !layer.path.as_os_str().is_empty() {
                 ui.small(format!("Path: {}", layer.path.display()));
+            } else if let Some(ref bm) = layer.band_math {
+                let inputs = bm
+                    .inputs
+                    .iter()
+                    .map(|i| i.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.small(format!("Sources: {inputs}"));
             }
         });
 }
@@ -156,7 +164,11 @@ pub(super) fn show_raster_card(
                 let hover_tip = layer
                     .remote_url
                     .clone()
-                    .unwrap_or_else(|| layer.path.display().to_string());
+                    .or_else(|| {
+                        (!layer.path.as_os_str().is_empty())
+                            .then(|| layer.path.display().to_string())
+                    })
+                    .unwrap_or_else(|| layer.sample_info.clone());
                 ui.add(egui::Label::new(egui::RichText::new(&layer.name).strong()).truncate())
                     .on_hover_text(hover_tip);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

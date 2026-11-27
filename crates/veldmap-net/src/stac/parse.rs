@@ -129,10 +129,15 @@ fn infer_processing_level(
 ) -> Option<String> {
     props
         .and_then(|p| {
-            p.get("s2:product_type")
-                .or_else(|| p.get("processing:level"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+            ["s2:product_type", "processing:level", "s2:processing_level"]
+                .into_iter()
+                .find_map(|key| {
+                    p.get(key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
         })
         .or_else(|| {
             collection.and_then(|c| {
@@ -241,7 +246,7 @@ fn parse_stac_asset(key: &str, val: &Value) -> Option<StacAsset> {
         .map(|arr| {
             let mut out = Vec::new();
             for b in arr {
-                for field in ["common_name", "name"] {
+                for field in ["eo:common_name", "common_name", "name"] {
                     if let Some(s) = b.get(field).and_then(Value::as_str).map(str::trim)
                         && !s.is_empty()
                         && !out
@@ -259,6 +264,8 @@ fn parse_stac_asset(key: &str, val: &Value) -> Option<StacAsset> {
     let raster_bands = obj
         .get("raster:bands")
         .and_then(Value::as_array)
+        .filter(|arr| !arr.is_empty())
+        .or_else(|| obj.get("bands").and_then(Value::as_array))
         .map(|arr| arr.iter().filter_map(parse_raster_band_meta).collect())
         .unwrap_or_default();
 
@@ -276,20 +283,38 @@ fn parse_stac_asset(key: &str, val: &Value) -> Option<StacAsset> {
 
 fn parse_raster_band_meta(val: &Value) -> Option<StacRasterBandMeta> {
     let obj = val.as_object()?;
-    let nodata = obj.get("nodata").and_then(|v| {
-        v.as_f64()
-            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-    });
+    let nodata = obj
+        .get("nodata")
+        .or_else(|| obj.get("raster:nodata"))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        })
+        .filter(|v| v.is_finite() || v.is_nan());
     Some(StacRasterBandMeta {
-        scale: obj.get("scale").and_then(Value::as_f64),
-        offset: obj.get("offset").and_then(Value::as_f64),
+        scale: obj
+            .get("scale")
+            .or_else(|| obj.get("raster:scale"))
+            .and_then(Value::as_f64),
+        offset: obj
+            .get("offset")
+            .or_else(|| obj.get("raster:offset"))
+            .and_then(Value::as_f64),
         nodata,
         data_type: obj
             .get("data_type")
+            .or_else(|| obj.get("raster:data_type"))
             .and_then(Value::as_str)
             .map(str::to_owned),
-        spatial_resolution: obj.get("spatial_resolution").and_then(Value::as_f64),
-        unit: obj.get("unit").and_then(Value::as_str).map(str::to_owned),
+        spatial_resolution: obj
+            .get("spatial_resolution")
+            .or_else(|| obj.get("raster:spatial_resolution"))
+            .and_then(Value::as_f64),
+        unit: obj
+            .get("unit")
+            .or_else(|| obj.get("raster:unit"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -358,21 +383,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_processing_level_eo_bands_scl_and_prefers_nir_over_nir08() {
+    fn parses_stac11_bands_processing_level_scl_and_skips_visual_for_spectral() {
         let json: Value = serde_json::json!({
             "type": "FeatureCollection",
             "features": [{
                 "type": "Feature",
                 "id": "S2A_32TMS_20240715_0_L2A",
-                "collection": "sentinel-2-l2a",
+                "collection": "custom-collection",
                 "bbox": [7.5, 45.8, 9.2, 47.1],
                 "properties": {
                     "datetime": "2024-07-15T10:20:30Z",
                     "platform": "sentinel-2a",
+                    "s2:product_type": null,
                     "s2:processing_level": "level-2a",
                     "eo:cloud_cover": 4.2
                 },
                 "assets": {
+                    "visual": {
+                        "href": "https://example.org/TCI.tif",
+                        "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                        "roles": ["visual"],
+                        "eo:bands": [
+                            {"common_name": "red"},
+                            {"common_name": "green"},
+                            {"common_name": "blue"}
+                        ]
+                    },
                     "nir08": {
                         "href": "https://example.org/B8A.tif",
                         "type": "image/tiff; application=geotiff; profile=cloud-optimized",
@@ -386,24 +422,42 @@ mod tests {
                         "eo:bands": [{"name": "B08", "common_name": "nir"}],
                         "raster:bands": [{"scale": 0.0001, "offset": -0.1, "nodata": 0, "unit": "reflectance"}]
                     },
-                    "red": {
+                    "B04_10m": {
                         "href": "https://example.org/B04.tif",
                         "type": "image/tiff; application=geotiff; profile=cloud-optimized",
                         "roles": ["data"],
-                        "bands": [{"name": "B04", "eo:common_name": "red"}]
+                        "bands": [{
+                            "name": "B04",
+                            "eo:common_name": "red",
+                            "raster:scale": 0.0001,
+                            "raster:offset": -0.1,
+                            "nodata": 0,
+                            "unit": "reflectance"
+                        }]
                     },
-                    "scl": {
+                    "SCL_20m": {
                         "href": "https://example.org/SCL.tif",
                         "type": "image/tiff; application=geotiff; profile=cloud-optimized",
                         "roles": ["data", "scl"]
                     }
                 }
+            }, {
+                "type": "Feature",
+                "id": "S2_COLLECTION_FALLBACK",
+                "collection": "sentinel-2-l2a",
+                "properties": {"datetime": "2024-07-15T10:20:30Z"},
+                "assets": {}
             }]
         });
         let parsed = parse_search_response(&json).expect("parse");
         let item = &parsed.items[0];
-        assert_eq!(item.processing_level.as_deref(), Some("L2A (BOA)"));
+        assert_eq!(item.processing_level.as_deref(), Some("level-2a"));
         assert_eq!(item.platform.as_deref(), Some("sentinel-2a"));
+        // Collection fallback still works when explicit properties are absent.
+        assert_eq!(
+            parsed.items[1].processing_level.as_deref(),
+            Some("L2A (BOA)")
+        );
         // Prefer 10m nir/B08 over 20m nir08/B8A.
         let nir = item
             .find_band_asset(&["nir", "b08", "nir08", "b8a"])
@@ -411,12 +465,17 @@ mod tests {
         assert_eq!(nir.key, "nir");
         assert!(nir.eo_bands.iter().any(|b| b == "nir"));
         assert!(nir.eo_bands.iter().any(|b| b == "B08"));
-        // STAC 1.1 `bands` fallback populates `eo_bands` for `red`.
+        // STAC 1.1 `bands` with `eo:common_name` resolves `B04_10m` and skips `visual` TCI!
         let red = item.find_band_asset(&["red", "b04"]).expect("find red");
-        assert_eq!(red.key, "red");
-        // SCL asset detected cleanly.
+        assert_eq!(red.key, "B04_10m");
+        assert!(red.eo_bands.iter().any(|b| b == "red"));
+        assert_eq!(red.raster_bands.len(), 1);
+        assert_eq!(red.raster_bands[0].scale, Some(0.0001));
+        assert_eq!(red.raster_bands[0].offset, Some(-0.1));
+        assert_eq!(red.raster_bands[0].nodata, Some(0.0));
+        // `SCL_20m` + `roles: ["scl"]` detected cleanly.
         let scl = item.scl_asset().expect("find scl");
-        assert_eq!(scl.key, "scl");
+        assert_eq!(scl.key, "SCL_20m");
         assert!(scl.is_scl_asset());
     }
 }

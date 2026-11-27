@@ -161,6 +161,18 @@ impl ViewportState {
         self.offscreen.as_ref()
     }
 
+    /// Drop offscreen color/depth and Band Math scratch textures immediately
+    /// when the viewport collapses/minimizes so GPU VRAM stays aligned with
+    /// `SceneState::reserved_target_vram_bytes == 0`.
+    pub(super) fn release_targets(&mut self) {
+        self.offscreen = None;
+        if let Some(pool) = &mut self.scratch {
+            pool.release();
+        }
+        self.last_render = None;
+        self.pending_present.store(false, Ordering::Relaxed);
+    }
+
     pub(super) fn is_clean_for(
         &self,
         width: u32,

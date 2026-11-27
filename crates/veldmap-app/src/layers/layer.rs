@@ -61,8 +61,6 @@ pub(super) enum LayerKind {
     SingleRaster {
         asset: Box<RasterAsset>,
         style: LayerStyle,
-        #[cfg(test)]
-        aux_streams_for_test: Vec<LayerStream>,
     },
     BandMath(Box<BandMathLayerData>),
 }
@@ -145,8 +143,6 @@ impl OverlayLayer {
             kind: LayerKind::SingleRaster {
                 asset: Box::new(asset),
                 style,
-                #[cfg(test)]
-                aux_streams_for_test: Vec::new(),
             },
             pin_root,
             last_error: None,
@@ -385,28 +381,39 @@ impl OverlayLayer {
         }
     }
 
-    /// Collect references to every active [`LayerStream`] owned by this layer.
+    /// Collect references to every actively rendered [`LayerStream`] owned by
+    /// this layer (omitting a `BandMath` layer's `SCL` stream while its cloud
+    /// mask is toggled off).
     pub(super) fn streams(&self) -> Vec<&LayerStream> {
         match &self.kind {
-            LayerKind::SingleRaster {
-                asset,
-                #[cfg(test)]
-                aux_streams_for_test,
-                ..
-            } => {
-                #[cfg(test)]
+            LayerKind::SingleRaster { asset, .. } => vec![asset.stream()],
+            LayerKind::BandMath(bm) => {
+                let mut v: Vec<&LayerStream> = bm.bands.iter().map(RasterAsset::stream).collect();
+                if bm.style.scl_mask_enabled
+                    && let Some(scl) = &bm.scl
                 {
-                    let mut v = Vec::with_capacity(1 + aux_streams_for_test.len());
-                    v.push(asset.stream());
-                    v.extend(aux_streams_for_test.iter());
-                    v
+                    v.push(scl.stream());
                 }
-                #[cfg(not(test))]
-                {
-                    vec![asset.stream()]
-                }
+                v
             }
-            LayerKind::BandMath(bm) => bm.assets().map(RasterAsset::stream).collect(),
+        }
+    }
+
+    /// Collect every [`StreamKey`] owned by this layer (including disabled
+    /// `SCL`), used for cancelling orphaned jobs when hiding or removing.
+    pub(super) fn all_stream_keys(&self) -> Vec<StreamKey> {
+        match &self.kind {
+            LayerKind::SingleRaster { asset, .. } => vec![asset.meta().stream_key()],
+            LayerKind::BandMath(bm) => {
+                let mut keys = Vec::with_capacity(bm.bands.len() + usize::from(bm.scl.is_some()));
+                for a in bm.assets() {
+                    let key = a.meta().stream_key();
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+                keys
+            }
         }
     }
 
@@ -429,17 +436,6 @@ impl OverlayLayer {
     #[cfg(test)]
     pub(super) fn set_pin_root(&mut self, pin_root: bool) {
         self.pin_root = pin_root;
-    }
-
-    #[cfg(test)]
-    pub(super) fn push_aux_stream_for_test(&mut self, meta: PyramidMeta) {
-        if let LayerKind::SingleRaster {
-            aux_streams_for_test,
-            ..
-        } = &mut self.kind
-        {
-            aux_streams_for_test.push(LayerStream::new(meta));
-        }
     }
 
     /// Return `(float_band_count, needs_u8_mask)` required in the shared
@@ -520,19 +516,11 @@ impl OverlayLayer {
     /// Switch a single-raster layer's active stream (`Display` / `Scientific` /
     /// `Categorical` + band index). Returns `true` if the active stream changed.
     pub(super) fn set_active_stream(&mut self, spec: TileStreamSpec) -> Result<bool, String> {
-        let LayerKind::SingleRaster {
-            asset,
-            style,
-            #[cfg(test)]
-            aux_streams_for_test,
-        } = &mut self.kind
-        else {
+        let LayerKind::SingleRaster { asset, style } = &mut self.kind else {
             return Err("band-math layers do not support switching single-band streams".to_owned());
         };
         let changed = asset.set_active_stream(spec)?;
         if changed {
-            #[cfg(test)]
-            aux_streams_for_test.clear();
             style.on_stream_switched(spec);
         }
         Ok(changed)
@@ -615,19 +603,8 @@ impl OverlayLayer {
 
     pub(super) fn observe_stream_tile_bytes(&mut self, stream: StreamKey, bytes: usize) {
         match &mut self.kind {
-            LayerKind::SingleRaster {
-                asset,
-                #[cfg(test)]
-                aux_streams_for_test,
-                ..
-            } => {
+            LayerKind::SingleRaster { asset, .. } => {
                 asset.observe_stream_tile_bytes(stream, bytes);
-                #[cfg(test)]
-                for aux in aux_streams_for_test {
-                    if aux.stream_key() == stream {
-                        aux.observe_tile_bytes(bytes);
-                    }
-                }
             }
             LayerKind::BandMath(bm) => {
                 for a in bm.assets_mut() {
@@ -727,6 +704,7 @@ impl OverlayLayer {
 
     /// Total proportional VRAM appetite weight across all active streams of
     /// this layer (summing heterogeneous multi-band / multi-format streams).
+    #[cfg(test)]
     pub(super) fn appetite_weight_bytes(&self) -> u64 {
         if !self.is_active() {
             return 0;
@@ -765,17 +743,8 @@ impl OverlayLayer {
 
     pub(super) fn clear_wanted(&mut self) {
         match &mut self.kind {
-            LayerKind::SingleRaster {
-                asset,
-                #[cfg(test)]
-                aux_streams_for_test,
-                ..
-            } => {
+            LayerKind::SingleRaster { asset, .. } => {
                 asset.clear_wanted();
-                #[cfg(test)]
-                for aux in aux_streams_for_test {
-                    aux.clear_wanted();
-                }
             }
             LayerKind::BandMath(bm) => {
                 for a in bm.assets_mut() {

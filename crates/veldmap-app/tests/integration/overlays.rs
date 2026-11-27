@@ -1271,4 +1271,99 @@ fn band_math_mrt_vs_non_mrt_parity_scissor_painter_order_and_lazy_scratch_releas
         0,
         "scratch pool must release all VRAM immediately when no BandMath layer is visible"
     );
+
+    // 5. H2 regression: distinct projections sharing identical 4 corner lat/lons
+    //    (geographic quad vs Web Mercator EPSG:3857) MUST NOT batch into MRT.
+    let merc_frame = Arc::new(
+        Frame::from_crs_pixel_affine(
+            &veldmap_core::geo::CrsSpec::from_epsg(3857).expect("epsg 3857"),
+            [8_000.0, 0.0, 0.0, 0.0, -8_000.0, 8_000_000.0],
+            512,
+            512,
+        )
+        .expect("mercator frame"),
+    );
+    let geo_frame = Arc::new(
+        Frame::quad([
+            merc_frame.geodetic(0.0, 0.0),
+            merc_frame.geodetic(1.0, 0.0),
+            merc_frame.geodetic(0.0, 1.0),
+            merc_frame.geodetic(1.0, 1.0),
+        ])
+        .expect("quad frame with identical 4 corners"),
+    );
+    let bm_diff_proj = DrawBandMathLayer {
+        formula: BandMathFormula::Difference,
+        colormap: ColormapId::RdBu,
+        invert_colormap: false,
+        stretch_min: -1.0,
+        stretch_max: 1.0,
+        rgb_min: [0.0; 3],
+        rgb_max: [1.0; 3],
+        rgb_gamma: 1.0,
+        scl_mask_enabled: false,
+        scl_mask_bits: 0,
+        bands: vec![
+            scratch_band(
+                &geo_frame,
+                src_r,
+                10,
+                512,
+                512,
+                1.0,
+                0.0,
+                Arc::clone(&tex_r),
+            ),
+            scratch_band(
+                &merc_frame,
+                src_g,
+                11,
+                512,
+                512,
+                1.0,
+                0.0,
+                Arc::clone(&tex_g),
+            ),
+        ],
+        scl: None,
+    };
+    assert!(
+        !bm_diff_proj.can_use_mrt(),
+        "EPSG:4326 and EPSG:3857 frames sharing 4 corners must not batch into MRT"
+    );
+
+    // 6. H3 regression: a trailing empty BandMath layer with no allocated scratch
+    //    pool MUST NOT drop the post-overlay graticule pass.
+    let mut snap_grat_ref = build_empty_snapshot(cam, width, height, &config);
+    snap_grat_ref.show_graticule = true;
+    let pixels_grat_ref = render_srgb(
+        &mut globe,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(snap_grat_ref),
+    );
+    let mut snap_trailing_empty = build_empty_snapshot(cam, width, height, &config);
+    snap_trailing_empty.show_graticule = true;
+    snap_trailing_empty.overlays.push(DrawOverlayLayer {
+        opacity: 1.0,
+        content: DrawOverlayContent::BandMath(Box::new(DrawBandMathLayer {
+            bands: Vec::new(),
+            scl: None,
+            ..bm_diff_proj
+        })),
+    });
+    let pixels_trailing_empty = render_srgb(
+        &mut globe,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(snap_trailing_empty),
+    );
+    assert_eq!(
+        pixels_grat_ref, pixels_trailing_empty,
+        "trailing empty BandMath layer must preserve post-overlay graticule rendering"
+    );
 }

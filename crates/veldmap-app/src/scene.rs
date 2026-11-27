@@ -33,6 +33,9 @@ use crate::measure::MeasureSession;
 use crate::render::{
     DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy, estimate_viewport_target_vram_bytes,
 };
+use crate::stac::StacSession;
+use crate::storage::settings::BasemapConfigView;
+use crate::vectors::{VectorEdit, VectorIoEvent, VectorLayerId, VectorManager, is_geojson_path};
 
 /// Hard minimum `GpuTileCache` VRAM floor (`64 MiB`) enforced when subtracting
 /// dynamic viewport `OffscreenTarget` + Band Math scratch VRAM from the total
@@ -52,9 +55,6 @@ pub(crate) fn effective_gpu_tile_cache_cap(
         .saturating_sub(reserved_target_vram_bytes)
         .max(floor)
 }
-use crate::stac::StacSession;
-use crate::storage::settings::BasemapConfigView;
-use crate::vectors::{VectorEdit, VectorIoEvent, VectorLayerId, VectorManager, is_geojson_path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SnapshotKey {
@@ -134,6 +134,7 @@ pub(crate) struct SceneState {
     default_gpu_tile_cache_bytes: usize,
     total_gpu_vram_budget_bytes: usize,
     reserved_target_vram_bytes: usize,
+    last_viewport_px: (u32, u32),
     pending_uploads: PendingUploads,
     decode_shutdown: CancelToken,
     decode_pool: Option<TwoLaneDecodePool>,
@@ -208,6 +209,7 @@ impl SceneState {
             default_gpu_tile_cache_bytes: budget.gpu_tile_cache_bytes,
             total_gpu_vram_budget_bytes: total_vram,
             reserved_target_vram_bytes: 0,
+            last_viewport_px: (0, 0),
             pending_uploads,
             decode_shutdown,
             decode_pool: Some(decode_pool),
@@ -334,6 +336,12 @@ impl SceneState {
     /// the current viewport `OffscreenTarget` + active Band Math scratch pool
     /// VRAM while preserving [`MIN_GPU_TILE_CACHE_FLOOR_BYTES`].
     pub(crate) fn update_viewport_target_vram(&mut self, width_px: u32, height_px: u32) {
+        self.last_viewport_px = (width_px, height_px);
+        self.sync_viewport_target_vram();
+    }
+
+    fn sync_viewport_target_vram(&mut self) {
+        let (width_px, height_px) = self.last_viewport_px;
         let (float_bands, needs_mask) = self.overlays.max_scratch_requirements();
         let reserved =
             estimate_viewport_target_vram_bytes(width_px, height_px, float_bands, needs_mask);
@@ -344,6 +352,7 @@ impl SceneState {
         let effective = effective_gpu_tile_cache_cap(self.total_gpu_vram_budget_bytes, reserved);
         if self.gpu_tile_cache.max_bytes() != effective {
             self.gpu_tile_cache.set_max_bytes(effective);
+            self.mark_dirty();
         }
     }
 
@@ -427,6 +436,7 @@ impl SceneState {
             self.purge_source_caches(src);
         }
         if mutation.topology_changed {
+            self.sync_viewport_target_vram();
             self.mark_topology_changed();
         } else if mutation.changed {
             self.mark_dirty();

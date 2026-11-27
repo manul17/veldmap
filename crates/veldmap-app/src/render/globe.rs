@@ -74,6 +74,7 @@ impl GlobeRenderer {
     ) -> bool {
         bind_groups.sweep_stale();
         if params.width == 0 || params.height == 0 {
+            self.viewport.release_targets();
             return false;
         }
         let max_dim = device.limits().max_texture_dimension_2d;
@@ -109,6 +110,12 @@ impl GlobeRenderer {
         true
     }
 
+    /// Drop offscreen color/depth and Band Math scratch targets immediately
+    /// when the viewport collapses/minimizes.
+    pub fn release_viewport_targets(&mut self) {
+        self.viewport.release_targets();
+    }
+
     /// Currently allocated viewport scratch target VRAM in bytes (0 when no
     /// analytical Band Math layer is visible).
     #[cfg(any(test, feature = "test-support"))]
@@ -136,6 +143,7 @@ impl GlobeRenderer {
     ) {
         self.meshes
             .prepare_for_tiles(device, snapshot.grid_cells, &snapshot.tiles);
+        bind_groups.begin_mrt_frame();
 
         for draw in &snapshot.tiles {
             if let Some(gpu_tile) = &draw.texture {
@@ -350,18 +358,23 @@ impl GlobeRenderer {
             })
         }
 
+        let has_tail = !snapshot.vectors.is_empty() || snapshot.show_graticule;
+        let mut tail_drawn = false;
         let mut layer_cursor = 0usize;
         let overlay_len = snapshot.overlays.len();
 
         while layer_cursor < overlay_len {
-            if let DrawOverlayContent::BandMath(bm) = &snapshot.overlays[layer_cursor].content {
+            let bm_to_composite = if let DrawOverlayContent::BandMath(bm) =
+                &snapshot.overlays[layer_cursor].content
+            {
+                let bm_idx = layer_cursor;
+                layer_cursor += 1;
                 let Some(scratch) = self.viewport.scratch() else {
-                    layer_cursor += 1;
                     continue;
                 };
                 let drawn = self.overlay.record_band_math_scratch_passes(
                     encoder,
-                    layer_cursor,
+                    bm_idx,
                     bm,
                     self.viewport.camera_bind_group(),
                     &self.pipelines.band_math,
@@ -369,88 +382,63 @@ impl GlobeRenderer {
                     self.viewport.uniform_arena(),
                     bind_groups,
                 );
-                let bm_idx = layer_cursor;
-                layer_cursor += 1;
-
-                // Batch the fullscreen composite plus any immediately following
-                // direct overlays (and final vectors/graticule if this is the
-                // tail) into one `LoadOp::Load` color pass.
-                let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
-                if drawn {
-                    self.overlay.record_band_math_composite(
-                        &mut post_pass,
-                        bm_idx,
-                        target.width,
-                        target.height,
-                        &self.pipelines.band_math,
-                        scratch,
-                        self.viewport.uniform_arena(),
-                    );
+                if !drawn {
+                    continue;
                 }
-                post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
-                while layer_cursor < overlay_len
-                    && matches!(
-                        snapshot.overlays[layer_cursor].content,
-                        DrawOverlayContent::Direct { .. }
-                    )
-                {
-                    self.overlay.record_direct_layer(
-                        &mut post_pass,
-                        layer_cursor,
-                        &snapshot.overlays[layer_cursor],
-                        &self.pipelines.overlay,
-                        self.viewport.uniform_arena(),
-                        bind_groups,
-                    );
-                    layer_cursor += 1;
-                }
-                if layer_cursor == overlay_len {
-                    self.vector.record_pass(
-                        &mut post_pass,
-                        &self.pipelines.vector,
-                        self.viewport.uniform_arena(),
-                        snapshot,
-                    );
-                    if snapshot.show_graticule {
-                        self.record_graticule_pass(&mut post_pass, snapshot);
-                    }
-                }
+                Some((bm_idx, scratch))
             } else {
-                let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
-                post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
-                while layer_cursor < overlay_len
-                    && matches!(
-                        snapshot.overlays[layer_cursor].content,
-                        DrawOverlayContent::Direct { .. }
-                    )
-                {
-                    self.overlay.record_direct_layer(
-                        &mut post_pass,
-                        layer_cursor,
-                        &snapshot.overlays[layer_cursor],
-                        &self.pipelines.overlay,
-                        self.viewport.uniform_arena(),
-                        bind_groups,
-                    );
-                    layer_cursor += 1;
+                None
+            };
+
+            // Batch an optional BandMath fullscreen composite plus any
+            // immediately following direct overlays (and final vectors /
+            // graticule if this reaches the tail) into one `LoadOp::Load` pass.
+            let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
+            if let Some((bm_idx, scratch)) = bm_to_composite {
+                self.overlay.record_band_math_composite(
+                    &mut post_pass,
+                    bm_idx,
+                    target.width,
+                    target.height,
+                    &self.pipelines.band_math,
+                    scratch,
+                    self.viewport.uniform_arena(),
+                );
+            }
+            post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
+            while layer_cursor < overlay_len
+                && matches!(
+                    snapshot.overlays[layer_cursor].content,
+                    DrawOverlayContent::Direct { .. }
+                )
+            {
+                self.overlay.record_direct_layer(
+                    &mut post_pass,
+                    layer_cursor,
+                    &snapshot.overlays[layer_cursor],
+                    &self.pipelines.overlay,
+                    self.viewport.uniform_arena(),
+                    bind_groups,
+                );
+                layer_cursor += 1;
+            }
+            if layer_cursor == overlay_len && has_tail {
+                self.vector.record_pass(
+                    &mut post_pass,
+                    &self.pipelines.vector,
+                    self.viewport.uniform_arena(),
+                    snapshot,
+                );
+                if snapshot.show_graticule {
+                    self.record_graticule_pass(&mut post_pass, snapshot);
                 }
-                if layer_cursor == overlay_len {
-                    self.vector.record_pass(
-                        &mut post_pass,
-                        &self.pipelines.vector,
-                        self.viewport.uniform_arena(),
-                        snapshot,
-                    );
-                    if snapshot.show_graticule {
-                        self.record_graticule_pass(&mut post_pass, snapshot);
-                    }
-                }
+                tail_drawn = true;
             }
         }
 
-        // If there were zero overlays (only vectors and/or graticule), record
-        // the single post-body color pass directly.
-        if overlay_len == 0 {
+        // If no overlay color pass reached the tail (zero overlays, or trailing
+        // skipped/off-screen BandMath layers), record vectors & graticule once.
+        if has_tail && !tail_drawn {
             let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
             post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
             self.vector.record_pass(

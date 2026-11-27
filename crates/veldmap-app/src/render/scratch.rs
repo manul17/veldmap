@@ -306,7 +306,7 @@ impl ScratchTargetPool {
 /// Compute a conservative clamped screen-space scissor rectangle `[x, y, w, h]`
 /// enclosing all visible patches of `bm`, falling back to full viewport
 /// `[0, 0, width, height]` whenever any projected sample has `clip.w <= near`,
-/// straddles the ellipsoid horizon limb, or spans a wide angular arc (`> 10°`),
+/// straddles the ellipsoid horizon limb, or spans a wide angular arc (`> 4°`),
 /// and returning `None` when the clamped scissor rectangle is empty.
 pub fn compute_band_math_scissor_rect(
     camera: &Camera,
@@ -321,6 +321,7 @@ pub fn compute_band_math_scissor_rect(
     let aspect = f64::from(width) / f64::from(height);
     let vp = camera.view_projection(aspect);
     let eye = camera.eye_ecef();
+    let near_m = camera.height_m() * 0.5;
     let wf = f64::from(width);
     let hf = f64::from(height);
 
@@ -366,7 +367,7 @@ pub fn compute_band_math_scissor_rect(
                         return false;
                     }
                     let clip = vp * DVec4::new(rel.x, rel.y, rel.z, 1.0);
-                    if !clip.w.is_finite() || clip.w <= 1e-4 {
+                    if !clip.w.is_finite() || clip.w <= near_m {
                         return false;
                     }
                     let ndc_x = clip.x / clip.w;
@@ -383,8 +384,8 @@ pub fn compute_band_math_scissor_rect(
                     any_sample = true;
                 }
             }
-            // Wide angular cells (>10 deg) can curve outside a 3x3 sample AABB.
-            if (lat_hi - lat_lo) > 10.0 || (lon_hi - lon_lo) > 10.0 {
+            // Wide angular cells (>4 deg) can curve outside a 3x3 sample AABB.
+            if (lat_hi - lat_lo) > 4.0 || (lon_hi - lon_lo) > 4.0 {
                 return false;
             }
             true

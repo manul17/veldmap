@@ -22,6 +22,7 @@ pub(super) struct ReloadRequest {
     pub(super) crs_override_epoch: u64,
     pub(super) path: PathBuf,
     pub(super) old_fingerprint_hex: String,
+    pub(super) clear_old_disk_cache: bool,
     pub(super) crs_override: Option<CrsOverride>,
     pub(super) cancel: CancelToken,
 }
@@ -91,6 +92,7 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             crs_override_epoch,
             path,
             old_fingerprint_hex,
+            clear_old_disk_cache,
             crs_override,
             cancel,
         }) => {
@@ -111,12 +113,16 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             }
             // Only clear disk cache entries AFTER reopen succeeds so a failed
             // reload preserves existing state, and run `clear_source` strictly
-            // off the UI thread.
+            // off the UI thread. Preserve `old_fingerprint_hex` in SQLite when
+            // a sibling layer still shares that source and the file's content
+            // fingerprint changed on disk.
             if let Ok((ref source, _)) = outcome
                 && let Some(ref disk) = runtime.disk_cache
             {
-                let _ = disk.clear_source(&old_fingerprint_hex);
                 let new_fp = source.fingerprint().to_hex();
+                if clear_old_disk_cache || new_fp == old_fingerprint_hex {
+                    let _ = disk.clear_source(&old_fingerprint_hex);
+                }
                 if new_fp != old_fingerprint_hex {
                     let _ = disk.clear_source(&new_fp);
                 }

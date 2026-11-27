@@ -175,14 +175,13 @@ impl BandMathPreset {
         }
     }
 
-    pub(crate) fn from_recipe_id(id: &str) -> Self {
-        match id {
-            "true_color" => Self::TrueColor,
-            "ndvi" => Self::Ndvi,
-            "ndwi" => Self::Ndwi,
-            "false_color_nir" => Self::FalseColorNir,
-            "swir" => Self::Swir,
-            _ => Self::CustomNormalizedDiff,
+    pub(crate) const fn from_sample_kind(kind: veldmap_net::SampleRecipeKind) -> Self {
+        match kind {
+            veldmap_net::SampleRecipeKind::TrueColor => Self::TrueColor,
+            veldmap_net::SampleRecipeKind::Ndvi => Self::Ndvi,
+            veldmap_net::SampleRecipeKind::Ndwi => Self::Ndwi,
+            veldmap_net::SampleRecipeKind::FalseColorNir => Self::FalseColorNir,
+            veldmap_net::SampleRecipeKind::Swir => Self::Swir,
         }
     }
 }
@@ -200,6 +199,7 @@ pub(super) struct BandMathStyle {
     pub(super) stretch_max: f64,
     pub(super) rgb_min: [f64; 3],
     pub(super) rgb_max: [f64; 3],
+    default_rgb_range: ([f64; 3], [f64; 3]),
     pub(super) rgb_gamma: f32,
     pub(super) scl_mask_enabled: bool,
     pub(super) scl_mask_bits: u32,
@@ -220,6 +220,7 @@ impl BandMathStyle {
             stretch_max,
             rgb_min,
             rgb_max,
+            default_rgb_range: (rgb_min, rgb_max),
             rgb_gamma: 1.0,
             scl_mask_enabled: has_scl,
             scl_mask_bits: DEFAULT_SCL_MASK_BITS,
@@ -236,7 +237,7 @@ impl BandMathStyle {
         rgb_max_hint: Option<f64>,
     ) -> Self {
         let preset = match formula {
-            BandMathFormula::NormalizedDiff => BandMathPreset::Ndvi,
+            BandMathFormula::NormalizedDiff => BandMathPreset::CustomNormalizedDiff,
             BandMathFormula::Difference => BandMathPreset::CustomDifference,
             BandMathFormula::Ratio => BandMathPreset::CustomRatio,
             BandMathFormula::RgbComposite => BandMathPreset::CustomRgb,
@@ -256,6 +257,7 @@ impl BandMathStyle {
         {
             style.rgb_min = [0.0; 3];
             style.rgb_max = [hi; 3];
+            style.default_rgb_range = (style.rgb_min, style.rgb_max);
         }
         style
     }
@@ -340,7 +342,7 @@ impl BandMathStyle {
             let (lo, hi) = self.preset.default_scalar_range();
             self.set_stretch_range(lo, hi)
         } else {
-            let (lo, hi) = self.preset.default_rgb_range();
+            let (lo, hi) = self.default_rgb_range;
             self.set_rgb_stretch(lo, hi, 1.0)
         }
     }
@@ -349,8 +351,13 @@ impl BandMathStyle {
     /// configuration.
     #[cfg(test)]
     pub(crate) const fn is_scl_masked(&self, scl_class: u16) -> bool {
-        self.scl_mask_enabled && scl_class < 32 && ((self.scl_mask_bits & (1u32 << scl_class)) != 0)
+        is_scl_class_masked(self.scl_mask_enabled, self.scl_mask_bits, scl_class)
     }
+}
+
+/// Evaluate whether `scl_class` is masked out under `enabled` + `mask_bits`.
+pub(crate) const fn is_scl_class_masked(enabled: bool, mask_bits: u32, scl_class: u16) -> bool {
+    enabled && scl_class < 32 && ((mask_bits & (1u32 << scl_class)) != 0)
 }
 
 /// Multi-asset data owned by [`super::layer::LayerKind::BandMath`].
@@ -405,15 +412,33 @@ pub(crate) struct BandMathSummary {
     pub(crate) scl_label: Option<String>,
 }
 
+/// Per-channel sample state in a [`BandMathReadout`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum BandChannelSample {
+    Value(f64),
+    Nodata,
+    Unavailable,
+}
+
+impl BandChannelSample {
+    pub(crate) const fn value(self) -> Option<f64> {
+        match self {
+            Self::Value(v) => Some(v),
+            Self::Nodata | Self::Unavailable => None,
+        }
+    }
+}
+
 /// Zoom-invariant CPU readout payload for a `BandMath` layer at the cursor.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BandMathReadout {
     pub(crate) formula_label: String,
     pub(crate) is_scalar: bool,
     pub(crate) computed: Option<f64>,
-    pub(crate) channels: Vec<(String, Option<f64>)>,
+    pub(crate) channels: Vec<(String, BandChannelSample)>,
     pub(crate) scl_class: Option<u16>,
     pub(crate) scl_masked: bool,
+    pub(crate) has_unavailable: bool,
 }
 
 #[cfg(test)]
@@ -458,5 +483,23 @@ mod tests {
         assert!(!style.is_scl_masked(4));
         style.set_scl_mask_enabled(false);
         assert!(!style.is_scl_masked(9));
+
+        // Custom U8 RGB composite retains its 0..255 default range across Reset.
+        let mut rgb_style =
+            BandMathStyle::for_custom(BandMathFormula::RgbComposite, false, Some(255.0));
+        assert_eq!(rgb_style.rgb_max, [255.0; 3]);
+        rgb_style.set_rgb_stretch([10.0; 3], [120.0; 3], 1.5);
+        assert!(rgb_style.reset_stretch());
+        assert_eq!(rgb_style.rgb_min, [0.0; 3]);
+        assert_eq!(rgb_style.rgb_max, [255.0; 3]);
+        assert_eq!(rgb_style.rgb_gamma, 1.0);
+
+        // Custom NormalizedDiff uses CustomNormalizedDiff (-1.0..1.0).
+        let mut nd_style = BandMathStyle::for_custom(BandMathFormula::NormalizedDiff, false, None);
+        assert_eq!(nd_style.preset, BandMathPreset::CustomNormalizedDiff);
+        assert_eq!((nd_style.stretch_min, nd_style.stretch_max), (-1.0, 1.0));
+        nd_style.set_stretch_range(0.0, 0.5);
+        assert!(nd_style.reset_stretch());
+        assert_eq!((nd_style.stretch_min, nd_style.stretch_max), (-1.0, 1.0));
     }
 }

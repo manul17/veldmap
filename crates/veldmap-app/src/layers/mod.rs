@@ -31,7 +31,7 @@ use veldmap_raster::{BandStats, ExternalBandMeta};
 use crate::colormap::{CategoricalPaletteId, ColormapId};
 
 pub use band_math::BandMathFormula;
-pub(crate) use band_math::{BandMathPreset, BandMathReadout, BandMathSummary};
+pub(crate) use band_math::{BandChannelSample, BandMathPreset, BandMathReadout, BandMathSummary};
 pub(crate) use crs_override::CrsOverride;
 pub(crate) use manager::{
     OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayManagerDeps, OverlayMutation,

@@ -77,9 +77,25 @@ impl OverlayLayer {
         can_move_up: bool,
         can_move_down: bool,
     ) -> LayerSummary {
-        match self.kind() {
-            LayerKind::SingleRaster { asset, style, .. } => {
-                let desc = asset.source().description();
+        let primary = self.primary_asset();
+        let desc = primary.source().description();
+        let geo = primary.geo();
+
+        let (
+            path,
+            is_remote,
+            remote_url,
+            reloading,
+            sample_info,
+            detail_limit_level,
+            can_override_crs,
+            has_crs_override,
+            band_options,
+            scientific,
+            categorical,
+            band_math,
+        ) = match self.kind() {
+            LayerKind::SingleRaster { asset, style } => {
                 let active_spec = asset.meta().spec;
                 let sample_info = desc.bands.first().map_or_else(
                     || "Display RGBA".to_owned(),
@@ -118,49 +134,28 @@ impl OverlayLayer {
                     has_source_color_map: style.has_source_color_map(),
                     nodata_value: LayerStyle::categorical_nodata_value(desc, active_spec.band),
                 });
-                let geo = asset.geo();
-
-                LayerSummary {
-                    id: self.id(),
-                    name: self.name().to_owned(),
-                    path: asset
+                (
+                    asset
                         .local_path()
                         .map(Path::to_path_buf)
                         .unwrap_or_default(),
-                    is_remote: asset.is_remote(),
-                    remote_url: asset.remote_url().map(str::to_owned),
-                    visible: self.is_visible(),
-                    opacity: self.opacity(),
-                    width: desc.width,
-                    height: desc.height,
-                    source_pixel_size_m: geo.source_pixel_size_m(),
-                    footprint: geo.footprint(),
-                    in_flight,
-                    pass_active,
-                    reloading: self.is_reloading(),
-                    crs_label: geo.frame().crs_label(),
-                    datum_warning: geo.frame().datum_warning().map(|w| w.message()),
+                    asset.is_remote(),
+                    asset.remote_url().map(str::to_owned),
+                    self.is_reloading(),
                     sample_info,
-                    detail_limit_level: asset
+                    asset
                         .meta()
                         .finest_fitting_level()
                         .unwrap_or(asset.meta().max_level()),
-                    can_override_crs: desc.can_override_crs(),
-                    has_crs_override: geo.crs_override().is_some(),
-                    last_error: self.last_error().map(str::to_owned),
-                    can_move_up,
-                    can_move_down,
-                    active_spec,
-                    band_options: style.band_options().to_vec(),
+                    desc.can_override_crs(),
+                    geo.crs_override().is_some(),
+                    style.band_options().to_vec(),
                     scientific,
                     categorical,
-                    band_math: None,
-                }
+                    None,
+                )
             }
             LayerKind::BandMath(bm) => {
-                let primary = bm.primary_asset();
-                let desc = primary.source().description();
-                let geo = primary.geo();
                 let detail_limit_level = bm
                     .assets()
                     .map(|a| {
@@ -187,36 +182,19 @@ impl OverlayLayer {
                     bm.bands.len(),
                     if bm.scl.is_some() { " + SCL" } else { "" }
                 );
-
-                LayerSummary {
-                    id: self.id(),
-                    name: self.name().to_owned(),
-                    path: Default::default(),
-                    is_remote: self.is_remote(),
-                    remote_url: self.remote_url().map(str::to_owned),
-                    visible: self.is_visible(),
-                    opacity: self.opacity(),
-                    width: desc.width,
-                    height: desc.height,
-                    source_pixel_size_m: geo.source_pixel_size_m(),
-                    footprint: geo.footprint(),
-                    in_flight,
-                    pass_active,
-                    reloading: false,
-                    crs_label: geo.frame().crs_label(),
-                    datum_warning: geo.frame().datum_warning().map(|w| w.message()),
+                (
+                    Default::default(),
+                    self.is_remote(),
+                    self.remote_url().map(str::to_owned),
+                    false,
                     sample_info,
                     detail_limit_level,
-                    can_override_crs: false,
-                    has_crs_override: false,
-                    last_error: self.last_error().map(str::to_owned),
-                    can_move_up,
-                    can_move_down,
-                    active_spec: primary.meta().spec,
-                    band_options: Vec::new(),
-                    scientific: None,
-                    categorical: None,
-                    band_math: Some(BandMathSummary {
+                    false,
+                    false,
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(BandMathSummary {
                         formula: bm.style.formula,
                         recipe_label: bm.style.recipe_label.clone(),
                         colormap: bm.style.colormap,
@@ -232,8 +210,39 @@ impl OverlayLayer {
                         inputs,
                         scl_label,
                     }),
-                }
+                )
             }
+        };
+
+        LayerSummary {
+            id: self.id(),
+            name: self.name().to_owned(),
+            path,
+            is_remote,
+            remote_url,
+            visible: self.is_visible(),
+            opacity: self.opacity(),
+            width: desc.width,
+            height: desc.height,
+            source_pixel_size_m: geo.source_pixel_size_m(),
+            footprint: geo.footprint(),
+            in_flight,
+            pass_active,
+            reloading,
+            crs_label: geo.frame().crs_label(),
+            datum_warning: geo.frame().datum_warning().map(|w| w.message()),
+            sample_info,
+            detail_limit_level,
+            can_override_crs,
+            has_crs_override,
+            last_error: self.last_error().map(str::to_owned),
+            can_move_up,
+            can_move_down,
+            active_spec: primary.meta().spec,
+            band_options,
+            scientific,
+            categorical,
+            band_math,
         }
     }
 }

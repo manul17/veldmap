@@ -88,6 +88,7 @@ pub(super) struct StretchRequest<'a> {
     pub(super) access: &'a RawTiffAccess,
     pub(super) stats_ifd: &'a CachedIfd,
     pub(super) nodata_f64: Option<f64>,
+    pub(super) per_band_nodata: &'a [Option<f64>],
     pub(super) budget_tracker: &'a DecodeBudgetTracker,
     pub(super) cancel: &'a CancelToken,
 }
@@ -160,9 +161,15 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
                     let spp = usize::from(ifd.samples_per_pixel);
                     for at in (0..pixels).step_by(step) {
                         for ch in 0..colors {
+                            let ch_nodata = req
+                                .per_band_nodata
+                                .get(ch)
+                                .copied()
+                                .flatten()
+                                .or(req.nodata_f64);
                             if let Some(v) =
                                 read_native_sample_f64(&data, ifd.sample_type, at * spp + ch)
-                                && is_data_f64(v, req.nodata_f64)
+                                && is_data_f64(v, ch_nodata)
                             {
                                 let f = v as f32;
                                 if f.is_finite() {
@@ -179,9 +186,15 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
                         let RawChunkPayload::Bytes(data) = payload else {
                             continue;
                         };
+                        let plane_nodata = req
+                            .per_band_nodata
+                            .get(plane)
+                            .copied()
+                            .flatten()
+                            .or(req.nodata_f64);
                         for at in (0..pixels).step_by(step) {
                             if let Some(v) = read_native_sample_f64(&data, ifd.sample_type, at)
-                                && is_data_f64(v, req.nodata_f64)
+                                && is_data_f64(v, plane_nodata)
                             {
                                 let f = v as f32;
                                 if f.is_finite() {

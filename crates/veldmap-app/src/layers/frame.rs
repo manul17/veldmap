@@ -22,15 +22,37 @@ use super::layer::{LayerKind, OverlayLayer};
 use super::runtime::OverlayRuntime;
 use super::style::LayerStyle;
 
-/// Per-frame shared inputs passed down to [`build_and_schedule_layer`].
-pub(super) struct LayerFrameCtx<'a> {
-    pub(super) runtime: &'a Arc<OverlayRuntime>,
+/// Shared read-only inputs for Phase 1 (`prepare_layer_wanted`), before the
+/// frame-wide unioned `reconcile_pointwise_streams` pass runs.
+pub(super) struct PrepareFrameCtx<'a> {
     pub(super) frustum: &'a CullFrustum,
     pub(super) viewport_mpp: f64,
+    pub(super) gpu_cache: &'a GpuTileCache,
+    pub(super) total_appetite_weight: u64,
+}
+
+/// Per-frame shared inputs passed down to [`finish_scheduled_layer`].
+pub(super) struct LayerFrameCtx<'a> {
+    pub(super) runtime: &'a Arc<OverlayRuntime>,
     pub(super) gpu_cache: &'a mut GpuTileCache,
     pub(super) pending: &'a PendingUploads,
-    pub(super) total_appetite_weight: u64,
     pub(super) carrier_keys: &'a mut HashSet<TileKey>,
+}
+
+pub(super) struct PreparedAssetPlan {
+    img_w: u32,
+    img_h: u32,
+    target_level: u8,
+    target_cells: Vec<(u32, u32)>,
+    ladder_cells: Vec<(u8, Vec<(u32, u32)>)>,
+}
+
+pub(super) enum PreparedLayerPlan {
+    Single(PreparedAssetPlan),
+    BandMath {
+        bands: Vec<PreparedAssetPlan>,
+        scl: Option<PreparedAssetPlan>,
+    },
 }
 
 struct ScheduledAsset {
@@ -64,7 +86,7 @@ fn select_target_rung(
     }
 }
 
-fn schedule_single_asset(asset: &mut RasterAsset, ctx: &mut LayerFrameCtx<'_>) -> ScheduledAsset {
+fn prepare_single_asset(asset: &mut RasterAsset, ctx: &PrepareFrameCtx<'_>) -> PreparedAssetPlan {
     let desc = asset.source().description();
     let (img_w, img_h) = (desc.width, desc.height);
     let max_level = asset.meta().max_level();
@@ -92,31 +114,42 @@ fn schedule_single_asset(asset: &mut RasterAsset, ctx: &mut LayerFrameCtx<'_>) -
         ladder_cells.push((rung, cells));
     }
 
-    update_wanted_and_reconcile(
-        asset,
-        img_w,
-        img_h,
-        &ladder_cells,
-        ctx.runtime,
-        ctx.gpu_cache,
-        ctx.pending,
-    );
+    update_wanted(asset, img_w, img_h, &ladder_cells);
 
-    let segments = level_segments(asset.geo().frame(), img_w, img_h, target_level);
-    let patches = build_draw_patches(
-        asset,
+    PreparedAssetPlan {
         img_w,
         img_h,
         target_level,
-        &target_cells,
+        target_cells,
+        ladder_cells,
+    }
+}
+
+fn finish_single_asset(
+    asset: &RasterAsset,
+    plan: PreparedAssetPlan,
+    ctx: &mut LayerFrameCtx<'_>,
+) -> ScheduledAsset {
+    let segments = level_segments(
+        asset.geo().frame(),
+        plan.img_w,
+        plan.img_h,
+        plan.target_level,
+    );
+    let patches = build_draw_patches(
+        asset,
+        plan.img_w,
+        plan.img_h,
+        plan.target_level,
+        &plan.target_cells,
         ctx.gpu_cache,
         ctx.carrier_keys,
     );
 
-    if !target_cells.is_empty() {
+    if !plan.target_cells.is_empty() {
         schedule_asset_rungs(
             asset,
-            &ladder_cells,
+            &plan.ladder_cells,
             ctx.runtime,
             ctx.gpu_cache,
             ctx.pending,
@@ -124,29 +157,61 @@ fn schedule_single_asset(asset: &mut RasterAsset, ctx: &mut LayerFrameCtx<'_>) -
     }
 
     ScheduledAsset {
-        image_width: img_w,
-        image_height: img_h,
+        image_width: plan.img_w,
+        image_height: plan.img_h,
         segments,
         patches,
     }
 }
 
-/// Build the immutable [`DrawOverlayLayer`] (if any carriers are cached),
-/// update each asset's `wanted` across all active ladder rungs, reconcile stale
-/// pointwise jobs, and schedule missing tiles onto `fast_pool` / `bulk_pool`.
-pub(super) fn build_and_schedule_layer(
+/// Phase 1: compute visible target + ladder rungs and update `wanted` for all
+/// active assets of `layer` (clearing `wanted` on inactive layers or disabled
+/// `SCL` masks) before the frame-wide unioned reconcile runs.
+pub(super) fn prepare_layer_wanted(
     layer: &mut OverlayLayer,
-    ctx: &mut LayerFrameCtx<'_>,
-) -> Option<DrawOverlayLayer> {
+    ctx: &PrepareFrameCtx<'_>,
+) -> Option<PreparedLayerPlan> {
     if !layer.is_active() {
         layer.clear_wanted();
         return None;
     }
 
-    let opacity = layer.opacity();
     match layer.kind_mut() {
-        LayerKind::SingleRaster { asset, style, .. } => {
-            let scheduled = schedule_single_asset(asset, ctx);
+        LayerKind::SingleRaster { asset, .. } => {
+            Some(PreparedLayerPlan::Single(prepare_single_asset(asset, ctx)))
+        }
+        LayerKind::BandMath(bm) => {
+            let bands = bm
+                .bands
+                .iter_mut()
+                .map(|band_asset| prepare_single_asset(band_asset, ctx))
+                .collect();
+            let scl = if let Some(scl_asset) = &mut bm.scl {
+                if bm.style.scl_mask_enabled {
+                    Some(prepare_single_asset(scl_asset, ctx))
+                } else {
+                    scl_asset.clear_wanted();
+                    None
+                }
+            } else {
+                None
+            };
+            Some(PreparedLayerPlan::BandMath { bands, scl })
+        }
+    }
+}
+
+/// Phase 3: build the immutable [`DrawOverlayLayer`] from cached carrier tiles
+/// and submit missing tiles onto `fast_pool` / `bulk_pool`.
+pub(super) fn finish_scheduled_layer(
+    layer: &OverlayLayer,
+    plan: PreparedLayerPlan,
+    ctx: &mut LayerFrameCtx<'_>,
+) -> Option<DrawOverlayLayer> {
+    let opacity = layer.opacity();
+    match (layer.kind(), plan) {
+        (LayerKind::SingleRaster { asset, style }, PreparedLayerPlan::Single(asset_plan)) => {
+            let scheduled = finish_single_asset(asset, asset_plan, ctx);
             let track = style.draw_track(asset.source().as_ref(), asset.meta().spec);
             (!scheduled.patches.is_empty()).then(|| DrawOverlayLayer {
                 opacity,
@@ -160,12 +225,18 @@ pub(super) fn build_and_schedule_layer(
                 },
             })
         }
-        LayerKind::BandMath(bm) => {
+        (
+            LayerKind::BandMath(bm),
+            PreparedLayerPlan::BandMath {
+                bands: band_plans,
+                scl: scl_plan,
+            },
+        ) => {
             let mut draw_bands = Vec::with_capacity(bm.bands.len());
             let mut all_bands_have_patches = true;
-            for band_asset in &mut bm.bands {
+            for (band_asset, band_plan) in bm.bands.iter().zip(band_plans) {
                 let (scale, offset) = band_asset.band_scale_offset();
-                let scheduled = schedule_single_asset(band_asset, ctx);
+                let scheduled = finish_single_asset(band_asset, band_plan, ctx);
                 if scheduled.patches.is_empty() {
                     all_bands_have_patches = false;
                 }
@@ -180,25 +251,26 @@ pub(super) fn build_and_schedule_layer(
                 });
             }
 
-            let draw_scl = if let Some(scl_asset) = &mut bm.scl {
-                if bm.style.scl_mask_enabled {
-                    let nodata_value = LayerStyle::categorical_nodata_value(
-                        scl_asset.source().description(),
-                        scl_asset.meta().spec.band,
-                    );
-                    let scheduled = schedule_single_asset(scl_asset, ctx);
-                    (!scheduled.patches.is_empty()).then(|| DrawScratchMask {
-                        frame: Arc::clone(scl_asset.geo().frame()),
-                        image_width: scheduled.image_width,
-                        image_height: scheduled.image_height,
-                        segments: scheduled.segments,
-                        nodata_value,
-                        patches: scheduled.patches,
-                    })
-                } else {
-                    scl_asset.clear_wanted();
-                    None
-                }
+            let draw_scl = if let (Some(scl_asset), Some(scl_plan)) = (&bm.scl, scl_plan) {
+                // Never discard maskable SCL class IDs (`0..32`, notably class
+                // `0` = ESA "No Data" declared as `GDAL_NODATA = 0` on real
+                // Sentinel-2 COGs): write them into the `R8Uint` scratch target
+                // so `scl_mask_bits` controls them while `255u` stays strictly
+                // the uncovered-footprint sentinel.
+                let nodata_value = LayerStyle::categorical_nodata_value(
+                    scl_asset.source().description(),
+                    scl_asset.meta().spec.band,
+                )
+                .filter(|&nd| nd >= 32);
+                let scheduled = finish_single_asset(scl_asset, scl_plan, ctx);
+                (!scheduled.patches.is_empty()).then(|| DrawScratchMask {
+                    frame: Arc::clone(scl_asset.geo().frame()),
+                    image_width: scheduled.image_width,
+                    image_height: scheduled.image_height,
+                    segments: scheduled.segments,
+                    nodata_value,
+                    patches: scheduled.patches,
+                })
             } else {
                 None
             };
@@ -224,17 +296,15 @@ pub(super) fn build_and_schedule_layer(
                 })),
             })
         }
+        _ => None,
     }
 }
 
-fn update_wanted_and_reconcile(
+fn update_wanted(
     asset: &mut RasterAsset,
     img_w: u32,
     img_h: u32,
     ladder_cells: &[(u8, Vec<(u32, u32)>)],
-    runtime: &OverlayRuntime,
-    gpu_cache: &GpuTileCache,
-    pending: &PendingUploads,
 ) {
     let max_level = asset.meta().max_level();
     // Populate `wanted` with apex root tiles AND visible cells across ALL
@@ -260,12 +330,6 @@ fn update_wanted_and_reconcile(
         }
     }
     asset.stream_mut().replace_wanted(next_wanted);
-
-    runtime.reconcile_pointwise_streams(
-        [(asset.meta().stream_key(), asset.stream().wanted())],
-        gpu_cache,
-        pending,
-    );
 }
 
 fn build_draw_patches(

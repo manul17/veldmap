@@ -285,7 +285,15 @@ impl StacAsset {
         if !self.is_geotiff_http() {
             return false;
         }
-        if self.key.eq_ignore_ascii_case("scl") {
+        if self.key.eq_ignore_ascii_case("scl")
+            || self
+                .key
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("scl_"))
+        {
+            return true;
+        }
+        if self.roles.iter().any(|r| r.eq_ignore_ascii_case("scl")) {
             return true;
         }
         if let Some(title) = &self.title {
@@ -295,6 +303,16 @@ impl StacAsset {
             }
         }
         false
+    }
+
+    fn is_visual_or_overview(&self) -> bool {
+        self.key.eq_ignore_ascii_case("visual")
+            || self.key.eq_ignore_ascii_case("tci")
+            || self.roles.iter().any(|r| {
+                r.eq_ignore_ascii_case("visual")
+                    || r.eq_ignore_ascii_case("overview")
+                    || r.eq_ignore_ascii_case("thumbnail")
+            })
     }
 }
 
@@ -338,7 +356,8 @@ impl StacItem {
 
     /// Find the highest-priority HTTP(S) GeoTIFF asset matching any alias in
     /// `aliases` (checking exact asset keys first in priority order, then
-    /// `eo:bands` common names / band names).
+    /// single-band scientific `eo:bands` common names / band names while
+    /// skipping 8-bit `visual`/`tci`/overview composites).
     pub fn find_band_asset(&self, aliases: &[&str]) -> Option<&StacAsset> {
         for alias in aliases {
             if let Some(asset) = self
@@ -351,7 +370,10 @@ impl StacItem {
         }
         for alias in aliases {
             if let Some(asset) = self.assets.iter().find(|a| {
-                a.is_geotiff_http() && a.eo_bands.iter().any(|b| b.eq_ignore_ascii_case(alias))
+                a.is_geotiff_http()
+                    && !a.is_visual_or_overview()
+                    && a.raster_bands.len() <= 1
+                    && a.eo_bands.iter().any(|b| b.eq_ignore_ascii_case(alias))
             }) {
                 return Some(asset);
             }

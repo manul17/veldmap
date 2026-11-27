@@ -40,9 +40,9 @@ pub use range::RANGE_BLOCK_SIZE;
 pub use range::{HttpRangeConfig, HttpRangeSource, PrefetchPin, RangeOpenError};
 pub use redact::sanitize_url_for_display;
 pub use stac::{
-    SampleRecipeBand, SampleRecipeScene, SampleScene, StacAsset, StacAuth, StacCatalogConfig,
-    StacClient, StacError, StacItem, StacRasterBandMeta, StacSearchQuery, StacSearchResult,
-    builtin_sample_recipes, builtin_sample_scenes,
+    SampleRecipeBand, SampleRecipeKind, SampleRecipeScene, SampleScene, StacAsset, StacAuth,
+    StacCatalogConfig, StacClient, StacError, StacItem, StacRasterBandMeta, StacSearchQuery,
+    StacSearchResult, builtin_sample_recipes, builtin_sample_scenes,
 };
 pub use url::{is_valid_http_endpoint, same_http_origin};
 

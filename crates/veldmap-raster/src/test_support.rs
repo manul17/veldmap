@@ -12,6 +12,26 @@ fn tiff_io_err(err: ::tiff::TiffError) -> io::Error {
     io::Error::other(err)
 }
 
+fn write_utm37n_geotags<W: io::Write + io::Seek, K: ::tiff::encoder::TiffKind>(
+    dir: &mut ::tiff::encoder::DirectoryEncoder<'_, W, K>,
+) -> io::Result<()> {
+    let geokeys: [u16; 16] = [
+        1, 1, 0, 3, // header
+        1024, 0, 1, 1, // Projected
+        1025, 0, 1, 1, // PixelIsArea
+        3072, 0, 1, 32637, // EPSG:32637
+    ];
+    dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(
+        Tag::ModelTiepointTag,
+        &[0.0_f64, 0.0, 0.0, 500_000.0, 5_250_000.0, 0.0][..],
+    )
+    .map_err(tiff_io_err)
+}
+
 fn write_cog_level(
     enc: &mut TiffEncoder<&mut File>,
     w: u32,
@@ -61,21 +81,7 @@ fn write_cog_level(
     dir.write_tag(Tag::TileByteCounts, &counts[..])
         .map_err(tiff_io_err)?;
     if is_base {
-        let geokeys: [u16; 16] = [
-            1, 1, 0, 3, // header
-            1024, 0, 1, 1, // Projected
-            1025, 0, 1, 1, // PixelIsArea
-            3072, 0, 1, 32637, // EPSG:32637
-        ];
-        dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .map_err(tiff_io_err)?;
-        dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
-            .map_err(tiff_io_err)?;
-        dir.write_tag(
-            Tag::ModelTiepointTag,
-            &[0.0_f64, 0.0, 0.0, 500_000.0, 5_250_000.0, 0.0][..],
-        )
-        .map_err(tiff_io_err)?;
+        write_utm37n_geotags(&mut dir)?;
     }
     dir.finish().map_err(tiff_io_err)
 }
@@ -143,16 +149,7 @@ pub fn write_rgbnir_u16_geotiff(
         .map_err(tiff_io_err)?;
     dir.write_tag(Tag::StripByteCounts, &[bytes.len() as u32][..])
         .map_err(tiff_io_err)?;
-    let geokeys: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32637];
-    dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-        .map_err(tiff_io_err)?;
-    dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
-        .map_err(tiff_io_err)?;
-    dir.write_tag(
-        Tag::ModelTiepointTag,
-        &[0.0_f64, 0.0, 0.0, 500_000.0, 5_250_000.0, 0.0][..],
-    )
-    .map_err(tiff_io_err)?;
+    write_utm37n_geotags(&mut dir)?;
     let xml = format!("<GDALMetadata><Item name=\"SCALE\">{scale}</Item></GDALMetadata>");
     dir.write_tag(Tag::Unknown(42112), xml.as_str())
         .map_err(tiff_io_err)?;
@@ -199,15 +196,6 @@ pub fn write_scl_u8_geotiff(
         .map_err(tiff_io_err)?;
     dir.write_tag(Tag::StripByteCounts, &[bytes.len() as u32][..])
         .map_err(tiff_io_err)?;
-    let geokeys: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32637];
-    dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-        .map_err(tiff_io_err)?;
-    dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
-        .map_err(tiff_io_err)?;
-    dir.write_tag(
-        Tag::ModelTiepointTag,
-        &[0.0_f64, 0.0, 0.0, 500_000.0, 5_250_000.0, 0.0][..],
-    )
-    .map_err(tiff_io_err)?;
+    write_utm37n_geotags(&mut dir)?;
     dir.finish().map_err(tiff_io_err)
 }

@@ -74,9 +74,9 @@ fn fs_composite(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32
         var sb = clamp((b - params.rgb_min.z) * params.rgb_inv_range.z, 0.0, 1.0);
         let inv_gamma = params.rgb_min.w;
         if abs(inv_gamma - 1.0) > 1e-4 {
-            sr = pow(sr, inv_gamma);
-            sg = pow(sg, inv_gamma);
-            sb = pow(sb, inv_gamma);
+            sr = select(0.0, pow(max(sr, 1e-12), inv_gamma), sr > 0.0);
+            sg = select(0.0, pow(max(sg, 1e-12), inv_gamma), sg > 0.0);
+            sb = select(0.0, pow(max(sb, 1e-12), inv_gamma), sb > 0.0);
         }
         let alpha = clamp(params.opacity, 0.0, 1.0);
         if alpha <= 0.001 {
@@ -123,7 +123,7 @@ fn fs_composite(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32
     }
 
     let scaled = t * 255.0;
-    let idx0 = u32(floor(scaled));
+    let idx0 = min(u32(floor(scaled)), 255u);
     let idx1 = min(idx0 + 1u, 255u);
     let frac = scaled - f32(idx0);
     let lut_color = mix(palette.entries[idx0], palette.entries[idx1], frac);

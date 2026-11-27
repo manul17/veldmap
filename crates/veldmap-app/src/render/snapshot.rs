@@ -143,11 +143,23 @@ pub struct DrawBandMathLayer {
 }
 
 fn frames_share_exact_grid(a: &Arc<Frame>, b: &Arc<Frame>) -> bool {
-    if Arc::ptr_eq(a, b) {
+    if Arc::ptr_eq(a, b) || a == b {
         return true;
     }
     const EPS_DEG: f64 = 1e-10;
-    for (fx, fy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+    // Check 4 corners plus edge/interior points so distinct projections that
+    // happen to share identical corner lat/lons (e.g. EPSG:4326 vs EPSG:3857)
+    // never silently batch onto a single warp mesh.
+    for (fx, fy) in [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (0.0, 1.0),
+        (1.0, 1.0),
+        (0.5, 0.5),
+        (0.5, 0.0),
+        (0.0, 0.5),
+        (0.25, 0.75),
+    ] {
         let (la, loa) = a.geodetic(fx, fy);
         let (lb, lob) = b.geodetic(fx, fy);
         if (la - lb).abs() > EPS_DEG || (loa - lob).abs() > EPS_DEG {
@@ -159,15 +171,21 @@ fn frames_share_exact_grid(a: &Arc<Frame>, b: &Arc<Frame>) -> bool {
 
 impl DrawBandMathLayer {
     /// Return whether all active float bands share one geodetic grid, image
-    /// dimensions, subdivision density, and identical patch `cell_rect` list
-    /// so they can be rasterized in a single MRT render pass (`2..=4` `R32Float`
-    /// attachments, fitting `downlevel_defaults()` `max_color_attachments = 4`).
+    /// dimensions, subdivision density, `R32Float` tile format, and identical
+    /// patch `cell_rect` list so they can be rasterized in a single MRT render
+    /// pass (`2..=4` `R32Float` attachments, fitting `downlevel_defaults()`
+    /// `max_color_attachments = 4`).
     pub fn can_use_mrt(&self) -> bool {
         if self.bands.len() < 2 || self.bands.len() > 4 {
             return false;
         }
         let first = &self.bands[0];
-        if first.patches.is_empty() {
+        if first.patches.is_empty()
+            || !first
+                .patches
+                .iter()
+                .all(|p| p.texture.format == veldmap_core::tile::PixelFormat::R32Float)
+        {
             return false;
         }
         self.bands[1..].iter().all(|band| {
@@ -176,11 +194,10 @@ impl DrawBandMathLayer {
                 && first.segments == band.segments
                 && first.patches.len() == band.patches.len()
                 && frames_share_exact_grid(&first.frame, &band.frame)
-                && first
-                    .patches
-                    .iter()
-                    .zip(&band.patches)
-                    .all(|(p0, p1)| p0.cell_rect == p1.cell_rect)
+                && first.patches.iter().zip(&band.patches).all(|(p0, p1)| {
+                    p0.cell_rect == p1.cell_rect
+                        && p1.texture.format == veldmap_core::tile::PixelFormat::R32Float
+                })
         })
     }
 }

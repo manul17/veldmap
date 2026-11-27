@@ -94,18 +94,13 @@ impl TiffSource {
         if external.is_empty() {
             return;
         }
-        let single_data_band = self.base_ifd().data_bands == 1;
-        let mut updated_display_nodata: Option<f64> = None;
 
         for band in &mut self.description.bands {
             let BandKey::Index(b) = band.band_key else {
                 continue;
             };
             let idx = usize::from(b);
-            let ext = external
-                .get(idx)
-                .or_else(|| (single_data_band && external.len() == 1).then(|| &external[0]));
-            let Some(ext) = ext else {
+            let Some(ext) = external.get(idx) else {
                 continue;
             };
 
@@ -126,9 +121,6 @@ impl TiffSource {
                 if let Some(slot) = self.per_band_nodata.get_mut(idx) {
                     *slot = Some(nd);
                 }
-                if single_data_band && self.nodata_f64.is_none() {
-                    updated_display_nodata = Some(nd);
-                }
             }
 
             if band.units.is_none()
@@ -138,7 +130,12 @@ impl TiffSource {
             }
         }
 
-        if let Some(nd) = updated_display_nodata {
+        if self.nodata_f64.is_none()
+            && let Some(nd) = ifd::uniform_display_nodata(
+                &self.per_band_nodata,
+                self.base_ifd().pixel_layout.colors().max(1),
+            )
+        {
             self.nodata_f64 = Some(nd);
             if let Some(display) = self
                 .description
@@ -173,19 +170,12 @@ impl TiffSource {
             .map_or((1.0, 0.0), |info| (info.scale, info.offset))
     }
 
-    fn band_nodata(&self, band: u16) -> Option<f64> {
-        self.per_band_nodata
-            .get(usize::from(band))
-            .copied()
-            .flatten()
-            .or(self.nodata_f64)
-    }
-
     fn stretch_request<'a>(&'a self, ctx: &'a DecodeContext<'_>) -> StretchRequest<'a> {
         StretchRequest {
             access: &self.access,
             stats_ifd: self.stats_ifd_ref(),
             nodata_f64: self.nodata_f64,
+            per_band_nodata: &self.per_band_nodata,
             budget_tracker: ctx.budget_tracker,
             cancel: ctx.cancel,
         }
@@ -518,7 +508,7 @@ impl RasterSource for TiffSource {
             return Ok(None);
         };
         let (scale, offset) = self.band_scale_offset(band);
-        let band_nodata = self.band_nodata(b);
+        let band_nodata = self.source_view().nodata_for_band(usize::from(b));
         let req = self.stretch_request(ctx);
         self.band_stats
             .get_or_compute(b, scale, offset, band_nodata, &req)

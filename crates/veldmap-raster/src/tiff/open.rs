@@ -387,7 +387,7 @@ impl TiffSource {
             .min_by_key(|o| o.width)
             .map_or(0, |o| o.image);
 
-        let bands = build_band_infos(&base_ifd, meta.nodata_f64, &meta.gdal_meta);
+        let mut bands = build_band_infos(&base_ifd, meta.nodata_f64, &meta.gdal_meta);
         let mut per_band_nodata = vec![meta.nodata_f64; usize::from(base_ifd.samples_per_pixel)];
         for info in &bands {
             if let BandKey::Index(b) = info.band_key
@@ -396,8 +396,20 @@ impl TiffSource {
                 *slot = info.nodata;
             }
         }
+        let display_nodata = meta.nodata_f64.or_else(|| {
+            super::ifd::uniform_display_nodata(
+                &per_band_nodata,
+                base_ifd.pixel_layout.colors().max(1),
+            )
+        });
+        if let Some(nd) = display_nodata
+            && let Some(display) = bands.iter_mut().find(|b| b.band_key == BandKey::Display)
+            && display.nodata.is_none()
+        {
+            display.nodata = Some(nd);
+        }
         let initial_mapping = (!base_ifd.needs_display_stretch()).then(|| {
-            DisplayMapping::identity(meta.nodata_f64)
+            DisplayMapping::identity(display_nodata)
                 .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
         });
 
@@ -429,7 +441,7 @@ impl TiffSource {
             description,
             grid,
             ifds,
-            nodata_f64: meta.nodata_f64,
+            nodata_f64: display_nodata,
             per_band_nodata,
             stats_ifd,
             budget_snapshot: *budget,

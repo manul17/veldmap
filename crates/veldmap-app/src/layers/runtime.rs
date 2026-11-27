@@ -362,21 +362,35 @@ impl OverlayRuntime {
     }
 
     /// Reconcile in-flight pointwise jobs across `streams` under a single
-    /// scheduler lock acquisition, cancelling stale tokens strictly outside
-    /// the lock.
+    /// scheduler lock acquisition, unioning duplicate [`StreamKey`]s before
+    /// cancelling stale tokens strictly outside the lock.
     pub(super) fn reconcile_pointwise_streams<'a>(
         &self,
         streams: impl IntoIterator<Item = (StreamKey, &'a HashSet<TileKey>)>,
         gpu_cache: &GpuTileCache,
         pending: &PendingUploads,
     ) {
+        use std::borrow::Cow;
+        let mut merged: HashMap<StreamKey, Cow<'a, HashSet<TileKey>>> = HashMap::new();
+        for (stream_key, wanted) in streams {
+            match merged.entry(stream_key) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(Cow::Borrowed(wanted));
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.get_mut().to_mut().extend(wanted.iter().copied());
+                }
+            }
+        }
         let mut to_cancel = Vec::new();
         {
             let mut sched = lock_unpoisoned(&self.scheduler);
-            for (stream_key, wanted) in streams {
-                to_cancel.extend(sched.reconcile_pointwise(stream_key, wanted, |k| {
-                    gpu_cache.contains(k) || pending.contains(k)
-                }));
+            for (stream_key, wanted) in &merged {
+                to_cancel.extend(
+                    sched.reconcile_pointwise(*stream_key, wanted.as_ref(), |k| {
+                        gpu_cache.contains(k) || pending.contains(k)
+                    }),
+                );
             }
         }
         for tok in to_cancel {

@@ -164,6 +164,13 @@ fn safe_inv_range(min_v: f32, max_v: f32) -> (f32, f32) {
     (safe_min, inv)
 }
 
+fn sanitize_scale_offset(scale: f32, offset: f32) -> (f32, f32) {
+    (
+        if scale.is_finite() { scale } else { 1.0 },
+        if offset.is_finite() { offset } else { 0.0 },
+    )
+}
+
 impl PreparedTrackParams {
     fn from_track(track: &DrawOverlayTrack) -> Self {
         match track {
@@ -177,8 +184,7 @@ impl PreparedTrackParams {
                 invert_colormap,
                 ..
             } => {
-                let safe_scale = if scale.is_finite() { *scale } else { 1.0 };
-                let safe_offset = if offset.is_finite() { *offset } else { 0.0 };
+                let (safe_scale, safe_offset) = sanitize_scale_offset(*scale, *offset);
                 let (stretch_min, stretch_inv_range) = safe_inv_range(*stretch_min, *stretch_max);
                 Self::Scientific {
                     scale: safe_scale,
@@ -525,8 +531,12 @@ impl OverlayRenderer {
                         .push(PreparedLayerDraw::Direct { patch_offsets });
                 }
                 DrawOverlayContent::BandMath(bm) => {
-                    let scissor =
-                        compute_band_math_scissor_rect(&snapshot.camera, width, height, bm);
+                    let has_required_bands = bm.bands.len() >= bm.formula.required_bands();
+                    let scissor = has_required_bands
+                        .then(|| {
+                            compute_band_math_scissor_rect(&snapshot.camera, width, height, bm)
+                        })
+                        .flatten();
                     if scissor.is_none() {
                         self.prepared_layers.push(PreparedLayerDraw::BandMath {
                             scissor: None,
@@ -551,16 +561,8 @@ impl OverlayRenderer {
                                 for (b_idx, band) in bm.bands.iter().take(4).enumerate() {
                                     if let Some(bp) = band.patches.get(patch_idx) {
                                         uv_rects[b_idx] = bp.uv_rect;
-                                        let sc = if band.scale.is_finite() {
-                                            band.scale
-                                        } else {
-                                            1.0
-                                        };
-                                        let of = if band.offset.is_finite() {
-                                            band.offset
-                                        } else {
-                                            0.0
-                                        };
+                                        let (sc, of) =
+                                            sanitize_scale_offset(band.scale, band.offset);
                                         scale_offsets[b_idx] = [sc, of, 0.0, 0.0];
                                         mip_counts[b_idx] = bp.texture.mip_level_count.max(1);
                                     }
@@ -579,16 +581,7 @@ impl OverlayRenderer {
                     } else {
                         let mut all_band_offs = Vec::with_capacity(bm.bands.len());
                         for band in &bm.bands {
-                            let sc = if band.scale.is_finite() {
-                                band.scale
-                            } else {
-                                1.0
-                            };
-                            let of = if band.offset.is_finite() {
-                                band.offset
-                            } else {
-                                0.0
-                            };
+                            let (sc, of) = sanitize_scale_offset(band.scale, band.offset);
                             let mut b_offs = Vec::with_capacity(band.patches.len());
                             for patch in &band.patches {
                                 let off = self.meshes.peek(&patch.mesh_key).map(|mesh| {
@@ -737,6 +730,50 @@ impl OverlayRenderer {
         }
     }
 
+    fn record_scratch_single_patches<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        patches: &'a [DrawOverlayPatch],
+        offsets: &[Option<u32>],
+        arena: &'a DynamicUniformArena,
+        mut resolve_tex_bg: impl FnMut(
+            &'a Arc<crate::gpu_tiles::GpuTile>,
+        ) -> Option<&'a wgpu::BindGroup>,
+    ) {
+        let mut last_idx_key: Option<(u32, bool)> = None;
+        let mut last_tex_id: Option<u64> = None;
+        for (patch, &dyn_offset) in patches.iter().zip(offsets.iter()) {
+            let Some(dyn_offset) = dyn_offset else {
+                continue;
+            };
+            let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {
+                continue;
+            };
+            let Some(tex_bg) = resolve_tex_bg(&patch.texture) else {
+                continue;
+            };
+            let idx_key = (mesh.segments, mesh.flip_winding);
+            let Some((idx_buf, idx_count)) = self.index_buffers.get(&idx_key) else {
+                continue;
+            };
+            if last_idx_key != Some(idx_key) {
+                pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
+                last_idx_key = Some(idx_key);
+            }
+            if last_tex_id != Some(patch.texture.tile_id) {
+                pass.set_bind_group(2, tex_bg, &[]);
+                last_tex_id = Some(patch.texture.tile_id);
+            }
+            pass.set_vertex_buffer(0, mesh.buffer.slice(..));
+            pass.set_bind_group(
+                1,
+                arena.bind_group(UniformSlot::ScratchSingle),
+                &[dyn_offset],
+            );
+            pass.draw_indexed(0..*idx_count, 0, 0..1);
+        }
+    }
+
     /// Record the shared viewport scratch passes (quiet-NaN initialization +
     /// MRT or per-band `R32Float` draws + optional `R8Uint` `SCL` mask pass)
     /// for a `BandMath` layer, constrained to its clamped projected-AABB
@@ -769,16 +806,17 @@ impl OverlayRenderer {
         };
         let band_count = bm.bands.len().min(4);
         let float_views = scratch.float_views();
-        if band_count == 0 || float_views.len() < band_count {
+        if band_count < bm.formula.required_bands() || float_views.len() < band_count {
             return false;
         }
 
         let [sx, sy, sw, sh] = *scissor;
 
-        // 1. Initialize active `1..=band_count` `R32Float` scratch targets to
-        //    quiet-NaN via scissored 3-vertex fullscreen fill; if MRT is active,
-        //    also record the co-grid MRT patch draws in the exact same pass!
-        {
+        // 1. Initialize active `1..=band_count` `R32Float` scratch targets via
+        //    `LoadOp::Clear(TRANSPARENT)` (eliminating TBDR full-viewport DRAM
+        //    readback) + scissored quiet-NaN fill, merged directly with either
+        //    the single co-grid MRT pass or each per-band single-target pass.
+        if let Some(mrt_offsets) = mrt_patch_offsets {
             let attachments: Vec<Option<wgpu::RenderPassColorAttachment<'_>>> = float_views
                 [..band_count]
                 .iter()
@@ -788,14 +826,14 @@ impl OverlayRenderer {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
                     })
                 })
                 .collect();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("band-math scratch NaN fill (+ optional MRT)"),
+                label: Some("band-math scratch NaN fill + MRT"),
                 color_attachments: &attachments,
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -807,49 +845,39 @@ impl OverlayRenderer {
             pass.set_bind_group(0, scratch.nan_clear_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
-            if let Some(mrt_offsets) = mrt_patch_offsets {
-                pass.set_pipeline(pipelines.mrt_for_count(band_count));
-                pass.set_bind_group(0, camera_bg, &[]);
-                let first = &bm.bands[0];
-                let mut last_idx_key: Option<(u32, bool)> = None;
-                for (patch_idx, (patch, &dyn_offset)) in
-                    first.patches.iter().zip(mrt_offsets.iter()).enumerate()
-                {
-                    let Some(dyn_offset) = dyn_offset else {
-                        continue;
-                    };
-                    let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {
-                        continue;
-                    };
-                    let Some(tiles) = mrt_tiles_for_patch(bm, patch_idx) else {
-                        continue;
-                    };
-                    let Some(mrt_bg) = bind_groups.get_mrt(tiles) else {
-                        continue;
-                    };
-                    let idx_key = (mesh.segments, mesh.flip_winding);
-                    let Some((idx_buf, idx_count)) = self.index_buffers.get(&idx_key) else {
-                        continue;
-                    };
-                    if last_idx_key != Some(idx_key) {
-                        pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
-                        last_idx_key = Some(idx_key);
-                    }
-                    pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-                    pass.set_bind_group(
-                        1,
-                        arena.bind_group(UniformSlot::ScratchMrt),
-                        &[dyn_offset],
-                    );
-                    pass.set_bind_group(2, mrt_bg, &[]);
-                    pass.draw_indexed(0..*idx_count, 0, 0..1);
+            pass.set_pipeline(pipelines.mrt_for_count(band_count));
+            pass.set_bind_group(0, camera_bg, &[]);
+            let first = &bm.bands[0];
+            let mut last_idx_key: Option<(u32, bool)> = None;
+            for (patch_idx, (patch, &dyn_offset)) in
+                first.patches.iter().zip(mrt_offsets.iter()).enumerate()
+            {
+                let Some(dyn_offset) = dyn_offset else {
+                    continue;
+                };
+                let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {
+                    continue;
+                };
+                let Some(tiles) = mrt_tiles_for_patch(bm, patch_idx) else {
+                    continue;
+                };
+                let Some(mrt_bg) = bind_groups.get_mrt(tiles) else {
+                    continue;
+                };
+                let idx_key = (mesh.segments, mesh.flip_winding);
+                let Some((idx_buf, idx_count)) = self.index_buffers.get(&idx_key) else {
+                    continue;
+                };
+                if last_idx_key != Some(idx_key) {
+                    pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    last_idx_key = Some(idx_key);
                 }
+                pass.set_vertex_buffer(0, mesh.buffer.slice(..));
+                pass.set_bind_group(1, arena.bind_group(UniformSlot::ScratchMrt), &[dyn_offset]);
+                pass.set_bind_group(2, mrt_bg, &[]);
+                pass.draw_indexed(0..*idx_count, 0, 0..1);
             }
-        }
-
-        // 2. Non-MRT path (mixed GSD, independent ancestor grids, rotated/multi-sensor):
-        //    render each band into its dedicated `R32Float` scratch target (`LoadOp::Load`).
-        if mrt_patch_offsets.is_none() {
+        } else {
             for ((band, offsets), view) in bm
                 .bands
                 .iter()
@@ -857,13 +885,13 @@ impl OverlayRenderer {
                 .zip(float_views[..band_count].iter())
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("band-math single-band R32Float scratch pass"),
+                    label: Some("band-math single-band NaN fill + R32Float scratch pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -873,46 +901,19 @@ impl OverlayRenderer {
                     multiview_mask: None,
                 });
                 pass.set_scissor_rect(sx, sy, sw, sh);
+                pass.set_pipeline(pipelines.clear_for_count(1));
+                pass.set_bind_group(0, scratch.nan_clear_bind_group(), &[]);
+                pass.draw(0..3, 0..1);
+
                 pass.set_pipeline(&pipelines.band_single);
                 pass.set_bind_group(0, camera_bg, &[]);
-                let mut last_idx_key: Option<(u32, bool)> = None;
-                let mut last_tex_id: Option<u64> = None;
-
-                for (patch, &dyn_offset) in band.patches.iter().zip(offsets.iter()) {
-                    let Some(dyn_offset) = dyn_offset else {
-                        continue;
-                    };
-                    let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {
-                        continue;
-                    };
-                    let Some(tex_bg) = bind_groups.get(&patch.texture, PixelFormat::R32Float)
-                    else {
-                        continue;
-                    };
-                    let idx_key = (mesh.segments, mesh.flip_winding);
-                    let Some((idx_buf, idx_count)) = self.index_buffers.get(&idx_key) else {
-                        continue;
-                    };
-                    if last_idx_key != Some(idx_key) {
-                        pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
-                        last_idx_key = Some(idx_key);
-                    }
-                    if last_tex_id != Some(patch.texture.tile_id) {
-                        pass.set_bind_group(2, tex_bg, &[]);
-                        last_tex_id = Some(patch.texture.tile_id);
-                    }
-                    pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-                    pass.set_bind_group(
-                        1,
-                        arena.bind_group(UniformSlot::ScratchSingle),
-                        &[dyn_offset],
-                    );
-                    pass.draw_indexed(0..*idx_count, 0, 0..1);
-                }
+                self.record_scratch_single_patches(&mut pass, &band.patches, offsets, arena, |t| {
+                    bind_groups.get(t, PixelFormat::R32Float)
+                });
             }
         }
 
-        // 3. Optional nearest-neighbor `R8Uint` `SCL` mask pass (cleared to 255u sentinel).
+        // 2. Optional nearest-neighbor `R8Uint` `SCL` mask pass (cleared to 255u sentinel).
         if !mask_offsets.is_empty()
             && let Some(scl) = &bm.scl
             && let Some(mask_view) = scratch.mask_view()
@@ -941,39 +942,9 @@ impl OverlayRenderer {
             pass.set_scissor_rect(sx, sy, sw, sh);
             pass.set_pipeline(&pipelines.mask_u8);
             pass.set_bind_group(0, camera_bg, &[]);
-            let mut last_idx_key: Option<(u32, bool)> = None;
-            let mut last_tex_id: Option<u64> = None;
-
-            for (patch, &dyn_offset) in scl.patches.iter().zip(mask_offsets.iter()) {
-                let Some(dyn_offset) = dyn_offset else {
-                    continue;
-                };
-                let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {
-                    continue;
-                };
-                let Some(tex_bg) = bind_groups.get_uint(&patch.texture) else {
-                    continue;
-                };
-                let idx_key = (mesh.segments, mesh.flip_winding);
-                let Some((idx_buf, idx_count)) = self.index_buffers.get(&idx_key) else {
-                    continue;
-                };
-                if last_idx_key != Some(idx_key) {
-                    pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
-                    last_idx_key = Some(idx_key);
-                }
-                if last_tex_id != Some(patch.texture.tile_id) {
-                    pass.set_bind_group(2, tex_bg, &[]);
-                    last_tex_id = Some(patch.texture.tile_id);
-                }
-                pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-                pass.set_bind_group(
-                    1,
-                    arena.bind_group(UniformSlot::ScratchSingle),
-                    &[dyn_offset],
-                );
-                pass.draw_indexed(0..*idx_count, 0, 0..1);
-            }
+            self.record_scratch_single_patches(&mut pass, &scl.patches, mask_offsets, arena, |t| {
+                bind_groups.get_uint(t)
+            });
         }
 
         true

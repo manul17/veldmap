@@ -206,7 +206,7 @@ impl<'a> TiffChunkReader<'a> {
             alpha_mode,
             ifd,
             color_map,
-            self.view.nodata_f64,
+            self.view.nodata_for_band(0),
             pixels,
         ))
     }

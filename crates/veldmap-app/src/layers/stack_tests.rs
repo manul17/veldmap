@@ -217,6 +217,10 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
 
 #[test]
 fn multi_stream_appetite_weight_and_opt_in_pin_root() {
+    use crate::layers::asset::{GeoBinding, LayerOrigin, RasterAsset};
+    use crate::layers::band_math::{BandMathPreset, BandMathStyle};
+    use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
+
     let mut stack = LayerStack::default();
     let mut layer = make_layer(10, 10, 10.0);
     assert!(
@@ -225,27 +229,6 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
     );
     layer.set_pin_root(false);
     assert!(!layer.pin_root());
-
-    let primary_key = layer.meta().stream_key();
-    let extra_spec = veldmap_core::tile::TileStreamSpec {
-        band: veldmap_core::tile::BandKey::Index(1),
-        format: veldmap_core::tile::PixelFormat::R8Uint,
-        gutter: 0,
-        decode_rev: 0,
-    };
-    let mut extra_meta = layer.meta().clone();
-    extra_meta.spec = extra_spec;
-    layer.push_aux_stream_for_test(extra_meta);
-    let extra_key = layer.streams()[1].stream_key();
-
-    // Distinct streams sharing one SourceId track independent tile-byte weights
-    // and sum cleanly for multi-band VRAM appetite budgeting.
-    layer.observe_stream_tile_bytes(primary_key, 2_000_000);
-    layer.observe_stream_tile_bytes(extra_key, 262_144);
-    assert_eq!(layer.streams()[0].observed_tile_bytes(), 2_000_000);
-    assert_eq!(layer.streams()[1].observed_tile_bytes(), 262_144);
-    assert_eq!(layer.appetite_weight_bytes(), 2_000_000 + 262_144);
-    assert_eq!(layer.cell_observed_bytes(), 2_000_000 + 262_144);
 
     // Reloading preserves opt-in `pin_root` flag.
     let reloaded_src = StubSource::arc(11, 512, 512);
@@ -273,9 +256,65 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
         .set_pin_root(true);
     stack.extend_pinned_root_streams(&mut pinned);
     assert_eq!(pinned.len(), 1);
-    // Calling extend a second time deduplicates cleanly.
     stack.extend_pinned_root_streams(&mut pinned);
     assert_eq!(pinned.len(), 1);
+
+    // Multi-asset BandMath layer tracks independent per-stream tile bytes,
+    // excludes disabled SCL from active streams / appetite / pinned roots, and
+    // deduplicates shared StreamKeys across the stack.
+    let make_asset = |tag: u8, band: u16, format: PixelFormat| {
+        let src = StubSource::arc(tag, 512, 512);
+        let mut meta = src
+            .pyramid_meta(veldmap_raster::DISPLAY_STREAM_SPEC)
+            .expect("meta");
+        meta.spec = TileStreamSpec {
+            band: BandKey::Index(band),
+            format,
+            gutter: 0,
+            decode_rev: 0,
+        };
+        let geo = GeoBinding::new(utm_frame(10.0), 512, 512, meta.max_level(), None, 1);
+        RasterAsset::new(
+            format!("B{band}"),
+            LayerOrigin::Local {
+                path: PathBuf::from(format!("/tmp/b{tag}.tif")),
+            },
+            src,
+            geo,
+            meta,
+        )
+    };
+    let mut bm = OverlayLayer::from_band_math(
+        LayerId(20),
+        "NDVI + SCL".to_owned(),
+        vec![
+            make_asset(21, 0, PixelFormat::R32Float),
+            make_asset(21, 1, PixelFormat::R32Float),
+        ],
+        Some(make_asset(22, 0, PixelFormat::R8Uint)),
+        BandMathStyle::from_preset(BandMathPreset::Ndvi, true),
+    );
+    let k0 = bm.streams()[0].stream_key();
+    let k1 = bm.streams()[1].stream_key();
+    let kscl = bm.streams()[2].stream_key();
+    bm.observe_stream_tile_bytes(k0, 2_000_000);
+    bm.observe_stream_tile_bytes(k1, 1_500_000);
+    bm.observe_stream_tile_bytes(kscl, 262_144);
+    assert_eq!(bm.appetite_weight_bytes(), 2_000_000 + 1_500_000 + 262_144);
+    assert_eq!(bm.cell_observed_bytes(), 2_000_000 + 1_500_000 + 262_144);
+
+    // Disabling SCL removes it from active streams, appetite weight, and pinned roots.
+    bm.band_math_mut()
+        .unwrap()
+        .style
+        .set_scl_mask_enabled(false);
+    assert_eq!(bm.streams().len(), 2);
+    assert_eq!(bm.appetite_weight_bytes(), 2_000_000 + 1_500_000);
+    let mut bm_stack = LayerStack::default();
+    bm_stack.push(bm);
+    let mut bm_pinned = Vec::new();
+    bm_stack.extend_pinned_root_streams(&mut bm_pinned);
+    assert_eq!(bm_pinned, vec![k0, k1]);
 }
 
 #[test]

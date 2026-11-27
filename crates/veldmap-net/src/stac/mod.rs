@@ -9,7 +9,8 @@ mod types;
 
 pub use self::client::StacClient;
 pub use self::samples::{
-    SampleRecipeBand, SampleRecipeScene, SampleScene, builtin_sample_recipes, builtin_sample_scenes,
+    SampleRecipeBand, SampleRecipeKind, SampleRecipeScene, SampleScene, builtin_sample_recipes,
+    builtin_sample_scenes,
 };
 pub use self::types::{
     StacAsset, StacAuth, StacCatalogConfig, StacError, StacItem, StacRasterBandMeta,

@@ -471,6 +471,7 @@ impl LayerStyle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LayerBandOption {
     pub(crate) label: String,
+    pub(crate) short_label: String,
     pub(crate) spec: TileStreamSpec,
 }
 
@@ -479,12 +480,14 @@ pub(super) fn build_band_options(desc: &RasterDescription) -> Vec<LayerBandOptio
     let mut opts = Vec::new();
     opts.push(LayerBandOption {
         label: "Display (RGB)".to_owned(),
+        short_label: "Display".to_owned(),
         spec: DISPLAY_STREAM_SPEC,
     });
     for info in desc.indexed_bands() {
         let base_label = format_band_label(info);
         opts.push(LayerBandOption {
             label: format!("{base_label} · Scientific (f32)"),
+            short_label: base_label.clone(),
             spec: stream_spec_for_band(info.band_key, PixelFormat::R32Float),
         });
         if let Some(cat_fmt) = info.sample_type.categorical_pixel_format() {
@@ -495,6 +498,7 @@ pub(super) fn build_band_options(desc: &RasterDescription) -> Vec<LayerBandOptio
             };
             opts.push(LayerBandOption {
                 label: format!("{base_label} · Categorical ({fmt_tag})"),
+                short_label: base_label,
                 spec: stream_spec_for_band(info.band_key, cat_fmt),
             });
         }

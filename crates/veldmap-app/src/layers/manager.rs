@@ -27,7 +27,7 @@ use crate::worker::SingleThreadWorker;
 
 use super::cursor::CursorProber;
 use super::disk_cache::TileWriteWorker;
-use super::frame::{LayerFrameCtx, build_and_schedule_layer};
+use super::frame::{LayerFrameCtx, PrepareFrameCtx, finish_scheduled_layer, prepare_layer_wanted};
 use super::io_worker::{OverlayIoCmd, OverlayIoResult, spawn_overlay_io_worker};
 use super::jobs::band_stats::BandStatsTracker;
 use super::opener::bind_frame_with_override;
@@ -316,11 +316,38 @@ impl OverlayManager {
                     .band_math_mut()
                     .is_some_and(|bm| bm.style.reset_stretch())
             }),
-            OverlayEdit::SetBandMathSclEnabled(enabled) => self.mutate_layer(id, |layer| {
-                layer
-                    .band_math_mut()
-                    .is_some_and(|bm| bm.style.set_scl_mask_enabled(enabled))
-            }),
+            OverlayEdit::SetBandMathSclEnabled(enabled) => {
+                let (changed, disabled_scl_stream) = {
+                    let Some(layer) = self.stack.get_mut(id) else {
+                        return OverlayMutation::default();
+                    };
+                    let Some(bm) = layer.band_math_mut() else {
+                        return OverlayMutation::default();
+                    };
+                    if !bm.style.set_scl_mask_enabled(enabled) {
+                        return OverlayMutation::default();
+                    }
+                    let disabled = if !enabled {
+                        if let Some(scl) = &mut bm.scl {
+                            scl.clear_wanted();
+                            Some(scl.meta().stream_key())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    (true, disabled)
+                };
+                if let Some(sk) = disabled_scl_stream {
+                    self.cancel_stream_if_unused(sk);
+                }
+                OverlayMutation {
+                    changed,
+                    topology_changed: changed,
+                    purge_sources: Vec::new(),
+                }
+            }
             OverlayEdit::SetBandMathSclMaskBits(bits) => self.mutate_layer(id, |layer| {
                 layer
                     .band_math_mut()
@@ -355,6 +382,23 @@ impl OverlayManager {
         ))
     }
 
+    pub(super) fn cancel_stream_if_unused(&self, stream_key: StreamKey) {
+        let still_used = self
+            .stack
+            .layers()
+            .iter()
+            .any(|l| l.is_active() && l.streams().iter().any(|s| s.stream_key() == stream_key));
+        if !still_used {
+            self.runtime.cancel_stream(stream_key);
+        }
+    }
+
+    pub(crate) fn is_layer_persistable(&self, id: LayerId) -> bool {
+        self.stack
+            .get(id)
+            .is_some_and(|l| l.persist_entry().is_some())
+    }
+
     /// Remove a layer from [`LayerStack`], cancelling active jobs and returning
     /// its `SourceId`(s) for GPU/pending purge unless another layer still shares
     /// that exact content fingerprint.
@@ -367,36 +411,52 @@ impl OverlayManager {
             tok.cancel();
         }
         let sources = removed.all_source_ids();
+        let stream_keys = removed.all_stream_keys();
         let mut mutation = OverlayMutation {
             changed: true,
             topology_changed: true,
             purge_sources: Vec::new(),
         };
+        let mut purged_sources = Vec::new();
         for src in sources {
             if self.stack.count_sharing_source(src) == 0 {
                 self.purge_source(src);
                 mutation.purge_sources.push(src);
+                purged_sources.push(src);
             } else if !self.stack.has_visible_source(src) {
                 self.purge_source(src);
+                purged_sources.push(src);
+            }
+        }
+        for sk in stream_keys {
+            if !purged_sources.contains(&sk.source) {
+                self.cancel_stream_if_unused(sk);
             }
         }
         mutation
     }
 
     fn set_visible(&mut self, id: LayerId, visible: bool) -> OverlayMutation {
-        let sources = {
+        let (sources, stream_keys) = {
             let Some(layer) = self.stack.get_mut(id) else {
                 return OverlayMutation::default();
             };
             if !layer.set_visible(visible) {
                 return OverlayMutation::default();
             }
-            layer.all_source_ids()
+            (layer.all_source_ids(), layer.all_stream_keys())
         };
         if !visible {
+            let mut purged_sources = Vec::new();
             for src in sources {
                 if !self.stack.has_visible_source(src) {
                     self.purge_source(src);
+                    purged_sources.push(src);
+                }
+            }
+            for sk in stream_keys {
+                if !purged_sources.contains(&sk.source) {
+                    self.cancel_stream_if_unused(sk);
                 }
             }
         }
@@ -423,14 +483,7 @@ impl OverlayManager {
         if !changed {
             return Ok(OverlayMutation::default());
         }
-        let still_used = self
-            .stack
-            .layers()
-            .iter()
-            .any(|l| l.is_active() && l.streams().iter().any(|s| s.stream_key() == old_stream));
-        if !still_used {
-            self.runtime.cancel_stream(old_stream);
-        }
+        self.cancel_stream_if_unused(old_stream);
         if let Some(layer) = self.stack.get(id) {
             self.cursor.invalidate_source(layer.source_id());
         }
@@ -491,8 +544,9 @@ impl OverlayManager {
     }
 
     /// Build immutable [`DrawOverlayLayer`]s for the current frame, update
-    /// per-layer wanted sets across all ladder rungs, and schedule missing
-    /// tiles onto the two-lane decode pool.
+    /// per-layer wanted sets across all ladder rungs, reconcile stale pointwise
+    /// jobs once across unioned active streams, and schedule missing tiles onto
+    /// the two-lane decode pool.
     pub(crate) fn build_and_schedule(
         &mut self,
         ctx: &mut OverlayFrameCtx<'_>,
@@ -500,23 +554,41 @@ impl OverlayManager {
         let aspect = f64::from(ctx.width_px.max(1)) / f64::from(ctx.height_px.max(1));
         let frustum = ctx.camera.frustum(aspect);
         let viewport_mpp = ctx.camera.metres_per_pixel(f64::from(ctx.height_px.max(1)));
-        let mut layer_ctx = LayerFrameCtx {
-            runtime: &self.runtime,
+
+        // Phase 1: compute visible target/ladder rungs and replace `wanted` on
+        // every active asset before reconciling so shared `StreamKey`s union.
+        let prep_ctx = PrepareFrameCtx {
             frustum: &frustum,
             viewport_mpp,
             gpu_cache: ctx.gpu_cache,
-            pending: ctx.pending,
             total_appetite_weight: ctx.total_appetite_weight,
-            carrier_keys: ctx.carrier_keys,
         };
-
-        let mut draw_layers = Vec::new();
         let mut stats_needed_ids = Vec::new();
+        let mut prepared = Vec::with_capacity(self.stack.layers().len());
         for layer in self.stack.layers_mut() {
             if layer.needs_band_stats().is_some() {
                 stats_needed_ids.push(layer.id());
             }
-            if let Some(draw_layer) = build_and_schedule_layer(layer, &mut layer_ctx) {
+            prepared.push(prepare_layer_wanted(layer, &prep_ctx));
+        }
+
+        // Phase 2: reconcile in-flight pointwise jobs once across the union of
+        // all active layers' wanted sets.
+        self.reconcile(ctx.gpu_cache, ctx.pending);
+
+        // Phase 3: build draw patches from cached carriers and schedule missing
+        // tiles onto `fast_pool` / `bulk_pool`.
+        let mut layer_ctx = LayerFrameCtx {
+            runtime: &self.runtime,
+            gpu_cache: ctx.gpu_cache,
+            pending: ctx.pending,
+            carrier_keys: ctx.carrier_keys,
+        };
+        let mut draw_layers = Vec::new();
+        for (layer, plan) in self.stack.layers().iter().zip(prepared) {
+            if let Some(plan) = plan
+                && let Some(draw_layer) = finish_scheduled_layer(layer, plan, &mut layer_ctx)
+            {
                 draw_layers.push(draw_layer);
             }
         }

@@ -10,7 +10,11 @@ use veldmap_core::tile::PixelFormat;
 use crate::gpu_tiles::GpuTile;
 
 type CachedBindGroupEntry = (Weak<GpuTile>, PixelFormat, wgpu::BindGroup);
-type CachedMrtBindGroupEntry = ([Weak<GpuTile>; 4], wgpu::BindGroup);
+type CachedMrtBindGroupEntry = ([Weak<GpuTile>; 4], wgpu::BindGroup, u64);
+
+/// Soft ceiling on combinatorial live 4-band MRT bind-group tuples pruned on
+/// frame start (strictly keeping entries touched during the active frame).
+const MAX_MRT_BIND_GROUPS: usize = 512;
 
 fn entry_matches(
     entry: &CachedBindGroupEntry,
@@ -45,6 +49,7 @@ pub struct TileBindGroupCache {
     tile_sampler: wgpu::Sampler,
     entries: HashMap<u64, CachedBindGroupEntry>,
     mrt_entries: HashMap<[u64; 4], CachedMrtBindGroupEntry>,
+    mrt_epoch: u64,
 }
 
 impl TileBindGroupCache {
@@ -88,50 +93,20 @@ impl TileBindGroupCache {
             }],
         });
 
+        let r32f_mrt_entries: [wgpu::BindGroupLayoutEntry; 4] =
+            std::array::from_fn(|binding| wgpu::BindGroupLayoutEntry {
+                binding: binding as u32,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            });
         let r32f_mrt_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tile R32Float MRT 4-band texture layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &r32f_mrt_entries,
         });
 
         let uint_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -167,6 +142,7 @@ impl TileBindGroupCache {
             tile_sampler,
             entries: HashMap::new(),
             mrt_entries: HashMap::new(),
+            mrt_epoch: 0,
         }
     }
 
@@ -258,43 +234,43 @@ impl TileBindGroupCache {
         self.get(gpu_tile, gpu_tile.format)
     }
 
+    /// Advance the MRT frame epoch and prune stale unused combinatorial tuples
+    /// when `mrt_entries` exceeds [`MAX_MRT_BIND_GROUPS`]. Must be called once
+    /// per frame *before* `ensure_mrt` so active-frame tuples are never evicted.
+    pub(super) fn begin_mrt_frame(&mut self) {
+        self.mrt_epoch = self.mrt_epoch.wrapping_add(1);
+        if self.mrt_entries.len() > MAX_MRT_BIND_GROUPS {
+            let prev_epoch = self.mrt_epoch.wrapping_sub(1);
+            self.mrt_entries.retain(|_, (weaks, _, epoch)| {
+                *epoch == prev_epoch && weaks.iter().all(|w| w.strong_count() > 0)
+            });
+        }
+    }
+
     /// Ensure a 4-texture `R32Float` MRT bind group exists for `tiles`.
     pub(super) fn ensure_mrt(&mut self, device: &wgpu::Device, tiles: [&Arc<GpuTile>; 4]) {
         if tiles.iter().any(|t| t.format != PixelFormat::R32Float) {
             return;
         }
         let key = tiles.map(|t| t.tile_id);
-        let reuse = self
-            .mrt_entries
-            .get(&key)
-            .is_some_and(|entry| mrt_entry_matches(entry, tiles));
-        if reuse {
+        if let Some(entry) = self.mrt_entries.get_mut(&key)
+            && mrt_entry_matches(entry, tiles)
+        {
+            entry.2 = self.mrt_epoch;
             return;
         }
+        let entries: [wgpu::BindGroupEntry<'_>; 4] =
+            std::array::from_fn(|i| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: wgpu::BindingResource::TextureView(&tiles[i].view),
+            });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tile R32Float MRT 4-band bind group"),
             layout: &self.r32f_mrt_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&tiles[0].view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&tiles[1].view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&tiles[2].view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&tiles[3].view),
-                },
-            ],
+            entries: &entries,
         });
         self.mrt_entries
-            .insert(key, (tiles.map(Arc::downgrade), bg));
+            .insert(key, (tiles.map(Arc::downgrade), bg, self.mrt_epoch));
     }
 
     /// Look up the cached 4-texture MRT bind group for `tiles`.
@@ -310,7 +286,7 @@ impl TileBindGroupCache {
         self.entries
             .retain(|_, (weak, _, _)| weak.strong_count() > 0);
         self.mrt_entries
-            .retain(|_, (weaks, _)| weaks.iter().all(|w| w.strong_count() > 0));
+            .retain(|_, (weaks, _, _)| weaks.iter().all(|w| w.strong_count() > 0));
     }
 
     /// Total cached bind groups across all pixel formats.

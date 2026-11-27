@@ -10,6 +10,104 @@ use crate::ui::widgets::{DragCommit, track_drag_commit};
 use super::LayerUiAction;
 use super::histogram::paint_interactive_histogram;
 
+/// Shared `Ramp` ComboBox + `Inv` checkbox reused across scientific single-band
+/// and scalar Band Math layer cards.
+pub(super) fn show_colormap_picker(
+    ui: &mut egui::Ui,
+    id_salt: (&str, LayerId),
+    layer_id: LayerId,
+    colormap: ColormapId,
+    invert_colormap: bool,
+    actions: &mut Vec<LayerUiAction>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Ramp").small());
+        let mut cmap = colormap;
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(egui::RichText::new(cmap.label()).small())
+            .width(114.0)
+            .show_ui(ui, |ui| {
+                for opt in ColormapId::ALL {
+                    if ui.selectable_value(&mut cmap, opt, opt.label()).clicked() {
+                        actions.push(LayerUiAction::edit_raster(
+                            layer_id,
+                            OverlayEdit::SetColormap {
+                                colormap: opt,
+                                invert: invert_colormap,
+                            },
+                        ));
+                    }
+                }
+            });
+        let mut invert = invert_colormap;
+        if ui
+            .checkbox(&mut invert, egui::RichText::new("Inv").small())
+            .changed()
+        {
+            actions.push(LayerUiAction::edit_raster(
+                layer_id,
+                OverlayEdit::SetColormap { colormap, invert },
+            ));
+        }
+    });
+}
+
+pub(super) enum MinMaxEvent {
+    None,
+    Drag { min: f64, max: f64, commit: bool },
+    Reset,
+}
+
+/// Shared `Min`/`Max` `DragValue` row with `track_drag_commit` and optional
+/// `Reset` button reused across scientific and Band Math layer cards.
+pub(super) fn show_min_max_drag(
+    ui: &mut egui::Ui,
+    drag_salt: (&str, LayerId),
+    mut lo: f64,
+    mut hi: f64,
+    reset_tooltip: Option<&str>,
+) -> MinMaxEvent {
+    let speed = ((hi - lo).abs() * 0.005).max(1e-4);
+    let drag_id = ui.scope_id().with(drag_salt);
+    let mut event = MinMaxEvent::None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Min").small());
+        let r_lo = ui.add(egui::DragValue::new(&mut lo).speed(speed).max_decimals(4));
+        ui.label(egui::RichText::new("Max").small());
+        let r_hi = ui.add(egui::DragValue::new(&mut hi).speed(speed).max_decimals(4));
+        if let Some(tip) = reset_tooltip
+            && ui.small_button("Reset").on_hover_text(tip).clicked()
+        {
+            event = MinMaxEvent::Reset;
+            return;
+        }
+        match track_drag_commit(
+            ui,
+            drag_id,
+            r_lo.changed() || r_hi.changed(),
+            r_lo.dragged() || r_hi.dragged(),
+            r_lo.drag_stopped() || r_hi.drag_stopped(),
+        ) {
+            DragCommit::None => {}
+            DragCommit::Preview => {
+                event = MinMaxEvent::Drag {
+                    min: lo,
+                    max: hi,
+                    commit: false,
+                };
+            }
+            DragCommit::Commit => {
+                event = MinMaxEvent::Drag {
+                    min: lo,
+                    max: hi,
+                    commit: true,
+                };
+            }
+        }
+    });
+    event
+}
+
 pub(super) fn show_scientific_controls(
     ui: &mut egui::Ui,
     layer_id: LayerId,
@@ -34,73 +132,24 @@ pub(super) fn show_scientific_controls(
             });
     });
 
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Ramp").small());
-        let mut cmap = sci.colormap;
-        egui::ComboBox::from_id_salt(("colormap", layer_id))
-            .selected_text(egui::RichText::new(cmap.label()).small())
-            .width(110.0)
-            .show_ui(ui, |ui| {
-                for opt in ColormapId::ALL {
-                    if ui.selectable_value(&mut cmap, opt, opt.label()).clicked() {
-                        actions.push(LayerUiAction::edit_raster(
-                            layer_id,
-                            OverlayEdit::SetColormap {
-                                colormap: opt,
-                                invert: sci.invert_colormap,
-                            },
-                        ));
-                    }
-                }
-            });
-        let mut invert = sci.invert_colormap;
-        if ui
-            .checkbox(&mut invert, egui::RichText::new("Inv").small())
-            .changed()
-        {
-            actions.push(LayerUiAction::edit_raster(
-                layer_id,
-                OverlayEdit::SetColormap {
-                    colormap: sci.colormap,
-                    invert,
-                },
-            ));
-        }
-    });
+    show_colormap_picker(
+        ui,
+        ("colormap", layer_id),
+        layer_id,
+        sci.colormap,
+        sci.invert_colormap,
+        actions,
+    );
 
-    let mut lo = sci.min;
-    let mut hi = sci.max;
-    let speed = ((sci.max - sci.min).abs() * 0.005).max(1e-4);
-    let drag_dirty_id = ui.scope_id().with(("stretch_drag_dirty", layer_id));
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Min").small());
-        let r_lo = ui.add(egui::DragValue::new(&mut lo).speed(speed).max_decimals(4));
-        ui.label(egui::RichText::new("Max").small());
-        let r_hi = ui.add(egui::DragValue::new(&mut hi).speed(speed).max_decimals(4));
-        match track_drag_commit(
-            ui,
-            drag_dirty_id,
-            r_lo.changed() || r_hi.changed(),
-            r_lo.dragged() || r_hi.dragged(),
-            r_lo.drag_stopped() || r_hi.drag_stopped(),
-        ) {
-            DragCommit::None => {}
-            DragCommit::Preview => {
-                actions.push(LayerUiAction::edit_raster_drag(
-                    layer_id,
-                    OverlayEdit::SetStretchRange { min: lo, max: hi },
-                    false,
-                ));
-            }
-            DragCommit::Commit => {
-                actions.push(LayerUiAction::edit_raster_drag(
-                    layer_id,
-                    OverlayEdit::SetStretchRange { min: lo, max: hi },
-                    true,
-                ));
-            }
-        }
-    });
+    if let MinMaxEvent::Drag { min, max, commit } =
+        show_min_max_drag(ui, ("stretch_drag_dirty", layer_id), sci.min, sci.max, None)
+    {
+        actions.push(LayerUiAction::edit_raster_drag(
+            layer_id,
+            OverlayEdit::SetStretchRange { min, max },
+            commit,
+        ));
+    }
 
     paint_interactive_histogram(ui, layer_id, sci, actions);
 }

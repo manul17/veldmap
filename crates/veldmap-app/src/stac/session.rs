@@ -112,6 +112,7 @@ fn external_bands_from_asset(asset: &StacAsset) -> Vec<ExternalBandMeta> {
 }
 
 fn external_bands_from_sample(
+    band_count: u8,
     scale: Option<f64>,
     offset: Option<f64>,
     nodata: Option<f64>,
@@ -124,7 +125,7 @@ fn external_bands_from_sample(
         unit: unit.map(str::to_owned),
     };
     if meta.has_any() {
-        vec![meta]
+        vec![meta; usize::from(band_count.max(1))]
     } else {
         Vec::new()
     }
@@ -134,7 +135,13 @@ fn recipe_asset_from_sample(band: &SampleRecipeBand) -> StacRecipeAssetView {
     StacRecipeAssetView {
         label: band.label.to_owned(),
         href: RedactedUrl::new(band.url),
-        external_bands: external_bands_from_sample(band.scale, band.offset, band.nodata, band.unit),
+        external_bands: external_bands_from_sample(
+            1,
+            band.scale,
+            band.offset,
+            band.nodata,
+            band.unit,
+        ),
     }
 }
 
@@ -149,6 +156,7 @@ fn builtin_sample_scene_views() -> &'static [SampleSceneView] {
                 description: sample.description,
                 cog_url: sample.cog_url,
                 external_bands: external_bands_from_sample(
+                    sample.band_count,
                     sample.scale,
                     sample.offset,
                     sample.nodata,
@@ -168,12 +176,20 @@ fn builtin_sample_recipe_views() -> &'static [SampleRecipeView] {
             .map(|recipe| SampleRecipeView {
                 title: recipe.title,
                 description: recipe.description,
-                preset: BandMathPreset::from_recipe_id(recipe.recipe_id),
+                preset: BandMathPreset::from_sample_kind(recipe.kind),
                 bands: recipe.bands.iter().map(recipe_asset_from_sample).collect(),
                 scl: recipe.scl.as_ref().map(recipe_asset_from_sample),
             })
             .collect()
     })
+}
+
+fn format_recipe_band_label(key: &str, role: &str) -> String {
+    if key.eq_ignore_ascii_case(role) {
+        role.to_owned()
+    } else {
+        format!("{key} ({role})")
+    }
 }
 
 fn build_asset_view(asset: &StacAsset) -> StacCogAssetView {
@@ -214,9 +230,9 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
                 r.key, g.key, b.key
             ),
             bands: vec![
-                recipe_asset_from_stac(&format!("{} (Red)", r.key), r),
-                recipe_asset_from_stac(&format!("{} (Green)", g.key), g),
-                recipe_asset_from_stac(&format!("{} (Blue)", b.key), b),
+                recipe_asset_from_stac(&format_recipe_band_label(&r.key, "Red"), r),
+                recipe_asset_from_stac(&format_recipe_band_label(&g.key, "Green"), g),
+                recipe_asset_from_stac(&format_recipe_band_label(&b.key, "Blue"), b),
             ],
             scl: scl.clone(),
         });
@@ -230,8 +246,8 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
                 n.key, r.key, n.key, r.key
             ),
             bands: vec![
-                recipe_asset_from_stac(&format!("{} (NIR)", n.key), n),
-                recipe_asset_from_stac(&format!("{} (Red)", r.key), r),
+                recipe_asset_from_stac(&format_recipe_band_label(&n.key, "NIR"), n),
+                recipe_asset_from_stac(&format_recipe_band_label(&r.key, "Red"), r),
             ],
             scl: scl.clone(),
         });
@@ -245,8 +261,8 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
                 g.key, n.key, g.key, n.key
             ),
             bands: vec![
-                recipe_asset_from_stac(&format!("{} (Green)", g.key), g),
-                recipe_asset_from_stac(&format!("{} (NIR)", n.key), n),
+                recipe_asset_from_stac(&format_recipe_band_label(&g.key, "Green"), g),
+                recipe_asset_from_stac(&format_recipe_band_label(&n.key, "NIR"), n),
             ],
             scl: scl.clone(),
         });
@@ -260,9 +276,9 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
                 n.key, r.key, g.key
             ),
             bands: vec![
-                recipe_asset_from_stac(&format!("{} (NIR)", n.key), n),
-                recipe_asset_from_stac(&format!("{} (Red)", r.key), r),
-                recipe_asset_from_stac(&format!("{} (Green)", g.key), g),
+                recipe_asset_from_stac(&format_recipe_band_label(&n.key, "NIR"), n),
+                recipe_asset_from_stac(&format_recipe_band_label(&r.key, "Red"), r),
+                recipe_asset_from_stac(&format_recipe_band_label(&g.key, "Green"), g),
             ],
             scl: scl.clone(),
         });
@@ -276,9 +292,9 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
                 s.key, n.key, r.key
             ),
             bands: vec![
-                recipe_asset_from_stac(&format!("{} (SWIR)", s.key), s),
-                recipe_asset_from_stac(&format!("{} (NIR)", n.key), n),
-                recipe_asset_from_stac(&format!("{} (Red)", r.key), r),
+                recipe_asset_from_stac(&format_recipe_band_label(&s.key, "SWIR"), s),
+                recipe_asset_from_stac(&format_recipe_band_label(&n.key, "NIR"), n),
+                recipe_asset_from_stac(&format_recipe_band_label(&r.key, "Red"), r),
             ],
             scl,
         });
