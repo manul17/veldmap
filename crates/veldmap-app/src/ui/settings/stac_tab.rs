@@ -39,21 +39,16 @@ pub(super) fn show_stac_tab(ui: &mut egui::Ui, stac: &mut StacSettings) {
             ui.end_row();
 
             ui.label("Auth mode:");
-            let prev_auth_kind = stac.auth_kind;
+            let mut auth_kind = stac.auth_kind;
             egui::ComboBox::from_id_salt("stac_auth_kind")
-                .selected_text(stac.auth_kind.label())
+                .selected_text(auth_kind.label())
                 .width(170.0)
                 .show_ui(ui, |ui| {
                     for kind in StacAuthKind::ALL {
-                        ui.selectable_value(&mut stac.auth_kind, kind, kind.label());
+                        ui.selectable_value(&mut auth_kind, kind, kind.label());
                     }
                 });
-            if stac.auth_kind != prev_auth_kind {
-                // Scrub the hidden secret whenever auth mode changes so a Bearer
-                // token can never leak into a SAS query string or linger on disk
-                // after switching to `None`.
-                stac.auth_secret.clear();
-            }
+            stac.set_auth_kind(auth_kind);
             ui.end_row();
 
             if stac.auth_kind == StacAuthKind::ApiKey {

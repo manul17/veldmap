@@ -1,29 +1,19 @@
 //! MGRS grid reference parsing into WGS84 coordinates for Go-To navigation.
 
-use thiserror::Error;
-
 use super::crs::System;
 use super::geodesy::unwind;
 
 /// Errors produced when parsing an MGRS grid reference.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MgrsError {
-    #[error("MGRS code '{0}' has invalid length or format")]
-    InvalidFormat(String),
-    #[error("MGRS zone in '{0}' is not a valid integer")]
-    InvalidZoneNumber(String),
-    #[error("MGRS UTM zone {0} is out of range (expected 1..=60)")]
+    InvalidFormat,
+    InvalidZoneNumber,
     ZoneOutOfRange(u32),
-    #[error("MGRS latitude band '{0}' is invalid")]
     InvalidBand(char),
-    #[error("MGRS zone {zone}{band} does not exist")]
     InvalidZoneBand { zone: u32, band: char },
-    #[error("MGRS 100 km column '{col}' is invalid in zone {zone}")]
     InvalidColumn { col: char, zone: u32 },
-    #[error("MGRS 100 km row '{0}' is invalid")]
     InvalidRow(char),
-    #[error("MGRS numerical grid coordinates '{0}' must have an even number of 2..=10 digits")]
-    InvalidDigits(String),
+    InvalidDigits,
 }
 
 /// Side of an MGRS 100 km square in metres.
@@ -198,7 +188,7 @@ fn square_geo_bounds(system: &System, easting: f64, northing: f64) -> (f64, f64,
 pub(super) fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> {
     let trimmed = input.trim();
     if trimmed.is_empty() || !trimmed.is_ascii() {
-        return Err(MgrsError::InvalidFormat(input.to_owned()));
+        return Err(MgrsError::InvalidFormat);
     }
 
     // Track non-whitespace byte positions so we can validate whitespace-separated
@@ -212,7 +202,7 @@ pub(super) fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> 
         }
     }
     if compact.is_empty() {
-        return Err(MgrsError::InvalidFormat(input.to_owned()));
+        return Err(MgrsError::InvalidFormat);
     }
 
     // Allow Sentinel-2 tile notation with leading `T` (e.g. `T40WFC`).
@@ -222,13 +212,11 @@ pub(super) fn parse_to_wgs84(input: &str) -> Result<(f64, f64, f64), MgrsError> 
 
     let zone_digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
     if !(1..=2).contains(&zone_digits) || bytes.len() < zone_digits + 3 {
-        return Err(MgrsError::InvalidFormat(input.to_owned()));
+        return Err(MgrsError::InvalidFormat);
     }
-    let zone_str = std::str::from_utf8(&bytes[..zone_digits])
-        .map_err(|_| MgrsError::InvalidZoneNumber(input.to_owned()))?;
-    let zone: u32 = zone_str
-        .parse()
-        .map_err(|_| MgrsError::InvalidZoneNumber(input.to_owned()))?;
+    let zone_str =
+        std::str::from_utf8(&bytes[..zone_digits]).map_err(|_| MgrsError::InvalidZoneNumber)?;
+    let zone: u32 = zone_str.parse().map_err(|_| MgrsError::InvalidZoneNumber)?;
 
     let band = bytes[zone_digits];
     let col = bytes[zone_digits + 1];
@@ -291,7 +279,7 @@ fn parse_grid_digits(raw_digits: &str) -> Result<(f64, f64, f64), MgrsError> {
                 || !combined.len().is_multiple_of(2)
                 || combined.len() > 10
             {
-                return Err(MgrsError::InvalidDigits(raw_digits.to_owned()));
+                return Err(MgrsError::InvalidDigits);
             }
             combined.split_at(combined.len() / 2)
         }
@@ -301,19 +289,15 @@ fn parse_grid_digits(raw_digits: &str) -> Result<(f64, f64, f64), MgrsError> {
                 || !e_part.bytes().all(|b| b.is_ascii_digit())
                 || !n_part.bytes().all(|b| b.is_ascii_digit())
             {
-                return Err(MgrsError::InvalidDigits(raw_digits.to_owned()));
+                return Err(MgrsError::InvalidDigits);
             }
             (*e_part, *n_part)
         }
-        _ => return Err(MgrsError::InvalidDigits(raw_digits.to_owned())),
+        _ => return Err(MgrsError::InvalidDigits),
     };
     let step_m = 10_f64.powi(5 - e_str.len() as i32);
-    let e_val: f64 = e_str
-        .parse()
-        .map_err(|_| MgrsError::InvalidDigits(raw_digits.to_owned()))?;
-    let n_val: f64 = n_str
-        .parse()
-        .map_err(|_| MgrsError::InvalidDigits(raw_digits.to_owned()))?;
+    let e_val: f64 = e_str.parse().map_err(|_| MgrsError::InvalidDigits)?;
+    let n_val: f64 = n_str.parse().map_err(|_| MgrsError::InvalidDigits)?;
     Ok(((e_val + 0.5) * step_m, (n_val + 0.5) * step_m, step_m))
 }
 

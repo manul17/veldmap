@@ -229,10 +229,25 @@ pub(crate) fn build_http_client(cfg: &HttpClientConfig<'_>) -> Result<reqwest::C
         .map_err(|err| NetError::HttpClient(err.to_string()))
 }
 
+/// Lazily prune idle host entries whenever a new host is inserted while at
+/// least this many hosts are tracked, preventing unbounded map growth in long
+/// multi-host sessions.
+const HOST_LIMITER_PRUNE_THRESHOLD: usize = 64;
+
 struct HostEntry {
     semaphore: Arc<Semaphore>,
     cooldown_until: Option<Instant>,
     cooldown_notify: Arc<Notify>,
+}
+
+impl HostEntry {
+    fn is_active(&self, max_per_host: usize, now: Instant) -> bool {
+        let has_cooldown = self.cooldown_until.is_some_and(|u| u > now);
+        has_cooldown
+            || Arc::strong_count(&self.semaphore) > 1
+            || self.semaphore.available_permits() < max_per_host
+            || Arc::strong_count(&self.cooldown_notify) > 1
+    }
 }
 
 /// Reason a per-host HTTP permit could not be acquired immediately.
@@ -269,6 +284,11 @@ impl HostLimiters {
         let mut map = lock_unpoisoned(&self.map);
         if let Some(existing) = map.get_mut(host) {
             return f(existing);
+        }
+        if map.len() >= HOST_LIMITER_PRUNE_THRESHOLD {
+            let now = Instant::now();
+            let max_per_host = self.max_per_host;
+            map.retain(|_, entry| entry.is_active(max_per_host, now));
         }
         let entry = map.entry(host.to_owned()).or_insert_with(|| HostEntry {
             semaphore: Arc::new(Semaphore::new(self.max_per_host)),
@@ -374,13 +394,7 @@ impl HostLimiters {
                 }
             }
             let max_per_host = self.max_per_host;
-            map.retain(|_, entry| {
-                let has_cooldown = entry.cooldown_until.is_some_and(|u| u > now);
-                has_cooldown
-                    || Arc::strong_count(&entry.semaphore) > 1
-                    || entry.semaphore.available_permits() < max_per_host
-                    || Arc::strong_count(&entry.cooldown_notify) > 1
-            });
+            map.retain(|_, entry| entry.is_active(max_per_host, now));
         }
         // Notify outside `self.map` so `HostLimiters` remains a strict leaf lock.
         for notify in to_notify {
@@ -451,5 +465,34 @@ mod tests {
             Some(PermitDenied::Cooldown(later)),
             "clearing example.org must leave unrelated host cooldowns intact"
         );
+
+        // Inserting past the prune threshold lazily evicts idle hosts while
+        // keeping hosts with an active permit or active cooldown.
+        let held_permit = limiters
+            .try_acquire_permit("busy.org", now)
+            .expect("busy permit");
+        for i in 0..HOST_LIMITER_PRUNE_THRESHOLD {
+            let host = format!("idle-{i}.example.org");
+            let p = limiters
+                .try_acquire_permit(&host, now)
+                .expect("idle permit");
+            drop(p);
+        }
+        let trigger = limiters
+            .try_acquire_permit("trigger.example.org", now)
+            .expect("trigger permit");
+        drop(trigger);
+        {
+            let map = lock_unpoisoned(&limiters.map);
+            assert!(
+                map.len() < HOST_LIMITER_PRUNE_THRESHOLD,
+                "idle entries should be pruned lazily, got {}",
+                map.len()
+            );
+            assert!(map.contains_key("busy.org"));
+            assert!(map.contains_key("other.org"));
+            assert!(map.contains_key("trigger.example.org"));
+        }
+        drop(held_permit);
     }
 }

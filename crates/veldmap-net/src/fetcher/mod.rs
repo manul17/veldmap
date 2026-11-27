@@ -12,6 +12,7 @@ mod state;
 mod workers;
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,7 @@ const DEFAULT_TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 /// reverse; `HostLimiters` is a leaf lock).
 struct PipelineShared {
     shutdown: CancelToken,
+    shutdown_signaled: AtomicBool,
     state: Mutex<PipelineState>,
     host_limiters: Arc<HostLimiters>,
     notify: Notify,
@@ -111,6 +113,7 @@ impl LiveTilePipeline {
 
         let shared = Arc::new(PipelineShared {
             shutdown,
+            shutdown_signaled: AtomicBool::new(false),
             state: Mutex::new(PipelineState::new(disk_cache.is_some())),
             host_limiters: net.host_limiters(),
             notify: Notify::new(),
@@ -203,6 +206,9 @@ impl LiveTilePipeline {
     /// deterministic shutdown, called BEFORE closing the upload channel or
     /// joining the caller-owned decode pool).
     pub fn signal_shutdown(&self) {
+        if self.shared.shutdown_signaled.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.shared.shutdown.cancel();
         let active_tokens = lock_unpoisoned(&self.shared.state).signal_shutdown();
         for tok in active_tokens {
@@ -211,11 +217,9 @@ impl LiveTilePipeline {
         self.shared.notify.notify_waiters();
     }
 
-    /// Deterministically shut down the pipeline by cancelling its root and
-    /// active per-tile tokens.
-    pub fn shutdown(self) {
-        self.signal_shutdown();
-    }
+    /// Deterministically shut down the pipeline by dropping it (invoking
+    /// [`Self::signal_shutdown`] via `Drop`).
+    pub fn shutdown(self) {}
 }
 
 impl Drop for LiveTilePipeline {

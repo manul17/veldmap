@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{DecodedTile, PixelFormat, RASTER_TILE_SIZE, TileKey};
-use veldmap_net::{HttpRangeSource, PrefetchPin};
+use veldmap_net::{HttpRangeSource, NetContext, PrefetchPin};
 use veldmap_raster::{
-    AdmittedTile, DecodeJob, DecodeJobKey, RasterError, RasterSource, SharedChunkCache,
+    AdmittedTile, ByteRange, DecodeJob, DecodeJobKey, RasterError, RasterSource,
     TileFailureOutcome, generate_tile_mipmaps,
 };
 use veldmap_storage::DiskTileKey;
@@ -15,7 +15,7 @@ use crate::gpu_tiles::tile_format_bytes;
 
 use super::super::disk_cache::load_cached_tile;
 use super::super::runtime::OverlayRuntime;
-use super::coalesce_remote_ranges;
+use super::prefetch_coalesced_ranges;
 
 /// RAII guard guaranteeing a pointwise tile never remains stuck in-flight in
 /// [`veldmap_raster::TileScheduler`] if its `DecodeJob` is evicted from
@@ -201,166 +201,153 @@ fn plan_remote_tile_ranges(
     rt: &OverlayRuntime,
     source: &dyn RasterSource,
     tile_key: TileKey,
-) -> Result<Vec<(u64, u64)>, RasterError> {
+) -> Result<Vec<ByteRange>, RasterError> {
     let spec = tile_key.stream_spec();
-    // Pass a zero-capacity chunk cache when planning pins for `fast_pool` so
-    // every required chunk block is pinned in `PrefetchPin` (cached blocks in
-    // `RangeBlockPool` pin with 0 HTTP RTT) and `SharedChunkCache` LRU eviction
-    // between planning and decode can never cause blocking HTTP I/O on `fast_pool`.
-    let empty_cache = SharedChunkCache::new(0);
     let mut ranges = source.plan_pointwise_byte_ranges(
         spec,
         tile_key.level,
         &[(tile_key.x, tile_key.y)],
         &rt.budget,
-        &empty_cache,
     )?;
     if spec.format == PixelFormat::Rgba8UnormSrgb && source.needs_display_stretch() {
         ranges.extend(source.plan_stretch_byte_ranges()?);
     }
-    Ok(coalesce_remote_ranges(ranges))
+    Ok(ranges)
 }
 
-/// Submit a single pointwise overlay decode job.
-///
-/// Local rasters submit directly to `fast_pool`. Remote COGs acquire a bounded
-/// prefetch slot and spawn an async prefetch task on `NetContext` that checks
-/// SQLite, plans + coalesces + pins required HTTP byte ranges into a
-/// [`PrefetchPin`], and then submits the pure-CPU decode (capturing
-/// `PrefetchPin`) onto `fast_pool`.
-///
-/// Returns `false` if the lane or remote prefetch window is saturated/closed so
-/// the caller stops submitting this rung and backs off cleanly without spinning.
-pub(super) fn submit_pointwise_job(
+fn spawn_remote_pointwise_job(
     admitted: AdmittedTile,
-    source: &Arc<dyn RasterSource>,
-    remote_range: Option<&HttpRangeSource>,
-    fingerprint_hex: &str,
+    source: Arc<dyn RasterSource>,
+    fp: String,
+    range_src: HttpRangeSource,
+    net: Arc<NetContext>,
     runtime: &Arc<OverlayRuntime>,
 ) -> bool {
     let tile_key = admitted.key;
     let job_id = admitted.job_id;
     let cancel = admitted.cancel;
-    let source = Arc::clone(source);
-    let fp = fingerprint_hex.to_owned();
+    let Some(prefetch_permit) = runtime.try_acquire_remote_prefetch() else {
+        let _ = runtime.cancel_pointwise_in_flight(&tile_key, job_id);
+        runtime.note_submit_backoff();
+        return false;
+    };
     let rt = Arc::clone(runtime);
-
-    if source.is_remote()
-        && let (Some(range_src), Some(net)) = (remote_range.cloned(), runtime.net.clone())
-    {
-        let Some(prefetch_permit) = runtime.try_acquire_remote_prefetch() else {
-            let _ = runtime.cancel_pointwise_in_flight(&tile_key, job_id);
-            runtime.note_submit_backoff();
-            return false;
-        };
-        let guard = PointwiseFlightGuard::new(Arc::clone(runtime), tile_key, job_id);
-        let handle = net.handle().clone();
-        let disk_handle = handle.clone();
-        handle.spawn(async move {
-            let _prefetch_permit = prefetch_permit;
-            if cancel.is_cancelled() {
-                guard.mark_cancelled();
-                return;
-            }
-
-            // 1. Fast path: check SQLite disk cache off the async worker thread.
-            if let Some(disk) = rt.disk_cache.clone() {
-                let disk_key = DiskTileKey::from_tile_key(fp.clone(), &tile_key);
-                let cached = disk_handle
-                    .spawn_blocking(move || load_cached_tile(&disk, &disk_key))
-                    .await
-                    .ok()
-                    .flatten();
-                if let Some(tile) = cached {
-                    let _ = deliver_pointwise_tile(&rt, tile_key, tile, &cancel, guard);
-                    return;
-                }
-            }
-
-            if cancel.is_cancelled() {
-                guard.mark_cancelled();
-                return;
-            }
-
-            // 2. Plan and asynchronously prefetch/pin all needed byte ranges.
-            let byte_pairs = match plan_remote_tile_ranges(&rt, source.as_ref(), tile_key) {
-                Ok(pairs) => pairs,
-                Err(err) if err.is_cancelled() => {
-                    guard.mark_cancelled();
-                    return;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        source = ?tile_key.source,
-                        level = tile_key.level,
-                        x = tile_key.x,
-                        y = tile_key.y,
-                        error = %err,
-                        "Remote COG range planning failed"
-                    );
-                    guard.mark_failed(err.is_terminal());
-                    return;
-                }
-            };
-            let pin = if byte_pairs.is_empty() {
-                None
-            } else {
-                match range_src.prefetch_ranges_async(&byte_pairs, &cancel).await {
-                    Ok(pin) => Some(pin),
-                    Err(err) if err.is_cancelled() => {
-                        guard.mark_cancelled();
-                        return;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            source = ?tile_key.source,
-                            level = tile_key.level,
-                            x = tile_key.x,
-                            y = tile_key.y,
-                            error = %err,
-                            "Remote COG range prefetch failed"
-                        );
-                        let terminal = matches!(err, veldmap_core::io::IoError::InvalidInput(_));
-                        guard.mark_failed(terminal);
-                        return;
-                    }
-                }
-            };
-
-            if cancel.is_cancelled() {
-                guard.mark_cancelled();
-                return;
-            }
-
-            // 3. Submit pure CPU decode (holding `PrefetchPin` so zero HTTP I/O
-            //    occurs on `fast_pool`) with rejection cleanup.
-            let job_rt = Arc::clone(&rt);
-            let job_cancel = cancel.clone();
-            let job = DecodeJob {
-                key: DecodeJobKey::Tile(tile_key),
-                queued_bytes: tile_format_bytes(RASTER_TILE_SIZE, tile_key.format),
-                cancel,
-                work: Box::new(move || {
-                    run_pointwise_job(PointwiseRunArgs {
-                        rt: &job_rt,
-                        source: source.as_ref(),
-                        fp,
-                        tile_key,
-                        cancel: &job_cancel,
-                        check_disk: false,
-                        pin,
-                        guard,
-                    });
-                }),
-            };
-            let _ = rt.try_submit_guarded(&rt.fast_pool, job, true, || {
-                let _ = rt.cancel_pointwise_in_flight(&tile_key, job_id);
-            });
-        });
-        return true;
-    }
-
     let guard = PointwiseFlightGuard::new(Arc::clone(runtime), tile_key, job_id);
+    let handle = net.handle().clone();
+    let disk_handle = handle.clone();
+    handle.spawn(async move {
+        let _prefetch_permit = prefetch_permit;
+        if cancel.is_cancelled() {
+            guard.mark_cancelled();
+            return;
+        }
+
+        // 1. Fast path: check SQLite disk cache off the async worker thread.
+        if let Some(disk) = rt.disk_cache.clone() {
+            let disk_key = DiskTileKey::from_tile_key(fp.clone(), &tile_key);
+            let cached = disk_handle
+                .spawn_blocking(move || load_cached_tile(&disk, &disk_key))
+                .await
+                .ok()
+                .flatten();
+            if let Some(tile) = cached {
+                let _ = deliver_pointwise_tile(&rt, tile_key, tile, &cancel, guard);
+                return;
+            }
+        }
+
+        if cancel.is_cancelled() {
+            guard.mark_cancelled();
+            return;
+        }
+
+        // 2. Plan and asynchronously prefetch/pin all needed byte ranges.
+        let raw_ranges = match plan_remote_tile_ranges(&rt, source.as_ref(), tile_key) {
+            Ok(ranges) => ranges,
+            Err(err) if err.is_cancelled() => {
+                guard.mark_cancelled();
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    source = ?tile_key.source,
+                    level = tile_key.level,
+                    x = tile_key.x,
+                    y = tile_key.y,
+                    error = %err,
+                    "Remote COG range planning failed"
+                );
+                guard.mark_failed(err.is_terminal());
+                return;
+            }
+        };
+        let pin = match prefetch_coalesced_ranges(&range_src, raw_ranges, &cancel).await {
+            Ok(pin) => pin,
+            Err(err) if err.is_cancelled() => {
+                guard.mark_cancelled();
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    source = ?tile_key.source,
+                    level = tile_key.level,
+                    x = tile_key.x,
+                    y = tile_key.y,
+                    error = %err,
+                    "Remote COG range prefetch failed"
+                );
+                let terminal = matches!(err, veldmap_core::io::IoError::InvalidInput(_));
+                guard.mark_failed(terminal);
+                return;
+            }
+        };
+
+        if cancel.is_cancelled() {
+            guard.mark_cancelled();
+            return;
+        }
+
+        // 3. Submit pure CPU decode (holding `PrefetchPin` so zero HTTP I/O
+        //    occurs on `fast_pool`) with rejection cleanup.
+        let job_rt = Arc::clone(&rt);
+        let job_cancel = cancel.clone();
+        let job = DecodeJob {
+            key: DecodeJobKey::Tile(tile_key),
+            queued_bytes: tile_format_bytes(RASTER_TILE_SIZE, tile_key.format),
+            cancel,
+            work: Box::new(move || {
+                run_pointwise_job(PointwiseRunArgs {
+                    rt: &job_rt,
+                    source: source.as_ref(),
+                    fp,
+                    tile_key,
+                    cancel: &job_cancel,
+                    check_disk: false,
+                    pin,
+                    guard,
+                });
+            }),
+        };
+        let _ = rt.try_submit_guarded(&rt.fast_pool, job, true, || {
+            let _ = rt.cancel_pointwise_in_flight(&tile_key, job_id);
+        });
+    });
+    true
+}
+
+fn submit_direct_pointwise_job(
+    admitted: AdmittedTile,
+    source: Arc<dyn RasterSource>,
+    fp: String,
+    runtime: &Arc<OverlayRuntime>,
+) -> bool {
+    let tile_key = admitted.key;
+    let job_id = admitted.job_id;
+    let cancel = admitted.cancel;
+    let rt = Arc::clone(runtime);
+    let guard = PointwiseFlightGuard::new(Arc::clone(runtime), tile_key, job_id);
+    // Preserve pool isolation (`docs/decisions.md` §11): a remote source
+    // without an async prefetch handle still routes to `remote_pool`.
     let pool = if source.is_remote() {
         &runtime.remote_pool
     } else {
@@ -387,4 +374,32 @@ pub(super) fn submit_pointwise_job(
     runtime.try_submit_guarded(pool, job, true, || {
         let _ = runtime.cancel_pointwise_in_flight(&tile_key, job_id);
     })
+}
+
+/// Submit a single pointwise overlay decode job.
+///
+/// Local rasters submit directly to `fast_pool`. Remote COGs acquire a bounded
+/// prefetch slot and spawn an async prefetch task on `NetContext` that checks
+/// SQLite, plans + coalesces + pins required HTTP byte ranges into a
+/// [`PrefetchPin`], and then submits the pure-CPU decode (capturing
+/// `PrefetchPin`) onto `fast_pool`.
+///
+/// Returns `false` if the lane or remote prefetch window is saturated/closed so
+/// the caller stops submitting this rung and backs off cleanly without spinning.
+pub(super) fn submit_pointwise_job(
+    admitted: AdmittedTile,
+    source: &Arc<dyn RasterSource>,
+    remote_range: Option<&HttpRangeSource>,
+    fingerprint_hex: &str,
+    runtime: &Arc<OverlayRuntime>,
+) -> bool {
+    let source = Arc::clone(source);
+    let fp = fingerprint_hex.to_owned();
+    if source.is_remote()
+        && let (Some(range_src), Some(net)) = (remote_range.cloned(), runtime.net.clone())
+    {
+        spawn_remote_pointwise_job(admitted, source, fp, range_src, net, runtime)
+    } else {
+        submit_direct_pointwise_job(admitted, source, fp, runtime)
+    }
 }

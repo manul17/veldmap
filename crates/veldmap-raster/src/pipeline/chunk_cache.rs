@@ -44,8 +44,11 @@ type ChunkSlot = SingleflightSlot<Arc<DecodedChunk>>;
 struct CacheState {
     lru: TileCache<ChunkKey, Arc<DecodedChunk>>,
     in_flight: HashMap<ChunkKey, Arc<ChunkSlot>>,
+    #[cfg(any(test, feature = "test-support"))]
     hits: u64,
+    #[cfg(any(test, feature = "test-support"))]
     misses: u64,
+    #[cfg(any(test, feature = "test-support"))]
     dedup_waits: u64,
 }
 
@@ -62,14 +65,18 @@ impl SharedChunkCache {
             state: Mutex::new(CacheState {
                 lru: TileCache::new(max_bytes),
                 in_flight: HashMap::new(),
+                #[cfg(any(test, feature = "test-support"))]
                 hits: 0,
+                #[cfg(any(test, feature = "test-support"))]
                 misses: 0,
+                #[cfg(any(test, feature = "test-support"))]
                 dedup_waits: 0,
             }),
         }
     }
 
     /// Cache statistics `(hits, misses, dedup_waits)`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stats(&self) -> (u64, u64, u64) {
         let guard = lock_unpoisoned(&self.state);
         (guard.hits, guard.misses, guard.dedup_waits)
@@ -83,18 +90,15 @@ impl SharedChunkCache {
         drop(removed);
     }
 
-    /// Return whether `key` is already present in the decoded-chunk LRU cache
-    /// (without touching recency or triggering a decode).
-    pub(crate) fn contains(&self, key: &ChunkKey) -> bool {
-        lock_unpoisoned(&self.state).lru.contains(key)
-    }
-
     /// Non-blocking cache lookup returning an already-decoded chunk if present
     /// in the LRU cache, without initiating I/O or singleflight waits.
     pub(crate) fn get_cached(&self, key: &ChunkKey) -> Option<Arc<DecodedChunk>> {
         let mut guard = lock_unpoisoned(&self.state);
         let chunk = guard.lru.get(key).map(Arc::clone)?;
-        guard.hits += 1;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            guard.hits += 1;
+        }
         Some(chunk)
     }
 
@@ -117,13 +121,22 @@ impl SharedChunkCache {
             || {
                 let mut guard = lock_unpoisoned(&self.state);
                 if let Some(chunk) = guard.lru.get(&key).map(Arc::clone) {
-                    guard.hits += 1;
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        guard.hits += 1;
+                    }
                     SingleflightRole::Ready(chunk)
                 } else if let Some(slot) = guard.in_flight.get(&key).map(Arc::clone) {
-                    guard.dedup_waits += 1;
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        guard.dedup_waits += 1;
+                    }
                     SingleflightRole::Follower(slot)
                 } else {
-                    guard.misses += 1;
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        guard.misses += 1;
+                    }
                     let slot = Arc::new(SingleflightSlot::new());
                     guard.in_flight.insert(key, Arc::clone(&slot));
                     SingleflightRole::Leader(slot)

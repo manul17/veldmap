@@ -180,7 +180,11 @@ impl Projection {
     /// Strict forward projection returning `None` when inputs or projected
     /// outputs are non-finite, or when a Web Mercator latitude hits `±90°`
     /// (never clamping polar latitudes onto `±WEB_MERCATOR_LIMIT_DEG`).
-    pub(crate) fn project_geodetic_strict(&self, lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
+    pub(in crate::geo) fn project_geodetic_strict(
+        &self,
+        lat_deg: f64,
+        lon_deg: f64,
+    ) -> Option<(f64, f64)> {
         if !(lat_deg.is_finite() && lon_deg.is_finite()) {
             return None;
         }

@@ -6,7 +6,9 @@
 use std::fmt::{self, Write as _};
 
 use thiserror::Error;
-use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey, fnv1a_64};
+#[cfg(any(test, feature = "test-support"))]
+use veldmap_core::tile::TileKey;
+use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, fnv1a_64};
 
 use crate::NetError;
 use crate::redact::{EncodedSecret, redact_secret_label, redact_text, sanitize_url_for_display};
@@ -195,10 +197,9 @@ pub fn validate_custom_url_template(url_template: &str) -> Result<&str, NetError
             "URL template must start with https:// or http://".to_owned(),
         ));
     }
-    let authority = parse_http_authority(template).ok_or_else(|| {
+    let host = parse_http_authority(template).ok_or_else(|| {
         NetError::InvalidUrlTemplate("URL template must include a valid hostname".to_owned())
     })?;
-    let host = authority.host;
     if host.contains("{z}") || host.contains("{x}") || host.contains("{y}") || host.contains("{-y}")
     {
         return Err(NetError::InvalidUrlTemplate(
@@ -371,6 +372,7 @@ impl LiveBasemapSpec {
     }
 
     /// Build the canonical display `TileKey` for `id` under this live source.
+    #[cfg(any(test, feature = "test-support"))]
     pub const fn tile_key(&self, id: QuadTileId) -> TileKey {
         TileKey::display_quad(self.source_id, id)
     }

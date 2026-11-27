@@ -6,7 +6,9 @@
 //! allowing the direct raw-chunk decoder (`raw_decode`) to execute lock-free
 //! positioned reads over [`ByteSource`].
 
+pub(super) mod budget;
 pub(super) mod parse;
+mod tag_decode;
 pub(super) mod tag_ids;
 pub(super) mod wire;
 
@@ -25,6 +27,14 @@ pub(super) use wire::TiffByteOrder;
 /// Maximum uncompressed byte size admitted for any single TIFF strip/tile,
 /// matching [`crate::tiff::TiffSource`]'s per-chunk decode cap.
 pub(super) const MAX_SINGLE_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Return whether `NewSubfileType` marks a reduced-resolution overview (and
+/// not a transparency mask).
+pub(in crate::tiff) fn is_overview(subfile_type: u32) -> bool {
+    const REDUCED: u32 = 1;
+    const MASK: u32 = 4;
+    subfile_type & REDUCED != 0 && subfile_type & MASK == 0
+}
 
 /// Shared stateless raw-chunk I/O access parameters borrowed by chunk readers,
 /// stretch samplers, and cursor probes.
@@ -337,7 +347,6 @@ impl CachedIfd {
     pub(super) const fn stretch_planes(&self) -> &'static [usize] {
         match (self.planar, self.pixel_layout.colors()) {
             (PlanarConfig::Planar, 3) => &[0, 1, 2],
-            (PlanarConfig::Planar, 2) => &[0, 1],
             _ => &[0],
         }
     }
@@ -490,5 +499,17 @@ impl CachedIfd {
             ))
         })?;
         Ok((offset, count))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overview_bit_filters_reduced_resolution_and_excludes_masks() {
+        assert!(!is_overview(0));
+        assert!(is_overview(1));
+        assert!(!is_overview(5)); // mask bit set
     }
 }

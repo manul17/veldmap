@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::layers::CrsOverride;
+use crate::layers::{CrsOverride, RemoteCogRequest};
 use crate::measure::{MeasureMode, MeasureSession};
-use crate::stac::{StacSession, resolve_cog_auth};
+use crate::stac::StacSession;
 use crate::storage::session::SavedCameraPose;
 use crate::storage::settings::BasemapSelection;
 use crate::ui::basemap::BasemapUiAction;
@@ -185,7 +185,7 @@ impl VeldmapApp {
                 .vectors()
                 .layer_name(id)
                 .map_or_else(|| "GeoJSON AOI".to_owned(), str::to_owned);
-            self.cancel_draw_aoi();
+            self.deactivate_draw_aoi();
             self.panels.stac.clear_copy_notice();
             self.scene.mutate_stac(|s| s.set_aoi_geometry(geom, label));
         }
@@ -200,10 +200,10 @@ impl VeldmapApp {
         for action in actions {
             match action {
                 StacUiAction::Search(request) => {
-                    let settings = self.storage.settings();
+                    let stac_settings = &self.storage.settings().stac;
                     let res = self
                         .scene
-                        .mutate_stac(|s| s.begin_search(&request, settings));
+                        .mutate_stac(|s| s.begin_search(&request, stac_settings));
                     if let Err(err) = res {
                         self.scene.mutate_stac(|s| s.set_error(err));
                     }
@@ -223,7 +223,7 @@ impl VeldmapApp {
                 }
                 StacUiAction::CaptureViewportAoi => {
                     if let Some(bbox) = self.viewport.viewport_bbox(&self.camera) {
-                        self.cancel_draw_aoi();
+                        self.deactivate_draw_aoi();
                         self.scene
                             .mutate_stac(|s| s.set_aoi_bbox(bbox, "Viewport".to_owned()));
                     } else {
@@ -244,7 +244,7 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 StacUiAction::ClearAoi => {
-                    self.cancel_draw_aoi();
+                    self.deactivate_draw_aoi();
                     self.scene.mutate_stac(StacSession::clear_aoi);
                     needs_repaint = true;
                 }
@@ -283,19 +283,18 @@ impl VeldmapApp {
                     scale_offset,
                 } => {
                     let raw_url = url.into_inner();
-                    let (final_url, headers) = resolve_cog_auth(
+                    let (final_url, headers) = self.scene.stac().resolve_cog_auth(
                         &raw_url,
                         auth_mode,
-                        self.scene.stac(),
-                        self.storage.settings(),
+                        &self.storage.settings().stac,
                     );
-                    if let Err(err) = self.scene.begin_open_remote_cog(
-                        final_url,
+                    if let Err(err) = self.scene.begin_open_remote_cog(RemoteCogRequest {
+                        url: final_url,
                         title,
-                        headers,
+                        extra_headers: headers,
                         scale_offset,
-                        true,
-                    ) {
+                        fly_to: true,
+                    }) {
                         self.scene.mutate_stac(|s| s.set_error(err));
                     } else {
                         self.scene.mutate_stac(StacSession::clear_error);
@@ -340,10 +339,12 @@ impl VeldmapApp {
         match action {
             SettingsAction::ApplyDraft(draft) => {
                 needs_repaint |= self.storage.mutate_settings(|s| draft.apply_into(s));
-                needs_repaint |= self.scene.sync_settings(self.storage.settings());
-                self.panels
-                    .settings
-                    .sync_from_settings(self.storage.settings());
+                let settings = self.storage.settings();
+                needs_repaint |= self.scene.sync_settings(
+                    settings.basemap_config(),
+                    settings.gpu_tile_cache_override_bytes(),
+                );
+                self.panels.settings.sync_from_settings(settings);
             }
             SettingsAction::ClearDiskCache => {
                 self.storage.request_clear_disk_cache();
@@ -353,17 +354,21 @@ impl VeldmapApp {
         needs_repaint
     }
 
-    pub(super) fn apply_basemap_action(&mut self, action: BasemapUiAction) -> bool {
+    fn apply_basemap_action(&mut self, action: BasemapUiAction) -> bool {
         let mut needs_repaint = false;
         match action {
             BasemapUiAction::SelectBasemap(selection) => {
                 needs_repaint |= self
                     .storage
                     .mutate_settings(|s| s.active_basemap = selection);
-                needs_repaint |= self.scene.sync_settings(self.storage.settings());
+                let settings = self.storage.settings();
+                needs_repaint |= self.scene.sync_settings(
+                    settings.basemap_config(),
+                    settings.gpu_tile_cache_override_bytes(),
+                );
                 self.panels
                     .settings
-                    .set_draft_active_basemap(self.storage.settings().active_basemap);
+                    .set_draft_active_basemap(settings.active_basemap);
             }
             BasemapUiAction::ConfigureCustomXyz => {
                 self.open_settings_tab(SettingsTab::Basemap);
@@ -473,7 +478,7 @@ impl VeldmapApp {
         needs_repaint
     }
 
-    pub(super) fn handle_measure_action(
+    pub(super) fn apply_measure_action(
         &mut self,
         action: MeasureAction,
         frame: &eframe::Frame,

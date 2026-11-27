@@ -11,9 +11,14 @@ use crate::RasterError;
 
 use super::DecodeContext;
 use super::cascade::TileEmit;
-use super::chunk_cache::SharedChunkCache;
 use super::metadata::{BandSample, BandStats, RasterDescription};
 use super::plan::{DISPLAY_STREAM_SPEC, PyramidMeta};
+
+/// Default maximum gap (`64 KiB`) bridged when coalescing remote byte ranges.
+pub const DEFAULT_COALESCE_GAP_BYTES: u64 = 64 * 1024;
+
+/// Default maximum merged span length (`4 MiB`) when coalescing remote byte ranges.
+pub const DEFAULT_COALESCE_MAX_SPAN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Contiguous byte span `(offset, len)` inside a raster's backing
 /// [`veldmap_core::io::ByteSource`], used by remote COG batch prefetchers.
@@ -78,17 +83,15 @@ pub trait RasterSource: Send + Sync {
     }
 
     /// Plan coalesced source byte ranges required for pointwise decoding of
-    /// `wants` at `level` for stream `spec`, skipping chunks already present
-    /// in `chunk_cache`.
+    /// `wants` at `level` for stream `spec`.
     fn plan_pointwise_byte_ranges(
         &self,
         spec: TileStreamSpec,
         level: u8,
         wants: &[(u32, u32)],
         budget: &MemoryBudget,
-        chunk_cache: &SharedChunkCache,
     ) -> Result<Vec<ByteRange>, RasterError> {
-        let _ = (spec, level, wants, budget, chunk_cache);
+        let _ = (spec, level, wants, budget);
         Ok(Vec::new())
     }
 
@@ -175,18 +178,20 @@ pub trait RasterSource: Send + Sync {
                 Ok(())
             },
         )?;
-        let scheme = self
-            .pyramid_meta(spec)
-            .map(|m| m.scheme())
-            .unwrap_or_else(|_| {
-                let max_level = self.description().levels.len().saturating_sub(1) as u8;
-                veldmap_core::tile::TileScheme::RasterPyramid { max_level }
-            });
-        produced.ok_or(RasterError::TileOutOfRange {
-            scheme,
-            level,
-            x: tx,
-            y: ty,
+        produced.ok_or_else(|| {
+            let scheme = self
+                .pyramid_meta(spec)
+                .map(|m| m.scheme())
+                .unwrap_or_else(|_| {
+                    let max_level = self.description().levels.len().saturating_sub(1) as u8;
+                    veldmap_core::tile::TileScheme::RasterPyramid { max_level }
+                });
+            RasterError::TileOutOfRange {
+                scheme,
+                level,
+                x: tx,
+                y: ty,
+            }
         })
     }
 

@@ -55,6 +55,14 @@ struct CachedPalette {
     custom_weak: Option<Weak<[[u8; 4]]>>,
 }
 
+impl CachedPalette {
+    fn is_live(&self) -> bool {
+        self.custom_weak
+            .as_ref()
+            .is_none_or(|w| w.strong_count() > 0)
+    }
+}
+
 /// Lazily populated cache of GPU palette LUT uniform bind groups with
 /// `Weak`-guarded automatic sweeping for source-specific TIFF `ColorMap` tables.
 #[derive(Default)]
@@ -69,8 +77,7 @@ impl PaletteCache {
 
     /// Drop custom TIFF `ColorMap` palette entries whose owning source dropped.
     pub(super) fn sweep_stale(&mut self) {
-        self.entries
-            .retain(|_, p| p.custom_weak.as_ref().is_none_or(|w| w.strong_count() > 0));
+        self.entries.retain(|_, p| p.is_live());
     }
 
     pub(super) fn ensure(
@@ -79,17 +86,19 @@ impl PaletteCache {
         palette_layout: &wgpu::BindGroupLayout,
         track: &DrawOverlayTrack,
     ) {
-        let (key, lut, custom_weak) = match track {
+        let Some(key) = palette_key(track) else {
+            return;
+        };
+        if self.entries.get(&key).is_some_and(CachedPalette::is_live) {
+            return;
+        }
+
+        let (lut, custom_weak) = match track {
             DrawOverlayTrack::Display => return,
             DrawOverlayTrack::Scientific { colormap, .. } => {
-                let key = PaletteKey::Scientific(*colormap);
-                if self.entries.contains_key(&key) {
-                    return;
-                }
-                (key, scientific_lut_linear(*colormap), None)
+                (scientific_lut_linear(*colormap), None)
             }
             DrawOverlayTrack::Categorical {
-                source,
                 palette,
                 custom_color_map,
                 ..
@@ -97,21 +106,12 @@ impl PaletteCache {
                 if *palette == CategoricalPaletteId::SourceColorMap
                     && let Some(cmap) = custom_color_map
                 {
-                    let key = custom_source_key(*source, cmap);
-                    if self.entries.contains_key(&key) {
-                        return;
-                    }
                     (
-                        key,
                         categorical_lut_linear(*palette, Some(cmap.as_ref())),
                         Some(Arc::downgrade(cmap)),
                     )
                 } else {
-                    let key = PaletteKey::CategoricalPreset(*palette);
-                    if self.entries.contains_key(&key) {
-                        return;
-                    }
-                    (key, categorical_lut_linear(*palette, None), None)
+                    (categorical_lut_linear(*palette, None), None)
                 }
             }
         };
@@ -142,6 +142,9 @@ impl PaletteCache {
 
     pub(super) fn bind_group(&self, track: &DrawOverlayTrack) -> Option<&wgpu::BindGroup> {
         let key = palette_key(track)?;
-        self.entries.get(&key).map(|p| &p.bind_group)
+        self.entries
+            .get(&key)
+            .filter(|entry| entry.is_live())
+            .map(|entry| &entry.bind_group)
     }
 }

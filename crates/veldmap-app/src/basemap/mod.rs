@@ -16,6 +16,9 @@
 mod adapters;
 mod bundled;
 mod manager;
+#[cfg(not(any(test, feature = "test-support")))]
+mod policy;
+#[cfg(any(test, feature = "test-support"))]
 pub mod policy;
 
 use veldmap_core::tile::SourceId;

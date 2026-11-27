@@ -35,7 +35,9 @@ pub use fetcher::{
     LiveTilePipeline, NetworkStatus, TileBlobStore, TileDecodeExecutor,
 };
 pub use http::is_valid_custom_header_name;
-pub use range::{HttpRangeConfig, HttpRangeSource, PrefetchPin, RANGE_BLOCK_SIZE, RangeOpenError};
+#[cfg(any(test, feature = "test-support"))]
+pub use range::RANGE_BLOCK_SIZE;
+pub use range::{HttpRangeConfig, HttpRangeSource, PrefetchPin, RangeOpenError};
 pub use redact::sanitize_url_for_display;
 pub use stac::{
     SampleScene, StacAsset, StacAuth, StacCatalogConfig, StacClient, StacError, StacItem,

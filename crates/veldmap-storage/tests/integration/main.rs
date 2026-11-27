@@ -53,7 +53,7 @@ fn local_file_source_fingerprinting_and_bypass_cache_work_end_to_end() {
 fn durable_json_and_sqlite_disk_cache_persist_across_reopen() {
     let dir = TestTempDir::new("storage-integ-persist");
     let paths = StoragePaths::with_root(dir.path());
-    let doc_path = paths.config_dir.join("session.json");
+    let doc_path = paths.session_path();
     std::fs::create_dir_all(&paths.config_dir).expect("create config dir");
     std::fs::create_dir_all(&paths.cache_dir).expect("create cache dir");
 

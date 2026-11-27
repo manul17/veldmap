@@ -114,6 +114,7 @@ impl Drop for PermitGuard {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
 
     use tokio::sync::Notify;
     use veldmap_core::sync::CancelToken;
@@ -127,6 +128,7 @@ mod tests {
     fn stale_inflight_guard_never_removes_newer_generation() {
         let shared = Arc::new(PipelineShared {
             shutdown: CancelToken::new(),
+            shutdown_signaled: AtomicBool::new(false),
             state: Mutex::new(PipelineState::default()),
             host_limiters: Arc::new(HostLimiters::new(4)),
             notify: Notify::new(),

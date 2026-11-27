@@ -5,23 +5,39 @@ use std::borrow::Cow;
 use std::io::{Cursor, Read};
 
 use crate::RasterError;
-use crate::image_codec::{rgb_to_rgba8, rgba_to_rgb8};
+use crate::image_codec::{build_jpeg_decoder, rgb_to_rgba8, rgba_to_rgb8};
 
 use super::super::ifd::ChunkDims;
+
+/// Initial output buffer pre-allocation cap (`256 KiB`) for streaming TIFF
+/// chunk decompressors.
+const INITIAL_CHUNK_CAP: usize = 256 * 1024;
+
+fn read_bounded(
+    reader: impl Read,
+    expected_max: usize,
+    codec: &str,
+) -> Result<Vec<u8>, RasterError> {
+    let mut out = Vec::with_capacity(expected_max.min(INITIAL_CHUNK_CAP));
+    reader
+        .take(expected_max as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| RasterError::Decode(format!("TIFF {codec} decode failed: {e}")))?;
+    if out.len() > expected_max {
+        out.truncate(expected_max);
+    }
+    Ok(out)
+}
 
 pub(super) fn decompress_deflate(
     compressed: &[u8],
     expected_max: usize,
 ) -> Result<Vec<u8>, RasterError> {
-    let mut decoder = flate2::read::ZlibDecoder::new(compressed).take(expected_max as u64 + 1);
-    let mut out = Vec::with_capacity(expected_max.min(256 * 1024));
-    decoder
-        .read_to_end(&mut out)
-        .map_err(|e| RasterError::Decode(format!("TIFF Deflate decode failed: {e}")))?;
-    if out.len() > expected_max {
-        out.truncate(expected_max);
-    }
-    Ok(out)
+    read_bounded(
+        flate2::read::ZlibDecoder::new(compressed),
+        expected_max,
+        "Deflate",
+    )
 }
 
 pub(super) fn decompress_lzw(
@@ -29,7 +45,7 @@ pub(super) fn decompress_lzw(
     expected_max: usize,
 ) -> Result<Vec<u8>, RasterError> {
     let mut decoder = weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
-    let mut out = Vec::with_capacity(expected_max.min(256 * 1024));
+    let mut out = Vec::with_capacity(expected_max.min(INITIAL_CHUNK_CAP));
     let mut input = compressed;
     let mut scratch = [0u8; 16 * 1024];
     loop {
@@ -69,7 +85,7 @@ pub(super) fn decompress_packbits(
     compressed: &[u8],
     expected_max: usize,
 ) -> Result<Vec<u8>, RasterError> {
-    let mut out = Vec::with_capacity(expected_max.min(256 * 1024));
+    let mut out = Vec::with_capacity(expected_max.min(INITIAL_CHUNK_CAP));
     let mut i = 0usize;
     while i < compressed.len() && out.len() < expected_max {
         let header = compressed[i] as i8;
@@ -106,15 +122,7 @@ pub(super) fn decompress_zstd(
 ) -> Result<Vec<u8>, RasterError> {
     let decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
         .map_err(|e| RasterError::Decode(format!("TIFF ZSTD init failed: {e}")))?;
-    let mut out = Vec::with_capacity(expected_max.min(256 * 1024));
-    decoder
-        .take(expected_max as u64 + 1)
-        .read_to_end(&mut out)
-        .map_err(|e| RasterError::Decode(format!("TIFF ZSTD decode failed: {e}")))?;
-    if out.len() > expected_max {
-        out.truncate(expected_max);
-    }
-    Ok(out)
+    read_bounded(decoder, expected_max, "ZSTD")
 }
 
 fn validate_decoded_chunk_dims(
@@ -136,6 +144,59 @@ fn validate_decoded_chunk_dims(
     }
 }
 
+fn splice_jpeg_tables<'a>(
+    compressed: &'a [u8],
+    jpeg_tables: Option<&[u8]>,
+) -> Result<Cow<'a, [u8]>, RasterError> {
+    let Some(tables) = jpeg_tables else {
+        return Ok(Cow::Borrowed(compressed));
+    };
+    if compressed.len() < 2 || tables.len() < 2 {
+        return Err(RasterError::Decode(
+            "truncated TIFF JPEG stream or JPEGTables".to_owned(),
+        ));
+    }
+    let table_prefix = tables.strip_suffix(&[0xFF, 0xD9]).unwrap_or(tables);
+    let chunk_suffix = compressed.strip_prefix(&[0xFF, 0xD8]).unwrap_or(compressed);
+    let mut buf = Vec::with_capacity(table_prefix.len() + chunk_suffix.len());
+    buf.extend_from_slice(table_prefix);
+    buf.extend_from_slice(chunk_suffix);
+    Ok(Cow::Owned(buf))
+}
+
+fn validate_jpeg_header<R: Read>(
+    decoder: &mut jpeg_decoder::Decoder<R>,
+    expected_samples: usize,
+    chunk_index: u32,
+    expected_dims: ChunkDims,
+) -> Result<u32, RasterError> {
+    decoder
+        .read_info()
+        .map_err(|e| RasterError::Decode(format!("TIFF JPEG header decode failed: {e}")))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| RasterError::Decode("TIFF JPEG decoder missing image info".to_owned()))?;
+    let decoded_channels = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => 1,
+        jpeg_decoder::PixelFormat::RGB24 => 3,
+        jpeg_decoder::PixelFormat::CMYK32 => 4,
+        jpeg_decoder::PixelFormat::L16 => {
+            return Err(RasterError::Decode(
+                "16-bit lossless JPEG inside TIFF is not supported".to_owned(),
+            ));
+        }
+    };
+    if decoded_channels != expected_samples {
+        return Err(RasterError::Decode(format!(
+            "TIFF JPEG decoded {decoded_channels} channels, expected {expected_samples}"
+        )));
+    }
+    let w = u32::from(info.width);
+    let h = u32::from(info.height);
+    validate_decoded_chunk_dims("JPEG", chunk_index, w, h, expected_dims)?;
+    Ok(w)
+}
+
 pub(super) fn decompress_jpeg(
     compressed: &[u8],
     jpeg_tables: Option<&[u8]>,
@@ -144,32 +205,9 @@ pub(super) fn decompress_jpeg(
     chunk_index: u32,
     expected_dims: ChunkDims,
 ) -> Result<(Vec<u8>, u32), RasterError> {
-    let combined: Cow<'_, [u8]> = if let Some(tables) = jpeg_tables {
-        if compressed.len() < 2 || tables.len() < 2 {
-            return Err(RasterError::Decode(
-                "truncated TIFF JPEG stream or JPEGTables".to_owned(),
-            ));
-        }
-        let table_prefix = if tables.ends_with(&[0xFF, 0xD9]) {
-            &tables[..tables.len() - 2]
-        } else {
-            tables
-        };
-        let chunk_suffix = if compressed.starts_with(&[0xFF, 0xD8]) {
-            &compressed[2..]
-        } else {
-            compressed
-        };
-        let mut buf = Vec::with_capacity(table_prefix.len() + chunk_suffix.len());
-        buf.extend_from_slice(table_prefix);
-        buf.extend_from_slice(chunk_suffix);
-        Cow::Owned(buf)
-    } else {
-        Cow::Borrowed(compressed)
-    };
+    let combined = splice_jpeg_tables(compressed, jpeg_tables)?;
+    let mut decoder = build_jpeg_decoder(Cursor::new(combined.as_ref()), max_decoded_bytes as u64);
 
-    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(combined.as_ref()));
-    decoder.set_max_decoding_buffer_size(max_decoded_bytes);
     // Work around `jpeg-decoder 0.3.2` quirks:
     // - Do NOT use `ColorTransform::None` (it outputs row-planar bytes and panics on
     //   subsampled 4:2:0/4:2:2 JPEGs).
@@ -200,30 +238,7 @@ pub(super) fn decompress_jpeg(
     };
 
     // Validate dimensions and channel count BEFORE allocating/decoding pixels.
-    decoder
-        .read_info()
-        .map_err(|e| RasterError::Decode(format!("TIFF JPEG header decode failed: {e}")))?;
-    let info = decoder
-        .info()
-        .ok_or_else(|| RasterError::Decode("TIFF JPEG decoder missing image info".to_owned()))?;
-    let decoded_channels = match info.pixel_format {
-        jpeg_decoder::PixelFormat::L8 => 1,
-        jpeg_decoder::PixelFormat::RGB24 => 3,
-        jpeg_decoder::PixelFormat::CMYK32 => 4,
-        jpeg_decoder::PixelFormat::L16 => {
-            return Err(RasterError::Decode(
-                "16-bit lossless JPEG inside TIFF is not supported".to_owned(),
-            ));
-        }
-    };
-    if decoded_channels != expected_samples {
-        return Err(RasterError::Decode(format!(
-            "TIFF JPEG decoded {decoded_channels} channels, expected {expected_samples}"
-        )));
-    }
-    let w = u32::from(info.width);
-    let h = u32::from(info.height);
-    validate_decoded_chunk_dims("JPEG", chunk_index, w, h, expected_dims)?;
+    let w = validate_jpeg_header(&mut decoder, expected_samples, chunk_index, expected_dims)?;
 
     let mut pixels = decoder
         .decode()

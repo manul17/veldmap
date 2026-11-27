@@ -101,10 +101,11 @@ impl<'a> TiffChunkReader<'a> {
         let data = match self.spec.format {
             PixelFormat::Rgba8UnormSrgb => self.decode_display_chunk(ifd, index, pixels, cancel)?,
             PixelFormat::R32Float => self.decode_scientific_chunk(ifd, index, pixels, cancel)?,
-            PixelFormat::R8Uint | PixelFormat::R16Uint => {
-                let fmt = CategoricalFormat::from_pixel_format(self.spec.format)
-                    .ok_or_else(|| RasterError::Decode("non-categorical format".to_owned()))?;
-                self.decode_categorical_chunk(ifd, index, pixels, fmt, cancel)?
+            PixelFormat::R8Uint => {
+                self.decode_categorical_chunk(ifd, index, pixels, CategoricalFormat::U8, cancel)?
+            }
+            PixelFormat::R16Uint => {
+                self.decode_categorical_chunk(ifd, index, pixels, CategoricalFormat::U16, cancel)?
             }
         };
 

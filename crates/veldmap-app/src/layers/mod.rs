@@ -10,6 +10,7 @@ mod frame;
 mod io_worker;
 mod jobs;
 mod layer;
+mod lifecycle;
 mod manager;
 mod opener;
 mod remote_opener;
@@ -39,11 +40,32 @@ pub(crate) struct LayerId(u64);
 /// Initial display, style, and georeference override options when inserting an
 /// opened raster layer into [`stack::LayerStack`].
 #[derive(Clone, Debug)]
-pub(super) struct LayerInitOptions {
-    pub(super) visible: bool,
-    pub(super) opacity: f32,
-    pub(super) crs_override: Option<CrsOverride>,
-    pub(super) style: Option<LayerStyleSpec>,
+struct LayerInitOptions {
+    visible: bool,
+    opacity: f32,
+    crs_override: Option<CrsOverride>,
+    style: Option<LayerStyleSpec>,
+}
+
+/// Parameters for queuing a non-blocking local raster overlay open.
+#[derive(Clone, Debug)]
+pub(crate) struct OpenOverlayRequest<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) fly_to: bool,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
+    pub(crate) crs_override: Option<CrsOverride>,
+    pub(crate) style: Option<LayerStyleSpec>,
+}
+
+/// Parameters for queuing a non-blocking remote Cloud-Optimized GeoTIFF open.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteCogRequest {
+    pub(crate) url: String,
+    pub(crate) title: String,
+    pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) scale_offset: Option<(f64, f64)>,
+    pub(crate) fly_to: bool,
 }
 
 /// Read-only scientific track summary projected into [`LayerSummary`].
@@ -137,8 +159,8 @@ pub(crate) struct CursorReadout {
     pub(crate) value: CursorReadoutValue,
 }
 
-/// Asynchronous result of a background local raster open or reload operation,
-/// drained by `SceneState` at the start of each frame.
+/// Asynchronous result of a background local or remote raster open or reload
+/// operation, drained by `SceneState` at the start of each frame.
 #[derive(Clone, Debug)]
 pub(crate) enum OverlayIoEvent {
     Opened {

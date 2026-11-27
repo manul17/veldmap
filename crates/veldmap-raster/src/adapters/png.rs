@@ -47,6 +47,12 @@ impl PngSource {
         if cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
+        if byte_source.is_remote() {
+            return Err(RasterError::RemotePassUnsupported(
+                "PNG requires whole-file decoding and cannot be streamed over HTTP Range"
+                    .to_owned(),
+            ));
+        }
         let reader = BufferedByteReader::new(Arc::clone(&byte_source), cancel.clone());
         let decoder = build_png_decoder(reader, budget.decode_working_bytes);
         let info_reader = decoder.read_info().map_err(|e| map_png_error(e, cancel))?;

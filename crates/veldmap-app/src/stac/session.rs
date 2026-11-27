@@ -12,12 +12,12 @@ use veldmap_net::{
 };
 
 use crate::render::{DrawVectorId, DrawVectorLayer};
-use crate::storage::settings::AppSettings;
+use crate::storage::settings::StacSettings;
 
 use super::aoi::{
-    AoiState, build_vector_layer, footprint_bounds_from_bbox, geometry_bbox,
-    polygon_geometry_from_bbox,
+    AoiState, build_vector_layer, footprint_bounds_from_bbox, polygon_geometry_from_bbox,
 };
+use super::auth::{StacCogAuthMode, resolve_cog_auth};
 use super::{RedactedUrl, SampleSceneView, StacCogAssetView, StacItemView, StacViewSnapshot};
 
 /// Default visual colors (sRGB RGB + linear alpha) for STAC overlays on globe.
@@ -52,11 +52,11 @@ impl StacCatalogPreset {
         !matches!(self, Self::AwsCopDemGlo30)
     }
 
-    fn to_catalog_config(self, settings: &AppSettings) -> StacCatalogConfig {
+    fn to_catalog_config(self, stac_settings: &StacSettings) -> StacCatalogConfig {
         match self {
             Self::AwsSentinel2L2a => StacCatalogConfig::aws_sentinel2_l2a(),
             Self::AwsCopDemGlo30 => StacCatalogConfig::aws_cop_dem_glo30(),
-            Self::Custom => settings.stac.to_custom_catalog(),
+            Self::Custom => stac_settings.to_custom_catalog(),
         }
     }
 
@@ -132,7 +132,7 @@ fn build_item_view(item: &StacItem) -> StacItemView {
         .collect();
     let zoom_bounds = item
         .bbox
-        .or_else(|| item.geometry.as_ref().and_then(geometry_bbox))
+        .or_else(|| item.geometry.as_ref().and_then(GeoJsonGeometry::bbox))
         .and_then(footprint_bounds_from_bbox);
     StacItemView {
         id: item.id.clone(),
@@ -153,11 +153,11 @@ fn item_geometry(item: &StacItem) -> Option<GeoJsonGeometry> {
     }
 }
 
-pub(super) struct SearchDoneMsg {
-    pub(super) seq: u64,
-    pub(super) uses_custom_auth: bool,
-    pub(super) catalog_endpoint: String,
-    pub(super) outcome: Result<StacSearchResult, String>,
+struct SearchDoneMsg {
+    seq: u64,
+    uses_custom_auth: bool,
+    catalog_endpoint: String,
+    outcome: Result<StacSearchResult, String>,
 }
 
 /// Domain controller for STAC catalog search, AOI management, and globe scene
@@ -166,16 +166,16 @@ pub(crate) struct StacSession {
     net: Option<Arc<NetContext>>,
     wakeup: Wakeup,
     shutdown: CancelToken,
-    pub(super) tx: Sender<SearchDoneMsg>,
+    tx: Sender<SearchDoneMsg>,
     rx: Receiver<SearchDoneMsg>,
-    pub(super) active_seq: u64,
+    active_seq: u64,
     active_cancel: Option<CancelToken>,
-    pub(super) searching: bool,
+    searching: bool,
     aoi: AoiState,
     last_result: Option<StacSearchResult>,
     item_views: Vec<StacItemView>,
-    pub(super) result_uses_custom_auth: bool,
-    pub(super) result_catalog_endpoint: Option<String>,
+    result_uses_custom_auth: bool,
+    result_catalog_endpoint: Option<String>,
     last_error: Option<String>,
     selected_idx: Option<usize>,
     hovered_idx: Option<usize>,
@@ -222,7 +222,7 @@ impl StacSession {
     }
 
     /// Borrow a zero-allocation read-only snapshot for the Cloud / STAC UI tab.
-    pub(crate) fn view_snapshot(&self, settings: &AppSettings) -> StacViewSnapshot<'_> {
+    pub(crate) fn view_snapshot(&self, stac_settings: &StacSettings) -> StacViewSnapshot<'_> {
         StacViewSnapshot {
             is_searching: self.searching,
             has_aoi: self.aoi.has_geometry(),
@@ -234,8 +234,25 @@ impl StacSession {
             hovered_idx: self.hovered_idx,
             items: &self.item_views,
             sample_scenes: builtin_sample_scene_views(),
-            custom_endpoint_configured: !settings.stac.custom_endpoint.trim().is_empty(),
+            custom_endpoint_configured: !stac_settings.custom_endpoint.trim().is_empty(),
         }
+    }
+
+    /// Resolve origin-aware URL & custom HTTP headers for opening a remote COG
+    /// using this session's last search-result auth context and `stac_settings`.
+    pub(crate) fn resolve_cog_auth(
+        &self,
+        url: &str,
+        mode: StacCogAuthMode,
+        stac_settings: &StacSettings,
+    ) -> (String, Vec<(String, String)>) {
+        resolve_cog_auth(
+            url,
+            mode,
+            self.result_uses_custom_auth,
+            self.result_catalog_endpoint.as_deref(),
+            stac_settings,
+        )
     }
 
     #[cfg(test)]
@@ -254,12 +271,31 @@ impl StacSession {
         self.last_error = None;
     }
 
-    pub(crate) fn result_uses_custom_auth(&self) -> bool {
-        self.result_uses_custom_auth
+    #[cfg(test)]
+    pub(super) fn seed_queued_search_for_test(
+        &mut self,
+        seq: u64,
+        catalog_endpoint: &str,
+        result: StacSearchResult,
+    ) {
+        self.active_seq = seq;
+        self.searching = true;
+        let _ = self.tx.send(SearchDoneMsg {
+            seq,
+            uses_custom_auth: false,
+            catalog_endpoint: catalog_endpoint.to_owned(),
+            outcome: Ok(result),
+        });
     }
 
-    pub(crate) fn result_catalog_endpoint(&self) -> Option<&str> {
-        self.result_catalog_endpoint.as_deref()
+    #[cfg(test)]
+    pub(super) fn set_result_auth_context_for_test(
+        &mut self,
+        uses_custom_auth: bool,
+        catalog_endpoint: Option<&str>,
+    ) {
+        self.result_uses_custom_auth = uses_custom_auth;
+        self.result_catalog_endpoint = catalog_endpoint.map(str::to_owned);
     }
 
     #[cfg(test)]
@@ -323,7 +359,7 @@ impl StacSession {
             .map_or(&[], |res| res.items.as_slice())
     }
 
-    pub(crate) fn matched(&self) -> Option<u64> {
+    pub(super) fn matched(&self) -> Option<u64> {
         self.last_result.as_ref().and_then(|res| res.matched)
     }
 
@@ -375,12 +411,12 @@ impl StacSession {
     pub(crate) fn begin_search(
         &mut self,
         request: &StacSearchRequest,
-        settings: &AppSettings,
+        stac_settings: &StacSettings,
     ) -> Result<(), String> {
         let Some(net) = self.net.clone() else {
             return Err("network subsystem is unavailable".to_owned());
         };
-        let catalog = request.preset.to_catalog_config(settings);
+        let catalog = request.preset.to_catalog_config(stac_settings);
         let uses_custom_auth = request.preset == StacCatalogPreset::Custom;
         let query = request.preset.build_search_query(
             self.aoi.geometry().cloned(),

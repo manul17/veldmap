@@ -3,9 +3,7 @@
 
 use veldmap_net::{StacAuth, same_http_origin};
 
-use crate::storage::settings::AppSettings;
-
-use super::StacSession;
+use crate::storage::settings::StacSettings;
 
 /// Authentication policy for opening a remote COG from the Cloud / STAC panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,7 +20,7 @@ pub(crate) enum StacCogAuthMode {
 /// Return `true` if `url` already carries a cloud presigned-URL signature query
 /// parameter (AWS S3, Azure SAS, GCS) so we never double-sign or attach
 /// conflicting auth headers.
-pub(crate) fn url_has_presigned_query(url: &str) -> bool {
+fn url_has_presigned_query(url: &str) -> bool {
     let before_frag = url.split('#').next().unwrap_or(url);
     let Some((_, query)) = before_frag.split_once('?') else {
         return false;
@@ -39,20 +37,21 @@ pub(crate) fn url_has_presigned_query(url: &str) -> bool {
 /// Resolve the final URL and custom HTTP headers for opening a remote COG,
 /// preventing accidental credential leaks onto public or cross-origin hosts and
 /// avoiding dual-auth errors on already-presigned URLs.
-pub(crate) fn resolve_cog_auth(
+pub(super) fn resolve_cog_auth(
     url: &str,
     mode: StacCogAuthMode,
-    session: &StacSession,
-    settings: &AppSettings,
+    result_uses_custom_auth: bool,
+    result_catalog_endpoint: Option<&str>,
+    stac_settings: &StacSettings,
 ) -> (String, Vec<(String, String)>) {
     if mode == StacCogAuthMode::None || url_has_presigned_query(url) {
         return (url.to_owned(), Vec::new());
     }
-    if mode == StacCogAuthMode::FromSearchResult && !session.result_uses_custom_auth() {
+    if mode == StacCogAuthMode::FromSearchResult && !result_uses_custom_auth {
         return (url.to_owned(), Vec::new());
     }
 
-    let auth = settings.stac.to_stac_auth();
+    let auth = stac_settings.to_stac_auth();
     match &auth {
         StacAuth::None => (url.to_owned(), Vec::new()),
         // SAS query tokens are intentionally used across storage domains (e.g.
@@ -60,7 +59,7 @@ pub(crate) fn resolve_cog_auth(
         StacAuth::SasQuery(_) => (auth.apply_to_url(url), Vec::new()),
         StacAuth::Bearer(_) | StacAuth::ApiKey { .. } => {
             if mode == StacCogAuthMode::FromSearchResult
-                && let Some(origin_ep) = session.result_catalog_endpoint()
+                && let Some(origin_ep) = result_catalog_endpoint
                 && !same_http_origin(origin_ep, url)
             {
                 tracing::debug!("Skipping custom STAC auth headers for cross-origin asset URL");

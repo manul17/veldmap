@@ -27,9 +27,10 @@ pub use identity::{
     BandKey, PixelFormat, SourceFingerprint, SourceId, StreamKey, TileStreamSpec, fnv1a_64,
 };
 pub use key::{QuadTileId, TileKey, compose_uv_rect};
+#[cfg(any(test, feature = "test-support"))]
+pub use overlay::MIN_WARP_SEGMENTS;
 pub use overlay::{
-    MAX_WARP_SEGMENTS, MIN_WARP_SEGMENTS, OverlayCullTree, WarpPatch, build_warp_patch,
-    level_segments,
+    MAX_WARP_SEGMENTS, OverlayCullTree, WarpPatch, build_warp_patch, level_segments,
 };
 pub use pyramid::{
     CarrierLayout, RASTER_TILE_SIZE, cell_image_rect, cell_uv_rect, grid_dim, level_count,
@@ -41,7 +42,7 @@ pub use quadtree::{DEFAULT_GRID_CELLS, QuadtreeConfig, VisibleTile, traverse};
 pub use scheme::{GlobeScheme, PlanetaryScheme, TileScheme};
 
 #[cfg(test)]
-pub(super) fn make_key(scheme: TileScheme, level: u8, x: u32, y: u32) -> TileKey {
+fn make_key(scheme: TileScheme, level: u8, x: u32, y: u32) -> TileKey {
     TileKey {
         source: SourceId::BUNDLED_BASEMAP,
         band: BandKey::Display,

@@ -9,6 +9,7 @@ use veldmap_core::geo::Frame;
 use veldmap_net::{HttpRangeConfig, HttpRangeSource, sanitize_url_for_display};
 use veldmap_raster::{DecodeJob, DecodeJobKey, RasterSource};
 
+use super::RemoteCogRequest;
 use super::opener::open_remote_cog_source;
 use super::runtime::OverlayRuntime;
 
@@ -45,12 +46,15 @@ impl RemoteOpenTracker {
     pub(super) fn begin_open(
         &self,
         runtime: &Arc<OverlayRuntime>,
-        url: String,
-        title: String,
-        extra_headers: Vec<(String, String)>,
-        scale_offset: Option<(f64, f64)>,
-        fly_to: bool,
+        request: RemoteCogRequest,
     ) -> Result<(), String> {
+        let RemoteCogRequest {
+            url,
+            title,
+            extra_headers,
+            scale_offset,
+            fly_to,
+        } = request;
         let Some(net) = runtime.net.clone() else {
             return Err("network subsystem is unavailable".to_owned());
         };

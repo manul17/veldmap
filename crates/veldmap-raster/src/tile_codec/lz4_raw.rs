@@ -12,6 +12,8 @@ use veldmap_core::tile::{DecodedTile, PixelFormat};
 
 use crate::RasterError;
 
+use super::checked_tile_bytes;
+
 const MAGIC: [u8; 4] = *b"VML4";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 24;
@@ -89,22 +91,11 @@ pub fn encode_lz4_raw_tile(
     let valid_h = tile.valid_h();
     let gutter = tile.gutter();
 
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|px| px.checked_mul(format.bytes_per_pixel()));
-    if width == 0 || height == 0 || expected != Some(raw.len()) {
+    let bpp = format.bytes_per_pixel();
+    let expected = checked_tile_bytes(width, height, bpp, max_decoded_bytes)?;
+    if raw.len() != expected {
         return Err(RasterError::InvalidDimensions { width, height });
     }
-    if raw.len() > max_decoded_bytes {
-        return Err(RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes: raw.len() as u64,
-            limit_bytes: max_decoded_bytes as u64,
-        });
-    }
-
-    let bpp = format.bytes_per_pixel();
     let shuffled;
     let (flags, src): (u8, &[u8]) = if bpp > 1 {
         shuffled = byte_shuffle(raw, bpp);
@@ -130,14 +121,20 @@ pub fn encode_lz4_raw_tile(
     Ok(out)
 }
 
-/// Decode a self-describing byte-shuffled `Lz4Raw` blob into a mip-0
-/// [`DecodedTile`], validating magic, version, format, geometry, and
-/// `max_decoded_bytes` **before** allocating decompression buffers.
-pub fn decode_lz4_raw_tile(
+struct Lz4Header {
+    format: PixelFormat,
+    gutter: u8,
+    flags: u8,
+    width: u32,
+    height: u32,
+    valid_w: u32,
+    valid_h: u32,
+}
+
+fn parse_lz4_header(
     payload: &[u8],
     expected_format: PixelFormat,
-    max_decoded_bytes: usize,
-) -> Result<DecodedTile, RasterError> {
+) -> Result<Lz4Header, RasterError> {
     if payload.len() < HEADER_LEN {
         return Err(RasterError::Decode(
             "truncated Lz4Raw tile header".to_owned(),
@@ -188,26 +185,28 @@ pub fn decode_lz4_raw_tile(
         return Err(RasterError::InvalidDimensions { width, height });
     }
 
-    let bpp = format.bytes_per_pixel();
-    let Some(expected_bytes) = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|px| px.checked_mul(bpp))
-    else {
-        return Err(RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes: u64::MAX,
-            limit_bytes: max_decoded_bytes as u64,
-        });
-    };
-    if expected_bytes > max_decoded_bytes {
-        return Err(RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes: expected_bytes as u64,
-            limit_bytes: max_decoded_bytes as u64,
-        });
-    }
+    Ok(Lz4Header {
+        format,
+        gutter,
+        flags,
+        width,
+        height,
+        valid_w,
+        valid_h,
+    })
+}
+
+/// Decode a self-describing byte-shuffled `Lz4Raw` blob into a mip-0
+/// [`DecodedTile`], validating magic, version, format, geometry, and
+/// `max_decoded_bytes` **before** allocating decompression buffers.
+pub fn decode_lz4_raw_tile(
+    payload: &[u8],
+    expected_format: PixelFormat,
+    max_decoded_bytes: usize,
+) -> Result<DecodedTile, RasterError> {
+    let header = parse_lz4_header(payload, expected_format)?;
+    let bpp = header.format.bytes_per_pixel();
+    let expected_bytes = checked_tile_bytes(header.width, header.height, bpp, max_decoded_bytes)?;
 
     let decompressed = lz4_flex::block::decompress(&payload[HEADER_LEN..], expected_bytes)
         .map_err(|e| RasterError::Decode(format!("Lz4Raw decompression failed: {e}")))?;
@@ -218,14 +217,22 @@ pub fn decode_lz4_raw_tile(
         )));
     }
 
-    let data = if flags & FLAG_BYTE_SHUFFLED != 0 && bpp > 1 {
+    let data = if header.flags & FLAG_BYTE_SHUFFLED != 0 && bpp > 1 {
         byte_unshuffle(&decompressed, bpp)
     } else {
         decompressed
     };
 
-    DecodedTile::try_with_valid_region(width, height, valid_w, valid_h, gutter, format, data)
-        .map_err(|e| RasterError::Decode(e.to_string()))
+    DecodedTile::try_with_valid_region(
+        header.width,
+        header.height,
+        header.valid_w,
+        header.valid_h,
+        header.gutter,
+        header.format,
+        data,
+    )
+    .map_err(|e| RasterError::Decode(e.to_string()))
 }
 
 #[cfg(test)]

@@ -44,16 +44,13 @@ fn tessellate_geometry(
 ) {
     match geom {
         GeoJsonGeometry::Point(p) => {
-            if p.lat.is_finite() && p.lon.is_finite() {
+            if p.is_finite() {
                 raw.push_point(WGS84.surface_ecef_and_normal(p.lat, p.lon));
             }
         }
         GeoJsonGeometry::MultiPoint(pts) => {
             for &p in pts {
-                if p.lat.is_finite()
-                    && p.lon.is_finite()
-                    && !raw.push_point(WGS84.surface_ecef_and_normal(p.lat, p.lon))
-                {
+                if p.is_finite() && !raw.push_point(WGS84.surface_ecef_and_normal(p.lat, p.lon)) {
                     break;
                 }
             }

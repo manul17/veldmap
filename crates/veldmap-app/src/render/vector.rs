@@ -99,8 +99,7 @@ impl VectorRenderer {
             // Relax any elastic cap expansion back to `DEFAULT_MESH_CACHE_BYTES`
             // without clearing warm entries so toggling visibility avoids full
             // CPU repacking and GPU buffer re-upload.
-            self.buffers.begin_frame(0, std::iter::empty());
-            self.buffers.end_frame(0);
+            self.buffers.relax_to_default();
             return;
         }
 

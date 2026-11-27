@@ -129,7 +129,7 @@ pub(super) fn sample_geodesic_arc(
     to: GeoPoint,
     max_chord_deg: f64,
 ) -> Vec<GeoPoint> {
-    if !(from.lat.is_finite() && from.lon.is_finite() && to.lat.is_finite() && to.lon.is_finite()) {
+    if !(from.is_finite() && to.is_finite()) {
         return Vec::new();
     }
     let inv = geodesic_inverse(from.lat, from.lon, to.lat, to.lon);

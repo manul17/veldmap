@@ -25,13 +25,13 @@ use crate::gpu_tiles::{
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::layers::{
-    CrsOverride, CursorReadout, LayerId, LayerStyleSpec, OverlayEdit, OverlayFrameCtx,
-    OverlayIoEvent, OverlayManager, OverlayManagerDeps, OverlayMutation,
+    CrsOverride, CursorReadout, LayerId, OpenOverlayRequest, OverlayEdit, OverlayFrameCtx,
+    OverlayIoEvent, OverlayManager, OverlayManagerDeps, OverlayMutation, RemoteCogRequest,
 };
 use crate::measure::MeasureSession;
 use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
 use crate::stac::StacSession;
-use crate::storage::settings::AppSettings;
+use crate::storage::settings::BasemapConfigView;
 use crate::vectors::{VectorEdit, VectorIoEvent, VectorLayerId, VectorManager, is_geojson_path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +130,8 @@ impl SceneState {
     /// overlay management, STAC controller, and the GeoJSON vector manager from
     /// startup `budget` and persisted `settings`.
     pub(crate) fn new(
-        settings: &AppSettings,
+        basemap_config: BasemapConfigView<'_>,
+        gpu_tile_cache_override_bytes: Option<usize>,
         disk_cache: Option<Arc<TileDiskCache>>,
         wakeup: Wakeup,
         budget: &MemoryBudget,
@@ -155,7 +156,7 @@ impl SceneState {
         let decode_pool = TwoLaneDecodePool::spawn(decode_cfg, decode_shutdown.clone());
 
         let basemap = BasemapManager::new(BasemapManagerDeps {
-            config: settings.basemap_config(),
+            config: basemap_config,
             disk_cache: disk_cache.clone(),
             net: net.clone(),
             net_init_error,
@@ -177,7 +178,7 @@ impl SceneState {
             shutdown: decode_shutdown.clone(),
         });
 
-        let gpu_cap = settings.effective_gpu_tile_cache_bytes(budget.gpu_tile_cache_bytes);
+        let gpu_cap = gpu_tile_cache_override_bytes.unwrap_or(budget.gpu_tile_cache_bytes);
         let scene = Self {
             gpu_tile_cache: GpuTileCache::new(gpu_cap),
             default_gpu_tile_cache_bytes: budget.gpu_tile_cache_bytes,
@@ -280,16 +281,8 @@ impl SceneState {
     }
 
     /// Queue a non-blocking remote Cloud-Optimized GeoTIFF open.
-    pub(crate) fn begin_open_remote_cog(
-        &self,
-        url: String,
-        title: String,
-        extra_headers: Vec<(String, String)>,
-        scale_offset: Option<(f64, f64)>,
-        fly_to: bool,
-    ) -> Result<(), String> {
-        self.overlays
-            .begin_open_remote_cog(url, title, extra_headers, scale_offset, fly_to)
+    pub(crate) fn begin_open_remote_cog(&self, request: RemoteCogRequest) -> Result<(), String> {
+        self.overlays.begin_open_remote_cog(request)
     }
 
     /// Mutate the geodesic measurement session and mark the scene dirty
@@ -331,29 +324,21 @@ impl SceneState {
         if is_geojson_path(path) {
             self.begin_open_vector(path, fly_to, true, 1.0)
         } else {
-            self.begin_open_overlay(path, fly_to, true, 1.0, crs_override, None)
+            self.begin_open_overlay(OpenOverlayRequest {
+                path,
+                fly_to,
+                visible: true,
+                opacity: 1.0,
+                crs_override,
+                style: None,
+            })
         }
     }
 
     /// Queue a non-blocking local raster overlay open with explicit initial
     /// display/style/CRS options (used by session restoration and local open).
-    pub(crate) fn begin_open_overlay(
-        &self,
-        path: &Path,
-        fly_to: bool,
-        visible: bool,
-        opacity: f32,
-        crs_override: Option<CrsOverride>,
-        style: Option<LayerStyleSpec>,
-    ) -> Result<(), String> {
-        self.overlays.begin_open_file_with_options(
-            path,
-            fly_to,
-            visible,
-            opacity,
-            crs_override,
-            style,
-        )
+    pub(crate) fn begin_open_overlay(&self, request: OpenOverlayRequest<'_>) -> Result<(), String> {
+        self.overlays.begin_open_file(request)
     }
 
     /// Queue a non-blocking GeoJSON vector layer open with explicit initial
@@ -399,8 +384,8 @@ impl SceneState {
         id: LayerId,
         crs_override: Option<CrsOverride>,
     ) -> Result<Option<veldmap_core::geo::FootprintBounds>, String> {
-        let bounds = self.overlays.override_layer_crs(id, crs_override)?;
-        self.mark_dirty();
+        let (bounds, mutation) = self.overlays.override_layer_crs(id, crs_override)?;
+        let _ = self.apply_overlay_mutation(mutation);
         Ok(bounds)
     }
 
@@ -448,17 +433,21 @@ impl SceneState {
     }
 
     /// Synchronize basemap providers and GPU tile cache cap with updated
-    /// [`AppSettings`], purging any superseded live source from VRAM / pending
+    /// settings slices, purging any superseded live source from VRAM / pending
     /// uploads and updating pinned roots.
-    pub(crate) fn sync_settings(&mut self, settings: &AppSettings) -> bool {
+    pub(crate) fn sync_settings(
+        &mut self,
+        basemap_config: BasemapConfigView<'_>,
+        gpu_tile_cache_override_bytes: Option<usize>,
+    ) -> bool {
         let next_gpu_cap =
-            settings.effective_gpu_tile_cache_bytes(self.default_gpu_tile_cache_bytes);
+            gpu_tile_cache_override_bytes.unwrap_or(self.default_gpu_tile_cache_bytes);
         let mut gpu_changed = false;
         if self.gpu_tile_cache.max_bytes() != next_gpu_cap {
             self.gpu_tile_cache.set_max_bytes(next_gpu_cap);
             gpu_changed = true;
         }
-        let outcome = self.basemap.sync_settings(settings.basemap_config());
+        let outcome = self.basemap.sync_settings(basemap_config);
         if let Some(evict) = outcome.evict_source {
             self.purge_source_caches(evict);
         }

@@ -16,8 +16,8 @@ use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_net::HttpRangeSource;
 use veldmap_raster::{
-    OpenedRaster, RasterDescription, RasterError, RasterSource, TiffSource,
-    frame_from_description_with_override, open_raster,
+    OpenRasterOptions, OpenedRaster, RasterDescription, RasterError, RasterSource,
+    frame_from_description_with_override, open_raster, open_raster_with_options,
 };
 use veldmap_storage::{LocalFingerprintCache, StorageError, read_regular_file_utf8_limited};
 
@@ -168,20 +168,25 @@ pub(super) fn open_remote_cog_source(
 ) -> Result<(Arc<dyn RasterSource>, Frame), OpenRasterError> {
     let fingerprint = range_source.fingerprint();
     let byte_source: Arc<dyn ByteSource> = Arc::new(range_source);
-    let mut tiff =
-        TiffSource::open(byte_source, fingerprint, budget, cancel).map_err(|err| match err {
-            RasterError::UnsupportedFormat => OpenRasterError::other(
-                "remote asset is not a valid GeoTIFF / Cloud-Optimized GeoTIFF".to_owned(),
-            ),
-            RasterError::RemotePassUnsupported(reason) => OpenRasterError::other(format!(
-                "remote GeoTIFF is not cloud-optimized (requires tiled pointwise access): {reason}"
-            )),
-            other => OpenRasterError::other(format!("failed to read remote COG: {other}")),
-        })?;
-    if let Some((scale, offset)) = scale_offset {
-        tiff.apply_external_scale_offset(scale, offset);
-    }
-    let source: Arc<dyn RasterSource> = Arc::new(tiff);
+    let OpenedRaster { source, .. } = open_raster_with_options(
+        byte_source,
+        fingerprint,
+        OpenRasterOptions {
+            sidecars: None,
+            external_scale_offset: scale_offset.map(|(scale, offset)| (Some(scale), Some(offset))),
+        },
+        budget,
+        cancel,
+    )
+    .map_err(|err| match err {
+        RasterError::UnsupportedFormat => OpenRasterError::other(
+            "remote asset is not a valid GeoTIFF / Cloud-Optimized GeoTIFF".to_owned(),
+        ),
+        RasterError::RemotePassUnsupported(reason) => OpenRasterError::other(format!(
+            "remote GeoTIFF is not cloud-optimized (requires tiled pointwise access): {reason}"
+        )),
+        other => OpenRasterError::other(format!("failed to read remote COG: {other}")),
+    })?;
     let frame = frame_from_description_with_override(source.description(), None)
         .map_err(|e| OpenRasterError::other(format!("remote COG georeference error: {e}")))?;
     Ok((source, frame))

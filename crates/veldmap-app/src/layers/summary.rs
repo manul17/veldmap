@@ -6,7 +6,7 @@ use std::path::Path;
 use veldmap_core::tile::PixelFormat;
 
 use super::layer::OverlayLayer;
-use super::style::{ColorbarInfo, format_band_label};
+use super::style::{ColorbarInfo, LayerStyle, format_band_label};
 use super::{CategoricalSummary, LayerSummary, ScientificSummary};
 
 impl OverlayLayer {
@@ -21,7 +21,7 @@ impl OverlayLayer {
             Some(bt) => format!("{} · {bt}", self.name()),
             None => self.name().to_owned(),
         };
-        let sci = self.scientific_style();
+        let sci = self.style().scientific();
         Some(ColorbarInfo {
             title,
             units: info.and_then(|b| b.units.clone()),
@@ -53,7 +53,8 @@ impl OverlayLayer {
             },
         );
         let active_band_info = desc.band_info(active_spec.band);
-        let sci = self.scientific_style();
+        let style = self.style();
+        let sci = style.scientific();
         let scientific = (active_spec.format == PixelFormat::R32Float).then(|| {
             let (scale, offset) = active_band_info.map_or((1.0, 0.0), |b| (b.scale, b.offset));
             ScientificSummary {
@@ -74,10 +75,11 @@ impl OverlayLayer {
             PixelFormat::R8Uint | PixelFormat::R16Uint
         )
         .then(|| CategoricalSummary {
-            palette: self.categorical_palette(),
-            has_source_color_map: self.has_source_color_map(),
-            nodata_value: self.categorical_nodata_value(active_spec.band),
+            palette: style.categorical_palette(),
+            has_source_color_map: style.has_source_color_map(),
+            nodata_value: LayerStyle::categorical_nodata_value(desc, active_spec.band),
         });
+        let geo = self.geo();
 
         LayerSummary {
             id: self.id(),
@@ -89,25 +91,25 @@ impl OverlayLayer {
             opacity: self.opacity(),
             width: desc.width,
             height: desc.height,
-            source_pixel_size_m: self.source_pixel_size_m(),
-            footprint: self.footprint(),
+            source_pixel_size_m: geo.source_pixel_size_m(),
+            footprint: geo.footprint(),
             in_flight,
             pass_active,
             reloading: self.is_reloading(),
-            crs_label: self.frame().crs_label(),
-            datum_warning: self.frame().datum_warning().map(|w| w.message()),
+            crs_label: geo.frame().crs_label(),
+            datum_warning: geo.frame().datum_warning().map(|w| w.message()),
             sample_info,
             detail_limit_level: self
                 .meta()
                 .finest_fitting_level()
                 .unwrap_or(self.meta().max_level()),
             can_override_crs: desc.can_override_crs(),
-            has_crs_override: self.crs_override().is_some(),
+            has_crs_override: geo.crs_override().is_some(),
             last_error: self.last_error().map(str::to_owned),
             can_move_up,
             can_move_down,
             active_spec,
-            band_options: self.band_options().to_vec(),
+            band_options: style.band_options().to_vec(),
             scientific,
             categorical,
         }

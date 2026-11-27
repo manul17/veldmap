@@ -15,14 +15,6 @@ pub(crate) struct AuthorityParts<'a> {
     pub(crate) tail: &'a str,
 }
 
-/// Parsed HTTP(S) authority components (`host_port` without `user:pass@`, and
-/// bare `host` preserving bracketed IPv6 literals like `[::1]`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ParsedAuthority<'a> {
-    pub(crate) host_port: &'a str,
-    pub(crate) host: &'a str,
-}
-
 /// Return whether `s` contains ASCII whitespace or control bytes disallowed
 /// in HTTP(S) URLs and URL templates.
 pub(crate) fn has_invalid_url_bytes(s: &str) -> bool {
@@ -30,24 +22,17 @@ pub(crate) fn has_invalid_url_bytes(s: &str) -> bool {
         .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
 }
 
-/// Split an ASCII case-insensitive `https://` or `http://` prefix into
-/// `(normalized_scheme, after_scheme)` without ever slicing across a
-/// multi-byte UTF-8 character boundary.
-fn split_http_scheme(url: &str) -> Option<(&'static str, &str)> {
-    let bytes = url.as_bytes();
-    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
-        Some(("https", &url[8..]))
-    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
-        Some(("http", &url[7..]))
-    } else {
-        None
-    }
-}
-
 /// Strip an ASCII case-insensitive `https://` or `http://` prefix without
 /// ever slicing across a multi-byte UTF-8 character boundary.
 pub(crate) fn strip_http_scheme(url: &str) -> Option<&str> {
-    split_http_scheme(url).map(|(_, rest)| rest)
+    let bytes = url.as_bytes();
+    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        Some(&url[8..])
+    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+        Some(&url[7..])
+    } else {
+        None
+    }
 }
 
 /// Split `after_scheme` (the slice immediately following `"://"`) at the first
@@ -82,13 +67,19 @@ fn valid_optional_port(port_suffix: &str) -> bool {
         && port_str.parse::<u16>().is_ok()
 }
 
-fn parse_authority_after_scheme(after_scheme: &str) -> Option<(ParsedAuthority<'_>, &str)> {
+/// Parse and validate the authority section of an HTTP(S) URL or `{s}`
+/// template, handling case-insensitive `http://`/`https://` schemes,
+/// `user:pass@` userinfo, numeric `:port` validation, and bracketed IPv6
+/// literals (`http://[::1]:8080/...`), and returning the bare `host`
+/// (preserving IPv6 brackets).
+pub(crate) fn parse_http_authority(url: &str) -> Option<&str> {
+    let after_scheme = strip_http_scheme(url)?;
     let parts = split_authority_and_userinfo(after_scheme);
     let host_port = parts.host_port;
     if host_port.is_empty() {
         return None;
     }
-    let host = if let Some(rest) = host_port.strip_prefix('[') {
+    if let Some(rest) = host_port.strip_prefix('[') {
         let end = rest.find(']')?;
         let inner = &rest[..end];
         inner.parse::<Ipv6Addr>().ok()?;
@@ -96,65 +87,70 @@ fn parse_authority_after_scheme(after_scheme: &str) -> Option<(ParsedAuthority<'
         if !valid_optional_port(after) {
             return None;
         }
-        &host_port[..=end + 1]
+        Some(&host_port[..=end + 1])
     } else {
-        let (h, port_suffix) = match host_port.find(':') {
+        let (host, port_suffix) = match host_port.find(':') {
             Some(colon) => (&host_port[..colon], &host_port[colon..]),
             None => (host_port, ""),
         };
-        if h.is_empty() || !valid_optional_port(port_suffix) {
+        if host.is_empty() || !valid_optional_port(port_suffix) {
             return None;
         }
-        h
-    };
-    Some((ParsedAuthority { host_port, host }, parts.tail))
+        Some(host)
+    }
 }
 
-/// Parse the authority section of an HTTP(S) URL or template, handling
-/// case-insensitive `http://`/`https://` schemes, `user:pass@` userinfo,
-/// numeric `:port` validation, and bracketed IPv6 literals
-/// (`http://[::1]:8080/...`).
-pub(crate) fn parse_http_authority(url: &str) -> Option<ParsedAuthority<'_>> {
-    let (_, after_scheme) = split_http_scheme(url)?;
-    Some(parse_authority_after_scheme(after_scheme)?.0)
-}
-
-/// Extract the lowercased `host[:port]` authority key from an HTTP(S) URL.
-pub(crate) fn extract_host(url: &str) -> String {
-    parse_http_authority(url)
-        .map(|auth| auth.host_port.to_ascii_lowercase())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-/// Normalize an HTTP(S) URL into `scheme://host[:port]/path` with lowercased
-/// scheme and authority, stripping any inline `user:pass@`, `?query`, and
-/// `#fragment` so presigned URLs for the same immutable object share a stable
-/// cache identity.
-pub(crate) fn canonical_url_without_query(url: &str) -> Option<String> {
+/// Strictly parse a concrete `http://` or `https://` URL using
+/// `reqwest::Url::parse` after enforcing an explicit `http://`/`https://`
+/// scheme prefix and rejecting ASCII whitespace and control bytes (which
+/// WHATWG URL parsing would otherwise silently normalize, strip, or
+/// percent-encode).
+fn parse_http_url(url: &str) -> Option<reqwest::Url> {
     let trimmed = url.trim();
     if trimmed.is_empty() || has_invalid_url_bytes(trimmed) {
         return None;
     }
-    let (scheme, after_scheme) = split_http_scheme(trimmed)?;
-    let (authority, tail) = parse_authority_after_scheme(after_scheme)?;
-    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
-    let path = &tail[..path_end];
-    let normalized_path = if path.is_empty() { "/" } else { path };
-    Some(format!(
-        "{scheme}://{}{normalized_path}",
-        authority.host_port.to_ascii_lowercase()
-    ))
+    strip_http_scheme(trimmed)?;
+    let parsed = reqwest::Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed.host_str()?;
+    Some(parsed)
+}
+
+/// Extract the lowercased `host[:port]` authority key from an HTTP(S) URL
+/// (stripping default `:80`/`:443` ports and normalizing IDNA hosts).
+pub(crate) fn extract_host(url: &str) -> String {
+    let Some(parsed) = parse_http_url(url) else {
+        return "unknown".to_owned();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "unknown".to_owned();
+    };
+    match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    }
+}
+
+/// Normalize an HTTP(S) URL into `scheme://host[:port]/path` with lowercased
+/// scheme and authority, default ports (`:80` for `http`, `:443` for `https`)
+/// stripped, and any inline `user:pass@`, `?query`, and `#fragment` removed so
+/// presigned URLs for the same immutable object share a stable cache identity.
+pub(crate) fn canonical_url_without_query(url: &str) -> Option<String> {
+    let mut parsed = parse_http_url(url)?;
+    parsed.set_password(None).ok()?;
+    parsed.set_username("").ok()?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.into())
 }
 
 /// Return whether `url` is a syntactically valid `http://` or `https://` URL
 /// with a valid authority and no ASCII whitespace or control bytes.
 pub fn is_valid_http_endpoint(url: &str) -> bool {
-    let trimmed = url.trim();
-    !trimmed.is_empty()
-        && !has_invalid_url_bytes(trimmed)
-        && split_http_scheme(trimmed)
-            .and_then(|(_, after_scheme)| parse_authority_after_scheme(after_scheme))
-            .is_some()
+    parse_http_url(url).is_some()
 }
 
 /// Split `url` into `(base_without_query_or_fragment, optional_query_without_qmark,
@@ -171,30 +167,15 @@ pub(crate) fn split_url_query_fragment(url: &str) -> (&str, Option<&str>, Option
     (base, query, frag)
 }
 
-fn normalized_http_origin(url: &str) -> Option<(&'static str, String, u16)> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() || has_invalid_url_bytes(trimmed) {
-        return None;
-    }
-    let (scheme, after_scheme) = split_http_scheme(trimmed)?;
-    let default_port = if scheme == "https" { 443u16 } else { 80u16 };
-    let (auth, _) = parse_authority_after_scheme(after_scheme)?;
-    let port_suffix = &auth.host_port[auth.host.len()..];
-    let port = if let Some(p) = port_suffix.strip_prefix(':') {
-        p.parse::<u16>().ok()?
-    } else {
-        default_port
-    };
-    Some((scheme, auth.host.to_ascii_lowercase(), port))
-}
-
 /// Return whether two HTTP(S) URLs share the exact same `(scheme, host, port)`
 /// origin (normalizing default ports `http -> 80` and `https -> 443`).
 pub fn same_http_origin(a: &str, b: &str) -> bool {
-    match (normalized_http_origin(a), normalized_http_origin(b)) {
-        (Some(oa), Some(ob)) => oa == ob,
-        _ => false,
-    }
+    let (Some(ua), Some(ub)) = (parse_http_url(a), parse_http_url(b)) else {
+        return false;
+    };
+    ua.scheme() == ub.scheme()
+        && ua.host_str() == ub.host_str()
+        && ua.port_or_known_default() == ub.port_or_known_default()
 }
 
 #[cfg(test)]

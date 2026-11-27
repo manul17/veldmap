@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use serde_json::Value;
 use veldmap_core::sync::CancelToken;
 
@@ -12,7 +12,7 @@ use crate::http::{
     BodyReadError, HostLimiters, link_cancel_token, parse_custom_headers, read_body_capped,
     record_rate_limit_cooldown,
 };
-use crate::redact::{redact_text_many, sanitize_url_for_display};
+use crate::redact::{EncodedSecret, redact_text_many, sanitize_url_for_display};
 use crate::url::{extract_host, is_valid_http_endpoint, split_url_query_fragment};
 
 use super::parse::{build_search_payload, parse_search_response};
@@ -26,6 +26,59 @@ const MAX_STAC_ERROR_SNIPPET_BYTES: usize = 512;
 
 /// Additional protocol-owned headers forbidden in STAC custom auth headers.
 const STAC_EXTRA_FORBIDDEN_HEADERS: &[&str] = &["content-type", "accept"];
+
+struct PreparedSearchRequest {
+    search_url: String,
+    host: String,
+    custom_headers: Vec<(HeaderName, HeaderValue)>,
+    secrets: Vec<EncodedSecret>,
+}
+
+impl PreparedSearchRequest {
+    fn redact(&self, msg: &str) -> String {
+        redact_text_many(msg, &self.secrets)
+    }
+}
+
+fn prepare_search_request(
+    catalog: &StacCatalogConfig,
+    query: &StacSearchQuery,
+) -> Result<(PreparedSearchRequest, Vec<u8>), StacError> {
+    let endpoint = catalog.endpoint.trim();
+    if !is_valid_http_endpoint(endpoint) {
+        return Err(StacError::InvalidEndpoint(sanitize_url_for_display(
+            endpoint,
+        )));
+    }
+    let search_base = append_search_path(endpoint);
+    let search_url = catalog.auth.apply_to_url(&search_base);
+    let host = extract_host(&search_url);
+
+    let raw_headers = catalog.auth.extra_headers();
+    let parsed = parse_custom_headers(&raw_headers, STAC_EXTRA_FORBIDDEN_HEADERS)
+        .map_err(|(name, reason)| StacError::InvalidAuthHeader { name, reason })?;
+    let custom_headers = parsed.headers;
+    let mut secrets = parsed.secrets;
+    if let Some(secret) = catalog.auth.encoded_secret()
+        && !secrets.contains(&secret)
+    {
+        secrets.push(secret);
+    }
+
+    let body_json = build_search_payload(&catalog.collection, query);
+    let body_bytes =
+        serde_json::to_vec(&body_json).map_err(|e| StacError::InvalidJson(e.to_string()))?;
+
+    Ok((
+        PreparedSearchRequest {
+            search_url,
+            host,
+            custom_headers,
+            secrets,
+        },
+        body_bytes,
+    ))
+}
 
 /// Asynchronous STAC API search client sharing [`NetContext`]'s gzip-enabled
 /// HTTP clients and per-host concurrency/cooldown limiters.
@@ -51,6 +104,75 @@ impl StacClient {
         }
     }
 
+    /// Execute the HTTP POST and read the capped response body while owning
+    /// the per-host semaphore permit strictly inside this function's lexical
+    /// scope so the permit drops before JSON parsing begins.
+    async fn execute_search_http(
+        &self,
+        prepared: &PreparedSearchRequest,
+        body_bytes: Vec<u8>,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, StacError> {
+        let _permit = self
+            .host_limiters
+            .acquire_permit(&prepared.host, cancel)
+            .await
+            .map_err(|_| StacError::Cancelled)?;
+
+        let client = if prepared.custom_headers.is_empty() {
+            &self.api_client
+        } else {
+            &self.api_auth_client
+        };
+        let mut req = client
+            .post(&prepared.search_url)
+            .header(ACCEPT, "application/geo+json, application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .body(body_bytes);
+        for (name, val) in &prepared.custom_headers {
+            req = req.header(name, val);
+        }
+
+        let resp_res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(StacError::Cancelled),
+            res = req.send() => res,
+        };
+        let mut resp = match resp_res {
+            Ok(resp) => resp,
+            Err(err) => {
+                return Err(StacError::Network(prepared.redact(&err.to_string())));
+            }
+        };
+
+        let status = resp.status();
+        let code = status.as_u16();
+        if matches!(code, 429 | 503) {
+            record_rate_limit_cooldown(
+                &self.host_limiters,
+                &prepared.host,
+                resp.headers(),
+                Duration::from_secs(5),
+            );
+        }
+        if !status.is_success() {
+            let detail =
+                read_error_detail(&mut resp, status, cancel, |msg| prepared.redact(msg)).await?;
+            return Err(StacError::HttpStatus { code, detail });
+        }
+
+        match read_body_capped(&mut resp, MAX_STAC_RESPONSE_BYTES, 16 * 1024, cancel).await {
+            Ok(bytes) => Ok(bytes),
+            Err(BodyReadError::Cancelled) => Err(StacError::Cancelled),
+            Err(BodyReadError::TooLarge) => Err(StacError::ResponseTooLarge {
+                limit: MAX_STAC_RESPONSE_BYTES,
+            }),
+            Err(BodyReadError::Network(err)) => {
+                Err(StacError::Network(prepared.redact(&err.to_string())))
+            }
+        }
+    }
+
     /// Execute a STAC `/search` query asynchronously against `catalog`.
     pub async fn search_async(
         &self,
@@ -63,102 +185,13 @@ impl StacClient {
             return Err(StacError::Cancelled);
         }
 
-        let endpoint = catalog.endpoint.trim();
-        if !is_valid_http_endpoint(endpoint) {
-            return Err(StacError::InvalidEndpoint(sanitize_url_for_display(
-                endpoint,
-            )));
-        }
-        let search_base = append_search_path(endpoint);
-        let search_url = catalog.auth.apply_to_url(&search_base);
-        let host = extract_host(&search_url);
-
-        let raw_headers = catalog.auth.extra_headers();
-        let parsed = parse_custom_headers(&raw_headers, STAC_EXTRA_FORBIDDEN_HEADERS)
-            .map_err(|(name, reason)| StacError::InvalidAuthHeader { name, reason })?;
-        let custom_headers = parsed.headers;
-        let mut secrets = parsed.secrets;
-        if let Some(secret) = catalog.auth.encoded_secret()
-            && !secrets.contains(&secret)
-        {
-            secrets.push(secret);
-        }
-        let redact_msg = |msg: &str| redact_text_many(msg, &secrets);
-
-        let body_json = build_search_payload(&catalog.collection, query);
-        let body_bytes =
-            serde_json::to_vec(&body_json).map_err(|e| StacError::InvalidJson(e.to_string()))?;
-
-        let permit = self
-            .host_limiters
-            .acquire_permit(&host, &linked_cancel)
-            .await
-            .map_err(|_| StacError::Cancelled)?;
-
-        let client = if custom_headers.is_empty() {
-            &self.api_client
-        } else {
-            &self.api_auth_client
-        };
-        let mut req = client
-            .post(&search_url)
-            .header(ACCEPT, "application/geo+json, application/json")
-            .header(CONTENT_TYPE, "application/json")
-            .body(body_bytes);
-        for (name, val) in custom_headers {
-            req = req.header(name, val);
-        }
-
-        let resp_res = tokio::select! {
-            biased;
-            _ = linked_cancel.cancelled() => return Err(StacError::Cancelled),
-            res = req.send() => res,
-        };
-        let mut resp = match resp_res {
-            Ok(resp) => resp,
-            Err(err) => {
-                return Err(StacError::Network(redact_msg(&err.to_string())));
-            }
-        };
-
-        let status = resp.status();
-        let code = status.as_u16();
-        if matches!(code, 429 | 503) {
-            record_rate_limit_cooldown(
-                &self.host_limiters,
-                &host,
-                resp.headers(),
-                Duration::from_secs(5),
-            );
-        }
-        if !status.is_success() {
-            let detail = read_error_detail(&mut resp, status, &linked_cancel, &redact_msg).await?;
-            return Err(StacError::HttpStatus { code, detail });
-        }
-
-        let raw = match read_body_capped(
-            &mut resp,
-            MAX_STAC_RESPONSE_BYTES,
-            16 * 1024,
-            &linked_cancel,
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(BodyReadError::Cancelled) => return Err(StacError::Cancelled),
-            Err(BodyReadError::TooLarge) => {
-                return Err(StacError::ResponseTooLarge {
-                    limit: MAX_STAC_RESPONSE_BYTES,
-                });
-            }
-            Err(BodyReadError::Network(err)) => {
-                return Err(StacError::Network(redact_msg(&err.to_string())));
-            }
-        };
-        drop(permit);
+        let (prepared, body_bytes) = prepare_search_request(catalog, query)?;
+        let raw = self
+            .execute_search_http(&prepared, body_bytes, &linked_cancel)
+            .await?;
 
         let value: Value = serde_json::from_slice(&raw)
-            .map_err(|e| StacError::InvalidJson(redact_msg(&e.to_string())))?;
+            .map_err(|e| StacError::InvalidJson(prepared.redact(&e.to_string())))?;
         parse_search_response(&value)
     }
 }
@@ -167,7 +200,7 @@ async fn read_error_detail(
     resp: &mut reqwest::Response,
     status: reqwest::StatusCode,
     cancel: &CancelToken,
-    redact_msg: &impl Fn(&str) -> String,
+    redact_msg: impl Fn(&str) -> String,
 ) -> Result<String, StacError> {
     let reason = status
         .canonical_reason()

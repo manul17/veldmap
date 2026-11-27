@@ -5,10 +5,7 @@
 use super::bind_groups::TileBindGroupCache;
 use super::mesh::TileVertex;
 use super::overlay::OverlayVertex;
-use super::uniforms::{
-    CameraUniform, CategoricalPatchUniform, OverlayPatchUniform, PaletteUniform,
-    ScientificPatchUniform, TileUniform, UNIFORM_SLOT_COUNT, UniformSlot, VectorUniform,
-};
+use super::uniforms::{CameraUniform, PaletteUniform, UNIFORM_SLOT_COUNT, UniformSlot};
 use super::vector_pack::{GpuRibbonSegment, GpuVectorVertex};
 use super::{
     COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL, OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL,
@@ -115,9 +112,10 @@ impl SharedLayouts {
     }
 }
 
-fn uniform_buffer_layout<T>(
+fn uniform_buffer_layout(
     device: &wgpu::Device,
     label: &str,
+    min_size_bytes: usize,
     visibility: wgpu::ShaderStages,
     dynamic: bool,
 ) -> wgpu::BindGroupLayout {
@@ -129,7 +127,7 @@ fn uniform_buffer_layout<T>(
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: dynamic,
-                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<T>() as u64),
+                min_binding_size: wgpu::BufferSize::new(min_size_bytes as u64),
             },
             count: None,
         }],
@@ -165,43 +163,21 @@ fn non_filtering_texture_sampler_layout(
 
 fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
     let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
-    let camera_layout =
-        uniform_buffer_layout::<CameraUniform>(device, "globe camera bind group layout", vf, false);
-    let dynamic_uniform_layouts = std::array::from_fn(|idx| match UniformSlot::ALL[idx] {
-        UniformSlot::Tile => uniform_buffer_layout::<TileUniform>(
-            device,
-            "globe per-tile dynamic uniform layout",
-            vf,
-            true,
-        ),
-        UniformSlot::Overlay => uniform_buffer_layout::<OverlayPatchUniform>(
-            device,
-            "overlay patch dynamic uniform layout",
-            vf,
-            true,
-        ),
-        UniformSlot::Scientific => uniform_buffer_layout::<ScientificPatchUniform>(
-            device,
-            "scientific overlay patch dynamic uniform layout",
-            vf,
-            true,
-        ),
-        UniformSlot::Categorical => uniform_buffer_layout::<CategoricalPatchUniform>(
-            device,
-            "categorical overlay patch dynamic uniform layout",
-            vf,
-            true,
-        ),
-        UniformSlot::Vector => uniform_buffer_layout::<VectorUniform>(
-            device,
-            "vector dynamic uniform layout",
-            vf,
-            true,
-        ),
+    let camera_layout = uniform_buffer_layout(
+        device,
+        "globe camera bind group layout",
+        std::mem::size_of::<CameraUniform>(),
+        vf,
+        false,
+    );
+    let dynamic_uniform_layouts = std::array::from_fn(|idx| {
+        let slot = UniformSlot::ALL[idx];
+        uniform_buffer_layout(device, slot.layout_label(), slot.binding_size(), vf, true)
     });
-    let palette_uniform_layout = uniform_buffer_layout::<PaletteUniform>(
+    let palette_uniform_layout = uniform_buffer_layout(
         device,
         "overlay palette LUT uniform layout",
+        std::mem::size_of::<PaletteUniform>(),
         wgpu::ShaderStages::FRAGMENT,
         false,
     );

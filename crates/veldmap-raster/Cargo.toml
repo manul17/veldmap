@@ -26,6 +26,7 @@ zstd.workspace = true
 image.workspace = true
 tiff.workspace = true
 veldmap-core = { path = "../veldmap-core", features = ["test-support"] }
+veldmap-raster = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

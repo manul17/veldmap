@@ -219,7 +219,7 @@ impl TieGrid {
     }
 
     /// Widest normalized row and column ground spans in metres.
-    pub(crate) fn widest_spans_m(&self) -> (f64, f64) {
+    pub(super) fn widest_spans_m(&self) -> (f64, f64) {
         (self.widest_row_m, self.widest_col_m)
     }
 

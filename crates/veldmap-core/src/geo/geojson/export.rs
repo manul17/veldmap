@@ -38,8 +38,14 @@ pub fn export_geojson_feature_collection(collection: &GeoJsonFeatureCollection) 
 /// Export a standalone RFC 7946 GeoJSON geometry object (suitable for STAC
 /// `intersects` queries or AOI clipboard export).
 pub fn export_geojson_geometry(geom: &GeoJsonGeometry) -> String {
-    let val = geometry_to_rfc7946_value(geom);
+    let val = geojson_geometry_to_value(geom);
     serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Convert a [`GeoJsonGeometry`] directly into an RFC 7946 [`serde_json::Value`]
+/// object without intermediate string serialization.
+pub fn geojson_geometry_to_value(geom: &GeoJsonGeometry) -> Value {
+    geometry_to_rfc7946_value(geom)
 }
 
 /// Export a [`GeoJsonGeometry`] as OGC Well-Known Text (WKT) in WGS84
@@ -47,7 +53,7 @@ pub fn export_geojson_geometry(geom: &GeoJsonGeometry) -> String {
 pub fn export_wkt_geometry(geom: &GeoJsonGeometry) -> String {
     match geom {
         GeoJsonGeometry::Point(p) => {
-            if is_finite_point(*p) {
+            if p.is_finite() {
                 format!("POINT ({})", format_wkt_point(*p))
             } else {
                 "POINT EMPTY".to_string()
@@ -57,7 +63,7 @@ pub fn export_wkt_geometry(geom: &GeoJsonGeometry) -> String {
             let inner: Vec<String> = pts
                 .iter()
                 .copied()
-                .filter(|&p| is_finite_point(p))
+                .filter(|p| p.is_finite())
                 .map(|p| format!("({})", format_wkt_point(p)))
                 .collect();
             if inner.is_empty() {
@@ -102,10 +108,6 @@ pub fn export_wkt_geometry(geom: &GeoJsonGeometry) -> String {
     }
 }
 
-fn is_finite_point(p: GeoPoint) -> bool {
-    p.lat.is_finite() && p.lon.is_finite()
-}
-
 fn normalize_wkt_coord(v: f64) -> f64 {
     if v.abs() < 0.5e-8 { 0.0 } else { v }
 }
@@ -121,7 +123,7 @@ fn format_wkt_point(p: GeoPoint) -> String {
 fn format_wkt_coords(pts: &[GeoPoint]) -> String {
     pts.iter()
         .copied()
-        .filter(|&p| is_finite_point(p))
+        .filter(|p| p.is_finite())
         .map(format_wkt_point)
         .collect::<Vec<_>>()
         .join(", ")
@@ -131,12 +133,7 @@ fn format_wkt_coords(pts: &[GeoPoint]) -> String {
 /// exterior rings, `want_ccw = false` for interior holes), filtering non-finite
 /// vertices and closing the ring.
 fn normalize_ring(points: &[GeoPoint], want_ccw: bool) -> Vec<GeoPoint> {
-    let finite: Vec<GeoPoint> = points
-        .iter()
-        .copied()
-        .filter(|&p| is_finite_point(p))
-        .collect();
-    let mut cleaned = dedup_geo_ring(&finite);
+    let mut cleaned = dedup_geo_ring(points);
     if cleaned.len() >= 3 {
         let is_ccw = ring_signed_area_m2(&cleaned) >= 0.0;
         if is_ccw != want_ccw {
@@ -170,7 +167,7 @@ fn format_wkt_polygon(poly: &Polygon) -> Option<String> {
 }
 
 fn point_to_json(p: GeoPoint) -> Option<Value> {
-    (p.lat.is_finite() && p.lon.is_finite()).then(|| json!([p.lon, p.lat]))
+    p.is_finite().then(|| json!([p.lon, p.lat]))
 }
 
 fn points_to_json(pts: &[GeoPoint]) -> Vec<Value> {

@@ -20,6 +20,7 @@ veldmap-core = { path = "../veldmap-core" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "net"] }
+veldmap-net = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -65,14 +65,26 @@ impl fmt::Debug for SourceFingerprint {
 /// Compact identifier for a tile data source (bundled basemap, live XYZ/TMS
 /// layer, local GeoTIFF, or cloud COG).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SourceId(pub u64);
+pub struct SourceId(u64);
 
 impl SourceId {
     /// Reserved source ID for the bundled offline global basemap.
     pub const BUNDLED_BASEMAP: Self = Self(1);
 
+    /// Construct a `SourceId` from a raw integer (for synthetic test fixtures).
+    #[cfg(any(test, feature = "test-support"))]
     pub const fn new(id: u64) -> Self {
         Self(id)
+    }
+
+    /// Whether this identifier refers to [`Self::BUNDLED_BASEMAP`].
+    pub const fn is_bundled(self) -> bool {
+        self.0 == Self::BUNDLED_BASEMAP.0
+    }
+
+    /// Raw 64-bit source identifier value.
+    pub(super) const fn raw(self) -> u64 {
+        self.0
     }
 
     /// Derive a deterministic `SourceId` from a stable ASCII/UTF-8 source key

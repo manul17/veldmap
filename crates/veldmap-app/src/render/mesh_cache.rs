@@ -70,6 +70,12 @@ impl<K: Eq + Hash + Copy, V> ElasticMeshCache<K, V> {
             let _ = self.inner.set_max_bytes(target_cap);
         }
     }
+
+    /// Relax any elastic active-frame capacity expansion back to
+    /// `default_cap_bytes` without clearing warm cached meshes.
+    pub(super) fn relax_to_default(&mut self) {
+        self.end_frame(0);
+    }
 }
 
 /// Append triangle indices for an `n x n` row-major vertex grid

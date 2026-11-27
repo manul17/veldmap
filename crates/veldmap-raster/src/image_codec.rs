@@ -2,7 +2,7 @@
 //! `png::Decoder` builders, JPEG progressive/lossless working-memory estimates,
 //! and PNG/JPEG pixel-format conversions into packed RGB8/RGBA8.
 
-use std::io::{BufRead, Seek};
+use std::io::{BufRead, Read, Seek};
 
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
@@ -40,6 +40,14 @@ pub(crate) fn build_normalized_png_decoder<R: BufRead + Seek>(
 ) -> png::Decoder<R> {
     let mut decoder = build_png_decoder(reader, max_bytes);
     decoder.set_transformations(png::Transformations::normalize_to_color8());
+    decoder
+}
+
+/// Build a [`jpeg_decoder::Decoder`] bounded by `max_bytes` for its decoded
+/// output buffer.
+pub(crate) fn build_jpeg_decoder<R: Read>(reader: R, max_bytes: u64) -> jpeg_decoder::Decoder<R> {
+    let mut decoder = jpeg_decoder::Decoder::new(reader);
+    decoder.set_max_decoding_buffer_size(max_bytes.min(usize::MAX as u64) as usize);
     decoder
 }
 

@@ -178,12 +178,6 @@ impl NetContext {
         self.next_instance_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Clear rate-limit cooldowns strictly for `hosts` (leaving all other hosts
-    /// untouched).
-    pub fn clear_cooldowns_for<'a>(&self, hosts: impl IntoIterator<Item = &'a str>) {
-        self.host_limiters.clear_cooldowns_for(hosts);
-    }
-
     /// Signal global cancellation across all live pipelines, range readers,
     /// and STAC requests sharing this context (Phase 1 of shutdown).
     pub fn signal_shutdown(&self) {

@@ -153,8 +153,15 @@ impl VeldmapApp {
         let budget = detect_memory_budget();
         let storage = AppStorage::open(Arc::clone(&wakeup), None);
         let dialogs = DialogHost::new(Arc::clone(&wakeup));
-        let scene = SceneState::new(storage.settings(), storage.disk_cache(), wakeup, &budget)?;
-        let panels = UiPanels::new(storage.settings());
+        let settings = storage.settings();
+        let scene = SceneState::new(
+            settings.basemap_config(),
+            settings.gpu_tile_cache_override_bytes(),
+            storage.disk_cache(),
+            wakeup,
+            &budget,
+        )?;
+        let panels = UiPanels::new(settings);
 
         let restored_session = storage.session().clone();
         let camera = restored_session
@@ -189,7 +196,7 @@ impl VeldmapApp {
     /// Open the unified Settings modal on `tab`, synchronizing the draft when
     /// newly opened, refreshing disk cache statistics, and clearing any stale
     /// disk-cache notice.
-    pub(super) fn open_settings_tab(&mut self, tab: SettingsTab) {
+    fn open_settings_tab(&mut self, tab: SettingsTab) {
         self.panels.settings.open_tab(self.storage.settings(), tab);
         self.storage.maybe_refresh_disk_stats(true);
         self.storage.clear_disk_cache_notice();
@@ -197,7 +204,7 @@ impl VeldmapApp {
 
     /// Toggle the unified Settings modal open or closed from the toolbar,
     /// preserving the last selected tab when reopening.
-    pub(super) fn toggle_settings(&mut self) {
+    fn toggle_settings(&mut self) {
         if self.panels.settings.is_open() {
             self.panels.settings.close();
         } else {
@@ -217,16 +224,22 @@ impl VeldmapApp {
         }
     }
 
+    /// Clear AOI box drawing state, active drag, and live preview without
+    /// disturbing an unrelated active measurement session.
     fn deactivate_draw_aoi(&mut self) {
         self.panels.draw_aoi_active = false;
         self.viewport.cancel_aoi_drag();
         self.scene.mutate_stac(StacSession::clear_aoi_preview);
     }
 
-    /// Transition to an exclusive viewport tool (`Navigate`, `Measure`, or
-    /// `DrawAoiBox`), atomically deactivating any conflicting drag, preview, or
-    /// measurement state.
-    fn set_viewport_tool(&mut self, tool: ViewportToolMode) {
+    /// Single transition point enforcing mutual exclusion between `Navigate`,
+    /// `DrawAoiBox`, and `Measure` (preserving remembered `last_active_mode`
+    /// when `explicit_measure_mode` is `None`).
+    fn set_viewport_tool(
+        &mut self,
+        tool: ViewportToolMode,
+        explicit_measure_mode: Option<MeasureMode>,
+    ) {
         if tool != ViewportToolMode::DrawAoiBox {
             self.deactivate_draw_aoi();
         }
@@ -238,64 +251,58 @@ impl VeldmapApp {
             ViewportToolMode::DrawAoiBox => {
                 self.panels.draw_aoi_active = true;
             }
-            ViewportToolMode::Measure => {
-                if !self.scene.measure().is_active() {
-                    self.scene.mutate_measure(MeasureSession::toggle);
+            ViewportToolMode::Measure => match explicit_measure_mode {
+                Some(mode) => {
+                    self.scene.mutate_measure(|m| m.set_mode(mode));
                 }
-            }
-        }
-    }
-
-    /// Atomically cancel interactive AOI box drawing without disturbing an
-    /// unrelated active measurement session.
-    pub(super) fn cancel_draw_aoi(&mut self) {
-        if self.panels.draw_aoi_active {
-            self.set_viewport_tool(ViewportToolMode::Navigate);
-        } else {
-            self.deactivate_draw_aoi();
+                None => {
+                    if !self.scene.measure().is_active() {
+                        self.scene.mutate_measure(MeasureSession::toggle);
+                    }
+                }
+            },
         }
     }
 
     /// Enable or disable interactive AOI box drawing, enforcing mutual
     /// exclusion with geodesic measurement.
-    pub(super) fn set_draw_aoi_active(&mut self, active: bool) {
+    fn set_draw_aoi_active(&mut self, active: bool) {
         if active {
-            self.set_viewport_tool(ViewportToolMode::DrawAoiBox);
+            self.set_viewport_tool(ViewportToolMode::DrawAoiBox, None);
         } else {
-            self.cancel_draw_aoi();
+            self.deactivate_draw_aoi();
         }
     }
 
     /// Toggle geodesic measurement mode while preserving
     /// [`MeasureSession`]'s remembered `last_active_mode`.
-    pub(super) fn toggle_measure_tool(&mut self) {
+    fn toggle_measure_tool(&mut self) {
         if self.scene.measure().is_active() {
-            self.set_viewport_tool(ViewportToolMode::Navigate);
+            self.set_viewport_tool(ViewportToolMode::Navigate, None);
         } else {
-            self.set_viewport_tool(ViewportToolMode::Measure);
+            self.set_viewport_tool(ViewportToolMode::Measure, None);
         }
     }
 
     /// Set geodesic measurement mode explicitly (`Distance`, `Area`, or `Off`),
     /// enforcing mutual exclusion with AOI box drawing.
-    pub(super) fn set_measure_mode(&mut self, mode: MeasureMode) {
+    fn set_measure_mode(&mut self, mode: MeasureMode) {
         if mode == MeasureMode::Off {
-            self.set_viewport_tool(ViewportToolMode::Navigate);
+            self.set_viewport_tool(ViewportToolMode::Navigate, None);
         } else {
-            self.deactivate_draw_aoi();
-            self.scene.mutate_measure(|m| m.set_mode(mode));
+            self.set_viewport_tool(ViewportToolMode::Measure, Some(mode));
         }
     }
 
     /// Clear transient Cloud/STAC interaction modes (AOI drag, live drag
     /// preview, hovered footprint highlight) whenever leaving the STAC tab or
     /// closing the workbench so orbit navigation and highlights never stick.
-    pub(super) fn cleanup_stac_transient_modes(&mut self) {
-        self.cancel_draw_aoi();
+    fn cleanup_stac_transient_modes(&mut self) {
+        self.deactivate_draw_aoi();
         self.scene.mutate_stac(|s| s.set_hovered(None));
     }
 
-    pub(super) fn open_workbench_tab(&mut self, tab: WorkbenchTab) {
+    fn open_workbench_tab(&mut self, tab: WorkbenchTab) {
         let leaving_stac = self.panels.workbench_open
             && self.panels.workbench_tab == WorkbenchTab::CloudStac
             && tab != WorkbenchTab::CloudStac;
@@ -306,14 +313,14 @@ impl VeldmapApp {
         }
     }
 
-    pub(super) fn close_workbench(&mut self) {
+    fn close_workbench(&mut self) {
         if self.panels.workbench_open {
             self.panels.workbench_open = false;
             self.cleanup_stac_transient_modes();
         }
     }
 
-    pub(super) fn toggle_workbench_tab(&mut self, tab: WorkbenchTab) {
+    fn toggle_workbench_tab(&mut self, tab: WorkbenchTab) {
         if self.panels.workbench_open && self.panels.workbench_tab == tab {
             self.close_workbench();
         } else {
@@ -375,7 +382,7 @@ impl VeldmapApp {
         if let Some(measure_action) =
             show_measure_window(ctx, measure_summary, &self.panels.measure)
         {
-            needs_repaint |= self.handle_measure_action(measure_action, frame);
+            needs_repaint |= self.apply_measure_action(measure_action, frame);
         }
         needs_repaint
     }
@@ -401,7 +408,10 @@ impl VeldmapApp {
         } else {
             Vec::new()
         };
-        let stac_view = self.scene.stac().view_snapshot(self.storage.settings());
+        let stac_view = self
+            .scene
+            .stac()
+            .view_snapshot(&self.storage.settings().stac);
         let wb_out = show_workbench_panel(
             ui,
             WorkbenchInputs {
@@ -467,13 +477,13 @@ impl VeldmapApp {
                                     self.scene.mutate_stac(|s| {
                                         s.set_aoi_bbox(bbox, "Drawn Box".to_owned())
                                     });
-                                    self.set_viewport_tool(ViewportToolMode::Navigate);
+                                    self.set_viewport_tool(ViewportToolMode::Navigate, None);
                                 } else {
                                     self.scene.mutate_stac(|s| s.set_aoi_preview_bbox(bbox));
                                 }
                             }
                             ViewportEvent::AoiBoxCancelled => {
-                                self.set_viewport_tool(ViewportToolMode::Navigate);
+                                self.set_viewport_tool(ViewportToolMode::Navigate, None);
                             }
                         }
                     }
@@ -532,7 +542,7 @@ impl VeldmapApp {
             && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
-            self.set_viewport_tool(ViewportToolMode::Navigate);
+            self.set_viewport_tool(ViewportToolMode::Navigate, None);
             active = true;
         }
 

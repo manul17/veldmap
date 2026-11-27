@@ -14,7 +14,7 @@ use std::fmt;
 use veldmap_core::geo::FootprintBounds;
 use veldmap_net::sanitize_url_for_display;
 
-pub(crate) use auth::{StacCogAuthMode, resolve_cog_auth};
+pub(crate) use auth::StacCogAuthMode;
 pub(crate) use session::{StacCatalogPreset, StacSearchRequest, StacSession};
 
 /// URL string wrapper whose [`fmt::Debug`] implementation delegates to

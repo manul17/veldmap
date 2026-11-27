@@ -10,7 +10,9 @@ mod warp;
 
 pub use cull::OverlayCullTree;
 pub use grid::MAX_WARP_SEGMENTS;
-pub use warp::{MIN_WARP_SEGMENTS, WarpPatch, build_warp_patch, level_segments};
+#[cfg(any(test, feature = "test-support"))]
+pub use warp::MIN_WARP_SEGMENTS;
+pub use warp::{WarpPatch, build_warp_patch, level_segments};
 
 #[cfg(test)]
 use cull::compute_cell_ball;

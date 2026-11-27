@@ -1,15 +1,74 @@
 //! Shared synthetic TIFF/COG fixture builders for `veldmap-raster` integration tests.
 
 use std::io::{Cursor, Seek, Write};
+use std::sync::Arc;
 
 use ::tiff::encoder::{
     DirectoryEncoder, TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard, colortype,
 };
 use ::tiff::tags::Tag;
+use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
+use veldmap_core::io::testing::MemoryByteSource;
+use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{
     BandKey, DecodedTile, PixelFormat, RASTER_TILE_SIZE, SourceFingerprint, level_size,
 };
-use veldmap_raster::{BandSample, DecodeContext, RasterError, RasterSource, generate_tile_mipmaps};
+use veldmap_raster::{
+    BandSample, DecodeContext, RasterError, RasterSource, SharedChunkCache, TiffSource,
+    generate_tile_mipmaps,
+};
+
+/// Reusable budget + chunk-cache + cancel test harness for integration tests.
+pub struct DecodeHarness {
+    pub budget: MemoryBudget,
+    pub cancel: CancelToken,
+    pub chunk_cache: SharedChunkCache,
+    pub tracker: DecodeBudgetTracker,
+}
+
+impl Default for DecodeHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecodeHarness {
+    pub fn new() -> Self {
+        let budget = MemoryBudget::default();
+        let chunk_cache = SharedChunkCache::new(budget.decoded_chunk_cache_bytes);
+        let tracker = DecodeBudgetTracker::new(budget.decode_working_bytes);
+        Self {
+            budget,
+            cancel: CancelToken::new(),
+            chunk_cache,
+            tracker,
+        }
+    }
+
+    pub fn ctx(&self) -> DecodeContext<'_> {
+        DecodeContext {
+            chunk_cache: &self.chunk_cache,
+            budget_tracker: &self.tracker,
+            budget: &self.budget,
+            cancel: &self.cancel,
+        }
+    }
+}
+
+/// Open an in-memory TIFF byte vector with a deterministic fingerprint.
+pub fn open_mem_tiff(
+    bytes: Vec<u8>,
+    budget: &MemoryBudget,
+    cancel: &CancelToken,
+) -> Result<TiffSource, RasterError> {
+    let fp = fake_fingerprint(&bytes);
+    TiffSource::open(
+        Arc::new(MemoryByteSource::from_vec(bytes)),
+        fp,
+        budget,
+        cancel,
+    )
+}
 
 /// Test helper wrapping [`RasterSource::sample_band`] for display RGBA8 readouts.
 pub fn sample_display_rgba(

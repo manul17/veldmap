@@ -5,13 +5,16 @@
 //! Kept strictly free of `serde` and `session.json` wire-format concerns;
 //! persistence proxies live in `crate::storage::session`.
 
+use std::sync::Arc;
+
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
 use veldmap_raster::{
-    BandInfo, BandStats, DISPLAY_STREAM_SPEC, RasterDescription, stream_spec_for_band,
+    BandInfo, BandStats, DISPLAY_STREAM_SPEC, RasterDescription, RasterSource, stream_spec_for_band,
 };
 
 use crate::colormap::{CategoricalPaletteId, ColormapId};
+use crate::render::DrawOverlayTrack;
 
 /// High-level track classification for a selectable raster stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +296,175 @@ impl ScientificStyle {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct CategoricalStyle {
     pub(super) palette: CategoricalPaletteId,
+}
+
+fn default_categorical_palette(has_color_map: bool) -> CategoricalPaletteId {
+    if has_color_map {
+        CategoricalPaletteId::SourceColorMap
+    } else {
+        CategoricalPaletteId::DistinctClasses
+    }
+}
+
+/// Cohesive per-layer analytical style state: selectable band options, optional
+/// embedded TIFF ColorMap, live scientific stretch/colormap/stats state, and
+/// categorical palette selection.
+pub(super) struct LayerStyle {
+    band_options: Vec<LayerBandOption>,
+    custom_color_map: Option<Arc<[[u8; 4]]>>,
+    scientific: ScientificStyle,
+    categorical: CategoricalStyle,
+}
+
+impl LayerStyle {
+    pub(super) fn new(
+        source: &dyn RasterSource,
+        active_spec: TileStreamSpec,
+        saved: Option<&LayerStyleSpec>,
+    ) -> Self {
+        let band_options = build_band_options(source.description());
+        let custom_color_map = source.color_map();
+        let mut scientific = ScientificStyle {
+            last_scientific_band: (active_spec.format == PixelFormat::R32Float)
+                .then_some(active_spec.band),
+            ..ScientificStyle::default()
+        };
+        let mut categorical = CategoricalStyle {
+            palette: default_categorical_palette(custom_color_map.is_some()),
+        };
+        if let Some(saved) = saved {
+            scientific.apply_saved(saved);
+            if let Some(pal) = saved.categorical_palette
+                && (pal != CategoricalPaletteId::SourceColorMap || custom_color_map.is_some())
+            {
+                categorical.palette = pal;
+            }
+        }
+        Self {
+            band_options,
+            custom_color_map,
+            scientific,
+            categorical,
+        }
+    }
+
+    pub(super) fn scientific(&self) -> &ScientificStyle {
+        &self.scientific
+    }
+
+    pub(super) fn scientific_mut(&mut self) -> &mut ScientificStyle {
+        &mut self.scientific
+    }
+
+    pub(super) fn categorical_palette(&self) -> CategoricalPaletteId {
+        self.categorical.palette
+    }
+
+    pub(super) fn has_source_color_map(&self) -> bool {
+        self.custom_color_map.is_some()
+    }
+
+    pub(super) fn band_options(&self) -> &[LayerBandOption] {
+        &self.band_options
+    }
+
+    pub(super) fn on_stream_switched(&mut self, spec: TileStreamSpec) {
+        self.scientific.on_stream_switched(spec);
+    }
+
+    pub(super) fn set_stretch_preset(&mut self, preset: StretchPreset) -> bool {
+        self.scientific.set_stretch_preset(preset)
+    }
+
+    pub(super) fn set_stretch_range(&mut self, min: f64, max: f64) -> bool {
+        self.scientific.set_stretch_range(min, max)
+    }
+
+    pub(super) fn set_colormap(&mut self, colormap: ColormapId, invert: bool) -> bool {
+        self.scientific.set_colormap(colormap, invert)
+    }
+
+    pub(super) fn set_categorical_palette(&mut self, palette: CategoricalPaletteId) -> bool {
+        if palette == CategoricalPaletteId::SourceColorMap && self.custom_color_map.is_none() {
+            return false;
+        }
+        if self.categorical.palette == palette {
+            return false;
+        }
+        self.categorical.palette = palette;
+        true
+    }
+
+    pub(super) fn categorical_nodata_value(desc: &RasterDescription, band: BandKey) -> Option<u32> {
+        desc.band_info(band)
+            .and_then(|b| b.nodata)
+            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= f64::from(u32::MAX))
+            .map(|v| v.round() as u32)
+    }
+
+    pub(super) fn draw_track(
+        &self,
+        source: &dyn RasterSource,
+        spec: TileStreamSpec,
+    ) -> DrawOverlayTrack {
+        let desc = source.description();
+        let band_info = desc.band_info(spec.band);
+        match spec.format {
+            PixelFormat::Rgba8UnormSrgb => DrawOverlayTrack::Display,
+            PixelFormat::R32Float => {
+                let (scale, offset) = band_info.map_or((1.0, 0.0), |b| (b.scale, b.offset));
+                DrawOverlayTrack::Scientific {
+                    scale: scale as f32,
+                    offset: offset as f32,
+                    stretch_min: self.scientific.min as f32,
+                    stretch_max: self.scientific.max as f32,
+                    log10_db: self.scientific.preset.is_log10_db(),
+                    colormap: self.scientific.colormap,
+                    invert_colormap: self.scientific.invert_colormap,
+                }
+            }
+            PixelFormat::R8Uint | PixelFormat::R16Uint => DrawOverlayTrack::Categorical {
+                source: source.source_id(),
+                palette: self.categorical.palette,
+                custom_color_map: self.custom_color_map.clone(),
+                nodata_value: Self::categorical_nodata_value(desc, spec.band),
+            },
+        }
+    }
+
+    pub(super) fn saved_style(
+        &self,
+        source: &dyn RasterSource,
+        spec: TileStreamSpec,
+    ) -> Option<LayerStyleSpec> {
+        let default_cat = default_categorical_palette(self.custom_color_map.is_some());
+        if spec == source.default_stream_spec()
+            && spec.format == PixelFormat::Rgba8UnormSrgb
+            && self.scientific.is_default_untouched()
+            && self.categorical.palette == default_cat
+        {
+            return None;
+        }
+        let track_kind = TrackKind::from_format(spec.format);
+        let (band_index, track) = match (spec.band, track_kind) {
+            (_, TrackKind::Display) => (None, Some(track_kind)),
+            (BandKey::Index(i), TrackKind::Scientific | TrackKind::Categorical) => {
+                (Some(i), Some(track_kind))
+            }
+            _ => (None, None),
+        };
+        Some(LayerStyleSpec {
+            band_index,
+            track,
+            stretch_preset: Some(self.scientific.preset),
+            stretch_min: Some(self.scientific.min),
+            stretch_max: Some(self.scientific.max),
+            custom_stretch_range: self.scientific.custom_range_applied,
+            colormap: Some(self.scientific.colormap),
+            invert_colormap: self.scientific.invert_colormap,
+            categorical_palette: Some(self.categorical.palette),
+        })
+    }
 }
 
 /// One selectable band/track entry in the Layer Card dropdown.

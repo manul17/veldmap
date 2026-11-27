@@ -40,7 +40,7 @@ impl BasemapCarrierPolicy {
     /// has no cached carrier in VRAM yet.
     pub(crate) const fn fallback_key(self, tex_id: QuadTileId) -> Option<TileKey> {
         if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. })
-            || self.active_source.0 == SourceId::BUNDLED_BASEMAP.0
+            || self.active_source.is_bundled()
         {
             None
         } else {

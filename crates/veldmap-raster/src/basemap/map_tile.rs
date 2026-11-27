@@ -8,9 +8,9 @@ use veldmap_core::tile::{DecodedTile, PixelFormat};
 
 use crate::RasterError;
 use crate::image_codec::{
-    build_normalized_png_decoder, decode_jpeg_pixels_to_rgb8, decode_jpeg_pixels_to_rgba8,
-    has_jpeg_magic, has_png_magic, jpeg_codec_working_bytes, jpeg_pixel_format_bpp,
-    jpeg_pixel_format_channels, png_u8_to_rgb8, png_u8_to_rgba8,
+    build_jpeg_decoder, build_normalized_png_decoder, decode_jpeg_pixels_to_rgb8,
+    decode_jpeg_pixels_to_rgba8, has_jpeg_magic, has_png_magic, jpeg_codec_working_bytes,
+    jpeg_pixel_format_bpp, jpeg_pixel_format_channels, png_u8_to_rgb8, png_u8_to_rgba8,
 };
 
 use crate::mipmap::generate_tile_mipmaps;
@@ -98,20 +98,9 @@ fn checked_peak_bytes(
     Ok((conversion_bytes, estimated_peak))
 }
 
-fn map_png_err(
-    err: png::DecodingError,
-    width: u32,
-    height: u32,
-    estimated_bytes: u64,
-    limit_bytes: u64,
-) -> RasterError {
+fn map_png_err(err: png::DecodingError) -> RasterError {
     match err {
-        png::DecodingError::LimitsExceeded => RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes,
-            limit_bytes,
-        },
+        png::DecodingError::LimitsExceeded => RasterError::DecoderLimitsExceeded(err.to_string()),
         other => RasterError::Decode(other.to_string()),
     }
 }
@@ -124,9 +113,7 @@ fn decode_png_limited(
 ) -> Result<(u32, u32, Vec<u8>), RasterError> {
     let decoder = build_normalized_png_decoder(Cursor::new(bytes), max_alloc_bytes);
 
-    let mut reader = decoder
-        .read_info()
-        .map_err(|err| map_png_err(err, 0, 0, 0, max_alloc_bytes))?;
+    let mut reader = decoder.read_info().map_err(map_png_err)?;
     let (width, height) = {
         let info = reader.info();
         (info.width, info.height)
@@ -137,7 +124,7 @@ fn decode_png_limited(
         (color_type, target),
         (png::ColorType::Rgba, TargetFormat::Rgba8) | (png::ColorType::Rgb, TargetFormat::Rgb8)
     );
-    let (conversion_bytes, estimated_peak) = checked_peak_bytes(
+    let (conversion_bytes, _estimated_peak) = checked_peak_bytes(
         width,
         height,
         src_bpp,
@@ -164,9 +151,7 @@ fn decode_png_limited(
     }
 
     let mut buf = vec![0u8; buf_len];
-    let out = reader
-        .next_frame(&mut buf)
-        .map_err(|err| map_png_err(err, width, height, estimated_peak, max_alloc_bytes))?;
+    let out = reader.next_frame(&mut buf).map_err(map_png_err)?;
     drop(reader);
     buf.truncate(out.buffer_size());
 
@@ -184,8 +169,7 @@ fn decode_jpeg_limited(
     max_alloc_bytes: u64,
     target: TargetFormat,
 ) -> Result<(u32, u32, Vec<u8>), RasterError> {
-    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(bytes));
-    decoder.set_max_decoding_buffer_size(max_alloc_bytes.min(usize::MAX as u64) as usize);
+    let mut decoder = build_jpeg_decoder(Cursor::new(bytes), max_alloc_bytes);
     decoder
         .read_info()
         .map_err(|err| RasterError::Decode(err.to_string()))?;

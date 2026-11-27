@@ -19,6 +19,10 @@ const MAX_CONCURRENT_DISK_WRITES: usize = 1;
 /// slow disk writes never accumulate unbounded queued tasks and payloads.
 const MAX_QUEUED_DISK_WRITES: usize = 32;
 
+/// Maximum concurrent best-effort LRU recency touch tasks so burst disk-cache
+/// hits never pile up unbounded `spawn_blocking` tasks.
+const MAX_CONCURRENT_DISK_TOUCHES: usize = 8;
+
 /// Outcome of a bounded blocking disk-cache read.
 pub(super) enum DiskReadOutcome {
     Hit(Vec<u8>, BlobLease),
@@ -28,14 +32,15 @@ pub(super) enum DiskReadOutcome {
 }
 
 /// Encapsulates the optional [`TileBlobStore`] together with its bounded
-/// write/delete backpressure semaphores so non-disk pipelines allocate zero
-/// write-gate semaphores and both permits always stay held until the blocking
-/// call completes.
+/// write/delete and touch backpressure semaphores so non-disk pipelines
+/// allocate zero gate semaphores and permits always stay held until the
+/// blocking call completes.
 #[derive(Clone)]
 pub(super) struct DiskCacheGate {
     store: Arc<dyn TileBlobStore>,
     put_queue_sem: Arc<Semaphore>,
     put_sem: Arc<Semaphore>,
+    touch_permits: Arc<Semaphore>,
 }
 
 impl DiskCacheGate {
@@ -44,6 +49,7 @@ impl DiskCacheGate {
             store,
             put_queue_sem: Arc::new(Semaphore::new(MAX_QUEUED_DISK_WRITES)),
             put_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_DISK_WRITES)),
+            touch_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DISK_TOUCHES)),
         }
     }
 
@@ -134,14 +140,19 @@ impl DiskCacheGate {
 
     /// Record an LRU recency touch for a decode-validated [`BlobLease`] on the
     /// blocking thread pool so opportunistic touch flushes never stall Tokio
-    /// async worker threads.
+    /// async worker threads, dropping excess best-effort touches under burst
+    /// cache-hit saturation.
     pub(super) fn touch_async(&self, lease: BlobLease, shutdown: &CancelToken) {
         if shutdown.is_cancelled() {
             return;
         }
+        let Ok(permit) = Arc::clone(&self.touch_permits).try_acquire_owned() else {
+            return;
+        };
         let store = Arc::clone(&self.store);
         let shutdown = shutdown.clone();
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             if !shutdown.is_cancelled() {
                 store.touch(lease);
             }

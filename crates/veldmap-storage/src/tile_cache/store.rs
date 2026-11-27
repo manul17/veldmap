@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, TryLockError};
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
 use crate::StorageError;
@@ -158,16 +158,8 @@ impl TileDiskCache {
 
         let (total_bytes, _) = read_cache_meta_totals(&conn)?;
         if total_bytes > max_bytes {
-            let evicted_ids = Self::with_write_tx(&mut conn, |tx| {
-                let (current_bytes, current_count) = read_cache_meta_totals(tx)?;
-                evict_in_tx(
-                    tx,
-                    current_bytes,
-                    current_count,
-                    max_bytes,
-                    EvictOptions::default(),
-                )
-            })?;
+            let evicted_ids =
+                Self::with_write_tx(&mut conn, |tx| evict_to_cap_in_tx(tx, max_bytes))?;
             if !evicted_ids.is_empty() {
                 reclaim_space(&conn, false);
             }
@@ -357,7 +349,7 @@ impl TileDiskCache {
         // Re-check under `self.writer` so a concurrent `set_max_bytes()` cannot
         // lower the cap between the lock-free pre-check and transaction commit.
         let max_bytes = self.max_bytes.load(Ordering::Acquire);
-        self.commit_put_batch_locked(&mut conn, &valid, max_bytes, entries.len() > 1)
+        self.commit_put_batch_locked(&mut conn, &valid, max_bytes, valid.len() > 1)
     }
 
     fn commit_put_batch_locked(
@@ -432,16 +424,8 @@ impl TileDiskCache {
     pub fn set_max_bytes(&self, max_bytes: u64) -> Result<(), StorageError> {
         let mut conn = lock_unpoisoned(&self.writer);
         self.max_bytes.store(max_bytes, Ordering::Release);
-        let evicted_ids = self.with_write_tx_flushing_touches(&mut conn, |tx| {
-            let (current_bytes, current_count) = read_cache_meta_totals(tx)?;
-            evict_in_tx(
-                tx,
-                current_bytes,
-                current_count,
-                max_bytes,
-                EvictOptions::default(),
-            )
-        })?;
+        let evicted_ids =
+            self.with_write_tx_flushing_touches(&mut conn, |tx| evict_to_cap_in_tx(tx, max_bytes))?;
         self.touches.prune(&evicted_ids);
         if !evicted_ids.is_empty() {
             reclaim_space(&conn, true);
@@ -491,6 +475,17 @@ impl TileDiskCache {
             max_bytes: self.max_bytes.load(Ordering::Acquire),
         })
     }
+}
+
+fn evict_to_cap_in_tx(tx: &Transaction<'_>, max_bytes: u64) -> Result<Vec<i64>, rusqlite::Error> {
+    let (current_bytes, current_count) = read_cache_meta_totals(tx)?;
+    evict_in_tx(
+        tx,
+        current_bytes,
+        current_count,
+        max_bytes,
+        EvictOptions::default(),
+    )
 }
 
 #[cfg(test)]

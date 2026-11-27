@@ -109,7 +109,7 @@ fn find_topmost_pixel(
         if !layer.is_active() {
             return None;
         }
-        let (fx, fy) = layer.frame().fraction_at(lat_deg, lon_deg)?;
+        let (fx, fy) = layer.geo().frame().fraction_at(lat_deg, lon_deg)?;
         let desc = layer.source().description();
         let px = ((fx * f64::from(desc.width)).floor() as i64)
             .clamp(0, i64::from(desc.width.saturating_sub(1))) as u32;
@@ -129,12 +129,12 @@ fn build_readout(
     CursorReadout {
         layer_name: layer.name().to_owned(),
         pixel,
-        source_pixel_size_m: layer.source_pixel_size_m(),
+        source_pixel_size_m: layer.geo().source_pixel_size_m(),
         units: band_info.and_then(|b| b.units.clone()),
         has_affine_scaling: band_info
             .is_some_and(|b| (b.scale - 1.0).abs() > 1e-12 || b.offset.abs() > 1e-12),
         log10_db: spec.format == PixelFormat::R32Float
-            && layer.scientific_style().preset.is_log10_db(),
+            && layer.style().scientific().preset.is_log10_db(),
         value,
     }
 }
@@ -165,7 +165,8 @@ fn sample_cursor_pixel(
 }
 
 /// Manages single-flight cancelled-on-move base-resolution CPU pixel probes on
-/// `fast_pool` without ever blocking the UI thread or spinning on queue saturation.
+/// `fast_pool` (local rasters) or `remote_pool` (cache-only remote COGs) without
+/// ever blocking the UI thread or spinning on queue saturation.
 pub(super) struct CursorProber {
     cache: Arc<Mutex<CursorProbeCache>>,
 }

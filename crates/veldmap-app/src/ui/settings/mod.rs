@@ -43,7 +43,7 @@ pub(crate) enum SettingsAction {
 pub(crate) struct SettingsWindowState {
     open: bool,
     active_tab: SettingsTab,
-    pub(super) draft: AppSettingsDraft,
+    draft: AppSettingsDraft,
     cached_custom_validation: Option<(String, Result<(), String>)>,
 }
 
@@ -97,7 +97,7 @@ impl SettingsWindowState {
 
     /// Return cached validation result for `draft.custom_xyz.url_template`,
     /// recomputing only when the URL template changes.
-    pub(super) fn custom_validation(&mut self) -> Result<(), &str> {
+    fn custom_validation(&mut self) -> Result<(), &str> {
         let needs_recompute = self
             .cached_custom_validation
             .as_ref()

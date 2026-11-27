@@ -37,11 +37,9 @@ pub(super) fn show_aoi_section(
             state.clear_copy_notice();
             actions.push(StacUiAction::ToggleDrawAoiBox);
         }
-        let poly_vectors: Vec<&VectorLayerSummary> =
-            vectors.iter().filter(|v| v.has_polygons).collect();
-        if !poly_vectors.is_empty() {
+        if vectors.iter().any(|v| v.has_polygons) {
             ui.menu_button("From GeoJSON", |ui| {
-                for vec_layer in poly_vectors {
+                for vec_layer in vectors.iter().filter(|v| v.has_polygons) {
                     if ui.button(&vec_layer.name).clicked() {
                         state.clear_copy_notice();
                         actions.push(StacUiAction::UseVectorAoi(vec_layer.id));

@@ -12,6 +12,11 @@ impl GeoPoint {
     pub const fn new(lat: f64, lon: f64) -> Self {
         Self { lat, lon }
     }
+
+    /// Whether both latitude and longitude are finite floating-point numbers.
+    pub const fn is_finite(self) -> bool {
+        self.lat.is_finite() && self.lon.is_finite()
+    }
 }
 
 /// A closed ring of geographic vertices.
@@ -48,8 +53,8 @@ const RING_DEDUP_EPS_DEG: f64 = 1e-12;
 
 /// Append `point` to a ring accumulator if it is finite and distinct from the
 /// previous vertex.
-pub(crate) fn push_dedup_geo_point(out: &mut Vec<GeoPoint>, point: GeoPoint) {
-    if !(point.lat.is_finite() && point.lon.is_finite()) {
+pub(in crate::geo) fn push_dedup_geo_point(out: &mut Vec<GeoPoint>, point: GeoPoint) {
+    if !point.is_finite() {
         return;
     }
     if out.last().is_none_or(|prev| {
@@ -62,7 +67,7 @@ pub(crate) fn push_dedup_geo_point(out: &mut Vec<GeoPoint>, point: GeoPoint) {
 
 /// Drop a trailing closing vertex when it duplicates the first vertex of a
 /// closed ring.
-pub(crate) fn trim_closing_geo_point(out: &mut Vec<GeoPoint>) {
+pub(in crate::geo) fn trim_closing_geo_point(out: &mut Vec<GeoPoint>) {
     if out.len() > 1
         && let (Some(first), Some(last)) = (out.first(), out.last())
         && (first.lat - last.lat).abs() <= RING_DEDUP_EPS_DEG
@@ -74,7 +79,7 @@ pub(crate) fn trim_closing_geo_point(out: &mut Vec<GeoPoint>) {
 
 /// Remove consecutive duplicate points (including wrap-around `last == first`)
 /// from a closed [`GeoPoint`] ring, dropping non-finite coordinates.
-pub(crate) fn dedup_geo_ring(points: &[GeoPoint]) -> Vec<GeoPoint> {
+pub(in crate::geo) fn dedup_geo_ring(points: &[GeoPoint]) -> Vec<GeoPoint> {
     let mut out: Vec<GeoPoint> = Vec::with_capacity(points.len());
     for &p in points {
         push_dedup_geo_point(&mut out, p);

@@ -28,13 +28,12 @@ fn single_patch_layer(
     source: SourceId,
     relaid: u64,
     segments: u32,
-    opacity: f32,
-    uv_rect: [f32; 4],
+    track: DrawOverlayTrack,
     texture: Arc<GpuTile>,
 ) -> DrawOverlayLayer {
     DrawOverlayLayer {
-        opacity,
-        track: DrawOverlayTrack::Display,
+        opacity: 1.0,
+        track,
         frame: Arc::clone(frame),
         image_width: 512,
         image_height: 512,
@@ -48,10 +47,23 @@ fn single_patch_layer(
                 y: 0,
             },
             cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
             texture,
         }],
     }
+}
+
+fn utm37_test_frame() -> Arc<Frame> {
+    let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
+    Arc::new(
+        Frame::from_pixel_affine(
+            utm37,
+            [100.0, 0.0, 500_000.0, 0.0, -100.0, 5_250_000.0],
+            512,
+            512,
+        )
+        .expect("utm37"),
+    )
 }
 
 fn upload_overlay_tile(
@@ -141,8 +153,7 @@ fn overlay_warp_mesh_drapes_with_south_up_winding_graticule_on_top_and_zero_idle
             src,
             1,
             segs,
-            1.0,
-            [0.0, 0.0, 1.0, 1.0],
+            DrawOverlayTrack::Display,
             Arc::clone(&gpu_tile),
         ));
         let snap = Arc::new(snap);
@@ -227,8 +238,7 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
         src_coarse,
         1,
         segs_coarse,
-        1.0,
-        [0.0, 0.0, 1.0, 1.0],
+        DrawOverlayTrack::Display,
         tex_coarse,
     ));
     let pixels_2m = render_srgb(
@@ -271,8 +281,7 @@ fn overlay_horizon_facing_has_zero_holes_at_2m_coarse_sag_and_zero_silhouette_le
         src_limb,
         2,
         segs_limb,
-        1.0,
-        [0.0, 0.0, 1.0, 1.0],
+        DrawOverlayTrack::Display,
         tex_limb,
     ));
     let limb_pixels = render_srgb(
@@ -316,16 +325,7 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
     let mut renderer = TestGlobe::new_srgb(device);
     let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
 
-    let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
-    let frame = Arc::new(
-        Frame::from_pixel_affine(
-            utm37,
-            [100.0, 0.0, 500_000.0, 0.0, -100.0, 5_250_000.0],
-            512,
-            512,
-        )
-        .expect("utm37"),
-    );
+    let frame = utm37_test_frame();
     let (clat, clon) = frame.geodetic(0.5, 0.5);
     let cam = Camera::at(clat, clon, 25_000.0);
     let config = QuadtreeConfig::default();
@@ -354,24 +354,27 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
         });
 
     let mut snap = build_empty_snapshot(cam, width, height, &config);
-    snap.overlays.push(single_patch_layer(
+    let mut bot_layer = single_patch_layer(
         &frame,
         src_bot,
         1,
         MIN_WARP_SEGMENTS,
-        1.0,
-        [0.5, 0.0, 0.5, 1.0],
+        DrawOverlayTrack::Display,
         tex_bot,
-    ));
-    snap.overlays.push(single_patch_layer(
+    );
+    bot_layer.patches[0].uv_rect = [0.5, 0.0, 0.5, 1.0];
+    snap.overlays.push(bot_layer);
+
+    let mut top_layer = single_patch_layer(
         &frame,
         src_top,
         2,
         MIN_WARP_SEGMENTS,
-        0.5,
-        [0.0, 0.0, 1.0, 1.0],
+        DrawOverlayTrack::Display,
         tex_top,
-    ));
+    );
+    top_layer.opacity = 0.5;
+    snap.overlays.push(top_layer);
 
     let pixels = render_srgb(&mut renderer, device, queue, width, height, &Arc::new(snap));
 
@@ -391,7 +394,7 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
 }
 
 #[test]
-fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cleanly() {
+fn scientific_r32float_nodata_linear_db_and_trilinear_render_and_sweep_cleanly() {
     let Some((device, queue)) = shared_headless_device() else {
         return;
     };
@@ -400,16 +403,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
     let mut globe = TestGlobe::new_srgb(device);
     let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
 
-    let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
-    let frame = Arc::new(
-        Frame::from_pixel_affine(
-            utm37,
-            [100.0, 0.0, 500_000.0, 0.0, -100.0, 5_250_000.0],
-            512,
-            512,
-        )
-        .expect("utm37"),
-    );
+    let frame = utm37_test_frame();
     let (clat, clon) = frame.geodetic(0.5, 0.5);
     let cam = Camera::at(clat, clon, 25_000.0);
     let config = QuadtreeConfig::default();
@@ -458,48 +452,39 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         .upload_and_insert(device, queue, k_sci, &dec_sci)
         .expect("upload r32f");
 
+    let build_sci_snap = |camera: Camera, track: DrawOverlayTrack| {
+        let mut snap = build_empty_snapshot(camera, width, height, &config);
+        snap.overlays.push(single_patch_layer(
+            &frame,
+            src_base,
+            1,
+            MIN_WARP_SEGMENTS,
+            DrawOverlayTrack::Display,
+            Arc::clone(&tex_base),
+        ));
+        snap.overlays.push(single_patch_layer(
+            &frame,
+            src_sci,
+            2,
+            MIN_WARP_SEGMENTS,
+            track,
+            Arc::clone(&tex_sci),
+        ));
+        Arc::new(snap)
+    };
+
     // 1. Render Scientific R32Float with Grayscale ramp over [0, 100]:
     //    Left half (NaN/±Inf) discards to green base; Right half (1000*0.1 = 100) maps to white!
-    let mut snap = build_empty_snapshot(cam, width, height, &config);
-    snap.overlays.push(single_patch_layer(
-        &frame,
-        src_base,
-        1,
-        MIN_WARP_SEGMENTS,
-        1.0,
-        [0.0, 0.0, 1.0, 1.0],
-        Arc::clone(&tex_base),
-    ));
-    snap.overlays.push(DrawOverlayLayer {
-        opacity: 1.0,
-        track: DrawOverlayTrack::Scientific {
-            scale: 0.1,
-            offset: 0.0,
-            stretch_min: 0.0,
-            stretch_max: 100.0,
-            log10_db: false,
-            colormap: ColormapId::Grayscale,
-            invert_colormap: false,
-        },
-        frame: Arc::clone(&frame),
-        image_width: 512,
-        image_height: 512,
-        segments: MIN_WARP_SEGMENTS,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_sci,
-                relaid: 2,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture: Arc::clone(&tex_sci),
-        }],
-    });
-    let snap = Arc::new(snap);
-    // Render and read back directly through the hoisted `bind_groups` cache.
+    let linear_track = DrawOverlayTrack::Scientific {
+        scale: 0.1,
+        offset: 0.0,
+        stretch_min: 0.0,
+        stretch_max: 100.0,
+        log10_db: false,
+        colormap: ColormapId::Grayscale,
+        invert_colormap: false,
+    };
+    let snap = build_sci_snap(cam, linear_track.clone());
     let pixels = render_srgb(&mut globe, device, queue, width, height, &snap);
     let left_px = pixel_at(&pixels, width, width / 2 - 20, height / 2);
     assert!(
@@ -512,21 +497,11 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         "Right half (1000*0.1=100) must map to white on [0,100] Grayscale, got {right_px:?}"
     );
 
-    // 1b. Verify `log10_db = true` stretch (`10 * log10(100.0) = 20 dB`):
-    //     over [20, 40] dB -> black (and with `invert_colormap = true` -> white).
-    let mut snap_db = build_empty_snapshot(cam, width, height, &config);
-    snap_db.overlays.push(single_patch_layer(
-        &frame,
-        src_base,
-        1,
-        MIN_WARP_SEGMENTS,
-        1.0,
-        [0.0, 0.0, 1.0, 1.0],
-        Arc::clone(&tex_base),
-    ));
-    snap_db.overlays.push(DrawOverlayLayer {
-        opacity: 1.0,
-        track: DrawOverlayTrack::Scientific {
+    // 2. Verify `log10_db = true` stretch (`10 * log10(100.0) = 20 dB`):
+    //    over [20, 40] dB -> black (and NaN/±Inf still discards to green base).
+    let snap_db = build_sci_snap(
+        cam,
+        DrawOverlayTrack::Scientific {
             scale: 0.1,
             offset: 0.0,
             stretch_min: 20.0,
@@ -535,24 +510,7 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
             colormap: ColormapId::Grayscale,
             invert_colormap: false,
         },
-        frame: Arc::clone(&frame),
-        image_width: 512,
-        image_height: 512,
-        segments: MIN_WARP_SEGMENTS,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_sci,
-                relaid: 2,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture: Arc::clone(&tex_sci),
-        }],
-    });
-    let snap_db = Arc::new(snap_db);
+    );
     let pixels_db = render_srgb(&mut globe, device, queue, width, height, &snap_db);
     let db_right = pixel_at(&pixels_db, width, width / 2 + 20, height / 2);
     assert!(
@@ -565,49 +523,11 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         "dB stretch must still discard NaN/±Inf to green base, got {db_left:?}"
     );
 
-    // 1c. Zoomed-out trilinear mip-selection (`lod > 0.5`):
-    //     Pull camera back so the 64x64 tile projects smaller than 32 px wide, forcing
-    //     8-tap trilinear mip blending across NaN-skipping mipmaps without NaN artifacts.
+    // 3. Zoomed-out trilinear mip-selection (`lod > 0.5`):
+    //    Pull camera back so the 64x64 tile projects smaller than 32 px wide, forcing
+    //    8-tap trilinear mip blending across NaN-skipping mipmaps without NaN artifacts.
     let cam_far = Camera::at(clat, clon, 180_000.0);
-    let mut snap_far = build_empty_snapshot(cam_far, width, height, &config);
-    snap_far.overlays.push(single_patch_layer(
-        &frame,
-        src_base,
-        1,
-        MIN_WARP_SEGMENTS,
-        1.0,
-        [0.0, 0.0, 1.0, 1.0],
-        Arc::clone(&tex_base),
-    ));
-    snap_far.overlays.push(DrawOverlayLayer {
-        opacity: 1.0,
-        track: DrawOverlayTrack::Scientific {
-            scale: 0.1,
-            offset: 0.0,
-            stretch_min: 0.0,
-            stretch_max: 100.0,
-            log10_db: false,
-            colormap: ColormapId::Grayscale,
-            invert_colormap: false,
-        },
-        frame: Arc::clone(&frame),
-        image_width: 512,
-        image_height: 512,
-        segments: MIN_WARP_SEGMENTS,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_sci,
-                relaid: 2,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture: Arc::clone(&tex_sci),
-        }],
-    });
-    let snap_far = Arc::new(snap_far);
+    let snap_far = build_sci_snap(cam_far, linear_track);
     let pixels_far = render_srgb(&mut globe, device, queue, width, height, &snap_far);
     let far_right = pixel_at(&pixels_far, width, width / 2 + 4, height / 2);
     assert!(
@@ -620,7 +540,41 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         "Zoomed-out trilinear R32Float mip blend must discard NaN half cleanly, got {far_left:?}"
     );
 
-    // 2. Categorical R8Uint + R16Uint sharing Uint bind-group layout.
+    assert!(globe.bind_groups.len() >= 2);
+    drop(snap);
+    drop(snap_db);
+    drop(snap_far);
+    drop(tex_base);
+    drop(tex_sci);
+    gpu_cache.remove_source(src_base);
+    gpu_cache.remove_source(src_sci);
+    globe.bind_groups.sweep_stale();
+    assert_eq!(globe.bind_groups.len(), 0);
+}
+
+#[test]
+fn categorical_r8uint_and_r16uint_render_and_sweep_cleanly() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let (width, height) = (128u32, 128u32);
+    let mut globe = TestGlobe::new_srgb(device);
+    let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
+
+    let frame = utm37_test_frame();
+    let (clat, clon) = frame.geodetic(0.5, 0.5);
+    let cam = Camera::at(clat, clon, 25_000.0);
+    let config = QuadtreeConfig::default();
+
+    // Base Display layer (solid green) beneath Categorical layers to detect nodata discard.
+    let src_base = SourceId::new(974);
+    let (_, tex_base) =
+        upload_overlay_tile(device, queue, &mut gpu_cache, src_base, 16, 16, |_, _| {
+            [0, 255, 0, 255]
+        });
+
+    // 1. Categorical R8Uint with source ColorMap (Class 1 -> blue, Class 0 -> nodata).
     let src_cat8 = SourceId::new(972);
     let k_cat8 = TileKey {
         source: src_cat8,
@@ -653,35 +607,22 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         src_base,
         1,
         MIN_WARP_SEGMENTS,
-        1.0,
-        [0.0, 0.0, 1.0, 1.0],
+        DrawOverlayTrack::Display,
         Arc::clone(&tex_base),
     ));
-    snap_cat.overlays.push(DrawOverlayLayer {
-        opacity: 1.0,
-        track: DrawOverlayTrack::Categorical {
+    snap_cat.overlays.push(single_patch_layer(
+        &frame,
+        src_cat8,
+        3,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Categorical {
             source: src_cat8,
             palette: CategoricalPaletteId::SourceColorMap,
             custom_color_map: Some(custom_cmap),
             nodata_value: Some(0),
         },
-        frame: Arc::clone(&frame),
-        image_width: 512,
-        image_height: 512,
-        segments: MIN_WARP_SEGMENTS,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_cat8,
-                relaid: 3,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture: Arc::clone(&tex_cat8),
-        }],
-    });
+        Arc::clone(&tex_cat8),
+    ));
     let snap_cat = Arc::new(snap_cat);
     let pixels_cat = render_srgb(&mut globe, device, queue, width, height, &snap_cat);
     let cat_left = pixel_at(&pixels_cat, width, width / 2 - 20, height / 2);
@@ -695,8 +636,8 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         "Categorical class=1 right half must render pure blue from ColorMap, got {cat_right:?}"
     );
 
-    // 2b. Categorical R16Uint with 16-bit QA class value > 255 (1024) and nodata = 65535,
-    //     rendered through the shared `Uint` bind-group layout and `shared_bg`.
+    // 2. Categorical R16Uint with 16-bit QA class value > 255 (1024) and nodata = 65535,
+    //    rendered through the shared `Uint` bind-group layout and `shared_bg`.
     let src_cat16 = SourceId::new(973);
     let k_cat16 = TileKey {
         source: src_cat16,
@@ -726,35 +667,22 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
         src_base,
         1,
         MIN_WARP_SEGMENTS,
-        1.0,
-        [0.0, 0.0, 1.0, 1.0],
+        DrawOverlayTrack::Display,
         Arc::clone(&tex_base),
     ));
-    snap_cat16.overlays.push(DrawOverlayLayer {
-        opacity: 1.0,
-        track: DrawOverlayTrack::Categorical {
+    snap_cat16.overlays.push(single_patch_layer(
+        &frame,
+        src_cat16,
+        4,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Categorical {
             source: src_cat16,
             palette: CategoricalPaletteId::DistinctClasses,
             custom_color_map: None,
             nodata_value: Some(65535),
         },
-        frame: Arc::clone(&frame),
-        image_width: 512,
-        image_height: 512,
-        segments: MIN_WARP_SEGMENTS,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source: src_cat16,
-                relaid: 4,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture: Arc::clone(&tex_cat16),
-        }],
-    });
+        Arc::clone(&tex_cat16),
+    ));
     let snap_cat16 = Arc::new(snap_cat16);
     let pixels_cat16 = render_srgb(&mut globe, device, queue, width, height, &snap_cat16);
     let cat16_left = pixel_at(&pixels_cat16, width, width / 2 - 20, height / 2);
@@ -770,17 +698,12 @@ fn scientific_r32float_nodata_trilinear_and_categorical_uint_render_and_sweep_cl
 
     // Verify hoisted multi-format TileBindGroupCache sweeps cleanly once evicted.
     assert!(globe.bind_groups.len() >= 3);
-    drop(snap);
-    drop(snap_db);
-    drop(snap_far);
     drop(snap_cat);
     drop(snap_cat16);
     drop(tex_base);
-    drop(tex_sci);
     drop(tex_cat8);
     drop(tex_cat16);
     gpu_cache.remove_source(src_base);
-    gpu_cache.remove_source(src_sci);
     gpu_cache.remove_source(src_cat8);
     gpu_cache.remove_source(src_cat16);
     globe.bind_groups.sweep_stale();

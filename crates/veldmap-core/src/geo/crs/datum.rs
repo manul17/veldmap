@@ -230,8 +230,9 @@ impl LinearUnit {
         }
     }
 
-    /// Resolve a GeoTIFF `ProjLinearUnitsGeoKey` (3076) EPSG unit code.
-    pub const fn from_geotiff_code(code: u16) -> Option<Self> {
+    /// Resolve a standard EPSG linear unit code (`9001` metre, `9002`
+    /// international foot, `9003` US survey foot).
+    pub const fn from_epsg(code: u16) -> Option<Self> {
         match code {
             9001 => Some(Self::Metre),
             9002 => Some(Self::InternationalFoot),

@@ -43,15 +43,16 @@ fn url_authority_parsing_and_host_extraction_handle_edge_cases() {
         strip_http_scheme("\u{00e9}\u{00e9}\u{00e9}\u{00e9}://example.com"),
         None
     );
-    assert_eq!(extract_host("http://\u{00e9}/0/0/0.png"), "\u{00e9}");
+    assert_eq!(extract_host("http://\u{00e9}/0/0/0.png"), "xn--9ca");
     assert_eq!(
         extract_host("http://user:pass@127.0.0.1:8080/0/0/0.png?key=1"),
         "127.0.0.1:8080"
     );
     assert_eq!(extract_host("http://[::1]:8080/0/0/0.png"), "[::1]:8080");
-    let ipv6 = parse_http_authority("http://user:pw@[::1]:8080/0/0/0.png").expect("ipv6");
-    assert_eq!(ipv6.host, "[::1]");
-    assert_eq!(ipv6.host_port, "[::1]:8080");
+    assert_eq!(
+        parse_http_authority("http://user:pw@[::1]:8080/0/0/0.png"),
+        Some("[::1]")
+    );
 
     // Reject invalid ports and malformed IPv6 brackets.
     assert!(parse_http_authority("http://example.com:notaport/0/0/0.png").is_none());
@@ -66,7 +67,19 @@ fn canonical_endpoint_origin_and_query_fragment_helpers_work() {
     assert_eq!(
         canonical_url_without_query("  HTTPS://user:pw@Example.COM:443/path/a.tif?sig=abc#frag  ")
             .as_deref(),
-        Some("https://example.com:443/path/a.tif")
+        Some("https://example.com/path/a.tif")
+    );
+    assert_eq!(
+        canonical_url_without_query("https://example.com:443/a.tif"),
+        canonical_url_without_query("https://example.com/a.tif")
+    );
+    assert_eq!(
+        canonical_url_without_query("http://example.com:80/a.tif").as_deref(),
+        Some("http://example.com/a.tif")
+    );
+    assert_eq!(
+        canonical_url_without_query("https://example.com:8443/a.tif").as_deref(),
+        Some("https://example.com:8443/a.tif")
     );
     assert_eq!(
         canonical_url_without_query("https://example.com"),
@@ -74,6 +87,30 @@ fn canonical_endpoint_origin_and_query_fragment_helpers_work() {
     );
     assert!(canonical_url_without_query("https://example.com/a b.tif").is_none());
     assert!(canonical_url_without_query("ftp://example.com/a.tif").is_none());
+    // Reject slash-missing special-scheme URLs (which WHATWG Url::parse would
+    // otherwise normalize while bypassing `://` credential redaction) and
+    // internal ASCII control characters.
+    for malformed in [
+        "http:example.com/v1",
+        "https:/example.com/v1",
+        "https:user:secret@example.com/a.tif",
+        "https://example.com/a\tb.tif",
+        "https://example.com/a\0b.tif",
+        "https://example.com/a\x7fb.tif",
+    ] {
+        assert!(
+            canonical_url_without_query(malformed).is_none(),
+            "canonical_url_without_query must reject {malformed:?}"
+        );
+        assert!(
+            !is_valid_http_endpoint(malformed),
+            "is_valid_http_endpoint must reject {malformed:?}"
+        );
+        assert!(
+            !same_http_origin(malformed, "https://example.com/v1"),
+            "same_http_origin must reject {malformed:?}"
+        );
+    }
 
     assert!(is_valid_http_endpoint(
         "https://earth-search.aws.element84.com/v1"

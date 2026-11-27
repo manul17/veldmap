@@ -201,18 +201,18 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
     );
     assert_eq!(old_src, shared_src);
     assert_eq!(l1.source_id(), new_src_id);
-    assert_eq!(l1.relaid(), 99);
+    assert_eq!(l1.geo().relaid(), 99);
     assert_eq!(l1.local_path(), Some(Path::new("/tmp/reloaded.tif")));
     assert!(!l1.is_reloading());
     assert!(l1.matches_reload_seq(prep2.reload_seq));
     assert!(l1.to_summary(0, false, true, false).last_error.is_none());
 
     // Rebinding CRS increments epoch and clears errors.
-    let epoch_before = l1.crs_override_epoch();
+    let epoch_before = l1.geo().crs_override_epoch();
     l1.apply_rebound_frame(utm_frame(20.0), Some(CrsOverride::Epsg(32637)), 100);
-    assert_eq!(l1.crs_override_epoch(), epoch_before + 1);
-    assert_eq!(l1.crs_override(), Some(&CrsOverride::Epsg(32637)));
-    assert_eq!(l1.relaid(), 100);
+    assert_eq!(l1.geo().crs_override_epoch(), epoch_before + 1);
+    assert_eq!(l1.geo().crs_override(), Some(&CrsOverride::Epsg(32637)));
+    assert_eq!(l1.geo().relaid(), 100);
 }
 
 #[test]
@@ -336,10 +336,10 @@ fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
 
     let tok1 = CancelToken::new();
     layer.begin_stats_job(1, tok1.clone());
-    assert!(layer.scientific_style().is_loading());
+    assert!(layer.style().scientific().is_loading());
     // Stale job_id cannot clobber active job 1.
     assert!(!layer.apply_band_stats_empty(BandKey::Index(0), 99));
-    assert!(layer.scientific_style().is_loading());
+    assert!(layer.style().scientific().is_loading());
     // Cancelled job resets back to NotRequested (never poisons Empty).
     assert!(layer.apply_band_stats_cancelled(BandKey::Index(0), 1));
     assert_eq!(layer.needs_band_stats(), Some(BandKey::Index(0)));
@@ -347,15 +347,18 @@ fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
     layer.begin_stats_job(2, CancelToken::new());
     assert!(layer.apply_band_stats_ready(BandKey::Index(0), sample_stats(0.0, 100.0)));
     assert_eq!(
-        (layer.scientific_style().min, layer.scientific_style().max),
+        (
+            layer.style().scientific().min,
+            layer.style().scientific().max
+        ),
         (1.0, 99.0)
     );
 
-    assert!(layer.set_stretch_range(10.0, 80.0));
-    assert_eq!(layer.scientific_style().preset, StretchPreset::Custom);
+    assert!(layer.style_mut().set_stretch_range(10.0, 80.0));
+    assert_eq!(layer.style().scientific().preset, StretchPreset::Custom);
     // No-op range and preset calls return false.
-    assert!(!layer.set_stretch_range(10.0, 80.0));
-    assert!(!layer.set_stretch_preset(StretchPreset::Custom));
+    assert!(!layer.style_mut().set_stretch_range(10.0, 80.0));
+    assert!(!layer.style_mut().set_stretch_preset(StretchPreset::Custom));
     assert!(layer.saved_style().is_some());
 
     // Toggling Display -> back to SAME Band 0 preserves Ready stats and custom bounds.
@@ -367,21 +370,27 @@ fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
     assert!(layer.set_active_stream(b0_spec).expect("back to b0"));
     assert_eq!(layer.needs_band_stats(), None);
     assert_eq!(
-        (layer.scientific_style().min, layer.scientific_style().max),
+        (
+            layer.style().scientific().min,
+            layer.style().scientific().max
+        ),
         (10.0, 80.0)
     );
-    assert_eq!(layer.scientific_style().preset, StretchPreset::Custom);
+    assert_eq!(layer.style().scientific().preset, StretchPreset::Custom);
 
     // Switching to DIFFERENT Band 1 resets Custom -> Percentile2_98 so new stats apply cleanly.
     assert!(layer.set_active_stream(b1_spec).expect("switch b1"));
     assert_eq!(
-        layer.scientific_style().preset,
+        layer.style().scientific().preset,
         StretchPreset::Percentile2_98
     );
     assert_eq!(layer.needs_band_stats(), Some(BandKey::Index(1)));
     assert!(layer.apply_band_stats_ready(BandKey::Index(1), sample_stats(500.0, 1000.0)));
     assert_eq!(
-        (layer.scientific_style().min, layer.scientific_style().max),
+        (
+            layer.style().scientific().min,
+            layer.style().scientific().max
+        ),
         (501.0, 999.0)
     );
 }

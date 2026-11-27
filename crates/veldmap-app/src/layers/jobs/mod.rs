@@ -1,5 +1,6 @@
-//! Two-lane pointwise/pass decode scheduling, RAII flight guards, and worker
-//! execution over [`super::disk_cache`].
+//! Two-lane pointwise/pass decode scheduling, RAII flight guards, shared
+//! remote-COG range coalescing/prefetching, and worker execution over
+//! [`super::disk_cache`].
 
 pub(super) mod band_stats;
 mod pass;
@@ -7,8 +8,14 @@ mod pointwise;
 
 use std::sync::Arc;
 
+use veldmap_core::io::IoError;
+use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::TileKey;
-use veldmap_raster::{ByteRange, ServeMode, coalesce_byte_ranges};
+use veldmap_net::{HttpRangeSource, PrefetchPin};
+use veldmap_raster::{
+    ByteRange, DEFAULT_COALESCE_GAP_BYTES, DEFAULT_COALESCE_MAX_SPAN_BYTES, ServeMode,
+    coalesce_byte_ranges,
+};
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 
@@ -18,21 +25,32 @@ use super::stack::OverlayLayer;
 use self::pass::{PassJobSpec, submit_pass_job};
 use self::pointwise::submit_pointwise_job;
 
-/// Gap threshold (`64 KiB`) when coalescing remote COG chunk byte ranges.
-const REMOTE_COALESCE_GAP_BYTES: u64 = 64 * 1024;
-
-/// Maximum span (`4 MiB`) of a single coalesced remote COG byte range.
-const REMOTE_COALESCE_MAX_SPAN_BYTES: u64 = 4 * 1024 * 1024;
-
 /// Coalesce remote COG chunk byte ranges into `(offset, len)` spans ready for
 /// `HttpRangeSource::prefetch_ranges_async`.
-pub(super) fn coalesce_remote_ranges(mut ranges: Vec<ByteRange>) -> Vec<(u64, u64)> {
+fn coalesce_remote_ranges(mut ranges: Vec<ByteRange>) -> Vec<(u64, u64)> {
     coalesce_byte_ranges(
         &mut ranges,
-        REMOTE_COALESCE_GAP_BYTES,
-        REMOTE_COALESCE_MAX_SPAN_BYTES,
+        DEFAULT_COALESCE_GAP_BYTES,
+        DEFAULT_COALESCE_MAX_SPAN_BYTES,
     );
     ranges.into_iter().map(|r| (r.offset, r.len)).collect()
+}
+
+/// Coalesce `ranges` and asynchronously prefetch/pin all needed byte blocks on
+/// `range_src`, returning `Ok(None)` when no byte ranges are needed.
+async fn prefetch_coalesced_ranges(
+    range_src: &HttpRangeSource,
+    ranges: Vec<ByteRange>,
+    cancel: &CancelToken,
+) -> Result<Option<PrefetchPin>, IoError> {
+    let byte_pairs = coalesce_remote_ranges(ranges);
+    if byte_pairs.is_empty() {
+        return Ok(None);
+    }
+    range_src
+        .prefetch_ranges_async(&byte_pairs, cancel)
+        .await
+        .map(Some)
 }
 
 pub(super) fn schedule_layer_rungs(

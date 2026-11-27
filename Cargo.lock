@@ -3656,6 +3656,7 @@ dependencies = [
  "tokio",
  "tracing",
  "veldmap-core",
+ "veldmap-net",
 ]
 
 [[package]]
@@ -3673,6 +3674,7 @@ dependencies = [
  "tiff",
  "tracing",
  "veldmap-core",
+ "veldmap-raster",
  "weezl",
  "zstd",
 ]

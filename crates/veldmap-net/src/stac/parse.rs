@@ -1,7 +1,7 @@
 //! STAC `/search` JSON payload construction and Item/Asset/`raster:bands` parsing.
 
 use serde_json::{Map, Value};
-use veldmap_core::geo::{export_geojson_geometry, parse_geojson};
+use veldmap_core::geo::{geojson_geometry_to_value, parse_geojson_geometry_value};
 
 use super::types::{
     MAX_STAC_SEARCH_LIMIT, StacAsset, StacError, StacItem, StacRasterBandMeta, StacSearchQuery,
@@ -21,10 +21,7 @@ pub(super) fn build_search_payload(collection: &str, query: &StacSearchQuery) ->
     obj.insert("limit".to_owned(), Value::from(limit as u64));
 
     if let Some(geom) = &query.intersects {
-        let geom_str = export_geojson_geometry(geom);
-        if let Ok(geom_val) = serde_json::from_str::<Value>(&geom_str) {
-            obj.insert("intersects".to_owned(), geom_val);
-        }
+        obj.insert("intersects".to_owned(), geojson_geometry_to_value(geom));
     } else if let Some(bbox) = query.bbox
         && bbox.iter().all(|v| v.is_finite())
     {
@@ -84,6 +81,72 @@ pub(super) fn parse_search_response(val: &Value) -> Result<StacSearchResult, Sta
     Ok(StacSearchResult { items, matched })
 }
 
+/// Parse an RFC 7946 §5 2D (`[west, south, east, north]`) or 3D
+/// (`[west, south, min_z, east, north, max_z]`) bounding box into finite 2D
+/// WGS84 coordinates.
+fn parse_item_bbox(obj: &Map<String, Value>) -> Option<[f64; 4]> {
+    let arr = obj.get("bbox").and_then(Value::as_array)?;
+    let coords = match arr.len() {
+        4 => [
+            arr[0].as_f64()?,
+            arr[1].as_f64()?,
+            arr[2].as_f64()?,
+            arr[3].as_f64()?,
+        ],
+        6 => [
+            arr[0].as_f64()?,
+            arr[1].as_f64()?,
+            arr[3].as_f64()?,
+            arr[4].as_f64()?,
+        ],
+        _ => return None,
+    };
+    coords.iter().all(|v| v.is_finite()).then_some(coords)
+}
+
+fn parse_mgrs_tile(props: &Map<String, Value>) -> Option<String> {
+    props
+        .get("grid:code")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            let zone = props.get("mgrs:utm_zone").and_then(Value::as_u64)?;
+            let lat_band = props.get("mgrs:latitude_band").and_then(Value::as_str)?;
+            let sq = props.get("mgrs:grid_square").and_then(Value::as_str)?;
+            Some(format!("{zone:02}{lat_band}{sq}"))
+        })
+        .or_else(|| {
+            props
+                .get("s2:mgrs_tile")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn infer_processing_level(
+    props: Option<&Map<String, Value>>,
+    collection: Option<&str>,
+) -> Option<String> {
+    props
+        .and_then(|p| {
+            p.get("s2:product_type")
+                .or_else(|| p.get("processing:level"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            collection.and_then(|c| {
+                if c.contains("l2a") {
+                    Some("L2A (BOA)".to_owned())
+                } else if c.contains("l1c") {
+                    Some("L1C (TOA)".to_owned())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
 fn parse_stac_item(val: &Value) -> Option<StacItem> {
     let obj = val.as_object()?;
     let id = obj.get("id")?.as_str()?.to_owned();
@@ -108,81 +171,13 @@ fn parse_stac_item(val: &Value) -> Option<StacItem> {
         .and_then(|p| p.get("platform"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let mgrs_tile = props.and_then(|p| {
-        p.get("grid:code")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                let zone = p.get("mgrs:utm_zone").and_then(Value::as_u64)?;
-                let lat_band = p.get("mgrs:latitude_band").and_then(Value::as_str)?;
-                let sq = p.get("mgrs:grid_square").and_then(Value::as_str)?;
-                Some(format!("{zone:02}{lat_band}{sq}"))
-            })
-            .or_else(|| {
-                p.get("s2:mgrs_tile")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-    });
-    let processing_level = props
-        .and_then(|p| {
-            p.get("s2:product_type")
-                .or_else(|| p.get("processing:level"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            collection.as_deref().and_then(|c| {
-                if c.contains("l2a") {
-                    Some("L2A (BOA)".to_owned())
-                } else if c.contains("l1c") {
-                    Some("L1C (TOA)".to_owned())
-                } else {
-                    None
-                }
-            })
-        });
-
-    // RFC 7946 §5: 2D bbox is `[west, south, east, north]` (len 4);
-    // 3D bbox is `[west, south, min_z, east, north, max_z]` (len 6).
-    let bbox = obj
-        .get("bbox")
-        .and_then(Value::as_array)
-        .and_then(|arr| match arr.len() {
-            4 => {
-                let coords = [
-                    arr[0].as_f64()?,
-                    arr[1].as_f64()?,
-                    arr[2].as_f64()?,
-                    arr[3].as_f64()?,
-                ];
-                coords.iter().all(|v| v.is_finite()).then_some(coords)
-            }
-            6 => {
-                let coords = [
-                    arr[0].as_f64()?,
-                    arr[1].as_f64()?,
-                    arr[3].as_f64()?,
-                    arr[4].as_f64()?,
-                ];
-                coords.iter().all(|v| v.is_finite()).then_some(coords)
-            }
-            _ => None,
-        });
-
-    let geometry = obj.get("geometry").and_then(|g| {
-        if g.is_null() {
-            return None;
-        }
-        let wrapped = serde_json::json!({
-            "type": "Feature",
-            "properties": {},
-            "geometry": g,
-        });
-        let text = serde_json::to_string(&wrapped).ok()?;
-        let fc = parse_geojson(&text).ok()?;
-        fc.features.into_iter().next().map(|f| f.geometry)
-    });
+    let mgrs_tile = props.and_then(parse_mgrs_tile);
+    let processing_level = infer_processing_level(props, collection.as_deref());
+    let bbox = parse_item_bbox(obj);
+    let geometry = obj
+        .get("geometry")
+        .filter(|g| !g.is_null())
+        .and_then(|g| parse_geojson_geometry_value(g).ok().flatten());
 
     let mut assets = Vec::new();
     if let Some(asset_map) = obj.get("assets").and_then(Value::as_object) {
@@ -303,6 +298,10 @@ mod tests {
                 "id": "ITEM_3D",
                 "collection": "cop-dem-glo-30",
                 "bbox": [7.5, 45.8, 120.0, 9.2, 47.1, 4500.0],
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [8.5, 46.5]
+                },
                 "properties": {
                     "datetime": null,
                     "start_datetime": "2024-06-01T00:00:00Z",
@@ -325,6 +324,18 @@ mod tests {
         assert_eq!(item.datetime.as_deref(), Some("2024-06-01T00:00:00Z"));
         assert_eq!(item.mgrs_tile.as_deref(), Some("32TMS"));
         assert!(item.assets[0].raster_bands[0].nodata.unwrap().is_nan());
+        let geom = item.geometry.clone().expect("parsed point geometry");
+        let payload = build_search_payload(
+            "cop-dem-glo-30",
+            &StacSearchQuery {
+                intersects: Some(geom),
+                ..StacSearchQuery::default()
+            },
+        );
+        assert_eq!(
+            payload.get("intersects").and_then(|v| v.get("type")),
+            Some(&Value::String("Point".to_owned()))
+        );
     }
 
     #[test]

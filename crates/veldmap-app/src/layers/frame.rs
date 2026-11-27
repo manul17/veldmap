@@ -43,7 +43,7 @@ fn select_target_rung(
 
     let mut level = finest.min(max_level);
     loop {
-        let cells = layer.visible_cells(level, frustum);
+        let cells = layer.geo_mut().visible_cells(level, frustum);
         if cells.len() <= cap_tiles || level >= max_level {
             return (level, cells);
         }
@@ -74,6 +74,7 @@ pub(super) fn build_and_schedule_layer(
     let cap_tiles = (appetite_bytes / layer.cell_observed_bytes()).max(1);
 
     let sharpest = layer
+        .geo()
         .frame()
         .sharpest_level(img_w, img_h, ctx.viewport_mpp, max_level);
     let (target_level, target_cells) = select_target_rung(layer, sharpest, cap_tiles, ctx.frustum);
@@ -84,7 +85,7 @@ pub(super) fn build_and_schedule_layer(
         let cells = if rung == target_level {
             target_cells.clone()
         } else {
-            layer.visible_cells(rung, ctx.frustum)
+            layer.geo_mut().visible_cells(rung, ctx.frustum)
         };
         ladder_cells.push((rung, cells));
     }
@@ -99,7 +100,7 @@ pub(super) fn build_and_schedule_layer(
         ctx.pending,
     );
 
-    let segments = level_segments(layer.frame(), img_w, img_h, target_level);
+    let segments = level_segments(layer.geo().frame(), img_w, img_h, target_level);
     let patches = build_draw_patches(
         layer,
         img_w,
@@ -123,7 +124,7 @@ pub(super) fn build_and_schedule_layer(
     (!patches.is_empty()).then(|| DrawOverlayLayer {
         opacity: layer.opacity(),
         track: layer.draw_track(),
-        frame: Arc::clone(layer.frame()),
+        frame: Arc::clone(layer.geo().frame()),
         image_width: img_w,
         image_height: img_h,
         segments,
@@ -204,7 +205,7 @@ fn build_draw_patches(
         patches.push(DrawOverlayPatch {
             mesh_key: OverlayMeshKey {
                 source: layer.source_id(),
-                relaid: layer.relaid(),
+                relaid: layer.geo().relaid(),
                 level: target_level,
                 x,
                 y,

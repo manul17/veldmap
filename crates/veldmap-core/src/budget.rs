@@ -107,6 +107,7 @@ pub enum BudgetError {
 #[derive(Default)]
 struct TrackerState {
     active_bytes: u64,
+    #[cfg(any(test, feature = "test-support"))]
     peak_bytes: u64,
     next_ticket: u64,
     waiters: VecDeque<u64>,
@@ -158,11 +159,13 @@ impl DecodeBudgetTracker {
     }
 
     /// Currently reserved active working bytes.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn active_bytes(&self) -> u64 {
         lock_unpoisoned(&self.inner.state).active_bytes
     }
 
     /// High-water mark of `active_bytes` observed over the tracker's lifetime.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn peak_bytes(&self) -> u64 {
         lock_unpoisoned(&self.inner.state).peak_bytes
     }
@@ -186,7 +189,10 @@ impl DecodeBudgetTracker {
             return None;
         }
         state.active_bytes += bytes;
-        state.peak_bytes = state.peak_bytes.max(state.active_bytes);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            state.peak_bytes = state.peak_bytes.max(state.active_bytes);
+        }
         Some(BudgetLease {
             inner: Arc::clone(&self.inner),
             bytes,
@@ -252,7 +258,10 @@ impl DecodeBudgetTracker {
                 state.waiters.pop_front();
                 waiter_guard.ticket = None;
                 state.active_bytes += bytes;
-                state.peak_bytes = state.peak_bytes.max(state.active_bytes);
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    state.peak_bytes = state.peak_bytes.max(state.active_bytes);
+                }
                 if !state.waiters.is_empty() {
                     self.inner.cvar.notify_all();
                 }

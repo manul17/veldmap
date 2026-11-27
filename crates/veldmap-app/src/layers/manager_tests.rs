@@ -12,8 +12,8 @@ use veldmap_storage::test_support::TestTempDir;
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 use crate::layers::{
-    CursorReadout, CursorReadoutValue, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
-    OverlayManagerDeps,
+    CursorReadout, CursorReadoutValue, OpenOverlayRequest, OverlayFrameCtx, OverlayIoEvent,
+    OverlayManager, OverlayManagerDeps, RemoteCogRequest,
 };
 
 fn wait_for_io_event(mgr: &mut OverlayManager) -> OverlayIoEvent {
@@ -78,7 +78,15 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
     });
 
     // 1. Non-blocking open completes off the UI thread.
-    mgr.begin_open_file(&tif_path, true).expect("queue open");
+    mgr.begin_open_file(OpenOverlayRequest {
+        path: &tif_path,
+        fly_to: true,
+        visible: true,
+        opacity: 1.0,
+        crs_override: None,
+        style: None,
+    })
+    .expect("queue open");
     let (layer_id, bounds) = match wait_for_io_event(&mut mgr) {
         OverlayIoEvent::Opened {
             id, bounds, fly_to, ..
@@ -293,8 +301,14 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
     });
 
     let url = format!("http://{addr}/scene.tif?token=secret-query");
-    mgr.begin_open_remote_cog(url, "Test Remote COG".to_owned(), Vec::new(), None, true)
-        .expect("queue remote open");
+    mgr.begin_open_remote_cog(RemoteCogRequest {
+        url,
+        title: "Test Remote COG".to_owned(),
+        extra_headers: Vec::new(),
+        scale_offset: None,
+        fly_to: true,
+    })
+    .expect("queue remote open");
 
     let (layer_id, bounds) = match wait_for_io_event(&mut mgr) {
         OverlayIoEvent::RemoteOpened {

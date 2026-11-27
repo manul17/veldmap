@@ -211,7 +211,7 @@ impl TileKey {
     /// (`level == 0` for planetary schemes, or `level == max_level` for
     /// `RasterPyramid`; out-of-range `level > max_level` returns `false`).
     pub const fn is_root_of(&self, source: SourceId) -> bool {
-        if self.source.0 != source.0 {
+        if self.source.raw() != source.raw() {
             return false;
         }
         match self.scheme {

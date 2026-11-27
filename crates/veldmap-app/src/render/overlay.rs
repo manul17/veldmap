@@ -253,8 +253,7 @@ impl OverlayRenderer {
             // Relax any elastic cap expansion back to `DEFAULT_MESH_CACHE_BYTES`
             // without clearing warm warp meshes so temporary layer hides or
             // off-screen pans avoid full CPU warp rebuilding and GPU re-upload.
-            self.meshes.begin_frame(0, std::iter::empty());
-            self.meshes.end_frame(0);
+            self.meshes.relax_to_default();
             return;
         }
 

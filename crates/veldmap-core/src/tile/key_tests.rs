@@ -35,7 +35,7 @@ fn tile_scheme_parent_respects_level_direction_without_inverting() {
     );
     assert!(format!("{fp:?}").contains("abababababab.."));
     assert_eq!(
-        SourceId::from_fingerprint(&fp).0,
+        SourceId::from_fingerprint(&fp).raw(),
         u64::from_le_bytes([0xAB; 8]) | (1u64 << 63)
     );
 
@@ -98,7 +98,7 @@ fn band_key_from_name_and_source_id_are_deterministic() {
     assert_eq!(s1, SourceId::from_stable_key("eox-s2cloudless-2023-3857"));
     assert_ne!(s1, s2);
     assert_ne!(s1, SourceId::BUNDLED_BASEMAP);
-    assert_ne!(s1.0 & (1u64 << 63), 0, "derived SourceId sets high bit");
+    assert_ne!(s1.raw() & (1u64 << 63), 0, "derived SourceId sets high bit");
 }
 
 #[test]

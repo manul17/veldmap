@@ -196,6 +196,7 @@ impl TileScheduler {
     }
 
     /// Return whether `key` is currently marked in-flight.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_in_flight(&self, key: &TileKey) -> bool {
         self.in_flight.contains_key(key)
     }

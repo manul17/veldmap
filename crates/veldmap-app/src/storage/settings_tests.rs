@@ -132,23 +132,23 @@ fn basemap_draft_preserves_unrelated_app_settings_and_validates_partial_edits() 
 fn gpu_tile_cache_cap_clamps_persists_and_loads_legacy_settings() {
     let mut settings = AppSettings::default();
     assert_eq!(settings.gpu_tile_cache_max_mb, None);
-    assert_eq!(
-        settings.effective_gpu_tile_cache_bytes(512 * 1024 * 1024),
-        512 * 1024 * 1024
-    );
+    assert_eq!(settings.gpu_tile_cache_override_bytes(), None);
 
     settings.gpu_tile_cache_max_mb = Some(16);
     settings.normalize();
     assert_eq!(settings.gpu_tile_cache_max_mb, Some(MIN_GPU_CACHE_MAX_MB));
     assert_eq!(
-        settings.effective_gpu_tile_cache_bytes(512 * 1024 * 1024),
-        (MIN_GPU_CACHE_MAX_MB as usize) * 1024 * 1024
+        settings.gpu_tile_cache_override_bytes(),
+        Some((MIN_GPU_CACHE_MAX_MB as usize) * 1024 * 1024)
     );
 
     settings.gpu_tile_cache_max_mb = Some(99_999);
     settings.normalize();
     assert_eq!(settings.gpu_tile_cache_max_mb, Some(MAX_GPU_CACHE_MAX_MB));
-    assert!(settings.effective_gpu_tile_cache_bytes(512 * 1024 * 1024) >= 128 * 1024 * 1024);
+    assert_eq!(
+        settings.gpu_tile_cache_override_bytes(),
+        Some((MAX_GPU_CACHE_MAX_MB as usize) * 1024 * 1024)
+    );
 
     let mut draft = AppSettingsDraft::from_settings(&settings);
     draft.gpu_tile_cache_max_mb = Some(768);
@@ -237,4 +237,25 @@ fn stac_settings_forward_compat_normalization_validation_and_secret_scrub() {
     assert!(draft.stac.validation_error().is_some());
     draft.stac.auth_header_name = "x-api-key".to_owned();
     assert!(draft.stac.validation_error().is_none());
+
+    // Changing auth kind scrubs previous secret; keeping the same mode preserves it.
+    let mut stac = StacSettings {
+        auth_kind: StacAuthKind::Bearer,
+        auth_secret: "bearer-secret".to_owned(),
+        ..StacSettings::default()
+    };
+    stac.set_auth_kind(StacAuthKind::Bearer);
+    assert_eq!(stac.auth_secret, "bearer-secret");
+    stac.set_auth_kind(StacAuthKind::SasQuery);
+    assert_eq!(stac.auth_kind, StacAuthKind::SasQuery);
+    assert!(
+        stac.auth_secret.is_empty(),
+        "switching Bearer -> SasQuery must scrub secret"
+    );
+    stac.auth_secret = "sv=2024&sig=abc".to_owned();
+    stac.set_auth_kind(StacAuthKind::ApiKey);
+    assert!(
+        stac.auth_secret.is_empty(),
+        "switching SasQuery -> ApiKey must scrub secret"
+    );
 }

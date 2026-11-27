@@ -28,10 +28,10 @@ use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint, SourceId, Tile
 
 use crate::RasterError;
 use crate::pipeline::{
-    BandSample, BandStats, ByteRange, ChunkKey, DISPLAY_STREAM_SPEC, DecodeContext, DirectRead,
-    DisplayMapping, Grid, PyramidMeta, RasterDescription, RasterSource, SampleType,
-    SharedChunkCache, TileEmit, build_chunked_level_table, coalesce_byte_ranges, direct, pass,
-    plan_direct, stream_spec_for_band,
+    BandSample, BandStats, ByteRange, DEFAULT_COALESCE_GAP_BYTES, DEFAULT_COALESCE_MAX_SPAN_BYTES,
+    DISPLAY_STREAM_SPEC, DecodeContext, DirectRead, DisplayMapping, Grid, PyramidMeta,
+    RasterDescription, RasterSource, SampleType, TileEmit, build_chunked_level_table,
+    coalesce_byte_ranges, direct, pass, plan_direct, stream_spec_for_band,
 };
 
 use chunk_reader::{ChunkReadMode, TiffChunkReader};
@@ -75,11 +75,13 @@ pub struct TiffSource {
 impl TiffSource {
     /// Return the number of compatible reduced-resolution overviews discovered
     /// during [`Self::open`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn overview_count(&self) -> usize {
         self.grid.overviews.len()
     }
 
     /// Return whether the base IFD uses tiled TIFF storage (`TileWidth`).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_tiled(&self) -> bool {
         self.base_ifd().tiled
     }
@@ -87,7 +89,7 @@ impl TiffSource {
     /// Apply external per-band `(scale, offset)` metadata (e.g., from STAC
     /// `raster:bands`) to indexed bands whose embedded TIFF metadata left
     /// scaling at identity `(1.0, 0.0)`.
-    pub fn apply_external_scale_offset(&mut self, scale: f64, offset: f64) {
+    pub(crate) fn apply_external_scale_offset(&mut self, scale: f64, offset: f64) {
         if !scale.is_finite() || !offset.is_finite() {
             return;
         }
@@ -153,16 +155,10 @@ impl TiffSource {
         let base = self.base_ifd();
         match (spec.band, spec.format) {
             (BandKey::Display, PixelFormat::Rgba8UnormSrgb) => Ok(()),
-            (BandKey::Index(b), PixelFormat::R32Float) => {
-                if b >= base.samples_per_pixel {
-                    return Err(RasterError::Decode(format!(
-                        "band {b} out of range ({} samples/pixel)",
-                        base.samples_per_pixel
-                    )));
-                }
-                Ok(())
-            }
-            (BandKey::Index(b), PixelFormat::R8Uint | PixelFormat::R16Uint) => {
+            (
+                BandKey::Index(b),
+                PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint,
+            ) => {
                 if b >= base.samples_per_pixel {
                     return Err(RasterError::Decode(format!(
                         "band {b} out of range ({} samples/pixel)",
@@ -170,7 +166,8 @@ impl TiffSource {
                     )));
                 }
                 match (spec.format, base.sample_type) {
-                    (PixelFormat::R8Uint, SampleType::U8)
+                    (PixelFormat::R32Float, _)
+                    | (PixelFormat::R8Uint, SampleType::U8)
                     | (PixelFormat::R16Uint, SampleType::U8 | SampleType::U16) => Ok(()),
                     _ => Err(RasterError::Decode(format!(
                         "categorical format {:?} requires U8/U16 source samples, got {:?}",
@@ -211,7 +208,11 @@ impl TiffSource {
             }
         }
 
-        coalesce_byte_ranges(&mut ranges, 64 * 1024, 4 * 1024 * 1024);
+        coalesce_byte_ranges(
+            &mut ranges,
+            DEFAULT_COALESCE_GAP_BYTES,
+            DEFAULT_COALESCE_MAX_SPAN_BYTES,
+        );
         Ok(ranges)
     }
 
@@ -252,7 +253,6 @@ impl RasterSource for TiffSource {
         level: u8,
         wants: &[(u32, u32)],
         budget: &MemoryBudget,
-        chunk_cache: &SharedChunkCache,
     ) -> Result<Vec<ByteRange>, RasterError> {
         self.validate_stream_spec(spec)?;
         let plan = plan_direct(
@@ -265,20 +265,8 @@ impl RasterSource for TiffSource {
         )?;
         let ifd = find_ifd(&self.ifds, plan.image())?;
         let planes = ifd.planes_for_stream(spec)?;
-        let uncached: Vec<u32> = plan
-            .unique_chunk_indices()
-            .into_iter()
-            .filter(|&chunk_index| {
-                let key = ChunkKey {
-                    source: self.source_id,
-                    spec,
-                    image: plan.image(),
-                    chunk_index,
-                };
-                !chunk_cache.contains(&key)
-            })
-            .collect();
-        self.collect_validated_spans(ifd, &planes, &uncached)
+        let indices = plan.unique_chunk_indices();
+        self.collect_validated_spans(ifd, &planes, &indices)
     }
 
     fn plan_stretch_byte_ranges(&self) -> Result<Vec<ByteRange>, RasterError> {

@@ -2,8 +2,6 @@
 //! Display (`Rgba8UnormSrgb`), Scientific (`R32Float`), and Categorical
 //! (`R8Uint`/`R16Uint`) streams, plus shared single-band sample iteration.
 
-use veldmap_core::tile::PixelFormat;
-
 use crate::RasterError;
 use crate::pipeline::{
     DisplayMapping, PixelLayout, SampleType, is_data_f64, raw_bytes_to_rgba, read_native_sample_f64,
@@ -17,16 +15,6 @@ use super::ifd::{CachedIfd, PlanarConfig};
 pub(super) enum CategoricalFormat {
     U8,
     U16,
-}
-
-impl CategoricalFormat {
-    pub(super) const fn from_pixel_format(format: PixelFormat) -> Option<Self> {
-        match format {
-            PixelFormat::R8Uint => Some(Self::U8),
-            PixelFormat::R16Uint => Some(Self::U16),
-            PixelFormat::Rgba8UnormSrgb | PixelFormat::R32Float => None,
-        }
-    }
 }
 
 pub(super) enum PaletteAlpha<'a> {

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use super::super::crs::{CrsSpec, Datum, DatumWarning, Proj4Projection, Projection, WGS84_DATUM};
 use super::super::footprint::FootprintBounds;
 use super::super::geodesy;
-use super::tie_grid::{Tie, TieGrid};
+#[cfg(any(test, feature = "test-support"))]
+use super::tie_grid::Tie;
+use super::tie_grid::TieGrid;
 
 /// Web Mercator equatorial circumference in metres (`2 * pi * a`).
 const WEB_MERCATOR_WORLD_M: f64 = geodesy::EQUATORIAL_CIRCUMFERENCE_M;
@@ -236,6 +238,7 @@ impl Frame {
     /// Construct a 2x2 geographic tie-grid frame from `(UL, UR, LR, LL)`
     /// corners, preserving 360-degree global spans and matching forward/inverse
     /// bilinear interpolation.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn quad(points: [(f64, f64); 4]) -> Option<Self> {
         let [ul, ur, lr, ll] = points;
         let ties = [

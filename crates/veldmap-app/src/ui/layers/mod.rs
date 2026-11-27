@@ -72,7 +72,7 @@ pub(crate) enum LayerUiAction {
 }
 
 impl LayerUiAction {
-    pub(super) fn edit_raster(id: LayerId, edit: OverlayEdit) -> Self {
+    fn edit_raster(id: LayerId, edit: OverlayEdit) -> Self {
         Self::EditRaster {
             id,
             edit,
@@ -80,7 +80,7 @@ impl LayerUiAction {
         }
     }
 
-    pub(super) fn edit_raster_drag(id: LayerId, edit: OverlayEdit, commit: bool) -> Self {
+    fn edit_raster_drag(id: LayerId, edit: OverlayEdit, commit: bool) -> Self {
         Self::EditRaster {
             id,
             edit,
@@ -88,7 +88,7 @@ impl LayerUiAction {
         }
     }
 
-    pub(super) fn edit_vector(id: VectorLayerId, edit: VectorEdit) -> Self {
+    fn edit_vector(id: VectorLayerId, edit: VectorEdit) -> Self {
         Self::EditVector {
             id,
             edit,
@@ -96,7 +96,7 @@ impl LayerUiAction {
         }
     }
 
-    pub(super) fn edit_vector_drag(id: VectorLayerId, edit: VectorEdit, commit: bool) -> Self {
+    fn edit_vector_drag(id: VectorLayerId, edit: VectorEdit, commit: bool) -> Self {
         Self::EditVector {
             id,
             edit,

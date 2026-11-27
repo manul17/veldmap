@@ -33,9 +33,12 @@ pub use adapters::{JpegSource, PngSource};
 pub use basemap::{BundledBasemap, BundledBasemapConfig, decode_map_tile_with_mipmaps};
 pub use image_codec::{has_jpeg_magic, has_png_magic};
 pub use mipmap::generate_tile_mipmaps;
-pub use open::{OpenedRaster, SidecarReader, open_raster};
+pub use open::{
+    OpenRasterOptions, OpenedRaster, SidecarReader, open_raster, open_raster_with_options,
+};
 pub use pipeline::{
-    AdmittedPass, AdmittedTile, BandInfo, BandSample, BandStats, ByteRange, DISPLAY_STREAM_SPEC,
+    AdmittedPass, AdmittedTile, BandInfo, BandSample, BandStats, ByteRange,
+    DEFAULT_COALESCE_GAP_BYTES, DEFAULT_COALESCE_MAX_SPAN_BYTES, DISPLAY_STREAM_SPEC,
     DecodeContext, GeoPlacement, GeoTie, HISTOGRAM_BINS, LevelPlan, MAX_SOURCE_SIDE, PlacementCrs,
     PyramidMeta, RasterDescription, RasterSource, SampleType, ServeMode, SharedChunkCache,
     TileEmit, TileFailureOutcome, TileScheduler, coalesce_byte_ranges, frame_from_description,

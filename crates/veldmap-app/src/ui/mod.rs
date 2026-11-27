@@ -12,7 +12,7 @@ pub(crate) mod settings;
 pub(crate) mod stac;
 pub(crate) mod status_bar;
 pub(crate) mod toolbar;
-pub(crate) mod widgets;
+mod widgets;
 pub(crate) mod workbench;
 
 use eframe::egui;

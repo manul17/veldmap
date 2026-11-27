@@ -22,7 +22,8 @@ use veldmap_core::tile::{
 };
 
 use crate::image_codec::{
-    decode_jpeg_pixels_to_rgba8, jpeg_codec_working_bytes, jpeg_pixel_format_channels,
+    build_jpeg_decoder, decode_jpeg_pixels_to_rgba8, jpeg_codec_working_bytes,
+    jpeg_pixel_format_channels,
 };
 use crate::pipeline::{
     BandInfo, BandSample, Cascade, DISPLAY_STREAM_SPEC, DecodeContext, GeoPlacement, LevelPlan,
@@ -58,11 +59,14 @@ impl JpegSource {
         if cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
+        if byte_source.is_remote() {
+            return Err(RasterError::RemotePassUnsupported(
+                "JPEG requires whole-file decoding and cannot be streamed over HTTP Range"
+                    .to_owned(),
+            ));
+        }
         let reader = BufferedByteReader::new(Arc::clone(&byte_source), cancel.clone());
-        let mut decoder = jpeg_decoder::Decoder::new(reader);
-        decoder.set_max_decoding_buffer_size(
-            budget.decode_working_bytes.min(usize::MAX as u64) as usize
-        );
+        let mut decoder = build_jpeg_decoder(reader, budget.decode_working_bytes);
         decoder.read_info().map_err(|e| map_jpeg_error(e, cancel))?;
         let info = decoder
             .info()
@@ -200,10 +204,7 @@ impl RasterSource for JpegSource {
         let lh = level_size(self.description.height, u32::from(self.pass_level));
 
         let reader = BufferedByteReader::new(Arc::clone(&self.byte_source), ctx.cancel.clone());
-        let mut decoder = jpeg_decoder::Decoder::new(reader);
-        decoder.set_max_decoding_buffer_size(
-            ctx.budget.decode_working_bytes.min(usize::MAX as u64) as usize,
-        );
+        let mut decoder = build_jpeg_decoder(reader, ctx.budget.decode_working_bytes);
 
         // `scale()` internally calls `read_info()` and computes the scaled output
         // dimensions BEFORE allocating the decoded frame buffer.

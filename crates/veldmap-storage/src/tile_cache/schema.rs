@@ -55,6 +55,16 @@ pub(super) fn open_read_only_connection(path: &Path) -> Result<Connection, rusql
     Ok(conn)
 }
 
+fn open_writer_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open(path)?;
+    conn.set_prepared_statement_cache_capacity(32);
+    // Configure `busy_timeout` BEFORE probing PRAGMAs so multi-process WAL
+    // startup contention waits cleanly instead of failing immediately with
+    // `SQLITE_BUSY`.
+    conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
+    Ok(conn)
+}
+
 fn query_page_count_and_version(conn: &Connection) -> Result<(i64, i64), rusqlite::Error> {
     let page_count: i64 = conn.query_row("PRAGMA page_count;", [], |r| r.get(0))?;
     let user_version: i64 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
@@ -62,8 +72,6 @@ fn query_page_count_and_version(conn: &Connection) -> Result<(i64, i64), rusqlit
 }
 
 fn init_connection(conn: &Connection, is_empty: bool) -> Result<i64, rusqlite::Error> {
-    conn.set_prepared_statement_cache_capacity(32);
-    conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
 
     if is_empty {
@@ -136,17 +144,13 @@ fn init_connection(conn: &Connection, is_empty: bool) -> Result<i64, rusqlite::E
 
 pub(super) fn recreate_file_db(path: &Path) -> Result<(Connection, i64), rusqlite::Error> {
     remove_sqlite_files(path);
-    let fresh = Connection::open(path)?;
+    let fresh = open_writer_connection(path)?;
     let max_ts = init_connection(&fresh, true)?;
     Ok((fresh, max_ts))
 }
 
 pub(super) fn open_and_init_file_db(path: &Path) -> Result<(Connection, i64), rusqlite::Error> {
-    let conn = Connection::open(path)?;
-    // Configure `busy_timeout` BEFORE probing PRAGMAs so multi-process WAL
-    // startup contention waits cleanly instead of failing immediately with
-    // `SQLITE_BUSY`.
-    conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
+    let conn = open_writer_connection(path)?;
     let (page_count, user_version) = query_page_count_and_version(&conn)?;
     if page_count > 0 && user_version != SCHEMA_VERSION {
         tracing::info!(

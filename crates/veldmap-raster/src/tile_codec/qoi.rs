@@ -4,6 +4,8 @@
 
 use crate::RasterError;
 
+use super::checked_tile_bytes;
+
 /// Encode an 8-bit `Rgba8UnormSrgb` tile into lossless QOI bytes.
 ///
 /// Symmetrically enforces `width > 0`, `height > 0`, exact `width * height * 4`
@@ -15,19 +17,9 @@ pub fn encode_qoi_rgba8(
     rgba: &[u8],
     max_decoded_bytes: usize,
 ) -> Result<Vec<u8>, RasterError> {
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|px| px.checked_mul(4));
-    if width == 0 || height == 0 || expected != Some(rgba.len()) {
+    let expected = checked_tile_bytes(width, height, 4, max_decoded_bytes)?;
+    if rgba.len() != expected {
         return Err(RasterError::InvalidDimensions { width, height });
-    }
-    if rgba.len() > max_decoded_bytes {
-        return Err(RasterError::LimitExceeded {
-            width,
-            height,
-            estimated_bytes: rgba.len() as u64,
-            limit_bytes: max_decoded_bytes as u64,
-        });
     }
     qoi::encode_to_vec(rgba, width, height).map_err(|e| RasterError::Decode(e.to_string()))
 }
@@ -40,9 +32,6 @@ pub fn decode_qoi_rgba8(
     max_decoded_bytes: usize,
 ) -> Result<(u32, u32, Vec<u8>), RasterError> {
     let header = qoi::decode_header(payload).map_err(|e| RasterError::Decode(e.to_string()))?;
-    let expected = (header.width as usize)
-        .checked_mul(header.height as usize)
-        .and_then(|px| px.checked_mul(4));
     if header.width == 0 || header.height == 0 {
         return Err(RasterError::InvalidDimensions {
             width: header.width,
@@ -55,22 +44,7 @@ pub fn decode_qoi_rgba8(
             header.channels, header.colorspace
         )));
     }
-    let Some(expected_bytes) = expected else {
-        return Err(RasterError::LimitExceeded {
-            width: header.width,
-            height: header.height,
-            estimated_bytes: u64::MAX,
-            limit_bytes: max_decoded_bytes as u64,
-        });
-    };
-    if expected_bytes > max_decoded_bytes {
-        return Err(RasterError::LimitExceeded {
-            width: header.width,
-            height: header.height,
-            estimated_bytes: expected_bytes as u64,
-            limit_bytes: max_decoded_bytes as u64,
-        });
-    }
+    let expected_bytes = checked_tile_bytes(header.width, header.height, 4, max_decoded_bytes)?;
     let (decoded_header, rgba) =
         qoi::decode_to_vec(payload).map_err(|e| RasterError::Decode(e.to_string()))?;
     if decoded_header.width != header.width

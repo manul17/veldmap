@@ -192,7 +192,7 @@ fn resolve_linear_unit_m(geo_params: &GeoKeyParams) -> Option<f64> {
         }
         return Some(1.0);
     }
-    if let Some(unit) = LinearUnit::from_geotiff_code(code) {
+    if let Some(unit) = LinearUnit::from_epsg(code) {
         return Some(unit.to_metres());
     }
     if code == EPSG_UNIT_KILOMETRE {

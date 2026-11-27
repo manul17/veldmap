@@ -12,3 +12,5 @@ mod common;
 mod georef;
 mod stress_and_budget;
 mod tiff_and_cog;
+mod tiff_codecs;
+mod tiff_formats;

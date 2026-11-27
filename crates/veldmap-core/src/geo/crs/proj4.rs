@@ -31,7 +31,9 @@ pub struct Proj4Projection {
 
 impl PartialEq for Proj4Projection {
     fn eq(&self, other: &Self) -> bool {
-        self.proj_string == other.proj_string && self.label == other.label
+        self.proj_string == other.proj_string
+            && self.label == other.label
+            && self.warning == other.warning
     }
 }
 
@@ -127,7 +129,7 @@ impl Proj4Projection {
 
     /// Scale factor from this projection's linear units to metres (`1.0` for
     /// metres or geographic).
-    pub(crate) fn unit_to_metres(&self) -> f64 {
+    pub(in crate::geo) fn unit_to_metres(&self) -> f64 {
         let m = self.proj.to_meter();
         if m.is_finite() && m > 0.0 { m } else { 1.0 }
     }
@@ -139,7 +141,7 @@ impl Proj4Projection {
 
     /// Convert projected `(x, y)` (or source-datum `(lon_deg, lat_deg)` when
     /// geographic) into WGS84 `(lat_deg, lon_deg)`.
-    pub(crate) fn to_wgs84_geodetic(&self, x: f64, y: f64) -> (f64, f64) {
+    pub(in crate::geo) fn to_wgs84_geodetic(&self, x: f64, y: f64) -> (f64, f64) {
         if !(x.is_finite() && y.is_finite()) {
             return (f64::NAN, f64::NAN);
         }
@@ -162,7 +164,11 @@ impl Proj4Projection {
 
     /// Convert WGS84 `(lat_deg, lon_deg)` into projected `(x, y)` (or
     /// source-datum `(lon_deg, lat_deg)` when geographic).
-    pub(crate) fn transform_from_wgs84_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
+    pub(in crate::geo) fn transform_from_wgs84_geodetic(
+        &self,
+        lat_deg: f64,
+        lon_deg: f64,
+    ) -> (f64, f64) {
         if !(lat_deg.is_finite() && lon_deg.is_finite()) {
             return (f64::NAN, f64::NAN);
         }
@@ -394,5 +400,12 @@ mod tests {
             foreign.datum_warning(),
             Some(DatumWarning::UnshiftedForeignDatum { .. })
         ));
+
+        // PartialEq must distinguish identical proj/label instances whose warnings differ.
+        let mut without_warning =
+            Proj4Projection::from_proj_string(&foreign.proj_string, Some(foreign.label.clone()))
+                .expect("rebuild proj without WKT warning");
+        without_warning.warning = None;
+        assert_ne!(foreign, without_warning);
     }
 }

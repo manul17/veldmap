@@ -25,7 +25,7 @@ struct OverlayPatchUniform {
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
-@group(1) @binding(0) var<uniform> overlay: OverlayPatchUniform;
+@group(1) @binding(0) var<uniform> tile: OverlayPatchUniform;
 @group(2) @binding(0) var tile_tex: texture_2d<f32>;
 @group(2) @binding(1) var tile_sampler: sampler;
 
@@ -46,7 +46,7 @@ fn vs_main(
     @location(2) uv: vec2<f32>,
 ) -> VsOut {
     var out: VsOut;
-    let rel = overlay.offset_eye + rel_pos;
+    let rel = tile.offset_eye + rel_pos;
     out.clip = camera.view_proj * vec4<f32>(rel, 1.0);
     out.world = rel;
     out.normal = normal;
@@ -58,14 +58,14 @@ fn vs_main(
 fn fs_overlay(in: VsOut) -> @location(0) vec4<f32> {
     // Evaluate texture sampling in uniform control flow strictly before any
     // horizon or transparency `discard`.
-    let sample_uv = overlay.uv_rect.xy + in.uv * overlay.uv_rect.zw;
+    let sample_uv = tile.uv_rect.xy + in.uv * tile.uv_rect.zw;
     let color = textureSample(tile_tex, tile_sampler, sample_uv);
 
     if dot(in.normal, -in.world) <= 0.0 {
         discard;
     }
 
-    let alpha = color.a * overlay.opacity;
+    let alpha = color.a * tile.opacity;
     if alpha <= 0.001 {
         discard;
     }

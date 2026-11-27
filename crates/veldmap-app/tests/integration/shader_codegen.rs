@@ -1,12 +1,14 @@
 //! CPU-only `naga` WGSL validation, uniform struct layout parity checks, and
 //! SPIR-V / HLSL / MSL codegen tests (pinned to `wgpu` 30's `naga` 30).
 
+use std::collections::HashSet;
+
 use naga::back::{hlsl, msl, spv};
 use naga::proc::Layouter;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use veldmap_app::render::{
     COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL, OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL,
-    VECTOR_WGSL,
+    UNIFORM_LAYOUT_SPECS, UniformLayoutSpec, VECTOR_WGSL,
 };
 
 fn parse_and_validate(name: &str, wgsl_source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
@@ -22,12 +24,15 @@ fn parse_and_validate(name: &str, wgsl_source: &str) -> (naga::Module, naga::val
     (module, info)
 }
 
-fn assert_struct_layout(
-    module: &naga::Module,
-    struct_name: &str,
-    expected_size: u32,
-    expected_members: &[(&str, u32)],
-) {
+fn layout_spec(wgsl_name: &str) -> &'static UniformLayoutSpec {
+    UNIFORM_LAYOUT_SPECS
+        .iter()
+        .find(|spec| spec.wgsl_name == wgsl_name)
+        .unwrap_or_else(|| panic!("missing Rust UniformLayoutSpec for `{wgsl_name}`"))
+}
+
+fn assert_struct_layout(module: &naga::Module, spec: &UniformLayoutSpec) {
+    let struct_name = spec.wgsl_name;
     let mut layouter = Layouter::default();
     layouter
         .update(module.to_ctx())
@@ -38,19 +43,19 @@ fn assert_struct_layout(
         .find(|(_, t)| t.name.as_deref() == Some(struct_name))
         .unwrap_or_else(|| panic!("WGSL struct `{struct_name}` not found"));
     assert_eq!(
-        layouter[handle].size, expected_size,
+        layouter[handle].size as usize, spec.size,
         "WGSL struct `{struct_name}` size mismatch"
     );
     let naga::TypeInner::Struct { members, .. } = &ty.inner else {
         panic!("`{struct_name}` is not a WGSL struct");
     };
-    for &(field, expected_offset) in expected_members {
+    for &(field, expected_offset) in spec.fields {
         let member = members
             .iter()
             .find(|m| m.name.as_deref() == Some(field))
             .unwrap_or_else(|| panic!("field `{struct_name}.{field}` not found"));
         assert_eq!(
-            member.offset, expected_offset,
+            member.offset as usize, expected_offset,
             "field `{struct_name}.{field}` offset mismatch"
         );
     }
@@ -117,76 +122,33 @@ fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
     let vector = validate_and_compile_all_backends("vector.wgsl", VECTOR_WGSL);
     let _composite = validate_and_compile_all_backends("composite.wgsl", COMPOSITE_WGSL);
 
-    let camera_members = &[
-        ("view_proj", 0),
-        ("grid_step_deg", 64),
-        ("grid_width_px", 68),
-        ("polar_r_cap", 72),
+    let shader_uniforms: &[(&naga::Module, &[&str])] = &[
+        (&globe, &["CameraUniform", "TileUniform"]),
+        (&overlay, &["CameraUniform", "OverlayPatchUniform"]),
+        (
+            &overlay_sci,
+            &["CameraUniform", "ScientificPatchUniform", "PaletteUniform"],
+        ),
+        (
+            &overlay_cat,
+            &["CameraUniform", "CategoricalPatchUniform", "PaletteUniform"],
+        ),
+        (&vector, &["CameraUniform", "VectorUniform"]),
     ];
-    assert_struct_layout(&globe, "CameraUniform", 80, camera_members);
-    assert_struct_layout(&overlay, "CameraUniform", 80, camera_members);
-    assert_struct_layout(&overlay_sci, "CameraUniform", 80, camera_members);
-    assert_struct_layout(&overlay_cat, "CameraUniform", 80, camera_members);
-    assert_struct_layout(&vector, "CameraUniform", 80, camera_members);
-    assert_struct_layout(
-        &globe,
-        "TileUniform",
-        48,
-        &[
-            ("offset_eye", 0),
-            ("tile_kind", 12),
-            ("uv_rect", 16),
-            ("grid_anchor", 32),
-        ],
-    );
-    assert_struct_layout(
-        &overlay,
-        "OverlayPatchUniform",
-        32,
-        &[("offset_eye", 0), ("opacity", 12), ("uv_rect", 16)],
-    );
-    assert_struct_layout(
-        &overlay_sci,
-        "ScientificPatchUniform",
-        64,
-        &[
-            ("offset_eye", 0),
-            ("opacity", 12),
-            ("uv_rect", 16),
-            ("scale", 32),
-            ("offset", 36),
-            ("stretch_min", 40),
-            ("stretch_inv_range", 44),
-            ("stretch_mode", 48),
-            ("invert_colormap", 52),
-            ("mip_count", 56),
-        ],
-    );
-    assert_struct_layout(&overlay_sci, "PaletteUniform", 4096, &[("entries", 0)]);
-    assert_struct_layout(
-        &overlay_cat,
-        "CategoricalPatchUniform",
-        48,
-        &[
-            ("offset_eye", 0),
-            ("opacity", 12),
-            ("uv_rect", 16),
-            ("has_nodata", 32),
-            ("nodata_value", 36),
-        ],
-    );
-    assert_struct_layout(&overlay_cat, "PaletteUniform", 4096, &[("entries", 0)]);
-    assert_struct_layout(
-        &vector,
-        "VectorUniform",
-        48,
-        &[
-            ("offset_eye", 0),
-            ("point_radius_m", 12),
-            ("color", 16),
-            ("viewport_inv_size", 32),
-            ("stroke_half_width_px", 40),
-            ("hatch_spacing_px", 44),
-        ],
-    );
+
+    let mut verified = HashSet::new();
+    for &(module, struct_names) in shader_uniforms {
+        for &struct_name in struct_names {
+            assert_struct_layout(module, layout_spec(struct_name));
+            verified.insert(struct_name);
+        }
+    }
+
+    for spec in UNIFORM_LAYOUT_SPECS {
+        assert!(
+            verified.contains(spec.wgsl_name),
+            "UniformLayoutSpec `{}` was not verified against any WGSL shader",
+            spec.wgsl_name
+        );
+    }
 }

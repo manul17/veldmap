@@ -3,24 +3,23 @@
 //! (`veldmap-remote-io`), offloaded tile persistence (`veldmap-tile-write`),
 //! and the local overlay I/O worker.
 //!
-//! Returns [`OverlayMutation`] records rather than mutating `GpuTileCache` /
-//! `PendingUploads` directly, matching `BasemapManager`'s clean boundary with
-//! `SceneState`.
+//! Asynchronous open, reload, and completion reconciliation methods live in the
+//! sibling [`super::lifecycle`] module. Returns [`OverlayMutation`] records
+//! rather than mutating `GpuTileCache` / `PendingUploads` directly, matching
+//! `BasemapManager`'s clean boundary with `SceneState`.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::geo::{Camera, FootprintBounds, Frame};
+use veldmap_core::geo::{Camera, FootprintBounds};
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileStreamSpec};
 use veldmap_net::NetContext;
-use veldmap_raster::{DecodePool, DecodePoolConfig, DecodePoolHandle, RasterSource};
+use veldmap_raster::{DecodePool, DecodePoolConfig, DecodePoolHandle};
 use veldmap_storage::TileDiskCache;
 
-use crate::clamp_opacity;
 use crate::colormap::{CategoricalPaletteId, ColormapId};
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSender};
 use crate::render::DrawOverlayLayer;
@@ -29,21 +28,18 @@ use crate::worker::SingleThreadWorker;
 use super::cursor::CursorProber;
 use super::disk_cache::TileWriteWorker;
 use super::frame::{LayerFrameCtx, build_and_schedule_layer};
-use super::io_worker::{
-    OverlayIoCmd, OverlayIoResult, ReloadRequest, ReloadedPayload, spawn_overlay_io_worker,
-};
+use super::io_worker::{OverlayIoCmd, OverlayIoResult, spawn_overlay_io_worker};
 use super::jobs::band_stats::BandStatsTracker;
-use super::layer::RemoteLayerSpec;
-use super::opener::{OpenRasterError, bind_frame_with_override};
+use super::opener::bind_frame_with_override;
 use super::remote_opener::RemoteOpenTracker;
 use super::runtime::{OverlayRuntime, OverlayRuntimeDeps};
 use super::stack::{LayerStack, OverlayLayer};
 use super::{
-    ColorbarInfo, CrsOverride, CursorReadout, LayerId, LayerInitOptions, LayerSummary,
-    OverlayIoEvent, OverlayPersistEntry, StretchPreset,
+    ColorbarInfo, CrsOverride, CursorReadout, LayerId, LayerSummary, OverlayPersistEntry,
+    StretchPreset,
 };
 
-fn alloc_seq(counter: &mut u64) -> u64 {
+pub(super) fn alloc_seq(counter: &mut u64) -> u64 {
     let value = *counter;
     *counter = counter.saturating_add(1);
     value
@@ -102,16 +98,16 @@ pub(crate) struct OverlayMutation {
 /// `NetContext` + `veldmap-remote-io`, `StreamKey`-scoped two-lane scheduling,
 /// offloaded lossless QOI & `Lz4Raw` disk caching, and zoom-invariant CPU cursor readouts.
 pub(crate) struct OverlayManager {
-    stack: LayerStack,
-    next_layer_id: u64,
-    next_relaid: u64,
-    runtime: Arc<OverlayRuntime>,
+    pub(super) stack: LayerStack,
+    pub(super) next_layer_id: u64,
+    pub(super) next_relaid: u64,
+    pub(super) runtime: Arc<OverlayRuntime>,
     remote_pool: Option<DecodePool>,
     tile_writer: Option<TileWriteWorker>,
-    remote_opener: RemoteOpenTracker,
+    pub(super) remote_opener: RemoteOpenTracker,
     cursor: CursorProber,
-    io_worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
-    band_stats: BandStatsTracker,
+    pub(super) io_worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
+    pub(super) band_stats: BandStatsTracker,
 }
 
 impl OverlayManager {
@@ -189,13 +185,13 @@ impl OverlayManager {
         self.stack.topmost_colorbar_info()
     }
 
-    fn request_band_stats_if_needed(&mut self, id: LayerId) {
+    pub(super) fn request_band_stats_if_needed(&mut self, id: LayerId) {
         if let Some(layer) = self.stack.get_mut(id) {
             self.band_stats.request_if_needed(layer, &self.runtime);
         }
     }
 
-    fn purge_source(&self, src: SourceId) {
+    pub(super) fn purge_source(&self, src: SourceId) {
         self.runtime.purge_source_runtime(src);
         self.cursor.invalidate_source(src);
     }
@@ -224,7 +220,9 @@ impl OverlayManager {
 
     /// Look up the current CRS override for `id`, if any.
     pub(crate) fn layer_crs_override(&self, id: LayerId) -> Option<CrsOverride> {
-        self.stack.get(id).and_then(|l| l.crs_override().cloned())
+        self.stack
+            .get(id)
+            .and_then(|l| l.geo().crs_override().cloned())
     }
 
     /// Borrowed view of loaded local raster layers in painter's order for
@@ -234,309 +232,6 @@ impl OverlayManager {
             .layers()
             .iter()
             .filter_map(OverlayLayer::persist_entry)
-    }
-
-    /// Queue a non-blocking remote Cloud-Optimized GeoTIFF open onto
-    /// [`NetContext`] + `remote_pool`, completely isolated from local file
-    /// open/reload I/O and `fast_pool`.
-    pub(crate) fn begin_open_remote_cog(
-        &self,
-        url: String,
-        title: String,
-        extra_headers: Vec<(String, String)>,
-        scale_offset: Option<(f64, f64)>,
-        fly_to: bool,
-    ) -> Result<(), String> {
-        self.remote_opener.begin_open(
-            &self.runtime,
-            url,
-            title,
-            extra_headers,
-            scale_offset,
-            fly_to,
-        )
-    }
-
-    /// Queue a non-blocking local raster open onto the overlay I/O worker.
-    #[cfg(test)]
-    fn begin_open_file(&self, path: &Path, fly_to: bool) -> Result<(), String> {
-        self.begin_open_file_with_options(path, fly_to, true, 1.0, None, None)
-    }
-
-    /// Queue a non-blocking local raster open with explicit initial visibility,
-    /// opacity, optional CRS override, and optional saved analytical style.
-    pub(crate) fn begin_open_file_with_options(
-        &self,
-        path: &Path,
-        fly_to: bool,
-        visible: bool,
-        opacity: f32,
-        crs_override: Option<CrsOverride>,
-        style: Option<super::LayerStyleSpec>,
-    ) -> Result<(), String> {
-        if self.io_worker.send(OverlayIoCmd::Open {
-            path: path.to_path_buf(),
-            fly_to,
-            options: LayerInitOptions {
-                visible,
-                opacity: clamp_opacity(opacity),
-                crs_override,
-                style,
-            },
-        }) {
-            Ok(())
-        } else {
-            Err("overlay I/O worker is unavailable".to_owned())
-        }
-    }
-
-    /// Queue a non-blocking reload of `id` onto the overlay I/O worker,
-    /// cancelling active tile jobs for `old_src` immediately so stale tiles
-    /// cannot race the reload, while preserving the layer if reopen fails.
-    pub(crate) fn begin_reload_bypass_cache(
-        &mut self,
-        id: LayerId,
-    ) -> Result<OverlayMutation, String> {
-        let cancel = self.runtime.shutdown.child_token();
-        let (request, prep) = {
-            let Some(layer) = self.stack.get_mut(id) else {
-                return Err("layer no longer exists".to_owned());
-            };
-            let Some(local_path) = layer.local_path().map(Path::to_path_buf) else {
-                return Err("remote COG layers do not support local disk reload".to_owned());
-            };
-            layer.cancel_stats_job();
-            let prep = layer.begin_reload(cancel.clone());
-            let request = ReloadRequest {
-                id,
-                reload_seq: prep.reload_seq,
-                crs_override_epoch: layer.crs_override_epoch(),
-                path: local_path,
-                old_fingerprint_hex: layer.fingerprint_hex().to_owned(),
-                crs_override: layer.crs_override().cloned(),
-                cancel,
-            };
-            (request, prep)
-        };
-        if let Some(prev) = prep.old_cancel {
-            prev.cancel();
-        }
-
-        // Cancel in-flight jobs, rotate source write tokens, purge queued disk
-        // writes, and clear runtime caches for `old_source` BEFORE `io_worker`
-        // runs `clear_source` so no pre-reload tile can poison SQLite.
-        self.purge_source(prep.old_source);
-
-        if !self.io_worker.send(OverlayIoCmd::Reload(request)) {
-            if let Some(layer) = self.stack.get_mut(id) {
-                layer.abort_reload();
-            }
-            self.runtime.request_reschedule();
-            return Err("overlay I/O worker is unavailable".to_owned());
-        }
-
-        Ok(OverlayMutation {
-            changed: true,
-            topology_changed: true,
-            purge_sources: vec![prep.old_source],
-        })
-    }
-
-    /// Drain completed background raster open/reload operations from the
-    /// overlay I/O worker.
-    pub(crate) fn poll_io_events(&mut self) -> (Vec<OverlayIoEvent>, OverlayMutation) {
-        let mut events = Vec::new();
-        let mut mutation = OverlayMutation::default();
-
-        while let Some(res) = self.io_worker.try_recv() {
-            match res {
-                OverlayIoResult::Opened {
-                    path,
-                    fly_to,
-                    options,
-                    outcome,
-                } => self.handle_opened_result(
-                    path,
-                    fly_to,
-                    options,
-                    outcome,
-                    &mut events,
-                    &mut mutation,
-                ),
-                OverlayIoResult::Reloaded(payload) => {
-                    self.handle_reloaded_result(payload, &mut events, &mut mutation);
-                }
-            }
-        }
-
-        for remote in self.remote_opener.drain() {
-            match remote.outcome {
-                Ok((range_source, source, frame)) => {
-                    let id = LayerId(alloc_seq(&mut self.next_layer_id));
-                    let relaid = alloc_seq(&mut self.next_relaid);
-                    let layer = OverlayLayer::from_remote_source(RemoteLayerSpec {
-                        id,
-                        title: remote.title.clone(),
-                        display_url: remote.display_url.clone(),
-                        range_source,
-                        source,
-                        frame,
-                        options: LayerInitOptions {
-                            visible: true,
-                            opacity: 1.0,
-                            crs_override: None,
-                            style: None,
-                        },
-                        relaid,
-                    });
-                    let bounds = self.insert_opened_layer(layer, &mut mutation);
-                    events.push(OverlayIoEvent::RemoteOpened {
-                        id,
-                        title: remote.title,
-                        display_url: remote.display_url,
-                        bounds,
-                        fly_to: remote.fly_to,
-                    });
-                }
-                Err(error) => {
-                    events.push(OverlayIoEvent::RemoteFailed {
-                        title: remote.title,
-                        display_url: remote.display_url,
-                        error,
-                    });
-                }
-            }
-        }
-
-        if self.band_stats.drain_into(&mut self.stack) {
-            mutation.changed = true;
-        }
-
-        (events, mutation)
-    }
-
-    fn insert_opened_layer(
-        &mut self,
-        layer: OverlayLayer,
-        mutation: &mut OverlayMutation,
-    ) -> Option<FootprintBounds> {
-        let id = layer.id();
-        let bounds = layer.footprint();
-        self.stack.push(layer);
-        self.request_band_stats_if_needed(id);
-        mutation.changed = true;
-        mutation.topology_changed = true;
-        bounds
-    }
-
-    fn handle_opened_result(
-        &mut self,
-        path: PathBuf,
-        fly_to: bool,
-        options: LayerInitOptions,
-        outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
-        events: &mut Vec<OverlayIoEvent>,
-        mutation: &mut OverlayMutation,
-    ) {
-        match outcome {
-            Ok((source, frame)) => {
-                let id = LayerId(alloc_seq(&mut self.next_layer_id));
-                let relaid = alloc_seq(&mut self.next_relaid);
-                let event_path = path.clone();
-                let layer = OverlayLayer::from_source(id, path, source, frame, options, relaid);
-                let bounds = self.insert_opened_layer(layer, mutation);
-                events.push(OverlayIoEvent::Opened {
-                    id,
-                    path: event_path,
-                    bounds,
-                    fly_to,
-                });
-            }
-            Err(err) => {
-                events.push(OverlayIoEvent::Failed {
-                    path,
-                    error: err.message,
-                    can_assign_crs: err.can_assign_crs,
-                });
-            }
-        }
-    }
-
-    fn handle_reloaded_result(
-        &mut self,
-        reloaded: ReloadedPayload,
-        events: &mut Vec<OverlayIoEvent>,
-        mutation: &mut OverlayMutation,
-    ) {
-        let ReloadedPayload {
-            id,
-            reload_seq,
-            crs_override_epoch,
-            path,
-            outcome,
-        } = reloaded;
-        let (old_src, new_src) = {
-            let Some(slot) = self.stack.get_mut(id) else {
-                return;
-            };
-            if !slot.matches_reload_seq(reload_seq) {
-                // Layer was superseded by a newer reload trigger.
-                return;
-            }
-            match outcome {
-                Ok((source, mut frame)) => {
-                    // If `override_layer_crs` ran while this reload was in flight,
-                    // re-bind the reloaded source against the live `crs_override`
-                    // so it never silently reverts.
-                    if slot.crs_override_epoch() != crs_override_epoch {
-                        match bind_frame_with_override(source.description(), slot.crs_override()) {
-                            Ok(rebound) => frame = rebound,
-                            Err(error) => {
-                                slot.fail_reload(error.clone());
-                                mutation.changed = true;
-                                mutation.topology_changed = true;
-                                events.push(OverlayIoEvent::ReloadFailed {
-                                    path,
-                                    error,
-                                    can_assign_crs: true,
-                                });
-                                return;
-                            }
-                        }
-                    }
-                    let new_src = source.source_id();
-                    let relaid = alloc_seq(&mut self.next_relaid);
-                    let old_src = slot.replace_reloaded(path, source, frame, relaid);
-                    (old_src, new_src)
-                }
-                Err(err) => {
-                    slot.fail_reload(err.message.clone());
-                    // Reload failed: leave the existing layer intact and
-                    // resume normal rendering on the next frame.
-                    mutation.changed = true;
-                    mutation.topology_changed = true;
-                    events.push(OverlayIoEvent::ReloadFailed {
-                        path,
-                        error: err.message,
-                        can_assign_crs: err.can_assign_crs,
-                    });
-                    return;
-                }
-            }
-        };
-
-        // Purge runtime/GPU state for both `old_src` and `new_src`
-        // (in case a sibling layer decoded tiles during reload).
-        self.purge_source(old_src);
-        mutation.purge_sources.push(old_src);
-        if new_src != old_src {
-            self.purge_source(new_src);
-            mutation.purge_sources.push(new_src);
-        }
-        mutation.changed = true;
-        mutation.topology_changed = true;
-        self.request_band_stats_if_needed(id);
-        events.push(OverlayIoEvent::Reloaded { id });
     }
 
     fn mutate_layer(
@@ -568,17 +263,17 @@ impl OverlayManager {
                 self.mutate_layer(id, |layer| layer.set_opacity(opacity))
             }
             OverlayEdit::SetStretchPreset(preset) => {
-                self.mutate_layer(id, |layer| layer.set_stretch_preset(preset))
+                self.mutate_layer(id, |layer| layer.style_mut().set_stretch_preset(preset))
             }
             OverlayEdit::SetStretchRange { min, max } => {
-                self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
+                self.mutate_layer(id, |layer| layer.style_mut().set_stretch_range(min, max))
             }
             OverlayEdit::SetColormap { colormap, invert } => {
-                self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
+                self.mutate_layer(id, |layer| layer.style_mut().set_colormap(colormap, invert))
             }
-            OverlayEdit::SetCategoricalPalette(palette) => {
-                self.mutate_layer(id, |layer| layer.set_categorical_palette(palette))
-            }
+            OverlayEdit::SetCategoricalPalette(palette) => self.mutate_layer(id, |layer| {
+                layer.style_mut().set_categorical_palette(palette)
+            }),
         }
     }
 
@@ -589,14 +284,20 @@ impl OverlayManager {
         &mut self,
         id: LayerId,
         crs_override: Option<CrsOverride>,
-    ) -> Result<Option<FootprintBounds>, String> {
+    ) -> Result<(Option<FootprintBounds>, OverlayMutation), String> {
         let Some(layer) = self.stack.get_mut(id) else {
             return Err("layer no longer exists".to_owned());
         };
         let frame = bind_frame_with_override(layer.source().description(), crs_override.as_ref())?;
         let relaid = alloc_seq(&mut self.next_relaid);
         layer.apply_rebound_frame(frame, crs_override, relaid);
-        Ok(layer.footprint())
+        Ok((
+            layer.geo().footprint(),
+            OverlayMutation {
+                changed: true,
+                ..OverlayMutation::default()
+            },
+        ))
     }
 
     /// Remove a layer from [`LayerStack`], cancelling active jobs and returning

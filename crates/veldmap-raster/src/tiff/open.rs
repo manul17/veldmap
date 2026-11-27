@@ -18,14 +18,15 @@ use crate::pipeline::{
 
 use super::gdal_meta::{GdalMetadata, parse_gdal_metadata, parse_gdal_nodata};
 use super::georef::{ParsedGeoref, RawGeoTiffTags, parse_georef};
-use super::ifd::parse::{IfdParseBudget, parse_cached_ifd};
+use super::ifd::budget::IfdParseBudget;
+use super::ifd::parse::parse_cached_ifd;
 use super::ifd::tag_ids::{
     TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
     TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, TAG_MODEL_TRANSFORMATION,
     TAG_NEW_SUBFILE_TYPE,
 };
-use super::ifd::wire::{IfdDirectory, SinglePassIfdReader, is_overview};
-use super::ifd::{CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, RawTiffAccess};
+use super::ifd::wire::{IfdDirectory, SinglePassIfdReader};
+use super::ifd::{CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, RawTiffAccess, is_overview};
 use super::stretch::{BandStatsCache, StretchCache};
 use super::{MAX_IFDS, TiffSource};
 
@@ -145,6 +146,23 @@ fn plan_and_validate_levels(
     Ok(levels)
 }
 
+fn is_fatal_overview_err(err: &RasterError) -> bool {
+    matches!(
+        err,
+        RasterError::Cancelled | RasterError::Io(_) | RasterError::DecoderLimitsExceeded(_)
+    )
+}
+
+fn is_compatible_overview(base_ifd: &CachedIfd, overview_ifd: &CachedIfd) -> bool {
+    let photo_compat = overview_ifd.photometric == base_ifd.photometric
+        || (base_ifd.photometric == Photometric::Rgb
+            && overview_ifd.photometric == Photometric::YCbCr);
+    photo_compat
+        && overview_ifd.samples_per_pixel == base_ifd.samples_per_pixel
+        && overview_ifd.sample_type == base_ifd.sample_type
+        && overview_ifd.alpha_channel() == base_ifd.alpha_channel()
+}
+
 fn scan_overviews(
     reader: &mut SinglePassIfdReader,
     mut next_ifd: u64,
@@ -162,11 +180,7 @@ fn scan_overviews(
         }
         let mut dir = match reader.read_directory(next_ifd, cancel) {
             Ok(dir) => dir,
-            Err(
-                err @ (RasterError::Cancelled
-                | RasterError::Io(_)
-                | RasterError::DecoderLimitsExceeded(_)),
-            ) => return Err(err),
+            Err(err) if is_fatal_overview_err(&err) => return Err(err),
             Err(err) => {
                 tracing::debug!(error = %err, "Stopped scanning TIFF overviews");
                 break;
@@ -184,22 +198,11 @@ fn scan_overviews(
         let overview_ifd = match parse_cached_ifd(&mut dir, reader, ifd_index, parse_budget, cancel)
         {
             Ok(ifd) => ifd,
-            Err(
-                err @ (RasterError::Cancelled
-                | RasterError::Io(_)
-                | RasterError::DecoderLimitsExceeded(_)),
-            ) => return Err(err),
+            Err(err) if is_fatal_overview_err(&err) => return Err(err),
             Err(RasterError::LimitExceeded { .. }) => break,
             Err(_) => continue,
         };
-        let photo_compat = overview_ifd.photometric == base_ifd.photometric
-            || (base_ifd.photometric == Photometric::Rgb
-                && overview_ifd.photometric == Photometric::YCbCr);
-        if !photo_compat
-            || overview_ifd.samples_per_pixel != base_ifd.samples_per_pixel
-            || overview_ifd.sample_type != base_ifd.sample_type
-            || overview_ifd.alpha_channel() != base_ifd.alpha_channel()
-        {
+        if !is_compatible_overview(base_ifd, &overview_ifd) {
             continue;
         }
         parse_budget.charge_ifd(&overview_ifd);
@@ -428,17 +431,7 @@ impl TiffSource {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ifd::parse::max_cached_ifd_table_bytes;
     use super::*;
-
-    #[test]
-    fn ifd_table_budget_clamps_remote_limit_safely() {
-        let tiny_budget = MemoryBudget::for_host_ram(1024 * 1024 * 1024);
-        assert!(max_cached_ifd_table_bytes(&tiny_budget, false) >= 4 * 1024 * 1024);
-        assert!(
-            max_cached_ifd_table_bytes(&tiny_budget, true) <= tiny_budget.remote_ifd_limit_bytes
-        );
-    }
 
     #[test]
     fn merge_georef_with_sidecar_preserves_trouble_when_sidecar_lacks_crs() {

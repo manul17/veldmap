@@ -36,20 +36,9 @@ impl GeoJsonGeometry {
     /// Axis-aligned WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]`
     /// across all finite vertices in this geometry.
     pub fn bbox(&self) -> Option<[f64; 4]> {
-        let mut min_lon = f64::INFINITY;
-        let mut min_lat = f64::INFINITY;
-        let mut max_lon = f64::NEG_INFINITY;
-        let mut max_lat = f64::NEG_INFINITY;
-        for_each_geometry_point(self, |p| {
-            if !p.lat.is_finite() || !p.lon.is_finite() {
-                return;
-            }
-            min_lon = min_lon.min(p.lon);
-            min_lat = min_lat.min(p.lat);
-            max_lon = max_lon.max(p.lon);
-            max_lat = max_lat.max(p.lat);
-        });
-        (min_lon.is_finite() && min_lat.is_finite()).then_some([min_lon, min_lat, max_lon, max_lat])
+        let mut acc = BboxAccumulator::new();
+        acc.extend_geometry(self);
+        acc.finish()
     }
 }
 
@@ -105,22 +94,50 @@ impl GeoJsonFeatureCollection {
     /// Axis-aligned WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]`
     /// across all finite vertices in the collection.
     pub fn bbox(&self) -> Option<[f64; 4]> {
-        let mut min_lon = f64::INFINITY;
-        let mut min_lat = f64::INFINITY;
-        let mut max_lon = f64::NEG_INFINITY;
-        let mut max_lat = f64::NEG_INFINITY;
+        let mut acc = BboxAccumulator::new();
         for feature in &self.features {
-            for_each_geometry_point(&feature.geometry, |p| {
-                if !p.lat.is_finite() || !p.lon.is_finite() {
-                    return;
-                }
-                min_lon = min_lon.min(p.lon);
-                min_lat = min_lat.min(p.lat);
-                max_lon = max_lon.max(p.lon);
-                max_lat = max_lat.max(p.lat);
-            });
+            acc.extend_geometry(&feature.geometry);
         }
-        (min_lon.is_finite() && min_lat.is_finite()).then_some([min_lon, min_lat, max_lon, max_lat])
+        acc.finish()
+    }
+}
+
+struct BboxAccumulator {
+    min_lon: f64,
+    min_lat: f64,
+    max_lon: f64,
+    max_lat: f64,
+}
+
+impl BboxAccumulator {
+    const fn new() -> Self {
+        Self {
+            min_lon: f64::INFINITY,
+            min_lat: f64::INFINITY,
+            max_lon: f64::NEG_INFINITY,
+            max_lat: f64::NEG_INFINITY,
+        }
+    }
+
+    fn extend_geometry(&mut self, geom: &GeoJsonGeometry) {
+        for_each_geometry_point(geom, |p| {
+            if !p.is_finite() {
+                return;
+            }
+            self.min_lon = self.min_lon.min(p.lon);
+            self.min_lat = self.min_lat.min(p.lat);
+            self.max_lon = self.max_lon.max(p.lon);
+            self.max_lat = self.max_lat.max(p.lat);
+        });
+    }
+
+    fn finish(self) -> Option<[f64; 4]> {
+        (self.min_lon.is_finite() && self.min_lat.is_finite()).then_some([
+            self.min_lon,
+            self.min_lat,
+            self.max_lon,
+            self.max_lat,
+        ])
     }
 }
 

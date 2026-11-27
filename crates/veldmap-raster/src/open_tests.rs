@@ -148,3 +148,61 @@ fn open_raster_handles_short_reads_and_sidecar_precedence() {
         Some(RasterError::Binding(_))
     ));
 }
+
+#[test]
+fn open_raster_with_options_applies_external_scale_offset_and_adapters_reject_remote() {
+    use veldmap_core::io::testing::MemoryByteSource;
+
+    let budget = MemoryBudget::default();
+    let cancel = CancelToken::new();
+
+    // External scale/offset applied via OpenRasterOptions onto indexed bands.
+    let opened = open_raster_with_options(
+        Arc::new(MemoryByteSource::from_vec(tiny_tiff())),
+        SourceFingerprint::from_digest([4; 32]),
+        OpenRasterOptions {
+            sidecars: None,
+            external_scale_offset: Some((Some(0.0001), Some(-0.1))),
+        },
+        &budget,
+        &cancel,
+    )
+    .expect("open TIFF with external scale/offset");
+    let indexed: Vec<_> = opened.source.description().indexed_bands().collect();
+    assert!(!indexed.is_empty());
+    for band in indexed {
+        assert!((band.scale - 0.0001).abs() < 1e-12);
+        assert!((band.offset - (-0.1)).abs() < 1e-12);
+    }
+
+    // PngSource and JpegSource self-enforce RemotePassUnsupported even when opened directly.
+    let remote_png: Arc<dyn ByteSource> =
+        Arc::new(MemoryByteSource::from_vec(tiny_png()).with_remote(true));
+    assert!(matches!(
+        PngSource::open(
+            remote_png,
+            SourceFingerprint::from_digest([5; 32]),
+            None,
+            &budget,
+            &cancel,
+        ),
+        Err(RasterError::RemotePassUnsupported(_))
+    ));
+
+    let mut jpg_bytes = Vec::new();
+    image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]))
+        .write_to(&mut Cursor::new(&mut jpg_bytes), image::ImageFormat::Jpeg)
+        .expect("jpeg");
+    let remote_jpg: Arc<dyn ByteSource> =
+        Arc::new(MemoryByteSource::from_vec(jpg_bytes).with_remote(true));
+    assert!(matches!(
+        JpegSource::open(
+            remote_jpg,
+            SourceFingerprint::from_digest([6; 32]),
+            None,
+            &budget,
+            &cancel,
+        ),
+        Err(RasterError::RemotePassUnsupported(_))
+    ));
+}

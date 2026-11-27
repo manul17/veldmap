@@ -38,6 +38,18 @@ pub fn parse_geojson(input: &str) -> Result<GeoJsonFeatureCollection, GeoJsonErr
     Ok(GeoJsonFeatureCollection { features })
 }
 
+/// Parse an already-deserialized GeoJSON geometry [`serde_json::Value`]
+/// (including `GeometryCollection`) directly without string round-tripping,
+/// enforcing the same vertex and nesting safety caps as [`parse_geojson`].
+///
+/// Returns `Ok(None)` for an empty `GeometryCollection`.
+pub fn parse_geojson_geometry_value(val: &Value) -> Result<Option<GeoJsonGeometry>, GeoJsonError> {
+    let mut features = Vec::new();
+    let mut vertex_count = 0usize;
+    parse_geometry_value(val, None, 0, &mut features, &mut vertex_count)?;
+    Ok(features.into_iter().next().map(|f| f.geometry))
+}
+
 fn parse_root_value(
     val: &Value,
     out: &mut Vec<GeoJsonFeature>,

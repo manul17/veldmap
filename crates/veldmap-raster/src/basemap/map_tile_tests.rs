@@ -77,10 +77,11 @@ fn decodes_valid_png_and_jpeg_tiles_and_rejects_invalid_inputs() {
         decode_rgba8_limited(&png_bytes, 2, MAX_MAP_TILE_ALLOC_BYTES),
         Err(RasterError::LimitExceeded { .. })
     ));
-    // 4x4 RGBA8 PNG (64 B) rejected when budget < 64 B.
+    // 4x4 RGBA8 PNG (64 B) rejected when budget < 64 B (either by `png::Limits`
+    // as `DecoderLimitsExceeded` or by upfront peak-bytes check as `LimitExceeded`).
     assert!(matches!(
         decode_rgba8_limited(&png_bytes, MAX_MAP_TILE_DIM, 63),
-        Err(RasterError::LimitExceeded { .. })
+        Err(RasterError::LimitExceeded { .. } | RasterError::DecoderLimitsExceeded(_))
     ));
     // 8x8 RGB8 JPEG (192 B src + 256 B dst = 448 B peak) rejected at 400 B.
     assert!(matches!(

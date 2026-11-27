@@ -30,7 +30,10 @@ pub use plan::{
     DISPLAY_STREAM_SPEC, LevelPlan, MAX_SOURCE_SIDE, PyramidMeta, ServeMode, stream_spec_for_band,
 };
 pub use scheduler::{AdmittedPass, AdmittedTile, TileFailureOutcome, TileScheduler};
-pub use source::{ByteRange, RasterSource, coalesce_byte_ranges};
+pub use source::{
+    ByteRange, DEFAULT_COALESCE_GAP_BYTES, DEFAULT_COALESCE_MAX_SPAN_BYTES, RasterSource,
+    coalesce_byte_ranges,
+};
 
 pub(crate) use cascade::{Cascade, bleed_display_emit, bytes as cascade_bytes};
 pub(crate) use chunk_cache::{ChunkKey, DecodedChunk};

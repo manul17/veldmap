@@ -244,6 +244,15 @@ impl Default for StacSettings {
 }
 
 impl StacSettings {
+    /// Switch the authentication mode, scrubbing any previous secret whenever
+    /// the mode changes so credentials never leak across auth schemes.
+    pub(crate) fn set_auth_kind(&mut self, kind: StacAuthKind) {
+        if self.auth_kind != kind {
+            self.auth_kind = kind;
+            self.auth_secret.clear();
+        }
+    }
+
     /// Trim whitespace and scrub unused secret material when `auth_kind == None`.
     pub(crate) fn normalize(&mut self) {
         self.custom_endpoint = self.custom_endpoint.trim().to_owned();
@@ -450,17 +459,16 @@ impl AppSettings {
         self.stac.normalize();
     }
 
-    /// Resolve effective GPU tile cache byte cap from user override or auto
-    /// host-RAM budget.
-    pub(crate) fn effective_gpu_tile_cache_bytes(&self, default_bytes: usize) -> usize {
-        match self.gpu_tile_cache_max_mb {
-            Some(mb) => usize::try_from(
+    /// Optional user GPU tile cache cap override in bytes (`None` = auto
+    /// host-RAM budget owned by `SceneState`).
+    pub(crate) fn gpu_tile_cache_override_bytes(&self) -> Option<usize> {
+        self.gpu_tile_cache_max_mb.map(|mb| {
+            usize::try_from(
                 mb.clamp(MIN_GPU_CACHE_MAX_MB, MAX_GPU_CACHE_MAX_MB)
                     .saturating_mul(1024 * 1024),
             )
-            .unwrap_or(usize::MAX),
-            None => default_bytes,
-        }
+            .unwrap_or(usize::MAX)
+        })
     }
 
     /// Configured disk cache cap in bytes.

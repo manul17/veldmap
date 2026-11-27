@@ -33,13 +33,14 @@ pub use geodesy::{Ellipsoid, Geodetic, SEMI_MAJOR_M, WGS84};
 pub use geojson::{
     DEFAULT_VECTOR_MAX_CHORD_DEG, GeoJsonError, GeoJsonFeature, GeoJsonFeatureCollection,
     GeoJsonGeometry, MAX_GEOJSON_BYTES, VectorCluster, VectorMesh, VectorVertex,
-    export_geojson_feature_collection, export_geojson_geometry, export_wkt_geometry, parse_geojson,
+    export_geojson_feature_collection, export_geojson_geometry, export_wkt_geometry,
+    geojson_geometry_to_value, parse_geojson, parse_geojson_geometry_value,
 };
 pub use shapes::{GeoPoint, Polygon, Ring};
 
 /// Local WGS84 surface distance approximation in metres for unit test error assertions.
 #[cfg(test)]
-pub(super) fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {
+fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {
     let lat = ((first.0 + second.0) / 2.0).to_radians();
     let per_lat = 111_132.92 - 559.82 * (2.0 * lat).cos();
     let per_lon = 111_412.84 * lat.cos() - 93.5 * (3.0 * lat).cos();

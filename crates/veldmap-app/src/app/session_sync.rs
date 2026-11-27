@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use veldmap_core::geo::FootprintBounds;
 
 use crate::display_name_from_path;
-use crate::layers::OverlayIoEvent;
+use crate::layers::{OpenOverlayRequest, OverlayIoEvent};
 use crate::scene::SceneIoEvent;
 use crate::storage::session::{SavedCameraPose, SavedLayerEntry, SavedVectorEntry};
 use crate::ui::layers::UnavailableLayerNotice;
@@ -211,14 +211,14 @@ impl VeldmapApp {
         open_vectors: Vec<SavedVectorEntry>,
     ) {
         for saved in open_layers {
-            match self.scene.begin_open_overlay(
-                &saved.path,
-                false,
-                saved.visible,
-                saved.opacity,
-                saved.crs_override(),
-                saved.style(),
-            ) {
+            match self.scene.begin_open_overlay(OpenOverlayRequest {
+                path: &saved.path,
+                fly_to: false,
+                visible: saved.visible,
+                opacity: saved.opacity,
+                crs_override: saved.crs_override(),
+                style: saved.style(),
+            }) {
                 Ok(()) => self.restore_tracker.push_layer(saved),
                 Err(err) => self.restore_tracker.record_unavailable_layer(saved, err),
             }

@@ -68,12 +68,6 @@ pub(super) fn polygon_geometry_from_bbox(bbox: [f64; 4]) -> Option<GeoJsonGeomet
     }
 }
 
-/// Compute `[min_lon, min_lat, max_lon, max_lat]` covering `geometry` without
-/// cloning vertices.
-pub(super) fn geometry_bbox(geometry: &GeoJsonGeometry) -> Option<[f64; 4]> {
-    geometry.bbox()
-}
-
 /// Compute a camera [`FootprintBounds`] covering a `[west, south, east, north]`
 /// RFC 7946 bbox (including `west > east` antimeridian crossings).
 pub(super) fn footprint_bounds_from_bbox(bbox: [f64; 4]) -> Option<FootprintBounds> {
@@ -191,7 +185,7 @@ impl AoiState {
 
     pub(super) fn set_geometry(&mut self, geometry: GeoJsonGeometry, label: String, rev: u64) {
         self.preview_draw = None;
-        self.display_bbox = geometry_bbox(&geometry);
+        self.display_bbox = geometry.bbox();
         self.set_geometry_inner(geometry, label, rev);
     }
 

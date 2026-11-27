@@ -156,7 +156,7 @@ pub(crate) fn build_empty_snapshot(
     build_raw_snapshot(camera, width_px, height_px, false, config, None).0
 }
 
-pub(crate) fn readback_rgba8(
+fn readback_rgba8(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,

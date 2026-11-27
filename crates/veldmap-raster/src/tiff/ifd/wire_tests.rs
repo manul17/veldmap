@@ -1,5 +1,6 @@
 use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 
+use super::super::is_overview;
 use super::super::tag_ids::{
     TAG_COMPRESSION, TAG_GDAL_METADATA, TAG_IMAGE_WIDTH, TAG_MODEL_PIXEL_SCALE,
     TAG_NEW_SUBFILE_TYPE, TAG_TILE_OFFSETS,
@@ -25,13 +26,6 @@ fn put_u64(buf: &mut Vec<u8>, order: TiffByteOrder, v: u64) {
         TiffByteOrder::Little => buf.extend_from_slice(&v.to_le_bytes()),
         TiffByteOrder::Big => buf.extend_from_slice(&v.to_be_bytes()),
     }
-}
-
-#[test]
-fn overview_bit_filters_reduced_resolution_and_excludes_masks() {
-    assert!(!is_overview(0));
-    assert!(is_overview(1));
-    assert!(!is_overview(5)); // mask bit set
 }
 
 #[test]

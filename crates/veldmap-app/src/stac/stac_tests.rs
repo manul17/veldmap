@@ -5,10 +5,9 @@ use veldmap_core::sync::CancelToken;
 use veldmap_net::StacSearchResult;
 
 use crate::render::DrawVectorId;
-use crate::storage::settings::{AppSettings, StacAuthKind};
+use crate::storage::settings::{StacAuthKind, StacSettings};
 
 use super::aoi::{footprint_bounds_from_bbox, polygon_geometry_from_bbox};
-use super::session::SearchDoneMsg;
 use super::*;
 
 fn test_session() -> StacSession {
@@ -43,20 +42,14 @@ fn bbox_polygon_and_bounds_handle_antimeridian_and_non_finite() {
 #[test]
 fn cancel_increments_seq_so_queued_search_result_is_ignored() {
     let mut session = test_session();
-    session.active_seq = 5;
-    session.searching = true;
-    session
-        .tx
-        .send(SearchDoneMsg {
-            seq: 5,
-            uses_custom_auth: false,
-            catalog_endpoint: "https://example.org/v1".to_owned(),
-            outcome: Ok(StacSearchResult {
-                items: Vec::new(),
-                matched: Some(7),
-            }),
-        })
-        .expect("send");
+    session.seed_queued_search_for_test(
+        5,
+        "https://example.org/v1",
+        StacSearchResult {
+            items: Vec::new(),
+            matched: Some(7),
+        },
+    );
 
     session.cancel();
     assert!(!session.poll_results());
@@ -65,60 +58,53 @@ fn cancel_increments_seq_so_queued_search_result_is_ignored() {
 
 #[test]
 fn resolve_cog_auth_enforces_origin_presigned_and_result_coupling() {
-    let mut settings = AppSettings::default();
-    settings.stac.custom_endpoint = "https://stac.private.example/v1".to_owned();
-    settings.stac.auth_kind = StacAuthKind::Bearer;
-    settings.stac.auth_secret = "secret-bearer".to_owned();
+    let mut stac_settings = StacSettings {
+        custom_endpoint: "https://stac.private.example/v1".to_owned(),
+        auth_kind: StacAuthKind::Bearer,
+        auth_secret: "secret-bearer".to_owned(),
+        ..StacSettings::default()
+    };
 
     let mut session = test_session();
     // Public search result must NEVER attach custom credentials.
-    session.result_uses_custom_auth = false;
-    let (u, h) = resolve_cog_auth(
+    session.set_result_auth_context_for_test(false, None);
+    let (u, h) = session.resolve_cog_auth(
         "https://sentinel-cogs.s3.amazonaws.com/a.tif",
         StacCogAuthMode::FromSearchResult,
-        &session,
-        &settings,
+        &stac_settings,
     );
     assert_eq!(u, "https://sentinel-cogs.s3.amazonaws.com/a.tif");
     assert!(h.is_empty());
 
     // Custom search result: same-origin gets Bearer header, cross-origin does not.
-    session.result_uses_custom_auth = true;
-    session.result_catalog_endpoint = Some("https://stac.private.example/v1".to_owned());
-    let (_, same_hdrs) = resolve_cog_auth(
+    session.set_result_auth_context_for_test(true, Some("https://stac.private.example/v1"));
+    let (_, same_hdrs) = session.resolve_cog_auth(
         "https://stac.private.example/assets/a.tif",
         StacCogAuthMode::FromSearchResult,
-        &session,
-        &settings,
+        &stac_settings,
     );
     assert_eq!(same_hdrs.len(), 1);
-    let (_, cross_hdrs) = resolve_cog_auth(
+    let (_, cross_hdrs) = session.resolve_cog_auth(
         "https://other-bucket.s3.amazonaws.com/a.tif",
         StacCogAuthMode::FromSearchResult,
-        &session,
-        &settings,
+        &stac_settings,
     );
     assert!(cross_hdrs.is_empty());
 
     // Already-presigned URL never gets dual auth or double SAS.
-    settings.stac.auth_kind = StacAuthKind::SasQuery;
-    settings.stac.auth_secret = "sv=2024&sig=custom".to_owned();
+    stac_settings.auth_kind = StacAuthKind::SasQuery;
+    stac_settings.auth_secret = "sv=2024&sig=custom".to_owned();
     let presigned = "https://blob.example/a.tif?X-Amz-Signature=existing";
-    let (u2, h2) = resolve_cog_auth(
-        presigned,
-        StacCogAuthMode::DirectCustom,
-        &session,
-        &settings,
-    );
+    let (u2, h2) =
+        session.resolve_cog_auth(presigned, StacCogAuthMode::DirectCustom, &stac_settings);
     assert_eq!(u2, presigned);
     assert!(h2.is_empty());
 
     // Unsigned cross-origin URL with SasQuery DOES receive SAS token.
-    let (u3, h3) = resolve_cog_auth(
+    let (u3, h3) = session.resolve_cog_auth(
         "https://blob.example/a.tif",
         StacCogAuthMode::FromSearchResult,
-        &session,
-        &settings,
+        &stac_settings,
     );
     assert_eq!(u3, "https://blob.example/a.tif?sv=2024&sig=custom");
     assert!(h3.is_empty());

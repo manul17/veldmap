@@ -33,6 +33,8 @@ pub use snapshot::{
     DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack, DrawSnapshot, DrawVectorId,
     DrawVectorLayer, OverlayMeshKey, SnapshotBuildParams, TileCarrierPolicy,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use uniforms::{UNIFORM_LAYOUT_SPECS, UniformLayoutSpec};
 pub use viewport::RenderParams;
 
 /// Native desktop primary `wgpu` backends (Vulkan, DX12, Metal), explicitly

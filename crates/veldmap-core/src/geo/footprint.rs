@@ -13,7 +13,7 @@ pub struct FootprintBounds {
 
 /// Compute the spherical framing circle enclosing an iterator of `(lat, lon)`
 /// degree coordinates, or `None` if empty.
-pub(crate) fn frame_coords(
+pub(in crate::geo) fn frame_coords(
     coords: impl Iterator<Item = (f64, f64)> + Clone,
 ) -> Option<FootprintBounds> {
     let first = coords.clone().next()?;

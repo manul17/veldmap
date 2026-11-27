@@ -236,7 +236,7 @@ impl Geodetic {
 
 /// Convert WGS84 geodetic coordinates to `f64` ECEF Cartesian coordinates in
 /// **metres**.
-pub(crate) fn world(point: Geodetic) -> DVec3 {
+pub(in crate::geo) fn world(point: Geodetic) -> DVec3 {
     WGS84.to_ecef(point)
 }
 
@@ -282,18 +282,20 @@ pub(super) fn separation(from: (f64, f64), to: (f64, f64)) -> f64 {
 }
 
 /// One full turn of longitude in degrees.
-pub(crate) const TURN_DEG: f64 = 360.0;
+pub(in crate::geo) const TURN_DEG: f64 = 360.0;
 
 /// Minimum longitude span treated as a full circle around the globe.
 ///
 /// Pixel-centered global grids may fall half a pixel short of 360 degrees
 /// (for example `-179.9875 -> 179.9875`).
-pub(crate) const FULL_CIRCLE_DEG: f64 = 359.0;
+pub(in crate::geo) const FULL_CIRCLE_DEG: f64 = 359.0;
 
 /// Spherical centroid `(lat_deg, lon_deg)` of a set of `(lat_deg, lon_deg)`
 /// points via normalized unit-vector sum, returning `None` if empty or
 /// antipodally balanced.
-pub(crate) fn spherical_centroid(points: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
+pub(in crate::geo) fn spherical_centroid(
+    points: impl Iterator<Item = (f64, f64)>,
+) -> Option<(f64, f64)> {
     let sum: DVec3 = points.map(|(lat, lon)| unit(lat, lon)).sum();
     (sum.length() > 1e-9).then(|| angles(sum.normalize()))
 }

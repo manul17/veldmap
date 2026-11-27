@@ -31,6 +31,7 @@ pub enum RangeOpenError {
     InvalidResponse(String),
     #[error("network error: {0}")]
     Network(String),
+    #[cfg(any(test, feature = "test-support"))]
     #[error("blocking HttpRangeSource::open called inside a Tokio runtime")]
     CalledInsideTokioRuntime,
 }
