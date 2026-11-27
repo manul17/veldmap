@@ -525,21 +525,8 @@ impl VeldmapApp {
                     self.scene.update_viewport_target_vram(0, 0);
                     self.scene.clear_cached_snapshot();
                     self.viewport.clear_viewport();
-                    if was_positive && let Some(render_state) = frame.wgpu_render_state() {
-                        let mut res = render_state.renderer.write();
-                        if let Some(renderer) = res
-                            .callback_resources
-                            .get_mut::<crate::render::GlobeRenderer>()
-                        {
-                            renderer.release_viewport_targets();
-                        }
-                        if let Some(bg) = res
-                            .callback_resources
-                            .get::<Arc<std::sync::Mutex<crate::render::TileBindGroupCache>>>()
-                            .cloned()
-                        {
-                            veldmap_core::sync::lock_unpoisoned(&bg).sweep_stale();
-                        }
+                    if was_positive {
+                        viewport_bridge::release_viewport_resources(frame);
                     }
                 }
             });

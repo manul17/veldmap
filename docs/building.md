@@ -50,7 +50,7 @@ lychee --offline --no-progress docs/ assets/README.md README.md plan.md CONTRIBU
 | `WGPU_BACKEND` | Selects `wgpu` backend(s): `primary`, `vulkan` (`vk`), `dx12` (`d3d12`), or `metal` (`mtl`). OpenGL/GLES/WebGPU values are ignored with a warning. |
 | `WGPU_POWER_PREF` | Selects adapter power preference: `high` (default), `low`, or `none`. |
 | `VELDMAP_REQUIRE_GPU_TEST` | Set to `1` in headless test runs to fail if no `Backends::PRIMARY` adapter is found. |
-| `COPERNICUS_ACCESS_KEY` / `COPERNICUS_ACCESS_SECRET` | *Planned (Slice 4B):* optional CDSE S3 credentials (template in [.env.example](../.env.example); not yet read). |
+| `COPERNICUS_ACCESS_KEY` / `COPERNICUS_ACCESS_SECRET` | *Planned (Slice 4B-1):* optional CDSE S3 credentials (template in [.env.example](../.env.example); not yet read). |
 
 ## Dev Build Ergonomics
 

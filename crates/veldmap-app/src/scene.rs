@@ -342,9 +342,8 @@ impl SceneState {
 
     fn sync_viewport_target_vram(&mut self) {
         let (width_px, height_px) = self.last_viewport_px;
-        let (float_bands, needs_mask) = self.overlays.max_scratch_requirements();
-        let reserved =
-            estimate_viewport_target_vram_bytes(width_px, height_px, float_bands, needs_mask);
+        let demand = self.overlays.max_scratch_requirements();
+        let reserved = estimate_viewport_target_vram_bytes(width_px, height_px, demand);
         if self.reserved_target_vram_bytes == reserved {
             return;
         }
@@ -752,17 +751,23 @@ impl Drop for SceneState {
 
 #[cfg(test)]
 mod tests {
+    use crate::render::ScratchDemand;
+
     use super::*;
 
     #[test]
     fn dynamic_vram_accounting_enforces_hard_minimum_tile_cache_floor_at_5k() {
         // 4K offscreen (8 B/px) + 4x R32Float + 1x R8Uint (17 B/px) = 25 B/px.
-        let vram_4k = estimate_viewport_target_vram_bytes(3840, 2160, 4, true);
+        let full_demand = ScratchDemand {
+            float_bands: 4,
+            needs_u8_mask: true,
+        };
+        let vram_4k = estimate_viewport_target_vram_bytes(3840, 2160, full_demand);
         assert_eq!(vram_4k, 3840 * 2160 * 25);
         // 5K viewport: ~351.6 MiB total offscreen + 4-band + mask scratch.
-        let vram_5k = estimate_viewport_target_vram_bytes(5120, 2880, 4, true);
+        let vram_5k = estimate_viewport_target_vram_bytes(5120, 2880, full_demand);
         assert_eq!(vram_5k, 5120 * 2880 * 25);
-        assert_eq!(estimate_viewport_target_vram_bytes(0, 2160, 4, true), 0);
+        assert_eq!(estimate_viewport_target_vram_bytes(0, 2160, full_demand), 0);
 
         // Even on a small 4-8 GiB host (128 MiB or 256 MiB total budget) at 5K,
         // the effective GpuTileCache cap NEVER starves to 0 and respects the 64 MiB floor.

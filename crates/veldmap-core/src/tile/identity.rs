@@ -156,8 +156,8 @@ impl PixelFormat {
 }
 
 /// Source-independent stream-partitioning descriptor (`band`, `format`,
-/// `gutter`, `decode_rev`) shared across `TileKey`, `DiskTileKey`,
-/// `PyramidMeta`, and `ChunkKey` so cache/key comparisons stay in lockstep.
+/// `gutter`, `decode_rev`) shared across `TileKey`, `DiskTileKey`, and
+/// `PyramidMeta` so tile cache/key comparisons stay in lockstep.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TileStreamSpec {
     pub band: BandKey,

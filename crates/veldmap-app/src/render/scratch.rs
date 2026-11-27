@@ -25,21 +25,51 @@ pub(super) const QUIET_NAN_BITS: u32 = 0x7FC0_0000;
 /// masked by `SCL` class `0`.
 pub(super) const MASK_UNCOVERED_SENTINEL: u8 = 255;
 
+/// Viewport scratch target requirements aggregated across active analytical
+/// layers (extensible to Slice 5B DEM relief scratch targets).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScratchDemand {
+    /// Maximum concurrent `R32Float` band targets required (`0..=4`).
+    pub(crate) float_bands: usize,
+    /// Whether an `R8Uint` `SCL` mask target is required.
+    pub(crate) needs_u8_mask: bool,
+}
+
+impl ScratchDemand {
+    /// Zero scratch targets required.
+    pub(crate) const NONE: Self = Self {
+        float_bands: 0,
+        needs_u8_mask: false,
+    };
+
+    /// Combine two demands into the shared pool capacity covering both.
+    pub(crate) const fn merge(self, other: Self) -> Self {
+        Self {
+            float_bands: if self.float_bands >= other.float_bands {
+                self.float_bands
+            } else {
+                other.float_bands
+            },
+            needs_u8_mask: self.needs_u8_mask || other.needs_u8_mask,
+        }
+    }
+}
+
 /// Compute exact VRAM bytes occupied by viewport offscreen + scratch targets
 /// (`OffscreenTarget` = `8 B/px`, each `R32Float` scratch = `4 B/px`, optional
 /// `R8Uint` mask = `1 B/px`).
 pub(crate) fn estimate_viewport_target_vram_bytes(
     width: u32,
     height: u32,
-    float_bands: usize,
-    needs_mask: bool,
+    demand: ScratchDemand,
 ) -> usize {
     if width == 0 || height == 0 {
         return 0;
     }
     let pixels = (width as usize).saturating_mul(height as usize);
     let offscreen_bpp = 8usize; // Rgba8UnormSrgb (4) + Depth32Float (4)
-    let scratch_bpp = float_bands.min(4).saturating_mul(4) + usize::from(needs_mask);
+    let scratch_bpp =
+        demand.float_bands.min(4).saturating_mul(4) + usize::from(demand.needs_u8_mask);
     pixels.saturating_mul(offscreen_bpp.saturating_add(scratch_bpp))
 }
 
@@ -166,18 +196,18 @@ impl ScratchTargetPool {
         }
     }
 
-    /// Ensure scratch targets match `(width, height, float_bands, needs_mask)`,
-    /// releasing all scratch VRAM immediately when `float_bands == 0`.
+    /// Ensure scratch targets match `(width, height, demand)`, releasing all
+    /// scratch VRAM immediately when `demand.float_bands == 0`.
     pub(super) fn ensure(
         &mut self,
         device: &wgpu::Device,
         pipelines: &BandMathPipelines,
         width: u32,
         height: u32,
-        float_bands: usize,
-        needs_mask: bool,
+        demand: ScratchDemand,
     ) {
-        let float_bands = float_bands.min(4);
+        let float_bands = demand.float_bands.min(4);
+        let needs_mask = demand.needs_u8_mask;
         if float_bands == 0 || width == 0 || height == 0 {
             self.allocated = None;
             return;

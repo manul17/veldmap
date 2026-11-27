@@ -4,15 +4,22 @@ VeldMap itself is licensed under the MIT License ([LICENSE](LICENSE)).
 
 ## Rust Dependencies
 
-Third-party Rust crate licenses are verified on every CI run using `cargo-deny` against the allow-list in [deny.toml](deny.toml).
+Third-party Rust crate licenses are verified on every CI run using `cargo-deny` against the allow-list in [deny.toml](deny.toml). Notable bundled native, cryptographic, root-certificate, and non-MIT/Apache-only crates compiled into desktop builds include:
+
+- **`ring` (`0.17.14`)** — `Apache-2.0 AND ISC` (TLS cryptography via `rustls`).
+- **`zstd-sys` (`2.1.3+zstd.1.5.7`)** — `BSD-3-Clause AND BSD-2-Clause` (bundled Zstandard decoder via `zstd`).
+- **`libsqlite3-sys` (`0.40.0`)** — `MIT` Rust wrapper bundling the **Public Domain** SQLite C amalgamation (via `rusqlite` `bundled`).
+- **`webpki-root-certs` (`1.0.12`)** — `CDLA-Permissive-2.0` (Mozilla root CA bundle for `rustls`).
+- **`option-ext` (`0.2.0`)** — `MPL-2.0` (file-level copyleft transitive dependency of `directories`).
 
 ## UI Fonts
 
 No standalone font binaries are stored in this repository. The desktop UI layers two permissively licensed Rust-crate font sources:
 
-- **`epaint_default_fonts`** (`eframe`'s `default_fonts` feature):
-  - **Ubuntu-Light** — licensed under the Ubuntu Font License 1.0 (`Ubuntu-font-1.0`).
-  - **Hack** / **NotoEmoji** / **emoji-icon-font** / **egui-icons** — licensed under the SIL Open Font License 1.1 (`OFL-1.1`) / MIT / Apache-2.0 as packaged by `epaint_default_fonts`.
+- **`epaint_default_fonts` (`0.37.0`)** (`eframe`'s `default_fonts` feature; `monochrome_emoji_fonts` — `NotoEmoji` under `OFL-1.1` and full `emoji-icon-font` — is **not** enabled in VeldMap builds):
+  - **Ubuntu-Light** (`Ubuntu-Light.ttf`) — licensed under the **Ubuntu Font Licence 1.0** (`Ubuntu-font-1.0`; compiled binary distributions embedding `Ubuntu-Light.ttf` must accompany the binary with the UFL 1.0 copyright notice and licence text from `epaint_default_fonts/fonts/UFL.txt`).
+  - **Hack** (`Hack-Regular.ttf`) — licensed under the **MIT License** (Copyright 2018 Source Foundry Authors) + **DejaVu** (Public Domain) + **Bitstream Vera Fonts License** (reproduced below).
+  - **egui-icons** (`egui-icons.ttf`, 5-glyph subset of `emoji-icon-font.ttf`) — licensed under the **MIT License** (Copyright 2014 John Slegers).
 - **`dejavu` (`2.37.0`)** (non-Latin proportional & monospace fallback — **DejaVu Sans** and **DejaVu Sans Mono**):
   - Rust wrapper crate licensed under `MIT OR Apache-2.0`.
   - DejaVu modifications are in the Public Domain; underlying glyphs are governed by the Bitstream Vera and Arev font licenses reproduced below.

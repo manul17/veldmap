@@ -5,6 +5,8 @@ use std::collections::HashSet;
 
 use veldmap_core::tile::{SourceId, StreamKey, TileKey};
 
+use crate::render::ScratchDemand;
+
 use super::LayerId;
 pub(super) use super::layer::OverlayLayer;
 use super::style::ColorbarInfo;
@@ -76,15 +78,10 @@ impl LayerStack {
             .any(|l| l.is_active() && l.has_source(source_id))
     }
 
-    pub(super) fn max_scratch_requirements(&self) -> (usize, bool) {
-        let mut max_float_bands = 0usize;
-        let mut needs_mask = false;
-        for layer in &self.layers {
-            let (fb, mask) = layer.scratch_requirements();
-            max_float_bands = max_float_bands.max(fb);
-            needs_mask |= mask;
-        }
-        (max_float_bands, needs_mask)
+    pub(super) fn max_scratch_requirements(&self) -> ScratchDemand {
+        self.layers.iter().fold(ScratchDemand::NONE, |acc, layer| {
+            acc.merge(layer.scratch_requirements())
+        })
     }
 
     pub(super) fn total_appetite_weight_bytes(&self) -> u64 {

@@ -1,12 +1,16 @@
 //! Standalone offscreen `wgpu` WGS84 quadtree globe renderer (`GlobeRenderer`).
 //!
-//! Renders in two distinct passes:
+//! Renders in two distinct phases:
 //! 1. **Pass 1 (Opaque globe body):** `Rgba8UnormSrgb` color clear +
 //!    `Depth32Float` Reverse-Z (`TRANSIENT_ATTACHMENT`, `StoreOp::Discard`).
-//! 2. **Pass 2 (Post-body overlays + procedural graticule):**
-//!    `depth_stencil_attachment: None`, `LoadOp::Load` over the globe body so
-//!    draped display, scientific (`R32Float`), and categorical (`R8Uint`/`R16Uint`)
-//!    raster warp meshes, vectors, and the procedural graticule compose cleanly.
+//! 2. **Pass 2 (Segmented depth-less post-body overlays, Band Math scratch
+//!    passes, vectors & procedural graticule):** `depth_stencil_attachment: None`,
+//!    `LoadOp::Load` over the globe body. Consecutive direct display / scientific
+//!    (`R32Float`) / categorical (`R8Uint`/`R16Uint`) warp meshes batch together,
+//!    while each multi-asset `BandMath` layer interleaves lazy shared
+//!    `R32Float` + `R8Uint` `SCL` scratch passes ([`super::scratch::ScratchTargetPool`])
+//!    and a scissored fullscreen composite in exact painter's order before
+//!    draped vectors and the procedural graticule.
 
 use veldmap_core::tile::{POLAR_R_CAP, PixelFormat};
 
@@ -16,6 +20,7 @@ use super::graticule::{TILE_KIND_GEO, tile_graticule_uniform};
 use super::mesh::TileMeshCache;
 use super::overlay::OverlayRenderer;
 use super::pipelines::GlobePipelines;
+use super::scratch::ScratchDemand;
 use super::snapshot::{DrawOverlayContent, DrawSnapshot};
 use super::uniforms::{CameraUniform, TileUniform, UniformSlot};
 use super::vector::VectorRenderer;
@@ -87,12 +92,9 @@ impl GlobeRenderer {
 
         self.viewport
             .ensure_offscreen(device, &self.pipelines, width, height);
-        let mut max_float_bands = 0usize;
-        let mut needs_mask = false;
+        let mut scratch_demand = ScratchDemand::NONE;
         for layer in &params.snapshot.overlays {
-            let (fb, mask) = layer.scratch_requirements();
-            max_float_bands = max_float_bands.max(fb);
-            needs_mask |= mask;
+            scratch_demand = scratch_demand.merge(layer.scratch_requirements());
         }
         self.viewport.ensure_scratch(
             device,
@@ -100,8 +102,7 @@ impl GlobeRenderer {
             &self.pipelines.band_math,
             width,
             height,
-            max_float_bands,
-            needs_mask,
+            scratch_demand,
         );
         self.prepare_tile_resources(device, bind_groups, params.snapshot);
         self.upload_uniforms(device, queue, width, height, params.snapshot);

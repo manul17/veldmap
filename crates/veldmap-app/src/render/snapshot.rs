@@ -12,6 +12,7 @@ use crate::gpu_tiles::{GpuTile, GpuTileCache};
 use crate::layers::BandMathFormula;
 
 use super::graticule::adaptive_grid_step_deg;
+use super::scratch::ScratchDemand;
 
 /// Cache identity for an uploaded overlay cell warp-mesh vertex buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -224,19 +225,21 @@ pub struct DrawOverlayLayer {
 }
 
 impl DrawOverlayLayer {
-    /// Return `(float_band_count, needs_u8_mask)` required in the shared
-    /// viewport scratch target pool for this layer (`(0, false)` for direct
-    /// overlays).
-    pub(crate) fn scratch_requirements(&self) -> (usize, bool) {
+    /// Return the shared viewport [`ScratchDemand`] required for this layer
+    /// (`ScratchDemand::NONE` for direct overlays).
+    pub(crate) fn scratch_requirements(&self) -> ScratchDemand {
         match &self.content {
-            DrawOverlayContent::Direct { .. } => (0, false),
+            DrawOverlayContent::Direct { .. } => ScratchDemand::NONE,
             DrawOverlayContent::BandMath(bm) => {
                 let float_bands = bm.bands.len().min(4);
-                let needs_mask = bm
+                let needs_u8_mask = bm
                     .scl
                     .as_ref()
                     .is_some_and(|m| bm.scl_mask_enabled && !m.patches.is_empty());
-                (float_bands, needs_mask)
+                ScratchDemand {
+                    float_bands,
+                    needs_u8_mask,
+                }
             }
         }
     }

@@ -37,12 +37,7 @@ impl TiffSourceView<'_> {
         ctx: &DecodeContext<'_>,
     ) -> Result<Option<Arc<DecodedChunk>>, RasterError> {
         if self.access.byte_source.is_remote() {
-            let key = ChunkKey {
-                source: self.source_id,
-                spec,
-                image: 0,
-                chunk_index,
-            };
+            let key = ChunkKey::from_spec(self.source_id, spec, 0, chunk_index);
             return Ok(ctx.chunk_cache.get_cached(&key));
         }
         let display_mapping = get_mapping()?;

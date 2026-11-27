@@ -270,12 +270,7 @@ impl Chunked for TiffChunkReader<'_> {
                 chunk_cache,
                 budget_tracker,
             } => {
-                let key = ChunkKey {
-                    source: self.view.source_id,
-                    spec: self.spec,
-                    image,
-                    chunk_index: index,
-                };
+                let key = ChunkKey::from_spec(self.view.source_id, self.spec, image, index);
                 chunk_cache.get_or_decode(key, cancel, || {
                     self.decode_chunk_uncached(image, index, Some(budget_tracker), cancel)
                 })

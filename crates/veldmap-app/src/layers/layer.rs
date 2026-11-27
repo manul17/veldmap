@@ -18,6 +18,7 @@ use veldmap_net::HttpRangeSource;
 use veldmap_raster::{BandStats, PyramidMeta, RasterSource, stream_spec_for_band};
 
 use crate::colormap::CategoricalPaletteId;
+use crate::render::ScratchDemand;
 use crate::{clamp_opacity, display_name_from_path};
 
 use super::asset::{GeoBinding, LayerOrigin, LayerStream, RasterAsset};
@@ -438,18 +439,18 @@ impl OverlayLayer {
         self.pin_root = pin_root;
     }
 
-    /// Return `(float_band_count, needs_u8_mask)` required in the shared
-    /// viewport scratch target pool when this layer is active.
-    pub(super) fn scratch_requirements(&self) -> (usize, bool) {
+    /// Return the shared viewport [`ScratchDemand`] required when this layer is
+    /// active.
+    pub(super) fn scratch_requirements(&self) -> ScratchDemand {
         if !self.is_active() {
-            return (0, false);
+            return ScratchDemand::NONE;
         }
         match &self.kind {
-            LayerKind::SingleRaster { .. } => (0, false),
-            LayerKind::BandMath(bm) => (
-                bm.bands.len().min(4),
-                bm.scl.is_some() && bm.style.scl_mask_enabled,
-            ),
+            LayerKind::SingleRaster { .. } => ScratchDemand::NONE,
+            LayerKind::BandMath(bm) => ScratchDemand {
+                float_bands: bm.bands.len().min(4),
+                needs_u8_mask: bm.scl.is_some() && bm.style.scl_mask_enabled,
+            },
         }
     }
 

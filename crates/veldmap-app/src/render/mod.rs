@@ -2,12 +2,15 @@
 //!
 //! Renders per-tile CPU `f64` RTC quadtree meshes (textured sRGB basemap or
 //! untextured WGS84 ellipsoid shading) in Pass 1 (`Rgba8UnormSrgb` +
-//! `Depth32Float` Reverse-Z), followed by depth-less Pass 2 draped display /
-//! scientific (`R32Float`) / categorical (`R8Uint`/`R16Uint`) raster overlays,
-//! draped GeoJSON / measurement / STAC AOI & HiDPI ribbon/hatch vector
-//! overlays, and the post-overlay procedural `fwidth()` graticule, then
-//! composites 1:1 with `FilterMode::Nearest` onto `egui_wgpu`'s target format
-//! via `view_formats`.
+//! `Depth32Float` Reverse-Z), followed by segmented depth-less Pass 2 post-body
+//! rendering in exact painter's order: direct display / scientific (`R32Float`)
+//! / categorical (`R8Uint`/`R16Uint`) raster warp meshes, multi-asset
+//! screen-space `BandMath` + `SCL` masking (backed by the lazy shared
+//! quiet-`NaN`-filled `R32Float` + `R8Uint` `ScratchTargetPool` with
+//! co-grid MRT & clamped scissor bounds), draped GeoJSON / measurement / STAC
+//! AOI & HiDPI ribbon/hatch vector overlays, and the post-overlay procedural
+//! `fwidth()` graticule, then composites 1:1 with `FilterMode::Nearest` onto
+//! `egui_wgpu`'s target format via `view_formats`.
 
 mod bind_groups;
 mod globe;
@@ -32,7 +35,7 @@ pub use bind_groups::TileBindGroupCache;
 pub use globe::GlobeRenderer;
 #[cfg(any(test, feature = "test-support"))]
 pub use scratch::compute_band_math_scissor_rect;
-pub(crate) use scratch::estimate_viewport_target_vram_bytes;
+pub(crate) use scratch::{ScratchDemand, estimate_viewport_target_vram_bytes};
 #[cfg(any(test, feature = "test-support"))]
 pub use snapshot::DrawTile;
 pub use snapshot::{

@@ -22,7 +22,7 @@ use veldmap_storage::TileDiskCache;
 
 use crate::colormap::{CategoricalPaletteId, ColormapId};
 use crate::gpu_tiles::{GpuTileCache, PendingUploads, UploadBatchReport, UploadSender};
-use crate::render::DrawOverlayLayer;
+use crate::render::{DrawOverlayLayer, ScratchDemand};
 use crate::worker::SingleThreadWorker;
 
 use super::cursor::CursorProber;
@@ -199,9 +199,9 @@ impl OverlayManager {
         self.stack.topmost_colorbar_info()
     }
 
-    /// Return `(max_float_bands, needs_u8_mask)` required in the shared
-    /// viewport scratch pool across all currently active layers.
-    pub(crate) fn max_scratch_requirements(&self) -> (usize, bool) {
+    /// Return the combined viewport [`ScratchDemand`] across all currently
+    /// active layers.
+    pub(crate) fn max_scratch_requirements(&self) -> ScratchDemand {
         self.stack.max_scratch_requirements()
     }
 

@@ -174,16 +174,6 @@ impl BandMathPreset {
             _ => ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
         }
     }
-
-    pub(crate) const fn from_sample_kind(kind: veldmap_net::SampleRecipeKind) -> Self {
-        match kind {
-            veldmap_net::SampleRecipeKind::TrueColor => Self::TrueColor,
-            veldmap_net::SampleRecipeKind::Ndvi => Self::Ndvi,
-            veldmap_net::SampleRecipeKind::Ndwi => Self::Ndwi,
-            veldmap_net::SampleRecipeKind::FalseColorNir => Self::FalseColorNir,
-            veldmap_net::SampleRecipeKind::Swir => Self::Swir,
-        }
-    }
 }
 
 /// Live GPU styling, stretch, colormap, and `SCL` mask configuration for a

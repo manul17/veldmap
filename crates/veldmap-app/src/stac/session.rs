@@ -7,8 +7,8 @@ use std::sync::{Arc, OnceLock};
 use veldmap_core::geo::GeoJsonGeometry;
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_net::{
-    NetContext, SampleRecipeBand, StacAsset, StacCatalogConfig, StacClient, StacItem,
-    StacSearchQuery, StacSearchResult, builtin_sample_recipes, builtin_sample_scenes,
+    NetContext, SampleRecipeBand, SampleRecipeKind, StacAsset, StacCatalogConfig, StacClient,
+    StacItem, StacSearchQuery, StacSearchResult, builtin_sample_recipes, builtin_sample_scenes,
 };
 use veldmap_raster::ExternalBandMeta;
 
@@ -167,6 +167,16 @@ fn builtin_sample_scene_views() -> &'static [SampleSceneView] {
     })
 }
 
+const fn preset_from_sample_kind(kind: SampleRecipeKind) -> BandMathPreset {
+    match kind {
+        SampleRecipeKind::TrueColor => BandMathPreset::TrueColor,
+        SampleRecipeKind::Ndvi => BandMathPreset::Ndvi,
+        SampleRecipeKind::Ndwi => BandMathPreset::Ndwi,
+        SampleRecipeKind::FalseColorNir => BandMathPreset::FalseColorNir,
+        SampleRecipeKind::Swir => BandMathPreset::Swir,
+    }
+}
+
 /// Cached UI-facing projection of built-in zero-auth multi-band sample recipes.
 fn builtin_sample_recipe_views() -> &'static [SampleRecipeView] {
     static VIEWS: OnceLock<Vec<SampleRecipeView>> = OnceLock::new();
@@ -176,7 +186,7 @@ fn builtin_sample_recipe_views() -> &'static [SampleRecipeView] {
             .map(|recipe| SampleRecipeView {
                 title: recipe.title,
                 description: recipe.description,
-                preset: BandMathPreset::from_sample_kind(recipe.kind),
+                preset: preset_from_sample_kind(recipe.kind),
                 bands: recipe.bands.iter().map(recipe_asset_from_sample).collect(),
                 scl: recipe.scl.as_ref().map(recipe_asset_from_sample),
             })

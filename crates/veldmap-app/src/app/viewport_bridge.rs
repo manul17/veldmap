@@ -127,6 +127,26 @@ pub(super) fn install_wgpu_resources(
     wgpu_renderer.callback_resources.insert(renderer);
 }
 
+/// Release offscreen/scratch viewport GPU targets and sweep stale bind groups
+/// when the globe viewport collapses or minimizes.
+pub(super) fn release_viewport_resources(frame: &eframe::Frame) {
+    let Some(render_state) = frame.wgpu_render_state() else {
+        return;
+    };
+    let bind_groups = {
+        let mut res = render_state.renderer.write();
+        if let Some(renderer) = res.callback_resources.get_mut::<GlobeRenderer>() {
+            renderer.release_viewport_targets();
+        }
+        res.callback_resources
+            .get::<Arc<Mutex<TileBindGroupCache>>>()
+            .cloned()
+    };
+    if let Some(bg) = bind_groups {
+        lock_unpoisoned(&bg).sweep_stale();
+    }
+}
+
 /// Estimate physical viewport dimensions from `egui::Context` during `App::ui`
 /// (where `egui_wgpu::ScreenDescriptor::size_in_pixels` is not exposed yet;
 /// `GlobePaintCallback::prepare` uses the exact framebuffer size during

@@ -5,21 +5,47 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{SourceId, TileCache, TileStreamSpec};
+use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileCache, TileStreamSpec};
 
 use crate::RasterError;
 
 use super::singleflight::{SingleflightRole, SingleflightSlot, run_singleflight};
 
 /// Composite key identifying one decoded source chunk (TIFF tile/strip)
-/// partitioned by `(source, spec, image, chunk_index)` so incompatible bands,
-/// formats, gutters, or revisions never alias.
+/// partitioned by `(source, band, format, decode_rev, image, chunk_index)`.
+///
+/// Intentionally omits `TileStreamSpec::gutter`: raw decoded source chunks do
+/// not depend on output tile border gutters, so `gutter = 0` (scientific /
+/// cursor probes) and `gutter = 1` (DEM relief) streams share cached chunks
+/// without duplicate decoding or RAM usage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ChunkKey {
     pub(crate) source: SourceId,
-    pub(crate) spec: TileStreamSpec,
+    pub(crate) band: BandKey,
+    pub(crate) format: PixelFormat,
+    pub(crate) decode_rev: u32,
     pub(crate) image: usize,
     pub(crate) chunk_index: u32,
+}
+
+impl ChunkKey {
+    /// Construct a gutter-agnostic chunk cache key from `source`, `spec`,
+    /// IFD `image` index, and `chunk_index`.
+    pub(crate) const fn from_spec(
+        source: SourceId,
+        spec: TileStreamSpec,
+        image: usize,
+        chunk_index: u32,
+    ) -> Self {
+        Self {
+            source,
+            band: spec.band,
+            format: spec.format,
+            decode_rev: spec.decode_rev,
+            image,
+            chunk_index,
+        }
+    }
 }
 
 /// Decoded chunk payload with its pixel format and valid dimensions

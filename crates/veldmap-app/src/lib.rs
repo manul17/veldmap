@@ -1,7 +1,28 @@
 //! Library surface of `veldmap-app` exposing [`VeldmapApp`], [`AppError`],
-//! and [`clamp_to_primary_backends`] for the binary entry point, plus
-//! a `test-support`-gated headless rendering/upload harness for GPU smoke tests
+//! and [`clamp_to_primary_backends`] for the binary entry point, plus a
+//! `test-support`-gated headless rendering/upload harness for GPU smoke tests
 //! and `naga` shader validation.
+//!
+//! ## Internal Modules
+//! - `app` — Top-level `eframe::App` shell, input/tool state, native `rfd`
+//!   dialogs, `egui_wgpu::CallbackResources` bridge, and session restoration.
+//! - `basemap` — Bundled NASA Blue Marble & live HTTP basemap policy/streaming.
+//! - `colormap` — Linear-light scientific colormaps & categorical palettes.
+//! - `gpu_tiles` — Bounded `GpuTileCache` and enqueue-bounded `PendingUploads`.
+//! - `layers` — `OverlayManager`, `LayerStack`, multi-asset `BandMath`,
+//!   background I/O/decode/tile-write orchestration, and CPU cursor probing.
+//! - `measure` — Interactive Karney WGS84 distance/area measurement session.
+//! - `render` — Offscreen two-pass `wgpu` `GlobeRenderer` (Pass 1
+//!   body + segmented depth-less Pass 2 overlays, `BandMath` scratch pool,
+//!   vectors, and procedural graticule).
+//! - `scene` — `SceneState` mediator coordinating camera snapshots, caches,
+//!   VRAM budgeting, and deterministic shutdown.
+//! - `stac` — Cloud/STAC search session, AOI state, and read-only UI DTOs.
+//! - `storage` — `settings.json` / `session.json` persistence & `DiskCacheWorker`.
+//! - `ui` — Presentation-only `egui` views emitting typed actions (zero
+//!   `veldmap-net`/`veldmap-raster`/`veldmap-storage` imports).
+//! - `vectors` — Retained GeoJSON vector layers and background tessellation.
+//! - `worker` — Lightweight single-thread background worker primitive.
 
 #![forbid(unsafe_code)]
 

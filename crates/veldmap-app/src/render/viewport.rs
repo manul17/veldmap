@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 
 use super::DrawSnapshot;
 use super::pipelines::{BandMathPipelines, GlobePipelines};
-use super::scratch::ScratchTargetPool;
+use super::scratch::{ScratchDemand, ScratchTargetPool};
 use super::uniforms::{CameraUniform, DynamicUniformArena};
 
 /// Parameters for a single offscreen globe frame.
@@ -104,10 +104,6 @@ impl ViewportState {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Direct parameters keep lazy viewport scratch allocation zero-allocation on steady frames."
-    )]
     pub(super) fn ensure_scratch(
         &mut self,
         device: &wgpu::Device,
@@ -115,10 +111,9 @@ impl ViewportState {
         pipelines: &BandMathPipelines,
         width: u32,
         height: u32,
-        float_bands: usize,
-        needs_mask: bool,
+        demand: ScratchDemand,
     ) {
-        if float_bands == 0 {
+        if demand.float_bands == 0 {
             if let Some(pool) = &mut self.scratch {
                 pool.release();
             }
@@ -127,7 +122,7 @@ impl ViewportState {
         let pool = self
             .scratch
             .get_or_insert_with(|| ScratchTargetPool::new(device, queue, pipelines));
-        pool.ensure(device, pipelines, width, height, float_bands, needs_mask);
+        pool.ensure(device, pipelines, width, height, demand);
     }
 
     pub(super) fn scratch(&self) -> Option<&ScratchTargetPool> {

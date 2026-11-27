@@ -5,17 +5,37 @@ use std::time::Duration;
 use super::*;
 
 fn test_key(idx: u32) -> ChunkKey {
-    ChunkKey {
-        source: SourceId::new(9),
-        spec: TileStreamSpec::new(
+    ChunkKey::from_spec(
+        SourceId::new(9),
+        TileStreamSpec::new(
             veldmap_core::tile::BandKey::Display,
             veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
             0,
             1,
         ),
-        image: 0,
-        chunk_index: idx,
-    }
+        0,
+        idx,
+    )
+}
+
+#[test]
+fn chunk_key_ignores_tile_gutter_so_relief_and_scientific_streams_share_chunks() {
+    let sci = TileStreamSpec::new(
+        veldmap_core::tile::BandKey::Index(0),
+        veldmap_core::tile::PixelFormat::R32Float,
+        0,
+        1,
+    );
+    let relief = TileStreamSpec::new(
+        veldmap_core::tile::BandKey::Index(0),
+        veldmap_core::tile::PixelFormat::R32Float,
+        1,
+        1,
+    );
+    assert_eq!(
+        ChunkKey::from_spec(SourceId::new(7), sci, 0, 3),
+        ChunkKey::from_spec(SourceId::new(7), relief, 0, 3)
+    );
 }
 
 #[test]
