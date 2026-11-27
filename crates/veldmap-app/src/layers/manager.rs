@@ -57,16 +57,30 @@ pub(crate) struct OverlayManagerDeps {
     pub(crate) shutdown: CancelToken,
 }
 
-/// Typed infallible edit operation applied to a single raster overlay layer
-/// via [`OverlayManager::edit_layer`] / `SceneState::edit_overlay`.
+/// Typed infallible edit operation applied to a single raster or band-math
+/// overlay layer via [`OverlayManager::edit_layer`] / `SceneState::edit_overlay`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum OverlayEdit {
     SetVisible(bool),
     SetOpacity(f32),
     SetStretchPreset(StretchPreset),
-    SetStretchRange { min: f64, max: f64 },
-    SetColormap { colormap: ColormapId, invert: bool },
+    SetStretchRange {
+        min: f64,
+        max: f64,
+    },
+    SetColormap {
+        colormap: ColormapId,
+        invert: bool,
+    },
     SetCategoricalPalette(CategoricalPaletteId),
+    SetBandMathRgbStretch {
+        min: [f64; 3],
+        max: [f64; 3],
+        gamma: f32,
+    },
+    ResetBandMathStretch,
+    SetBandMathSclEnabled(bool),
+    SetBandMathSclMaskBits(u32),
     MoveUp,
     MoveDown,
     Remove,
@@ -185,6 +199,12 @@ impl OverlayManager {
         self.stack.topmost_colorbar_info()
     }
 
+    /// Return `(max_float_bands, needs_u8_mask)` required in the shared
+    /// viewport scratch pool across all currently active layers.
+    pub(crate) fn max_scratch_requirements(&self) -> (usize, bool) {
+        self.stack.max_scratch_requirements()
+    }
+
     pub(super) fn request_band_stats_if_needed(&mut self, id: LayerId) {
         if let Some(layer) = self.stack.get_mut(id) {
             self.band_stats.request_if_needed(layer, &self.runtime);
@@ -199,15 +219,25 @@ impl OverlayManager {
     /// Return immutable UI summaries of all loaded overlay layers.
     pub(crate) fn layer_summaries(&self) -> Vec<LayerSummary> {
         let layers = self.stack.layers();
-        let stats = self
-            .runtime
-            .layer_flight_stats(layers.iter().map(|l| l.meta().stream_key()));
+        let all_stream_keys: Vec<StreamKey> = layers
+            .iter()
+            .flat_map(|l| l.streams().into_iter().map(|s| s.stream_key()))
+            .collect();
+        let flat_stats = self.runtime.layer_flight_stats(all_stream_keys);
+        let mut cursor_idx = 0usize;
         let len = layers.len();
         layers
             .iter()
-            .zip(stats)
             .enumerate()
-            .map(|(idx, (layer, (in_flight, pass_active)))| {
+            .map(|(idx, layer)| {
+                let count = layer.streams().len();
+                let mut in_flight = 0usize;
+                let mut pass_active = false;
+                for &(f, p) in &flat_stats[cursor_idx..cursor_idx + count] {
+                    in_flight = in_flight.saturating_add(f);
+                    pass_active |= p;
+                }
+                cursor_idx += count;
                 layer.to_summary(in_flight, pass_active, idx + 1 < len, idx > 0)
             })
             .collect()
@@ -263,16 +293,38 @@ impl OverlayManager {
                 self.mutate_layer(id, |layer| layer.set_opacity(opacity))
             }
             OverlayEdit::SetStretchPreset(preset) => {
-                self.mutate_layer(id, |layer| layer.style_mut().set_stretch_preset(preset))
+                self.mutate_layer(id, |layer| layer.set_stretch_preset(preset))
             }
             OverlayEdit::SetStretchRange { min, max } => {
-                self.mutate_layer(id, |layer| layer.style_mut().set_stretch_range(min, max))
+                self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
             }
             OverlayEdit::SetColormap { colormap, invert } => {
-                self.mutate_layer(id, |layer| layer.style_mut().set_colormap(colormap, invert))
+                self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
             }
-            OverlayEdit::SetCategoricalPalette(palette) => self.mutate_layer(id, |layer| {
-                layer.style_mut().set_categorical_palette(palette)
+            OverlayEdit::SetCategoricalPalette(palette) => {
+                self.mutate_layer(id, |layer| layer.set_categorical_palette(palette))
+            }
+            OverlayEdit::SetBandMathRgbStretch { min, max, gamma } => {
+                self.mutate_layer(id, |layer| {
+                    layer
+                        .band_math_mut()
+                        .is_some_and(|bm| bm.style.set_rgb_stretch(min, max, gamma))
+                })
+            }
+            OverlayEdit::ResetBandMathStretch => self.mutate_layer(id, |layer| {
+                layer
+                    .band_math_mut()
+                    .is_some_and(|bm| bm.style.reset_stretch())
+            }),
+            OverlayEdit::SetBandMathSclEnabled(enabled) => self.mutate_layer(id, |layer| {
+                layer
+                    .band_math_mut()
+                    .is_some_and(|bm| bm.style.set_scl_mask_enabled(enabled))
+            }),
+            OverlayEdit::SetBandMathSclMaskBits(bits) => self.mutate_layer(id, |layer| {
+                layer
+                    .band_math_mut()
+                    .is_some_and(|bm| bm.style.set_scl_mask_bits(bits))
             }),
         }
     }
@@ -288,11 +340,14 @@ impl OverlayManager {
         let Some(layer) = self.stack.get_mut(id) else {
             return Err("layer no longer exists".to_owned());
         };
+        if layer.single_asset().is_none() {
+            return Err("band-math layers do not support per-layer CRS overrides".to_owned());
+        }
         let frame = bind_frame_with_override(layer.source().description(), crs_override.as_ref())?;
         let relaid = alloc_seq(&mut self.next_relaid);
         layer.apply_rebound_frame(frame, crs_override, relaid);
         Ok((
-            layer.geo().footprint(),
+            layer.footprint(),
             OverlayMutation {
                 changed: true,
                 ..OverlayMutation::default()
@@ -301,7 +356,7 @@ impl OverlayManager {
     }
 
     /// Remove a layer from [`LayerStack`], cancelling active jobs and returning
-    /// its `SourceId` for GPU/pending purge unless another layer still shares
+    /// its `SourceId`(s) for GPU/pending purge unless another layer still shares
     /// that exact content fingerprint.
     fn remove_layer(&mut self, id: LayerId) -> OverlayMutation {
         let Some(mut removed) = self.stack.remove(id) else {
@@ -311,33 +366,39 @@ impl OverlayManager {
         if let Some(tok) = removed.take_reload_cancel() {
             tok.cancel();
         }
-        let src = removed.source_id();
+        let sources = removed.all_source_ids();
         let mut mutation = OverlayMutation {
             changed: true,
             topology_changed: true,
             purge_sources: Vec::new(),
         };
-        if self.stack.count_sharing_source(src) == 0 {
-            self.purge_source(src);
-            mutation.purge_sources.push(src);
-        } else if !self.stack.has_visible_source(src) {
-            self.purge_source(src);
+        for src in sources {
+            if self.stack.count_sharing_source(src) == 0 {
+                self.purge_source(src);
+                mutation.purge_sources.push(src);
+            } else if !self.stack.has_visible_source(src) {
+                self.purge_source(src);
+            }
         }
         mutation
     }
 
     fn set_visible(&mut self, id: LayerId, visible: bool) -> OverlayMutation {
-        let src = {
+        let sources = {
             let Some(layer) = self.stack.get_mut(id) else {
                 return OverlayMutation::default();
             };
             if !layer.set_visible(visible) {
                 return OverlayMutation::default();
             }
-            layer.source_id()
+            layer.all_source_ids()
         };
-        if !visible && !self.stack.has_visible_source(src) {
-            self.purge_source(src);
+        if !visible {
+            for src in sources {
+                if !self.stack.has_visible_source(src) {
+                    self.purge_source(src);
+                }
+            }
         }
         OverlayMutation {
             changed: true,
@@ -387,7 +448,7 @@ impl OverlayManager {
             let mut is_remote = false;
             for layer in self.stack.layers_mut() {
                 layer.observe_stream_tile_bytes(stream_key, max_bytes);
-                if layer.source_id() == stream_key.source && layer.source().is_remote() {
+                if layer.has_remote_source(stream_key.source) {
                     is_remote = true;
                 }
             }
@@ -413,15 +474,20 @@ impl OverlayManager {
     /// cache state (called when `SceneState::reconcile_providers` runs outside a
     /// full snapshot rebuild).
     pub(crate) fn reconcile(&self, gpu_cache: &GpuTileCache, pending: &PendingUploads) {
-        self.runtime.reconcile_pointwise_streams(
-            self.stack
-                .layers()
-                .iter()
-                .filter(|l| l.is_active())
-                .flat_map(|l| l.streams().iter().map(|s| (s.stream_key(), s.wanted()))),
-            gpu_cache,
-            pending,
-        );
+        let active_layers: Vec<_> = self
+            .stack
+            .layers()
+            .iter()
+            .filter(|l| l.is_active())
+            .collect();
+        let mut streams = Vec::new();
+        for layer in active_layers {
+            for s in layer.streams() {
+                streams.push((s.stream_key(), s.wanted()));
+            }
+        }
+        self.runtime
+            .reconcile_pointwise_streams(streams, gpu_cache, pending);
     }
 
     /// Build immutable [`DrawOverlayLayer`]s for the current frame, update
@@ -472,8 +538,15 @@ impl OverlayManager {
     /// Phase 1 shutdown: cancel active overlay passes, pointwise jobs, reloads,
     /// cursor probes, and close the I/O and tile-write worker channels.
     pub(crate) fn begin_shutdown(&mut self) {
-        self.runtime
-            .cancel_sources(self.stack.layers().iter().map(OverlayLayer::source_id));
+        let mut all_sources = Vec::new();
+        for layer in self.stack.layers() {
+            for src in layer.all_source_ids() {
+                if !all_sources.contains(&src) {
+                    all_sources.push(src);
+                }
+            }
+        }
+        self.runtime.cancel_sources(all_sources);
         for layer in self.stack.layers_mut() {
             layer.cancel_stats_job();
             if let Some(tok) = layer.take_reload_cancel() {

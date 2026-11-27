@@ -140,6 +140,49 @@ impl PaletteCache {
         );
     }
 
+    pub(super) fn ensure_colormap(
+        &mut self,
+        device: &wgpu::Device,
+        palette_layout: &wgpu::BindGroupLayout,
+        colormap: ColormapId,
+    ) {
+        let key = PaletteKey::Scientific(colormap);
+        if self.entries.get(&key).is_some_and(CachedPalette::is_live) {
+            return;
+        }
+        let lut = scientific_lut_linear(colormap);
+        let uniform = PaletteUniform { entries: lut };
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("band-math palette LUT uniform buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("band-math palette LUT bind group"),
+            layout: palette_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        self.entries.insert(
+            key,
+            CachedPalette {
+                _buffer: buffer,
+                bind_group,
+                custom_weak: None,
+            },
+        );
+    }
+
+    pub(super) fn colormap_bind_group(&self, colormap: ColormapId) -> Option<&wgpu::BindGroup> {
+        let key = PaletteKey::Scientific(colormap);
+        self.entries
+            .get(&key)
+            .filter(|entry| entry.is_live())
+            .map(|entry| &entry.bind_group)
+    }
+
     pub(super) fn bind_group(&self, track: &DrawOverlayTrack) -> Option<&wgpu::BindGroup> {
         let key = palette_key(track)?;
         self.entries

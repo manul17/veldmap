@@ -84,6 +84,8 @@ wire_enum!(WireColormapId <-> ColormapId {
     Plasma,
     Turbo,
     RdBu,
+    RdYlGn,
+    BrBG,
     Terrain,
 });
 

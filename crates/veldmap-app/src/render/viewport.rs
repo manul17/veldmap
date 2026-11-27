@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use super::DrawSnapshot;
-use super::pipelines::GlobePipelines;
+use super::pipelines::{BandMathPipelines, GlobePipelines};
+use super::scratch::ScratchTargetPool;
 use super::uniforms::{CameraUniform, DynamicUniformArena};
 
 /// Parameters for a single offscreen globe frame.
@@ -46,8 +47,8 @@ impl LastRenderKey {
 }
 
 pub(super) struct OffscreenTarget {
-    width: u32,
-    height: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
     pub(super) color_srgb_view: wgpu::TextureView,
     pub(super) depth_view: wgpu::TextureView,
     pub(super) composite_bind_group: wgpu::BindGroup,
@@ -61,6 +62,7 @@ pub(super) struct ViewportState {
     camera_bind_group: wgpu::BindGroup,
     uniform_arena: DynamicUniformArena,
     offscreen: Option<OffscreenTarget>,
+    scratch: Option<ScratchTargetPool>,
     last_render: Option<LastRenderKey>,
     /// Tracks whether the most recent offscreen pass reached `composite_into`.
     pending_present: AtomicBool,
@@ -96,9 +98,47 @@ impl ViewportState {
             camera_bind_group,
             uniform_arena,
             offscreen: None,
+            scratch: None,
             last_render: None,
             pending_present: AtomicBool::new(false),
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Direct parameters keep lazy viewport scratch allocation zero-allocation on steady frames."
+    )]
+    pub(super) fn ensure_scratch(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipelines: &BandMathPipelines,
+        width: u32,
+        height: u32,
+        float_bands: usize,
+        needs_mask: bool,
+    ) {
+        if float_bands == 0 {
+            if let Some(pool) = &mut self.scratch {
+                pool.release();
+            }
+            return;
+        }
+        let pool = self
+            .scratch
+            .get_or_insert_with(|| ScratchTargetPool::new(device, queue, pipelines));
+        pool.ensure(device, pipelines, width, height, float_bands, needs_mask);
+    }
+
+    pub(super) fn scratch(&self) -> Option<&ScratchTargetPool> {
+        self.scratch.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn scratch_vram_bytes(&self) -> usize {
+        self.scratch
+            .as_ref()
+            .map_or(0, ScratchTargetPool::vram_bytes)
     }
 
     pub(super) fn camera_buffer(&self) -> &wgpu::Buffer {

@@ -1,8 +1,11 @@
-//! Raster overlay subsystem: ordered multi-stream local & remote COG overlay
-//! stack, two-lane `StreamKey`-scoped scheduling with offloaded QOI +
-//! byte-shuffled LZ4 disk caching, non-blocking local/remote open & reload I/O,
-//! background band statistics, and typed zoom-invariant CPU cursor readouts.
+//! Raster overlay subsystem: ordered multi-asset local & remote COG overlay
+//! stack (`SingleRaster` + `BandMath`), two-lane `StreamKey`-scoped scheduling
+//! with offloaded QOI + byte-shuffled LZ4 disk caching, non-blocking
+//! local/remote single & multi-asset open/reload I/O, background band
+//! statistics, and typed zoom-invariant CPU cursor readouts.
 
+mod asset;
+mod band_math;
 mod crs_override;
 mod cursor;
 mod disk_cache;
@@ -23,10 +26,12 @@ use std::path::{Path, PathBuf};
 
 use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::TileStreamSpec;
-use veldmap_raster::BandStats;
+use veldmap_raster::{BandStats, ExternalBandMeta};
 
 use crate::colormap::{CategoricalPaletteId, ColormapId};
 
+pub use band_math::BandMathFormula;
+pub(crate) use band_math::{BandMathPreset, BandMathReadout, BandMathSummary};
 pub(crate) use crs_override::CrsOverride;
 pub(crate) use manager::{
     OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayManagerDeps, OverlayMutation,
@@ -64,8 +69,53 @@ pub(crate) struct RemoteCogRequest {
     pub(crate) url: String,
     pub(crate) title: String,
     pub(crate) extra_headers: Vec<(String, String)>,
-    pub(crate) scale_offset: Option<(f64, f64)>,
+    pub(crate) external_bands: Vec<ExternalBandMeta>,
+    /// When `true`, explicitly opens the asset on the `R8Uint` track with
+    /// [`CategoricalPaletteId::Sentinel2Scl`].
+    pub(crate) is_scl: bool,
     pub(crate) fly_to: bool,
+}
+
+/// One constituent remote COG asset inside a [`RemoteBandMathRequest`].
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteBandAssetSpec {
+    pub(crate) label: String,
+    pub(crate) url: String,
+    pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) external_bands: Vec<ExternalBandMeta>,
+    pub(crate) band_index: u16,
+}
+
+/// Parameters for opening a multi-asset remote STAC Band Math / RGB Composite
+/// recipe as a single `LayerKind::BandMath` layer without duplicate raw layers
+/// or redundant camera flights.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteBandMathRequest {
+    pub(crate) title: String,
+    pub(crate) preset: BandMathPreset,
+    pub(crate) bands: Vec<RemoteBandAssetSpec>,
+    pub(crate) scl: Option<RemoteBandAssetSpec>,
+    pub(crate) fly_to: bool,
+}
+
+/// One constituent band reference selected from an already-loaded raster layer
+/// inside the Layers-panel Band Math / RGB Composite builder.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalBandMathInput {
+    pub(crate) layer_id: LayerId,
+    pub(crate) band_index: u16,
+    pub(crate) label: String,
+}
+
+/// Parameters for constructing a `LayerKind::BandMath` layer from already-loaded
+/// local or remote raster layers (e.g., a 4-band RGB+NIR orthophoto or distinct
+/// single-band layers).
+#[derive(Clone, Debug)]
+pub(crate) struct LocalBandMathSpec {
+    pub(crate) title: String,
+    pub(crate) formula: BandMathFormula,
+    pub(crate) inputs: Vec<LocalBandMathInput>,
+    pub(crate) scl: Option<LocalBandMathInput>,
 }
 
 /// Read-only scientific track summary projected into [`LayerSummary`].
@@ -121,6 +171,7 @@ pub(crate) struct LayerSummary {
     pub(crate) band_options: Vec<LayerBandOption>,
     pub(crate) scientific: Option<ScientificSummary>,
     pub(crate) categorical: Option<CategoricalSummary>,
+    pub(crate) band_math: Option<BandMathSummary>,
 }
 
 /// Borrowed persistence view of a loaded raster overlay layer for
@@ -136,11 +187,18 @@ pub(crate) struct OverlayPersistEntry<'a> {
 }
 
 /// Classified value returned by a zoom-invariant CPU cursor probe.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CursorReadoutValue {
     Rgba([u8; 4]),
-    Scalar { raw: f64, physical: f64 },
-    Categorical(u16),
+    Scalar {
+        raw: f64,
+        physical: f64,
+    },
+    Categorical {
+        class_id: u16,
+        class_name: Option<&'static str>,
+    },
+    BandMath(BandMathReadout),
     Nodata,
     Pending,
     Unavailable,

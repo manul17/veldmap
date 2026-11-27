@@ -7,6 +7,7 @@ use crate::ui::widgets::{paint_loading_shimmer, show_opacity_slider};
 use crate::ui::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format};
 
 use super::LayerUiAction;
+use super::band_math_card::show_band_math_controls;
 use super::style_controls::{show_categorical_controls, show_scientific_controls};
 
 fn show_layer_status_banners(ui: &mut egui::Ui, layer: &LayerSummary) {
@@ -64,7 +65,9 @@ fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Ve
         });
     }
 
-    if let Some(ref sci) = layer.scientific {
+    if let Some(ref bm) = layer.band_math {
+        show_band_math_controls(ui, layer.id, bm, actions);
+    } else if let Some(ref sci) = layer.scientific {
         show_scientific_controls(ui, layer.id, sci, actions);
     } else if let Some(cat) = layer.categorical {
         show_categorical_controls(ui, layer.id, cat, actions);
@@ -117,6 +120,7 @@ fn show_layer_actions(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec
             actions.push(LayerUiAction::OpenCrsPicker(layer.id, layer.name.clone()));
         }
         if !layer.is_remote
+            && layer.band_math.is_none()
             && ui
                 .add_enabled(!layer.reloading, egui::Button::new("Reload").small())
                 .on_hover_text("Reload from disk (bypass fingerprint & tile cache)")
@@ -185,6 +189,12 @@ pub(super) fn show_raster_card(
             let is_loading =
                 layer.reloading || (layer.visible && (layer.pass_active || layer.in_flight > 0));
             ui.horizontal(|ui| {
+                if let Some(ref bm) = layer.band_math {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(130, 220, 145),
+                        egui::RichText::new(&bm.recipe_label).small().strong(),
+                    );
+                }
                 if layer.is_remote {
                     ui.colored_label(
                         egui::Color32::from_rgb(100, 195, 255),

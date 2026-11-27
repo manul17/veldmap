@@ -91,6 +91,10 @@ pub struct BandInfo {
     pub sample_type: SampleType,
     pub scale: f64,
     pub offset: f64,
+    /// True when the raster container explicitly declared `SCALE` or `OFFSET`
+    /// metadata for this band (even if equal to identity `1.0` / `0.0`), so
+    /// external STAC `raster:bands` overrides never clobber embedded metadata.
+    pub has_embedded_scale_offset: bool,
     pub nodata: Option<f64>,
     pub channels: usize,
     pub has_alpha: bool,
@@ -113,6 +117,7 @@ impl BandInfo {
             sample_type,
             scale: 1.0,
             offset: 0.0,
+            has_embedded_scale_offset: false,
             nodata,
             channels,
             has_alpha,

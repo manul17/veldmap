@@ -16,8 +16,8 @@ use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_net::HttpRangeSource;
 use veldmap_raster::{
-    OpenRasterOptions, OpenedRaster, RasterDescription, RasterError, RasterSource,
-    frame_from_description_with_override, open_raster, open_raster_with_options,
+    ExternalBandMeta, OpenRasterOptions, OpenedRaster, RasterDescription, RasterError,
+    RasterSource, frame_from_description_with_override, open_raster, open_raster_with_options,
 };
 use veldmap_storage::{LocalFingerprintCache, StorageError, read_regular_file_utf8_limited};
 
@@ -158,11 +158,12 @@ pub(super) fn open_local_raster(
 }
 
 /// Open a remote Cloud-Optimized GeoTIFF over an already-probed
-/// [`HttpRangeSource`], applying optional STAC `raster:bands` `(scale, offset)`
-/// metadata when the TIFF header lacks embedded GDAL scale/offset tags.
+/// [`HttpRangeSource`], applying optional STAC `raster:bands` per-band
+/// `(scale, offset, nodata, unit)` metadata when the TIFF header lacks embedded
+/// tags.
 pub(super) fn open_remote_cog_source(
     range_source: HttpRangeSource,
-    scale_offset: Option<(f64, f64)>,
+    external_bands: &[ExternalBandMeta],
     budget: &MemoryBudget,
     cancel: &CancelToken,
 ) -> Result<(Arc<dyn RasterSource>, Frame), OpenRasterError> {
@@ -173,7 +174,7 @@ pub(super) fn open_remote_cog_source(
         fingerprint,
         OpenRasterOptions {
             sidecars: None,
-            external_scale_offset: scale_offset.map(|(scale, offset)| (Some(scale), Some(offset))),
+            external_bands,
         },
         budget,
         cancel,

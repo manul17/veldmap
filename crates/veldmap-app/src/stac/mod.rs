@@ -1,6 +1,6 @@
 //! STAC catalog search controller (`StacSession`), canonical AOI geometry
-//! ownership, origin-aware COG auth resolution, cached UI view DTOs, and
-//! redacted URL formatting.
+//! ownership, origin-aware COG auth resolution, cached UI view DTOs (including
+//! 1-click STAC Scene Recipes), and redacted URL formatting.
 //!
 //! Kept outside `ui/` so UI panels stay strictly presentation-only and free of
 //! direct `veldmap-net` dependencies.
@@ -13,6 +13,9 @@ use std::fmt;
 
 use veldmap_core::geo::FootprintBounds;
 use veldmap_net::sanitize_url_for_display;
+use veldmap_raster::ExternalBandMeta;
+
+use crate::layers::BandMathPreset;
 
 pub(crate) use auth::StacCogAuthMode;
 pub(crate) use session::{StacCatalogPreset, StacSearchRequest, StacSession};
@@ -48,12 +51,42 @@ impl fmt::Debug for RedactedUrl {
 }
 
 /// UI-facing view of a built-in zero-auth COG sample scene.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SampleSceneView {
     pub(crate) title: &'static str,
     pub(crate) description: &'static str,
     pub(crate) cog_url: &'static str,
-    pub(crate) scale_offset: Option<(f64, f64)>,
+    pub(crate) external_bands: Vec<ExternalBandMeta>,
+}
+
+/// UI-facing view of one constituent COG asset in a 1-click STAC Band Math
+/// scene recipe.
+#[derive(Clone, Debug)]
+pub(crate) struct StacRecipeAssetView {
+    pub(crate) label: String,
+    pub(crate) href: RedactedUrl,
+    pub(crate) external_bands: Vec<ExternalBandMeta>,
+}
+
+/// UI-facing view of one 1-click STAC Scene Recipe (`True Color`, `NDVI + SCL`,
+/// `NDWI + SCL`, `False Color NIR`, `SWIR`).
+#[derive(Clone, Debug)]
+pub(crate) struct StacRecipeView {
+    pub(crate) preset: BandMathPreset,
+    pub(crate) button_label: String,
+    pub(crate) tooltip: String,
+    pub(crate) bands: Vec<StacRecipeAssetView>,
+    pub(crate) scl: Option<StacRecipeAssetView>,
+}
+
+/// UI-facing view of a built-in zero-auth multi-band sample scene recipe.
+#[derive(Clone, Debug)]
+pub(crate) struct SampleRecipeView {
+    pub(crate) title: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) preset: BandMathPreset,
+    pub(crate) bands: Vec<StacRecipeAssetView>,
+    pub(crate) scl: Option<StacRecipeAssetView>,
 }
 
 /// UI-facing view of a single HTTP(S) COG asset on a STAC search result item.
@@ -63,7 +96,8 @@ pub(crate) struct StacCogAssetView {
     pub(crate) title: Option<String>,
     pub(crate) href: RedactedUrl,
     pub(crate) gsd: Option<f64>,
-    pub(crate) scale_offset: Option<(f64, f64)>,
+    pub(crate) external_bands: Vec<ExternalBandMeta>,
+    pub(crate) is_scl: bool,
 }
 
 /// Cached UI-facing view of a STAC search result item, rebuilt only when search
@@ -75,7 +109,10 @@ pub(crate) struct StacItemView {
     pub(crate) short_date: Option<String>,
     pub(crate) cloud_cover: Option<f32>,
     pub(crate) mgrs_tile: Option<String>,
+    pub(crate) platform: Option<String>,
+    pub(crate) processing_level: Option<String>,
     pub(crate) preferred_cog: Option<StacCogAssetView>,
+    pub(crate) recipes: Vec<StacRecipeView>,
     pub(crate) cog_assets: Vec<StacCogAssetView>,
     pub(crate) zoom_bounds: Option<FootprintBounds>,
 }
@@ -95,6 +132,7 @@ pub(crate) struct StacViewSnapshot<'a> {
     pub(crate) hovered_idx: Option<usize>,
     pub(crate) items: &'a [StacItemView],
     pub(crate) sample_scenes: &'static [SampleSceneView],
+    pub(crate) sample_recipes: &'static [SampleRecipeView],
     pub(crate) custom_endpoint_configured: bool,
 }
 

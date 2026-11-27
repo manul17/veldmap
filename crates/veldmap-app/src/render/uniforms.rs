@@ -94,6 +94,52 @@ pub(super) struct VectorUniform {
     pub(super) hatch_spacing_px: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct ScratchClearUniform {
+    pub(super) nan_bits: u32,
+    pub(super) _pad0: u32,
+    pub(super) _pad1: u32,
+    pub(super) _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct ScratchSinglePatchUniform {
+    pub(super) offset_eye: [f32; 3],
+    pub(super) scale: f32,
+    pub(super) uv_rect: [f32; 4],
+    pub(super) offset: f32,
+    pub(super) mip_count: u32,
+    pub(super) has_nodata: u32,
+    pub(super) nodata_value: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct ScratchMrtPatchUniform {
+    pub(super) offset_eye: [f32; 3],
+    pub(super) nan_bits: u32,
+    pub(super) uv_rects: [[f32; 4]; 4],
+    pub(super) scale_offsets: [[f32; 4]; 4],
+    pub(super) mip_counts: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct BandMathCompositeUniform {
+    pub(super) opacity: f32,
+    pub(super) mode: u32,
+    pub(super) stretch_min: f32,
+    pub(super) stretch_inv_range: f32,
+    pub(super) rgb_min: [f32; 4],
+    pub(super) rgb_inv_range: [f32; 4],
+    pub(super) invert_colormap: u32,
+    pub(super) scl_mask_enabled: u32,
+    pub(super) scl_mask_bits: u32,
+    pub(super) _pad0: u32,
+}
+
 const _: () = {
     assert!(std::mem::size_of::<OverlayPatchUniform>() == 32);
     assert!(std::mem::offset_of!(OverlayPatchUniform, offset_eye) == 0);
@@ -128,6 +174,36 @@ const _: () = {
     assert!(std::mem::offset_of!(VectorUniform, viewport_inv_size) == 32);
     assert!(std::mem::offset_of!(VectorUniform, stroke_half_width_px) == 40);
     assert!(std::mem::offset_of!(VectorUniform, hatch_spacing_px) == 44);
+
+    assert!(std::mem::size_of::<ScratchClearUniform>() == 16);
+    assert!(std::mem::offset_of!(ScratchClearUniform, nan_bits) == 0);
+
+    assert!(std::mem::size_of::<ScratchSinglePatchUniform>() == 48);
+    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, offset_eye) == 0);
+    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, scale) == 12);
+    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, uv_rect) == 16);
+    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, offset) == 32);
+    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, mip_count) == 36);
+    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, has_nodata) == 40);
+    assert!(std::mem::offset_of!(ScratchSinglePatchUniform, nodata_value) == 44);
+
+    assert!(std::mem::size_of::<ScratchMrtPatchUniform>() == 160);
+    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, offset_eye) == 0);
+    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, nan_bits) == 12);
+    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, uv_rects) == 16);
+    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, scale_offsets) == 80);
+    assert!(std::mem::offset_of!(ScratchMrtPatchUniform, mip_counts) == 144);
+
+    assert!(std::mem::size_of::<BandMathCompositeUniform>() == 64);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, opacity) == 0);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, mode) == 4);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, stretch_min) == 8);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, stretch_inv_range) == 12);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, rgb_min) == 16);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, rgb_inv_range) == 32);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, invert_colormap) == 48);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, scl_mask_enabled) == 52);
+    assert!(std::mem::offset_of!(BandMathCompositeUniform, scl_mask_bits) == 56);
 };
 
 /// Rust-side WGSL uniform struct layout descriptor computed directly from
@@ -299,11 +375,118 @@ pub const UNIFORM_LAYOUT_SPECS: &[UniformLayoutSpec] = &[
             ),
         ],
     },
+    UniformLayoutSpec {
+        wgsl_name: "ScratchClearUniform",
+        size: std::mem::size_of::<ScratchClearUniform>(),
+        fields: &[(
+            "nan_bits",
+            std::mem::offset_of!(ScratchClearUniform, nan_bits),
+        )],
+    },
+    UniformLayoutSpec {
+        wgsl_name: "ScratchSinglePatchUniform",
+        size: std::mem::size_of::<ScratchSinglePatchUniform>(),
+        fields: &[
+            (
+                "offset_eye",
+                std::mem::offset_of!(ScratchSinglePatchUniform, offset_eye),
+            ),
+            (
+                "scale",
+                std::mem::offset_of!(ScratchSinglePatchUniform, scale),
+            ),
+            (
+                "uv_rect",
+                std::mem::offset_of!(ScratchSinglePatchUniform, uv_rect),
+            ),
+            (
+                "offset",
+                std::mem::offset_of!(ScratchSinglePatchUniform, offset),
+            ),
+            (
+                "mip_count",
+                std::mem::offset_of!(ScratchSinglePatchUniform, mip_count),
+            ),
+            (
+                "has_nodata",
+                std::mem::offset_of!(ScratchSinglePatchUniform, has_nodata),
+            ),
+            (
+                "nodata_value",
+                std::mem::offset_of!(ScratchSinglePatchUniform, nodata_value),
+            ),
+        ],
+    },
+    UniformLayoutSpec {
+        wgsl_name: "ScratchMrtPatchUniform",
+        size: std::mem::size_of::<ScratchMrtPatchUniform>(),
+        fields: &[
+            (
+                "offset_eye",
+                std::mem::offset_of!(ScratchMrtPatchUniform, offset_eye),
+            ),
+            (
+                "nan_bits",
+                std::mem::offset_of!(ScratchMrtPatchUniform, nan_bits),
+            ),
+            (
+                "uv_rects",
+                std::mem::offset_of!(ScratchMrtPatchUniform, uv_rects),
+            ),
+            (
+                "scale_offsets",
+                std::mem::offset_of!(ScratchMrtPatchUniform, scale_offsets),
+            ),
+            (
+                "mip_counts",
+                std::mem::offset_of!(ScratchMrtPatchUniform, mip_counts),
+            ),
+        ],
+    },
+    UniformLayoutSpec {
+        wgsl_name: "BandMathCompositeUniform",
+        size: std::mem::size_of::<BandMathCompositeUniform>(),
+        fields: &[
+            (
+                "opacity",
+                std::mem::offset_of!(BandMathCompositeUniform, opacity),
+            ),
+            ("mode", std::mem::offset_of!(BandMathCompositeUniform, mode)),
+            (
+                "stretch_min",
+                std::mem::offset_of!(BandMathCompositeUniform, stretch_min),
+            ),
+            (
+                "stretch_inv_range",
+                std::mem::offset_of!(BandMathCompositeUniform, stretch_inv_range),
+            ),
+            (
+                "rgb_min",
+                std::mem::offset_of!(BandMathCompositeUniform, rgb_min),
+            ),
+            (
+                "rgb_inv_range",
+                std::mem::offset_of!(BandMathCompositeUniform, rgb_inv_range),
+            ),
+            (
+                "invert_colormap",
+                std::mem::offset_of!(BandMathCompositeUniform, invert_colormap),
+            ),
+            (
+                "scl_mask_enabled",
+                std::mem::offset_of!(BandMathCompositeUniform, scl_mask_enabled),
+            ),
+            (
+                "scl_mask_bits",
+                std::mem::offset_of!(BandMathCompositeUniform, scl_mask_bits),
+            ),
+        ],
+    },
 ];
 
 /// Number of typed dynamic-uniform bind-group slots backed by
 /// [`DynamicUniformArena`].
-pub(super) const UNIFORM_SLOT_COUNT: usize = 5;
+pub(super) const UNIFORM_SLOT_COUNT: usize = 8;
 
 /// Typed index into the frame-wide [`DynamicUniformArena`] bind-group slots and
 /// [`super::pipelines::SharedLayouts`] dynamic-uniform layouts.
@@ -315,6 +498,9 @@ pub(super) enum UniformSlot {
     Scientific = 2,
     Categorical = 3,
     Vector = 4,
+    ScratchSingle = 5,
+    ScratchMrt = 6,
+    BandMathComposite = 7,
 }
 
 impl UniformSlot {
@@ -324,6 +510,9 @@ impl UniformSlot {
         Self::Scientific,
         Self::Categorical,
         Self::Vector,
+        Self::ScratchSingle,
+        Self::ScratchMrt,
+        Self::BandMathComposite,
     ];
 
     pub(super) const fn index(self) -> usize {
@@ -337,6 +526,9 @@ impl UniformSlot {
             Self::Scientific => "scientific overlay patch dynamic uniform layout",
             Self::Categorical => "categorical overlay patch dynamic uniform layout",
             Self::Vector => "vector dynamic uniform layout",
+            Self::ScratchSingle => "scratch single-band patch dynamic uniform layout",
+            Self::ScratchMrt => "scratch MRT patch dynamic uniform layout",
+            Self::BandMathComposite => "band-math composite dynamic uniform layout",
         }
     }
 
@@ -347,6 +539,9 @@ impl UniformSlot {
             Self::Scientific => "arena scientific overlay dynamic uniform bind group",
             Self::Categorical => "arena categorical overlay dynamic uniform bind group",
             Self::Vector => "arena vector dynamic uniform bind group",
+            Self::ScratchSingle => "arena scratch single-band dynamic uniform bind group",
+            Self::ScratchMrt => "arena scratch MRT dynamic uniform bind group",
+            Self::BandMathComposite => "arena band-math composite dynamic uniform bind group",
         }
     }
 
@@ -357,6 +552,9 @@ impl UniformSlot {
             Self::Scientific => std::mem::size_of::<ScientificPatchUniform>(),
             Self::Categorical => std::mem::size_of::<CategoricalPatchUniform>(),
             Self::Vector => std::mem::size_of::<VectorUniform>(),
+            Self::ScratchSingle => std::mem::size_of::<ScratchSinglePatchUniform>(),
+            Self::ScratchMrt => std::mem::size_of::<ScratchMrtPatchUniform>(),
+            Self::BandMathComposite => std::mem::size_of::<BandMathCompositeUniform>(),
         }
     }
 }

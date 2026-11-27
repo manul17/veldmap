@@ -4,6 +4,7 @@
 //! CRS/radiometry metadata inspection, diagnostic banners, and loading shimmer
 //! indicators.
 
+mod band_math_card;
 mod histogram;
 mod raster_card;
 mod style_controls;
@@ -15,11 +16,12 @@ use eframe::egui;
 use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::TileStreamSpec;
 
-use crate::layers::{LayerId, LayerSummary, OverlayEdit};
+use crate::layers::{LayerId, LayerSummary, LocalBandMathSpec, OverlayEdit};
 use crate::vectors::{VectorEdit, VectorLayerId, VectorLayerSummary};
 
 use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, submitted_with_enter};
 
+use band_math_card::{BandMathBuilderState, show_band_math_builder};
 use raster_card::show_raster_card;
 use vector_card::show_vector_card;
 
@@ -69,6 +71,7 @@ pub(crate) enum LayerUiAction {
         persist: EditPersist,
     },
     UseVectorAsStacAoi(VectorLayerId),
+    CreateBandMath(LocalBandMathSpec),
 }
 
 impl LayerUiAction {
@@ -113,6 +116,7 @@ pub(crate) struct LayersPanelState {
     path_input: String,
     error: Option<String>,
     failed_unbound_path: Option<PathBuf>,
+    band_math_builder: BandMathBuilderState,
 }
 
 impl LayersPanelState {
@@ -154,6 +158,7 @@ impl LayersPanelState {
 fn show_panel_header(
     ui: &mut egui::Ui,
     layer_count: usize,
+    has_raster_sources: bool,
     state: &mut LayersPanelState,
     actions: &mut Vec<LayerUiAction>,
 ) {
@@ -176,6 +181,17 @@ fn show_panel_header(
                 .clicked()
             {
                 actions.push(LayerUiAction::OpenFileDialog);
+            }
+            if has_raster_sources
+                && ui
+                    .selectable_label(
+                        state.band_math_builder.open,
+                        egui::RichText::new("+ Math").small(),
+                    )
+                    .on_hover_text("Build a Band Math / RGB composite from loaded raster layers")
+                    .clicked()
+            {
+                state.band_math_builder.open = !state.band_math_builder.open;
             }
         });
     });
@@ -283,11 +299,16 @@ pub(crate) fn show_layers_tab_contents(
 ) -> Vec<LayerUiAction> {
     let mut actions = Vec::new();
     let total = layers.len() + vectors.len();
+    let has_raster_sources = layers.iter().any(|l| l.band_math.is_none());
 
-    show_panel_header(ui, total, state, &mut actions);
+    show_panel_header(ui, total, has_raster_sources, state, &mut actions);
 
     if state.open_prompt_visible {
         show_open_prompt(ui, state, &mut actions);
+    }
+
+    if state.band_math_builder.open {
+        show_band_math_builder(ui, layers, &mut state.band_math_builder, &mut actions);
     }
 
     if let Some(err) = &state.error {

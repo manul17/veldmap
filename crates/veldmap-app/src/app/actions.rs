@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::layers::{CrsOverride, RemoteCogRequest};
+use crate::layers::{CrsOverride, RemoteBandAssetSpec, RemoteBandMathRequest, RemoteCogRequest};
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::stac::StacSession;
 use crate::storage::session::SavedCameraPose;
@@ -170,6 +170,20 @@ impl VeldmapApp {
                     self.open_workbench_tab(WorkbenchTab::CloudStac);
                     needs_repaint = true;
                 }
+                LayerUiAction::CreateBandMath(spec) => {
+                    match self.scene.create_band_math_from_loaded(spec) {
+                        Ok((_id, bounds)) => {
+                            self.panels.layers.clear_error();
+                            if let Some(b) = bounds {
+                                self.focus_footprint(b);
+                            }
+                        }
+                        Err(err) => {
+                            self.panels.layers.push_error(err);
+                        }
+                    }
+                    needs_repaint = true;
+                }
             }
         }
         if session_dirty {
@@ -280,7 +294,8 @@ impl VeldmapApp {
                     url,
                     title,
                     auth_mode,
-                    scale_offset,
+                    external_bands,
+                    is_scl,
                 } => {
                     let raw_url = url.into_inner();
                     let (final_url, headers) = self.scene.stac().resolve_cog_auth(
@@ -292,9 +307,66 @@ impl VeldmapApp {
                         url: final_url,
                         title,
                         extra_headers: headers,
-                        scale_offset,
+                        external_bands,
+                        is_scl,
                         fly_to: true,
                     }) {
+                        self.scene.mutate_stac(|s| s.set_error(err));
+                    } else {
+                        self.scene.mutate_stac(StacSession::clear_error);
+                    }
+                    needs_repaint = true;
+                }
+                StacUiAction::OpenRecipe {
+                    title,
+                    preset,
+                    auth_mode,
+                    bands,
+                    scl,
+                } => {
+                    let stac_settings = &self.storage.settings().stac;
+                    let resolved_bands: Vec<RemoteBandAssetSpec> = bands
+                        .into_iter()
+                        .map(|b| {
+                            let raw_url = b.href.into_inner();
+                            let (final_url, extra_headers) = self.scene.stac().resolve_cog_auth(
+                                &raw_url,
+                                auth_mode,
+                                stac_settings,
+                            );
+                            RemoteBandAssetSpec {
+                                label: b.label,
+                                url: final_url,
+                                extra_headers,
+                                external_bands: b.external_bands,
+                                band_index: 0,
+                            }
+                        })
+                        .collect();
+                    let resolved_scl = scl.map(|s| {
+                        let raw_url = s.href.into_inner();
+                        let (final_url, extra_headers) =
+                            self.scene
+                                .stac()
+                                .resolve_cog_auth(&raw_url, auth_mode, stac_settings);
+                        RemoteBandAssetSpec {
+                            label: s.label,
+                            url: final_url,
+                            extra_headers,
+                            external_bands: s.external_bands,
+                            band_index: 0,
+                        }
+                    });
+                    if let Err(err) =
+                        self.scene
+                            .begin_open_remote_band_math(RemoteBandMathRequest {
+                                title,
+                                preset,
+                                bands: resolved_bands,
+                                scl: resolved_scl,
+                                fly_to: true,
+                            })
+                    {
                         self.scene.mutate_stac(|s| s.set_error(err));
                     } else {
                         self.scene.mutate_stac(StacSession::clear_error);

@@ -489,6 +489,7 @@ impl VeldmapApp {
                     }
 
                     let show_graticule = self.storage.settings().show_graticule;
+                    self.scene.update_viewport_target_vram(width_px, height_px);
                     let snapshot = self.scene.snapshot_for_frame(
                         self.camera,
                         width_px,
@@ -519,6 +520,7 @@ impl VeldmapApp {
                     self.viewport
                         .set_hud_rects(scale_rect, attr_rect, colorbar_rect);
                 } else {
+                    self.scene.update_viewport_target_vram(0, 0);
                     self.scene.clear_cached_snapshot();
                     self.viewport.clear_viewport();
                 }

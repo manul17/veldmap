@@ -23,6 +23,7 @@ pub(super) fn parse_gdal_nodata(raw: &str) -> Option<f64> {
 pub(super) struct GdalBandMeta {
     pub(super) scale: Option<f64>,
     pub(super) offset: Option<f64>,
+    pub(super) nodata: Option<f64>,
     pub(super) units: Option<String>,
     pub(super) description: Option<String>,
 }
@@ -42,6 +43,7 @@ impl GdalMetadata {
         GdalBandMeta {
             scale: specific.and_then(|m| m.scale).or(self.defaults.scale),
             offset: specific.and_then(|m| m.offset).or(self.defaults.offset),
+            nodata: specific.and_then(|m| m.nodata).or(self.defaults.nodata),
             units: specific
                 .and_then(|m| m.units.clone())
                 .or_else(|| self.defaults.units.clone()),
@@ -177,6 +179,10 @@ pub(super) fn parse_gdal_metadata(xml: &str) -> GdalMetadata {
             {
                 target.offset = Some(v);
             }
+        } else if name.eq_ignore_ascii_case("NODATA") {
+            if let Some(v) = parse_gdal_nodata(&raw_val) {
+                target.nodata = Some(v);
+            }
         } else if name.eq_ignore_ascii_case("UNITTYPE") && !raw_val.is_empty() {
             target.units = Some(raw_val);
         } else if (name.eq_ignore_ascii_case("DESCRIPTION")
@@ -198,8 +204,10 @@ mod tests {
     fn parses_per_band_and_default_gdal_metadata_items() {
         let xml = r#"<GDALMetadata>
   <Item name="UNITTYPE">reflectance</Item>
+  <Item name="NODATA">-9999</Item>
   <Item name="SCALE" sample="0">0.0001</Item>
   <Item name="OFFSET" sample="0">-0.1</Item>
+  <Item name="NODATA" sample="0">65535</Item>
   <Item name="DESCRIPTION" sample="0">B04 Red</Item>
   <Item name="DESCRIPTION" sample="1">B08 NIR &amp; SWIR</Item>
 </GDALMetadata>"#;
@@ -207,11 +215,13 @@ mod tests {
         let b0 = parsed.for_band(0);
         assert_eq!(b0.scale, Some(0.0001));
         assert_eq!(b0.offset, Some(-0.1));
+        assert_eq!(b0.nodata, Some(65535.0));
         assert_eq!(b0.units.as_deref(), Some("reflectance"));
         assert_eq!(b0.description.as_deref(), Some("B04 Red"));
 
         let b1 = parsed.for_band(1);
         assert_eq!(b1.scale, None);
+        assert_eq!(b1.nodata, Some(-9999.0));
         assert_eq!(b1.units.as_deref(), Some("reflectance"));
         assert_eq!(b1.description.as_deref(), Some("B08 NIR & SWIR"));
     }

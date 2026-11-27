@@ -1,20 +1,77 @@
-//! Asynchronous local/remote raster open, cache-bypassing reload, and
+//! Asynchronous local/remote raster open, multi-asset STAC Band Math recipe
+//! open, local Band Math builder construction, cache-bypassing reload, and
 //! background completion reconciliation for [`OverlayManager`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use veldmap_core::geo::{FootprintBounds, Frame};
-use veldmap_raster::RasterSource;
+use veldmap_core::tile::{BandKey, PixelFormat};
+use veldmap_raster::{RasterSource, SampleType, stream_spec_for_band};
 
 use crate::clamp_opacity;
 
+use super::asset::{GeoBinding, LayerOrigin, RasterAsset};
+use super::band_math::BandMathStyle;
 use super::io_worker::{OverlayIoCmd, OverlayIoResult, ReloadRequest, ReloadedPayload};
 use super::layer::RemoteLayerSpec;
 use super::manager::{OverlayManager, OverlayMutation, alloc_seq};
 use super::opener::{OpenRasterError, bind_frame_with_override};
+use super::remote_opener::{OpenedRemoteBandAsset, RemoteOpenResult};
 use super::stack::OverlayLayer;
-use super::{LayerId, LayerInitOptions, OpenOverlayRequest, OverlayIoEvent, RemoteCogRequest};
+use super::{
+    LayerId, LayerInitOptions, LocalBandMathSpec, OpenOverlayRequest, OverlayIoEvent,
+    RemoteBandMathRequest, RemoteCogRequest,
+};
+
+fn build_remote_band_asset(
+    opened: OpenedRemoteBandAsset,
+    format: PixelFormat,
+    relaid: u64,
+) -> Result<RasterAsset, String> {
+    let spec = stream_spec_for_band(BandKey::Index(opened.band_index), format);
+    let meta = opened
+        .source
+        .pyramid_meta(spec)
+        .map_err(|e| format!("band '{}': {e}", opened.label))?;
+    let desc = opened.source.description();
+    let geo = GeoBinding::new(
+        opened.frame,
+        desc.width,
+        desc.height,
+        meta.max_level(),
+        None,
+        relaid,
+    );
+    Ok(RasterAsset::new(
+        opened.label,
+        LayerOrigin::Remote {
+            display_url: opened.display_url,
+            range: opened.range_source,
+        },
+        opened.source,
+        geo,
+        meta,
+    ))
+}
+
+fn suggest_rgb_max_hint(asset: &RasterAsset) -> Option<f64> {
+    let band_info = asset
+        .source()
+        .description()
+        .band_info(asset.meta().spec.band)?;
+    let has_scaling = (band_info.scale - 1.0).abs() > 1e-12 || band_info.offset.abs() > 1e-12;
+    if has_scaling {
+        // Scaled reflectance (e.g. Sentinel-2 L2A scale=0.0001, offset=-0.1).
+        return Some(0.35);
+    }
+    match band_info.sample_type {
+        SampleType::U8 => Some(255.0),
+        SampleType::U16 => Some(3500.0),
+        SampleType::F32 | SampleType::F64 => Some(1.0),
+        _ => None,
+    }
+}
 
 impl OverlayManager {
     /// Queue a non-blocking remote Cloud-Optimized GeoTIFF open onto
@@ -22,6 +79,78 @@ impl OverlayManager {
     /// local file open/reload I/O and `fast_pool`.
     pub(crate) fn begin_open_remote_cog(&self, request: RemoteCogRequest) -> Result<(), String> {
         self.remote_opener.begin_open(&self.runtime, request)
+    }
+
+    /// Queue a non-blocking concurrent multi-asset remote STAC Band Math / RGB
+    /// recipe open, spawning one `LayerKind::BandMath` layer without duplicate
+    /// raw layers or redundant camera flights.
+    pub(crate) fn begin_open_remote_band_math(
+        &self,
+        request: RemoteBandMathRequest,
+    ) -> Result<(), String> {
+        self.remote_opener
+            .begin_open_band_math(&self.runtime, request)
+    }
+
+    /// Build and insert a `LayerKind::BandMath` layer from already-loaded local
+    /// or remote `SingleRaster` layers (supporting both bands from a single
+    /// multi-band GeoTIFF such as RGB+NIR and bands across distinct loaded
+    /// rasters, plus an optional `R8Uint` SCL/QA mask layer).
+    pub(crate) fn create_band_math_from_loaded(
+        &mut self,
+        spec: LocalBandMathSpec,
+    ) -> Result<(LayerId, Option<FootprintBounds>, OverlayMutation), String> {
+        let required = spec.formula.required_bands();
+        if spec.inputs.len() != required {
+            return Err(format!(
+                "{} requires {required} input bands, got {}",
+                spec.formula.label(),
+                spec.inputs.len()
+            ));
+        }
+
+        let mut band_assets = Vec::with_capacity(spec.inputs.len());
+        for input in &spec.inputs {
+            let layer = self
+                .stack
+                .get(input.layer_id)
+                .ok_or_else(|| "selected source layer no longer exists".to_owned())?;
+            let src_asset = layer
+                .single_asset()
+                .ok_or_else(|| "band-math inputs must be single-raster layers".to_owned())?;
+            let stream_spec =
+                stream_spec_for_band(BandKey::Index(input.band_index), PixelFormat::R32Float);
+            let cloned = src_asset.clone_for_stream(input.label.clone(), stream_spec)?;
+            band_assets.push(cloned);
+        }
+
+        let scl_asset = if let Some(scl_in) = &spec.scl {
+            let layer = self
+                .stack
+                .get(scl_in.layer_id)
+                .ok_or_else(|| "selected SCL mask layer no longer exists".to_owned())?;
+            let src_asset = layer
+                .single_asset()
+                .ok_or_else(|| "SCL mask input must be a single-raster layer".to_owned())?;
+            let stream_spec =
+                stream_spec_for_band(BandKey::Index(scl_in.band_index), PixelFormat::R8Uint);
+            Some(src_asset.clone_for_stream(scl_in.label.clone(), stream_spec)?)
+        } else {
+            None
+        };
+
+        let rgb_max_hint = band_assets.first().and_then(suggest_rgb_max_hint);
+        let style = BandMathStyle::for_custom(spec.formula, scl_asset.is_some(), rgb_max_hint);
+        let id = LayerId(alloc_seq(&mut self.next_layer_id));
+        let title = if spec.title.trim().is_empty() {
+            format!("{} Composite", spec.formula.short_label())
+        } else {
+            spec.title.trim().to_owned()
+        };
+        let layer = OverlayLayer::from_band_math(id, title, band_assets, scl_asset, style);
+        let mut mutation = OverlayMutation::default();
+        let bounds = self.insert_opened_layer(layer, &mut mutation);
+        Ok((id, bounds, mutation))
     }
 
     /// Queue a non-blocking local raster open with explicit initial visibility,
@@ -56,7 +185,9 @@ impl OverlayManager {
                 return Err("layer no longer exists".to_owned());
             };
             let Some(local_path) = layer.local_path().map(Path::to_path_buf) else {
-                return Err("remote COG layers do not support local disk reload".to_owned());
+                return Err(
+                    "remote COG and band-math layers do not support local disk reload".to_owned(),
+                );
             };
             layer.cancel_stats_job();
             let prep = layer.begin_reload(cancel.clone());
@@ -95,8 +226,8 @@ impl OverlayManager {
         })
     }
 
-    /// Drain completed background local open/reload results, remote COG open
-    /// results, and sampled band-statistics completions.
+    /// Drain completed background local open/reload results, remote COG &
+    /// Band Math recipe open results, and sampled band-statistics completions.
     pub(crate) fn poll_io_events(&mut self) -> (Vec<OverlayIoEvent>, OverlayMutation) {
         let mut events = Vec::new();
         let mut mutation = OverlayMutation::default();
@@ -123,41 +254,116 @@ impl OverlayManager {
         }
 
         for remote in self.remote_opener.drain() {
-            match remote.outcome {
-                Ok((range_source, source, frame)) => {
-                    let id = LayerId(alloc_seq(&mut self.next_layer_id));
-                    let relaid = alloc_seq(&mut self.next_relaid);
-                    let layer = OverlayLayer::from_remote_source(RemoteLayerSpec {
-                        id,
-                        title: remote.title.clone(),
-                        display_url: remote.display_url.clone(),
-                        range_source,
-                        source,
-                        frame,
-                        options: LayerInitOptions {
-                            visible: true,
-                            opacity: 1.0,
-                            crs_override: None,
-                            style: None,
-                        },
-                        relaid,
-                    });
-                    let bounds = self.insert_opened_layer(layer, &mut mutation);
-                    events.push(OverlayIoEvent::RemoteOpened {
-                        id,
-                        title: remote.title,
-                        display_url: remote.display_url,
-                        bounds,
-                        fly_to: remote.fly_to,
-                    });
-                }
-                Err(error) => {
-                    events.push(OverlayIoEvent::RemoteFailed {
-                        title: remote.title,
-                        display_url: remote.display_url,
-                        error,
-                    });
-                }
+            match remote {
+                RemoteOpenResult::Single {
+                    title,
+                    display_url,
+                    is_scl,
+                    fly_to,
+                    outcome,
+                } => match outcome {
+                    Ok((range_source, source, frame)) => {
+                        let id = LayerId(alloc_seq(&mut self.next_layer_id));
+                        let relaid = alloc_seq(&mut self.next_relaid);
+                        let layer = OverlayLayer::from_remote_source(RemoteLayerSpec {
+                            id,
+                            title: title.clone(),
+                            display_url: display_url.clone(),
+                            range_source,
+                            source,
+                            frame,
+                            options: LayerInitOptions {
+                                visible: true,
+                                opacity: 1.0,
+                                crs_override: None,
+                                style: None,
+                            },
+                            is_scl,
+                            relaid,
+                        });
+                        let bounds = self.insert_opened_layer(layer, &mut mutation);
+                        events.push(OverlayIoEvent::RemoteOpened {
+                            id,
+                            title,
+                            display_url,
+                            bounds,
+                            fly_to,
+                        });
+                    }
+                    Err(error) => {
+                        events.push(OverlayIoEvent::RemoteFailed {
+                            title,
+                            display_url,
+                            error,
+                        });
+                    }
+                },
+                RemoteOpenResult::BandMath {
+                    title,
+                    display_url,
+                    preset,
+                    fly_to,
+                    outcome,
+                } => match outcome {
+                    Ok((opened_bands, opened_scl)) => {
+                        let built_bands: Result<Vec<RasterAsset>, String> = opened_bands
+                            .into_iter()
+                            .map(|b| {
+                                let relaid = alloc_seq(&mut self.next_relaid);
+                                build_remote_band_asset(b, PixelFormat::R32Float, relaid)
+                            })
+                            .collect();
+                        match built_bands {
+                            Ok(band_assets) => {
+                                let scl_asset = opened_scl.and_then(|s| {
+                                    let relaid = alloc_seq(&mut self.next_relaid);
+                                    match build_remote_band_asset(s, PixelFormat::R8Uint, relaid) {
+                                        Ok(asset) => Some(asset),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                title = %title,
+                                                error = %err,
+                                                "Optional SCL asset stream incompatible; continuing without cloud mask"
+                                            );
+                                            None
+                                        }
+                                    }
+                                });
+                                let id = LayerId(alloc_seq(&mut self.next_layer_id));
+                                let style = BandMathStyle::from_preset(preset, scl_asset.is_some());
+                                let layer = OverlayLayer::from_band_math(
+                                    id,
+                                    title.clone(),
+                                    band_assets,
+                                    scl_asset,
+                                    style,
+                                );
+                                let bounds = self.insert_opened_layer(layer, &mut mutation);
+                                events.push(OverlayIoEvent::RemoteOpened {
+                                    id,
+                                    title,
+                                    display_url,
+                                    bounds,
+                                    fly_to,
+                                });
+                            }
+                            Err(error) => {
+                                events.push(OverlayIoEvent::RemoteFailed {
+                                    title,
+                                    display_url,
+                                    error,
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        events.push(OverlayIoEvent::RemoteFailed {
+                            title,
+                            display_url,
+                            error,
+                        });
+                    }
+                },
             }
         }
 
@@ -174,7 +380,7 @@ impl OverlayManager {
         mutation: &mut OverlayMutation,
     ) -> Option<FootprintBounds> {
         let id = layer.id();
-        let bounds = layer.geo().footprint();
+        let bounds = layer.footprint();
         self.stack.push(layer);
         self.request_band_stats_if_needed(id);
         mutation.changed = true;

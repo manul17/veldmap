@@ -52,11 +52,22 @@ pub(super) struct TiffSourceView<'a> {
     pub(super) source_id: SourceId,
     pub(super) ifds: &'a [CachedIfd],
     pub(super) nodata_f64: Option<f64>,
+    pub(super) per_band_nodata: &'a [Option<f64>],
 }
 
 impl<'a> TiffSourceView<'a> {
     pub(super) fn base_ifd(&self) -> &'a CachedIfd {
         &self.ifds[0]
+    }
+
+    /// Resolve declared nodata for 0-based band `band_index`, falling back to
+    /// the file-wide `GDAL_NODATA` tag when no band-specific override exists.
+    pub(super) fn nodata_for_band(&self, band_index: usize) -> Option<f64> {
+        self.per_band_nodata
+            .get(band_index)
+            .copied()
+            .flatten()
+            .or(self.nodata_f64)
     }
 }
 

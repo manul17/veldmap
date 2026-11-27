@@ -305,7 +305,8 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
         url,
         title: "Test Remote COG".to_owned(),
         extra_headers: Vec::new(),
-        scale_offset: None,
+        external_bands: Vec::new(),
+        is_scl: false,
         fly_to: true,
     })
     .expect("queue remote open");
@@ -466,6 +467,198 @@ fn tile_write_worker_honors_source_purge_and_backoff_wakes_idle_ui() {
         disk_cache.stats().expect("stats").tile_count,
         0,
         "purged pre-reload tile must not flush into SQLite"
+    );
+
+    mgr.begin_shutdown();
+    shutdown.cancel();
+    pending.close();
+    pool.shutdown();
+    mgr.finish_shutdown();
+}
+
+#[test]
+fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readout() {
+    use veldmap_core::tile::{BandKey, PixelFormat};
+    use veldmap_raster::test_support::{write_rgbnir_u16_geotiff, write_scl_u8_geotiff};
+
+    use crate::colormap::{CategoricalPaletteId, sentinel2_scl_class_name};
+    use crate::layers::layer::OverlayLayer;
+    use crate::layers::{
+        BandMathFormula, LayerId, LocalBandMathInput, LocalBandMathSpec, OverlayEdit,
+    };
+
+    let dir = TestTempDir::new("band-math-cursor-refcount");
+
+    // 1. Write a 4-band U16 RGB+NIR GeoTIFF (64x64, EPSG:32637, 10 m/px):
+    //    GDAL_METADATA sets SCALE=0.0001 across all bands.
+    //    Red (band 0) = 0 DN (valid 0.0 reflectance!), Green = 1000, Blue = 500,
+    //    NIR (band 3) = 5000 DN (0.5 reflectance) -> exact NDVI = (0.5 - 0.0) / (0.5 + 0.0) = 1.0!
+    let rgbnir_path = dir.path().join("rgbnir.tif");
+    write_rgbnir_u16_geotiff(&rgbnir_path, 64, 64, [0, 1000, 500, 5000], 0.0001)
+        .expect("write rgbnir");
+
+    // 2. Write a co-registered U8 SCL GeoTIFF (64x64, class 9 = Cloud High Prob on left half,
+    //    class 4 = Vegetation on right half).
+    let scl_path = dir.path().join("scl.tif");
+    write_scl_u8_geotiff(&scl_path, 64, 64, 9, 4).expect("write scl");
+
+    let budget = MemoryBudget::default();
+    let shutdown = CancelToken::new();
+    let pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig::from_budget(&budget),
+        shutdown.clone(),
+    );
+    let mut pending = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
+    let done_tx = pending.sender().expect("upload sender");
+    let wakeup: veldmap_core::sync::Wakeup = Arc::new(|| {});
+    let mut mgr = OverlayManager::new(OverlayManagerDeps {
+        budget,
+        disk_cache: None,
+        net: None,
+        fast_pool: pool.fast_handle(),
+        bulk_pool: pool.bulk_handle(),
+        done_tx,
+        wakeup,
+        shutdown: shutdown.clone(),
+    });
+
+    // Open both local rasters.
+    mgr.begin_open_file(OpenOverlayRequest {
+        path: &rgbnir_path,
+        fly_to: false,
+        visible: true,
+        opacity: 1.0,
+        crs_override: None,
+        style: None,
+    })
+    .expect("open rgbnir");
+    let (rgbnir_id, _bounds) = match wait_for_io_event(&mut mgr) {
+        OverlayIoEvent::Opened { id, bounds, .. } => (id, bounds.expect("bounds")),
+        other => panic!("expected Opened for rgbnir, got {other:?}"),
+    };
+
+    mgr.begin_open_file(OpenOverlayRequest {
+        path: &scl_path,
+        fly_to: false,
+        visible: true,
+        opacity: 1.0,
+        crs_override: None,
+        style: None,
+    })
+    .expect("open scl");
+    let (scl_id, _) = match wait_for_io_event(&mut mgr) {
+        OverlayIoEvent::Opened { id, bounds, .. } => (id, bounds.expect("bounds")),
+        other => panic!("expected Opened for scl, got {other:?}"),
+    };
+
+    // Build a multi-asset BandMath NDVI + SCL layer from the loaded layers.
+    let (bm_id, _, _) = mgr
+        .create_band_math_from_loaded(LocalBandMathSpec {
+            title: "Local NDVI + SCL".to_owned(),
+            formula: BandMathFormula::NormalizedDiff,
+            inputs: vec![
+                LocalBandMathInput {
+                    layer_id: rgbnir_id,
+                    band_index: 3, // NIR = 0.5
+                    label: "NIR".to_owned(),
+                },
+                LocalBandMathInput {
+                    layer_id: rgbnir_id,
+                    band_index: 0, // Red = 0.0 (valid zero!)
+                    label: "Red".to_owned(),
+                },
+            ],
+            scl: Some(LocalBandMathInput {
+                layer_id: scl_id,
+                band_index: 0,
+                label: "SCL".to_owned(),
+            }),
+        })
+        .expect("create local band math");
+
+    // Verify zoom-invariant CPU BandMath cursor readout on both cloud-masked (left)
+    // and clear vegetation (right) halves.
+    let frame = mgr
+        .stack
+        .get(bm_id)
+        .expect("bm layer")
+        .geo()
+        .frame()
+        .clone();
+    let (lat_left, lon_left) = frame.geodetic(0.25, 0.5);
+    let readout_left = wait_for_cursor_readout(&mgr, lat_left, lon_left);
+    match readout_left.value {
+        CursorReadoutValue::BandMath(ref bm) => {
+            let val = bm.computed.expect("NDVI must be valid even when Red=0.0");
+            assert!((val - 1.0).abs() < 1e-9, "expected NDVI=1.0, got {val}");
+            assert_eq!(bm.channels.len(), 2);
+            assert!((bm.channels[0].1.expect("NIR") - 0.5).abs() < 1e-9);
+            assert!(bm.channels[1].1.expect("Red").abs() < 1e-9);
+            assert_eq!(bm.scl_class, Some(9));
+            assert_eq!(
+                bm.scl_class.and_then(sentinel2_scl_class_name),
+                Some("Cloud High Prob.")
+            );
+            assert!(bm.scl_masked, "SCL class 9 must be masked by default");
+        }
+        other => panic!("expected BandMath readout on left, got {other:?}"),
+    }
+
+    let (lat_right, lon_right) = frame.geodetic(0.75, 0.5);
+    let readout_right = wait_for_cursor_readout(&mgr, lat_right, lon_right);
+    match readout_right.value {
+        CursorReadoutValue::BandMath(ref bm) => {
+            assert!((bm.computed.expect("NDVI") - 1.0).abs() < 1e-9);
+            assert_eq!(bm.scl_class, Some(4));
+            assert_eq!(
+                bm.scl_class.and_then(sentinel2_scl_class_name),
+                Some("Vegetation")
+            );
+            assert!(!bm.scl_masked, "SCL class 4 must not be masked");
+        }
+        other => panic!("expected BandMath readout on right, got {other:?}"),
+    }
+
+    // Verify multi-source refcounting: removing rgbnir_id while bm_id still references its SourceId
+    // MUST NOT purge its SourceId; removing bm_id afterward MUST purge it.
+    let rgbnir_src = mgr.stack.get(rgbnir_id).expect("rgbnir").source_id();
+    let mut_rm_orig = mgr.edit_layer(rgbnir_id, OverlayEdit::Remove);
+    assert!(
+        !mut_rm_orig.purge_sources.contains(&rgbnir_src),
+        "shared SourceId must not be purged while BandMath layer still uses it"
+    );
+    let mut_rm_bm = mgr.edit_layer(bm_id, OverlayEdit::Remove);
+    assert!(
+        mut_rm_bm.purge_sources.contains(&rgbnir_src),
+        "SourceId must be purged once the final referencing layer is removed"
+    );
+
+    // Verify SCL asset with `is_scl: true` opens directly on PixelFormat::R8Uint + Sentinel2Scl
+    // (instead of defaulting U8 BlackIsZero to Display RGBA8).
+    let scl_src = mgr
+        .stack
+        .get(scl_id)
+        .expect("scl")
+        .single_asset()
+        .expect("asset");
+    let scl_layer = OverlayLayer::from_scl_source_for_test(
+        LayerId(999),
+        scl_path.clone(),
+        Arc::clone(scl_src.source()),
+        (**scl_src.geo().frame()).clone(),
+    );
+    assert_eq!(
+        scl_layer.single_asset().expect("asset").meta().spec.format,
+        PixelFormat::R8Uint,
+        "SCL asset must explicitly open on R8Uint"
+    );
+    assert_eq!(
+        scl_layer.single_asset().expect("asset").meta().spec.band,
+        BandKey::Index(0)
+    );
+    assert_eq!(
+        scl_layer.style().categorical_palette(),
+        CategoricalPaletteId::Sentinel2Scl
     );
 
     mgr.begin_shutdown();

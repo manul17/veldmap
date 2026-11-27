@@ -16,17 +16,21 @@ pub enum ColormapId {
     Plasma,
     Turbo,
     RdBu,
+    RdYlGn,
+    BrBG,
     Terrain,
 }
 
 impl ColormapId {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Grayscale,
         Self::Viridis,
         Self::Inferno,
         Self::Plasma,
         Self::Turbo,
         Self::RdBu,
+        Self::RdYlGn,
+        Self::BrBG,
         Self::Terrain,
     ];
 
@@ -38,6 +42,8 @@ impl ColormapId {
             Self::Plasma => "Plasma",
             Self::Turbo => "Turbo",
             Self::RdBu => "RdBu (Diverging)",
+            Self::RdYlGn => "RdYlGn (NDVI)",
+            Self::BrBG => "BrBG (NDWI)",
             Self::Terrain => "Terrain",
         }
     }
@@ -185,6 +191,36 @@ const RDBU_STOPS: &[[u8; 3]] = &[
     [5, 48, 97],
 ];
 
+/// ColorBrewer diverging Red–Yellow–Green palette (EO standard for NDVI).
+const RDYLGN_STOPS: &[[u8; 3]] = &[
+    [165, 0, 38],
+    [215, 48, 39],
+    [244, 109, 67],
+    [253, 174, 97],
+    [254, 224, 139],
+    [255, 255, 191],
+    [217, 239, 139],
+    [166, 217, 106],
+    [102, 189, 99],
+    [26, 152, 80],
+    [0, 104, 55],
+];
+
+/// ColorBrewer diverging Brown–White–Blue-Green palette (EO standard for NDWI).
+const BRBG_STOPS: &[[u8; 3]] = &[
+    [84, 48, 5],
+    [140, 81, 10],
+    [191, 129, 45],
+    [223, 194, 125],
+    [246, 232, 195],
+    [245, 245, 245],
+    [199, 234, 229],
+    [128, 205, 193],
+    [53, 151, 143],
+    [1, 102, 94],
+    [0, 60, 48],
+];
+
 const TERRAIN_STOPS: &[[u8; 3]] = &[
     [32, 74, 135],
     [52, 132, 168],
@@ -211,6 +247,8 @@ pub(crate) fn sample_colormap_srgb(colormap: ColormapId, t: f32, invert: bool) -
         ColormapId::Plasma => PLASMA_STOPS,
         ColormapId::Turbo => TURBO_STOPS,
         ColormapId::RdBu => RDBU_STOPS,
+        ColormapId::RdYlGn => RDYLGN_STOPS,
+        ColormapId::BrBG => BRBG_STOPS,
         ColormapId::Terrain => TERRAIN_STOPS,
     };
     sample_stops_srgb(stops, u)
@@ -263,6 +301,32 @@ fn distinct_class_srgb(idx: usize) -> [u8; 4] {
         (b * 255.0).round() as u8,
         255,
     ]
+}
+
+/// Official ESA Sentinel-2 L2A Scene Classification Layer (`SCL`) class names (0..=11).
+pub(crate) const SENTINEL2_SCL_NAMES: [&str; 12] = [
+    "No Data",
+    "Saturated / Defective",
+    "Dark Area / Cast Shadows",
+    "Cloud Shadows",
+    "Vegetation",
+    "Not Vegetated",
+    "Water",
+    "Unclassified",
+    "Cloud Medium Prob.",
+    "Cloud High Prob.",
+    "Thin Cirrus",
+    "Snow / Ice",
+];
+
+/// Default Sentinel-2 L2A `SCL` cloud/shadow/nodata mask bitmask
+/// (classes `0, 1, 3, 8, 9, 10`).
+pub(crate) const DEFAULT_SCL_MASK_BITS: u32 =
+    (1 << 0) | (1 << 1) | (1 << 3) | (1 << 8) | (1 << 9) | (1 << 10);
+
+/// Look up the official ESA Sentinel-2 L2A `SCL` class name for `class_id`.
+pub(crate) fn sentinel2_scl_class_name(class_id: u16) -> Option<&'static str> {
+    SENTINEL2_SCL_NAMES.get(usize::from(class_id)).copied()
 }
 
 /// Official ESA Sentinel-2 L2A Scene Classification Layer (`SCL`) colors (0..=11).

@@ -278,6 +278,24 @@ impl StacAsset {
         let b = self.raster_bands.first()?;
         combine_scale_offset(b.scale, b.offset)
     }
+
+    /// Return whether this asset represents a Sentinel-2 Scene Classification
+    /// Layer (`SCL`) GeoTIFF.
+    pub fn is_scl_asset(&self) -> bool {
+        if !self.is_geotiff_http() {
+            return false;
+        }
+        if self.key.eq_ignore_ascii_case("scl") {
+            return true;
+        }
+        if let Some(title) = &self.title {
+            let lower = title.to_ascii_lowercase();
+            if lower.contains("scene classification") || lower == "scl" {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Single parsed STAC Item returned from `/search`.
@@ -316,6 +334,35 @@ impl StacItem {
     /// selection (visual/TCI first, then spectral bands, SCL, and DEM data).
     pub fn cog_assets(&self) -> Vec<&StacAsset> {
         self.assets.iter().filter(|a| a.is_geotiff_http()).collect()
+    }
+
+    /// Find the highest-priority HTTP(S) GeoTIFF asset matching any alias in
+    /// `aliases` (checking exact asset keys first in priority order, then
+    /// `eo:bands` common names / band names).
+    pub fn find_band_asset(&self, aliases: &[&str]) -> Option<&StacAsset> {
+        for alias in aliases {
+            if let Some(asset) = self
+                .assets
+                .iter()
+                .find(|a| a.is_geotiff_http() && a.key.eq_ignore_ascii_case(alias))
+            {
+                return Some(asset);
+            }
+        }
+        for alias in aliases {
+            if let Some(asset) = self.assets.iter().find(|a| {
+                a.is_geotiff_http() && a.eo_bands.iter().any(|b| b.eq_ignore_ascii_case(alias))
+            }) {
+                return Some(asset);
+            }
+        }
+        None
+    }
+
+    /// Return the item's Sentinel-2 Scene Classification Layer (`SCL`) GeoTIFF
+    /// asset, if present.
+    pub fn scl_asset(&self) -> Option<&StacAsset> {
+        self.assets.iter().find(|a| a.is_scl_asset())
     }
 }
 

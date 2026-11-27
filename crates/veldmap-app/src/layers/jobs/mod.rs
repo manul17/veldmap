@@ -19,8 +19,8 @@ use veldmap_raster::{
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 
+use super::asset::RasterAsset;
 use super::runtime::OverlayRuntime;
-use super::stack::OverlayLayer;
 
 use self::pass::{PassJobSpec, submit_pass_job};
 use self::pointwise::submit_pointwise_job;
@@ -53,8 +53,8 @@ async fn prefetch_coalesced_ranges(
         .map(Some)
 }
 
-pub(super) fn schedule_layer_rungs(
-    layer: &OverlayLayer,
+pub(super) fn schedule_asset_rungs(
+    asset: &RasterAsset,
     ladder_cells: &[(u8, Vec<(u32, u32)>)],
     runtime: &Arc<OverlayRuntime>,
     gpu_cache: &GpuTileCache,
@@ -65,7 +65,7 @@ pub(super) fn schedule_layer_rungs(
     // rung block finer rungs.
     for (rung, rung_cells) in ladder_cells {
         let rung = *rung;
-        let Some(plan) = layer.meta().level(rung) else {
+        let Some(plan) = asset.meta().level(rung) else {
             continue;
         };
         if !plan.fits || rung_cells.is_empty() {
@@ -73,13 +73,13 @@ pub(super) fn schedule_layer_rungs(
         }
         let candidates: Vec<TileKey> = rung_cells
             .iter()
-            .map(|&(x, y)| layer.meta().tile_key(rung, x, y))
+            .map(|&(x, y)| asset.meta().tile_key(rung, x, y))
             .collect();
 
         match plan.serve {
             ServeMode::Pointwise => {
                 let (admitted, rung_unfinished) = runtime.admit_pointwise_rung(
-                    layer.meta(),
+                    asset.meta(),
                     rung,
                     &candidates,
                     gpu_cache,
@@ -88,9 +88,9 @@ pub(super) fn schedule_layer_rungs(
                 for tile in admitted {
                     if !submit_pointwise_job(
                         tile,
-                        layer.source(),
-                        layer.remote_range(),
-                        layer.fingerprint_hex(),
+                        asset.source(),
+                        asset.remote_range(),
+                        asset.fingerprint_hex(),
                         runtime,
                     ) {
                         break;
@@ -102,7 +102,7 @@ pub(super) fn schedule_layer_rungs(
             }
             ServeMode::Pass { from } => {
                 let (admitted_pass, pass_active) = runtime.admit_pass_rung(
-                    layer.meta(),
+                    asset.meta(),
                     rung,
                     from,
                     &candidates,
@@ -112,10 +112,10 @@ pub(super) fn schedule_layer_rungs(
                 if let Some(admitted) = admitted_pass {
                     submit_pass_job(PassJobSpec {
                         admitted,
-                        wanted_shared: layer.wanted_shared(),
-                        source: Arc::clone(layer.source()),
-                        meta: layer.meta().clone(),
-                        fingerprint_hex: layer.fingerprint_hex().to_owned(),
+                        wanted_shared: asset.stream().wanted_shared(),
+                        source: Arc::clone(asset.source()),
+                        meta: asset.meta().clone(),
+                        fingerprint_hex: asset.fingerprint_hex().to_owned(),
                         runtime: Arc::clone(runtime),
                     });
                 }

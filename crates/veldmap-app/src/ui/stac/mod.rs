@@ -11,10 +11,12 @@ mod search_form;
 
 use eframe::egui;
 use veldmap_core::geo::FootprintBounds;
+use veldmap_raster::ExternalBandMeta;
 
+use crate::layers::BandMathPreset;
 use crate::stac::{
-    RedactedUrl, SampleSceneView, StacCatalogPreset, StacCogAuthMode, StacSearchRequest,
-    StacViewSnapshot,
+    RedactedUrl, SampleRecipeView, SampleSceneView, StacCatalogPreset, StacCogAuthMode,
+    StacRecipeAssetView, StacSearchRequest, StacViewSnapshot,
 };
 use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
@@ -44,7 +46,15 @@ pub(crate) enum StacUiAction {
         url: RedactedUrl,
         title: String,
         auth_mode: StacCogAuthMode,
-        scale_offset: Option<(f64, f64)>,
+        external_bands: Vec<ExternalBandMeta>,
+        is_scl: bool,
+    },
+    OpenRecipe {
+        title: String,
+        preset: BandMathPreset,
+        auth_mode: StacCogAuthMode,
+        bands: Vec<StacRecipeAssetView>,
+        scl: Option<StacRecipeAssetView>,
     },
     OpenStacSettings,
 }
@@ -92,12 +102,42 @@ impl StacUiState {
 fn show_sample_scenes_section(
     ui: &mut egui::Ui,
     samples: &[SampleSceneView],
+    recipes: &[SampleRecipeView],
     actions: &mut Vec<StacUiAction>,
 ) {
     egui::CollapsingHeader::new(egui::RichText::new("Quick-Open Sample Scenes").strong())
         .id_salt("stac_sample_scenes")
         .default_open(true)
         .show(ui, |ui| {
+            for recipe in recipes {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(130, 220, 145),
+                            egui::RichText::new("Recipe").small().strong(),
+                        );
+                        ui.strong(recipe.title);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("Open")
+                                .on_hover_text(
+                                    "Stream this public multi-band Sentinel-2 recipe with SCL masking",
+                                )
+                                .clicked()
+                            {
+                                actions.push(StacUiAction::OpenRecipe {
+                                    title: recipe.title.to_owned(),
+                                    preset: recipe.preset,
+                                    auth_mode: StacCogAuthMode::None,
+                                    bands: recipe.bands.clone(),
+                                    scl: recipe.scl.clone(),
+                                });
+                            }
+                        });
+                    });
+                    ui.weak(egui::RichText::new(recipe.description).small());
+                });
+            }
             for sample in samples {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
@@ -112,7 +152,8 @@ fn show_sample_scenes_section(
                                     url: RedactedUrl::new(sample.cog_url),
                                     title: sample.title.to_owned(),
                                     auth_mode: StacCogAuthMode::None,
-                                    scale_offset: sample.scale_offset,
+                                    external_bands: sample.external_bands.clone(),
+                                    is_scl: false,
                                 });
                             }
                         });
@@ -161,7 +202,8 @@ fn show_direct_cog_section(
                         url,
                         title,
                         auth_mode,
-                        scale_offset: None,
+                        external_bands: Vec::new(),
+                        is_scl: false,
                     });
                 }
             });
@@ -186,7 +228,7 @@ pub(crate) fn show_stac_tab_contents(
         .id_salt("stac_workbench_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            show_sample_scenes_section(ui, stac.sample_scenes, &mut actions);
+            show_sample_scenes_section(ui, stac.sample_scenes, stac.sample_recipes, &mut actions);
             ui.add_space(4.0);
             show_direct_cog_section(ui, state, &mut actions);
             ui.separator();
@@ -242,7 +284,8 @@ mod tests {
             url: RedactedUrl::new("https://user:pw@blob.example/a.tif?sig=top_secret"),
             title: "Test".to_owned(),
             auth_mode: StacCogAuthMode::DirectCustom,
-            scale_offset: None,
+            external_bands: Vec::new(),
+            is_scl: false,
         };
         let action_dbg = format!("{action:?}");
         assert!(

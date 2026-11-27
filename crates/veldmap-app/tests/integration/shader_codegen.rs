@@ -7,8 +7,10 @@ use naga::back::{hlsl, msl, spv};
 use naga::proc::Layouter;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use veldmap_app::render::{
-    COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL, OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL,
-    UNIFORM_LAYOUT_SPECS, UniformLayoutSpec, VECTOR_WGSL,
+    BAND_MATH_COMPOSITE_WGSL, BAND_MATH_MASK_WGSL, BAND_MATH_SCRATCH_MRT_WGSL,
+    BAND_MATH_SCRATCH_WGSL, COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL,
+    OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL, SCRATCH_NAN_FILL_WGSL, UNIFORM_LAYOUT_SPECS,
+    UniformLayoutSpec, VECTOR_WGSL,
 };
 
 fn parse_and_validate(name: &str, wgsl_source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
@@ -121,6 +123,15 @@ fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
         validate_and_compile_all_backends("overlay_categorical.wgsl", OVERLAY_CATEGORICAL_WGSL);
     let vector = validate_and_compile_all_backends("vector.wgsl", VECTOR_WGSL);
     let _composite = validate_and_compile_all_backends("composite.wgsl", COMPOSITE_WGSL);
+    let scratch_clear =
+        validate_and_compile_all_backends("scratch_nan_fill.wgsl", SCRATCH_NAN_FILL_WGSL);
+    let bm_scratch =
+        validate_and_compile_all_backends("band_math_scratch.wgsl", BAND_MATH_SCRATCH_WGSL);
+    let bm_scratch_mrt =
+        validate_and_compile_all_backends("band_math_scratch_mrt.wgsl", BAND_MATH_SCRATCH_MRT_WGSL);
+    let bm_mask = validate_and_compile_all_backends("band_math_mask.wgsl", BAND_MATH_MASK_WGSL);
+    let bm_composite =
+        validate_and_compile_all_backends("band_math_composite.wgsl", BAND_MATH_COMPOSITE_WGSL);
 
     let shader_uniforms: &[(&naga::Module, &[&str])] = &[
         (&globe, &["CameraUniform", "TileUniform"]),
@@ -134,6 +145,17 @@ fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
             &["CameraUniform", "CategoricalPatchUniform", "PaletteUniform"],
         ),
         (&vector, &["CameraUniform", "VectorUniform"]),
+        (&scratch_clear, &["ScratchClearUniform"]),
+        (&bm_scratch, &["CameraUniform", "ScratchSinglePatchUniform"]),
+        (
+            &bm_scratch_mrt,
+            &["CameraUniform", "ScratchMrtPatchUniform"],
+        ),
+        (&bm_mask, &["CameraUniform", "ScratchSinglePatchUniform"]),
+        (
+            &bm_composite,
+            &["BandMathCompositeUniform", "PaletteUniform"],
+        ),
     ];
 
     let mut verified = HashSet::new();

@@ -136,9 +136,10 @@ fn infer_processing_level(
         })
         .or_else(|| {
             collection.and_then(|c| {
-                if c.contains("l2a") {
+                let lower = c.to_ascii_lowercase();
+                if lower.contains("l2a") {
                     Some("L2A (BOA)".to_owned())
-                } else if c.contains("l1c") {
+                } else if lower.contains("l1c") {
                     Some("L1C (TOA)".to_owned())
                 } else {
                     None
@@ -235,16 +236,23 @@ fn parse_stac_asset(key: &str, val: &Value) -> Option<StacAsset> {
         .unwrap_or_default();
     let eo_bands = obj
         .get("eo:bands")
+        .or_else(|| obj.get("bands"))
         .and_then(Value::as_array)
         .map(|arr| {
-            arr.iter()
-                .filter_map(|b| {
-                    b.get("common_name")
-                        .or_else(|| b.get("name"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .collect()
+            let mut out = Vec::new();
+            for b in arr {
+                for field in ["common_name", "name"] {
+                    if let Some(s) = b.get(field).and_then(Value::as_str).map(str::trim)
+                        && !s.is_empty()
+                        && !out
+                            .iter()
+                            .any(|existing: &String| existing.eq_ignore_ascii_case(s))
+                    {
+                        out.push(s.to_owned());
+                    }
+                }
+            }
+            out
         })
         .unwrap_or_default();
     let gsd = obj.get("gsd").and_then(Value::as_f64);
@@ -347,5 +355,68 @@ mod tests {
         let payload = build_search_payload("sentinel-1-grd", &q);
         assert!(payload.get("bbox").is_none());
         assert!(payload.get("query").is_none());
+    }
+
+    #[test]
+    fn parses_processing_level_eo_bands_scl_and_prefers_nir_over_nir08() {
+        let json: Value = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "id": "S2A_32TMS_20240715_0_L2A",
+                "collection": "sentinel-2-l2a",
+                "bbox": [7.5, 45.8, 9.2, 47.1],
+                "properties": {
+                    "datetime": "2024-07-15T10:20:30Z",
+                    "platform": "sentinel-2a",
+                    "s2:processing_level": "level-2a",
+                    "eo:cloud_cover": 4.2
+                },
+                "assets": {
+                    "nir08": {
+                        "href": "https://example.org/B8A.tif",
+                        "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                        "roles": ["data", "reflectance"],
+                        "eo:bands": [{"name": "B8A", "common_name": "nir08"}]
+                    },
+                    "nir": {
+                        "href": "https://example.org/B08.tif",
+                        "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                        "roles": ["data", "reflectance"],
+                        "eo:bands": [{"name": "B08", "common_name": "nir"}],
+                        "raster:bands": [{"scale": 0.0001, "offset": -0.1, "nodata": 0, "unit": "reflectance"}]
+                    },
+                    "red": {
+                        "href": "https://example.org/B04.tif",
+                        "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                        "roles": ["data"],
+                        "bands": [{"name": "B04", "eo:common_name": "red"}]
+                    },
+                    "scl": {
+                        "href": "https://example.org/SCL.tif",
+                        "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                        "roles": ["data", "scl"]
+                    }
+                }
+            }]
+        });
+        let parsed = parse_search_response(&json).expect("parse");
+        let item = &parsed.items[0];
+        assert_eq!(item.processing_level.as_deref(), Some("L2A (BOA)"));
+        assert_eq!(item.platform.as_deref(), Some("sentinel-2a"));
+        // Prefer 10m nir/B08 over 20m nir08/B8A.
+        let nir = item
+            .find_band_asset(&["nir", "b08", "nir08", "b8a"])
+            .expect("find nir");
+        assert_eq!(nir.key, "nir");
+        assert!(nir.eo_bands.iter().any(|b| b == "nir"));
+        assert!(nir.eo_bands.iter().any(|b| b == "B08"));
+        // STAC 1.1 `bands` fallback populates `eo_bands` for `red`.
+        let red = item.find_band_asset(&["red", "b04"]).expect("find red");
+        assert_eq!(red.key, "red");
+        // SCL asset detected cleanly.
+        let scl = item.scl_asset().expect("find scl");
+        assert_eq!(scl.key, "scl");
+        assert!(scl.is_scl_asset());
     }
 }

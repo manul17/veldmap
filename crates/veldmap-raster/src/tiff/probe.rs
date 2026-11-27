@@ -192,7 +192,7 @@ pub(super) fn sample_indexed_band(
     if needs_raw_f64 {
         sample_raw_f64_band(view, base, band_idx, scale_offset, loc, ctx)
     } else {
-        sample_cached_band(view, base, spec, scale_offset, loc, ctx)
+        sample_cached_band(view, base, spec, band_idx, scale_offset, loc, ctx)
     }
 }
 
@@ -200,6 +200,7 @@ fn sample_cached_band(
     view: TiffSourceView<'_>,
     base: &CachedIfd,
     spec: TileStreamSpec,
+    band_idx: usize,
     (scale, offset): (f64, f64),
     loc: ChunkPixelLoc,
     ctx: &DecodeContext<'_>,
@@ -217,12 +218,13 @@ fn sample_cached_band(
         return Ok(BandSample::Unavailable);
     }
     let pix_idx = (loc.local_y as usize) * (chunk.width as usize) + (loc.local_x as usize);
+    let band_nodata = view.nodata_for_band(band_idx);
     match spec.format {
         PixelFormat::R8Uint => {
             let Some(&v) = chunk.data.get(pix_idx) else {
                 return Ok(BandSample::Unavailable);
             };
-            Ok(categorical_sample(u16::from(v), view.nodata_f64))
+            Ok(categorical_sample(u16::from(v), band_nodata))
         }
         PixelFormat::R16Uint => {
             let off = pix_idx * 2;
@@ -230,7 +232,7 @@ fn sample_cached_band(
                 return Ok(BandSample::Unavailable);
             };
             let v = u16::from_ne_bytes([slice[0], slice[1]]);
-            Ok(categorical_sample(v, view.nodata_f64))
+            Ok(categorical_sample(v, band_nodata))
         }
         PixelFormat::R32Float => {
             let off = pix_idx * 4;
@@ -278,5 +280,10 @@ fn sample_raw_f64_band(
     let Some(raw) = read_native_sample_f64(&data, base.sample_type, sample_idx) else {
         return Ok(BandSample::Unavailable);
     };
-    Ok(scalar_sample(raw, view.nodata_f64, scale, offset))
+    Ok(scalar_sample(
+        raw,
+        view.nodata_for_band(band_idx),
+        scale,
+        offset,
+    ))
 }

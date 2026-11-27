@@ -5,6 +5,7 @@
 use eframe::egui;
 use veldmap_core::geo::Camera;
 
+use crate::colormap::sentinel2_scl_class_name;
 use crate::layers::{CursorReadout, CursorReadoutValue};
 
 use super::format;
@@ -38,9 +39,9 @@ pub(crate) fn show_status_bar(ui: &mut egui::Ui, inputs: StatusBarInputs<'_>) {
 
             if let Some(readout) = cursor_readout {
                 ui.separator();
-                let val_text = match readout.value {
+                let val_text = match &readout.value {
                     CursorReadoutValue::Rgba([r, g, b, a]) => {
-                        if a == 255 {
+                        if *a == 255 {
                             format!(
                                 "RGB({r},{g},{b}) @ ({},{})",
                                 readout.pixel.0, readout.pixel.1
@@ -58,26 +59,76 @@ pub(crate) fn show_status_bar(ui: &mut egui::Ui, inputs: StatusBarInputs<'_>) {
                             .as_deref()
                             .map(|u| format!(" {u}"))
                             .unwrap_or_default();
-                        let db_part = if readout.log10_db && physical > 0.0 {
+                        let db_part = if readout.log10_db && *physical > 0.0 {
                             format!(" ({:.2} dB)", 10.0 * physical.log10())
                         } else {
                             String::new()
                         };
                         let raw_part = if readout.has_affine_scaling {
-                            format!(" [raw {}]", format::format_scalar(raw))
+                            format!(" [raw {}]", format::format_scalar(*raw))
                         } else {
                             String::new()
                         };
                         format!(
                             "Val: {}{unit}{db_part}{raw_part} @ ({},{})",
-                            format::format_scalar(physical),
+                            format::format_scalar(*physical),
                             readout.pixel.0,
                             readout.pixel.1
                         )
                     }
-                    CursorReadoutValue::Categorical(class_id) => {
-                        format!(
+                    CursorReadoutValue::Categorical {
+                        class_id,
+                        class_name,
+                    } => match class_name {
+                        Some(name) => format!(
+                            "SCL {class_id}: {name} @ ({},{})",
+                            readout.pixel.0, readout.pixel.1
+                        ),
+                        None => format!(
                             "Class {class_id} @ ({},{})",
+                            readout.pixel.0, readout.pixel.1
+                        ),
+                    },
+                    CursorReadoutValue::BandMath(bm) => {
+                        let ch_str = bm
+                            .channels
+                            .iter()
+                            .map(|(lbl, val)| match val {
+                                Some(v) => format!("{lbl}: {}", format::format_scalar(*v)),
+                                None => format!("{lbl}: nodata"),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let scl_str = match bm.scl_class {
+                            Some(cls) => match sentinel2_scl_class_name(cls) {
+                                Some(name) => format!(" · SCL {cls}: {name}"),
+                                None => format!(" · SCL {cls}"),
+                            },
+                            None => String::new(),
+                        };
+                        let main_str = if bm.scl_masked {
+                            format!("{}: masked ({ch_str})", bm.formula_label)
+                        } else if bm.is_scalar {
+                            match bm.computed {
+                                Some(v) => {
+                                    let unit = readout
+                                        .units
+                                        .as_deref()
+                                        .map(|u| format!(" {u}"))
+                                        .unwrap_or_default();
+                                    format!(
+                                        "{}: {}{unit} ({ch_str})",
+                                        bm.formula_label,
+                                        format::format_scalar(v)
+                                    )
+                                }
+                                None => format!("{}: nodata ({ch_str})", bm.formula_label),
+                            }
+                        } else {
+                            format!("{}: ({ch_str})", bm.formula_label)
+                        };
+                        format!(
+                            "{main_str}{scl_str} @ ({},{})",
                             readout.pixel.0, readout.pixel.1
                         )
                     }

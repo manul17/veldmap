@@ -229,7 +229,7 @@ impl<'a> TiffChunkReader<'a> {
             ifd,
             band,
             pixels,
-            self.view.nodata_f64,
+            self.view.nodata_for_band(band),
         ))
     }
 
@@ -248,7 +248,7 @@ impl<'a> TiffChunkReader<'a> {
             return Ok(sparse_categorical_chunk(
                 format,
                 pixels,
-                self.view.nodata_f64,
+                self.view.nodata_for_band(band),
             ));
         };
         convert_categorical_chunk(data, ifd, band, pixels, format)

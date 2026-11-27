@@ -9,6 +9,7 @@ use veldmap_core::tile::{QuadTileId, QuadtreeConfig, SourceId, TileKey, VisibleT
 
 use crate::colormap::{CategoricalPaletteId, ColormapId};
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
+use crate::layers::BandMathFormula;
 
 use super::graticule::adaptive_grid_step_deg;
 
@@ -99,18 +100,129 @@ pub enum DrawOverlayTrack {
     },
 }
 
+/// Single float input band rasterized into a viewport-sized `R32Float` scratch
+/// target for [`DrawBandMathLayer`].
+#[derive(Clone, Debug)]
+pub struct DrawScratchBand {
+    pub frame: Arc<Frame>,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub segments: u32,
+    pub scale: f32,
+    pub offset: f32,
+    pub patches: Vec<DrawOverlayPatch>,
+}
+
+/// Optional discrete `R8Uint` QA / `SCL` mask rasterized nearest-neighbor into
+/// the viewport-sized `R8Uint` scratch target for [`DrawBandMathLayer`].
+#[derive(Clone, Debug)]
+pub struct DrawScratchMask {
+    pub frame: Arc<Frame>,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub segments: u32,
+    pub nodata_value: Option<u32>,
+    pub patches: Vec<DrawOverlayPatch>,
+}
+
+/// Multi-band screen-space float band-math & RGB composite draw payload.
+#[derive(Clone, Debug)]
+pub struct DrawBandMathLayer {
+    pub formula: BandMathFormula,
+    pub colormap: ColormapId,
+    pub invert_colormap: bool,
+    pub stretch_min: f32,
+    pub stretch_max: f32,
+    pub rgb_min: [f32; 3],
+    pub rgb_max: [f32; 3],
+    pub rgb_gamma: f32,
+    pub scl_mask_enabled: bool,
+    pub scl_mask_bits: u32,
+    pub bands: Vec<DrawScratchBand>,
+    pub scl: Option<DrawScratchMask>,
+}
+
+fn frames_share_exact_grid(a: &Arc<Frame>, b: &Arc<Frame>) -> bool {
+    if Arc::ptr_eq(a, b) {
+        return true;
+    }
+    const EPS_DEG: f64 = 1e-10;
+    for (fx, fy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+        let (la, loa) = a.geodetic(fx, fy);
+        let (lb, lob) = b.geodetic(fx, fy);
+        if (la - lb).abs() > EPS_DEG || (loa - lob).abs() > EPS_DEG {
+            return false;
+        }
+    }
+    true
+}
+
+impl DrawBandMathLayer {
+    /// Return whether all active float bands share one geodetic grid, image
+    /// dimensions, subdivision density, and identical patch `cell_rect` list
+    /// so they can be rasterized in a single MRT render pass (`2..=4` `R32Float`
+    /// attachments, fitting `downlevel_defaults()` `max_color_attachments = 4`).
+    pub fn can_use_mrt(&self) -> bool {
+        if self.bands.len() < 2 || self.bands.len() > 4 {
+            return false;
+        }
+        let first = &self.bands[0];
+        if first.patches.is_empty() {
+            return false;
+        }
+        self.bands[1..].iter().all(|band| {
+            first.image_width == band.image_width
+                && first.image_height == band.image_height
+                && first.segments == band.segments
+                && first.patches.len() == band.patches.len()
+                && frames_share_exact_grid(&first.frame, &band.frame)
+                && first
+                    .patches
+                    .iter()
+                    .zip(&band.patches)
+                    .all(|(p0, p1)| p0.cell_rect == p1.cell_rect)
+        })
+    }
+}
+
+/// Direct single-asset or multi-asset scratch-backed overlay draw content.
+#[derive(Clone, Debug)]
+pub enum DrawOverlayContent {
+    Direct {
+        track: DrawOverlayTrack,
+        frame: Arc<Frame>,
+        image_width: u32,
+        image_height: u32,
+        segments: u32,
+        patches: Vec<DrawOverlayPatch>,
+    },
+    BandMath(Box<DrawBandMathLayer>),
+}
+
 /// Ordered draped raster overlay layer in painter's order (bottom-to-top).
 #[derive(Clone, Debug)]
 pub struct DrawOverlayLayer {
     pub opacity: f32,
-    pub track: DrawOverlayTrack,
-    pub frame: Arc<Frame>,
-    pub image_width: u32,
-    pub image_height: u32,
-    /// Uniform warp-mesh subdivisions per cell side for this layer's active
-    /// pyramid level (shared by every patch in `patches` to prevent T-junctions).
-    pub segments: u32,
-    pub patches: Vec<DrawOverlayPatch>,
+    pub content: DrawOverlayContent,
+}
+
+impl DrawOverlayLayer {
+    /// Return `(float_band_count, needs_u8_mask)` required in the shared
+    /// viewport scratch target pool for this layer (`(0, false)` for direct
+    /// overlays).
+    pub(crate) fn scratch_requirements(&self) -> (usize, bool) {
+        match &self.content {
+            DrawOverlayContent::Direct { .. } => (0, false),
+            DrawOverlayContent::BandMath(bm) => {
+                let float_bands = bm.bands.len().min(4);
+                let needs_mask = bm
+                    .scl
+                    .as_ref()
+                    .is_some_and(|m| bm.scl_mask_enabled && !m.patches.is_empty());
+                (float_bands, needs_mask)
+            }
+        }
+    }
 }
 
 /// Typed GPU buffer cache key for [`DrawVectorLayer`], keeping loaded vector

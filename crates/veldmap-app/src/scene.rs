@@ -25,11 +25,33 @@ use crate::gpu_tiles::{
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::layers::{
-    CrsOverride, CursorReadout, LayerId, OpenOverlayRequest, OverlayEdit, OverlayFrameCtx,
-    OverlayIoEvent, OverlayManager, OverlayManagerDeps, OverlayMutation, RemoteCogRequest,
+    CrsOverride, CursorReadout, LayerId, LocalBandMathSpec, OpenOverlayRequest, OverlayEdit,
+    OverlayFrameCtx, OverlayIoEvent, OverlayManager, OverlayManagerDeps, OverlayMutation,
+    RemoteBandMathRequest, RemoteCogRequest,
 };
 use crate::measure::MeasureSession;
-use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
+use crate::render::{
+    DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy, estimate_viewport_target_vram_bytes,
+};
+
+/// Hard minimum `GpuTileCache` VRAM floor (`64 MiB`) enforced when subtracting
+/// dynamic viewport `OffscreenTarget` + Band Math scratch VRAM from the total
+/// GPU cache budget, ensuring 5K HiDPI viewports on 4–8 GiB hosts never starve
+/// `GpuTileCache` to `0`.
+pub(crate) const MIN_GPU_TILE_CACHE_FLOOR_BYTES: usize = 64 * 1024 * 1024;
+
+/// Compute the effective `GpuTileCache` byte cap after accounting for dynamic
+/// viewport `OffscreenTarget` + active Band Math scratch target VRAM, subject
+/// to [`MIN_GPU_TILE_CACHE_FLOOR_BYTES`].
+pub(crate) fn effective_gpu_tile_cache_cap(
+    total_vram_budget_bytes: usize,
+    reserved_target_vram_bytes: usize,
+) -> usize {
+    let floor = MIN_GPU_TILE_CACHE_FLOOR_BYTES.min(total_vram_budget_bytes);
+    total_vram_budget_bytes
+        .saturating_sub(reserved_target_vram_bytes)
+        .max(floor)
+}
 use crate::stac::StacSession;
 use crate::storage::settings::BasemapConfigView;
 use crate::vectors::{VectorEdit, VectorIoEvent, VectorLayerId, VectorManager, is_geojson_path};
@@ -110,6 +132,8 @@ struct CachedFrameSnapshot {
 pub(crate) struct SceneState {
     gpu_tile_cache: GpuTileCache,
     default_gpu_tile_cache_bytes: usize,
+    total_gpu_vram_budget_bytes: usize,
+    reserved_target_vram_bytes: usize,
     pending_uploads: PendingUploads,
     decode_shutdown: CancelToken,
     decode_pool: Option<TwoLaneDecodePool>,
@@ -178,10 +202,12 @@ impl SceneState {
             shutdown: decode_shutdown.clone(),
         });
 
-        let gpu_cap = gpu_tile_cache_override_bytes.unwrap_or(budget.gpu_tile_cache_bytes);
+        let total_vram = gpu_tile_cache_override_bytes.unwrap_or(budget.gpu_tile_cache_bytes);
         let scene = Self {
-            gpu_tile_cache: GpuTileCache::new(gpu_cap),
+            gpu_tile_cache: GpuTileCache::new(total_vram),
             default_gpu_tile_cache_bytes: budget.gpu_tile_cache_bytes,
+            total_gpu_vram_budget_bytes: total_vram,
+            reserved_target_vram_bytes: 0,
             pending_uploads,
             decode_shutdown,
             decode_pool: Some(decode_pool),
@@ -283,6 +309,42 @@ impl SceneState {
     /// Queue a non-blocking remote Cloud-Optimized GeoTIFF open.
     pub(crate) fn begin_open_remote_cog(&self, request: RemoteCogRequest) -> Result<(), String> {
         self.overlays.begin_open_remote_cog(request)
+    }
+
+    /// Queue a non-blocking multi-asset STAC Band Math / RGB recipe open.
+    pub(crate) fn begin_open_remote_band_math(
+        &self,
+        request: RemoteBandMathRequest,
+    ) -> Result<(), String> {
+        self.overlays.begin_open_remote_band_math(request)
+    }
+
+    /// Construct a `BandMath` layer from already-loaded local or remote raster
+    /// layers and synchronize caches and `scene_generation`.
+    pub(crate) fn create_band_math_from_loaded(
+        &mut self,
+        spec: LocalBandMathSpec,
+    ) -> Result<(LayerId, Option<veldmap_core::geo::FootprintBounds>), String> {
+        let (id, bounds, mutation) = self.overlays.create_band_math_from_loaded(spec)?;
+        let _ = self.apply_overlay_mutation(mutation);
+        Ok((id, bounds))
+    }
+
+    /// Dynamically adjust `GpuTileCache`'s effective byte cap to account for
+    /// the current viewport `OffscreenTarget` + active Band Math scratch pool
+    /// VRAM while preserving [`MIN_GPU_TILE_CACHE_FLOOR_BYTES`].
+    pub(crate) fn update_viewport_target_vram(&mut self, width_px: u32, height_px: u32) {
+        let (float_bands, needs_mask) = self.overlays.max_scratch_requirements();
+        let reserved =
+            estimate_viewport_target_vram_bytes(width_px, height_px, float_bands, needs_mask);
+        if self.reserved_target_vram_bytes == reserved {
+            return;
+        }
+        self.reserved_target_vram_bytes = reserved;
+        let effective = effective_gpu_tile_cache_cap(self.total_gpu_vram_budget_bytes, reserved);
+        if self.gpu_tile_cache.max_bytes() != effective {
+            self.gpu_tile_cache.set_max_bytes(effective);
+        }
     }
 
     /// Mutate the geodesic measurement session and mark the scene dirty
@@ -440,8 +502,11 @@ impl SceneState {
         basemap_config: BasemapConfigView<'_>,
         gpu_tile_cache_override_bytes: Option<usize>,
     ) -> bool {
-        let next_gpu_cap =
+        let next_total_vram =
             gpu_tile_cache_override_bytes.unwrap_or(self.default_gpu_tile_cache_bytes);
+        self.total_gpu_vram_budget_bytes = next_total_vram;
+        let next_gpu_cap =
+            effective_gpu_tile_cache_cap(next_total_vram, self.reserved_target_vram_bytes);
         let mut gpu_changed = false;
         if self.gpu_tile_cache.max_bytes() != next_gpu_cap {
             self.gpu_tile_cache.set_max_bytes(next_gpu_cap);
@@ -672,5 +737,40 @@ impl Drop for SceneState {
         self.begin_shutdown();
         self.close_uploads();
         self.finish_shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_vram_accounting_enforces_hard_minimum_tile_cache_floor_at_5k() {
+        // 4K offscreen (8 B/px) + 4x R32Float + 1x R8Uint (17 B/px) = 25 B/px.
+        let vram_4k = estimate_viewport_target_vram_bytes(3840, 2160, 4, true);
+        assert_eq!(vram_4k, 3840 * 2160 * 25);
+        // 5K viewport: ~351.6 MiB total offscreen + 4-band + mask scratch.
+        let vram_5k = estimate_viewport_target_vram_bytes(5120, 2880, 4, true);
+        assert_eq!(vram_5k, 5120 * 2880 * 25);
+        assert_eq!(estimate_viewport_target_vram_bytes(0, 2160, 4, true), 0);
+
+        // Even on a small 4-8 GiB host (128 MiB or 256 MiB total budget) at 5K,
+        // the effective GpuTileCache cap NEVER starves to 0 and respects the 64 MiB floor.
+        let low_host_budget = 128 * 1024 * 1024;
+        assert_eq!(
+            effective_gpu_tile_cache_cap(low_host_budget, vram_5k),
+            MIN_GPU_TILE_CACHE_FLOOR_BYTES
+        );
+        // When total budget is below the floor itself, cap gracefully at total budget.
+        assert_eq!(
+            effective_gpu_tile_cache_cap(32 * 1024 * 1024, vram_5k),
+            32 * 1024 * 1024
+        );
+        // On a 1 GiB budget at 4K, target VRAM is subtracted cleanly above the floor.
+        let high_budget = 1024 * 1024 * 1024;
+        assert_eq!(
+            effective_gpu_tile_cache_cap(high_budget, vram_4k),
+            high_budget - vram_4k
+        );
     }
 }

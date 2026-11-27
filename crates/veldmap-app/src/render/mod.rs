@@ -17,6 +17,7 @@ mod mesh_cache;
 mod overlay;
 mod palette_cache;
 mod pipelines;
+mod scratch;
 mod snapshot;
 mod uniforms;
 mod vector;
@@ -25,13 +26,19 @@ mod viewport;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use crate::colormap::{CategoricalPaletteId, ColormapId};
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::layers::BandMathFormula;
 pub use bind_groups::TileBindGroupCache;
 pub use globe::GlobeRenderer;
 #[cfg(any(test, feature = "test-support"))]
+pub use scratch::compute_band_math_scissor_rect;
+pub(crate) use scratch::estimate_viewport_target_vram_bytes;
+#[cfg(any(test, feature = "test-support"))]
 pub use snapshot::DrawTile;
 pub use snapshot::{
-    DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack, DrawSnapshot, DrawVectorId,
-    DrawVectorLayer, OverlayMeshKey, SnapshotBuildParams, TileCarrierPolicy,
+    DrawBandMathLayer, DrawOverlayContent, DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack,
+    DrawScratchBand, DrawScratchMask, DrawSnapshot, DrawVectorId, DrawVectorLayer, OverlayMeshKey,
+    SnapshotBuildParams, TileCarrierPolicy,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use uniforms::{UNIFORM_LAYOUT_SPECS, UniformLayoutSpec};
@@ -72,6 +79,16 @@ pub const OVERLAY_WGSL: &str = include_str!("../shaders/overlay.wgsl");
 pub const OVERLAY_SCIENTIFIC_WGSL: &str = include_str!("../shaders/overlay_scientific.wgsl");
 /// Embedded WGSL source for depth-less post-body categorical (`R8Uint`/`R16Uint`) raster overlays.
 pub const OVERLAY_CATEGORICAL_WGSL: &str = include_str!("../shaders/overlay_categorical.wgsl");
+/// Embedded WGSL source for fullscreen quiet-NaN scratch target initialization.
+pub const SCRATCH_NAN_FILL_WGSL: &str = include_str!("../shaders/scratch_nan_fill.wgsl");
+/// Embedded WGSL source for single-band `R32Float` Band Math scratch rasterization.
+pub const BAND_MATH_SCRATCH_WGSL: &str = include_str!("../shaders/band_math_scratch.wgsl");
+/// Embedded WGSL source for 2..=4 attachment MRT `R32Float` Band Math scratch rasterization.
+pub const BAND_MATH_SCRATCH_MRT_WGSL: &str = include_str!("../shaders/band_math_scratch_mrt.wgsl");
+/// Embedded WGSL source for nearest-neighbor `R8Uint` `SCL` mask scratch rasterization.
+pub const BAND_MATH_MASK_WGSL: &str = include_str!("../shaders/band_math_mask.wgsl");
+/// Embedded WGSL source for fullscreen screen-space Band Math + `SCL` mask + colormap compositing.
+pub const BAND_MATH_COMPOSITE_WGSL: &str = include_str!("../shaders/band_math_composite.wgsl");
 /// Embedded WGSL source for depth-less post-body draped vector geometry.
 pub const VECTOR_WGSL: &str = include_str!("../shaders/vector.wgsl");
 /// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.

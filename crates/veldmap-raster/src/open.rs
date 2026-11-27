@@ -21,16 +21,37 @@ use crate::tiff::{TiffSource, has_tiff_magic};
 /// `veldmap-raster` free of filesystem dependencies.
 pub type SidecarReader<'a> = &'a mut dyn FnMut(&Path, u64) -> Result<Option<String>, String>;
 
-/// Optional sidecar georeferencing and external band scaling applied when
+/// External per-band radiometric metadata (e.g., from STAC `raster:bands`)
+/// applied to bands of a GeoTIFF/COG source whose embedded metadata did not
+/// declare the corresponding fields.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExternalBandMeta {
+    pub scale: Option<f64>,
+    pub offset: Option<f64>,
+    pub nodata: Option<f64>,
+    pub unit: Option<String>,
+}
+
+impl ExternalBandMeta {
+    /// Return whether at least one external metadata field is populated.
+    pub fn has_any(&self) -> bool {
+        self.scale.is_some()
+            || self.offset.is_some()
+            || self.nodata.is_some()
+            || self.unit.as_deref().is_some_and(|u| !u.trim().is_empty())
+    }
+}
+
+/// Optional sidecar georeferencing and external per-band metadata applied when
 /// opening a raster via [`open_raster_with_options`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenRasterOptions<'a> {
     /// Optional pre-parsed world-file / `.prj` sidecar georeferencing.
     pub sidecars: Option<&'a SidecarGeoref>,
-    /// Optional external per-band `(scale, offset)` override (e.g., from STAC
-    /// `raster:bands`), applied to indexed bands of GeoTIFF sources whose
-    /// embedded metadata left scaling at identity `(1.0, 0.0)`.
-    pub external_scale_offset: Option<(Option<f64>, Option<f64>)>,
+    /// Optional external per-band `(scale, offset, nodata, unit)` metadata
+    /// (e.g., from STAC `raster:bands`), applied per band index when embedded
+    /// container metadata did not declare the field.
+    pub external_bands: &'a [ExternalBandMeta],
 }
 
 /// Result of opening a raster source via [`open_raster`] or
@@ -86,10 +107,8 @@ fn open_classified_raster(
             let sidecar = options.sidecars.filter(|sc| !sc.is_empty()).cloned();
             let mut src =
                 TiffSource::open_with_sidecar(source, fingerprint, sidecar, budget, cancel)?;
-            if let Some((scale, offset)) = options.external_scale_offset
-                && (scale.is_some() || offset.is_some())
-            {
-                src.apply_external_scale_offset(scale.unwrap_or(1.0), offset.unwrap_or(0.0));
+            if !options.external_bands.is_empty() {
+                src.apply_external_band_meta(options.external_bands);
             }
             Ok(OpenedRaster {
                 source: Arc::new(src),
@@ -169,7 +188,7 @@ pub fn open_raster(
         format,
         OpenRasterOptions {
             sidecars: parsed_sidecar.as_ref(),
-            external_scale_offset: None,
+            external_bands: &[],
         },
         budget,
         cancel,

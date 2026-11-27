@@ -302,7 +302,8 @@ fn build_band_infos(
             sample_type: base_ifd.sample_type,
             scale: gmeta.scale.unwrap_or(1.0),
             offset: gmeta.offset.unwrap_or(0.0),
-            nodata: nodata_f64,
+            has_embedded_scale_offset: gmeta.scale.is_some() || gmeta.offset.is_some(),
+            nodata: gmeta.nodata.or(nodata_f64),
             channels: 1,
             has_alpha: false,
         });
@@ -387,6 +388,14 @@ impl TiffSource {
             .map_or(0, |o| o.image);
 
         let bands = build_band_infos(&base_ifd, meta.nodata_f64, &meta.gdal_meta);
+        let mut per_band_nodata = vec![meta.nodata_f64; usize::from(base_ifd.samples_per_pixel)];
+        for info in &bands {
+            if let BandKey::Index(b) = info.band_key
+                && let Some(slot) = per_band_nodata.get_mut(usize::from(b))
+            {
+                *slot = info.nodata;
+            }
+        }
         let initial_mapping = (!base_ifd.needs_display_stretch()).then(|| {
             DisplayMapping::identity(meta.nodata_f64)
                 .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
@@ -421,6 +430,7 @@ impl TiffSource {
             grid,
             ifds,
             nodata_f64: meta.nodata_f64,
+            per_band_nodata,
             stats_ifd,
             budget_snapshot: *budget,
             stretch: StretchCache::new(initial_mapping),

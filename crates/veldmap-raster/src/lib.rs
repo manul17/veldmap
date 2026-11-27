@@ -34,7 +34,8 @@ pub use basemap::{BundledBasemap, BundledBasemapConfig, decode_map_tile_with_mip
 pub use image_codec::{has_jpeg_magic, has_png_magic};
 pub use mipmap::generate_tile_mipmaps;
 pub use open::{
-    OpenRasterOptions, OpenedRaster, SidecarReader, open_raster, open_raster_with_options,
+    ExternalBandMeta, OpenRasterOptions, OpenedRaster, SidecarReader, open_raster,
+    open_raster_with_options,
 };
 pub use pipeline::{
     AdmittedPass, AdmittedTile, BandInfo, BandSample, BandStats, ByteRange,

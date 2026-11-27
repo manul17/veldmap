@@ -16,7 +16,7 @@ use super::graticule::{TILE_KIND_GEO, tile_graticule_uniform};
 use super::mesh::TileMeshCache;
 use super::overlay::OverlayRenderer;
 use super::pipelines::GlobePipelines;
-use super::snapshot::DrawSnapshot;
+use super::snapshot::{DrawOverlayContent, DrawSnapshot};
 use super::uniforms::{CameraUniform, TileUniform, UniformSlot};
 use super::vector::VectorRenderer;
 use super::viewport::{RenderParams, ViewportState};
@@ -86,11 +86,34 @@ impl GlobeRenderer {
 
         self.viewport
             .ensure_offscreen(device, &self.pipelines, width, height);
+        let mut max_float_bands = 0usize;
+        let mut needs_mask = false;
+        for layer in &params.snapshot.overlays {
+            let (fb, mask) = layer.scratch_requirements();
+            max_float_bands = max_float_bands.max(fb);
+            needs_mask |= mask;
+        }
+        self.viewport.ensure_scratch(
+            device,
+            queue,
+            &self.pipelines.band_math,
+            width,
+            height,
+            max_float_bands,
+            needs_mask,
+        );
         self.prepare_tile_resources(device, bind_groups, params.snapshot);
         self.upload_uniforms(device, queue, width, height, params.snapshot);
         self.record_offscreen_passes(encoder, bind_groups, params.snapshot);
         self.viewport.mark_rendered(width, height, params.snapshot);
         true
+    }
+
+    /// Currently allocated viewport scratch target VRAM in bytes (0 when no
+    /// analytical Band Math layer is visible).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scratch_vram_bytes(&self) -> usize {
+        self.viewport.scratch_vram_bytes()
     }
 
     /// Record the 1:1 `FilterMode::Nearest` composite draw into an existing
@@ -177,7 +200,8 @@ impl GlobeRenderer {
             self.tile_uniform_offsets.push(arena.push(&u));
         }
 
-        self.overlay.push_uniforms(arena, snapshot, eye);
+        self.overlay
+            .push_uniforms(arena, snapshot, eye, width, height);
         self.vector
             .push_uniforms(arena, snapshot, eye, width, height);
 
@@ -289,14 +313,29 @@ impl GlobeRenderer {
             self.record_body_pass(&mut body_pass, bind_groups, snapshot);
         }
 
-        // Pass 2: Depth-less (`depth_stencil_attachment: None`, `LoadOp::Load`)
-        // post-body raster overlays + draped vector layers + procedural graticule.
-        if !snapshot.overlays.is_empty() || !snapshot.vectors.is_empty() || snapshot.show_graticule
-        {
-            let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        // Pass 2: Segmented depth-less (`depth_stencil_attachment: None`,
+        // `LoadOp::Load`) post-body overlays, vectors, and procedural graticule.
+        //
+        // Consecutive direct overlays batch into a single color pass; each
+        // scratch-backed `BandMath` layer interleaves `[shared <=4-target
+        // scratch passes] -> [depth-less color LoadOp::Load composite pass]` in
+        // exact painter's order so transient scratch VRAM stays bounded to one
+        // viewport pool regardless of layer count.
+        let has_post_work = !snapshot.overlays.is_empty()
+            || !snapshot.vectors.is_empty()
+            || snapshot.show_graticule;
+        if !has_post_work {
+            return;
+        }
+
+        fn begin_color_load_pass<'a>(
+            encoder: &'a mut wgpu::CommandEncoder,
+            color_view: &'a wgpu::TextureView,
+        ) -> wgpu::RenderPass<'a> {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("globe post-body overlay, vector & graticule pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.color_srgb_view,
+                    view: color_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -308,16 +347,112 @@ impl GlobeRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
-            });
+            })
+        }
 
+        let mut layer_cursor = 0usize;
+        let overlay_len = snapshot.overlays.len();
+
+        while layer_cursor < overlay_len {
+            if let DrawOverlayContent::BandMath(bm) = &snapshot.overlays[layer_cursor].content {
+                let Some(scratch) = self.viewport.scratch() else {
+                    layer_cursor += 1;
+                    continue;
+                };
+                let drawn = self.overlay.record_band_math_scratch_passes(
+                    encoder,
+                    layer_cursor,
+                    bm,
+                    self.viewport.camera_bind_group(),
+                    &self.pipelines.band_math,
+                    scratch,
+                    self.viewport.uniform_arena(),
+                    bind_groups,
+                );
+                let bm_idx = layer_cursor;
+                layer_cursor += 1;
+
+                // Batch the fullscreen composite plus any immediately following
+                // direct overlays (and final vectors/graticule if this is the
+                // tail) into one `LoadOp::Load` color pass.
+                let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
+                if drawn {
+                    self.overlay.record_band_math_composite(
+                        &mut post_pass,
+                        bm_idx,
+                        target.width,
+                        target.height,
+                        &self.pipelines.band_math,
+                        scratch,
+                        self.viewport.uniform_arena(),
+                    );
+                }
+                post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
+                while layer_cursor < overlay_len
+                    && matches!(
+                        snapshot.overlays[layer_cursor].content,
+                        DrawOverlayContent::Direct { .. }
+                    )
+                {
+                    self.overlay.record_direct_layer(
+                        &mut post_pass,
+                        layer_cursor,
+                        &snapshot.overlays[layer_cursor],
+                        &self.pipelines.overlay,
+                        self.viewport.uniform_arena(),
+                        bind_groups,
+                    );
+                    layer_cursor += 1;
+                }
+                if layer_cursor == overlay_len {
+                    self.vector.record_pass(
+                        &mut post_pass,
+                        &self.pipelines.vector,
+                        self.viewport.uniform_arena(),
+                        snapshot,
+                    );
+                    if snapshot.show_graticule {
+                        self.record_graticule_pass(&mut post_pass, snapshot);
+                    }
+                }
+            } else {
+                let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
+                post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
+                while layer_cursor < overlay_len
+                    && matches!(
+                        snapshot.overlays[layer_cursor].content,
+                        DrawOverlayContent::Direct { .. }
+                    )
+                {
+                    self.overlay.record_direct_layer(
+                        &mut post_pass,
+                        layer_cursor,
+                        &snapshot.overlays[layer_cursor],
+                        &self.pipelines.overlay,
+                        self.viewport.uniform_arena(),
+                        bind_groups,
+                    );
+                    layer_cursor += 1;
+                }
+                if layer_cursor == overlay_len {
+                    self.vector.record_pass(
+                        &mut post_pass,
+                        &self.pipelines.vector,
+                        self.viewport.uniform_arena(),
+                        snapshot,
+                    );
+                    if snapshot.show_graticule {
+                        self.record_graticule_pass(&mut post_pass, snapshot);
+                    }
+                }
+            }
+        }
+
+        // If there were zero overlays (only vectors and/or graticule), record
+        // the single post-body color pass directly.
+        if overlay_len == 0 {
+            let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
             post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
-            self.overlay.record_pass(
-                &mut post_pass,
-                &self.pipelines.overlay,
-                self.viewport.uniform_arena(),
-                bind_groups,
-                snapshot,
-            );
             self.vector.record_pass(
                 &mut post_pass,
                 &self.pipelines.vector,

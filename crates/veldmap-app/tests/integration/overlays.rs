@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use veldmap_app::gpu_tiles::{GpuTile, GpuTileCache};
 use veldmap_app::render::{
-    CategoricalPaletteId, ColormapId, DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack,
-    OverlayMeshKey, RenderParams,
+    BandMathFormula, CategoricalPaletteId, ColormapId, DrawBandMathLayer, DrawOverlayContent,
+    DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack, DrawScratchBand, DrawScratchMask,
+    OverlayMeshKey, RenderParams, compute_band_math_scissor_rect,
 };
 use veldmap_core::geo::{Camera, Frame, Projection};
 use veldmap_core::tile::{
@@ -33,23 +34,25 @@ fn single_patch_layer(
 ) -> DrawOverlayLayer {
     DrawOverlayLayer {
         opacity: 1.0,
-        track,
-        frame: Arc::clone(frame),
-        image_width: 512,
-        image_height: 512,
-        segments,
-        patches: vec![DrawOverlayPatch {
-            mesh_key: OverlayMeshKey {
-                source,
-                relaid,
-                level: 0,
-                x: 0,
-                y: 0,
-            },
-            cell_rect: [0.0, 0.0, 512.0, 512.0],
-            uv_rect: [0.0, 0.0, 1.0, 1.0],
-            texture,
-        }],
+        content: DrawOverlayContent::Direct {
+            track,
+            frame: Arc::clone(frame),
+            image_width: 512,
+            image_height: 512,
+            segments,
+            patches: vec![DrawOverlayPatch {
+                mesh_key: OverlayMeshKey {
+                    source,
+                    relaid,
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                },
+                cell_rect: [0.0, 0.0, 512.0, 512.0],
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                texture,
+            }],
+        },
     }
 }
 
@@ -362,7 +365,9 @@ fn overlay_compositing_respects_painter_order_opacity_nodata_and_ancestor_uv_rec
         DrawOverlayTrack::Display,
         tex_bot,
     );
-    bot_layer.patches[0].uv_rect = [0.5, 0.0, 0.5, 1.0];
+    if let DrawOverlayContent::Direct { patches, .. } = &mut bot_layer.content {
+        patches[0].uv_rect = [0.5, 0.0, 0.5, 1.0];
+    }
     snap.overlays.push(bot_layer);
 
     let mut top_layer = single_patch_layer(
@@ -708,4 +713,562 @@ fn categorical_r8uint_and_r16uint_render_and_sweep_cleanly() {
     gpu_cache.remove_source(src_cat16);
     globe.bind_groups.sweep_stale();
     assert_eq!(globe.bind_groups.len(), 0);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Concise headless GPU test helper for uploading synthetic R32Float tiles."
+)]
+fn upload_r32f_tile(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &mut GpuTileCache,
+    source: SourceId,
+    band: BandKey,
+    w: u32,
+    h: u32,
+    mut val_fn: impl FnMut(u32, u32) -> f32,
+) -> (TileKey, Arc<GpuTile>) {
+    let key = TileKey {
+        source,
+        band,
+        scheme: TileScheme::RasterPyramid { max_level: 0 },
+        format: PixelFormat::R32Float,
+        gutter: 0,
+        decode_rev: 1,
+        level: 0,
+        x: 0,
+        y: 0,
+    };
+    let mut bytes = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            bytes.extend_from_slice(&val_fn(x, y).to_ne_bytes());
+        }
+    }
+    let mut decoded = DecodedTile::try_new(w, h, PixelFormat::R32Float, bytes).expect("r32f");
+    generate_tile_mipmaps(&mut decoded);
+    let (gpu_tile, _) = cache
+        .upload_and_insert(device, queue, key, &decoded)
+        .expect("upload r32f");
+    (key, gpu_tile)
+}
+
+fn upload_r8u_tile(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &mut GpuTileCache,
+    source: SourceId,
+    w: u32,
+    h: u32,
+    mut class_fn: impl FnMut(u32, u32) -> u8,
+) -> (TileKey, Arc<GpuTile>) {
+    let key = TileKey {
+        source,
+        band: BandKey::Index(0),
+        scheme: TileScheme::RasterPyramid { max_level: 0 },
+        format: PixelFormat::R8Uint,
+        gutter: 0,
+        decode_rev: 1,
+        level: 0,
+        x: 0,
+        y: 0,
+    };
+    let mut bytes = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            bytes.push(class_fn(x, y));
+        }
+    }
+    let decoded = DecodedTile::try_new(w, h, PixelFormat::R8Uint, bytes).expect("r8u");
+    let (gpu_tile, _) = cache
+        .upload_and_insert(device, queue, key, &decoded)
+        .expect("upload r8u");
+    (key, gpu_tile)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Concise headless GPU test helper for building DrawScratchBand fixtures."
+)]
+fn scratch_band(
+    frame: &Arc<Frame>,
+    source: SourceId,
+    relaid: u64,
+    img_w: u32,
+    img_h: u32,
+    scale: f32,
+    offset: f32,
+    texture: Arc<GpuTile>,
+) -> DrawScratchBand {
+    DrawScratchBand {
+        frame: Arc::clone(frame),
+        image_width: img_w,
+        image_height: img_h,
+        segments: MIN_WARP_SEGMENTS,
+        scale,
+        offset,
+        patches: vec![DrawOverlayPatch {
+            mesh_key: OverlayMeshKey {
+                source,
+                relaid,
+                level: 0,
+                x: 0,
+                y: 0,
+            },
+            cell_rect: [0.0, 0.0, f64::from(img_w), f64::from(img_h)],
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            texture,
+        }],
+    }
+}
+
+#[test]
+fn band_math_nan_fill_preserves_zero_reflectance_and_scl_masking() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let (width, height) = (128u32, 128u32);
+    let mut globe = TestGlobe::new_srgb(device);
+    let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
+
+    let frame = utm37_test_frame();
+    let (clat, clon) = frame.geodetic(0.5, 0.5);
+    let cam = Camera::at(clat, clon, 25_000.0);
+    let config = QuadtreeConfig::default();
+
+    // Solid blue base layer beneath BandMath so discarded/masked pixels show pure blue.
+    let src_base = SourceId::new(980);
+    let (_, tex_base) =
+        upload_overlay_tile(device, queue, &mut gpu_cache, src_base, 16, 16, |_, _| {
+            [0, 0, 255, 255]
+        });
+
+    // Quadrants (32x32):
+    //   Top-left     (x<16, y<16): NIR = 0.0 (valid zero!), Red = 0.5 -> NDVI = -1.0 (RdYlGn low = red)
+    //   Top-right    (x>=16, y<16): NIR = 0.8, Red = 0.1 -> NDVI = +0.778 (RdYlGn high = green)
+    //   Bottom-left  (x<16, y>=16): NIR = NaN, Red = 0.5 -> nodata discard (blue base shows)
+    //   Bottom-right (x>=16, y>=16): NIR = 0.8, Red = 0.1, SCL = 9 (Cloud High Prob) -> masked to blue base!
+    let src_nir = SourceId::new(981);
+    let (_, tex_nir) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_nir,
+        BandKey::Index(0),
+        32,
+        32,
+        |x, y| {
+            if x < 16 && y < 16 {
+                0.0
+            } else if x < 16 && y >= 16 {
+                f32::NAN
+            } else {
+                0.8
+            }
+        },
+    );
+    let src_red = SourceId::new(982);
+    let (_, tex_red) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_red,
+        BandKey::Index(0),
+        32,
+        32,
+        |x, _| if x < 16 { 0.5 } else { 0.1 },
+    );
+    // SCL covers only the right half (cell_rect x in [256..512]) so left half remains
+    // uncovered `255` sentinel — testing that class 0 in scl_mask_bits NEVER falsely masks uncovered pixels!
+    let src_scl = SourceId::new(983);
+    let (_, tex_scl) = upload_r8u_tile(device, queue, &mut gpu_cache, src_scl, 16, 32, |_, y| {
+        if y < 16 { 4 } else { 9 } // top-right = Vegetation (4), bottom-right = Cloud High (9)
+    });
+
+    let scl_mask_bits = (1u32 << 0) | (1u32 << 9); // mask NoData(0) and Cloud High(9)
+    let make_bm = |scl_enabled: bool| DrawBandMathLayer {
+        formula: BandMathFormula::NormalizedDiff,
+        colormap: ColormapId::RdYlGn,
+        invert_colormap: false,
+        stretch_min: -1.0,
+        stretch_max: 1.0,
+        rgb_min: [0.0; 3],
+        rgb_max: [1.0; 3],
+        rgb_gamma: 1.0,
+        scl_mask_enabled: scl_enabled,
+        scl_mask_bits,
+        bands: vec![
+            scratch_band(&frame, src_nir, 1, 512, 512, 1.0, 0.0, Arc::clone(&tex_nir)),
+            scratch_band(&frame, src_red, 2, 512, 512, 1.0, 0.0, Arc::clone(&tex_red)),
+        ],
+        scl: Some(DrawScratchMask {
+            frame: Arc::clone(&frame),
+            image_width: 512,
+            image_height: 512,
+            segments: MIN_WARP_SEGMENTS,
+            nodata_value: None,
+            patches: vec![DrawOverlayPatch {
+                mesh_key: OverlayMeshKey {
+                    source: src_scl,
+                    relaid: 3,
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                },
+                cell_rect: [256.0, 0.0, 512.0, 512.0],
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                texture: Arc::clone(&tex_scl),
+            }],
+        }),
+    };
+
+    let mut snap = build_empty_snapshot(cam, width, height, &config);
+    snap.overlays.push(single_patch_layer(
+        &frame,
+        src_base,
+        1,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Display,
+        Arc::clone(&tex_base),
+    ));
+    snap.overlays.push(DrawOverlayLayer {
+        opacity: 1.0,
+        content: DrawOverlayContent::BandMath(Box::new(make_bm(true))),
+    });
+    let pixels = render_srgb(&mut globe, device, queue, width, height, &Arc::new(snap));
+
+    let is_blue_base = |px: [u8; 4]| px[0] < 20 && px[1] < 20 && px[2] > 235;
+    let tl = pixel_at(&pixels, width, width / 2 - 20, height / 2 - 20);
+    let tr = pixel_at(&pixels, width, width / 2 + 20, height / 2 - 20);
+    let bl = pixel_at(&pixels, width, width / 2 - 20, height / 2 + 20);
+    let br = pixel_at(&pixels, width, width / 2 + 20, height / 2 + 20);
+
+    // Top-left: valid 0.0 NIR + uncovered SCL 255 sentinel must render RdYlGn low (reddish), NOT blue base.
+    assert!(
+        !is_blue_base(tl) && tl[0] > 140 && tl[2] < 80,
+        "valid 0.0 reflectance & uncovered 255 SCL sentinel must render NDVI=-1.0 (red), got {tl:?}"
+    );
+    // Top-right: SCL class 4 (Vegetation, unmasked) + high NDVI must render RdYlGn high (greenish).
+    assert!(
+        !is_blue_base(tr) && tr[1] > 100 && tr[1] > tr[0],
+        "unmasked SCL=4 high NDVI must render RdYlGn green, got {tr:?}"
+    );
+    // Bottom-left: NaN NIR must discard and reveal blue base.
+    assert!(
+        is_blue_base(bl),
+        "NaN input band must discard to reveal blue base, got {bl:?}"
+    );
+    // Bottom-right: SCL class 9 (Cloud High Probability) must be masked to reveal blue base.
+    assert!(
+        is_blue_base(br),
+        "SCL=9 cloud-masked quadrant must reveal blue base, got {br:?}"
+    );
+
+    // Toggling SCL mask OFF must immediately reveal the NDVI vegetation color in bottom-right!
+    let mut snap_unmasked = build_empty_snapshot(cam, width, height, &config);
+    snap_unmasked.overlays.push(single_patch_layer(
+        &frame,
+        src_base,
+        1,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Display,
+        Arc::clone(&tex_base),
+    ));
+    snap_unmasked.overlays.push(DrawOverlayLayer {
+        opacity: 1.0,
+        content: DrawOverlayContent::BandMath(Box::new(make_bm(false))),
+    });
+    let pixels_unmasked = render_srgb(
+        &mut globe,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(snap_unmasked),
+    );
+    let br_unmasked = pixel_at(&pixels_unmasked, width, width / 2 + 20, height / 2 + 20);
+    assert!(
+        !is_blue_base(br_unmasked) && br_unmasked[1] > 100 && br_unmasked[1] > br_unmasked[0],
+        "disabling SCL mask must reveal NDVI green in bottom-right, got {br_unmasked:?}"
+    );
+}
+
+#[test]
+fn band_math_mrt_vs_non_mrt_parity_scissor_painter_order_and_lazy_scratch_release() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let (width, height) = (128u32, 128u32);
+    let mut globe = TestGlobe::new_srgb(device);
+    let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
+
+    let frame_10m = utm37_test_frame();
+    // Same geographic footprint represented at half image resolution (256x256, 200 m/px)
+    // to exercise the non-MRT multi-GSD path (`can_use_mrt() == false`)!
+    let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
+    let frame_20m = Arc::new(
+        Frame::from_pixel_affine(
+            utm37,
+            [200.0, 0.0, 500_000.0, 0.0, -200.0, 5_250_000.0],
+            256,
+            256,
+        )
+        .expect("utm37 20m"),
+    );
+
+    let (clat, clon) = frame_10m.geodetic(0.5, 0.5);
+    let cam = Camera::at(clat, clon, 150_000.0);
+    let config = QuadtreeConfig::default();
+
+    // Physical RGB: R = 0.8 (DN=9000, scale=0.0001, offset=-0.1), G = 0.4, B = 0.2.
+    let src_r = SourceId::new(990);
+    let src_g = SourceId::new(991);
+    let src_b = SourceId::new(992);
+    let (_, tex_r) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_r,
+        BandKey::Index(0),
+        16,
+        16,
+        |_, _| 9000.0,
+    );
+    let (_, tex_g) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_g,
+        BandKey::Index(0),
+        16,
+        16,
+        |_, _| 5000.0,
+    );
+    let (_, tex_b) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_b,
+        BandKey::Index(0),
+        16,
+        16,
+        |_, _| 3000.0,
+    );
+
+    // 1. MRT path (all 3 bands share 512x512 frame_10m).
+    let bm_mrt = DrawBandMathLayer {
+        formula: BandMathFormula::RgbComposite,
+        colormap: ColormapId::Grayscale,
+        invert_colormap: false,
+        stretch_min: 0.0,
+        stretch_max: 1.0,
+        rgb_min: [0.0, 0.0, 0.0],
+        rgb_max: [1.0, 1.0, 1.0],
+        rgb_gamma: 1.0,
+        scl_mask_enabled: false,
+        scl_mask_bits: 0,
+        bands: vec![
+            scratch_band(
+                &frame_10m,
+                src_r,
+                1,
+                512,
+                512,
+                0.0001,
+                -0.1,
+                Arc::clone(&tex_r),
+            ),
+            scratch_band(
+                &frame_10m,
+                src_g,
+                2,
+                512,
+                512,
+                0.0001,
+                -0.1,
+                Arc::clone(&tex_g),
+            ),
+            scratch_band(
+                &frame_10m,
+                src_b,
+                3,
+                512,
+                512,
+                0.0001,
+                -0.1,
+                Arc::clone(&tex_b),
+            ),
+        ],
+        scl: None,
+    };
+    assert!(
+        bm_mrt.can_use_mrt(),
+        "co-grid 3-band layer must take MRT path"
+    );
+
+    // Verify scissor rect is tight (strictly smaller than full viewport) on-screen,
+    // None off-screen, and full viewport when straddling the horizon limb.
+    let scissor_on = compute_band_math_scissor_rect(&cam, width, height, &bm_mrt)
+        .expect("on-screen scissor rect");
+    assert!(
+        scissor_on[2] > 0 && scissor_on[3] > 0 && (scissor_on[2] < width || scissor_on[3] < height),
+        "on-screen patch scissor should be tight, got {scissor_on:?}"
+    );
+    let cam_far_side = Camera::at(-clat, (clon + 180.0 + 180.0) % 360.0 - 180.0, 500_000.0);
+    let scissor_back = compute_band_math_scissor_rect(&cam_far_side, width, height, &bm_mrt);
+    assert_eq!(
+        scissor_back,
+        Some([0, 0, width, height]),
+        "back-hemisphere / horizon fallback must return full viewport safely"
+    );
+    // 3 deg north is inside the ~6.8 deg horizon limb at 45 km altitude, yet well off-screen (~333 km >> 42 km FOV).
+    let cam_offscreen = Camera::at(clat + 3.0, clon, 45_000.0);
+    assert_eq!(
+        compute_band_math_scissor_rect(&cam_offscreen, width, height, &bm_mrt),
+        None,
+        "completely off-screen on-hemisphere patch must return empty/None scissor"
+    );
+
+    // 2. Non-MRT path (band 2 on 256x256 frame_20m -> mixed-GSD fallback).
+    let bm_non_mrt = DrawBandMathLayer {
+        bands: vec![
+            scratch_band(
+                &frame_10m,
+                src_r,
+                1,
+                512,
+                512,
+                0.0001,
+                -0.1,
+                Arc::clone(&tex_r),
+            ),
+            scratch_band(
+                &frame_10m,
+                src_g,
+                2,
+                512,
+                512,
+                0.0001,
+                -0.1,
+                Arc::clone(&tex_g),
+            ),
+            scratch_band(
+                &frame_20m,
+                src_b,
+                4,
+                256,
+                256,
+                0.0001,
+                -0.1,
+                Arc::clone(&tex_b),
+            ),
+        ],
+        ..bm_mrt.clone()
+    };
+    assert!(
+        !bm_non_mrt.can_use_mrt(),
+        "mixed-GSD 3-band layer must take non-MRT per-band scratch path"
+    );
+
+    let mut snap_mrt = build_empty_snapshot(cam, width, height, &config);
+    snap_mrt.overlays.push(DrawOverlayLayer {
+        opacity: 1.0,
+        content: DrawOverlayContent::BandMath(Box::new(bm_mrt.clone())),
+    });
+    let pixels_mrt = render_srgb(
+        &mut globe,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(snap_mrt),
+    );
+    // Verify lazy scratch pool allocated exact 3x R32Float (no mask) = 12 B/px.
+    assert_eq!(
+        globe.renderer.scratch_vram_bytes(),
+        (width * height * 12) as usize,
+        "lazy scratch pool must allocate exact 3x R32Float without mask"
+    );
+
+    let mut snap_non_mrt = build_empty_snapshot(cam, width, height, &config);
+    snap_non_mrt.overlays.push(DrawOverlayLayer {
+        opacity: 1.0,
+        content: DrawOverlayContent::BandMath(Box::new(bm_non_mrt)),
+    });
+    let pixels_non_mrt = render_srgb(
+        &mut globe,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(snap_non_mrt),
+    );
+
+    // Exact pixel parity between MRT and non-MRT paths at patch center!
+    let px_mrt = pixel_at(&pixels_mrt, width, width / 2, height / 2);
+    let px_non_mrt = pixel_at(&pixels_non_mrt, width, width / 2, height / 2);
+    assert!(
+        px_mrt[0] > 195 && px_mrt[1] > 90 && px_mrt[1] < 115 && px_mrt[2] > 40 && px_mrt[2] < 65,
+        "expected sRGB (~204, ~102, ~51) from physical (0.8, 0.4, 0.2), got {px_mrt:?}"
+    );
+    for c in 0..3 {
+        assert!(
+            px_mrt[c].abs_diff(px_non_mrt[c]) <= 1,
+            "MRT {px_mrt:?} vs non-MRT {px_non_mrt:?} mismatch on channel {c}"
+        );
+    }
+
+    // 3. Pass-2 painter's-order interleaving: Direct bottom (green) -> BandMath -> Direct top (50% blue).
+    let src_top = SourceId::new(993);
+    let (_, tex_top) =
+        upload_overlay_tile(device, queue, &mut gpu_cache, src_top, 16, 16, |_, _| {
+            [0, 0, 255, 255]
+        });
+    let mut top_direct = single_patch_layer(
+        &frame_10m,
+        src_top,
+        5,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Display,
+        tex_top,
+    );
+    top_direct.opacity = 0.5;
+    let mut snap_interleaved = build_empty_snapshot(cam, width, height, &config);
+    snap_interleaved.overlays.push(DrawOverlayLayer {
+        opacity: 1.0,
+        content: DrawOverlayContent::BandMath(Box::new(bm_mrt)),
+    });
+    snap_interleaved.overlays.push(top_direct);
+    let pixels_interleaved = render_srgb(
+        &mut globe,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(snap_interleaved),
+    );
+    let px_inter = pixel_at(&pixels_interleaved, width, width / 2, height / 2);
+    assert!(
+        px_inter[2] > px_mrt[2] + 80 && px_inter[0] < px_mrt[0] - 20,
+        "Direct layer above BandMath must composite over BandMath in Pass-2 painter order: before={px_mrt:?}, after={px_inter:?}"
+    );
+
+    // 4. Removing the BandMath layer releases all scratch VRAM immediately on the next frame!
+    let snap_empty = build_empty_snapshot(cam, width, height, &config);
+    let _ = render_srgb(
+        &mut globe,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(snap_empty),
+    );
+    assert_eq!(
+        globe.renderer.scratch_vram_bytes(),
+        0,
+        "scratch pool must release all VRAM immediately when no BandMath layer is visible"
+    );
 }

@@ -74,11 +74,12 @@ impl BandStatsCache {
         band: u16,
         scale: f64,
         offset: f64,
+        band_nodata: Option<f64>,
         req: &StretchRequest<'_>,
     ) -> Result<Option<BandStats>, RasterError> {
         self.map
             .get_or_compute(band, req.cancel, "band stats leader panicked", || {
-                compute_single_band_stats(band, scale, offset, req)
+                compute_single_band_stats(band, scale, offset, band_nodata, req)
             })
     }
 }
@@ -206,6 +207,7 @@ fn compute_single_band_stats(
     band: u16,
     scale: f64,
     offset: f64,
+    band_nodata: Option<f64>,
     req: &StretchRequest<'_>,
 ) -> Result<Option<BandStats>, RasterError> {
     let ifd = req.stats_ifd;
@@ -225,22 +227,14 @@ fn compute_single_band_stats(
                 return Ok(());
             };
             let step = pixels.div_ceil(target_per_chunk).max(1);
-            for_each_band_sample_f64(
-                &data,
-                ifd,
-                band_idx,
-                pixels,
-                step,
-                req.nodata_f64,
-                |sample| {
-                    if let Some(raw) = sample {
-                        let phys = raw.mul_add(scale, offset);
-                        if phys.is_finite() {
-                            values.push(phys);
-                        }
+            for_each_band_sample_f64(&data, ifd, band_idx, pixels, step, band_nodata, |sample| {
+                if let Some(raw) = sample {
+                    let phys = raw.mul_add(scale, offset);
+                    if phys.is_finite() {
+                        values.push(phys);
                     }
-                },
-            );
+                }
+            });
             Ok(())
         },
     )?;

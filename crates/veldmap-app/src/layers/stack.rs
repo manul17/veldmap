@@ -66,14 +66,25 @@ impl LayerStack {
     pub(super) fn count_sharing_source(&self, source_id: SourceId) -> usize {
         self.layers
             .iter()
-            .filter(|l| l.source_id() == source_id)
+            .filter(|l| l.has_source(source_id))
             .count()
     }
 
     pub(super) fn has_visible_source(&self, source_id: SourceId) -> bool {
         self.layers
             .iter()
-            .any(|l| l.is_active() && l.source_id() == source_id)
+            .any(|l| l.is_active() && l.has_source(source_id))
+    }
+
+    pub(super) fn max_scratch_requirements(&self) -> (usize, bool) {
+        let mut max_float_bands = 0usize;
+        let mut needs_mask = false;
+        for layer in &self.layers {
+            let (fb, mask) = layer.scratch_requirements();
+            max_float_bands = max_float_bands.max(fb);
+            needs_mask |= mask;
+        }
+        (max_float_bands, needs_mask)
     }
 
     pub(super) fn total_appetite_weight_bytes(&self) -> u64 {

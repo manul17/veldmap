@@ -101,3 +101,113 @@ pub fn write_tiled_geotiff_cog(
     }
     Ok(())
 }
+
+/// Write a 4-band `U16` RGB+NIR GeoTIFF (`width x height`, `EPSG:32637`,
+/// `10 m/px`, `ExtraSamples = 0`, `GDAL_METADATA` `SCALE`) filled with
+/// constant `[r, g, b, nir]` samples.
+pub fn write_rgbnir_u16_geotiff(
+    path: &Path,
+    width: u32,
+    height: u32,
+    samples: [u16; 4],
+    scale: f64,
+) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    let mut enc = TiffEncoder::new(&mut file).map_err(tiff_io_err)?;
+    let mut dir = enc.image_directory().map_err(tiff_io_err)?;
+    dir.write_tag(Tag::ImageWidth, width).map_err(tiff_io_err)?;
+    dir.write_tag(Tag::ImageLength, height)
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::BitsPerSample, &[16u16, 16, 16, 16][..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::Compression, 1u16).map_err(tiff_io_err)?;
+    dir.write_tag(Tag::PhotometricInterpretation, 2u16)
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::SamplesPerPixel, 4u16)
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::ExtraSamples, &[0u16][..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::PlanarConfiguration, 1u16)
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::RowsPerStrip, height)
+        .map_err(tiff_io_err)?;
+    let pixels = (width as usize).saturating_mul(height as usize);
+    let mut bytes = Vec::with_capacity(pixels.saturating_mul(8));
+    for _ in 0..pixels {
+        for s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+    let off = dir.write_data(&bytes[..]).map_err(tiff_io_err)?;
+    dir.write_tag(Tag::StripOffsets, &[off as u32][..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::StripByteCounts, &[bytes.len() as u32][..])
+        .map_err(tiff_io_err)?;
+    let geokeys: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32637];
+    dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(
+        Tag::ModelTiepointTag,
+        &[0.0_f64, 0.0, 0.0, 500_000.0, 5_250_000.0, 0.0][..],
+    )
+    .map_err(tiff_io_err)?;
+    let xml = format!("<GDALMetadata><Item name=\"SCALE\">{scale}</Item></GDALMetadata>");
+    dir.write_tag(Tag::Unknown(42112), xml.as_str())
+        .map_err(tiff_io_err)?;
+    dir.finish().map_err(tiff_io_err)
+}
+
+/// Write a 1-band `U8` Scene Classification Layer (`SCL`) GeoTIFF (`width x height`,
+/// `EPSG:32637`, `10 m/px`) with `left_class` on the left half and `right_class`
+/// on the right half.
+pub fn write_scl_u8_geotiff(
+    path: &Path,
+    width: u32,
+    height: u32,
+    left_class: u8,
+    right_class: u8,
+) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    let mut enc = TiffEncoder::new(&mut file).map_err(tiff_io_err)?;
+    let mut dir = enc.image_directory().map_err(tiff_io_err)?;
+    dir.write_tag(Tag::ImageWidth, width).map_err(tiff_io_err)?;
+    dir.write_tag(Tag::ImageLength, height)
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::BitsPerSample, 8u16)
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::Compression, 1u16).map_err(tiff_io_err)?;
+    dir.write_tag(Tag::PhotometricInterpretation, 1u16)
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::SamplesPerPixel, 1u16)
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::RowsPerStrip, height)
+        .map_err(tiff_io_err)?;
+    let mut bytes = Vec::with_capacity((width as usize).saturating_mul(height as usize));
+    for _y in 0..height {
+        for x in 0..width {
+            bytes.push(if x < width / 2 {
+                left_class
+            } else {
+                right_class
+            });
+        }
+    }
+    let off = dir.write_data(&bytes[..]).map_err(tiff_io_err)?;
+    dir.write_tag(Tag::StripOffsets, &[off as u32][..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::StripByteCounts, &[bytes.len() as u32][..])
+        .map_err(tiff_io_err)?;
+    let geokeys: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32637];
+    dir.write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(Tag::ModelPixelScaleTag, &[10.0_f64, 10.0, 0.0][..])
+        .map_err(tiff_io_err)?;
+    dir.write_tag(
+        Tag::ModelTiepointTag,
+        &[0.0_f64, 0.0, 0.0, 500_000.0, 5_250_000.0, 0.0][..],
+    )
+    .map_err(tiff_io_err)?;
+    dir.finish().map_err(tiff_io_err)
+}
