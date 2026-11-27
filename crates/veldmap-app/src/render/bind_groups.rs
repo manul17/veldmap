@@ -9,6 +9,19 @@ use veldmap_core::tile::PixelFormat;
 
 use crate::gpu_tiles::GpuTile;
 
+type CachedBindGroupEntry = (Weak<GpuTile>, PixelFormat, wgpu::BindGroup);
+
+fn entry_matches(
+    entry: &CachedBindGroupEntry,
+    gpu_tile: &Arc<GpuTile>,
+    expected_format: PixelFormat,
+) -> bool {
+    let (weak, fmt, _) = entry;
+    *fmt == expected_format
+        && weak.strong_count() > 0
+        && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
+}
+
 /// `Weak<GpuTile>`-guarded cache of `wgpu::BindGroup` entries across all
 /// supported tile pixel formats (`Rgba8UnormSrgb`, `R32Float`, `R8Uint`,
 /// `R16Uint`), keyed by process-unique `GpuTile::tile_id`.
@@ -21,7 +34,7 @@ pub struct TileBindGroupCache {
     r32f_layout: wgpu::BindGroupLayout,
     uint_layout: wgpu::BindGroupLayout,
     tile_sampler: wgpu::Sampler,
-    entries: HashMap<u64, (Weak<GpuTile>, PixelFormat, wgpu::BindGroup)>,
+    entries: HashMap<u64, CachedBindGroupEntry>,
 }
 
 impl TileBindGroupCache {
@@ -116,11 +129,7 @@ impl TileBindGroupCache {
         let reuse = self
             .entries
             .get(&gpu_tile.tile_id)
-            .is_some_and(|(weak, fmt, _)| {
-                *fmt == gpu_tile.format
-                    && weak.strong_count() > 0
-                    && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile))
-            });
+            .is_some_and(|entry| entry_matches(entry, gpu_tile, gpu_tile.format));
         if reuse {
             return;
         }
@@ -176,12 +185,7 @@ impl TileBindGroupCache {
         }
         self.entries
             .get(&gpu_tile.tile_id)
-            .and_then(|(weak, fmt, bg)| {
-                (*fmt == expected_format
-                    && weak.strong_count() > 0
-                    && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gpu_tile)))
-                .then_some(bg)
-            })
+            .and_then(|entry| entry_matches(entry, gpu_tile, expected_format).then_some(&entry.2))
     }
 
     /// Look up a cached `Uint` bind group for either `R8Uint` or `R16Uint`.

@@ -9,5 +9,6 @@
 )]
 
 mod fetcher;
+mod mock_http;
 mod range;
 mod stac;

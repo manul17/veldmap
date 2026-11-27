@@ -3,18 +3,19 @@
 //! `If-Match` validation, refcounted multi-block singleflight, and upfront-budgeted
 //! pinned coalesced prefetch batches.
 
+mod config;
 mod pool;
+mod prefetch;
 mod protocol;
 mod singleflight;
 mod transport;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use reqwest::header::{HeaderName, HeaderValue};
-use thiserror::Error;
 use veldmap_core::io::{ByteSource, IoError};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 use veldmap_core::tile::SourceFingerprint;
@@ -24,127 +25,17 @@ use crate::http::{HostLimiters, link_cancel_token, parse_custom_headers};
 use crate::redact::{EncodedSecret, sanitize_url_for_display};
 use crate::url::{canonical_url_without_query, extract_host};
 
+pub use self::config::{HttpRangeConfig, RangeOpenError};
+use self::pool::BlockPoolKey;
 pub use self::pool::RANGE_BLOCK_SIZE;
-pub(crate) use self::pool::{BlockPoolKey, PrefetchBudget, PrefetchBudgetLease, RangeBlockPool};
+pub(crate) use self::pool::{PrefetchBudget, RangeBlockPool};
+pub use self::prefetch::PrefetchPin;
 use self::protocol::fingerprint_remote_source;
 use self::singleflight::{BlockFlight, LeaderCleanupGuard, SharedRangeError, SingleflightTable};
 use self::transport::{RangeFetchMode, RangeFetchRequest, fetch_range_http};
 
-/// Default initial head probe window (`256 KiB`), covering typical 128–300 KiB
-/// Sentinel-2 COG IFD and tile-offset headers in a single RTT.
-pub const DEFAULT_HEAD_PROBE_BYTES: usize = 256 * 1024;
-
 /// Maximum blocks coalesced into one HTTP Range GET (`64 * 64 KiB = 4 MiB`).
 const MAX_COALESCED_SPAN_BLOCKS: u64 = 64;
-
-/// Maximum gap (in blocks) bridged when coalescing remote COG chunk prefetch
-/// ranges (`1` block = `64 KiB`).
-const MAX_PREFETCH_GAP_BLOCKS: u64 = 1;
-
-/// Default maximum consumed-only sequential readahead (`4 * 64 KiB = 256 KiB`).
-const DEFAULT_MAX_READAHEAD_BLOCKS: u64 = 4;
-
-/// Default transient retry limit for HTTP Range requests.
-const DEFAULT_MAX_RETRIES: usize = 2;
-
-/// Errors returned when opening an [`HttpRangeSource`].
-#[derive(Debug, Error)]
-pub enum RangeOpenError {
-    #[error("operation cancelled")]
-    Cancelled,
-    #[error("invalid HTTP URL: {0}")]
-    InvalidUrl(String),
-    #[error("invalid HTTP header '{name}': {reason}")]
-    InvalidHeader { name: String, reason: String },
-    #[error("HTTP Range requests not supported by server: {0}")]
-    RangeNotSupported(String),
-    #[error("HTTP {code} opening remote raster: {detail}")]
-    HttpStatus { code: u16, detail: String },
-    #[error("invalid HTTP Range response: {0}")]
-    InvalidResponse(String),
-    #[error("network error: {0}")]
-    Network(String),
-    #[error("blocking HttpRangeSource::open called inside a Tokio runtime")]
-    CalledInsideTokioRuntime,
-}
-
-impl RangeOpenError {
-    pub const fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled)
-    }
-}
-
-/// Configuration for opening an [`HttpRangeSource`].
-#[derive(Clone)]
-pub struct HttpRangeConfig {
-    /// Bytes requested in the initial open probe (`0..head_probe_bytes`).
-    pub head_probe_bytes: usize,
-    /// Upper bound on consumed-only sequential readahead in 64 KiB blocks.
-    pub max_readahead_blocks: u64,
-    /// Maximum retries on transient network/5xx/429 errors (`412` and `200` are
-    /// never retried).
-    pub max_retries: usize,
-    /// Optional custom HTTP headers (e.g. `Authorization: Bearer ...` or
-    /// `x-api-key`) attached to every request for this source; redacted from
-    /// `Debug` output and errors.
-    pub extra_headers: Vec<(String, String)>,
-}
-
-impl Default for HttpRangeConfig {
-    fn default() -> Self {
-        Self {
-            head_probe_bytes: DEFAULT_HEAD_PROBE_BYTES,
-            max_readahead_blocks: DEFAULT_MAX_READAHEAD_BLOCKS,
-            max_retries: DEFAULT_MAX_RETRIES,
-            extra_headers: Vec::new(),
-        }
-    }
-}
-
-impl fmt::Debug for HttpRangeConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let header_names: Vec<&str> = self.extra_headers.iter().map(|(k, _)| k.as_str()).collect();
-        f.debug_struct("HttpRangeConfig")
-            .field("head_probe_bytes", &self.head_probe_bytes)
-            .field("max_readahead_blocks", &self.max_readahead_blocks)
-            .field("max_retries", &self.max_retries)
-            .field("extra_header_names", &header_names)
-            .finish()
-    }
-}
-
-/// RAII guard pinning prefetched 64 KiB blocks in memory for the duration of a
-/// CPU decode job so LRU eviction in the shared range block pool can never
-/// cause unexpected HTTP I/O on the fast decode lane.
-pub struct PrefetchPin {
-    inner: Arc<RangeInner>,
-    pinned_blocks: Vec<u64>,
-    _budget_lease: PrefetchBudgetLease,
-}
-
-impl PrefetchPin {
-    /// Number of 64 KiB blocks pinned by this guard.
-    pub fn block_count(&self) -> usize {
-        self.pinned_blocks.len()
-    }
-}
-
-impl Drop for PrefetchPin {
-    fn drop(&mut self) {
-        if self.pinned_blocks.is_empty() {
-            return;
-        }
-        let mut pins = lock_unpoisoned(&self.inner.active_pins);
-        for &blk in &self.pinned_blocks {
-            if let Some((refcount, _)) = pins.get_mut(&blk) {
-                *refcount = refcount.saturating_sub(1);
-                if *refcount == 0 {
-                    pins.remove(&blk);
-                }
-            }
-        }
-    }
-}
 
 #[derive(Default)]
 struct ReadaheadTracker {
@@ -486,11 +377,6 @@ impl HttpRangeSource {
         self.inner.fingerprint
     }
 
-    /// Initial head bytes pinned in RAM during the open probe.
-    pub fn pinned_head(&self) -> &[u8] {
-        &self.inner.pinned_head
-    }
-
     /// Total HTTP GET requests issued by this source (including open probe).
     pub fn http_requests(&self) -> u64 {
         self.inner.http_requests.load(Ordering::Relaxed)
@@ -500,124 +386,39 @@ impl HttpRangeSource {
     pub fn bytes_delivered(&self) -> u64 {
         self.inner.bytes_delivered.load(Ordering::Relaxed)
     }
+}
 
-    /// Asynchronously coalesce, fetch, and pin all 64 KiB blocks covering
-    /// `ranges` (`(offset, len)` pairs) under an upfront memory permit from
-    /// [`NetContext`].
-    ///
-    /// While the returned [`PrefetchPin`] is alive, subsequent synchronous
-    /// [`ByteSource::read_at`] calls for any byte inside `ranges` are guaranteed
-    /// to hit RAM without issuing HTTP requests.
-    pub async fn prefetch_ranges_async(
-        &self,
-        ranges: &[(u64, u64)],
-        cancel: &CancelToken,
-    ) -> Result<PrefetchPin, IoError> {
-        let (linked_cancel, _cancel_guard) = link_cancel_token(&self.inner.shutdown, cancel);
-        if linked_cancel.is_cancelled() {
-            return Err(IoError::Cancelled);
+fn copy_blocks_into_buf(
+    offset: u64,
+    avail: usize,
+    first_block: u64,
+    cached: &[Option<Arc<[u8]>>],
+    buf: &mut [u8],
+) -> Result<usize, IoError> {
+    let mut dst_pos = 0usize;
+    let mut cursor = offset;
+    for (i, slot) in cached.iter().enumerate() {
+        let blk = first_block + i as u64;
+        let data = slot.as_ref().ok_or(IoError::UnexpectedEof {
+            offset,
+            requested: avail,
+            read: dst_pos,
+        })?;
+        let blk_start = blk * RANGE_BLOCK_SIZE as u64;
+        let in_blk_start = (cursor - blk_start) as usize;
+        let take = (avail - dst_pos).min(data.len().saturating_sub(in_blk_start));
+        if take == 0 {
+            return Err(IoError::UnexpectedEof {
+                offset,
+                requested: avail,
+                read: dst_pos,
+            });
         }
-
-        let cap_bytes = self.inner.prefetch_budget.cap_bytes();
-        let max_blocks_in_cap = (cap_bytes.div_ceil(RANGE_BLOCK_SIZE) as u64).saturating_add(1);
-        let mut unique_blocks = BTreeSet::new();
-        let mut total_pin_bytes = 0usize;
-
-        for &(offset, len) in ranges {
-            if len == 0 || offset >= self.inner.len {
-                continue;
-            }
-            let clamped_end = offset.saturating_add(len).min(self.inner.len);
-            if clamped_end <= self.inner.pinned_head.len() as u64 {
-                continue;
-            }
-            let first = offset / RANGE_BLOCK_SIZE as u64;
-            let last = (clamped_end - 1) / RANGE_BLOCK_SIZE as u64;
-            if last.saturating_sub(first).saturating_add(1) > max_blocks_in_cap {
-                return Err(IoError::InvalidInput(format!(
-                    "remote prefetch range ({len} B) exceeds cap ({cap_bytes} B)"
-                )));
-            }
-            for blk in first..=last {
-                let start = blk.saturating_mul(RANGE_BLOCK_SIZE as u64);
-                let blen = self.inner.expected_block_len(blk);
-                if start.saturating_add(blen as u64) <= self.inner.pinned_head.len() as u64 {
-                    continue;
-                }
-                if unique_blocks.insert(blk) {
-                    total_pin_bytes = total_pin_bytes.saturating_add(blen);
-                    if total_pin_bytes > cap_bytes {
-                        return Err(IoError::InvalidInput(format!(
-                            "remote prefetch batch ({total_pin_bytes} B) exceeds cap ({cap_bytes} B)"
-                        )));
-                    }
-                }
-            }
-        }
-        let needed_blocks: Vec<u64> = unique_blocks.into_iter().collect();
-
-        let budget_lease = self
-            .inner
-            .prefetch_budget
-            .reserve(total_pin_bytes, &linked_cancel)
-            .await?;
-
-        let mut resolved: HashMap<u64, Arc<[u8]>> = HashMap::with_capacity(needed_blocks.len());
-        let mut missing = Vec::new();
-        for &blk in &needed_blocks {
-            if let Some(data) = self.inner.lookup_cached_block(blk) {
-                resolved.insert(blk, data);
-            } else {
-                missing.push(blk);
-            }
-        }
-
-        if !missing.is_empty() {
-            let fetched = self
-                .inner
-                .fetch_blocks_singleflight(&missing, MAX_PREFETCH_GAP_BLOCKS, &linked_cancel)
-                .await?;
-            for (blk, data) in fetched {
-                resolved.insert(blk, data);
-            }
-        }
-
-        let mut pinned_blocks = Vec::with_capacity(resolved.len());
-        {
-            let mut pins = lock_unpoisoned(&self.inner.active_pins);
-            for &blk in &needed_blocks {
-                if let Some(data) = resolved.get(&blk) {
-                    pins.entry(blk)
-                        .and_modify(|(rc, _)| *rc = rc.saturating_add(1))
-                        .or_insert_with(|| (1, Arc::clone(data)));
-                    pinned_blocks.push(blk);
-                }
-            }
-        }
-
-        Ok(PrefetchPin {
-            inner: Arc::clone(&self.inner),
-            pinned_blocks,
-            _budget_lease: budget_lease,
-        })
+        buf[dst_pos..dst_pos + take].copy_from_slice(&data[in_blk_start..in_blk_start + take]);
+        dst_pos += take;
+        cursor += take as u64;
     }
-
-    /// Blocking wrapper around [`Self::prefetch_ranges_async`], enforcing that
-    /// it is never invoked from inside a Tokio runtime thread.
-    pub fn prefetch_ranges(
-        &self,
-        ranges: &[(u64, u64)],
-        cancel: &CancelToken,
-    ) -> Result<PrefetchPin, IoError> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(IoError::InvalidInput(
-                "blocking HttpRangeSource::prefetch_ranges called inside Tokio runtime".to_owned(),
-            ));
-        }
-        self.inner
-            .handle
-            .block_on(self.prefetch_ranges_async(ranges, cancel))
-    }
+    Ok(dst_pos)
 }
 
 impl ByteSource for HttpRangeSource {
@@ -714,30 +515,7 @@ impl ByteSource for HttpRangeSource {
             let _ = lock_unpoisoned(&self.inner.readahead).extra_blocks(first_block, last_block, 0);
         }
 
-        let mut dst_pos = 0usize;
-        let mut cursor = offset;
-        for (i, slot) in cached.iter().enumerate() {
-            let blk = first_block + i as u64;
-            let data = slot.as_ref().ok_or(IoError::UnexpectedEof {
-                offset,
-                requested: avail,
-                read: dst_pos,
-            })?;
-            let blk_start = blk * RANGE_BLOCK_SIZE as u64;
-            let in_blk_start = (cursor - blk_start) as usize;
-            let take = (avail - dst_pos).min(data.len().saturating_sub(in_blk_start));
-            if take == 0 {
-                return Err(IoError::UnexpectedEof {
-                    offset,
-                    requested: avail,
-                    read: dst_pos,
-                });
-            }
-            buf[dst_pos..dst_pos + take].copy_from_slice(&data[in_blk_start..in_blk_start + take]);
-            dst_pos += take;
-            cursor += take as u64;
-        }
-        Ok(dst_pos)
+        copy_blocks_into_buf(offset, avail, first_block, &cached, buf)
     }
 }
 

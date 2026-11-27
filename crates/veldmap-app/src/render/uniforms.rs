@@ -130,41 +130,69 @@ const _: () = {
     assert!(std::mem::offset_of!(VectorUniform, hatch_spacing_px) == 44);
 };
 
+/// Number of typed dynamic-uniform bind-group slots backed by
+/// [`DynamicUniformArena`].
+pub(super) const UNIFORM_SLOT_COUNT: usize = 5;
+
+/// Typed index into the frame-wide [`DynamicUniformArena`] bind-group slots and
+/// [`super::pipelines::SharedLayouts`] dynamic-uniform layouts.
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UniformSlot {
+    Tile = 0,
+    Overlay = 1,
+    Scientific = 2,
+    Categorical = 3,
+    Vector = 4,
+}
+
+impl UniformSlot {
+    pub(super) const ALL: [Self; UNIFORM_SLOT_COUNT] = [
+        Self::Tile,
+        Self::Overlay,
+        Self::Scientific,
+        Self::Categorical,
+        Self::Vector,
+    ];
+
+    pub(super) const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn bind_group_label(self) -> &'static str {
+        match self {
+            Self::Tile => "arena tile dynamic uniform bind group",
+            Self::Overlay => "arena overlay dynamic uniform bind group",
+            Self::Scientific => "arena scientific overlay dynamic uniform bind group",
+            Self::Categorical => "arena categorical overlay dynamic uniform bind group",
+            Self::Vector => "arena vector dynamic uniform bind group",
+        }
+    }
+
+    const fn binding_size(self) -> usize {
+        match self {
+            Self::Tile => std::mem::size_of::<TileUniform>(),
+            Self::Overlay => std::mem::size_of::<OverlayPatchUniform>(),
+            Self::Scientific => std::mem::size_of::<ScientificPatchUniform>(),
+            Self::Categorical => std::mem::size_of::<CategoricalPatchUniform>(),
+            Self::Vector => std::mem::size_of::<VectorUniform>(),
+        }
+    }
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < UNIFORM_SLOT_COUNT {
+        assert!(UniformSlot::ALL[i].index() == i);
+        i += 1;
+    }
+};
+
 struct UniformSlotEntry {
     label: &'static str,
     binding_size: usize,
     layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
-}
-
-struct ArenaSlots {
-    tile: UniformSlotEntry,
-    overlay: UniformSlotEntry,
-    scientific: UniformSlotEntry,
-    categorical: UniformSlotEntry,
-    vector: UniformSlotEntry,
-}
-
-impl ArenaSlots {
-    fn as_array(&self) -> [&UniformSlotEntry; 5] {
-        [
-            &self.tile,
-            &self.overlay,
-            &self.scientific,
-            &self.categorical,
-            &self.vector,
-        ]
-    }
-
-    fn as_mut_array(&mut self) -> [&mut UniformSlotEntry; 5] {
-        [
-            &mut self.tile,
-            &mut self.overlay,
-            &mut self.scientific,
-            &mut self.categorical,
-            &mut self.vector,
-        ]
-    }
 }
 
 fn dynamic_uniform_bind_group(
@@ -188,16 +216,6 @@ fn dynamic_uniform_bind_group(
     })
 }
 
-/// Named bind-group layouts required to build a [`DynamicUniformArena`].
-#[derive(Clone, Copy)]
-pub(super) struct DynamicUniformLayouts<'a> {
-    pub(super) tile: &'a wgpu::BindGroupLayout,
-    pub(super) overlay: &'a wgpu::BindGroupLayout,
-    pub(super) scientific: &'a wgpu::BindGroupLayout,
-    pub(super) categorical: &'a wgpu::BindGroupLayout,
-    pub(super) vector: &'a wgpu::BindGroupLayout,
-}
-
 /// Frame-wide dynamic uniform arena shared across globe body, post-body
 /// display/scientific/categorical raster overlays, vector overlays, and
 /// graticule passes.
@@ -207,53 +225,32 @@ pub(super) struct DynamicUniformArena {
     last_offset: usize,
     buffer: wgpu::Buffer,
     capacity_bytes: usize,
-    slots: ArenaSlots,
+    slots: [UniformSlotEntry; UNIFORM_SLOT_COUNT],
 }
 
 impl DynamicUniformArena {
-    pub(super) fn new(device: &wgpu::Device, layouts: DynamicUniformLayouts<'_>) -> Self {
+    pub(super) fn new(
+        device: &wgpu::Device,
+        layouts: &[wgpu::BindGroupLayout; UNIFORM_SLOT_COUNT],
+    ) -> Self {
         let alignment = device.limits().min_uniform_buffer_offset_alignment.max(1);
         let min_slot = alignment as usize;
         let initial_bytes = (128 * min_slot).max(4096);
         let buffer = Self::create_buffer(device, initial_bytes);
-        let make_slot =
-            |label: &'static str, binding_size: usize, layout: &wgpu::BindGroupLayout| {
-                let bind_group =
-                    dynamic_uniform_bind_group(device, label, layout, &buffer, binding_size);
-                UniformSlotEntry {
-                    label,
-                    binding_size,
-                    layout: layout.clone(),
-                    bind_group,
-                }
-            };
-        let slots = ArenaSlots {
-            tile: make_slot(
-                "arena tile dynamic uniform bind group",
-                std::mem::size_of::<TileUniform>(),
-                layouts.tile,
-            ),
-            overlay: make_slot(
-                "arena overlay dynamic uniform bind group",
-                std::mem::size_of::<OverlayPatchUniform>(),
-                layouts.overlay,
-            ),
-            scientific: make_slot(
-                "arena scientific overlay dynamic uniform bind group",
-                std::mem::size_of::<ScientificPatchUniform>(),
-                layouts.scientific,
-            ),
-            categorical: make_slot(
-                "arena categorical overlay dynamic uniform bind group",
-                std::mem::size_of::<CategoricalPatchUniform>(),
-                layouts.categorical,
-            ),
-            vector: make_slot(
-                "arena vector dynamic uniform bind group",
-                std::mem::size_of::<VectorUniform>(),
-                layouts.vector,
-            ),
-        };
+        let slots = std::array::from_fn(|idx| {
+            let slot = UniformSlot::ALL[idx];
+            let label = slot.bind_group_label();
+            let binding_size = slot.binding_size();
+            let layout = &layouts[idx];
+            let bind_group =
+                dynamic_uniform_bind_group(device, label, layout, &buffer, binding_size);
+            UniformSlotEntry {
+                label,
+                binding_size,
+                layout: layout.clone(),
+                bind_group,
+            }
+        });
         Self {
             alignment,
             staging: Vec::with_capacity(initial_bytes),
@@ -301,8 +298,7 @@ impl DynamicUniformArena {
         }
         let max_binding = self
             .slots
-            .as_array()
-            .into_iter()
+            .iter()
             .map(|slot| slot.binding_size)
             .max()
             .unwrap_or(0);
@@ -311,7 +307,7 @@ impl DynamicUniformArena {
         if required_bytes > self.capacity_bytes {
             let next_cap = required_bytes.next_power_of_two().max(4096);
             self.buffer = Self::create_buffer(device, next_cap);
-            for slot in self.slots.as_mut_array() {
+            for slot in &mut self.slots {
                 slot.bind_group = dynamic_uniform_bind_group(
                     device,
                     slot.label,
@@ -328,23 +324,7 @@ impl DynamicUniformArena {
         queue.write_buffer(&self.buffer, 0, &self.staging[..copy_len]);
     }
 
-    pub(super) fn tile_bind_group(&self) -> &wgpu::BindGroup {
-        &self.slots.tile.bind_group
-    }
-
-    pub(super) fn overlay_bind_group(&self) -> &wgpu::BindGroup {
-        &self.slots.overlay.bind_group
-    }
-
-    pub(super) fn scientific_overlay_bind_group(&self) -> &wgpu::BindGroup {
-        &self.slots.scientific.bind_group
-    }
-
-    pub(super) fn categorical_overlay_bind_group(&self) -> &wgpu::BindGroup {
-        &self.slots.categorical.bind_group
-    }
-
-    pub(super) fn vector_bind_group(&self) -> &wgpu::BindGroup {
-        &self.slots.vector.bind_group
+    pub(super) fn bind_group(&self, slot: UniformSlot) -> &wgpu::BindGroup {
+        &self.slots[slot.index()].bind_group
     }
 }

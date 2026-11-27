@@ -4,8 +4,7 @@
 use eframe::egui;
 
 use crate::layers::LayerSummary;
-use crate::stac::StacSession;
-use crate::storage::settings::AppSettings;
+use crate::stac::StacViewSnapshot;
 use crate::vectors::VectorLayerSummary;
 
 use super::layers::{
@@ -47,8 +46,7 @@ pub(crate) struct WorkbenchInputs<'a> {
     pub(crate) layer_summaries: &'a [LayerSummary],
     pub(crate) vector_summaries: &'a [VectorLayerSummary],
     pub(crate) unavailable_notices: &'a [UnavailableLayerNotice],
-    pub(crate) stac: &'a StacSession,
-    pub(crate) settings: &'a AppSettings,
+    pub(crate) stac: StacViewSnapshot<'a>,
     pub(crate) draw_aoi_active: bool,
 }
 
@@ -101,8 +99,7 @@ pub(crate) fn show_workbench_panel(
                 WorkbenchTab::CloudStac => {
                     out.stac_actions = show_stac_tab_contents(
                         ui,
-                        inputs.stac,
-                        inputs.settings,
+                        &inputs.stac,
                         inputs.vector_summaries,
                         inputs.draw_aoi_active,
                         stac_state,

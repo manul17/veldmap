@@ -14,10 +14,9 @@ use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint};
 
 use super::TiffSource;
 use crate::RasterError;
-use crate::pipeline::chunk_cache::SharedChunkCache;
-use crate::pipeline::metadata::BandSample;
-use crate::pipeline::plan::DISPLAY_STREAM_SPEC;
-use crate::pipeline::{DecodeContext, RasterSource};
+use crate::pipeline::{
+    BandSample, DISPLAY_STREAM_SPEC, DecodeContext, DisplayMapping, RasterSource, SharedChunkCache,
+};
 
 struct ControlledTailSource {
     inner: MemoryByteSource,
@@ -233,10 +232,7 @@ fn display_mapping_distinguishes_leader_cancel_from_permanent_failure() {
         .join()
         .expect("join retried follower")
         .expect("uncancelled follower succeeds after leader cancel");
-    assert_ne!(
-        mapping,
-        crate::pipeline::radiometry::DisplayMapping::identity(None)
-    );
+    assert_ne!(mapping, DisplayMapping::identity(None));
 
     // 3. Cached Ready mapping is served immediately for subsequent calls.
     let ctx = DecodeContext {

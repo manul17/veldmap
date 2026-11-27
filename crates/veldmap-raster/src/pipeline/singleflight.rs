@@ -21,7 +21,7 @@ enum SingleflightOutcome<T> {
 }
 
 /// Classification returned by a cache when entering [`run_singleflight`].
-pub(crate) enum SingleflightRole<T> {
+pub(super) enum SingleflightRole<T> {
     /// Cached value already available.
     Ready(T),
     /// Caller became the leader responsible for computing and publishing into
@@ -32,13 +32,13 @@ pub(crate) enum SingleflightRole<T> {
 }
 
 /// One-shot cancellable singleflight slot storing a resolved outcome for `T`.
-pub(crate) struct SingleflightSlot<T> {
+pub(super) struct SingleflightSlot<T> {
     state: Mutex<Option<SingleflightOutcome<T>>>,
     cvar: Condvar,
 }
 
 impl<T> SingleflightSlot<T> {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             state: Mutex::new(None),
             cvar: Condvar::new(),
@@ -127,7 +127,7 @@ impl<T: Clone + Send + 'static, F: FnOnce(&Arc<SingleflightSlot<T>>)> Drop
 /// `cancel.is_cancelled()` are true; an uncancelled leader returning
 /// `Err(RasterError::Cancelled)` propagates once to followers to avoid
 /// livelock.
-pub(crate) fn run_singleflight<T, Acquire, Compute, Commit, Abort>(
+pub(super) fn run_singleflight<T, Acquire, Compute, Commit, Abort>(
     cancel: &CancelToken,
     panic_message: &'static str,
     mut acquire: Acquire,

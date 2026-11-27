@@ -143,8 +143,8 @@ impl std::fmt::Debug for SubmitError {
 }
 
 pub(super) struct DecodeQueue {
-    pub(super) jobs: Vec<DecodeJob>,
-    pub(super) queued_bytes: usize,
+    jobs: Vec<DecodeJob>,
+    queued_bytes: usize,
     max_pending_jobs: usize,
     max_pending_bytes: usize,
     pub(super) closed: bool,
@@ -159,6 +159,16 @@ impl DecodeQueue {
             max_pending_bytes,
             closed: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn jobs(&self) -> &[DecodeJob] {
+        &self.jobs
+    }
+
+    #[cfg(test)]
+    pub(super) const fn queued_bytes(&self) -> usize {
+        self.queued_bytes
     }
 
     pub(super) fn is_empty(&self) -> bool {

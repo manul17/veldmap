@@ -14,7 +14,7 @@ const FINGERPRINT_HEAD_FALLBACK_BYTES: usize = 64 * 1024;
 
 /// Parsed RFC 9110 `Content-Range` header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ContentRange {
+pub(super) enum ContentRange {
     /// `bytes <start>-<end>/<total>` with `start <= end < total`.
     Span { start: u64, end: u64, total: u64 },
     /// `bytes */<total>` (used for `416 Range Not Satisfiable`, e.g. 0-byte files).
@@ -23,7 +23,7 @@ pub(crate) enum ContentRange {
 
 /// Extract a validated strong RFC 9110 `ETag` (`"..."`, never weak `W/"..."`
 /// or multi-quoted/control-byte values).
-pub(crate) fn parse_strong_etag(headers: &HeaderMap) -> Option<String> {
+pub(super) fn parse_strong_etag(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(reqwest::header::ETAG)?.to_str().ok()?.trim();
     if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
         return None;
@@ -41,7 +41,7 @@ pub(crate) fn parse_strong_etag(headers: &HeaderMap) -> Option<String> {
 
 /// Reject any response carrying a non-`identity` `Content-Encoding` header so
 /// byte-range offsets are never silently corrupted by transparent compression.
-pub(crate) fn validate_identity_content_encoding(headers: &HeaderMap) -> Result<(), String> {
+pub(super) fn validate_identity_content_encoding(headers: &HeaderMap) -> Result<(), String> {
     for val in headers.get_all(reqwest::header::CONTENT_ENCODING) {
         let text = val
             .to_str()
@@ -59,7 +59,7 @@ pub(crate) fn validate_identity_content_encoding(headers: &HeaderMap) -> Result<
 }
 
 /// Parse an RFC 9110 `Content-Range` header with an explicit total byte length.
-pub(crate) fn parse_content_range(raw: &str) -> Result<ContentRange, String> {
+pub(super) fn parse_content_range(raw: &str) -> Result<ContentRange, String> {
     let trimmed = raw.trim();
     let bytes = trimmed.as_bytes();
     if bytes.len() < 6 || !bytes[..5].eq_ignore_ascii_case(b"bytes") || bytes[5] != b' ' {
@@ -103,7 +103,7 @@ pub(crate) fn parse_content_range(raw: &str) -> Result<ContentRange, String> {
 /// Derive a deterministic [`SourceFingerprint`] without issuing extra HTTP GETs:
 /// - Strong ETag present: hashes `(canonical_url_without_query, len, strong_etag)`
 /// - Weak/missing ETag: hashes `(canonical_url_without_query, len, blake3(head_64k))`
-pub(crate) fn fingerprint_remote_source(
+pub(super) fn fingerprint_remote_source(
     canonical_url_without_query: &str,
     content_length: u64,
     strong_etag: Option<&str>,

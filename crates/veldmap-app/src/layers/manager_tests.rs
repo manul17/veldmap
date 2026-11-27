@@ -13,6 +13,7 @@ use veldmap_storage::test_support::TestTempDir;
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 use crate::layers::{
     CursorReadout, CursorReadoutValue, OverlayFrameCtx, OverlayIoEvent, OverlayManager,
+    OverlayManagerDeps,
 };
 
 fn wait_for_io_event(mgr: &mut OverlayManager) -> OverlayIoEvent {
@@ -65,16 +66,16 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         wakeup_count.fetch_add(1, Ordering::Relaxed);
     });
 
-    let mut mgr = OverlayManager::new(
-        &budget,
-        Some(Arc::clone(&disk_cache)),
-        None,
-        pool.fast_handle(),
-        pool.bulk_handle(),
+    let mut mgr = OverlayManager::new(OverlayManagerDeps {
+        budget,
+        disk_cache: Some(Arc::clone(&disk_cache)),
+        net: None,
+        fast_pool: pool.fast_handle(),
+        bulk_pool: pool.bulk_handle(),
         done_tx,
         wakeup,
-        shutdown.clone(),
-    );
+        shutdown: shutdown.clone(),
+    });
 
     // 1. Non-blocking open completes off the UI thread.
     mgr.begin_open_file(&tif_path, true).expect("queue open");
@@ -280,16 +281,16 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
     let done_tx = pending.sender().expect("upload sender");
     let wakeup: veldmap_core::sync::Wakeup = Arc::new(|| {});
 
-    let mut mgr = OverlayManager::new(
-        &budget,
-        Some(Arc::clone(&disk_cache)),
-        Some(Arc::clone(&net)),
-        pool.fast_handle(),
-        pool.bulk_handle(),
+    let mut mgr = OverlayManager::new(OverlayManagerDeps {
+        budget,
+        disk_cache: Some(Arc::clone(&disk_cache)),
+        net: Some(Arc::clone(&net)),
+        fast_pool: pool.fast_handle(),
+        bulk_pool: pool.bulk_handle(),
         done_tx,
         wakeup,
-        shutdown.clone(),
-    );
+        shutdown: shutdown.clone(),
+    });
 
     let url = format!("http://{addr}/scene.tif?token=secret-query");
     mgr.begin_open_remote_cog(url, "Test Remote COG".to_owned(), Vec::new(), None, true)
@@ -402,16 +403,16 @@ fn tile_write_worker_honors_source_purge_and_backoff_wakes_idle_ui() {
         TwoLaneDecodePoolConfig::from_budget(&budget),
         shutdown.clone(),
     );
-    let mut mgr = OverlayManager::new(
-        &budget,
-        Some(Arc::clone(&disk_cache)),
-        None,
-        pool.fast_handle(),
-        pool.bulk_handle(),
+    let mut mgr = OverlayManager::new(OverlayManagerDeps {
+        budget,
+        disk_cache: Some(Arc::clone(&disk_cache)),
+        net: None,
+        fast_pool: pool.fast_handle(),
+        bulk_pool: pool.bulk_handle(),
         done_tx,
         wakeup,
-        shutdown.clone(),
-    );
+        shutdown: shutdown.clone(),
+    });
 
     // `note_submit_backoff` must wake an idle UI once when entering backoff.
     let before = wake_count.load(Ordering::Relaxed);

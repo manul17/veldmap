@@ -1,7 +1,7 @@
 //! Pure TIFF endianness normalization and `Predictor = 2` (horizontal
 //! differencing) / `Predictor = 3` (floating-point byte-lane) reversal.
 
-use crate::pipeline::metadata::SampleType;
+use crate::pipeline::SampleType;
 
 use super::super::ifd::{TiffByteOrder, TiffPredictor};
 

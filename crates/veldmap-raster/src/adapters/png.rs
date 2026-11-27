@@ -15,13 +15,11 @@ use veldmap_core::tile::{
 };
 
 use crate::image_codec::{build_normalized_png_decoder, build_png_decoder, png_u8_to_rgba8};
-use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
-use crate::pipeline::metadata::{
-    BandInfo, BandSample, GeoPlacement, RasterDescription, SampleType,
+use crate::pipeline::{
+    BandInfo, BandSample, Cascade, DISPLAY_STREAM_SPEC, DecodeContext, GeoPlacement, LevelPlan,
+    PixelLayout, RasterDescription, RasterSource, SampleType, ServeMode, TileEmit,
+    bleed_display_emit, cascade_bytes, check_max_source_side, expand_u8_into_rgba,
 };
-use crate::pipeline::plan::{DISPLAY_STREAM_SPEC, LevelPlan, ServeMode, check_max_source_side};
-use crate::pipeline::radiometry::{PixelLayout, expand_u8_into_rgba};
-use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
 
 use super::world_file_binding_trouble;
@@ -71,7 +69,7 @@ impl PngSource {
             png::ColorType::Rgba => 4,
         };
 
-        let cascade_bytes = cascade::bytes(width, height, PixelFormat::Rgba8UnormSrgb);
+        let cascade_bytes = cascade_bytes(width, height, PixelFormat::Rgba8UnormSrgb);
         let row_bytes = u64::from(width).saturating_mul(4);
         let pass_peak_bytes = if interlaced {
             // Adam7 requires a full decoded frame buffer + RGBA conversion + cascade.
@@ -190,7 +188,7 @@ impl RasterSource for PngSource {
             })?;
             let est = (buf_len as u64)
                 .saturating_add(u64::from(w).saturating_mul(u64::from(h)).saturating_mul(4))
-                .saturating_add(cascade::bytes(w, h, PixelFormat::Rgba8UnormSrgb));
+                .saturating_add(cascade_bytes(w, h, PixelFormat::Rgba8UnormSrgb));
             if est > ctx.budget.decode_working_bytes {
                 return Err(RasterError::LimitExceeded {
                     width: w,

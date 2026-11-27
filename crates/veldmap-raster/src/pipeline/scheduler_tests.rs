@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
 
-use crate::pipeline::plan::LevelPlan;
+use crate::pipeline::LevelPlan;
 
 use super::*;
 

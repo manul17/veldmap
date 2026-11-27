@@ -6,7 +6,7 @@ use super::projection::{
     GK_PULKOVO_EPSG_BASE, GK_PULKOVO_ZONES, MSK61_EPSG_BASE, MSK61_ZONES, UTM_NORTH_EPSG_BASE,
     UTM_SOUTH_EPSG_BASE, UTM_ZONES,
 };
-use super::{CrsSpec, parse_epsg_shorthand};
+use super::spec::{CrsSpec, parse_epsg_shorthand};
 
 /// Searchable CRS preset entry for the UI CRS picker.
 #[derive(Clone, Debug, PartialEq, Eq)]

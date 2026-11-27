@@ -1,6 +1,6 @@
 //! Direct stateless raw-chunk GeoTIFF decompressor over [`veldmap_core::io::ByteSource`].
 //!
-//! Bypasses `tiff::decoder::Decoder::read_chunk`, reusing already-locked codecs
+//! Decodes raw TIFF strips and tiles directly using already-locked codecs
 //! (`flate2`, `weezl`, `zstd`, `jpeg-decoder`, `image-webp`) with explicit
 //! pre-allocation bounds, TIFF endianness handling, `Predictor = 2` & `3`
 //! (on full stored tile rows before edge cropping), `PlanarConfiguration = 2`

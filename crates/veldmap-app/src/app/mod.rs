@@ -11,37 +11,37 @@ mod viewport_bridge;
 mod viewport_input;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu;
 use thiserror::Error;
 use veldmap_core::geo::{Camera, FootprintBounds};
-use veldmap_core::sync::{Wakeup, lock_unpoisoned};
-use veldmap_net::{NetConfig, NetContext};
+use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
 use crate::gpu_tiles::UploadChannelClosed;
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::scene::{SceneRepaintHint, SceneState};
+use crate::stac::StacSession;
 use crate::storage::AppStorage;
 use crate::storage::session::SavedCameraPose;
 use crate::storage::settings::AppSettings;
-use crate::ui::basemap::BasemapUiState;
+use crate::ui;
 use crate::ui::crs_picker::{CrsPickerState, show_crs_picker_window};
 use crate::ui::hud;
 use crate::ui::layers::LayersPanelState;
 use crate::ui::measure::{MeasureUiState, show_measure_window};
+use crate::ui::settings::{SettingsTab, SettingsWindowState, show_settings_window};
 use crate::ui::stac::StacUiState;
+use crate::ui::status_bar::{self, StatusBarInputs};
 use crate::ui::toolbar::{self, ToolbarInputs, ToolbarState};
 use crate::ui::workbench::{WorkbenchInputs, WorkbenchTab, show_workbench_panel};
-use crate::ui::{self, status_bar};
 
 use dialogs::DialogHost;
 use fonts::build_font_definitions;
 use session_sync::SessionRestoreTracker;
-use viewport_bridge::{GlobePaintCallback, install_wgpu_resources, viewport_pixels};
+use viewport_bridge::{GlobePaintCallback, GpuFaultState, install_wgpu_resources, viewport_pixels};
 use viewport_input::{ViewportEvent, ViewportInteraction, ViewportToolMode};
 
 #[derive(Debug, Error)]
@@ -60,7 +60,7 @@ impl From<UploadChannelClosed> for AppError {
 
 /// Transient UI state for all floating windows, panels, and toolbar inputs.
 struct UiPanels {
-    basemap: BasemapUiState,
+    settings: SettingsWindowState,
     layers: LayersPanelState,
     stac: StacUiState,
     workbench_open: bool,
@@ -74,7 +74,7 @@ struct UiPanels {
 impl UiPanels {
     fn new(settings: &AppSettings) -> Self {
         Self {
-            basemap: BasemapUiState::new(settings),
+            settings: SettingsWindowState::new(settings),
             layers: LayersPanelState::default(),
             stac: StacUiState::default(),
             workbench_open: false,
@@ -84,70 +84,6 @@ impl UiPanels {
             measure: MeasureUiState::default(),
             toolbar: ToolbarState::default(),
         }
-    }
-}
-
-#[derive(Default)]
-struct GpuFaultInner {
-    device_lost: Option<String>,
-    uncaptured_error: Option<String>,
-}
-
-/// Lock-free fast-path holder for asynchronous `wgpu` device faults surfaced in
-/// the UI banner without per-frame mutex locks or error-frame repaint storms.
-#[derive(Default)]
-struct GpuFaultState {
-    has_fault: AtomicBool,
-    inner: Mutex<GpuFaultInner>,
-}
-
-impl GpuFaultState {
-    fn record_device_lost(&self, msg: String) -> bool {
-        let mut guard = lock_unpoisoned(&self.inner);
-        let changed = guard.device_lost.as_deref() != Some(msg.as_str());
-        guard.device_lost = Some(msg);
-        self.has_fault.store(true, Ordering::Release);
-        changed
-    }
-
-    fn record_uncaptured_error(&self, msg: String) -> bool {
-        let mut guard = lock_unpoisoned(&self.inner);
-        if guard.device_lost.is_some() {
-            return false;
-        }
-        if guard.uncaptured_error.as_deref() == Some(msg.as_str()) {
-            return false;
-        }
-        guard.uncaptured_error = Some(msg);
-        self.has_fault.store(true, Ordering::Release);
-        true
-    }
-
-    fn summary(&self) -> Option<(String, bool)> {
-        if !self.has_fault.load(Ordering::Acquire) {
-            return None;
-        }
-        let guard = lock_unpoisoned(&self.inner);
-        if let Some(lost) = &guard.device_lost {
-            return Some((
-                format!("GPU device lost (restart recommended): {lost}"),
-                true,
-            ));
-        }
-        guard
-            .uncaptured_error
-            .as_ref()
-            .map(|err| (format!("GPU error: {err}"), false))
-    }
-
-    fn dismiss(&self) {
-        if !self.has_fault.load(Ordering::Acquire) {
-            return;
-        }
-        let mut guard = lock_unpoisoned(&self.inner);
-        guard.device_lost = None;
-        guard.uncaptured_error = None;
-        self.has_fault.store(false, Ordering::Release);
     }
 }
 
@@ -215,23 +151,9 @@ impl VeldmapApp {
         let queue = render_state.queue.clone();
 
         let budget = detect_memory_budget();
-        let (net, net_init_error) = match NetContext::new(NetConfig::from_budget(&budget)) {
-            Ok(ctx) => (Some(Arc::new(ctx)), None),
-            Err(err) => {
-                tracing::warn!(error = %err, "Failed to initialize shared NetContext");
-                (None, Some(err.to_string()))
-            }
-        };
         let storage = AppStorage::open(Arc::clone(&wakeup), None);
         let dialogs = DialogHost::new(Arc::clone(&wakeup));
-        let scene = SceneState::new(
-            storage.settings(),
-            storage.disk_cache(),
-            net,
-            net_init_error,
-            wakeup,
-            &budget,
-        )?;
+        let scene = SceneState::new(storage.settings(), storage.disk_cache(), wakeup, &budget)?;
         let panels = UiPanels::new(storage.settings());
 
         let restored_session = storage.session().clone();
@@ -264,6 +186,26 @@ impl VeldmapApp {
             .focus(bounds.lat, bounds.lon, bounds.radius_deg.max(0.000_2));
     }
 
+    /// Open the unified Settings modal on `tab`, synchronizing the draft when
+    /// newly opened, refreshing disk cache statistics, and clearing any stale
+    /// disk-cache notice.
+    pub(super) fn open_settings_tab(&mut self, tab: SettingsTab) {
+        self.panels.settings.open_tab(self.storage.settings(), tab);
+        self.storage.maybe_refresh_disk_stats(true);
+        self.storage.clear_disk_cache_notice();
+    }
+
+    /// Toggle the unified Settings modal open or closed from the toolbar,
+    /// preserving the last selected tab when reopening.
+    pub(super) fn toggle_settings(&mut self) {
+        if self.panels.settings.is_open() {
+            self.panels.settings.close();
+        } else {
+            let tab = self.panels.settings.active_tab();
+            self.open_settings_tab(tab);
+        }
+    }
+
     /// Currently active exclusive viewport interaction tool.
     fn active_viewport_tool(&self) -> ViewportToolMode {
         if self.panels.draw_aoi_active {
@@ -275,43 +217,73 @@ impl VeldmapApp {
         }
     }
 
-    /// Atomically cancel interactive AOI box drawing, clearing both pointer
-    /// drag state and any live AOI preview footprint.
-    pub(super) fn cancel_draw_aoi(&mut self) {
+    fn deactivate_draw_aoi(&mut self) {
         self.panels.draw_aoi_active = false;
         self.viewport.cancel_aoi_drag();
-        self.scene.mutate_stac(|s| {
-            let changed = s.clear_aoi_preview();
-            ((), changed)
-        });
+        self.scene.mutate_stac(StacSession::clear_aoi_preview);
+    }
+
+    /// Transition to an exclusive viewport tool (`Navigate`, `Measure`, or
+    /// `DrawAoiBox`), atomically deactivating any conflicting drag, preview, or
+    /// measurement state.
+    fn set_viewport_tool(&mut self, tool: ViewportToolMode) {
+        if tool != ViewportToolMode::DrawAoiBox {
+            self.deactivate_draw_aoi();
+        }
+        if tool != ViewportToolMode::Measure {
+            self.scene.mutate_measure(|m| m.set_mode(MeasureMode::Off));
+        }
+        match tool {
+            ViewportToolMode::Navigate => {}
+            ViewportToolMode::DrawAoiBox => {
+                self.panels.draw_aoi_active = true;
+            }
+            ViewportToolMode::Measure => {
+                if !self.scene.measure().is_active() {
+                    self.scene.mutate_measure(MeasureSession::toggle);
+                }
+            }
+        }
+    }
+
+    /// Atomically cancel interactive AOI box drawing without disturbing an
+    /// unrelated active measurement session.
+    pub(super) fn cancel_draw_aoi(&mut self) {
+        if self.panels.draw_aoi_active {
+            self.set_viewport_tool(ViewportToolMode::Navigate);
+        } else {
+            self.deactivate_draw_aoi();
+        }
     }
 
     /// Enable or disable interactive AOI box drawing, enforcing mutual
     /// exclusion with geodesic measurement.
     pub(super) fn set_draw_aoi_active(&mut self, active: bool) {
         if active {
-            self.panels.draw_aoi_active = true;
-            self.scene.mutate_measure(|m| m.set_mode(MeasureMode::Off));
+            self.set_viewport_tool(ViewportToolMode::DrawAoiBox);
         } else {
             self.cancel_draw_aoi();
         }
     }
 
-    /// Toggle geodesic measurement mode, cancelling AOI drawing whenever
-    /// measurement activates.
+    /// Toggle geodesic measurement mode while preserving
+    /// [`MeasureSession`]'s remembered `last_active_mode`.
     pub(super) fn toggle_measure_tool(&mut self) {
-        self.scene.mutate_measure(MeasureSession::toggle);
         if self.scene.measure().is_active() {
-            self.cancel_draw_aoi();
+            self.set_viewport_tool(ViewportToolMode::Navigate);
+        } else {
+            self.set_viewport_tool(ViewportToolMode::Measure);
         }
     }
 
-    /// Set geodesic measurement mode explicitly, cancelling AOI drawing
-    /// whenever measurement becomes active.
+    /// Set geodesic measurement mode explicitly (`Distance`, `Area`, or `Off`),
+    /// enforcing mutual exclusion with AOI box drawing.
     pub(super) fn set_measure_mode(&mut self, mode: MeasureMode) {
-        self.scene.mutate_measure(|m| m.set_mode(mode));
-        if self.scene.measure().is_active() {
-            self.cancel_draw_aoi();
+        if mode == MeasureMode::Off {
+            self.set_viewport_tool(ViewportToolMode::Navigate);
+        } else {
+            self.deactivate_draw_aoi();
+            self.scene.mutate_measure(|m| m.set_mode(mode));
         }
     }
 
@@ -320,10 +292,7 @@ impl VeldmapApp {
     /// closing the workbench so orbit navigation and highlights never stick.
     pub(super) fn cleanup_stac_transient_modes(&mut self) {
         self.cancel_draw_aoi();
-        self.scene.mutate_stac(|s| {
-            let changed = s.set_hovered(None);
-            ((), changed)
-        });
+        self.scene.mutate_stac(|s| s.set_hovered(None));
     }
 
     pub(super) fn open_workbench_tab(&mut self, tab: WorkbenchTab) {
@@ -350,6 +319,113 @@ impl VeldmapApp {
         } else {
             self.open_workbench_tab(tab);
         }
+    }
+
+    fn show_toolbar(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) -> bool {
+        let settings = self.storage.settings();
+        let basemap_status = self.scene.basemap().status_snapshot();
+        let toolbar_actions = toolbar::show_top_toolbar(
+            ui,
+            ToolbarInputs {
+                active_basemap: settings.active_basemap,
+                custom_xyz_configured: !settings.custom_xyz.url_template.trim().is_empty(),
+                show_graticule: settings.show_graticule,
+                basemap_status: &basemap_status,
+                adapter_label: &self.adapter_label,
+                layer_count: self.scene.total_layer_count(),
+                unavailable_layer_count: self.restore_tracker.unavailable_count(),
+                layers_open: self.panels.workbench_open
+                    && self.panels.workbench_tab == WorkbenchTab::Layers,
+                cloud_open: self.panels.workbench_open
+                    && self.panels.workbench_tab == WorkbenchTab::CloudStac,
+                measure_active: self.scene.measure().is_active(),
+                recent_files: &self.storage.session().recent_files,
+                bookmarks: &self.storage.session().bookmarks,
+            },
+            &mut self.panels.toolbar,
+        );
+        self.apply_toolbar_actions(toolbar_actions, frame)
+    }
+
+    fn show_settings_if_open(&mut self, ctx: &egui::Context) -> bool {
+        if !self.panels.settings.is_open() {
+            return false;
+        }
+        self.storage.maybe_refresh_disk_stats(false);
+        let disk_status = self.storage.disk_cache_status();
+        let settings_actions = show_settings_window(
+            ctx,
+            self.storage.settings(),
+            &disk_status,
+            &mut self.panels.settings,
+        );
+        let mut needs_repaint = false;
+        for action in settings_actions {
+            needs_repaint |= self.apply_settings_action(action);
+        }
+        needs_repaint
+    }
+
+    fn show_floating_windows(&mut self, ctx: &egui::Context, frame: &eframe::Frame) -> bool {
+        let mut needs_repaint = self.show_settings_if_open(ctx);
+        if let Some(crs_action) = show_crs_picker_window(ctx, &mut self.panels.crs_picker) {
+            needs_repaint |= self.apply_crs_picker_action(crs_action);
+        }
+        let measure_summary = self.scene.measure().summary();
+        if let Some(measure_action) =
+            show_measure_window(ctx, measure_summary, &self.panels.measure)
+        {
+            needs_repaint |= self.handle_measure_action(measure_action, frame);
+        }
+        needs_repaint
+    }
+
+    fn show_workbench_if_open(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+    ) -> bool {
+        if !self.panels.workbench_open {
+            return false;
+        }
+        let total_layers = self.scene.total_layer_count();
+        let layer_summaries = if self.panels.workbench_tab == WorkbenchTab::Layers {
+            self.scene.overlays().layer_summaries()
+        } else {
+            Vec::new()
+        };
+        let vector_summaries = self.scene.vectors().summaries();
+        let visible_notices = if self.panels.workbench_tab == WorkbenchTab::Layers {
+            self.restore_tracker.visible_notices()
+        } else {
+            Vec::new()
+        };
+        let stac_view = self.scene.stac().view_snapshot(self.storage.settings());
+        let wb_out = show_workbench_panel(
+            ui,
+            WorkbenchInputs {
+                active_tab: self.panels.workbench_tab,
+                total_layers,
+                layer_summaries: &layer_summaries,
+                vector_summaries: &vector_summaries,
+                unavailable_notices: &visible_notices,
+                stac: stac_view,
+                draw_aoi_active: self.panels.draw_aoi_active,
+            },
+            &mut self.panels.layers,
+            &mut self.panels.stac,
+        );
+        let mut needs_repaint = self.apply_layer_actions(wb_out.layer_actions, frame);
+        needs_repaint |= self.apply_stac_actions(wb_out.stac_actions, ctx);
+        if wb_out.close_requested {
+            self.close_workbench();
+            needs_repaint = true;
+        } else if let Some(tab) = wb_out.selected_tab {
+            self.open_workbench_tab(tab);
+            needs_repaint = true;
+        }
+        needs_repaint
     }
 
     fn show_globe_viewport(
@@ -389,19 +465,15 @@ impl VeldmapApp {
                             ViewportEvent::AoiBox { bbox, finished } => {
                                 if finished {
                                     self.scene.mutate_stac(|s| {
-                                        let changed = s.set_aoi_bbox(bbox, "Drawn Box".to_owned());
-                                        ((), changed)
+                                        s.set_aoi_bbox(bbox, "Drawn Box".to_owned())
                                     });
-                                    self.panels.draw_aoi_active = false;
+                                    self.set_viewport_tool(ViewportToolMode::Navigate);
                                 } else {
-                                    self.scene.mutate_stac(|s| {
-                                        let changed = s.set_aoi_preview_bbox(bbox);
-                                        ((), changed)
-                                    });
+                                    self.scene.mutate_stac(|s| s.set_aoi_preview_bbox(bbox));
                                 }
                             }
                             ViewportEvent::AoiBoxCancelled => {
-                                self.cancel_draw_aoi();
+                                self.set_viewport_tool(ViewportToolMode::Navigate);
                             }
                         }
                     }
@@ -460,7 +532,7 @@ impl VeldmapApp {
             && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
-            self.cancel_draw_aoi();
+            self.set_viewport_tool(ViewportToolMode::Navigate);
             active = true;
         }
 
@@ -478,25 +550,6 @@ impl VeldmapApp {
             active = true;
         }
         active
-    }
-
-    fn show_settings_if_open(&mut self, ctx: &egui::Context) -> bool {
-        if !self.panels.basemap.is_settings_open() {
-            return false;
-        }
-        self.storage.maybe_refresh_disk_stats(false);
-        let disk_status = self.storage.disk_cache_status();
-        let settings_actions = ui::basemap::show_settings_window(
-            ctx,
-            self.storage.settings(),
-            &disk_status,
-            &mut self.panels.basemap,
-        );
-        let mut needs_repaint = false;
-        for action in settings_actions {
-            needs_repaint |= self.apply_basemap_action(action);
-        }
-        needs_repaint
     }
 
     fn show_system_fault_banner(&self, ui: &mut egui::Ui) -> bool {
@@ -553,40 +606,9 @@ impl eframe::App for VeldmapApp {
         }
 
         needs_repaint |= self.handle_global_input_and_drops(&ctx);
-
-        let basemap_status = self.scene.basemap().status_snapshot();
-        let toolbar_actions = toolbar::show_top_toolbar(
-            ui,
-            ToolbarInputs {
-                settings: self.storage.settings(),
-                basemap_status: &basemap_status,
-                adapter_label: &self.adapter_label,
-                layer_count: self.scene.total_layer_count(),
-                unavailable_layer_count: self.restore_tracker.unavailable_count(),
-                layers_open: self.panels.workbench_open
-                    && self.panels.workbench_tab == WorkbenchTab::Layers,
-                cloud_open: self.panels.workbench_open
-                    && self.panels.workbench_tab == WorkbenchTab::CloudStac,
-                measure_active: self.scene.measure().is_active(),
-                recent_files: &self.storage.session().recent_files,
-                bookmarks: &self.storage.session().bookmarks,
-            },
-            &mut self.panels.toolbar,
-            &mut self.panels.basemap,
-        );
-        needs_repaint |= self.apply_toolbar_actions(toolbar_actions, frame);
+        needs_repaint |= self.show_toolbar(ui, frame);
         needs_repaint |= self.show_system_fault_banner(ui);
-        needs_repaint |= self.show_settings_if_open(&ctx);
-
-        if let Some(crs_action) = show_crs_picker_window(&ctx, &mut self.panels.crs_picker) {
-            needs_repaint |= self.apply_crs_picker_action(crs_action);
-        }
-
-        if let Some(measure_action) =
-            show_measure_window(&ctx, self.scene.measure(), &self.panels.measure)
-        {
-            needs_repaint |= self.handle_measure_action(measure_action, frame);
-        }
+        needs_repaint |= self.show_floating_windows(&ctx, frame);
 
         self.viewport.update_cursor_probe(&ctx, &self.camera);
         let cursor_geo = self.viewport.cursor_geo();
@@ -597,56 +619,22 @@ impl eframe::App for VeldmapApp {
 
         status_bar::show_status_bar(
             ui,
-            cursor_geo,
-            cursor_readout.as_ref(),
-            topmost_source_px,
-            &self.camera,
-            self.viewport.viewport_height_px(),
+            StatusBarInputs {
+                cursor_geo,
+                cursor_readout: cursor_readout.as_ref(),
+                topmost_source_px,
+                camera: &self.camera,
+                viewport_height_px: self.viewport.viewport_height_px(),
+            },
         );
 
-        if self.panels.workbench_open {
-            let total_layers = self.scene.total_layer_count();
-            let layer_summaries = if self.panels.workbench_tab == WorkbenchTab::Layers {
-                self.scene.overlays().layer_summaries()
-            } else {
-                Vec::new()
-            };
-            let vector_summaries = self.scene.vectors().summaries();
-            let visible_notices = if self.panels.workbench_tab == WorkbenchTab::Layers {
-                self.restore_tracker.visible_notices()
-            } else {
-                Vec::new()
-            };
-            let wb_out = show_workbench_panel(
-                ui,
-                WorkbenchInputs {
-                    active_tab: self.panels.workbench_tab,
-                    total_layers,
-                    layer_summaries: &layer_summaries,
-                    vector_summaries: &vector_summaries,
-                    unavailable_notices: &visible_notices,
-                    stac: self.scene.stac(),
-                    settings: self.storage.settings(),
-                    draw_aoi_active: self.panels.draw_aoi_active,
-                },
-                &mut self.panels.layers,
-                &mut self.panels.stac,
-            );
-            needs_repaint |= self.apply_layer_actions(wb_out.layer_actions, frame);
-            needs_repaint |= self.apply_stac_actions(wb_out.stac_actions, &ctx);
-            if wb_out.close_requested {
-                self.close_workbench();
-                needs_repaint = true;
-            } else if let Some(tab) = wb_out.selected_tab {
-                self.open_workbench_tab(tab);
-                needs_repaint = true;
-            }
-        }
+        needs_repaint |= self.show_workbench_if_open(&ctx, ui, frame);
 
         let viewport_rect = self.show_globe_viewport(&ctx, ui);
         let scene_hint = self.scene.end_frame();
 
-        // Floating North compass in its own foreground Area (no pointer bleed).
+        // Floating North compass in its own Background-ordered Area (above the
+        // globe, beneath floating windows; no pointer bleed).
         if let Some(rect) = viewport_rect {
             let (clicked, compass_rect) =
                 hud::show_north_compass(&ctx, rect, self.camera.heading_deg());
@@ -657,33 +645,5 @@ impl eframe::App for VeldmapApp {
         }
 
         self.schedule_next_repaint(&ctx, camera_before, rect_before, needs_repaint, scene_hint);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gpu_fault_state_deduplicates_errors_preserves_device_lost_and_dismisses() {
-        let faults = GpuFaultState::default();
-        assert!(faults.summary().is_none());
-
-        // Identical repeated uncaptured errors return false (no repaint storm).
-        assert!(faults.record_uncaptured_error("validation fail".to_owned()));
-        assert!(!faults.record_uncaptured_error("validation fail".to_owned()));
-        let (msg, is_lost) = faults.summary().expect("uncaptured summary");
-        assert!(!is_lost);
-        assert!(msg.contains("validation fail"));
-
-        // Device lost overrides uncaptured errors and cannot be overwritten by later errors.
-        assert!(faults.record_device_lost("driver reset".to_owned()));
-        assert!(!faults.record_uncaptured_error("later error".to_owned()));
-        let (lost_msg, is_lost) = faults.summary().expect("device lost summary");
-        assert!(is_lost);
-        assert!(lost_msg.contains("driver reset"));
-
-        faults.dismiss();
-        assert!(faults.summary().is_none());
     }
 }

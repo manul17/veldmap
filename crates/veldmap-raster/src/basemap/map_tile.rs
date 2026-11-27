@@ -13,7 +13,7 @@ use crate::image_codec::{
     jpeg_pixel_format_channels, png_u8_to_rgb8, png_u8_to_rgba8,
 };
 
-use crate::mipmap::generate_linear_mipmaps;
+use crate::mipmap::generate_tile_mipmaps;
 
 /// Maximum single map-tile dimension accepted by [`decode_map_tile`].
 const MAX_MAP_TILE_DIM: u32 = 2048;
@@ -47,7 +47,7 @@ fn decode_map_tile(bytes: &[u8]) -> Result<DecodedTile, RasterError> {
 /// pixels and populate a complete CPU linear-light mipmap chain.
 pub fn decode_map_tile_with_mipmaps(bytes: &[u8]) -> Result<DecodedTile, RasterError> {
     let mut tile = decode_map_tile(bytes)?;
-    generate_linear_mipmaps(&mut tile);
+    generate_tile_mipmaps(&mut tile);
     Ok(tile)
 }
 

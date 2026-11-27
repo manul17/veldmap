@@ -20,32 +20,20 @@ mod pipelines;
 mod snapshot;
 mod uniforms;
 mod vector;
+mod vector_pack;
 mod viewport;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use crate::colormap::{CategoricalPaletteId, ColormapId};
-#[cfg(any(test, feature = "test-support"))]
 pub use bind_groups::TileBindGroupCache;
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) use bind_groups::TileBindGroupCache;
-#[cfg(any(test, feature = "test-support"))]
 pub use globe::GlobeRenderer;
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) use globe::GlobeRenderer;
 #[cfg(any(test, feature = "test-support"))]
+pub use snapshot::DrawTile;
 pub use snapshot::{
-    DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack, DrawSnapshot, DrawTile, DrawVectorId,
-    DrawVectorLayer, OverlayMeshKey, SnapshotBuildParams, TileCarrierPolicy,
-};
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) use snapshot::{
     DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack, DrawSnapshot, DrawVectorId,
     DrawVectorLayer, OverlayMeshKey, SnapshotBuildParams, TileCarrierPolicy,
 };
-#[cfg(any(test, feature = "test-support"))]
 pub use viewport::RenderParams;
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) use viewport::RenderParams;
 
 /// Native desktop primary `wgpu` backends (Vulkan, DX12, Metal), explicitly
 /// excluding OpenGL/GLES and WebGPU.
@@ -74,41 +62,18 @@ pub fn clamp_to_primary_backends(backends: wgpu::Backends) -> wgpu::Backends {
     }
 }
 
-macro_rules! shader_source {
-    ($(#[$meta:meta])* const $name:ident = $path:literal;) => {
-        $(#[$meta])*
-        #[cfg(any(test, feature = "test-support"))]
-        pub const $name: &str = include_str!($path);
-        $(#[$meta])*
-        #[cfg(not(any(test, feature = "test-support")))]
-        pub(crate) const $name: &str = include_str!($path);
-    };
-}
-
-shader_source! {
-    /// Embedded WGSL source for the quadtree globe body and procedural graticule.
-    const GLOBE_WGSL = "../shaders/globe.wgsl";
-}
-shader_source! {
-    /// Embedded WGSL source for depth-less post-body display raster overlay warp meshes.
-    const OVERLAY_WGSL = "../shaders/overlay.wgsl";
-}
-shader_source! {
-    /// Embedded WGSL source for depth-less post-body scientific (`R32Float`) raster overlays.
-    const OVERLAY_SCIENTIFIC_WGSL = "../shaders/overlay_scientific.wgsl";
-}
-shader_source! {
-    /// Embedded WGSL source for depth-less post-body categorical (`R8Uint`/`R16Uint`) raster overlays.
-    const OVERLAY_CATEGORICAL_WGSL = "../shaders/overlay_categorical.wgsl";
-}
-shader_source! {
-    /// Embedded WGSL source for depth-less post-body draped vector geometry.
-    const VECTOR_WGSL = "../shaders/vector.wgsl";
-}
-shader_source! {
-    /// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.
-    const COMPOSITE_WGSL = "../shaders/composite.wgsl";
-}
+/// Embedded WGSL source for the quadtree globe body and procedural graticule.
+pub const GLOBE_WGSL: &str = include_str!("../shaders/globe.wgsl");
+/// Embedded WGSL source for depth-less post-body display raster overlay warp meshes.
+pub const OVERLAY_WGSL: &str = include_str!("../shaders/overlay.wgsl");
+/// Embedded WGSL source for depth-less post-body scientific (`R32Float`) raster overlays.
+pub const OVERLAY_SCIENTIFIC_WGSL: &str = include_str!("../shaders/overlay_scientific.wgsl");
+/// Embedded WGSL source for depth-less post-body categorical (`R8Uint`/`R16Uint`) raster overlays.
+pub const OVERLAY_CATEGORICAL_WGSL: &str = include_str!("../shaders/overlay_categorical.wgsl");
+/// Embedded WGSL source for depth-less post-body draped vector geometry.
+pub const VECTOR_WGSL: &str = include_str!("../shaders/vector.wgsl");
+/// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.
+pub const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
 
 /// Deep-space clear color in exact linear RGB (`#0B1320` in sRGB).
 const CLEAR_COLOR_LINEAR: wgpu::Color = wgpu::Color {

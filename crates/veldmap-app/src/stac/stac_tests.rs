@@ -1,5 +1,15 @@
+use std::sync::Arc;
+
+use veldmap_core::geo::{GeoJsonGeometry, GeoPoint, Polygon, Ring};
+use veldmap_core::sync::CancelToken;
+use veldmap_net::StacSearchResult;
+
+use crate::render::DrawVectorId;
+use crate::storage::settings::{AppSettings, StacAuthKind};
+
+use super::aoi::{footprint_bounds_from_bbox, polygon_geometry_from_bbox};
+use super::session::SearchDoneMsg;
 use super::*;
-use crate::storage::settings::StacAuthKind;
 
 fn test_session() -> StacSession {
     StacSession::new(None, Arc::new(|| {}), CancelToken::new())
@@ -122,9 +132,40 @@ fn preview_preserves_committed_aoi_until_finished_and_display_bbox_keeps_antimer
     assert!(session.set_aoi_preview_bbox([10.0, 10.0, 20.0, 20.0]));
     // Preview must not clobber committed AOI geometry/bbox.
     assert_eq!(session.aoi_bbox(), Some([170.0, -10.0, -170.0, 10.0]));
+    let rev_before = session.rev();
     assert!(session.clear_aoi_preview());
+    assert_ne!(
+        session.rev(),
+        rev_before,
+        "clearing AOI preview must bump rev so DrawSnapshot rebuilds"
+    );
     let mut layers = Vec::new();
     session.push_draw_layers(&mut layers);
     assert_eq!(layers.len(), 1);
     assert_eq!(layers[0].id, DrawVectorId::StacAoi);
+}
+
+#[test]
+fn ui_errors_do_not_bump_rev_and_set_aoi_geometry_caches_bbox() {
+    let mut session = test_session();
+    let rev0 = session.rev();
+    session.set_error("transient error".to_owned());
+    assert_eq!(session.last_error(), Some("transient error"));
+    assert_eq!(session.rev(), rev0);
+    session.clear_error();
+    assert!(session.last_error().is_none());
+    assert_eq!(session.rev(), rev0);
+
+    let poly = GeoJsonGeometry::Polygon(Polygon::new(Ring {
+        points: vec![
+            GeoPoint::new(45.0, 7.0),
+            GeoPoint::new(45.0, 9.0),
+            GeoPoint::new(47.0, 9.0),
+            GeoPoint::new(47.0, 7.0),
+            GeoPoint::new(45.0, 7.0),
+        ],
+    }));
+    session.set_aoi_geometry(poly, "Alps".to_owned());
+    assert_ne!(session.rev(), rev0);
+    assert_eq!(session.aoi_bbox(), Some([7.0, 45.0, 9.0, 47.0]));
 }

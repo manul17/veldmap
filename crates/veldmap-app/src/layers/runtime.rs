@@ -49,6 +49,20 @@ impl Drop for RemotePrefetchPermit {
     }
 }
 
+/// Internal runtime subsystems wired into [`OverlayRuntime::new`].
+pub(super) struct OverlayRuntimeDeps {
+    pub(super) budget: MemoryBudget,
+    pub(super) disk_cache: Option<Arc<TileDiskCache>>,
+    pub(super) tile_writer: Option<TileWriteHandle>,
+    pub(super) net: Option<Arc<NetContext>>,
+    pub(super) fast_pool: DecodePoolHandle,
+    pub(super) bulk_pool: DecodePoolHandle,
+    pub(super) remote_pool: DecodePoolHandle,
+    pub(super) done_tx: UploadSender,
+    pub(super) wakeup: Wakeup,
+    pub(super) shutdown: CancelToken,
+}
+
 /// Shared runtime dependencies for overlay scheduling, decoding, caching, and
 /// wakeups. Held behind `Arc` so worker closures and helpers stay concise.
 pub(super) struct OverlayRuntime {
@@ -75,24 +89,21 @@ pub(super) struct OverlayRuntime {
 }
 
 impl OverlayRuntime {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "internal runtime wiring injects all explicit shared subsystems"
-    )]
-    pub(super) fn new(
-        budget: &MemoryBudget,
-        disk_cache: Option<Arc<TileDiskCache>>,
-        tile_writer: Option<TileWriteHandle>,
-        net: Option<Arc<NetContext>>,
-        fast_pool: DecodePoolHandle,
-        bulk_pool: DecodePoolHandle,
-        remote_pool: DecodePoolHandle,
-        done_tx: UploadSender,
-        wakeup: Wakeup,
-        shutdown: CancelToken,
-    ) -> Self {
+    pub(super) fn new(deps: OverlayRuntimeDeps) -> Self {
+        let OverlayRuntimeDeps {
+            budget,
+            disk_cache,
+            tile_writer,
+            net,
+            fast_pool,
+            bulk_pool,
+            remote_pool,
+            done_tx,
+            wakeup,
+            shutdown,
+        } = deps;
         Self {
-            budget: *budget,
+            budget,
             chunk_cache: Arc::new(SharedChunkCache::new(budget.decoded_chunk_cache_bytes)),
             budget_tracker: Arc::new(DecodeBudgetTracker::new(budget.decode_working_bytes)),
             fingerprint_cache: Arc::new(LocalFingerprintCache::new()),

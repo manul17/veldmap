@@ -20,24 +20,24 @@ fn format_bytes(bytes: u64) -> String {
 /// Named working-memory peak breakdown for one decode operation or pyramid
 /// level row.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DecodePeak {
+pub(super) struct DecodePeak {
     terms: Vec<(&'static str, u64)>,
 }
 
 impl DecodePeak {
     /// Construct an empty peak accumulator.
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default()
     }
 
     /// Add a named cost term in bytes.
-    pub(crate) fn with(mut self, what: &'static str, bytes: u64) -> Self {
+    pub(super) fn with(mut self, what: &'static str, bytes: u64) -> Self {
         self.terms.push((what, bytes));
         self
     }
 
     /// Sum of all named terms in bytes (saturating on overflow).
-    pub(crate) fn total(&self) -> u64 {
+    pub(super) fn total(&self) -> u64 {
         self.terms
             .iter()
             .map(|(_, bytes)| *bytes)
@@ -46,13 +46,13 @@ impl DecodePeak {
 
     /// Return whether `total() <= limit_bytes`.
     #[cfg(test)]
-    pub(crate) fn fits(&self, limit_bytes: u64) -> bool {
+    pub(super) fn fits(&self, limit_bytes: u64) -> bool {
         self.total() <= limit_bytes
     }
 
     /// Validate that `total() <= limit_bytes`, returning a structured
     /// [`BudgetError::ExceedsCap`] naming every component when refused.
-    pub(crate) fn admit(&self, limit_bytes: u64) -> Result<(), BudgetError> {
+    pub(super) fn admit(&self, limit_bytes: u64) -> Result<(), BudgetError> {
         let requested = self.total();
         if requested <= limit_bytes {
             Ok(())

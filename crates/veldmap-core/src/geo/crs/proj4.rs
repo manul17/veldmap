@@ -14,6 +14,11 @@ use super::super::geodesy::WGS84;
 use super::datum::DatumWarning;
 use super::error::CrsError;
 
+/// Strip any leading UTF-8 BOM and surrounding whitespace from a CRS definition.
+pub fn trim_crs_text(text: &str) -> &str {
+    text.trim().trim_start_matches('\u{FEFF}').trim()
+}
+
 /// Pure-Rust `proj4rs` coordinate system wrapper targeting WGS84 geodetic
 /// coordinates at the module boundary.
 #[derive(Debug)]
@@ -86,7 +91,7 @@ impl Proj4Projection {
 
     /// Construct from a WKT1 or WKT2 CRS string (such as a `.prj` sidecar).
     pub(super) fn from_wkt(wkt: &str) -> Result<Self, CrsError> {
-        let trimmed = wkt.trim().trim_start_matches('\u{FEFF}').trim();
+        let trimmed = trim_crs_text(wkt);
         let proj_string = proj4wkt::wkt_to_projstring(trimmed)
             .map_err(|e| CrsError::InvalidWkt(e.to_string()))?;
         let label = extract_wkt_name(trimmed).unwrap_or_else(|| proj_string.clone());

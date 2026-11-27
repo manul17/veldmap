@@ -10,18 +10,14 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use veldmap_core::budget::MemoryBudget;
-use veldmap_core::geo::{Camera, Frame};
+use veldmap_core::geo::{Camera, FootprintBounds, Frame};
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileStreamSpec};
-use veldmap_net::{HttpRangeConfig, HttpRangeSource, NetContext, sanitize_url_for_display};
-use veldmap_raster::{
-    DecodeJob, DecodeJobKey, DecodePool, DecodePoolConfig, DecodePoolHandle, RasterSource,
-};
+use veldmap_net::NetContext;
+use veldmap_raster::{DecodePool, DecodePoolConfig, DecodePoolHandle, RasterSource};
 use veldmap_storage::TileDiskCache;
 
 use crate::clamp_opacity;
@@ -37,25 +33,32 @@ use super::io_worker::{
     OverlayIoCmd, OverlayIoResult, ReloadRequest, ReloadedPayload, spawn_overlay_io_worker,
 };
 use super::jobs::band_stats::BandStatsTracker;
-use super::opener::{OpenRasterError, bind_frame_with_override, open_remote_cog_source};
-use super::runtime::OverlayRuntime;
+use super::layer::RemoteLayerSpec;
+use super::opener::{OpenRasterError, bind_frame_with_override};
+use super::remote_opener::RemoteOpenTracker;
+use super::runtime::{OverlayRuntime, OverlayRuntimeDeps};
 use super::stack::{LayerStack, OverlayLayer};
 use super::{
     ColorbarInfo, CrsOverride, CursorReadout, LayerId, LayerInitOptions, LayerSummary,
     OverlayIoEvent, OverlayPersistEntry, StretchPreset,
 };
 
-struct RemoteOpenResult {
-    title: String,
-    display_url: String,
-    fly_to: bool,
-    outcome: Result<(HttpRangeSource, Arc<dyn RasterSource>, Frame), String>,
-}
-
 fn alloc_seq(counter: &mut u64) -> u64 {
     let value = *counter;
     *counter = counter.saturating_add(1);
     value
+}
+
+/// Shared runtime subsystems injected into [`OverlayManager::new`].
+pub(crate) struct OverlayManagerDeps {
+    pub(crate) budget: MemoryBudget,
+    pub(crate) disk_cache: Option<Arc<TileDiskCache>>,
+    pub(crate) net: Option<Arc<NetContext>>,
+    pub(crate) fast_pool: DecodePoolHandle,
+    pub(crate) bulk_pool: DecodePoolHandle,
+    pub(crate) done_tx: UploadSender,
+    pub(crate) wakeup: Wakeup,
+    pub(crate) shutdown: CancelToken,
 }
 
 /// Typed infallible edit operation applied to a single raster overlay layer
@@ -102,32 +105,27 @@ pub(crate) struct OverlayManager {
     stack: LayerStack,
     next_layer_id: u64,
     next_relaid: u64,
-    next_remote_open_id: AtomicU64,
     runtime: Arc<OverlayRuntime>,
     remote_pool: Option<DecodePool>,
     tile_writer: Option<TileWriteWorker>,
-    remote_open_tx: Sender<RemoteOpenResult>,
-    remote_open_rx: Receiver<RemoteOpenResult>,
+    remote_opener: RemoteOpenTracker,
     cursor: CursorProber,
     io_worker: SingleThreadWorker<OverlayIoCmd, OverlayIoResult>,
     band_stats: BandStatsTracker,
 }
 
 impl OverlayManager {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "manager constructor wires explicit shared runtime subsystems"
-    )]
-    pub(crate) fn new(
-        budget: &MemoryBudget,
-        disk_cache: Option<Arc<TileDiskCache>>,
-        net: Option<Arc<NetContext>>,
-        fast_pool: DecodePoolHandle,
-        bulk_pool: DecodePoolHandle,
-        done_tx: UploadSender,
-        wakeup: Wakeup,
-        shutdown: CancelToken,
-    ) -> Self {
+    pub(crate) fn new(deps: OverlayManagerDeps) -> Self {
+        let OverlayManagerDeps {
+            budget,
+            disk_cache,
+            net,
+            fast_pool,
+            bulk_pool,
+            done_tx,
+            wakeup,
+            shutdown,
+        } = deps;
         let remote_pool = DecodePool::spawn_named(
             "veldmap-remote-io",
             DecodePoolConfig {
@@ -144,30 +142,27 @@ impl OverlayManager {
             }
             None => (None, None),
         };
-        let runtime = Arc::new(OverlayRuntime::new(
+        let runtime = Arc::new(OverlayRuntime::new(OverlayRuntimeDeps {
             budget,
             disk_cache,
-            tile_write_handle,
+            tile_writer: tile_write_handle,
             net,
             fast_pool,
             bulk_pool,
-            remote_pool.handle(),
+            remote_pool: remote_pool.handle(),
             done_tx,
             wakeup,
             shutdown,
-        ));
+        }));
         let io_worker = spawn_overlay_io_worker(Arc::clone(&runtime));
-        let (remote_open_tx, remote_open_rx) = mpsc::channel();
         Self {
             stack: LayerStack::default(),
             next_layer_id: 1,
             next_relaid: 1,
-            next_remote_open_id: AtomicU64::new(1),
             runtime,
             remote_pool: Some(remote_pool),
             tile_writer,
-            remote_open_tx,
-            remote_open_rx,
+            remote_opener: RemoteOpenTracker::new(),
             cursor: CursorProber::new(),
             io_worker,
             band_stats: BandStatsTracker::new(),
@@ -238,8 +233,7 @@ impl OverlayManager {
         self.stack
             .layers()
             .iter()
-            .filter(|l| !l.is_remote())
-            .map(OverlayLayer::persist_entry)
+            .filter_map(OverlayLayer::persist_entry)
     }
 
     /// Queue a non-blocking remote Cloud-Optimized GeoTIFF open onto
@@ -253,94 +247,14 @@ impl OverlayManager {
         scale_offset: Option<(f64, f64)>,
         fly_to: bool,
     ) -> Result<(), String> {
-        let Some(net) = self.runtime.net.clone() else {
-            return Err("network subsystem is unavailable".to_owned());
-        };
-        let trimmed = url.trim().to_owned();
-        if trimmed.is_empty() {
-            return Err("remote COG URL cannot be empty".to_owned());
-        }
-        let display_url = sanitize_url_for_display(&trimmed);
-        let title = if title.trim().is_empty() {
-            display_url.clone()
-        } else {
-            title.trim().to_owned()
-        };
-        let open_id = self.next_remote_open_id.fetch_add(1, Ordering::Relaxed);
-        let rt = Arc::clone(&self.runtime);
-        let tx = self.remote_open_tx.clone();
-        let cancel = self.runtime.shutdown.child_token();
-
-        let handle = net.handle().clone();
-        handle.spawn(async move {
-            let cfg = HttpRangeConfig {
-                extra_headers,
-                ..HttpRangeConfig::default()
-            };
-            let range_source =
-                match HttpRangeSource::open_async(Arc::clone(&net), &trimmed, cfg, &cancel).await {
-                    Ok(src) => src,
-                    Err(err) if err.is_cancelled() => return,
-                    Err(err) => {
-                        let _ = tx.send(RemoteOpenResult {
-                            title,
-                            display_url,
-                            fly_to,
-                            outcome: Err(err.to_string()),
-                        });
-                        (rt.wakeup)();
-                        return;
-                    }
-                };
-
-            if cancel.is_cancelled() {
-                return;
-            }
-
-            // Parse TIFF IFD & bind geodetic Frame on `remote_pool` (a pure
-            // non-Tokio thread pool so IFDs exceeding the 256 KiB head probe
-            // can perform blocking range reads without deadlocking Tokio).
-            let job_rt = Arc::clone(&rt);
-            let job_cancel = cancel.clone();
-            let tx_fail = tx.clone();
-            let title_fail = title.clone();
-            let url_fail = display_url.clone();
-            let wakeup_fail = Arc::clone(&rt.wakeup);
-            let job = DecodeJob {
-                key: DecodeJobKey::Open(open_id),
-                queued_bytes: 64 * 1024,
-                cancel,
-                work: Box::new(move || {
-                    let res = open_remote_cog_source(
-                        range_source.clone(),
-                        scale_offset,
-                        &job_rt.budget,
-                        &job_cancel,
-                    )
-                    .map(|(source, frame)| (range_source, source, frame))
-                    .map_err(|e| e.message);
-                    if !job_cancel.is_cancelled() {
-                        let _ = tx.send(RemoteOpenResult {
-                            title,
-                            display_url,
-                            fly_to,
-                            outcome: res,
-                        });
-                        (job_rt.wakeup)();
-                    }
-                }),
-            };
-            let _ = rt.try_submit_guarded(&rt.remote_pool, job, false, move || {
-                let _ = tx_fail.send(RemoteOpenResult {
-                    title: title_fail,
-                    display_url: url_fail,
-                    fly_to,
-                    outcome: Err("remote I/O pool is busy or shutting down".to_owned()),
-                });
-                (wakeup_fail)();
-            });
-        });
-        Ok(())
+        self.remote_opener.begin_open(
+            &self.runtime,
+            url,
+            title,
+            extra_headers,
+            scale_offset,
+            fly_to,
+        )
     }
 
     /// Queue a non-blocking local raster open onto the overlay I/O worker.
@@ -388,16 +302,16 @@ impl OverlayManager {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
             };
-            if layer.is_remote() {
+            let Some(local_path) = layer.local_path().map(Path::to_path_buf) else {
                 return Err("remote COG layers do not support local disk reload".to_owned());
-            }
+            };
             layer.cancel_stats_job();
             let prep = layer.begin_reload(cancel.clone());
             let request = ReloadRequest {
                 id,
                 reload_seq: prep.reload_seq,
                 crs_override_epoch: layer.crs_override_epoch(),
-                path: layer.path().to_path_buf(),
+                path: local_path,
                 old_fingerprint_hex: layer.fingerprint_hex().to_owned(),
                 crs_override: layer.crs_override().cloned(),
                 cancel,
@@ -455,31 +369,27 @@ impl OverlayManager {
             }
         }
 
-        while let Ok(remote) = self.remote_open_rx.try_recv() {
+        for remote in self.remote_opener.drain() {
             match remote.outcome {
                 Ok((range_source, source, frame)) => {
                     let id = LayerId(alloc_seq(&mut self.next_layer_id));
                     let relaid = alloc_seq(&mut self.next_relaid);
-                    let layer = OverlayLayer::from_remote_source(
+                    let layer = OverlayLayer::from_remote_source(RemoteLayerSpec {
                         id,
-                        remote.title.clone(),
-                        remote.display_url.clone(),
+                        title: remote.title.clone(),
+                        display_url: remote.display_url.clone(),
                         range_source,
                         source,
                         frame,
-                        LayerInitOptions {
+                        options: LayerInitOptions {
                             visible: true,
                             opacity: 1.0,
                             crs_override: None,
                             style: None,
                         },
                         relaid,
-                    );
-                    let bounds = layer.footprint();
-                    self.stack.push(layer);
-                    self.request_band_stats_if_needed(id);
-                    mutation.changed = true;
-                    mutation.topology_changed = true;
+                    });
+                    let bounds = self.insert_opened_layer(layer, &mut mutation);
                     events.push(OverlayIoEvent::RemoteOpened {
                         id,
                         title: remote.title,
@@ -505,6 +415,20 @@ impl OverlayManager {
         (events, mutation)
     }
 
+    fn insert_opened_layer(
+        &mut self,
+        layer: OverlayLayer,
+        mutation: &mut OverlayMutation,
+    ) -> Option<FootprintBounds> {
+        let id = layer.id();
+        let bounds = layer.footprint();
+        self.stack.push(layer);
+        self.request_band_stats_if_needed(id);
+        mutation.changed = true;
+        mutation.topology_changed = true;
+        bounds
+    }
+
     fn handle_opened_result(
         &mut self,
         path: PathBuf,
@@ -520,11 +444,7 @@ impl OverlayManager {
                 let relaid = alloc_seq(&mut self.next_relaid);
                 let event_path = path.clone();
                 let layer = OverlayLayer::from_source(id, path, source, frame, options, relaid);
-                let bounds = layer.footprint();
-                self.stack.push(layer);
-                self.request_band_stats_if_needed(id);
-                mutation.changed = true;
-                mutation.topology_changed = true;
+                let bounds = self.insert_opened_layer(layer, mutation);
                 events.push(OverlayIoEvent::Opened {
                     id,
                     path: event_path,
@@ -669,7 +589,7 @@ impl OverlayManager {
         &mut self,
         id: LayerId,
         crs_override: Option<CrsOverride>,
-    ) -> Result<Option<veldmap_core::geo::FootprintBounds>, String> {
+    ) -> Result<Option<FootprintBounds>, String> {
         let Some(layer) = self.stack.get_mut(id) else {
             return Err("layer no longer exists".to_owned());
         };
@@ -797,7 +717,7 @@ impl OverlayManager {
                 .layers()
                 .iter()
                 .filter(|l| l.is_active())
-                .map(|l| (l.meta().stream_key(), l.wanted())),
+                .flat_map(|l| l.streams().iter().map(|s| (s.stream_key(), s.wanted()))),
             gpu_cache,
             pending,
         );

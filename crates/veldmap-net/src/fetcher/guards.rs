@@ -8,7 +8,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use veldmap_core::sync::lock_unpoisoned;
 use veldmap_core::tile::TileKey;
 
-use super::context::PipelineShared;
+use super::PipelineShared;
 use super::state::{PipelineState, Transition};
 
 /// Generation-checked RAII guard keeping `key` registered in `state.in_flight`

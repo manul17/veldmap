@@ -45,11 +45,11 @@ pub use pool::{
     DecodeJob, DecodeJobKey, DecodePool, DecodePoolConfig, DecodePoolHandle, SubmitError,
     TwoLaneDecodePool, TwoLaneDecodePoolConfig,
 };
-pub use sidecar::{SidecarGeoref, load_sidecar_georef_with, parse_prj_text, parse_world_file};
+pub use sidecar::{SidecarGeoref, parse_prj_text, parse_world_file};
 pub use tiff::{MAX_IFDS, TiffSource, has_tiff_magic};
 pub use tile_codec::{
-    MAX_CACHED_TILE_DECODED_BYTES, MAX_LZ4_RAW_DECODED_BYTES, MAX_QOI_DECODED_BYTES,
-    decode_lz4_raw_tile, decode_qoi_rgba8, encode_lz4_raw_tile, encode_qoi_rgba8,
+    MAX_CACHED_TILE_DECODED_BYTES, decode_lz4_raw_tile, decode_qoi_rgba8, encode_lz4_raw_tile,
+    encode_qoi_rgba8,
 };
 
 #[cfg(any(test, feature = "test-support"))]

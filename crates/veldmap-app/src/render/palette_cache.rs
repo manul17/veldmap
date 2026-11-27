@@ -24,6 +24,10 @@ enum PaletteKey {
     CustomSource(SourceId, usize),
 }
 
+fn custom_source_key(source: SourceId, cmap: &Arc<[[u8; 4]]>) -> PaletteKey {
+    PaletteKey::CustomSource(source, Arc::as_ptr(cmap) as *const () as usize)
+}
+
 fn palette_key(track: &DrawOverlayTrack) -> Option<PaletteKey> {
     match track {
         DrawOverlayTrack::Display => None,
@@ -37,10 +41,7 @@ fn palette_key(track: &DrawOverlayTrack) -> Option<PaletteKey> {
             if *palette == CategoricalPaletteId::SourceColorMap
                 && let Some(cmap) = custom_color_map
             {
-                Some(PaletteKey::CustomSource(
-                    *source,
-                    Arc::as_ptr(cmap) as *const () as usize,
-                ))
+                Some(custom_source_key(*source, cmap))
             } else {
                 Some(PaletteKey::CategoricalPreset(*palette))
             }
@@ -78,18 +79,17 @@ impl PaletteCache {
         palette_layout: &wgpu::BindGroupLayout,
         track: &DrawOverlayTrack,
     ) {
-        let Some(key) = palette_key(track) else {
-            return;
-        };
-        if self.entries.contains_key(&key) {
-            return;
-        }
-        let (lut, custom_weak) = match track {
+        let (key, lut, custom_weak) = match track {
             DrawOverlayTrack::Display => return,
             DrawOverlayTrack::Scientific { colormap, .. } => {
-                (scientific_lut_linear(*colormap), None)
+                let key = PaletteKey::Scientific(*colormap);
+                if self.entries.contains_key(&key) {
+                    return;
+                }
+                (key, scientific_lut_linear(*colormap), None)
             }
             DrawOverlayTrack::Categorical {
+                source,
                 palette,
                 custom_color_map,
                 ..
@@ -97,12 +97,21 @@ impl PaletteCache {
                 if *palette == CategoricalPaletteId::SourceColorMap
                     && let Some(cmap) = custom_color_map
                 {
+                    let key = custom_source_key(*source, cmap);
+                    if self.entries.contains_key(&key) {
+                        return;
+                    }
                     (
+                        key,
                         categorical_lut_linear(*palette, Some(cmap.as_ref())),
                         Some(Arc::downgrade(cmap)),
                     )
                 } else {
-                    (categorical_lut_linear(*palette, None), None)
+                    let key = PaletteKey::CategoricalPreset(*palette);
+                    if self.entries.contains_key(&key) {
+                        return;
+                    }
+                    (key, categorical_lut_linear(*palette, None), None)
                 }
             }
         };

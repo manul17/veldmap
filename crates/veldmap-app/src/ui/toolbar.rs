@@ -14,9 +14,9 @@ use veldmap_core::geo::{ParsedLocation, parse_location};
 use crate::basemap::BasemapStatusSnapshot;
 use crate::display_name_from_path;
 use crate::storage::session::{CameraBookmark, MAX_BOOKMARKS};
-use crate::storage::settings::AppSettings;
+use crate::storage::settings::BasemapSelection;
 
-use super::basemap::{BasemapUiAction, BasemapUiState, show_toolbar_controls};
+use super::basemap::{BasemapUiAction, show_toolbar_controls};
 use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format, submitted_with_enter};
 
 /// User intent emitted by the top workstation toolbar and applied by
@@ -42,7 +42,9 @@ pub(crate) enum ToolbarAction {
 /// Read-only inputs rendered by the top workstation toolbar.
 #[derive(Clone, Copy)]
 pub(crate) struct ToolbarInputs<'a> {
-    pub(crate) settings: &'a AppSettings,
+    pub(crate) active_basemap: BasemapSelection,
+    pub(crate) custom_xyz_configured: bool,
+    pub(crate) show_graticule: bool,
     pub(crate) basemap_status: &'a BasemapStatusSnapshot,
     pub(crate) adapter_label: &'a str,
     pub(crate) layer_count: usize,
@@ -192,7 +194,6 @@ pub(crate) fn show_top_toolbar(
     ui: &mut egui::Ui,
     inputs: ToolbarInputs<'_>,
     state: &mut ToolbarState,
-    basemap_ui: &mut BasemapUiState,
 ) -> Vec<ToolbarAction> {
     let mut actions = Vec::new();
     egui::Panel::top("top_toolbar").show(ui, |ui| {
@@ -258,13 +259,18 @@ pub(crate) fn show_top_toolbar(
 
             ui.separator();
             actions.extend(
-                show_toolbar_controls(ui, inputs.settings, inputs.basemap_status, basemap_ui)
-                    .into_iter()
-                    .map(ToolbarAction::Basemap),
+                show_toolbar_controls(
+                    ui,
+                    inputs.active_basemap,
+                    inputs.custom_xyz_configured,
+                    inputs.basemap_status,
+                )
+                .into_iter()
+                .map(ToolbarAction::Basemap),
             );
 
             ui.separator();
-            let mut show_graticule = inputs.settings.show_graticule;
+            let mut show_graticule = inputs.show_graticule;
             if ui.checkbox(&mut show_graticule, "Graticule").changed() {
                 actions.push(ToolbarAction::SetGraticule(show_graticule));
             }

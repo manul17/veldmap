@@ -132,7 +132,13 @@ impl LocalFileSource {
         let maybe = lock_unpoisoned(&self.pool).pop();
         let file = match maybe {
             Some(file) => file,
-            None => File::open(&self.path)?,
+            None => open_regular_file(&self.path)
+                .map(|(file, _)| file)
+                .map_err(|err| match err {
+                    StorageError::Io(io_err) => IoError::Io(io_err),
+                    StorageError::InvalidPath(msg) => IoError::InvalidInput(msg),
+                    other => IoError::InvalidInput(other.to_string()),
+                })?,
         };
         Ok(PooledFile {
             pool: &self.pool,

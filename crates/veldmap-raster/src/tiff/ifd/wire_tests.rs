@@ -1,7 +1,9 @@
 use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 
-use crate::tiff::gdal_meta::TAG_GDAL_METADATA;
-
+use super::super::tag_ids::{
+    TAG_COMPRESSION, TAG_GDAL_METADATA, TAG_IMAGE_WIDTH, TAG_MODEL_PIXEL_SCALE,
+    TAG_NEW_SUBFILE_TYPE, TAG_TILE_OFFSETS,
+};
 use super::*;
 
 fn put_u16(buf: &mut Vec<u8>, order: TiffByteOrder, v: u16) {
@@ -86,10 +88,10 @@ fn rejects_cyclic_ifd_chains_and_truncated_or_invalid_bigtiff_headers() {
         .read_directory(reader.first_ifd, &cancel)
         .expect("IFD0 reads");
     let d1 = reader
-        .read_directory(d0.next_ifd, &cancel)
+        .read_directory(d0.next_ifd(), &cancel)
         .expect("IFD1 reads");
     let err = reader
-        .read_directory(d1.next_ifd, &cancel)
+        .read_directory(d1.next_ifd(), &cancel)
         .err()
         .expect("cycle must fail");
     assert!(matches!(err, RasterError::Decode(_)));

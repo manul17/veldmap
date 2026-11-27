@@ -1,7 +1,8 @@
-//! `egui_wgpu` viewport bridge ([`GlobePaintCallback`] and logical-to-physical
-//! viewport pixel mapping) using the hoisted [`TileBindGroupCache`] inside
-//! `egui_wgpu::CallbackResources`.
+//! `egui_wgpu` viewport bridge ([`GlobePaintCallback`], [`GpuFaultState`], and
+//! logical-to-physical viewport pixel mapping) using the hoisted
+//! [`TileBindGroupCache`] inside `egui_wgpu::CallbackResources`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -10,7 +11,69 @@ use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 
 use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams, TileBindGroupCache};
 
-use super::GpuFaultState;
+#[derive(Default)]
+struct GpuFaultInner {
+    device_lost: Option<String>,
+    uncaptured_error: Option<String>,
+}
+
+/// Lock-free fast-path holder for asynchronous `wgpu` device faults surfaced in
+/// the UI banner without per-frame mutex locks or error-frame repaint storms.
+#[derive(Default)]
+pub(super) struct GpuFaultState {
+    has_fault: AtomicBool,
+    inner: Mutex<GpuFaultInner>,
+}
+
+impl GpuFaultState {
+    fn record_device_lost(&self, msg: String) -> bool {
+        let mut guard = lock_unpoisoned(&self.inner);
+        let changed = guard.device_lost.as_deref() != Some(msg.as_str());
+        guard.device_lost = Some(msg);
+        self.has_fault.store(true, Ordering::Release);
+        changed
+    }
+
+    fn record_uncaptured_error(&self, msg: String) -> bool {
+        let mut guard = lock_unpoisoned(&self.inner);
+        if guard.device_lost.is_some() {
+            return false;
+        }
+        if guard.uncaptured_error.as_deref() == Some(msg.as_str()) {
+            return false;
+        }
+        guard.uncaptured_error = Some(msg);
+        self.has_fault.store(true, Ordering::Release);
+        true
+    }
+
+    pub(super) fn summary(&self) -> Option<(String, bool)> {
+        if !self.has_fault.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = lock_unpoisoned(&self.inner);
+        if let Some(lost) = &guard.device_lost {
+            return Some((
+                format!("GPU device lost (restart recommended): {lost}"),
+                true,
+            ));
+        }
+        guard
+            .uncaptured_error
+            .as_ref()
+            .map(|err| (format!("GPU error: {err}"), false))
+    }
+
+    pub(super) fn dismiss(&self) {
+        if !self.has_fault.load(Ordering::Acquire) {
+            return;
+        }
+        let mut guard = lock_unpoisoned(&self.inner);
+        guard.device_lost = None;
+        guard.uncaptured_error = None;
+        self.has_fault.store(false, Ordering::Release);
+    }
+}
 
 /// Install `wgpu` uncaptured-error / device-lost hooks and register the shared
 /// [`TileBindGroupCache`] and [`GlobeRenderer`] inside
@@ -148,5 +211,33 @@ impl CallbackTrait for GlobePaintCallback {
         if let Some(renderer) = callback_resources.get::<GlobeRenderer>() {
             renderer.composite_into(render_pass);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_fault_state_deduplicates_errors_preserves_device_lost_and_dismisses() {
+        let faults = GpuFaultState::default();
+        assert!(faults.summary().is_none());
+
+        // Identical repeated uncaptured errors return false (no repaint storm).
+        assert!(faults.record_uncaptured_error("validation fail".to_owned()));
+        assert!(!faults.record_uncaptured_error("validation fail".to_owned()));
+        let (msg, is_lost) = faults.summary().expect("uncaptured summary");
+        assert!(!is_lost);
+        assert!(msg.contains("validation fail"));
+
+        // Device lost overrides uncaptured errors and cannot be overwritten by later errors.
+        assert!(faults.record_device_lost("driver reset".to_owned()));
+        assert!(!faults.record_uncaptured_error("later error".to_owned()));
+        let (lost_msg, is_lost) = faults.summary().expect("device lost summary");
+        assert!(is_lost);
+        assert!(lost_msg.contains("driver reset"));
+
+        faults.dismiss();
+        assert!(faults.summary().is_none());
     }
 }

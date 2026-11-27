@@ -260,6 +260,11 @@ fn upload_tile_texture(
     decoded: &DecodedTile,
 ) -> Option<(wgpu::Texture, wgpu::TextureView)> {
     let mip_level_count = decoded.mip_level_count();
+    if mip_level_count == 0
+        || (0..mip_level_count).any(|mip_level| decoded.mip_data(mip_level).is_none())
+    {
+        return None;
+    }
     let bpp = decoded.format().bytes_per_pixel() as u32;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("veldmap gpu tile"),

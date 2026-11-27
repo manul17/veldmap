@@ -3,14 +3,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{DecodedTile, PixelFormat, PlanetaryScheme, QuadTileId, TileKey};
 use veldmap_net::{
     BlobLease, BlobStoreError, CustomBasemapConfig, DecodeFailure, DecodeRequest, FetcherConfig,
-    LiveBasemapSpec, LiveTilePipeline, TileBlobStore, TileDecodeExecutor,
+    LiveBasemapSpec, LiveTilePipeline, NetConfig, NetContext, TileBlobStore, TileDecodeExecutor,
 };
+
+use crate::mock_http::{MockHttpServer, write_http_response};
 
 type BlobMapKey = (String, PlanetaryScheme, u8, u32, u32);
 
@@ -130,11 +130,9 @@ fn make_valid_tile_bytes(tag: u8) -> Vec<u8> {
 }
 
 struct MockServer {
-    addr: std::net::SocketAddr,
     hits: Arc<AtomicUsize>,
     max_concurrent: Arc<AtomicUsize>,
-    handle: std::thread::JoinHandle<()>,
-    stop: CancelToken,
+    server: MockHttpServer,
 }
 
 #[derive(Clone)]
@@ -163,107 +161,51 @@ where
     let hits = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let max_concurrent = Arc::new(AtomicUsize::new(0));
-    let stop = CancelToken::new();
 
-    let (addr_tx, addr_rx) = mpsc::channel();
     let hits_c = Arc::clone(&hits);
     let active_c = Arc::clone(&active);
     let max_c = Arc::clone(&max_concurrent);
-    let stop_c = stop.clone();
     let handler = Arc::new(handler);
 
-    let handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("mock server rt");
-        rt.block_on(async move {
-            let listener = TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind loopback");
-            let addr = listener.local_addr().expect("local addr");
-            let _ = addr_tx.send(addr);
+    let server = MockHttpServer::start(move |req, mut socket, stop_t| {
+        let hits_t = Arc::clone(&hits_c);
+        let active_t = Arc::clone(&active_c);
+        let max_t = Arc::clone(&max_c);
+        let handler_t = Arc::clone(&handler);
+        async move {
+            let hit_no = hits_t.fetch_add(1, Ordering::AcqRel) + 1;
+            let cur = active_t.fetch_add(1, Ordering::AcqRel) + 1;
+            max_t.fetch_max(cur, Ordering::AcqRel);
 
-            loop {
-                let accepted = tokio::select! {
-                    _ = stop_c.cancelled() => break,
-                    res = listener.accept() => res,
-                };
-                let Ok((mut socket, _)) = accepted else {
-                    break;
-                };
-                let hits_t = Arc::clone(&hits_c);
-                let active_t = Arc::clone(&active_c);
-                let max_t = Arc::clone(&max_c);
-                let stop_t = stop_c.clone();
-                let handler_t = Arc::clone(&handler);
-                tokio::spawn(async move {
-                    let mut req_buf = [0u8; 2048];
-                    let n = socket.read(&mut req_buf).await.unwrap_or(0);
-                    let req_str = String::from_utf8_lossy(&req_buf[..n]);
-                    let path = req_str
-                        .lines()
-                        .next()
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .unwrap_or("/");
-
-                    let hit_no = hits_t.fetch_add(1, Ordering::AcqRel) + 1;
-                    let cur = active_t.fetch_add(1, Ordering::AcqRel) + 1;
-                    max_t.fetch_max(cur, Ordering::AcqRel);
-
-                    let resp = handler_t(path, hit_no);
-                    if !resp.delay.is_zero() {
-                        tokio::select! {
-                            _ = stop_t.cancelled() => {
-                                active_t.fetch_sub(1, Ordering::AcqRel);
-                                return;
-                            }
-                            _ = tokio::time::sleep(resp.delay) => {}
-                        }
+            let resp = handler_t(&req.path_and_query, hit_no);
+            if !resp.delay.is_zero() {
+                tokio::select! {
+                    _ = stop_t.cancelled() => {
+                        active_t.fetch_sub(1, Ordering::AcqRel);
+                        return;
                     }
-
-                    let reason = match resp.status {
-                        200 => "OK",
-                        204 => "No Content",
-                        401 => "Unauthorized",
-                        404 => "Not Found",
-                        429 => "Too Many Requests",
-                        500 => "Internal Server Error",
-                        _ => "Status",
-                    };
-                    let header = format!(
-                        "HTTP/1.1 {} {reason}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                        resp.status,
-                        resp.headers,
-                        resp.body.len()
-                    );
-                    let _ = socket.write_all(header.as_bytes()).await;
-                    if !resp.body.is_empty() {
-                        let _ = socket.write_all(&resp.body).await;
-                    }
-                    let _ = socket.shutdown().await;
-                    active_t.fetch_sub(1, Ordering::AcqRel);
-                });
+                    _ = tokio::time::sleep(resp.delay) => {}
+                }
             }
-        });
+
+            let reason = match resp.status {
+                200 => "OK",
+                204 => "No Content",
+                401 => "Unauthorized",
+                404 => "Not Found",
+                429 => "Too Many Requests",
+                500 => "Internal Server Error",
+                _ => "Status",
+            };
+            write_http_response(&mut socket, resp.status, reason, &resp.headers, &resp.body).await;
+            active_t.fetch_sub(1, Ordering::AcqRel);
+        }
     });
 
-    let addr = addr_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("mock server addr");
     MockServer {
-        addr,
         hits,
         max_concurrent,
-        handle,
-        stop,
-    }
-}
-
-impl MockServer {
-    fn shutdown(self) {
-        self.stop.cancel();
-        let _ = self.handle.join();
+        server,
     }
 }
 
@@ -279,10 +221,12 @@ fn custom_spec(addr: std::net::SocketAddr, max_level: u8) -> LiveBasemapSpec {
     .expect("custom spec")
 }
 
-/// RAII harness owning a [`LiveTilePipeline`] and its loopback [`MockServer`],
-/// guaranteeing `pipeline` always shuts down before `server` even on panic.
+/// RAII harness owning a [`LiveTilePipeline`], its shared [`NetContext`], and
+/// its loopback [`MockServer`], guaranteeing `pipeline` shuts down before
+/// `net` and `net` shuts down before `server` even on panic.
 struct TestPipelineHarness {
     pipeline: Option<LiveTilePipeline>,
+    net: Option<Arc<NetContext>>,
     server: Option<MockServer>,
     spec: LiveBasemapSpec,
     store: Option<Arc<MemBlobStore>>,
@@ -291,11 +235,18 @@ struct TestPipelineHarness {
 }
 
 impl TestPipelineHarness {
-    fn spawn<F>(cfg: FetcherConfig, with_disk_cache: bool, max_level: u8, handler: F) -> Self
+    fn spawn<F>(
+        max_concurrent_per_host: usize,
+        cfg: FetcherConfig,
+        with_disk_cache: bool,
+        max_level: u8,
+        handler: F,
+    ) -> Self
     where
         F: Fn(&str, usize) -> MockResponse + Send + Sync + 'static,
     {
         Self::spawn_with_decoder(
+            max_concurrent_per_host,
             cfg,
             with_disk_cache,
             max_level,
@@ -305,6 +256,7 @@ impl TestPipelineHarness {
     }
 
     fn spawn_with_decoder<F, D>(
+        max_concurrent_per_host: usize,
         cfg: FetcherConfig,
         with_disk_cache: bool,
         max_level: u8,
@@ -316,7 +268,7 @@ impl TestPipelineHarness {
         D: FnOnce(mpsc::Sender<(TileKey, DecodedTile)>, Wakeup) -> Arc<dyn TileDecodeExecutor>,
     {
         let server = spawn_mock_server(handler);
-        let spec = custom_spec(server.addr, max_level);
+        let spec = custom_spec(server.server.addr(), max_level);
         let store = with_disk_cache.then(|| Arc::new(MemBlobStore::default()));
         let disk_cache = store
             .as_ref()
@@ -328,12 +280,25 @@ impl TestPipelineHarness {
             wakes_c.fetch_add(1, Ordering::AcqRel);
         });
         let decoder = make_decoder(done_tx, Arc::clone(&wakeup));
-        let pipeline =
-            LiveTilePipeline::spawn(cfg, disk_cache, decoder, wakeup).expect("spawn pipeline");
+        let net = Arc::new(
+            NetContext::new(NetConfig {
+                max_concurrent_per_host,
+                ..NetConfig::default()
+            })
+            .expect("net context"),
+        );
+        let pipeline = LiveTilePipeline::spawn_with_context(
+            Arc::clone(&net),
+            cfg,
+            disk_cache,
+            decoder,
+            wakeup,
+        );
         pipeline.set_active_spec(Some(spec.clone()));
 
         Self {
             pipeline: Some(pipeline),
+            net: Some(net),
             server: Some(server),
             spec,
             store,
@@ -367,15 +332,16 @@ impl TestPipelineHarness {
         if let Some(pipeline) = self.pipeline.take() {
             pipeline.shutdown();
         }
+        if let Some(net) = self.net.take() {
+            net.shutdown();
+        }
     }
 }
 
 impl Drop for TestPipelineHarness {
     fn drop(&mut self) {
         self.shutdown_pipeline();
-        if let Some(server) = self.server.take() {
-            server.shutdown();
-        }
+        drop(self.server.take());
     }
 }
 
@@ -383,11 +349,7 @@ impl Drop for TestPipelineHarness {
 fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() {
     let payload = make_valid_tile_bytes(1);
     let payload_c = payload.clone();
-    let cfg = FetcherConfig {
-        max_concurrent_per_host: 2,
-        ..FetcherConfig::default()
-    };
-    let h = TestPipelineHarness::spawn(cfg, true, 2, move |_, _| {
+    let h = TestPipelineHarness::spawn(2, FetcherConfig::default(), true, 2, move |_, _| {
         MockResponse::ok_tile(payload_c.clone(), Duration::from_millis(25))
     });
 
@@ -467,11 +429,7 @@ fn streams_mipmapped_tiles_enforces_host_limit_max_level_polar_and_disk_cache() 
 fn corrupt_disk_blob_self_heals_from_http_and_cached_tiles_do_not_starve_behind_slow_http() {
     let payload = make_valid_tile_bytes(2);
     let payload_c = payload.clone();
-    let cfg = FetcherConfig {
-        max_concurrent_per_host: 1,
-        ..FetcherConfig::default()
-    };
-    let h = TestPipelineHarness::spawn(cfg, true, 2, move |path, _| {
+    let h = TestPipelineHarness::spawn(1, FetcherConfig::default(), true, 2, move |path, _| {
         if path.contains("/2/1/0") {
             MockResponse::ok_tile(payload_c.clone(), Duration::from_secs(5))
         } else {
@@ -527,11 +485,10 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
     let flaky_hits = Arc::new(AtomicUsize::new(0));
     let flaky_c = Arc::clone(&flaky_hits);
     let cfg = FetcherConfig {
-        max_concurrent_per_host: 4,
         transient_retry_backoff: Duration::from_millis(80),
         ..FetcherConfig::default()
     };
-    let h = TestPipelineHarness::spawn(cfg, true, 2, move |path, _| {
+    let h = TestPipelineHarness::spawn(4, cfg, true, 2, move |path, _| {
         if path.contains("/1/0/0") {
             MockResponse {
                 status: 204,
@@ -614,9 +571,13 @@ fn handles_http_204_404_corrupt_200_idle_retry_and_resets_failed_count() {
 #[test]
 fn cancel_token_aborts_slow_inflight_request_promptly_on_shutdown() {
     let payload = make_valid_tile_bytes(4);
-    let mut h = TestPipelineHarness::spawn(FetcherConfig::default(), false, 1, move |_, _| {
-        MockResponse::ok_tile(payload.clone(), Duration::from_secs(10))
-    });
+    let mut h = TestPipelineHarness::spawn(
+        NetConfig::default().max_concurrent_per_host,
+        FetcherConfig::default(),
+        false,
+        1,
+        move |_, _| MockResponse::ok_tile(payload.clone(), Duration::from_secs(10)),
+    );
 
     let k0 = h.wm_key(0, 0, 0);
     h.pipeline()
@@ -657,6 +618,7 @@ impl TileDecodeExecutor for DropFirstDecodeExecutor {
 fn dropped_or_evicted_decode_request_requeues_instead_of_orphaning() {
     let payload = make_valid_tile_bytes(5);
     let h = TestPipelineHarness::spawn_with_decoder(
+        NetConfig::default().max_concurrent_per_host,
         FetcherConfig::default(),
         false,
         1,

@@ -7,8 +7,8 @@ use glam::DVec3;
 
 use super::cluster::build_rtc_clusters;
 use super::mesh::{DEFAULT_VECTOR_MAX_CHORD_DEG, RawPrimitives, VectorMesh};
+use super::model::{GeoJsonFeatureCollection, GeoJsonGeometry};
 use super::triangulate::triangulate_spherical_polygon;
-use super::{GeoJsonFeatureCollection, GeoJsonGeometry};
 use crate::geo::geodesic::sample_geodesic_arc;
 use crate::geo::geodesy::{self, WGS84};
 use crate::geo::shapes::{

@@ -4,7 +4,7 @@
 mod jpeg;
 mod png;
 
-use crate::pipeline::metadata::GeoPlacement;
+use crate::pipeline::GeoPlacement;
 
 pub use jpeg::JpegSource;
 pub use png::PngSource;

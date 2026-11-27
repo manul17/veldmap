@@ -14,11 +14,11 @@ use super::CLEAR_COLOR_LINEAR;
 use super::bind_groups::TileBindGroupCache;
 use super::graticule::{TILE_KIND_GEO, tile_graticule_uniform};
 use super::mesh::TileMeshCache;
-use super::overlay::{OverlayPipelines, OverlayRenderer};
+use super::overlay::OverlayRenderer;
 use super::pipelines::GlobePipelines;
 use super::snapshot::DrawSnapshot;
-use super::uniforms::{CameraUniform, TileUniform};
-use super::vector::{VectorPipelines, VectorRenderer};
+use super::uniforms::{CameraUniform, TileUniform, UniformSlot};
+use super::vector::VectorRenderer;
 use super::viewport::{RenderParams, ViewportState};
 
 /// Standalone offscreen `wgpu` WGS84 quadtree globe renderer.
@@ -100,7 +100,7 @@ impl GlobeRenderer {
             return;
         };
         self.viewport.mark_presented();
-        render_pass.set_pipeline(&self.pipelines.composite_pipeline);
+        render_pass.set_pipeline(&self.pipelines.composite.pipeline);
         render_pass.set_bind_group(0, &target.composite_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
     }
@@ -200,13 +200,13 @@ impl GlobeRenderer {
                 continue;
             };
             pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-            pass.set_bind_group(1, arena.tile_bind_group(), &[dyn_offset]);
+            pass.set_bind_group(1, arena.bind_group(UniformSlot::Tile), &[dyn_offset]);
 
             if let Some(gpu_tile) = &draw.texture
                 && let Some(tex_bg) = bind_groups.get(gpu_tile, PixelFormat::Rgba8UnormSrgb)
             {
                 if last_textured != Some(true) {
-                    pass.set_pipeline(&self.pipelines.body_textured_pipeline);
+                    pass.set_pipeline(&self.pipelines.body.textured);
                     last_textured = Some(true);
                 }
                 if last_tex_id != Some(gpu_tile.tile_id) {
@@ -214,7 +214,7 @@ impl GlobeRenderer {
                     last_tex_id = Some(gpu_tile.tile_id);
                 }
             } else if last_textured != Some(false) {
-                pass.set_pipeline(&self.pipelines.body_ellipsoid_pipeline);
+                pass.set_pipeline(&self.pipelines.body.ellipsoid);
                 last_textured = Some(false);
                 last_tex_id = None;
             }
@@ -227,7 +227,7 @@ impl GlobeRenderer {
         pass: &mut wgpu::RenderPass<'a>,
         snapshot: &DrawSnapshot,
     ) {
-        pass.set_pipeline(&self.pipelines.grid_pipeline);
+        pass.set_pipeline(&self.pipelines.body.grid);
         pass.set_index_buffer(
             self.meshes.index_buffer().slice(..),
             wgpu::IndexFormat::Uint32,
@@ -240,7 +240,7 @@ impl GlobeRenderer {
                 continue;
             };
             pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-            pass.set_bind_group(1, arena.tile_bind_group(), &[dyn_offset]);
+            pass.set_bind_group(1, arena.bind_group(UniformSlot::Tile), &[dyn_offset]);
             pass.draw_indexed(surface_indices.clone(), 0, 0..1);
         }
     }
@@ -313,22 +313,14 @@ impl GlobeRenderer {
             post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
             self.overlay.record_pass(
                 &mut post_pass,
-                OverlayPipelines {
-                    display: &self.pipelines.overlay_pipeline,
-                    scientific: &self.pipelines.overlay_scientific_pipeline,
-                    categorical: &self.pipelines.overlay_categorical_pipeline,
-                },
+                &self.pipelines.overlay,
                 self.viewport.uniform_arena(),
                 bind_groups,
                 snapshot,
             );
             self.vector.record_pass(
                 &mut post_pass,
-                VectorPipelines {
-                    fill: &self.pipelines.vector_fill_pipeline,
-                    line: &self.pipelines.vector_line_pipeline,
-                    point: &self.pipelines.vector_point_pipeline,
-                },
+                &self.pipelines.vector,
                 self.viewport.uniform_arena(),
                 snapshot,
             );

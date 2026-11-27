@@ -1,7 +1,7 @@
 use super::*;
 use crate::geo::geodesic::ring_signed_area_m2;
 use crate::geo::geodesy::WGS84;
-use crate::geo::shapes::Ring;
+use crate::geo::shapes::{GeoPoint, Polygon, Ring};
 use glam::Vec3;
 
 #[test]
@@ -284,16 +284,16 @@ fn feature_properties_bbox_and_wkt_export_round_trip() {
     )
     .with_string_prop("sensor", "S2")
     .with_f64_prop("cloud", 12.5);
-    assert_eq!(feat.property_count(), 2);
-    assert_eq!(feat.property_str("sensor"), Some("S2"));
-    assert_eq!(feat.property_f64("cloud"), Some(12.5));
-    let pairs = feat.property_display_pairs();
-    assert!(pairs.iter().any(|(k, v)| k == "sensor" && v == "S2"));
+    assert_eq!(feat.geometry.bbox(), Some([37.0, 55.0, 38.0, 56.0]));
 
     let fc = GeoJsonFeatureCollection {
         features: vec![feat],
     };
     assert_eq!(fc.bbox(), Some([37.0, 55.0, 38.0, 56.0]));
+    let exported_fc = export_geojson_feature_collection(&fc);
+    assert!(exported_fc.contains("\"sensor\": \"S2\""));
+    assert!(exported_fc.contains("\"cloud\": 12.5"));
+    assert!(exported_fc.contains("\"name\": \"AOI\""));
 
     let wkt = export_wkt_geometry(&GeoJsonGeometry::Polygon(poly.clone()));
     assert!(wkt.starts_with("POLYGON (("));

@@ -22,7 +22,8 @@ pub use crs::{
     CrsError, CrsPreset, CrsSpec, CrsTextKind, CustomTmParams, Datum, DatumPreset, DatumWarning,
     HelmertConvention, KRASOVSKY, LinearUnit, PULKOVO_1942, Proj4Projection, Projection, System,
     US_SURVEY_FOOT_M, WEB_MERCATOR_LIMIT_DEG, WGS84_DATUM, builtin_crs_presets,
-    ellipsoid_from_epsg, known_datum_from_code, search_crs_presets, web_mercator_lat_deg,
+    ellipsoid_from_epsg, known_datum_from_code, search_crs_presets, trim_crs_text,
+    web_mercator_lat_deg,
 };
 pub use cull::{Ball, CullFrustum};
 pub use footprint::FootprintBounds;

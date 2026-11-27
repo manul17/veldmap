@@ -8,13 +8,13 @@ use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{QuadTileId, TileKey};
 
 use crate::basemap::LiveBasemapSpec;
-use crate::http::{
-    FetchFailure, FetchOutcome, TransientFetchError, TransientKind, download_capped,
-};
 use crate::{DecodeCompletion, DecodeFailure, DecodeRequest};
 
-use super::context::PipelineContext;
+use super::PipelineContext;
 use super::disk::{DiskCacheGate, DiskReadOutcome};
+use super::download::{
+    FetchFailure, FetchOutcome, TransientFetchError, TransientKind, download_capped,
+};
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
 use super::state::{PipelineState, TileTarget, Transition};
 
@@ -286,10 +286,7 @@ pub(super) async fn run_http_fetch(ctx: Arc<PipelineContext>, task: HttpTask) {
         }
     };
 
-    let fetch_res = tokio::select! {
-        _ = cancel.cancelled() => return,
-        res = download_capped(&ctx.client, &url, ctx.max_tile_bytes) => res,
-    };
+    let fetch_res = download_capped(&ctx.client, &url, ctx.max_tile_bytes, &cancel).await;
 
     // Release the per-host HTTP permit BEFORE submitting CPU decode / disk put.
     drop(permit_guard);
@@ -309,6 +306,7 @@ pub(super) async fn run_http_fetch(ctx: Arc<PipelineContext>, task: HttpTask) {
                 st.mark_empty_204(key, generation)
             });
         }
+        Ok(FetchOutcome::Cancelled) => {}
         Err(FetchFailure::Terminal(msg)) => {
             let safe_msg = spec.redact_secrets(&msg);
             tracing::debug!(?key, error = %safe_msg, "Terminal HTTP tile failure");

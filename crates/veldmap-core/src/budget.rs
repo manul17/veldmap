@@ -199,7 +199,7 @@ impl DecodeBudgetTracker {
     /// configured cap, `Ok(None)` when sufficient budget is occupied or queued
     /// ahead, or `Ok(Some(lease))` on success.
     #[cfg(test)]
-    pub fn try_reserve(&self, bytes: u64) -> Result<Option<BudgetLease>, BudgetError> {
+    fn try_reserve(&self, bytes: u64) -> Result<Option<BudgetLease>, BudgetError> {
         self.check_cap(bytes)?;
         Ok(self.try_reserve_unchecked(bytes))
     }
@@ -276,7 +276,7 @@ pub struct BudgetLease {
 #[cfg(test)]
 impl BudgetLease {
     /// Number of bytes held by this lease.
-    pub const fn bytes(&self) -> u64 {
+    const fn bytes(&self) -> u64 {
         self.bytes
     }
 }

@@ -5,8 +5,7 @@
 use eframe::egui;
 use eframe::egui_wgpu;
 use tracing_subscriber::EnvFilter;
-use veldmap_app::VeldmapApp;
-use veldmap_app::render::clamp_to_primary_backends;
+use veldmap_app::{VeldmapApp, clamp_to_primary_backends};
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {

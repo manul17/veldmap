@@ -11,6 +11,7 @@ use super::byte_source::{ByteSource, IoError};
 #[derive(Clone, Debug)]
 pub struct MemoryByteSource {
     bytes: Arc<[u8]>,
+    remote: bool,
 }
 
 impl MemoryByteSource {
@@ -18,18 +19,32 @@ impl MemoryByteSource {
     pub fn from_vec(bytes: Vec<u8>) -> Self {
         Self {
             bytes: Arc::from(bytes),
+            remote: false,
         }
     }
 
     /// Wrap a shared slice as a [`MemoryByteSource`].
     pub fn new(bytes: Arc<[u8]>) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            remote: false,
+        }
+    }
+
+    /// Mark whether this test source reports [`ByteSource::is_remote`].
+    pub const fn with_remote(mut self, remote: bool) -> Self {
+        self.remote = remote;
+        self
     }
 }
 
 impl ByteSource for MemoryByteSource {
     fn len(&self) -> u64 {
         self.bytes.len() as u64
+    }
+
+    fn is_remote(&self) -> bool {
+        self.remote
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8], cancel: &CancelToken) -> Result<usize, IoError> {
@@ -113,6 +128,10 @@ impl CountingByteSource {
 impl ByteSource for CountingByteSource {
     fn len(&self) -> u64 {
         self.inner.len()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8], cancel: &CancelToken) -> Result<usize, IoError> {

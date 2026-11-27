@@ -15,12 +15,10 @@ mod chunk_reader;
 mod gdal_meta;
 mod georef;
 mod ifd;
-mod ifd_parse;
 mod open;
 mod probe;
 mod raw_decode;
 mod stretch;
-mod tags;
 mod ycbcr;
 
 use std::sync::Arc;
@@ -29,19 +27,16 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint, SourceId, TileStreamSpec};
 
 use crate::RasterError;
-use crate::pipeline::chunk_cache::{ChunkKey, SharedChunkCache};
-use crate::pipeline::driver::{self, DirectRead, plan_direct};
-use crate::pipeline::grid::Grid;
-use crate::pipeline::metadata::{BandSample, BandStats, RasterDescription, SampleType};
-use crate::pipeline::plan::{
-    DISPLAY_STREAM_SPEC, PyramidMeta, build_chunked_level_table, stream_spec_for_band,
+use crate::pipeline::{
+    BandSample, BandStats, ByteRange, ChunkKey, DISPLAY_STREAM_SPEC, DecodeContext, DirectRead,
+    DisplayMapping, Grid, PyramidMeta, RasterDescription, RasterSource, SampleType,
+    SharedChunkCache, TileEmit, build_chunked_level_table, coalesce_byte_ranges, direct, pass,
+    plan_direct, stream_spec_for_band,
 };
-use crate::pipeline::radiometry::DisplayMapping;
-use crate::pipeline::{ByteRange, DecodeContext, RasterSource, TileEmit, coalesce_byte_ranges};
 
 use chunk_reader::{ChunkReadMode, TiffChunkReader};
-use ifd::{CachedIfd, Photometric, PlanarConfig, RawTiffAccess};
-use probe::{ProbeContext, sample_display_rgba, sample_indexed_band};
+use ifd::{CachedIfd, Photometric, RawTiffAccess, TiffSourceView, find_ifd};
+use probe::{sample_display_rgba, sample_indexed_band};
 use stretch::{BandStatsCache, StretchCache, StretchRequest, pick_sample_chunks};
 
 /// BigTIFF file header signatures (`version = 43`).
@@ -134,8 +129,8 @@ impl TiffSource {
         }
     }
 
-    fn probe_context(&self) -> ProbeContext<'_> {
-        ProbeContext {
+    fn source_view(&self) -> TiffSourceView<'_> {
+        TiffSourceView {
             access: &self.access,
             source_id: self.source_id,
             ifds: &self.ifds,
@@ -226,15 +221,7 @@ impl TiffSource {
         display_mapping: Option<DisplayMapping>,
         mode: ChunkReadMode<'a>,
     ) -> TiffChunkReader<'a> {
-        TiffChunkReader::new(
-            &self.access,
-            self.source_id,
-            &self.ifds,
-            spec,
-            self.nodata_f64,
-            display_mapping,
-            mode,
-        )
+        TiffChunkReader::new(self.source_view(), spec, display_mapping, mode)
     }
 }
 
@@ -276,11 +263,7 @@ impl RasterSource for TiffSource {
             wants,
             budget,
         )?;
-        let ifd = self
-            .ifds
-            .iter()
-            .find(|i| i.image == plan.image)
-            .ok_or_else(|| RasterError::Decode(format!("TIFF IFD {} is not cached", plan.image)))?;
+        let ifd = find_ifd(&self.ifds, plan.image())?;
         let planes = ifd.planes_for_stream(spec)?;
         let uncached: Vec<u32> = plan
             .unique_chunk_indices()
@@ -289,7 +272,7 @@ impl RasterSource for TiffSource {
                 let key = ChunkKey {
                     source: self.source_id,
                     spec,
-                    image: plan.image,
+                    image: plan.image(),
                     chunk_index,
                 };
                 !chunk_cache.contains(&key)
@@ -299,19 +282,12 @@ impl RasterSource for TiffSource {
     }
 
     fn plan_stretch_byte_ranges(&self) -> Result<Vec<ByteRange>, RasterError> {
-        if self.stretch.is_ready()
-            || self.base_ifd().sample_type == SampleType::U8
-            || self.base_ifd().photometric == Photometric::Palette
-        {
+        if self.stretch.is_ready() || !self.base_ifd().needs_display_stretch() {
             return Ok(Vec::new());
         }
         let ifd = self.stats_ifd_ref();
         let picks = pick_sample_chunks(ifd.chunks_per_plane);
-        let planes: Vec<usize> = match ifd.planar {
-            PlanarConfig::Chunky => vec![0],
-            PlanarConfig::Planar => (0..ifd.pixel_layout.colors().max(1)).collect(),
-        };
-        self.collect_validated_spans(ifd, &planes, &picks)
+        self.collect_validated_spans(ifd, ifd.stretch_planes(), &picks)
     }
 
     fn plan_band_stats_byte_ranges(&self, band: BandKey) -> Result<Vec<ByteRange>, RasterError> {
@@ -373,12 +349,10 @@ impl RasterSource for TiffSource {
     }
 
     fn pass_peak_bytes(&self, spec: TileStreamSpec) -> u64 {
-        self.grid
-            .pass_peak(
-                (self.description.width, self.description.height),
-                spec.format,
-            )
-            .total()
+        self.grid.pass_peak_bytes(
+            (self.description.width, self.description.height),
+            spec.format,
+        )
     }
 
     fn produce_direct(
@@ -413,7 +387,7 @@ impl RasterSource for TiffSource {
             budget_tracker: ctx.budget_tracker,
             cancel: ctx.cancel,
         };
-        driver::direct(&mut reader, &req, emit)
+        direct(&mut reader, &req, emit)
     }
 
     fn produce_pass(
@@ -433,17 +407,17 @@ impl RasterSource for TiffSource {
         } else {
             None
         };
-        let pass_peak = self.grid.pass_peak(
+        let pass_peak_bytes = self.grid.admit_pass_peak(
             (self.description.width, self.description.height),
             spec.format,
-        );
-        pass_peak.admit(ctx.budget.decode_working_bytes)?;
+            ctx.budget.decode_working_bytes,
+        )?;
         let _pass_lease = ctx
             .budget_tracker
-            .reserve_blocking(pass_peak.total(), ctx.cancel)?;
+            .reserve_blocking(pass_peak_bytes, ctx.cancel)?;
 
         let mut reader = self.make_reader(spec, mapping, ChunkReadMode::SequentialPass);
-        driver::pass(
+        pass(
             &mut reader,
             &self.grid,
             (self.description.width, self.description.height),
@@ -464,9 +438,9 @@ impl RasterSource for TiffSource {
         if px >= self.description.width || py >= self.description.height {
             return Ok(BandSample::Unavailable);
         }
-        let probe = self.probe_context();
+        let view = self.source_view();
         if band == BandKey::Display && format == PixelFormat::Rgba8UnormSrgb {
-            return sample_display_rgba(&probe, px, py, || self.display_mapping(ctx), ctx);
+            return sample_display_rgba(view, px, py, || self.display_mapping(ctx), ctx);
         }
         let spec = stream_spec_for_band(band, format);
         if self.validate_stream_spec(spec).is_err() {
@@ -476,7 +450,7 @@ impl RasterSource for TiffSource {
             return Ok(BandSample::Unavailable);
         };
         sample_indexed_band(
-            &probe,
+            view,
             spec,
             usize::from(band_u16),
             self.band_scale_offset(band),

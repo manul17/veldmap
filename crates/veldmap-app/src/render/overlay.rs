@@ -4,20 +4,25 @@
 //! nearest-neighbor class palettes).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use veldmap_core::glam::DVec3;
 use veldmap_core::tile::{MAX_WARP_SEGMENTS, PixelFormat, build_warp_patch};
 use wgpu::util::DeviceExt;
 
+use crate::clamp_opacity;
+use crate::gpu_tiles::GpuTile;
+
 use super::bind_groups::TileBindGroupCache;
 use super::mesh_cache::{DEFAULT_MESH_CACHE_BYTES, ElasticMeshCache, push_grid_quad_indices};
 use super::palette_cache::PaletteCache;
+use super::pipelines::OverlayPipelines;
 use super::snapshot::{DrawOverlayTrack, DrawSnapshot, OverlayMeshKey};
 use super::uniforms::{
     CategoricalPatchUniform, DynamicUniformArena, OverlayPatchUniform, ScientificPatchUniform,
+    UniformSlot,
 };
-use crate::clamp_opacity;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -43,11 +48,8 @@ impl OverlayVertex {
     };
 }
 
-/// Pipelines passed to [`OverlayRenderer::record_pass`].
-pub(super) struct OverlayPipelines<'a> {
-    pub(super) display: &'a wgpu::RenderPipeline,
-    pub(super) scientific: &'a wgpu::RenderPipeline,
-    pub(super) categorical: &'a wgpu::RenderPipeline,
+fn clamp_warp_segments(segments: u32) -> u32 {
+    segments.clamp(1, MAX_WARP_SEGMENTS)
 }
 
 struct CachedOverlayMesh {
@@ -62,6 +64,74 @@ enum ActiveOverlayPipeline {
     Display,
     Scientific,
     Categorical,
+}
+
+type TileTextureLookup =
+    for<'a, 'b> fn(&'a TileBindGroupCache, &'b Arc<GpuTile>) -> Option<&'a wgpu::BindGroup>;
+
+fn lookup_rgba8_tile<'a>(
+    bind_groups: &'a TileBindGroupCache,
+    tile: &Arc<GpuTile>,
+) -> Option<&'a wgpu::BindGroup> {
+    bind_groups.get(tile, PixelFormat::Rgba8UnormSrgb)
+}
+
+fn lookup_r32f_tile<'a>(
+    bind_groups: &'a TileBindGroupCache,
+    tile: &Arc<GpuTile>,
+) -> Option<&'a wgpu::BindGroup> {
+    bind_groups.get(tile, PixelFormat::R32Float)
+}
+
+/// Per-layer Pass-2 pipeline, dynamic uniform slot, optional palette LUT, and
+/// tile-format bind-group lookup resolved once per overlay layer.
+struct LayerDrawBindings<'a> {
+    pipeline_kind: ActiveOverlayPipeline,
+    pipeline: &'a wgpu::RenderPipeline,
+    uniform_bg: &'a wgpu::BindGroup,
+    palette_bg: Option<&'a wgpu::BindGroup>,
+    texture_lookup: TileTextureLookup,
+}
+
+impl<'a> LayerDrawBindings<'a> {
+    fn resolve(
+        track: &DrawOverlayTrack,
+        pipelines: &'a OverlayPipelines,
+        arena: &'a DynamicUniformArena,
+        palettes: &'a PaletteCache,
+    ) -> Option<Self> {
+        match track {
+            DrawOverlayTrack::Display => Some(Self {
+                pipeline_kind: ActiveOverlayPipeline::Display,
+                pipeline: &pipelines.display,
+                uniform_bg: arena.bind_group(UniformSlot::Overlay),
+                palette_bg: None,
+                texture_lookup: lookup_rgba8_tile,
+            }),
+            DrawOverlayTrack::Scientific { .. } => Some(Self {
+                pipeline_kind: ActiveOverlayPipeline::Scientific,
+                pipeline: &pipelines.scientific,
+                uniform_bg: arena.bind_group(UniformSlot::Scientific),
+                palette_bg: Some(palettes.bind_group(track)?),
+                texture_lookup: lookup_r32f_tile,
+            }),
+            DrawOverlayTrack::Categorical { .. } => Some(Self {
+                pipeline_kind: ActiveOverlayPipeline::Categorical,
+                pipeline: &pipelines.categorical,
+                uniform_bg: arena.bind_group(UniformSlot::Categorical),
+                palette_bg: Some(palettes.bind_group(track)?),
+                texture_lookup: TileBindGroupCache::get_uint,
+            }),
+        }
+    }
+
+    fn texture_bind_group(
+        &self,
+        bind_groups: &'a TileBindGroupCache,
+        texture: &Arc<GpuTile>,
+    ) -> Option<&'a wgpu::BindGroup> {
+        (self.texture_lookup)(bind_groups, texture)
+    }
 }
 
 /// Layer-invariant uniform parameters sanitized once per layer outside the
@@ -152,7 +222,7 @@ impl OverlayRenderer {
     }
 
     fn ensure_index_buffer(&mut self, device: &wgpu::Device, segments: u32, flip_winding: bool) {
-        let segs = segments.clamp(1, MAX_WARP_SEGMENTS);
+        let segs = clamp_warp_segments(segments);
         if self.index_buffers.contains_key(&(segs, flip_winding)) {
             return;
         }
@@ -180,7 +250,11 @@ impl OverlayRenderer {
         self.palettes.sweep_stale();
 
         if snapshot.overlays.is_empty() {
-            self.meshes.clear_and_reset_cap();
+            // Relax any elastic cap expansion back to `DEFAULT_MESH_CACHE_BYTES`
+            // without clearing warm warp meshes so temporary layer hides or
+            // off-screen pans avoid full CPU warp rebuilding and GPU re-upload.
+            self.meshes.begin_frame(0, std::iter::empty());
+            self.meshes.end_frame(0);
             return;
         }
 
@@ -188,7 +262,7 @@ impl OverlayRenderer {
             .overlays
             .iter()
             .map(|layer| {
-                let side = (layer.segments.clamp(1, MAX_WARP_SEGMENTS) + 1) as usize;
+                let side = (clamp_warp_segments(layer.segments) + 1) as usize;
                 layer
                     .patches
                     .len()
@@ -205,7 +279,7 @@ impl OverlayRenderer {
 
         for layer in &snapshot.overlays {
             self.palettes.ensure(device, palette_layout, &layer.track);
-            let segs = layer.segments.clamp(1, MAX_WARP_SEGMENTS);
+            let segs = clamp_warp_segments(layer.segments);
             for patch in &layer.patches {
                 bind_groups.ensure(device, &patch.texture);
 
@@ -318,7 +392,7 @@ impl OverlayRenderer {
     pub(super) fn record_pass<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
-        pipelines: OverlayPipelines<'a>,
+        pipelines: &'a OverlayPipelines,
         arena: &'a DynamicUniformArena,
         bind_groups: &'a TileBindGroupCache,
         snapshot: &'a DrawSnapshot,
@@ -332,32 +406,11 @@ impl OverlayRenderer {
         let mut offset_idx = 0usize;
 
         for layer in &snapshot.overlays {
-            let (desired_pipeline, rp, uniform_bg) = match &layer.track {
-                DrawOverlayTrack::Display => (
-                    ActiveOverlayPipeline::Display,
-                    pipelines.display,
-                    arena.overlay_bind_group(),
-                ),
-                DrawOverlayTrack::Scientific { .. } => (
-                    ActiveOverlayPipeline::Scientific,
-                    pipelines.scientific,
-                    arena.scientific_overlay_bind_group(),
-                ),
-                DrawOverlayTrack::Categorical { .. } => (
-                    ActiveOverlayPipeline::Categorical,
-                    pipelines.categorical,
-                    arena.categorical_overlay_bind_group(),
-                ),
-            };
-            let palette_bg = match &layer.track {
-                DrawOverlayTrack::Display => None,
-                DrawOverlayTrack::Scientific { .. } | DrawOverlayTrack::Categorical { .. } => {
-                    let Some(bg) = self.palettes.bind_group(&layer.track) else {
-                        offset_idx += layer.patches.len();
-                        continue;
-                    };
-                    Some(bg)
-                }
+            let Some(bindings) =
+                LayerDrawBindings::resolve(&layer.track, pipelines, arena, &self.palettes)
+            else {
+                offset_idx += layer.patches.len();
+                continue;
             };
 
             let mut layer_bound = false;
@@ -370,16 +423,7 @@ impl OverlayRenderer {
                 let Some(mesh) = self.meshes.peek(&patch.mesh_key) else {
                     continue;
                 };
-                let tex_bg = match desired_pipeline {
-                    ActiveOverlayPipeline::Display => {
-                        bind_groups.get(&patch.texture, PixelFormat::Rgba8UnormSrgb)
-                    }
-                    ActiveOverlayPipeline::Scientific => {
-                        bind_groups.get(&patch.texture, PixelFormat::R32Float)
-                    }
-                    ActiveOverlayPipeline::Categorical => bind_groups.get_uint(&patch.texture),
-                };
-                let Some(tex_bg) = tex_bg else {
+                let Some(tex_bg) = bindings.texture_bind_group(bind_groups, &patch.texture) else {
                     continue;
                 };
                 let idx_key = (mesh.segments, mesh.flip_winding);
@@ -387,13 +431,13 @@ impl OverlayRenderer {
                     continue;
                 };
 
-                if last_pipeline != Some(desired_pipeline) {
-                    pass.set_pipeline(rp);
-                    last_pipeline = Some(desired_pipeline);
+                if last_pipeline != Some(bindings.pipeline_kind) {
+                    pass.set_pipeline(bindings.pipeline);
+                    last_pipeline = Some(bindings.pipeline_kind);
                     last_tex_id = None;
                 }
                 if !layer_bound {
-                    if let Some(pbg) = palette_bg {
+                    if let Some(pbg) = bindings.palette_bg {
                         pass.set_bind_group(3, pbg, &[]);
                     }
                     layer_bound = true;
@@ -407,7 +451,7 @@ impl OverlayRenderer {
                     last_tex_id = Some(patch.texture.tile_id);
                 }
                 pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-                pass.set_bind_group(1, uniform_bg, &[dyn_offset]);
+                pass.set_bind_group(1, bindings.uniform_bg, &[dyn_offset]);
                 pass.draw_indexed(0..*idx_count, 0, 0..1);
             }
         }

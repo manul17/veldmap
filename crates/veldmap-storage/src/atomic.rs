@@ -11,11 +11,12 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::StorageError;
+use crate::paths::append_path_suffix;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
 
-fn sibling_temp_path(target: &Path) -> Result<(PathBuf, PathBuf), StorageError> {
+fn parent_and_file_name(target: &Path) -> Result<(PathBuf, &std::ffi::OsStr), StorageError> {
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -25,13 +26,16 @@ fn sibling_temp_path(target: &Path) -> Result<(PathBuf, PathBuf), StorageError> 
         .file_name()
         .filter(|n| !n.is_empty())
         .ok_or_else(|| StorageError::InvalidPath(target.display().to_string()))?;
+    Ok((parent, file_name))
+}
+
+fn sibling_temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     let pid = std::process::id();
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut name = OsString::from(".");
     name.push(file_name);
     name.push(format!(".tmp.{pid}.{seq}"));
-    let tmp = parent.join(name);
-    Ok((parent, tmp))
+    parent.join(name)
 }
 
 #[cfg(unix)]
@@ -99,10 +103,11 @@ fn create_unique_temp(
     path: &Path,
     private: bool,
 ) -> Result<(PathBuf, PathBuf, File), StorageError> {
+    let (parent, file_name) = parent_and_file_name(path)?;
+    fs::create_dir_all(&parent)?;
     let mut last_err = None;
     for _ in 0..MAX_TEMP_CREATE_ATTEMPTS {
-        let (parent, tmp_path) = sibling_temp_path(path)?;
-        fs::create_dir_all(&parent)?;
+        let tmp_path = sibling_temp_path(&parent, file_name);
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -183,9 +188,7 @@ pub fn read_json_or_default_with_backup<T: DeserializeOwned + Default>(path: &Pa
     match read_json_or_default::<T>(path) {
         Ok(value) => value,
         Err(StorageError::Json(err)) => {
-            let mut backup_os = path.as_os_str().to_os_string();
-            backup_os.push(".corrupt");
-            let backup = PathBuf::from(backup_os);
+            let backup = append_path_suffix(path, ".corrupt");
             match rename_replace(path, &backup) {
                 Ok(()) => {
                     tracing::warn!(

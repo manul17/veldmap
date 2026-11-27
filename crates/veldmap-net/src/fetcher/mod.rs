@@ -3,10 +3,11 @@
 //! queues, end-to-end `CancelToken` abort through an injected
 //! [`TileDecodeExecutor`], and deterministic shutdown.
 
-mod context;
 mod disk;
 mod dispatch;
+mod download;
 mod guards;
+mod ports;
 mod state;
 mod workers;
 
@@ -15,22 +16,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
-use veldmap_core::sync::{Wakeup, lock_unpoisoned};
+use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::TileKey;
 
 use crate::basemap::LiveBasemapSpec;
-use crate::context::{NetConfig, NetContext};
-use crate::http::default_user_agent;
-use crate::{NetError, TileBlobStore, TileDecodeExecutor};
+use crate::context::NetContext;
+use crate::http::HostLimiters;
 
-use self::context::{PipelineContext, PipelineShared};
 use self::disk::DiskCacheGate;
 use self::dispatch::dispatcher_loop;
+#[cfg(any(test, feature = "test-support"))]
+pub use self::ports::test_support;
+pub use self::ports::{
+    BlobLease, BlobStoreError, DecodeCompletion, DecodeFailure, DecodeRequest, TileBlobStore,
+    TileDecodeExecutor,
+};
 pub use self::state::NetworkStatus;
 use self::state::PipelineState;
-
-/// Default maximum concurrent HTTP requests per remote host.
-const DEFAULT_MAX_CONCURRENT_PER_HOST: usize = 6;
 
 /// Default maximum encoded response body accepted for one live tile (`16 MiB`).
 const DEFAULT_MAX_TILE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -39,13 +41,40 @@ const DEFAULT_MAX_TILE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// retrying a tile.
 const DEFAULT_TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 
-/// Configuration for [`LiveTilePipeline`].
+/// Shared control-plane handles held by both [`LiveTilePipeline`] and
+/// [`PipelineContext`].
+///
+/// Kept distinct from [`PipelineContext`] so the frontend handle never extends
+/// the lifetimes of `reqwest::Client`, `DiskCacheGate`, `TileDecodeExecutor`,
+/// or `Wakeup` past `dispatcher_loop` exit.
+///
+/// Lock ordering: always acquire `state` BEFORE `host_limiters` (never
+/// reverse; `HostLimiters` is a leaf lock).
+struct PipelineShared {
+    shutdown: CancelToken,
+    state: Mutex<PipelineState>,
+    host_limiters: Arc<HostLimiters>,
+    notify: Notify,
+}
+
+/// Shared immutable context passed across the dispatcher and per-tile tasks.
+struct PipelineContext {
+    shared: Arc<PipelineShared>,
+    client: reqwest::Client,
+    disk_cache: Option<DiskCacheGate>,
+    decoder: Arc<dyn TileDecodeExecutor>,
+    wakeup: Wakeup,
+    max_tile_bytes: usize,
+    transient_retry_backoff: Duration,
+}
+
+/// Per-pipeline configuration for [`LiveTilePipeline`].
+///
+/// Transport-level settings (`user_agent`, `max_concurrent_per_host`,
+/// `connect_timeout`, and `read_timeout`) are governed by the shared
+/// [`NetContext`].
 #[derive(Clone, Debug)]
 pub struct FetcherConfig {
-    pub user_agent: String,
-    pub max_concurrent_per_host: usize,
-    pub connect_timeout: Duration,
-    pub request_timeout: Duration,
     pub max_tile_bytes: usize,
     pub transient_retry_backoff: Duration,
 }
@@ -53,56 +82,24 @@ pub struct FetcherConfig {
 impl Default for FetcherConfig {
     fn default() -> Self {
         Self {
-            user_agent: default_user_agent(),
-            max_concurrent_per_host: DEFAULT_MAX_CONCURRENT_PER_HOST,
-            connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(20),
             max_tile_bytes: DEFAULT_MAX_TILE_RESPONSE_BYTES,
             transient_retry_backoff: DEFAULT_TRANSIENT_RETRY_BACKOFF,
         }
     }
 }
 
-/// Complete live HTTP tile streaming pipeline sharing a [`NetContext`] (or
-/// owning a private one when constructed via [`Self::spawn`]).
+/// Complete live HTTP tile streaming pipeline sharing a [`NetContext`].
 ///
 /// Decodes encoded tile payloads via the caller-injected [`TileDecodeExecutor`],
 /// keeping `veldmap-net` free of `veldmap-raster` and image codecs.
 /// Shuts down deterministically via [`Self::signal_shutdown`] / [`Self::shutdown`].
 pub struct LiveTilePipeline {
     shared: Arc<PipelineShared>,
-    owned_net: Option<Arc<NetContext>>,
 }
 
 impl LiveTilePipeline {
-    /// Spawn a live tile pipeline backed by a dedicated [`NetContext`].
-    pub fn spawn(
-        config: FetcherConfig,
-        disk_cache: Option<Arc<dyn TileBlobStore>>,
-        decoder: Arc<dyn TileDecodeExecutor>,
-        wakeup: Wakeup,
-    ) -> Result<Self, NetError> {
-        let net_cfg = NetConfig {
-            user_agent: config.user_agent.clone(),
-            max_concurrent_per_host: config.max_concurrent_per_host,
-            connect_timeout: config.connect_timeout,
-            read_timeout: config.request_timeout,
-            ..NetConfig::default()
-        };
-        let net = Arc::new(NetContext::new(net_cfg)?);
-        let mut pipeline =
-            Self::spawn_with_context(Arc::clone(&net), config, disk_cache, decoder, wakeup);
-        pipeline.owned_net = Some(net);
-        Ok(pipeline)
-    }
-
     /// Spawn a live tile pipeline sharing an existing [`NetContext`]'s Tokio
     /// runtime, HTTP client pool, and per-host limiters.
-    ///
-    /// Note: transport-level settings (`user_agent`, `max_concurrent_per_host`,
-    /// `connect_timeout`, and `request_timeout`) are governed by the shared
-    /// [`NetContext`]; `config.max_tile_bytes` and `config.transient_retry_backoff`
-    /// still apply per pipeline.
     pub fn spawn_with_context(
         net: Arc<NetContext>,
         config: FetcherConfig,
@@ -133,10 +130,7 @@ impl LiveTilePipeline {
             dispatcher_loop(ctx).await;
         });
 
-        Self {
-            shared,
-            owned_net: None,
-        }
+        Self { shared }
     }
 
     /// Switch the active live basemap specification (or `None` when viewing
@@ -217,22 +211,15 @@ impl LiveTilePipeline {
         self.shared.notify.notify_waiters();
     }
 
-    /// Deterministically shut down the pipeline (and its private async runtime
-    /// when constructed via [`Self::spawn`]).
-    pub fn shutdown(mut self) {
-        self.shutdown_inner();
-    }
-
-    fn shutdown_inner(&mut self) {
+    /// Deterministically shut down the pipeline by cancelling its root and
+    /// active per-tile tokens.
+    pub fn shutdown(self) {
         self.signal_shutdown();
-        if let Some(net) = self.owned_net.take() {
-            net.shutdown();
-        }
     }
 }
 
 impl Drop for LiveTilePipeline {
     fn drop(&mut self) {
-        self.shutdown_inner();
+        self.signal_shutdown();
     }
 }

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use veldmap_core::sync::lock_unpoisoned;
 
-use super::context::PipelineContext;
+use super::PipelineContext;
 use super::disk::DiskCacheGate;
 use super::guards::{DiskSlotGuard, InFlightGuard, PermitGuard};
 use super::workers::{DiskTask, HttpTask, run_disk_lookup, run_http_fetch};

@@ -12,5 +12,5 @@ mod qoi;
 /// codecs (`16 MiB`, matching the tile size cap in `veldmap-storage`).
 pub const MAX_CACHED_TILE_DECODED_BYTES: usize = 16 * 1024 * 1024;
 
-pub use lz4_raw::{MAX_LZ4_RAW_DECODED_BYTES, decode_lz4_raw_tile, encode_lz4_raw_tile};
-pub use qoi::{MAX_QOI_DECODED_BYTES, decode_qoi_rgba8, encode_qoi_rgba8};
+pub use lz4_raw::{decode_lz4_raw_tile, encode_lz4_raw_tile};
+pub use qoi::{decode_qoi_rgba8, encode_qoi_rgba8};

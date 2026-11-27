@@ -1,10 +1,19 @@
 //! Injectable application storage paths (`config_dir`, `cache_dir`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 
 use crate::StorageError;
+
+/// Append `suffix` directly onto `path`'s OS string (preserving existing
+/// extensions, e.g. `settings.json` -> `settings.json.corrupt` or
+/// `tiles.sqlite3` -> `tiles.sqlite3-wal`).
+pub(crate) fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
 
 /// Concrete filesystem roots for VeldMap configuration and ephemeral caches.
 /// Always injected rather than queried via globals so tests and portable

@@ -1,5 +1,6 @@
 //! HTTP client construction (`rustls` + `ring`), per-host concurrency &
-//! rate-limit cooldown management, and size-capped tile download helpers.
+//! rate-limit cooldown management, and size-capped response body reading
+//! helpers.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -46,10 +47,7 @@ pub fn is_valid_custom_header_name(name: &str) -> bool {
     validate_custom_header_name(name, &[]).is_ok()
 }
 
-pub(crate) fn validate_custom_header_name(
-    name: &str,
-    extra_forbidden: &[&str],
-) -> Result<HeaderName, String> {
+fn validate_custom_header_name(name: &str, extra_forbidden: &[&str]) -> Result<HeaderName, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("header name must not be empty".to_owned());
@@ -397,114 +395,6 @@ pub(crate) fn parse_retry_after_seconds(header: Option<&str>) -> Option<Duration
     Some(Duration::from_secs(secs).clamp(MIN_RETRY_AFTER, MAX_RETRY_AFTER))
 }
 
-pub(crate) enum FetchOutcome {
-    Payload(Vec<u8>),
-    /// HTTP `204 No Content` (valid empty/nodata tile, not an error).
-    Empty204,
-}
-
-/// Classification of a transient HTTP/network error so impossible combinations
-/// (such as non-rate-limited errors carrying `Retry-After`) are unrepresentable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TransientKind {
-    Network { offline: bool },
-    ServerError,
-    RateLimited { retry_after: Option<Duration> },
-}
-
-pub(crate) struct TransientFetchError {
-    pub msg: String,
-    pub kind: TransientKind,
-}
-
-pub(crate) enum FetchFailure {
-    Terminal(String),
-    Transient(TransientFetchError),
-}
-
-fn map_reqwest_err(err: reqwest::Error) -> FetchFailure {
-    FetchFailure::Transient(TransientFetchError {
-        msg: err.to_string(),
-        kind: TransientKind::Network {
-            offline: err.is_connect() || err.is_timeout(),
-        },
-    })
-}
-
-fn classify_http_error(status: reqwest::StatusCode, retry_after: Option<&str>) -> FetchFailure {
-    let code = status.as_u16();
-    let msg = format!("HTTP {code}");
-    if matches!(code, 429 | 503) {
-        return FetchFailure::Transient(TransientFetchError {
-            msg,
-            kind: TransientKind::RateLimited {
-                retry_after: parse_retry_after_seconds(retry_after),
-            },
-        });
-    }
-    if code == 408 {
-        // Request Timeout is transient, and receiving an HTTP response proves
-        // the host is reachable (so do not set `offline = true`).
-        return FetchFailure::Transient(TransientFetchError {
-            msg,
-            kind: TransientKind::ServerError,
-        });
-    }
-    if status.is_client_error() {
-        return FetchFailure::Terminal(msg);
-    }
-    FetchFailure::Transient(TransientFetchError {
-        msg,
-        kind: TransientKind::ServerError,
-    })
-}
-
-pub(crate) async fn download_capped(
-    client: &reqwest::Client,
-    url: &str,
-    max_bytes: usize,
-) -> Result<FetchOutcome, FetchFailure> {
-    let mut resp = client.get(url).send().await.map_err(map_reqwest_err)?;
-
-    let status = resp.status();
-    if status.as_u16() == 204 {
-        return Ok(FetchOutcome::Empty204);
-    }
-    if !status.is_success() {
-        let hdr = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok());
-        return Err(classify_http_error(status, hdr));
-    }
-
-    if let Some(len) = resp.content_length()
-        && len > max_bytes as u64
-    {
-        return Err(FetchFailure::Terminal(format!(
-            "tile payload {len} B exceeds limit {max_bytes} B"
-        )));
-    }
-
-    let initial_cap = resp.content_length().map_or(16 * 1024, |n| {
-        (n as usize).min(max_bytes).min(MAX_INITIAL_CAPACITY_BYTES)
-    });
-    let mut buf = Vec::with_capacity(initial_cap);
-    while let Some(chunk) = resp.chunk().await.map_err(map_reqwest_err)? {
-        if buf.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(FetchFailure::Terminal(format!(
-                "tile payload exceeded limit {max_bytes} B"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-
-    if buf.is_empty() {
-        return Err(FetchFailure::Terminal("empty tile response".to_owned()));
-    }
-    Ok(FetchOutcome::Payload(buf))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,44 +451,5 @@ mod tests {
             Some(PermitDenied::Cooldown(later)),
             "clearing example.org must leave unrelated host cooldowns intact"
         );
-    }
-
-    #[test]
-    fn classify_http_error_treats_client_errors_as_terminal_except_408_and_429() {
-        for status in [
-            reqwest::StatusCode::BAD_REQUEST,
-            reqwest::StatusCode::METHOD_NOT_ALLOWED,
-            reqwest::StatusCode::PRECONDITION_FAILED,
-            reqwest::StatusCode::RANGE_NOT_SATISFIABLE,
-            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        ] {
-            assert!(
-                matches!(classify_http_error(status, None), FetchFailure::Terminal(_)),
-                "expected terminal for {status}"
-            );
-        }
-        assert!(matches!(
-            classify_http_error(reqwest::StatusCode::REQUEST_TIMEOUT, None),
-            FetchFailure::Transient(TransientFetchError {
-                kind: TransientKind::ServerError,
-                ..
-            })
-        ));
-        assert!(matches!(
-            classify_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, Some("7")),
-            FetchFailure::Transient(TransientFetchError {
-                kind: TransientKind::RateLimited {
-                    retry_after: Some(d),
-                },
-                ..
-            }) if d == Duration::from_secs(7)
-        ));
-        assert!(matches!(
-            classify_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None),
-            FetchFailure::Transient(TransientFetchError {
-                kind: TransientKind::ServerError,
-                ..
-            })
-        ));
     }
 }

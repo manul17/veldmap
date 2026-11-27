@@ -4,6 +4,7 @@
 //! CRS/radiometry metadata inspection, diagnostic banners, and loading shimmer
 //! indicators.
 
+mod histogram;
 mod raster_card;
 mod style_controls;
 mod vector_card;
@@ -15,7 +16,7 @@ use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::TileStreamSpec;
 
 use crate::layers::{LayerId, LayerSummary, OverlayEdit};
-use crate::vectors::{VectorLayerId, VectorLayerSummary};
+use crate::vectors::{VectorEdit, VectorLayerId, VectorLayerSummary};
 
 use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, submitted_with_enter};
 
@@ -33,7 +34,8 @@ pub(crate) struct UnavailableLayerNotice {
     pub(crate) is_vector: bool,
 }
 
-/// Session persistence policy for an infallible [`OverlayEdit`] emitted from UI.
+/// Session persistence policy for an infallible [`OverlayEdit`] or [`VectorEdit`]
+/// emitted from UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EditPersist {
     /// Persist `session.json` whenever the edit actually changed layer state.
@@ -61,9 +63,11 @@ pub(crate) enum LayerUiAction {
     OpenCrsPickerForPendingPath(PathBuf),
     ZoomToExtent(FootprintBounds),
     ReloadBypassCache(LayerId),
-    ToggleVectorVisibility(VectorLayerId, bool),
-    SetVectorOpacity(VectorLayerId, f32, bool),
-    RemoveVector(VectorLayerId),
+    EditVector {
+        id: VectorLayerId,
+        edit: VectorEdit,
+        persist: EditPersist,
+    },
     UseVectorAsStacAoi(VectorLayerId),
 }
 
@@ -78,6 +82,22 @@ impl LayerUiAction {
 
     pub(super) fn edit_raster_drag(id: LayerId, edit: OverlayEdit, commit: bool) -> Self {
         Self::EditRaster {
+            id,
+            edit,
+            persist: EditPersist::OnCommit(commit),
+        }
+    }
+
+    pub(super) fn edit_vector(id: VectorLayerId, edit: VectorEdit) -> Self {
+        Self::EditVector {
+            id,
+            edit,
+            persist: EditPersist::OnChange,
+        }
+    }
+
+    pub(super) fn edit_vector_drag(id: VectorLayerId, edit: VectorEdit, commit: bool) -> Self {
+        Self::EditVector {
             id,
             edit,
             persist: EditPersist::OnCommit(commit),

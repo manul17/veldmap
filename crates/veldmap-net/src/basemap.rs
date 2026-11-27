@@ -10,7 +10,7 @@ use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, Til
 
 use crate::NetError;
 use crate::redact::{EncodedSecret, redact_secret_label, redact_text, sanitize_url_for_display};
-use crate::url::{extract_host, parse_http_authority, strip_http_scheme};
+use crate::url::{extract_host, has_invalid_url_bytes, parse_http_authority, strip_http_scheme};
 
 /// Internal validation error returned when checking or resolving a tile key
 /// against a [`LiveBasemapSpec`].
@@ -185,10 +185,7 @@ pub fn validate_custom_url_template(url_template: &str) -> Result<&str, NetError
             "URL template must not be empty".to_owned(),
         ));
     }
-    if template
-        .bytes()
-        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-    {
+    if has_invalid_url_bytes(template) {
         return Err(NetError::InvalidUrlTemplate(
             "URL template must not contain whitespace or control characters".to_owned(),
         ));

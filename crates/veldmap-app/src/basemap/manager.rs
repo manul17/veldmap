@@ -49,6 +49,19 @@ fn spec_from_config(config: BasemapConfigView<'_>) -> Result<Option<LiveBasemapS
     }
 }
 
+/// Initial configuration and shared runtime subsystems injected into
+/// [`BasemapManager::new`].
+pub(crate) struct BasemapManagerDeps<'a> {
+    pub(crate) config: BasemapConfigView<'a>,
+    pub(crate) disk_cache: Option<Arc<TileDiskCache>>,
+    pub(crate) net: Option<Arc<NetContext>>,
+    pub(crate) net_init_error: Option<String>,
+    pub(crate) done_tx: UploadSender,
+    pub(crate) wakeup: Wakeup,
+    pub(crate) decode_handle: DecodePoolHandle,
+    pub(crate) decode_shutdown: CancelToken,
+}
+
 /// Coordinates offline bundled + live HTTP basemap streaming without owning
 /// application-wide storage, shared CPU decode threads, GPU cache, or upload
 /// queue state.
@@ -72,24 +85,21 @@ impl Drop for BasemapManager {
 }
 
 impl BasemapManager {
-    /// Initialize basemap orchestration using initial `config`, an injected
-    /// fast-lane [`DecodePoolHandle`] + `decode_shutdown` token from
+    /// Initialize basemap orchestration using initial `deps.config`, an
+    /// injected fast-lane [`DecodePoolHandle`] + `decode_shutdown` token from
     /// [`crate::scene::SceneState`], and an optional shared SQLite
     /// [`TileDiskCache`].
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "basemap coordinator wires explicit shared runtime subsystems"
-    )]
-    pub(crate) fn new(
-        config: BasemapConfigView<'_>,
-        disk_cache: Option<Arc<TileDiskCache>>,
-        net: Option<Arc<NetContext>>,
-        net_init_error: Option<String>,
-        done_tx: UploadSender,
-        wakeup: Wakeup,
-        decode_handle: DecodePoolHandle,
-        decode_shutdown: CancelToken,
-    ) -> Self {
+    pub(crate) fn new(deps: BasemapManagerDeps<'_>) -> Self {
+        let BasemapManagerDeps {
+            config,
+            disk_cache,
+            net,
+            net_init_error,
+            done_tx,
+            wakeup,
+            decode_handle,
+            decode_shutdown,
+        } = deps;
         let bundled_provider = BundledBasemapProvider::new(
             decode_handle.clone(),
             done_tx.clone(),
@@ -486,7 +496,7 @@ impl BasemapManager {
         }
     }
 
-    /// Phase 2 of deterministic shutdown (after `PendingUploads::close()` and
+    /// Phase 3 of deterministic shutdown (after `PendingUploads::close()` and
     /// joining the shared decode pool): drop `LiveTilePipeline` ahead of
     /// `NetContext::shutdown()`.
     pub(crate) fn finish_shutdown(&mut self) {

@@ -118,12 +118,7 @@ impl SharedUploadQueue {
             queued: HashMap::new(),
             queued_bytes: 0,
             max_queued_bytes,
-            pinned_root_streams: vec![StreamKey::new(
-                SourceId::BUNDLED_BASEMAP,
-                veldmap_core::tile::BandKey::Display,
-                veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
-                0,
-            )],
+            pinned_root_streams: vec![StreamKey::display(SourceId::BUNDLED_BASEMAP)],
         }
     }
 
@@ -155,11 +150,16 @@ impl SharedUploadQueue {
 
     fn retain_keys(
         &mut self,
-        mut keep: impl FnMut(&TileKey) -> bool,
+        mut keep: impl FnMut(&TileKey, &[StreamKey]) -> bool,
         to_drop: &mut Vec<DecodedTile>,
     ) {
-        let keys_to_remove: Vec<TileKey> =
-            self.queued.keys().copied().filter(|k| !keep(k)).collect();
+        let pinned = &self.pinned_root_streams;
+        let keys_to_remove: Vec<TileKey> = self
+            .queued
+            .keys()
+            .copied()
+            .filter(|k| !keep(k, pinned))
+            .collect();
         for key in keys_to_remove {
             if let Some(tile) = self.remove_key(&key) {
                 to_drop.push(tile);
@@ -354,7 +354,7 @@ impl PendingUploads {
         let mut to_drop = Vec::new();
         {
             let mut state = lock_unpoisoned(&self.shared);
-            state.retain_keys(|k| !predicate(k), &mut to_drop);
+            state.retain_keys(|k, _| !predicate(k), &mut to_drop);
         }
         drop(to_drop);
     }
@@ -374,20 +374,19 @@ impl PendingUploads {
         let mut to_drop = Vec::new();
         let order: Vec<TileKey> = {
             let mut state = lock_unpoisoned(&self.shared);
-            if state.closed {
+            if state.closed || state.queued.is_empty() {
                 return UploadBatchReport::default();
             }
 
-            let pinned = state.pinned_root_streams.clone();
             state.retain_keys(
-                |key| {
+                |key, pinned| {
                     if cache.contains(key) {
                         return false;
                     }
                     if params.wanted.is_empty() {
                         true
                     } else {
-                        is_in_any_wanted(key, params.wanted) || is_pinned_root(key, &pinned)
+                        is_in_any_wanted(key, params.wanted) || is_pinned_root(key, pinned)
                     }
                 },
                 &mut to_drop,

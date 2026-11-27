@@ -1,6 +1,8 @@
 //! Read-only UI and HUD projections (`LayerSummary`, `ColorbarInfo`) derived
 //! from [`super::layer::OverlayLayer`].
 
+use std::path::Path;
+
 use veldmap_core::tile::PixelFormat;
 
 use super::layer::OverlayLayer;
@@ -80,7 +82,7 @@ impl OverlayLayer {
         LayerSummary {
             id: self.id(),
             name: self.name().to_owned(),
-            path: self.path().to_path_buf(),
+            path: self.local_path().map(Path::to_path_buf).unwrap_or_default(),
             is_remote: self.is_remote(),
             remote_url: self.remote_url().map(str::to_owned),
             visible: self.is_visible(),

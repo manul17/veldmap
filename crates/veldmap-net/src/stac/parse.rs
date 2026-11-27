@@ -3,7 +3,7 @@
 use serde_json::{Map, Value};
 use veldmap_core::geo::{export_geojson_geometry, parse_geojson};
 
-use super::{
+use super::types::{
     MAX_STAC_SEARCH_LIMIT, StacAsset, StacError, StacItem, StacRasterBandMeta, StacSearchQuery,
     StacSearchResult,
 };

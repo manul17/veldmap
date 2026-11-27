@@ -44,6 +44,16 @@ impl Default for MeasureMetrics {
     }
 }
 
+/// Presentation-only summary of [`MeasureSession`] state passed to
+/// `ui::measure` so the UI panel never depends directly on [`MeasureSession`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MeasureSummary {
+    pub(crate) active: bool,
+    pub(crate) mode: MeasureMode,
+    pub(crate) point_count: usize,
+    pub(crate) metrics: Option<MeasureMetrics>,
+}
+
 /// Interactive geodesic measurement session owning vertices, cached Karney
 /// metrics, and the derived Pass-2 [`DrawVectorLayer`].
 pub(crate) struct MeasureSession {
@@ -73,14 +83,26 @@ impl MeasureSession {
         !matches!(self.mode, MeasureMode::Off)
     }
 
+    pub(crate) fn summary(&self) -> MeasureSummary {
+        MeasureSummary {
+            active: self.is_active(),
+            mode: self.mode,
+            point_count: self.points.len(),
+            metrics: (!self.points.is_empty()).then_some(self.metrics),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) const fn mode(&self) -> MeasureMode {
         self.mode
     }
 
+    #[cfg(test)]
     pub(crate) fn points(&self) -> &[GeoPoint] {
         &self.points
     }
 
+    #[cfg(test)]
     pub(crate) const fn metrics(&self) -> MeasureMetrics {
         self.metrics
     }
@@ -235,11 +257,16 @@ mod tests {
     fn measure_session_caches_karney_metrics_and_exports_rfc7946_geojson() {
         let mut s = MeasureSession::default();
         assert!(!s.is_active());
+        assert!(!s.summary().active);
+        assert!(s.summary().metrics.is_none());
         s.toggle();
         assert_eq!(s.mode(), MeasureMode::Distance);
+        assert!(s.summary().active);
 
         s.add_point(GeoPoint::new(0.0, 0.0));
         s.add_point(GeoPoint::new(0.0, 1.0));
+        assert_eq!(s.summary().point_count, 2);
+        assert!(s.summary().metrics.is_some());
         assert!(s.metrics().length_m > 110_000.0 && s.metrics().length_m < 112_000.0);
         assert_eq!(
             s.draw_layer().expect("draw layer").id,

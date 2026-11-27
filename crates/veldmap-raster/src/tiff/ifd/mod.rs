@@ -2,31 +2,29 @@
 //! `TileByteCounts`/`StripByteCounts`, `JPEGTables`, `ColorMap`, layout, and
 //! compression/predictor descriptors) and raw-access value types.
 //!
-//! Completely free of `tiff::decoder::Decoder`: open-time parsing lives in
-//! [`super::ifd_parse`], allowing the direct raw-chunk decoder (`raw_decode`)
-//! to execute lock-free positioned reads over [`ByteSource`].
+//! Open-time parsing lives in [`parse`] over [`wire::SinglePassIfdReader`],
+//! allowing the direct raw-chunk decoder (`raw_decode`) to execute lock-free
+//! positioned reads over [`ByteSource`].
+
+pub(super) mod parse;
+pub(super) mod tag_ids;
+pub(super) mod wire;
 
 use std::sync::Arc;
 
 use veldmap_core::io::ByteSource;
-use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
+use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileStreamSpec};
 
 use crate::RasterError;
-use crate::pipeline::metadata::SampleType;
-use crate::pipeline::radiometry::PixelLayout;
+use crate::pipeline::{PixelLayout, SampleType};
 
 use super::ycbcr::YCbCrParams;
+
+pub(super) use wire::TiffByteOrder;
 
 /// Maximum uncompressed byte size admitted for any single TIFF strip/tile,
 /// matching [`crate::tiff::TiffSource`]'s per-chunk decode cap.
 pub(super) const MAX_SINGLE_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
-
-/// TIFF file byte order from header bytes `0..2`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TiffByteOrder {
-    Little,
-    Big,
-}
 
 /// Shared stateless raw-chunk I/O access parameters borrowed by chunk readers,
 /// stretch samplers, and cursor probes.
@@ -34,6 +32,29 @@ pub(super) struct RawTiffAccess {
     pub(super) byte_source: Arc<dyn ByteSource>,
     pub(super) byte_order: TiffByteOrder,
     pub(super) max_chunk_bytes: usize,
+}
+
+/// Borrowed immutable view of an opened [`super::TiffSource`]'s raw I/O
+/// access, cached IFD table, and nodata metadata.
+#[derive(Clone, Copy)]
+pub(super) struct TiffSourceView<'a> {
+    pub(super) access: &'a RawTiffAccess,
+    pub(super) source_id: SourceId,
+    pub(super) ifds: &'a [CachedIfd],
+    pub(super) nodata_f64: Option<f64>,
+}
+
+impl<'a> TiffSourceView<'a> {
+    pub(super) fn base_ifd(&self) -> &'a CachedIfd {
+        &self.ifds[0]
+    }
+}
+
+/// Look up cached IFD metadata for directory index `image`.
+pub(super) fn find_ifd(ifds: &[CachedIfd], image: usize) -> Result<&CachedIfd, RasterError> {
+    ifds.iter()
+        .find(|i| i.image == image)
+        .ok_or_else(|| RasterError::Decode(format!("TIFF IFD {image} is not cached")))
 }
 
 /// Stored (on-disk padded) and valid (cropped) dimensions of a single TIFF chunk.
@@ -304,6 +325,43 @@ impl CachedIfd {
         self.pixel_layout.alpha_channel()
     }
 
+    /// Return whether Display RGBA8 rendering requires percentile stretching
+    /// (true for >8-bit / non-U8 non-palette rasters).
+    pub(super) const fn needs_display_stretch(&self) -> bool {
+        !matches!(self.sample_type, SampleType::U8)
+            && !matches!(self.photometric, Photometric::Palette)
+    }
+
+    /// TIFF planes sampled for display percentile stretching (`&[0]` for
+    /// chunky or 1-color planar, `&[0, 1, 2]` for 3-color planar).
+    pub(super) const fn stretch_planes(&self) -> &'static [usize] {
+        match (self.planar, self.pixel_layout.colors()) {
+            (PlanarConfig::Planar, 3) => &[0, 1, 2],
+            (PlanarConfig::Planar, 2) => &[0, 1],
+            _ => &[0],
+        }
+    }
+
+    /// Resolve `band` into a validated `0..samples_per_pixel` band index.
+    pub(super) fn resolve_band_index(&self, band: BandKey) -> Result<usize, RasterError> {
+        let idx = match band {
+            BandKey::Display => 0usize,
+            BandKey::Index(i) => usize::from(i),
+            BandKey::NamedHash(_) => {
+                return Err(RasterError::Decode(
+                    "named band hash is not supported by TiffSource".to_owned(),
+                ));
+            }
+        };
+        if idx >= usize::from(self.samples_per_pixel) {
+            return Err(RasterError::Decode(format!(
+                "band index {idx} out of range for TIFF with {} samples/pixel",
+                self.samples_per_pixel
+            )));
+        }
+        Ok(idx)
+    }
+
     /// Resolve the TIFF planes read for `spec`, shared across
     /// [`super::chunk_reader::TiffChunkReader`] and remote COG byte-range
     /// planners so plane selection never diverges.
@@ -326,21 +384,7 @@ impl CachedIfd {
                 Ok(planes[..len].to_vec())
             }
             PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => {
-                let band_idx = match spec.band {
-                    BandKey::Display => 0usize,
-                    BandKey::Index(i) => usize::from(i),
-                    BandKey::NamedHash(_) => {
-                        return Err(RasterError::Decode(
-                            "named band hash is not supported by TiffSource".to_owned(),
-                        ));
-                    }
-                };
-                if band_idx >= usize::from(self.samples_per_pixel) {
-                    return Err(RasterError::Decode(format!(
-                        "band index {band_idx} out of range for TIFF with {} samples/pixel",
-                        self.samples_per_pixel
-                    )));
-                }
+                let band_idx = self.resolve_band_index(spec.band)?;
                 Ok(vec![self.band_plane(band_idx)])
             }
         }

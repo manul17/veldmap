@@ -37,12 +37,16 @@ fn session_restore_tracker_preserves_unavailable_layers_deduplicates_on_reopen_a
     });
 
     // Non-existent path failure is ignored (not a restored entry).
-    assert!(!tracker.on_failed(LayerKind::Raster, Path::new("/tmp/other.tif"), "not found"));
-    assert!(!tracker.on_failed(LayerKind::Vector, &raster_a, "wrong kind"));
+    assert!(!tracker.on_failed(
+        RestoredEntryKind::Raster,
+        Path::new("/tmp/other.tif"),
+        "not found"
+    ));
+    assert!(!tracker.on_failed(RestoredEntryKind::Vector, &raster_a, "wrong kind"));
 
     // Failing the first duplicate `raster_a` moves its full CRS/style entry to
-    // `unavailable_layers` while keeping it in `preserved_layers()`.
-    assert!(tracker.on_failed(LayerKind::Raster, &raster_a, "drive offline"));
+    // `unavailable` while keeping it in `preserved_layers()`.
+    assert!(tracker.on_failed(RestoredEntryKind::Raster, &raster_a, "drive offline"));
     assert_eq!(tracker.unavailable_count(), 1);
     assert_eq!(tracker.visible_notices().len(), 1);
     assert_eq!(tracker.visible_notices()[0].path, raster_a);
@@ -54,22 +58,22 @@ fn session_restore_tracker_preserves_unavailable_layers_deduplicates_on_reopen_a
     assert_eq!(preserved_a.crs_override(), Some(CrsOverride::Epsg(32637)));
     assert_eq!(preserved_a.style(), Some(custom_style));
 
-    // Second duplicate `raster_a` opening consumes from `pending_layers` first,
+    // Second duplicate `raster_a` opening consumes from `pending` first,
     // leaving the unavailable copy intact.
-    tracker.on_opened(LayerKind::Raster, &raster_a);
+    tracker.on_opened(RestoredEntryKind::Raster, &raster_a);
     assert_eq!(tracker.unavailable_count(), 1);
     assert_eq!(tracker.preserved_layers().count(), 2);
 
     // A subsequent manual open of `raster_a` (no pending entry left) clears the
     // unavailable entry so `session.json` does not duplicate it.
-    tracker.on_opened(LayerKind::Raster, &raster_a);
+    tracker.on_opened(RestoredEntryKind::Raster, &raster_a);
     assert_eq!(tracker.unavailable_count(), 0);
     assert_eq!(tracker.preserved_layers().count(), 1);
     assert_eq!(tracker.preserved_layers().next().expect("b").path, raster_b);
 
     // Failing vector moves it to unavailable; hiding silences UI notice without
     // losing the preserved entry or toolbar count.
-    assert!(tracker.on_failed(LayerKind::Vector, &vector_a, "missing"));
+    assert!(tracker.on_failed(RestoredEntryKind::Vector, &vector_a, "missing"));
     assert_eq!(tracker.unavailable_count(), 1);
     tracker.hide_notices();
     assert!(tracker.visible_notices().is_empty());

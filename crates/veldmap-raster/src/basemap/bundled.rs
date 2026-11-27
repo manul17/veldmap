@@ -23,7 +23,7 @@ use crate::color::{
     LINEAR_TO_SRGB_LUT_LEN, linear_to_srgb_lut, mix_2x2_srgb_rgb, srgb_to_linear_lut,
 };
 
-use crate::mipmap::generate_linear_mipmaps;
+use crate::mipmap::generate_tile_mipmaps;
 
 use super::map_tile::decode_rgb8_limited;
 
@@ -256,7 +256,7 @@ impl BundledBasemap {
     /// linear-light mipmap chain.
     pub fn render_tile_with_mipmaps(&self, id: QuadTileId) -> Result<DecodedTile, RasterError> {
         let mut tile = self.render_tile(id)?;
-        generate_linear_mipmaps(&mut tile);
+        generate_tile_mipmaps(&mut tile);
         Ok(tile)
     }
 

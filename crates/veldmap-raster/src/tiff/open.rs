@@ -5,28 +5,28 @@
 use std::sync::Arc;
 
 use veldmap_core::budget::MemoryBudget;
+use veldmap_core::geo::CrsSpec;
 use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
-use veldmap_core::tile::{PixelFormat, SourceFingerprint, SourceId};
+use veldmap_core::tile::{BandKey, PixelFormat, SourceFingerprint, SourceId};
 
 use crate::RasterError;
-use crate::pipeline::grid::{Grid, Overview};
-use crate::pipeline::metadata::{
-    BandInfo, GeoPlacement, PlacementCrs, RasterDescription, SampleType,
+use crate::pipeline::{
+    BandInfo, DisplayMapping, GeoPlacement, GeoTie, Grid, LevelPlan, Overview, PlacementCrs,
+    RasterDescription, ServeMode, build_chunked_level_table, check_max_source_side,
 };
-use crate::pipeline::plan::{ServeMode, build_chunked_level_table, check_max_source_side};
-use crate::pipeline::radiometry::DisplayMapping;
 
-use super::gdal_meta::{GdalMetadata, TAG_GDAL_METADATA, parse_gdal_metadata, parse_gdal_nodata};
-use super::georef::{ParsedGeoref, parse_georef};
-use super::ifd::{CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, RawTiffAccess};
-use super::ifd_parse::{max_cached_ifd_table_bytes, parse_cached_ifd};
-use super::stretch::{BandStatsCache, StretchCache};
-use super::tags::{
-    SinglePassIfdReader, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
+use super::gdal_meta::{GdalMetadata, parse_gdal_metadata, parse_gdal_nodata};
+use super::georef::{ParsedGeoref, RawGeoTiffTags, parse_georef};
+use super::ifd::parse::{IfdParseBudget, parse_cached_ifd};
+use super::ifd::tag_ids::{
+    TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
     TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, TAG_MODEL_TRANSFORMATION,
-    TAG_NEW_SUBFILE_TYPE, is_overview,
+    TAG_NEW_SUBFILE_TYPE,
 };
+use super::ifd::wire::{IfdDirectory, SinglePassIfdReader, is_overview};
+use super::ifd::{CachedIfd, MAX_SINGLE_CHUNK_BYTES, Photometric, RawTiffAccess};
+use super::stretch::{BandStatsCache, StretchCache};
 use super::{MAX_IFDS, TiffSource};
 
 const BASE_METADATA_TAGS: &[u16] = &[
@@ -40,13 +40,116 @@ const BASE_METADATA_TAGS: &[u16] = &[
     TAG_MODEL_TRANSFORMATION,
 ];
 
+fn read_geotiff_tags(dir: &IfdDirectory, reader: &SinglePassIfdReader) -> RawGeoTiffTags {
+    RawGeoTiffTags {
+        raw_keys: dir.read_u16_vec_opt(reader, TAG_GEO_KEY_DIRECTORY),
+        double_params: dir.read_f64_vec_opt(reader, TAG_GEO_DOUBLE_PARAMS),
+        ascii_params: dir.read_ascii_bytes_opt(reader, TAG_GEO_ASCII_PARAMS),
+        points: dir.read_f64_vec_opt(reader, TAG_MODEL_TIEPOINT),
+        scale: dir.read_f64_vec_opt(reader, TAG_MODEL_PIXEL_SCALE),
+        matrix: dir.read_f64_vec_opt(reader, TAG_MODEL_TRANSFORMATION),
+    }
+}
+
+struct BaseMetadata {
+    nodata_f64: Option<f64>,
+    gdal_meta: GdalMetadata,
+    ties: Vec<GeoTie>,
+    placement: Option<GeoPlacement>,
+    geographic_crs: Option<CrsSpec>,
+    binding_trouble: Option<String>,
+}
+
+fn read_base_metadata_and_georef(
+    base_dir: &mut IfdDirectory,
+    reader: &mut SinglePassIfdReader,
+    base_ifd: &CachedIfd,
+    parse_budget: IfdParseBudget<'_>,
+    sidecar: Option<crate::sidecar::SidecarGeoref>,
+    cancel: &CancelToken,
+) -> Result<BaseMetadata, RasterError> {
+    let meta_cap = parse_budget.metadata_prefetch_cap(reader);
+    base_dir.prefetch_tags(reader, BASE_METADATA_TAGS, meta_cap, cancel)?;
+
+    let nodata_raw = base_dir.read_ascii_opt(reader, TAG_GDAL_NODATA);
+    let nodata_f64 = parse_gdal_nodata(&nodata_raw);
+    let gdal_xml = base_dir.read_ascii_opt(reader, TAG_GDAL_METADATA);
+    let gdal_meta = if gdal_xml.is_empty() {
+        GdalMetadata::default()
+    } else {
+        parse_gdal_metadata(&gdal_xml)
+    };
+
+    let raw_geotiff_tags = read_geotiff_tags(base_dir, reader);
+    let ParsedGeoref {
+        ties,
+        placement,
+        embedded_affine,
+        geographic_crs,
+        trouble,
+    } = parse_georef(&raw_geotiff_tags, base_ifd.width, base_ifd.height);
+
+    let (placement, binding_trouble) = merge_georef_with_sidecar(
+        placement,
+        ties.is_empty(),
+        embedded_affine,
+        trouble,
+        sidecar,
+    );
+
+    Ok(BaseMetadata {
+        nodata_f64,
+        gdal_meta,
+        ties,
+        placement,
+        geographic_crs,
+        binding_trouble,
+    })
+}
+
+fn plan_and_validate_levels(
+    grid: &Grid,
+    width: u32,
+    height: u32,
+    budget: &MemoryBudget,
+    is_remote: bool,
+) -> Result<Vec<LevelPlan>, RasterError> {
+    let levels = build_chunked_level_table(
+        grid,
+        width,
+        height,
+        PixelFormat::Rgba8UnormSrgb,
+        budget,
+        !is_remote,
+    );
+    if is_remote
+        && (levels.is_empty()
+            || levels
+                .iter()
+                .any(|row| !matches!(row.serve, ServeMode::Pointwise) || !row.fits))
+    {
+        return Err(RasterError::RemotePassUnsupported(
+            "remote GeoTIFF cannot be streamed pointwise within memory budget (missing coarse overviews or unsupported tile geometry)"
+                .to_owned(),
+        ));
+    }
+    if levels.is_empty() || levels.iter().all(|row| !row.fits) {
+        let max_peak = levels.last().map_or(0, |row| row.estimated_peak_bytes);
+        return Err(RasterError::LimitExceeded {
+            width,
+            height,
+            estimated_bytes: max_peak,
+            limit_bytes: budget.decode_working_bytes,
+        });
+    }
+    Ok(levels)
+}
+
 fn scan_overviews(
     reader: &mut SinglePassIfdReader,
     mut next_ifd: u64,
     base_ifd: &CachedIfd,
-    budget: &MemoryBudget,
-    mut table_bytes_used: u64,
-    is_remote: bool,
+    mut parse_budget: IfdParseBudget<'_>,
     cancel: &CancelToken,
 ) -> Result<(Vec<Overview>, Vec<CachedIfd>), RasterError> {
     let mut overviews = Vec::new();
@@ -69,7 +172,7 @@ fn scan_overviews(
                 break;
             }
         };
-        next_ifd = dir.next_ifd;
+        next_ifd = dir.next_ifd();
         ifd_index += 1;
 
         // `NewSubfileType` is inline; skip non-overview IFDs (e.g. transparency
@@ -78,15 +181,8 @@ fn scan_overviews(
         if !is_overview(subfile) {
             continue;
         }
-        let overview_ifd = match parse_cached_ifd(
-            &mut dir,
-            reader,
-            ifd_index,
-            budget,
-            table_bytes_used,
-            is_remote,
-            cancel,
-        ) {
+        let overview_ifd = match parse_cached_ifd(&mut dir, reader, ifd_index, parse_budget, cancel)
+        {
             Ok(ifd) => ifd,
             Err(
                 err @ (RasterError::Cancelled
@@ -106,7 +202,7 @@ fn scan_overviews(
         {
             continue;
         }
-        table_bytes_used = table_bytes_used.saturating_add(overview_ifd.table_bytes());
+        parse_budget.charge_ifd(&overview_ifd);
         overviews.push(Overview {
             image: ifd_index,
             width: overview_ifd.width,
@@ -194,16 +290,19 @@ fn build_band_infos(
         } else {
             None
         };
-        bands.push(BandInfo::band(
-            b,
-            gmeta.description.or(default_name),
-            gmeta.units,
+        bands.push(BandInfo {
+            band_key: BandKey::Index(b),
+            index: b,
+            name: gmeta.description.or(default_name),
+            units: gmeta.units,
             pixel_format,
-            base_ifd.sample_type,
-            gmeta.scale.unwrap_or(1.0),
-            gmeta.offset.unwrap_or(0.0),
-            nodata_f64,
-        ));
+            sample_type: base_ifd.sample_type,
+            scale: gmeta.scale.unwrap_or(1.0),
+            offset: gmeta.offset.unwrap_or(0.0),
+            nodata: nodata_f64,
+            channels: 1,
+            has_alpha: false,
+        });
     }
     bands
 }
@@ -244,10 +343,10 @@ impl TiffSource {
         let first_ifd = reader.first_ifd;
 
         let mut base_dir = reader.read_directory(first_ifd, cancel)?;
-        let next_ifd = base_dir.next_ifd;
+        let next_ifd = base_dir.next_ifd();
 
-        let base_ifd =
-            parse_cached_ifd(&mut base_dir, &mut reader, 0, budget, 0, is_remote, cancel)?;
+        let mut parse_budget = IfdParseBudget::new(budget, is_remote);
+        let base_ifd = parse_cached_ifd(&mut base_dir, &mut reader, 0, parse_budget, cancel)?;
         if !base_ifd.tiled {
             if is_remote {
                 return Err(RasterError::RemotePassUnsupported(
@@ -257,104 +356,38 @@ impl TiffSource {
             }
             check_max_source_side(base_ifd.width, base_ifd.height)?;
         }
+        parse_budget.charge_ifd(&base_ifd);
 
-        let meta_cap = max_cached_ifd_table_bytes(budget, is_remote)
-            .saturating_sub(base_ifd.table_bytes())
-            .min(if is_remote {
-                reader.remaining_fetch_budget()
-            } else {
-                u64::MAX
-            });
-        base_dir.prefetch_tags(&mut reader, BASE_METADATA_TAGS, meta_cap, cancel)?;
-
-        let nodata_raw = base_dir.read_ascii_opt(&reader, TAG_GDAL_NODATA);
-        let nodata_f64 = parse_gdal_nodata(&nodata_raw);
-        let gdal_xml = base_dir.read_ascii_opt(&reader, TAG_GDAL_METADATA);
-        let gdal_meta = if gdal_xml.is_empty() {
-            GdalMetadata::default()
-        } else {
-            parse_gdal_metadata(&gdal_xml)
-        };
-
-        let raw_geotiff_tags = base_dir.read_geotiff_tags(&reader);
-        let ParsedGeoref {
-            ties,
-            placement,
-            embedded_affine,
-            geographic_crs,
-            trouble,
-        } = parse_georef(&raw_geotiff_tags, base_ifd.width, base_ifd.height);
-
-        let (placement, binding_trouble) = merge_georef_with_sidecar(
-            placement,
-            ties.is_empty(),
-            embedded_affine,
-            trouble,
-            sidecar,
-        );
-
-        let table_bytes_used = base_ifd.table_bytes();
-        let (overviews, cached_overviews) = scan_overviews(
+        let meta = read_base_metadata_and_georef(
+            &mut base_dir,
             &mut reader,
-            next_ifd,
             &base_ifd,
-            budget,
-            table_bytes_used,
-            is_remote,
+            parse_budget,
+            sidecar,
             cancel,
         )?;
+        let (overviews, cached_overviews) =
+            scan_overviews(&mut reader, next_ifd, &base_ifd, parse_budget, cancel)?;
         drop(reader);
 
-        let width = base_ifd.width;
-        let height = base_ifd.height;
-        let depth = base_ifd.raw_pixel_bytes();
+        let (width, height) = (base_ifd.width, base_ifd.height);
         let grid = Grid {
             chunk: (base_ifd.chunk_w, base_ifd.chunk_h),
             overviews,
-            depth,
+            depth: base_ifd.raw_pixel_bytes(),
         };
-        let levels = build_chunked_level_table(
-            &grid,
-            width,
-            height,
-            PixelFormat::Rgba8UnormSrgb,
-            budget,
-            !is_remote,
-        );
-        if is_remote
-            && (levels.is_empty()
-                || levels
-                    .iter()
-                    .any(|row| !matches!(row.serve, ServeMode::Pointwise) || !row.fits))
-        {
-            return Err(RasterError::RemotePassUnsupported(
-                "remote GeoTIFF cannot be streamed pointwise within memory budget (missing coarse overviews or unsupported tile geometry)"
-                    .to_owned(),
-            ));
-        }
-        if levels.is_empty() || levels.iter().all(|row| !row.fits) {
-            let max_peak = levels.last().map_or(0, |row| row.estimated_peak_bytes);
-            return Err(RasterError::LimitExceeded {
-                width,
-                height,
-                estimated_bytes: max_peak,
-                limit_bytes: budget.decode_working_bytes,
-            });
-        }
-
+        let levels = plan_and_validate_levels(&grid, width, height, budget, is_remote)?;
         let stats_ifd = grid
             .overviews
             .iter()
             .min_by_key(|o| o.width)
             .map_or(0, |o| o.image);
 
-        let bands = build_band_infos(&base_ifd, nodata_f64, &gdal_meta);
-        let initial_mapping = (base_ifd.sample_type == SampleType::U8
-            || base_ifd.photometric == Photometric::Palette)
-            .then(|| {
-                DisplayMapping::identity(nodata_f64)
-                    .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
-            });
+        let bands = build_band_infos(&base_ifd, meta.nodata_f64, &meta.gdal_meta);
+        let initial_mapping = (!base_ifd.needs_display_stretch()).then(|| {
+            DisplayMapping::identity(meta.nodata_f64)
+                .with_invert(base_ifd.photometric == Photometric::WhiteIsZero)
+        });
 
         let mut ifds = Vec::with_capacity(1 + cached_overviews.len());
         ifds.push(base_ifd);
@@ -364,10 +397,10 @@ impl TiffSource {
             width,
             height,
             bands,
-            ties,
-            placement,
-            geographic_crs,
-            binding_trouble,
+            ties: meta.ties,
+            placement: meta.placement,
+            geographic_crs: meta.geographic_crs,
+            binding_trouble: meta.binding_trouble,
             levels,
         };
 
@@ -384,7 +417,7 @@ impl TiffSource {
             description,
             grid,
             ifds,
-            nodata_f64,
+            nodata_f64: meta.nodata_f64,
             stats_ifd,
             budget_snapshot: *budget,
             stretch: StretchCache::new(initial_mapping),
@@ -395,6 +428,7 @@ impl TiffSource {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ifd::parse::max_cached_ifd_table_bytes;
     use super::*;
 
     #[test]
@@ -433,7 +467,7 @@ mod tests {
 
         let sidecar_with_crs = crate::sidecar::SidecarGeoref {
             affine: Some(affine),
-            crs: Some(veldmap_core::geo::CrsSpec::from_epsg(4326).expect("EPSG:4326")),
+            crs: Some(CrsSpec::from_epsg(4326).expect("EPSG:4326")),
         };
         let (placement_ok, trouble_ok) = merge_georef_with_sidecar(
             None,

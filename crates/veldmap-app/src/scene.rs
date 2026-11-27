@@ -15,24 +15,24 @@ use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileStreamSpec};
-use veldmap_net::NetContext;
+use veldmap_net::{NetConfig, NetContext};
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
 
-use crate::basemap::BasemapManager;
+use crate::basemap::{BasemapManager, BasemapManagerDeps};
 use crate::gpu_tiles::{
     DEFAULT_UPLOAD_BYTE_BUDGET, DEFAULT_UPLOAD_TIME_BUDGET, GpuTileCache, PendingUploads,
     UploadBatchReport, UploadChannelClosed, UploadPassParams,
 };
 use crate::layers::{
     CrsOverride, CursorReadout, LayerId, LayerStyleSpec, OverlayEdit, OverlayFrameCtx,
-    OverlayIoEvent, OverlayManager, OverlayMutation,
+    OverlayIoEvent, OverlayManager, OverlayManagerDeps, OverlayMutation,
 };
 use crate::measure::MeasureSession;
 use crate::render::{DrawSnapshot, SnapshotBuildParams, TileCarrierPolicy};
 use crate::stac::StacSession;
 use crate::storage::settings::AppSettings;
-use crate::vectors::{VectorIoEvent, VectorLayerId, VectorManager, is_geojson_path};
+use crate::vectors::{VectorEdit, VectorIoEvent, VectorLayerId, VectorManager, is_geojson_path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SnapshotKey {
@@ -125,20 +125,26 @@ pub(crate) struct SceneState {
 }
 
 impl SceneState {
-    /// Initialize GPU/upload caches, the shared two-lane CPU decode pool,
-    /// basemap streaming, local + remote raster overlay management, STAC
-    /// controller, and the GeoJSON vector manager from startup `budget`,
-    /// shared [`NetContext`], and persisted `settings`.
+    /// Initialize GPU/upload caches, the shared [`NetContext`], the shared
+    /// two-lane CPU decode pool, basemap streaming, local + remote raster
+    /// overlay management, STAC controller, and the GeoJSON vector manager from
+    /// startup `budget` and persisted `settings`.
     pub(crate) fn new(
         settings: &AppSettings,
         disk_cache: Option<Arc<TileDiskCache>>,
-        net: Option<Arc<NetContext>>,
-        net_init_error: Option<String>,
         wakeup: Wakeup,
         budget: &MemoryBudget,
     ) -> Result<Self, UploadChannelClosed> {
         let pending_uploads = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
         let done_tx = pending_uploads.sender().ok_or(UploadChannelClosed)?;
+
+        let (net, net_init_error) = match NetContext::new(NetConfig::from_budget(budget)) {
+            Ok(ctx) => (Some(Arc::new(ctx)), None),
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to initialize shared NetContext");
+                (None, Some(err.to_string()))
+            }
+        };
 
         let decode_shutdown = CancelToken::new();
         let mut decode_cfg = TwoLaneDecodePoolConfig::from_budget(budget);
@@ -148,28 +154,28 @@ impl SceneState {
             .clamp(2, 4);
         let decode_pool = TwoLaneDecodePool::spawn(decode_cfg, decode_shutdown.clone());
 
-        let basemap = BasemapManager::new(
-            settings.basemap_config(),
-            disk_cache.clone(),
-            net.clone(),
+        let basemap = BasemapManager::new(BasemapManagerDeps {
+            config: settings.basemap_config(),
+            disk_cache: disk_cache.clone(),
+            net: net.clone(),
             net_init_error,
-            done_tx.clone(),
-            Arc::clone(&wakeup),
-            decode_pool.fast_handle(),
-            decode_shutdown.clone(),
-        );
+            done_tx: done_tx.clone(),
+            wakeup: Arc::clone(&wakeup),
+            decode_handle: decode_pool.fast_handle(),
+            decode_shutdown: decode_shutdown.clone(),
+        });
         let vectors = VectorManager::new(Arc::clone(&wakeup), decode_shutdown.clone());
         let stac = StacSession::new(net.clone(), Arc::clone(&wakeup), decode_shutdown.clone());
-        let overlays = OverlayManager::new(
-            budget,
+        let overlays = OverlayManager::new(OverlayManagerDeps {
+            budget: *budget,
             disk_cache,
-            net.clone(),
-            decode_pool.fast_handle(),
-            decode_pool.bulk_handle(),
+            net: net.clone(),
+            fast_pool: decode_pool.fast_handle(),
+            bulk_pool: decode_pool.bulk_handle(),
             done_tx,
             wakeup,
-            decode_shutdown.clone(),
-        );
+            shutdown: decode_shutdown.clone(),
+        });
 
         let gpu_cap = settings.effective_gpu_tile_cache_bytes(budget.gpu_tile_cache_bytes);
         let scene = Self {
@@ -265,10 +271,11 @@ impl SceneState {
     }
 
     /// Mutate the STAC catalog & AOI controller and mark the scene dirty
-    /// whenever the callback returns `true`.
-    pub(crate) fn mutate_stac<R>(&mut self, f: impl FnOnce(&mut StacSession) -> (R, bool)) -> R {
-        let (out, changed) = f(&mut self.stac);
-        self.mark_dirty_if(changed);
+    /// automatically whenever its visual overlay revision advances.
+    pub(crate) fn mutate_stac<R>(&mut self, f: impl FnOnce(&mut StacSession) -> R) -> R {
+        let rev_before = self.stac.rev();
+        let out = f(&mut self.stac);
+        self.mark_dirty_if(self.stac.rev() != rev_before);
         out
     }
 
@@ -361,18 +368,10 @@ impl SceneState {
         self.vectors.begin_open(path, fly_to, visible, opacity)
     }
 
-    pub(crate) fn set_vector_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
-        let changed = self.vectors.set_visible(id, visible);
-        self.mark_dirty_if(changed)
-    }
-
-    pub(crate) fn set_vector_opacity(&mut self, id: VectorLayerId, opacity: f32) -> bool {
-        let changed = self.vectors.set_opacity(id, opacity);
-        self.mark_dirty_if(changed)
-    }
-
-    pub(crate) fn remove_vector(&mut self, id: VectorLayerId) -> bool {
-        let changed = self.vectors.remove(id);
+    /// Apply an infallible [`VectorEdit`] to `id` and mark the scene dirty
+    /// whenever layer state changed.
+    pub(crate) fn edit_vector(&mut self, id: VectorLayerId, edit: VectorEdit) -> bool {
+        let changed = self.vectors.edit(id, edit);
         self.mark_dirty_if(changed)
     }
 
@@ -427,8 +426,9 @@ impl SceneState {
             self.mark_dirty();
         }
 
+        let stac_rev_before = self.stac.rev();
         let stac_changed = self.stac.poll_results();
-        if stac_changed {
+        if self.stac.rev() != stac_rev_before {
             self.mark_dirty();
         }
 

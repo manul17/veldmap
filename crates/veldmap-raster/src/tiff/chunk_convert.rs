@@ -5,9 +5,8 @@
 use veldmap_core::tile::PixelFormat;
 
 use crate::RasterError;
-use crate::pipeline::metadata::SampleType;
-use crate::pipeline::radiometry::{
-    DisplayMapping, PixelLayout, is_data_f64, raw_bytes_to_rgba, read_native_sample_f64,
+use crate::pipeline::{
+    DisplayMapping, PixelLayout, SampleType, is_data_f64, raw_bytes_to_rgba, read_native_sample_f64,
 };
 
 use super::ifd::{CachedIfd, PlanarConfig};

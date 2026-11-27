@@ -94,32 +94,37 @@ fn blit_chunk(
 
 /// Pure per-tile chunk geometry plan extracted from [`direct`] so remote COG
 /// prefetch planners and pointwise execution share identical math.
-pub(crate) struct TileChunkPlan {
-    pub(crate) tx: u32,
-    pub(crate) ty: u32,
-    pub(crate) tw: u32,
-    pub(crate) th: u32,
-    pub(crate) sx0: u32,
-    pub(crate) sy0: u32,
-    pub(crate) rw: u32,
-    pub(crate) rh: u32,
-    pub(crate) window: Window,
-    pub(crate) cx_start: u32,
-    pub(crate) cx_end: u32,
-    pub(crate) cy_start: u32,
-    pub(crate) cy_end: u32,
+struct TileChunkPlan {
+    tx: u32,
+    ty: u32,
+    tw: u32,
+    th: u32,
+    sx0: u32,
+    sy0: u32,
+    rw: u32,
+    rh: u32,
+    window: Window,
+    cx_start: u32,
+    cx_end: u32,
+    cy_start: u32,
+    cy_end: u32,
 }
 
 /// Pure pointwise read plan for one level & `wants` tile batch.
 pub(crate) struct DirectPlan {
-    pub(crate) image: usize,
-    pub(crate) cw: u32,
-    pub(crate) ch: u32,
-    pub(crate) across: u32,
-    pub(crate) tiles: Vec<TileChunkPlan>,
+    image: usize,
+    cw: u32,
+    ch: u32,
+    across: u32,
+    tiles: Vec<TileChunkPlan>,
 }
 
 impl DirectPlan {
+    /// Target IFD/image index chosen for this pointwise plan.
+    pub(crate) const fn image(&self) -> usize {
+        self.image
+    }
+
     /// Sorted, deduplicated list of chunk indices touched by this plan.
     pub(crate) fn unique_chunk_indices(&self) -> Vec<u32> {
         let mut indices = Vec::new();
@@ -311,9 +316,9 @@ pub(crate) fn direct<S: Chunked>(
     Ok(())
 }
 
-/// Sequential top-to-bottom pass over the base IFD feeding `Cascade`.
+/// Sequential top-to-bottom pass over the base IFD feeding [`Cascade`].
 ///
-/// Callers must admit/reserve `grid.pass_peak(base, format)` before invoking `pass`.
+/// Callers must admit/reserve `grid.admit_pass_peak(base, format, limit)` before invoking `pass`.
 pub(crate) fn pass<S: Chunked>(
     source: &mut S,
     grid: &Grid,

@@ -20,6 +20,15 @@ use crate::{clamp_opacity, display_name_from_path};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct VectorLayerId(u64);
 
+/// Typed infallible edit operation applied to a single GeoJSON vector layer
+/// via [`VectorManager::edit`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VectorEdit {
+    SetVisible(bool),
+    SetOpacity(f32),
+    Remove,
+}
+
 /// Read-only summary of a vector layer rendered in the Layer List UI.
 #[derive(Clone, Debug)]
 pub(crate) struct VectorLayerSummary {
@@ -331,6 +340,27 @@ impl VectorLayerStack {
             opacity: l.opacity,
         })
     }
+
+    fn layer_name(&self, id: VectorLayerId) -> Option<&str> {
+        self.layers
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| l.name.as_str())
+    }
+
+    fn first_polygon_geometry(&self, id: VectorLayerId) -> Option<GeoJsonGeometry> {
+        let layer = self.layers.iter().find(|l| l.id == id)?;
+        layer
+            .collection
+            .features
+            .iter()
+            .find_map(|f| match &f.geometry {
+                GeoJsonGeometry::Polygon(_) | GeoJsonGeometry::MultiPolygon(_) => {
+                    Some(f.geometry.clone())
+                }
+                _ => None,
+            })
+    }
 }
 
 /// Facade coordinating read-only GeoJSON vector overlays and their dedicated
@@ -407,52 +437,28 @@ impl VectorManager {
         self.stack.saved_entries_iter()
     }
 
-    pub(crate) fn set_visible(&mut self, id: VectorLayerId, visible: bool) -> bool {
-        self.stack.set_visible(id, visible)
-    }
-
-    pub(crate) fn set_opacity(&mut self, id: VectorLayerId, opacity: f32) -> bool {
-        self.stack.set_opacity(id, opacity)
-    }
-
-    pub(crate) fn remove(&mut self, id: VectorLayerId) -> bool {
-        self.stack.remove(id)
+    /// Apply a [`VectorEdit`] to `id`, returning `true` if layer state changed.
+    pub(crate) fn edit(&mut self, id: VectorLayerId, edit: VectorEdit) -> bool {
+        match edit {
+            VectorEdit::SetVisible(visible) => self.stack.set_visible(id, visible),
+            VectorEdit::SetOpacity(opacity) => self.stack.set_opacity(id, opacity),
+            VectorEdit::Remove => self.stack.remove(id),
+        }
     }
 
     pub(crate) fn draw_layers(&self) -> Vec<DrawVectorLayer> {
         self.stack.draw_layers()
     }
 
-    /// Return the retained parsed GeoJSON feature collection (geometries +
-    /// properties) for `id`, shared by STAC AOI search and future AOI zonal
-    /// statistics.
-    pub(crate) fn collection(&self, id: VectorLayerId) -> Option<Arc<GeoJsonFeatureCollection>> {
-        self.stack
-            .layers
-            .iter()
-            .find(|l| l.id == id)
-            .map(|l| Arc::clone(&l.collection))
-    }
-
     /// Return the display name for `id` without allocating summaries.
     pub(crate) fn layer_name(&self, id: VectorLayerId) -> Option<&str> {
-        self.stack
-            .layers
-            .iter()
-            .find(|l| l.id == id)
-            .map(|l| l.name.as_str())
+        self.stack.layer_name(id)
     }
 
     /// Return the first polygon or multipolygon geometry in `id` suitable for
     /// STAC AOI intersection queries (or `None` if `id` contains no polygons).
     pub(crate) fn first_polygon_geometry(&self, id: VectorLayerId) -> Option<GeoJsonGeometry> {
-        let fc = self.collection(id)?;
-        fc.features.iter().find_map(|f| match &f.geometry {
-            GeoJsonGeometry::Polygon(_) | GeoJsonGeometry::MultiPolygon(_) => {
-                Some(f.geometry.clone())
-            }
-            _ => None,
-        })
+        self.stack.first_polygon_geometry(id)
     }
 
     /// Phase 1 shutdown: close the background worker command channel.

@@ -7,7 +7,7 @@ mod geokeys;
 
 use veldmap_core::geo::CrsSpec;
 
-use crate::pipeline::metadata::{GeoPlacement, GeoTie, PlacementCrs, is_valid_lat_lon};
+use crate::pipeline::{GeoPlacement, GeoTie, PlacementCrs, is_valid_lat_lon};
 
 use crs::{build_user_defined_projected_crs, resolve_geographic_crs};
 use geokeys::{
@@ -16,7 +16,7 @@ use geokeys::{
 };
 
 /// Plain pre-extracted GeoTIFF tag payloads consumed by [`parse_georef`],
-/// keeping `georef/` completely free of `tiff::decoder::Decoder`.
+/// keeping `georef/` pure and decoupled from IFD wire/I/O readers.
 pub(super) struct RawGeoTiffTags {
     pub(super) raw_keys: Vec<u16>,
     pub(super) double_params: Vec<f64>,

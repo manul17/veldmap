@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 
 use super::DrawSnapshot;
 use super::pipelines::GlobePipelines;
-use super::uniforms::{CameraUniform, DynamicUniformArena, DynamicUniformLayouts};
+use super::uniforms::{CameraUniform, DynamicUniformArena};
 
 /// Parameters for a single offscreen globe frame.
 #[derive(Clone, Copy, Debug)]
@@ -87,16 +87,8 @@ impl ViewportState {
             }],
         });
 
-        let uniform_arena = DynamicUniformArena::new(
-            device,
-            DynamicUniformLayouts {
-                tile: &pipelines.layouts.tile_uniform_layout,
-                overlay: &pipelines.layouts.overlay_uniform_layout,
-                scientific: &pipelines.layouts.scientific_uniform_layout,
-                categorical: &pipelines.layouts.categorical_uniform_layout,
-                vector: &pipelines.layouts.vector_uniform_layout,
-            },
-        );
+        let uniform_arena =
+            DynamicUniformArena::new(device, &pipelines.layouts.dynamic_uniform_layouts);
 
         Self {
             target_format,
@@ -222,7 +214,7 @@ impl ViewportState {
 
         let composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globe composite bind group"),
-            layout: &pipelines.composite_layout,
+            layout: &pipelines.composite.layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -230,7 +222,7 @@ impl ViewportState {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&pipelines.composite_sampler),
+                    resource: wgpu::BindingResource::Sampler(&pipelines.composite.sampler),
                 },
             ],
         });

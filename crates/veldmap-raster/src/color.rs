@@ -71,7 +71,7 @@ pub(crate) fn mix_2x2_srgb_rgb(
     }
 }
 
-/// Alpha-weighted linear-light 2x2 sRGB average across `count <= 4` pixel
+/// Alpha-weighted linear-light sRGB block average across `count <= 9` pixel
 /// byte offsets in `src`, writing RGBA8 to `out`.
 #[inline]
 pub(crate) fn average_srgb_rgba8_block(

@@ -1,10 +1,7 @@
 //! TIFF 6.0 Section 21 `YCbCr -> RGBA8` color conversion (`YCbCrCoefficients`
 //! tag 529 and `ReferenceBlackWhite` tag 532).
 
-use crate::pipeline::radiometry::is_data_f64;
-
-pub(super) const TAG_YCBCR_COEFFICIENTS: u16 = 529;
-pub(super) const TAG_REFERENCE_BLACK_WHITE: u16 = 532;
+use crate::pipeline::is_data_f64;
 
 const DEFAULT_LUMA: [f64; 3] = [0.299, 0.587, 0.114];
 const DEFAULT_REF_BLACK_WHITE: [f64; 6] = [0.0, 255.0, 128.0, 255.0, 128.0, 255.0];

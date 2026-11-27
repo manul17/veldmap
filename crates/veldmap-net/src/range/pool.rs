@@ -1,12 +1,12 @@
 //! Fixed host-RAM-scaled 64 KiB O(1) LRU block pool and upfront async memory
 //! permit tracker for pinned HTTP Range prefetch batches.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 use veldmap_core::io::IoError;
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
+use veldmap_core::tile::TileCache;
 
 /// Fixed aligned block size (`64 KiB`) for HTTP Range caching and singleflight.
 pub const RANGE_BLOCK_SIZE: usize = 64 * 1024;
@@ -17,7 +17,7 @@ pub const RANGE_BLOCK_SIZE: usize = 64 * 1024;
 /// re-opens via [`Self::Strong`]; sources with missing or weak (`W/"..."`) ETags
 /// are strictly isolated per open instance via [`Self::Isolated`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum BlockPoolKey {
+pub(super) enum BlockPoolKey {
     Strong {
         canonical_url: Arc<str>,
         strong_etag: Arc<str>,
@@ -29,154 +29,10 @@ pub(crate) enum BlockPoolKey {
     },
 }
 
-struct LruNode {
-    key: BlockPoolKey,
-    data: Arc<[u8]>,
-    prev: Option<usize>,
-    next: Option<usize>,
-}
-
-struct LruInner {
-    cap_bytes: usize,
-    bytes: usize,
-    nodes: Vec<Option<LruNode>>,
-    free: Vec<usize>,
-    index: HashMap<BlockPoolKey, usize>,
-    head: Option<usize>,
-    tail: Option<usize>,
-}
-
-impl LruInner {
-    fn new(cap_bytes: usize) -> Self {
-        Self {
-            cap_bytes,
-            bytes: 0,
-            nodes: Vec::new(),
-            free: Vec::new(),
-            index: HashMap::new(),
-            head: None,
-            tail: None,
-        }
-    }
-
-    fn detach(&mut self, idx: usize) {
-        let (prev, next) = match &self.nodes[idx] {
-            Some(node) => (node.prev, node.next),
-            None => return,
-        };
-        if let Some(p) = prev {
-            if let Some(pnode) = &mut self.nodes[p] {
-                pnode.next = next;
-            }
-        } else {
-            self.head = next;
-        }
-        if let Some(n) = next {
-            if let Some(nnode) = &mut self.nodes[n] {
-                nnode.prev = prev;
-            }
-        } else {
-            self.tail = prev;
-        }
-        if let Some(node) = &mut self.nodes[idx] {
-            node.prev = None;
-            node.next = None;
-        }
-    }
-
-    fn attach_front(&mut self, idx: usize) {
-        let old_head = self.head;
-        if let Some(node) = &mut self.nodes[idx] {
-            node.prev = None;
-            node.next = old_head;
-        }
-        if let Some(h) = old_head {
-            if let Some(hnode) = &mut self.nodes[h] {
-                hnode.prev = Some(idx);
-            }
-        } else {
-            self.tail = Some(idx);
-        }
-        self.head = Some(idx);
-    }
-
-    fn promote(&mut self, idx: usize) {
-        if self.head == Some(idx) {
-            return;
-        }
-        self.detach(idx);
-        self.attach_front(idx);
-    }
-
-    fn evict_tail(&mut self) -> bool {
-        let Some(tail_idx) = self.tail else {
-            return false;
-        };
-        self.detach(tail_idx);
-        if let Some(node) = self.nodes[tail_idx].take() {
-            self.index.remove(&node.key);
-            self.bytes = self.bytes.saturating_sub(node.data.len());
-            self.free.push(tail_idx);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn get(&mut self, key: &BlockPoolKey) -> Option<Arc<[u8]>> {
-        let &idx = self.index.get(key)?;
-        self.promote(idx);
-        self.nodes[idx].as_ref().map(|n| Arc::clone(&n.data))
-    }
-
-    fn insert(&mut self, key: BlockPoolKey, data: Arc<[u8]>) {
-        let len = data.len();
-        if self.cap_bytes == 0 || len > self.cap_bytes {
-            return;
-        }
-        if let Some(&idx) = self.index.get(&key) {
-            if let Some(node) = &mut self.nodes[idx] {
-                self.bytes = self.bytes.saturating_sub(node.data.len());
-                node.data = data;
-                self.bytes = self.bytes.saturating_add(len);
-            }
-            self.promote(idx);
-        } else {
-            let idx = if let Some(slot) = self.free.pop() {
-                self.nodes[slot] = Some(LruNode {
-                    key: key.clone(),
-                    data,
-                    prev: None,
-                    next: None,
-                });
-                slot
-            } else {
-                let slot = self.nodes.len();
-                self.nodes.push(Some(LruNode {
-                    key: key.clone(),
-                    data,
-                    prev: None,
-                    next: None,
-                }));
-                slot
-            };
-            self.index.insert(key, idx);
-            self.bytes = self.bytes.saturating_add(len);
-            self.attach_front(idx);
-        }
-
-        while self.bytes > self.cap_bytes {
-            if !self.evict_tail() {
-                break;
-            }
-        }
-    }
-}
-
 /// Thread-safe O(1) LRU cache of aligned 64 KiB HTTP Range blocks bounded by
 /// `MemoryBudget::range_block_pool_bytes`.
 pub(crate) struct RangeBlockPool {
-    inner: Mutex<LruInner>,
+    inner: Mutex<TileCache<BlockPoolKey, Arc<[u8]>>>,
 }
 
 impl RangeBlockPool {
@@ -187,22 +43,23 @@ impl RangeBlockPool {
             cap_bytes.max(RANGE_BLOCK_SIZE)
         };
         Self {
-            inner: Mutex::new(LruInner::new(clamped)),
+            inner: Mutex::new(TileCache::new(clamped)),
         }
     }
 
-    pub(crate) fn get(&self, key: &BlockPoolKey) -> Option<Arc<[u8]>> {
-        lock_unpoisoned(&self.inner).get(key)
+    pub(super) fn get(&self, key: &BlockPoolKey) -> Option<Arc<[u8]>> {
+        lock_unpoisoned(&self.inner).get(key).cloned()
     }
 
-    pub(crate) fn insert(&self, key: BlockPoolKey, data: Arc<[u8]>) {
-        lock_unpoisoned(&self.inner).insert(key, data);
+    pub(super) fn insert(&self, key: BlockPoolKey, data: Arc<[u8]>) {
+        let len = data.len();
+        let _evicted = lock_unpoisoned(&self.inner).insert(key, data, len);
     }
 
     #[cfg(test)]
-    pub(crate) fn stats(&self) -> (usize, usize) {
+    pub(super) fn stats(&self) -> (usize, usize) {
         let inner = lock_unpoisoned(&self.inner);
-        (inner.index.len(), inner.bytes)
+        (inner.len(), inner.total_bytes())
     }
 }
 
@@ -227,11 +84,11 @@ impl PrefetchBudget {
         }
     }
 
-    pub(crate) const fn cap_bytes(&self) -> usize {
+    pub(super) const fn cap_bytes(&self) -> usize {
         self.cap_bytes
     }
 
-    pub(crate) async fn reserve(
+    pub(super) async fn reserve(
         self: &Arc<Self>,
         bytes: usize,
         cancel: &CancelToken,
@@ -275,7 +132,7 @@ impl PrefetchBudget {
 }
 
 /// RAII lease releasing reserved pinned prefetch bytes on drop.
-pub(crate) struct PrefetchBudgetLease {
+pub(super) struct PrefetchBudgetLease {
     budget: Arc<PrefetchBudget>,
     bytes: usize,
 }

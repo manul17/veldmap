@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
+use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::{BandKey, SourceId};
 use veldmap_net::PrefetchPin;
 use veldmap_raster::{BandStats, DecodeJob, DecodeJobKey, RasterError};
@@ -31,7 +32,7 @@ fn compute_band_stats_outcome(
     rt: &OverlayRuntime,
     source: &dyn veldmap_raster::RasterSource,
     band: BandKey,
-    cancel: &veldmap_core::sync::CancelToken,
+    cancel: &CancelToken,
 ) -> BandStatsOutcome {
     if cancel.is_cancelled() {
         return BandStatsOutcome::Cancelled;
@@ -48,7 +49,7 @@ fn compute_band_stats_outcome(
 
 struct StatsCompletionGuard {
     tx: Sender<BandStatsMsg>,
-    wakeup: Arc<dyn Fn() + Send + Sync>,
+    wakeup: Wakeup,
     disarmed: Arc<AtomicBool>,
     layer_id: LayerId,
     job_id: u64,
@@ -183,7 +184,7 @@ impl BandStatsTracker {
 
                 // Route remote band_stats strictly to `remote_pool` (never `fast_pool`).
                 // On rejection, send `Cancelled` rather than disarming so
-                // `BandStatsState` returns to `NotLoaded` and retries cleanly.
+                // `BandStatsState` returns to `NotRequested` and retries cleanly.
                 let job_rt = Arc::clone(&rt);
                 let job_cancel = cancel.clone();
                 let reject_tx = guard.tx.clone();

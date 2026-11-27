@@ -9,17 +9,16 @@ use rusqlite::{Connection, TransactionBehavior};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
 use crate::StorageError;
+use crate::paths::append_path_suffix;
 
-use super::evict::{evict_in_tx, reclaim_space};
+use super::evict::{EvictOptions, evict_in_tx, reclaim_space};
 use super::key::{DiskTileKey, EncodedKey, TileBlobEncoding, valid_source_key};
 use super::queries::{
     TileUpserter, clear_all_in_tx, clear_source_in_tx, delete_entry_in_tx, flush_touches_in_tx,
     read_cache_meta_totals, select_tile_blob,
 };
 use super::readers::ReaderPool;
-use super::schema::{
-    is_corrupt_sqlite_error, open_and_init_file_db, recreate_file_db, sidecar_path,
-};
+use super::schema::{is_corrupt_sqlite_error, open_and_init_file_db, recreate_file_db};
 use super::touches::{MonotonicClock, TouchBuffer};
 
 /// Maximum encoded payload size admitted for a single cached tile (`16 MiB`).
@@ -166,9 +165,7 @@ impl TileDiskCache {
                     current_bytes,
                     current_count,
                     max_bytes,
-                    None,
-                    None,
-                    false,
+                    EvictOptions::default(),
                 )
             })?;
             if !evicted_ids.is_empty() {
@@ -199,20 +196,10 @@ impl TileDiskCache {
     }
 
     fn flush_touches_best_effort(&self, conn: &mut Connection) {
-        let touches = self.touches.take_all();
-        if touches.is_empty() {
+        if self.touches.is_empty() {
             return;
         }
-        let committed = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .and_then(|tx| {
-                flush_touches_in_tx(&tx, &touches)?;
-                tx.commit()
-            })
-            .is_ok();
-        if !committed {
-            self.touches.restore(touches);
-        }
+        let _ = self.with_write_tx_flushing_touches(conn, |_| Ok(()));
     }
 
     /// Execute an `IMMEDIATE` write transaction without flushing pending LRU
@@ -239,17 +226,14 @@ impl TileDiskCache {
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, rusqlite::Error>,
     ) -> Result<T, StorageError> {
         let touches = self.touches.take_all();
-        let res = (|| -> Result<T, rusqlite::Error> {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            flush_touches_in_tx(&tx, &touches)?;
-            let out = f(&tx)?;
-            tx.commit()?;
-            Ok(out)
-        })();
+        let res = Self::with_write_tx(conn, |tx| {
+            flush_touches_in_tx(tx, &touches)?;
+            f(tx)
+        });
         if res.is_err() {
             self.touches.restore(touches);
         }
-        res.map_err(Into::into)
+        res
     }
 
     /// Look up cached tile bytes without recording an LRU touch yet, returning
@@ -423,9 +407,11 @@ impl TileDiskCache {
                 total_bytes,
                 tile_count,
                 max_bytes,
-                Some(last_inserted),
-                batch_start_ts,
-                true,
+                EvictOptions {
+                    protect_id: Some(last_inserted),
+                    batch_start_ts,
+                    always_write_meta: true,
+                },
             )?;
             Ok((evicted_ids, true))
         })?;
@@ -453,9 +439,7 @@ impl TileDiskCache {
                 current_bytes,
                 current_count,
                 max_bytes,
-                None,
-                None,
-                false,
+                EvictOptions::default(),
             )
         })?;
         self.touches.prune(&evicted_ids);
@@ -499,7 +483,7 @@ impl TileDiskCache {
         let (payload_bytes, tile_count) = self.reader_pool.with_reader(read_cache_meta_totals)?;
         let db_path = self.reader_pool.db_path();
         let main = std::fs::metadata(db_path).map_or(0, |m| m.len());
-        let wal = std::fs::metadata(sidecar_path(db_path, "-wal")).map_or(0, |m| m.len());
+        let wal = std::fs::metadata(append_path_suffix(db_path, "-wal")).map_or(0, |m| m.len());
         Ok(DiskCacheStats {
             tile_count,
             payload_bytes,

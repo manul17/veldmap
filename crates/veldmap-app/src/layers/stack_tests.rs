@@ -202,7 +202,7 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
     assert_eq!(old_src, shared_src);
     assert_eq!(l1.source_id(), new_src_id);
     assert_eq!(l1.relaid(), 99);
-    assert_eq!(l1.path(), Path::new("/tmp/reloaded.tif"));
+    assert_eq!(l1.local_path(), Some(Path::new("/tmp/reloaded.tif")));
     assert!(!l1.is_reloading());
     assert!(l1.matches_reload_seq(prep2.reload_seq));
     assert!(l1.to_summary(0, false, true, false).last_error.is_none());

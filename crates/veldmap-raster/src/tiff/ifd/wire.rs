@@ -1,10 +1,11 @@
-//! Single-pass Classic TIFF + BigTIFF IFD reader and typed tag decoders built
-//! directly over positioned [`veldmap_core::io::ByteSource`].
+//! Single-pass Classic TIFF + BigTIFF IFD wire reader and typed tag decoders
+//! built directly over positioned [`veldmap_core::io::ByteSource`].
 //!
-//! Replaces open-time `tiff::decoder::Decoder` so remote Cloud-Optimized
-//! GeoTIFFs read the header prefix once, skip out-of-line tags for non-overview
-//! IFDs, enforce `MemoryBudget` limits *before* allocating tag buffers, and
-//! coalesce any out-of-prefix tag payloads into sorted reads.
+//! Reads the initial header prefix once so remote Cloud-Optimized GeoTIFFs
+//! resolve compact IFDs in a single request, skips out-of-line tags for
+//! non-overview IFDs, enforces `MemoryBudget` limits *before* allocating tag
+//! buffers, and coalesces any out-of-prefix tag payloads into budget-bounded
+//! sorted reads.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -13,9 +14,6 @@ use veldmap_core::io::ByteSource;
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
-
-use super::georef::RawGeoTiffTags;
-use super::ifd::TiffByteOrder;
 
 /// Initial header prefix window (`256 KiB`, matching `HttpRangeSource`'s head
 /// probe) read once on open so typical COG headers, GeoKeys, and tile offset
@@ -29,36 +27,45 @@ const MAX_IFD_ENTRIES: usize = 4096;
 const OUT_OF_LINE_COALESCE_GAP: u64 = 16 * 1024;
 const OUT_OF_LINE_COALESCE_MAX_LEN: u64 = 2 * 1024 * 1024;
 
-pub(super) const TAG_NEW_SUBFILE_TYPE: u16 = 254;
-pub(super) const TAG_IMAGE_WIDTH: u16 = 256;
-pub(super) const TAG_IMAGE_LENGTH: u16 = 257;
-pub(super) const TAG_BITS_PER_SAMPLE: u16 = 258;
-pub(super) const TAG_COMPRESSION: u16 = 259;
-pub(super) const TAG_PHOTOMETRIC: u16 = 262;
-pub(super) const TAG_STRIP_OFFSETS: u16 = 273;
-pub(super) const TAG_SAMPLES_PER_PIXEL: u16 = 277;
-pub(super) const TAG_ROWS_PER_STRIP: u16 = 278;
-pub(super) const TAG_STRIP_BYTE_COUNTS: u16 = 279;
-pub(super) const TAG_PLANAR_CONFIG: u16 = 284;
-pub(super) const TAG_PREDICTOR: u16 = 317;
-pub(super) const TAG_COLOR_MAP: u16 = 320;
-pub(super) const TAG_TILE_WIDTH: u16 = 322;
-pub(super) const TAG_TILE_LENGTH: u16 = 323;
-pub(super) const TAG_TILE_OFFSETS: u16 = 324;
-pub(super) const TAG_TILE_BYTE_COUNTS: u16 = 325;
-pub(super) const TAG_EXTRA_SAMPLES: u16 = 338;
-pub(super) const TAG_SAMPLE_FORMAT: u16 = 339;
-pub(super) const TAG_JPEG_TABLES: u16 = 347;
-pub(super) const TAG_YCBCR_SUBSAMPLING: u16 = 530;
-pub(super) const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
-pub(super) const TAG_MODEL_TIEPOINT: u16 = 33922;
-pub(super) const TAG_MODEL_TRANSFORMATION: u16 = 34264;
-pub(super) const TAG_GEO_KEY_DIRECTORY: u16 = 34735;
-pub(super) const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
-pub(super) const TAG_GEO_ASCII_PARAMS: u16 = 34737;
-pub(super) const TAG_GDAL_NODATA: u16 = 42113;
+/// TIFF file byte order from header bytes `0..2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tiff) enum TiffByteOrder {
+    Little,
+    Big,
+}
 
-pub(super) fn is_overview(subfile_type: u32) -> bool {
+macro_rules! impl_order_reads {
+    ($($name:ident -> $ty:ty : $n:literal),+ $(,)?) => {
+        impl TiffByteOrder {
+            $(
+                #[inline]
+                fn $name(self, b: &[u8]) -> $ty {
+                    let mut arr = [0u8; $n];
+                    arr.copy_from_slice(&b[..$n]);
+                    match self {
+                        Self::Little => <$ty>::from_le_bytes(arr),
+                        Self::Big => <$ty>::from_be_bytes(arr),
+                    }
+                }
+            )+
+        }
+    };
+}
+
+impl_order_reads!(
+    read_u16 -> u16 : 2,
+    read_i16 -> i16 : 2,
+    read_u32 -> u32 : 4,
+    read_i32 -> i32 : 4,
+    read_u64 -> u64 : 8,
+    read_i64 -> i64 : 8,
+    read_f32 -> f32 : 4,
+    read_f64 -> f64 : 8,
+);
+
+/// Return whether `NewSubfileType` marks a reduced-resolution overview (and
+/// not a transparency mask).
+pub(in crate::tiff) fn is_overview(subfile_type: u32) -> bool {
     const REDUCED: u32 = 1;
     const MASK: u32 = 4;
     subfile_type & REDUCED != 0 && subfile_type & MASK == 0
@@ -74,76 +81,12 @@ const fn field_type_size(field_type: u16) -> Option<u64> {
     }
 }
 
-fn read_u16(order: TiffByteOrder, b: &[u8]) -> u16 {
-    let arr = [b[0], b[1]];
-    match order {
-        TiffByteOrder::Little => u16::from_le_bytes(arr),
-        TiffByteOrder::Big => u16::from_be_bytes(arr),
-    }
-}
-
-fn read_i16(order: TiffByteOrder, b: &[u8]) -> i16 {
-    let arr = [b[0], b[1]];
-    match order {
-        TiffByteOrder::Little => i16::from_le_bytes(arr),
-        TiffByteOrder::Big => i16::from_be_bytes(arr),
-    }
-}
-
-fn read_u32(order: TiffByteOrder, b: &[u8]) -> u32 {
-    let arr = [b[0], b[1], b[2], b[3]];
-    match order {
-        TiffByteOrder::Little => u32::from_le_bytes(arr),
-        TiffByteOrder::Big => u32::from_be_bytes(arr),
-    }
-}
-
-fn read_i32(order: TiffByteOrder, b: &[u8]) -> i32 {
-    let arr = [b[0], b[1], b[2], b[3]];
-    match order {
-        TiffByteOrder::Little => i32::from_le_bytes(arr),
-        TiffByteOrder::Big => i32::from_be_bytes(arr),
-    }
-}
-
-fn read_u64(order: TiffByteOrder, b: &[u8]) -> u64 {
-    let arr = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
-    match order {
-        TiffByteOrder::Little => u64::from_le_bytes(arr),
-        TiffByteOrder::Big => u64::from_be_bytes(arr),
-    }
-}
-
-fn read_i64(order: TiffByteOrder, b: &[u8]) -> i64 {
-    let arr = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
-    match order {
-        TiffByteOrder::Little => i64::from_le_bytes(arr),
-        TiffByteOrder::Big => i64::from_be_bytes(arr),
-    }
-}
-
-fn read_f32(order: TiffByteOrder, b: &[u8]) -> f32 {
-    let arr = [b[0], b[1], b[2], b[3]];
-    match order {
-        TiffByteOrder::Little => f32::from_le_bytes(arr),
-        TiffByteOrder::Big => f32::from_be_bytes(arr),
-    }
-}
-
-fn read_f64(order: TiffByteOrder, b: &[u8]) -> f64 {
-    let arr = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
-    match order {
-        TiffByteOrder::Little => f64::from_le_bytes(arr),
-        TiffByteOrder::Big => f64::from_be_bytes(arr),
-    }
-}
-
 /// One parsed Classic or BigTIFF IFD directory entry.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct IfdEntry {
-    pub(super) tag: u16,
-    pub(super) field_type: u16,
-    pub(super) count: u64,
+    tag: u16,
+    field_type: u16,
+    count: u64,
     inline_bytes: [u8; 8],
     offset: u64,
     byte_len: u64,
@@ -151,6 +94,10 @@ pub(super) struct IfdEntry {
 }
 
 impl IfdEntry {
+    pub(super) const fn count(&self) -> u64 {
+        self.count
+    }
+
     pub(super) const fn byte_len(&self) -> u64 {
         self.byte_len
     }
@@ -158,14 +105,18 @@ impl IfdEntry {
 
 /// One parsed TIFF IFD directory with its inline entries and lazily fetched
 /// coalesced out-of-line tag payloads.
-pub(super) struct IfdDirectory {
-    pub(super) byte_order: TiffByteOrder,
-    pub(super) next_ifd: u64,
+pub(in crate::tiff) struct IfdDirectory {
+    byte_order: TiffByteOrder,
+    next_ifd: u64,
     entries: HashMap<u16, IfdEntry>,
     loaded_spans: Vec<(u64, Vec<u8>)>,
 }
 
 impl IfdDirectory {
+    pub(in crate::tiff) const fn next_ifd(&self) -> u64 {
+        self.next_ifd
+    }
+
     pub(super) fn entry(&self, tag: u16) -> Option<IfdEntry> {
         self.entries.get(&tag).copied()
     }
@@ -209,7 +160,7 @@ impl IfdDirectory {
     /// Coalesce and fetch all out-of-line payloads for `tags` that are not
     /// already covered by `reader.prefix`, enforcing `max_payload_bytes` and
     /// `reader`'s cumulative byte budget BEFORE allocation or I/O.
-    pub(super) fn prefetch_tags(
+    pub(in crate::tiff) fn prefetch_tags(
         &mut self,
         reader: &mut SinglePassIfdReader,
         tags: &[u16],
@@ -350,7 +301,11 @@ impl IfdDirectory {
         Ok(Some(v))
     }
 
-    pub(super) fn read_u32_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> Option<u32> {
+    pub(in crate::tiff) fn read_u32_opt(
+        &self,
+        reader: &SinglePassIfdReader,
+        tag: u16,
+    ) -> Option<u32> {
         self.read_u32_strict(reader, tag).ok().flatten()
     }
 
@@ -371,7 +326,11 @@ impl IfdDirectory {
         Ok(Some(out))
     }
 
-    pub(super) fn read_u16_vec_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> Vec<u16> {
+    pub(in crate::tiff) fn read_u16_vec_opt(
+        &self,
+        reader: &SinglePassIfdReader,
+        tag: u16,
+    ) -> Vec<u16> {
         self.read_u16_vec_strict(reader, tag)
             .ok()
             .flatten()
@@ -412,17 +371,17 @@ impl IfdDirectory {
             }
             3 => {
                 for chunk in bytes.chunks_exact(2).take(count) {
-                    out.push(u64::from(read_u16(order, chunk)));
+                    out.push(u64::from(order.read_u16(chunk)));
                 }
             }
             4 | 13 => {
                 for chunk in bytes.chunks_exact(4).take(count) {
-                    out.push(u64::from(read_u32(order, chunk)));
+                    out.push(u64::from(order.read_u32(chunk)));
                 }
             }
             16 | 18 => {
                 for chunk in bytes.chunks_exact(8).take(count) {
-                    out.push(read_u64(order, chunk));
+                    out.push(order.read_u64(chunk));
                 }
             }
             _ => unreachable!("field_type validated above"),
@@ -474,42 +433,42 @@ impl IfdDirectory {
                 bytes
                     .chunks_exact(2)
                     .take(count)
-                    .map(|c| f64::from(read_u16(order, c))),
+                    .map(|c| f64::from(order.read_u16(c))),
             ),
             8 => out.extend(
                 bytes
                     .chunks_exact(2)
                     .take(count)
-                    .map(|c| f64::from(read_i16(order, c))),
+                    .map(|c| f64::from(order.read_i16(c))),
             ),
             4 | 13 => out.extend(
                 bytes
                     .chunks_exact(4)
                     .take(count)
-                    .map(|c| f64::from(read_u32(order, c))),
+                    .map(|c| f64::from(order.read_u32(c))),
             ),
             9 => out.extend(
                 bytes
                     .chunks_exact(4)
                     .take(count)
-                    .map(|c| f64::from(read_i32(order, c))),
+                    .map(|c| f64::from(order.read_i32(c))),
             ),
             16 | 18 => out.extend(
                 bytes
                     .chunks_exact(8)
                     .take(count)
-                    .map(|c| read_u64(order, c) as f64),
+                    .map(|c| order.read_u64(c) as f64),
             ),
             17 => out.extend(
                 bytes
                     .chunks_exact(8)
                     .take(count)
-                    .map(|c| read_i64(order, c) as f64),
+                    .map(|c| order.read_i64(c) as f64),
             ),
             5 => {
                 for c in bytes.chunks_exact(8).take(count) {
-                    let n = read_u32(order, &c[0..4]);
-                    let d = read_u32(order, &c[4..8]);
+                    let n = order.read_u32(&c[0..4]);
+                    let d = order.read_u32(&c[4..8]);
                     if d != 0 {
                         out.push(f64::from(n) / f64::from(d));
                     }
@@ -517,8 +476,8 @@ impl IfdDirectory {
             }
             10 => {
                 for c in bytes.chunks_exact(8).take(count) {
-                    let n = read_i32(order, &c[0..4]);
-                    let d = read_i32(order, &c[4..8]);
+                    let n = order.read_i32(&c[0..4]);
+                    let d = order.read_i32(&c[4..8]);
                     if d != 0 {
                         out.push(f64::from(n) / f64::from(d));
                     }
@@ -528,20 +487,19 @@ impl IfdDirectory {
                 bytes
                     .chunks_exact(4)
                     .take(count)
-                    .map(|c| f64::from(read_f32(order, c))),
+                    .map(|c| f64::from(order.read_f32(c))),
             ),
-            12 => out.extend(
-                bytes
-                    .chunks_exact(8)
-                    .take(count)
-                    .map(|c| read_f64(order, c)),
-            ),
+            12 => out.extend(bytes.chunks_exact(8).take(count).map(|c| order.read_f64(c))),
             _ => return None,
         }
         Some(out)
     }
 
-    pub(super) fn read_f64_vec_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> Vec<f64> {
+    pub(in crate::tiff) fn read_f64_vec_opt(
+        &self,
+        reader: &SinglePassIfdReader,
+        tag: u16,
+    ) -> Vec<f64> {
         let Some(entry) = self.entry(tag) else {
             return Vec::new();
         };
@@ -552,7 +510,11 @@ impl IfdDirectory {
             .unwrap_or_default()
     }
 
-    pub(super) fn read_ascii_bytes_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> Vec<u8> {
+    pub(in crate::tiff) fn read_ascii_bytes_opt(
+        &self,
+        reader: &SinglePassIfdReader,
+        tag: u16,
+    ) -> Vec<u8> {
         let Some(entry) = self.entry(tag) else {
             return Vec::new();
         };
@@ -562,40 +524,29 @@ impl IfdDirectory {
         let Ok(bytes) = self.resolve_bytes(&entry, reader) else {
             return Vec::new();
         };
-        // Match `tiff::Decoder::get_tag_ascii_string`: truncate at the first NUL byte.
+        // Truncate TIFF ASCII payloads at the first NUL byte.
         bytes.split(|&b| b == 0).next().unwrap_or(&[]).to_vec()
     }
 
-    pub(super) fn read_ascii_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> String {
+    pub(in crate::tiff) fn read_ascii_opt(&self, reader: &SinglePassIfdReader, tag: u16) -> String {
         let raw = self.read_ascii_bytes_opt(reader, tag);
         if raw.is_empty() {
             return String::new();
         }
         String::from_utf8_lossy(&raw).into_owned()
     }
-
-    pub(super) fn read_geotiff_tags(&self, reader: &SinglePassIfdReader) -> RawGeoTiffTags {
-        RawGeoTiffTags {
-            raw_keys: self.read_u16_vec_opt(reader, TAG_GEO_KEY_DIRECTORY),
-            double_params: self.read_f64_vec_opt(reader, TAG_GEO_DOUBLE_PARAMS),
-            ascii_params: self.read_ascii_bytes_opt(reader, TAG_GEO_ASCII_PARAMS),
-            points: self.read_f64_vec_opt(reader, TAG_MODEL_TIEPOINT),
-            scale: self.read_f64_vec_opt(reader, TAG_MODEL_PIXEL_SCALE),
-            matrix: self.read_f64_vec_opt(reader, TAG_MODEL_TRANSFORMATION),
-        }
-    }
 }
 
 /// Single-pass Classic TIFF + BigTIFF IFD chain reader over [`ByteSource`].
-pub(super) struct SinglePassIfdReader {
+pub(in crate::tiff) struct SinglePassIfdReader {
     source: Arc<dyn ByteSource>,
     file_len: u64,
     prefix: Vec<u8>,
     bytes_fetched: u64,
     max_total_bytes: u64,
-    pub(super) byte_order: TiffByteOrder,
+    pub(in crate::tiff) byte_order: TiffByteOrder,
     big_tiff: bool,
-    pub(super) first_ifd: u64,
+    pub(in crate::tiff) first_ifd: u64,
     visited: HashSet<u64>,
 }
 
@@ -604,7 +555,7 @@ impl SinglePassIfdReader {
     /// signature and first IFD offset, enforcing a cumulative fetch budget of
     /// `max_total_bytes` across the prefix, all IFD directories, and prefetched
     /// tag payloads.
-    pub(super) fn open(
+    pub(in crate::tiff) fn open(
         source: Arc<dyn ByteSource>,
         max_total_bytes: u64,
         cancel: &CancelToken,
@@ -632,9 +583,9 @@ impl SinglePassIfdReader {
             b"MM" => TiffByteOrder::Big,
             _ => return Err(RasterError::UnsupportedFormat),
         };
-        let version = read_u16(byte_order, &prefix[2..4]);
+        let version = byte_order.read_u16(&prefix[2..4]);
         let (big_tiff, first_ifd) = match version {
-            42 => (false, u64::from(read_u32(byte_order, &prefix[4..8]))),
+            42 => (false, u64::from(byte_order.read_u32(&prefix[4..8]))),
             43 => {
                 if file_len < 16 {
                     return Err(RasterError::Decode("truncated BigTIFF header".to_owned()));
@@ -644,14 +595,14 @@ impl SinglePassIfdReader {
                         "TIFF IFD fetch budget {max_total_bytes} B is smaller than 16 B BigTIFF header"
                     )));
                 }
-                let offset_size = read_u16(byte_order, &prefix[4..6]);
-                let reserved = read_u16(byte_order, &prefix[6..8]);
+                let offset_size = byte_order.read_u16(&prefix[4..6]);
+                let reserved = byte_order.read_u16(&prefix[6..8]);
                 if offset_size != 8 || reserved != 0 {
                     return Err(RasterError::Decode(format!(
                         "unsupported BigTIFF header (offset_size={offset_size}, reserved={reserved})"
                     )));
                 }
-                (true, read_u64(byte_order, &prefix[8..16]))
+                (true, byte_order.read_u64(&prefix[8..16]))
             }
             _ => return Err(RasterError::UnsupportedFormat),
         };
@@ -669,7 +620,7 @@ impl SinglePassIfdReader {
         })
     }
 
-    pub(super) const fn remaining_fetch_budget(&self) -> u64 {
+    pub(in crate::tiff) const fn remaining_fetch_budget(&self) -> u64 {
         self.max_total_bytes.saturating_sub(self.bytes_fetched)
     }
 
@@ -714,7 +665,7 @@ impl SinglePassIfdReader {
     /// Read one IFD entry table + `next_ifd` pointer at `ifd_offset` (zero
     /// extra reads when inside the initial header prefix, or at most two
     /// positioned reads—entry count then table—when out-of-prefix).
-    pub(super) fn read_directory(
+    pub(in crate::tiff) fn read_directory(
         &mut self,
         ifd_offset: u64,
         cancel: &CancelToken,
@@ -744,9 +695,9 @@ impl SinglePassIfdReader {
         let mut count_buf = [0u8; 8];
         self.read_bytes_into(ifd_offset, &mut count_buf[..count_size as usize], cancel)?;
         let count_u64 = if self.big_tiff {
-            read_u64(order, &count_buf[..8])
+            order.read_u64(&count_buf[..8])
         } else {
-            u64::from(read_u16(order, &count_buf[..2]))
+            u64::from(order.read_u16(&count_buf[..2]))
         };
         if count_u64 > MAX_IFD_ENTRIES as u64 {
             return Err(RasterError::DecoderLimitsExceeded(format!(
@@ -768,12 +719,12 @@ impl SinglePassIfdReader {
         let mut entries = HashMap::with_capacity(count);
         for i in 0..count {
             let e = &raw_table[i * entry_size..(i + 1) * entry_size];
-            let tag = read_u16(order, &e[0..2]);
-            let field_type = read_u16(order, &e[2..4]);
+            let tag = order.read_u16(&e[0..2]);
+            let field_type = order.read_u16(&e[2..4]);
             let (elem_count, val_field) = if self.big_tiff {
-                (read_u64(order, &e[4..12]), &e[12..20])
+                (order.read_u64(&e[4..12]), &e[12..20])
             } else {
-                (u64::from(read_u32(order, &e[4..8])), &e[8..12])
+                (u64::from(order.read_u32(&e[4..8])), &e[8..12])
             };
             let Some(type_sz) = field_type_size(field_type) else {
                 // Preserve unknown field types with zero inline payload so
@@ -804,9 +755,9 @@ impl SinglePassIfdReader {
                 inline_bytes[..val_field.len()].copy_from_slice(val_field);
                 0
             } else if self.big_tiff {
-                read_u64(order, val_field)
+                order.read_u64(val_field)
             } else {
-                u64::from(read_u32(order, val_field))
+                u64::from(order.read_u32(val_field))
             };
             entries.insert(
                 tag,
@@ -824,9 +775,9 @@ impl SinglePassIfdReader {
 
         let next_slice = &raw_table[count * entry_size..];
         let next_ifd = if self.big_tiff {
-            read_u64(order, next_slice)
+            order.read_u64(next_slice)
         } else {
-            u64::from(read_u32(order, next_slice))
+            u64::from(order.read_u32(next_slice))
         };
 
         Ok(IfdDirectory {
@@ -839,5 +790,5 @@ impl SinglePassIfdReader {
 }
 
 #[cfg(test)]
-#[path = "tags_tests.rs"]
+#[path = "wire_tests.rs"]
 mod tests;

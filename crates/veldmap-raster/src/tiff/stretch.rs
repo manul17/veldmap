@@ -6,13 +6,10 @@ use veldmap_core::budget::DecodeBudgetTracker;
 use veldmap_core::sync::CancelToken;
 
 use crate::RasterError;
-use crate::pipeline::grid;
-use crate::pipeline::metadata::{BandStats, SampleType};
-use crate::pipeline::radiometry::{
-    self, DisplayMapping, compute_band_stats, is_data_f64, percentile_stretch,
-    read_native_sample_f64,
+use crate::pipeline::{
+    BandStats, DisplayMapping, STRETCH_SAMPLES, SingleflightMap, chunk_working_bytes,
+    compute_band_stats, is_data_f64, percentile_stretch, read_native_sample_f64,
 };
-use crate::pipeline::singleflight::SingleflightMap;
 
 use super::chunk_convert::for_each_band_sample_f64;
 use super::ifd::{CachedIfd, Photometric, PlanarConfig, RawTiffAccess};
@@ -123,7 +120,7 @@ fn for_each_sampled_chunk(
 ) -> Result<(), RasterError> {
     let ifd = req.stats_ifd;
     let picks = pick_sample_chunks(ifd.chunks_per_plane);
-    let target_per_chunk = (radiometry::STRETCH_SAMPLES / picks.len().max(1)).max(1);
+    let target_per_chunk = (STRETCH_SAMPLES / picks.len().max(1)).max(1);
     for index in picks {
         if req.cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
@@ -131,7 +128,7 @@ fn for_each_sampled_chunk(
         let Some(dims) = ifd.chunk_dims(index) else {
             continue;
         };
-        let est_bytes = grid::chunk_working_bytes(dims.stored_w, dims.stored_h, raw_depth, 0);
+        let est_bytes = chunk_working_bytes(dims.stored_w, dims.stored_h, raw_depth, 0);
         let _lease = req.budget_tracker.reserve_blocking(est_bytes, req.cancel)?;
         let pixels = (dims.data_w as usize) * (dims.data_h as usize);
         visit(index, pixels, target_per_chunk)?;
@@ -142,7 +139,7 @@ fn for_each_sampled_chunk(
 fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterError> {
     let ifd = req.stats_ifd;
     let invert = ifd.photometric == Photometric::WhiteIsZero;
-    if ifd.sample_type == SampleType::U8 || ifd.photometric == Photometric::Palette {
+    if !ifd.needs_display_stretch() {
         return Ok(DisplayMapping::identity(req.nodata_f64).with_invert(invert));
     }
     let colors = ifd.pixel_layout.colors().max(1);
@@ -175,9 +172,9 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
                     }
                 }
                 PlanarConfig::Planar => {
-                    for ch in 0..colors {
+                    for &plane in ifd.stretch_planes() {
                         let (_, _, payload) =
-                            decode_raw_chunk(req.access, ifd, ch, index, req.cancel)?;
+                            decode_raw_chunk(req.access, ifd, plane, index, req.cancel)?;
                         let RawChunkPayload::Bytes(data) = payload else {
                             continue;
                         };
@@ -197,7 +194,7 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
             Ok(())
         },
     )?;
-    values.truncate(radiometry::STRETCH_SAMPLES);
+    values.truncate(STRETCH_SAMPLES);
 
     Ok(match percentile_stretch(&mut values) {
         Some((lo, hi)) => DisplayMapping::stretched(lo, hi, req.nodata_f64).with_invert(invert),
@@ -247,7 +244,7 @@ fn compute_single_band_stats(
             Ok(())
         },
     )?;
-    values.truncate(radiometry::STRETCH_SAMPLES);
+    values.truncate(STRETCH_SAMPLES);
     Ok(compute_band_stats(&mut values))
 }
 

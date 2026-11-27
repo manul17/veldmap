@@ -105,20 +105,28 @@ fn deliver_pointwise_tile(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "internal helper carries explicit runtime, source, prefetch pin, and flight guard"
-)]
-fn run_pointwise_job(
-    rt: &OverlayRuntime,
-    source: &dyn RasterSource,
+struct PointwiseRunArgs<'a> {
+    rt: &'a OverlayRuntime,
+    source: &'a dyn RasterSource,
     fp: String,
     tile_key: TileKey,
-    cancel: &CancelToken,
+    cancel: &'a CancelToken,
     check_disk: bool,
-    _pin: Option<PrefetchPin>,
+    pin: Option<PrefetchPin>,
     guard: PointwiseFlightGuard,
-) {
+}
+
+fn run_pointwise_job(args: PointwiseRunArgs<'_>) {
+    let PointwiseRunArgs {
+        rt,
+        source,
+        fp,
+        tile_key,
+        cancel,
+        check_disk,
+        pin: _pin,
+        guard,
+    } = args;
     if cancel.is_cancelled() {
         guard.mark_cancelled();
         return;
@@ -333,16 +341,16 @@ pub(super) fn submit_pointwise_job(
                 queued_bytes: tile_format_bytes(RASTER_TILE_SIZE, tile_key.format),
                 cancel,
                 work: Box::new(move || {
-                    run_pointwise_job(
-                        &job_rt,
-                        source.as_ref(),
+                    run_pointwise_job(PointwiseRunArgs {
+                        rt: &job_rt,
+                        source: source.as_ref(),
                         fp,
                         tile_key,
-                        &job_cancel,
-                        false,
+                        cancel: &job_cancel,
+                        check_disk: false,
                         pin,
                         guard,
-                    );
+                    });
                 }),
             };
             let _ = rt.try_submit_guarded(&rt.fast_pool, job, true, || {
@@ -363,16 +371,16 @@ pub(super) fn submit_pointwise_job(
         queued_bytes: tile_format_bytes(RASTER_TILE_SIZE, tile_key.format),
         cancel: cancel.clone(),
         work: Box::new(move || {
-            run_pointwise_job(
-                &rt,
-                source.as_ref(),
+            run_pointwise_job(PointwiseRunArgs {
+                rt: &rt,
+                source: source.as_ref(),
                 fp,
                 tile_key,
-                &cancel,
-                true,
-                None,
+                cancel: &cancel,
+                check_disk: true,
+                pin: None,
                 guard,
-            );
+            });
         }),
     };
 

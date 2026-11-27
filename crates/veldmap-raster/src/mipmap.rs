@@ -5,51 +5,12 @@
 
 use veldmap_core::tile::{DecodedTile, PixelFormat, max_mip_levels, mip_dimensions};
 
-use crate::color::{
-    LINEAR_TO_SRGB_LUT_LEN, average_srgb_rgba8_block, linear_to_srgb_lut, srgb_to_linear_lut,
-};
-
-fn downsample_rgba8_srgb_2x(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-    to_lin: &[f32; 256],
-    to_srgb: &[u8; LINEAR_TO_SRGB_LUT_LEN],
-) -> Vec<u8> {
-    let sw = src_w as usize;
-    let sh = src_h as usize;
-    let dw = dst_w as usize;
-    let dh = dst_h as usize;
-    let mut dst = vec![0u8; dw * dh * 4];
-
-    for y in 0..dh {
-        let sy0 = (y * 2).min(sh - 1);
-        let sy1 = (sy0 + 1).min(sh - 1);
-        for x in 0..dw {
-            let sx0 = (x * 2).min(sw - 1);
-            let sx1 = (sx0 + 1).min(sw - 1);
-
-            let offsets = [
-                (sy0 * sw + sx0) * 4,
-                (sy0 * sw + sx1) * 4,
-                (sy1 * sw + sx0) * 4,
-                (sy1 * sw + sx1) * 4,
-            ];
-
-            let out = (y * dw + x) * 4;
-            average_srgb_rgba8_block(src, &offsets, to_lin, to_srgb, &mut dst[out..out + 4]);
-        }
-    }
-
-    dst
-}
+use crate::pipeline::{DownsampleRounding, downsample_r32f_2x, downsample_rgba8_2x};
 
 fn generate_mips_with(
     tile: &mut DecodedTile,
     expected_format: PixelFormat,
-    mut step: impl FnMut(&[u8], u32, u32, u32, u32) -> Vec<u8>,
+    mut step: impl FnMut(&[u8], u32, u32) -> Vec<u8>,
 ) {
     tile.clear_mips();
     let width = tile.width();
@@ -72,12 +33,14 @@ fn generate_mips_with(
     let mut prev_h = height;
     for level in 1..total_levels {
         let (dst_w, dst_h) = mip_dimensions(width, height, level);
+        debug_assert_eq!(dst_w, (prev_w / 2).max(1));
+        debug_assert_eq!(dst_h, (prev_h / 2).max(1));
         let src = if level == 1 {
             tile.data()
         } else {
             mips[(level - 2) as usize].as_slice()
         };
-        mips.push(step(src, prev_w, prev_h, dst_w, dst_h));
+        mips.push(step(src, prev_w, prev_h));
         prev_w = dst_w;
         prev_h = dst_h;
     }
@@ -97,57 +60,10 @@ fn generate_mips_with(
 /// Non-display formats (`R32Float`, `R8Uint`, `R16Uint`), guttered tiles, and
 /// padded partial-edge tiles are left untouched with `mips` cleared so 2x box
 /// filtering never shifts gutters or bleeds padding into valid pixels.
-pub(crate) fn generate_linear_mipmaps(tile: &mut DecodedTile) {
-    let to_lin = srgb_to_linear_lut();
-    let to_srgb = linear_to_srgb_lut();
-    generate_mips_with(tile, PixelFormat::Rgba8UnormSrgb, |src, pw, ph, dw, dh| {
-        downsample_rgba8_srgb_2x(src, pw, ph, dw, dh, to_lin, to_srgb)
+fn generate_linear_mipmaps(tile: &mut DecodedTile) {
+    generate_mips_with(tile, PixelFormat::Rgba8UnormSrgb, |src, pw, ph| {
+        downsample_rgba8_2x(src, pw, ph, DownsampleRounding::Floor)
     });
-}
-
-fn downsample_r32f_nan_skipping_2x(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Vec<u8> {
-    let sw = src_w as usize;
-    let sh = src_h as usize;
-    let dw = dst_w as usize;
-    let dh = dst_h as usize;
-    let mut dst = vec![0u8; dw * dh * 4];
-
-    for y in 0..dh {
-        let sy0 = y * 2;
-        let sy1 = if y + 1 == dh { sh } else { (sy0 + 2).min(sh) };
-        for x in 0..dw {
-            let sx0 = x * 2;
-            let sx1 = if x + 1 == dw { sw } else { (sx0 + 2).min(sw) };
-            let mut sum = 0.0f64;
-            let mut count = 0u32;
-            for sy in sy0..sy1 {
-                let row = sy * sw;
-                for sx in sx0..sx1 {
-                    let off = (row + sx) * 4;
-                    let v =
-                        f32::from_ne_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
-                    if v.is_finite() {
-                        sum += f64::from(v);
-                        count += 1;
-                    }
-                }
-            }
-            let out_val = if count > 0 {
-                (sum / f64::from(count)) as f32
-            } else {
-                f32::NAN
-            };
-            let out_off = (y * dw + x) * 4;
-            dst[out_off..out_off + 4].copy_from_slice(&out_val.to_ne_bytes());
-        }
-    }
-    dst
 }
 
 /// Populate the complete CPU NaN-skipping mipmap chain on an unguttered,
@@ -158,7 +74,9 @@ fn downsample_r32f_nan_skipping_2x(
 /// `NaN` / non-finite nodata samples are excluded; a footprint containing only
 /// non-finite samples produces `f32::NAN`.
 fn generate_scientific_mipmaps(tile: &mut DecodedTile) {
-    generate_mips_with(tile, PixelFormat::R32Float, downsample_r32f_nan_skipping_2x);
+    generate_mips_with(tile, PixelFormat::R32Float, |src, pw, ph| {
+        downsample_r32f_2x(src, pw, ph, DownsampleRounding::Floor)
+    });
 }
 
 /// Generate format-appropriate CPU mipmaps on `tile`:

@@ -9,10 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use veldmap_core::geo::CrsSpec;
+use veldmap_core::geo::{CrsSpec, trim_crs_text};
 
 use crate::RasterError;
-use crate::pipeline::metadata::{GeoPlacement, PlacementCrs};
+use crate::pipeline::{GeoPlacement, PlacementCrs};
 
 /// Maximum sidecar file size (1 MiB) to guard against reading huge accidental files.
 const MAX_SIDECAR_BYTES: u64 = 1024 * 1024;
@@ -109,7 +109,7 @@ pub fn parse_world_file(text: &str) -> Result<[f64; 6], RasterError> {
 /// Parse a `.prj` sidecar containing WKT1/WKT2 or a PROJ/EPSG string into a
 /// [`CrsSpec`].
 pub fn parse_prj_text(text: &str) -> Result<CrsSpec, RasterError> {
-    let trimmed = text.trim_start_matches('\u{FEFF}').trim();
+    let trimmed = trim_crs_text(text);
     if trimmed.is_empty() {
         return Err(RasterError::Binding(
             ".prj sidecar file is empty".to_string(),
@@ -179,7 +179,7 @@ fn prj_file_candidates(raster_path: &Path) -> Vec<PathBuf> {
 /// completely free of `std::fs` calls. `read_candidate(path, MAX_SIDECAR_BYTES)`
 /// returns `Ok(None)` when `path` does not exist or is not a regular file,
 /// `Ok(Some(text))` when read, or `Err(msg)` on size-limit/read errors.
-pub fn load_sidecar_georef_with<F>(
+pub(crate) fn load_sidecar_georef_with<F>(
     raster_path: &Path,
     mut read_candidate: F,
 ) -> Result<SidecarGeoref, RasterError>

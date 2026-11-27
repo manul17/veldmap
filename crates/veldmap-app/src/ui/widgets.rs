@@ -1,8 +1,10 @@
 //! Reusable `egui` widgets and interaction helpers shared across HUD and side
-//! panels (colormap ramps, drag-commit tracking, and opacity sliders).
+//! panels (colormap ramps, loading shimmer, drag-commit tracking, and opacity
+//! sliders).
 
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::time::Duration;
 
 use eframe::egui;
 
@@ -97,4 +99,25 @@ pub(crate) fn show_opacity_slider(
         ui.monospace(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).small());
     });
     update
+}
+
+/// Paint an animated indeterminate shimmer bar while a raster overlay is
+/// loading or reloading tiles.
+pub(crate) fn paint_loading_shimmer(ui: &mut egui::Ui) {
+    let width = ui.available_width().max(40.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 3.0), egui::Sense::hover());
+    let t = ui.input(|i| i.time) as f32;
+    let phase = (t * 0.9) % 1.0;
+    let bar_w = (rect.width() * 0.35).max(16.0);
+    let x0 = rect.left() - bar_w + phase * (rect.width() + bar_w);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 1.5, egui::Color32::from_gray(50));
+    let highlight = egui::Rect::from_min_max(
+        egui::pos2(x0.max(rect.left()), rect.top()),
+        egui::pos2((x0 + bar_w).min(rect.right()), rect.bottom()),
+    );
+    if highlight.width() > 0.0 {
+        painter.rect_filled(highlight, 1.5, egui::Color32::from_rgb(80, 175, 245));
+    }
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
 }

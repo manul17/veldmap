@@ -9,14 +9,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use veldmap_core::io::{ByteSource, IoError};
 use veldmap_core::sync::CancelToken;
 use veldmap_net::{
     HttpRangeConfig, HttpRangeSource, NetConfig, NetContext, RANGE_BLOCK_SIZE, RangeOpenError,
 };
+
+use crate::mock_http::{MockHttpServer, write_http_response};
 
 #[derive(Clone, Debug)]
 struct RecordedReq {
@@ -60,173 +60,92 @@ impl MockRangeState {
 
 struct MockRangeServer {
     url: String,
-    shutdown: CancelToken,
-    handle: Option<thread::JoinHandle<()>>,
+    _server: MockHttpServer,
 }
 
 impl MockRangeServer {
     fn start(state: Arc<MockRangeState>) -> Self {
-        let shutdown = CancelToken::new();
-        let stop = shutdown.clone();
-        let st = Arc::clone(&state);
-        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let server = MockHttpServer::start(move |req, mut stream, stop_conn| {
+            let st_conn = Arc::clone(&state);
+            async move {
+                let range = req.header("range").map(str::to_owned);
+                let if_match = req.header("if-match").map(str::to_owned);
+                let accept_encoding = req.header("accept-encoding").map(str::to_owned);
 
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("mock server runtime");
-            rt.block_on(async move {
-                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-                let addr = listener.local_addr().expect("local_addr");
-                let _ = addr_tx.send(addr);
+                st_conn.requests.lock().expect("lock").push(RecordedReq {
+                    if_match: if_match.clone(),
+                    accept_encoding,
+                });
+                st_conn.range_gets_started.fetch_add(1, Ordering::SeqCst);
 
-                loop {
+                let gate = st_conn.delay_gate.lock().expect("lock").clone();
+                if let Some(notify) = gate {
                     tokio::select! {
-                        biased;
-                        _ = stop.cancelled() => break,
-                        res = listener.accept() => {
-                            let Ok((mut stream, _)) = res else { break; };
-                            let st_conn = Arc::clone(&st);
-                            let stop_conn = stop.clone();
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; 8192];
-                                let mut filled = 0usize;
-                                loop {
-                                    let n = tokio::select! {
-                                        _ = stop_conn.cancelled() => return,
-                                        r = stream.read(&mut buf[filled..]) => match r {
-                                            Ok(0) | Err(_) => return,
-                                            Ok(n) => n,
-                                        }
-                                    };
-                                    filled += n;
-                                    if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") || filled == buf.len() {
-                                        break;
-                                    }
-                                }
-                                let req_str = String::from_utf8_lossy(&buf[..filled]);
-                                let mut range = None;
-                                let mut if_match = None;
-                                let mut accept_encoding = None;
-                                for line in req_str.lines().skip(1) {
-                                    if let Some((k, v)) = line.split_once(':') {
-                                        let key = k.trim().to_ascii_lowercase();
-                                        let val = v.trim().to_owned();
-                                        match key.as_str() {
-                                            "range" => range = Some(val),
-                                            "if-match" => if_match = Some(val),
-                                            "accept-encoding" => accept_encoding = Some(val),
-                                            _ => {}
-                                        }
-                                    }
-                                }
-
-                                st_conn.requests.lock().expect("lock").push(RecordedReq {
-                                    if_match: if_match.clone(),
-                                    accept_encoding,
-                                });
-                                st_conn.range_gets_started.fetch_add(1, Ordering::SeqCst);
-
-                                let gate = st_conn.delay_gate.lock().expect("lock").clone();
-                                if let Some(notify) = gate {
-                                    tokio::select! {
-                                        _ = stop_conn.cancelled() => return,
-                                        _ = notify.notified() => {}
-                                    }
-                                }
-
-                                let data = st_conn.data.lock().expect("lock").clone();
-                                let etag = st_conn.etag.lock().expect("lock").clone();
-
-                                if st_conn.enforce_if_match.load(Ordering::SeqCst)
-                                    && let Some(ref req_etag) = if_match
-                                    && etag.as_deref() != Some(req_etag.as_str())
-                                {
-                                    let resp = "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                    let _ = stream.write_all(resp.as_bytes()).await;
-                                    return;
-                                }
-
-                                if st_conn.force_200_on_range.load(Ordering::SeqCst) {
-                                    let header = format!(
-                                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                        data.len()
-                                    );
-                                    let _ = stream.write_all(header.as_bytes()).await;
-                                    let _ = stream.write_all(&data).await;
-                                    return;
-                                }
-
-                                let Some(range_val) = range else {
-                                    let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                    let _ = stream.write_all(resp.as_bytes()).await;
-                                    return;
-                                };
-
-                                let total = data.len() as u64;
-                                if total == 0 {
-                                    let mut hdr = String::from(
-                                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\n",
-                                    );
-                                    if let Some(ref e) = etag {
-                                        hdr.push_str(&format!("ETag: {e}\r\n"));
-                                    }
-                                    hdr.push_str("Connection: close\r\n\r\n");
-                                    let _ = stream.write_all(hdr.as_bytes()).await;
-                                    return;
-                                }
-
-                                let (start, req_end) = range_val
-                                    .strip_prefix("bytes=")
-                                    .and_then(|s| s.split_once('-'))
-                                    .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
-                                    .expect("valid Range header");
-                                if start >= total {
-                                    let hdr = format!(
-                                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                                    );
-                                    let _ = stream.write_all(hdr.as_bytes()).await;
-                                    return;
-                                }
-                                let end = req_end.min(total - 1);
-                                let slice = &data[start as usize..=end as usize];
-                                let mut hdr = format!(
-                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\n",
-                                    slice.len()
-                                );
-                                if let Some(ref e) = etag {
-                                    hdr.push_str(&format!("ETag: {e}\r\n"));
-                                }
-                                if st_conn.force_gzip_header.load(Ordering::SeqCst) {
-                                    hdr.push_str("Content-Encoding: gzip\r\n");
-                                } else {
-                                    hdr.push_str("Content-Encoding: identity\r\n");
-                                }
-                                hdr.push_str("Connection: close\r\n\r\n");
-                                let _ = stream.write_all(hdr.as_bytes()).await;
-                                let _ = stream.write_all(slice).await;
-                            });
-                        }
+                        _ = stop_conn.cancelled() => return,
+                        _ = notify.notified() => {}
                     }
                 }
-            });
+
+                let data = st_conn.data.lock().expect("lock").clone();
+                let etag = st_conn.etag.lock().expect("lock").clone();
+
+                if st_conn.enforce_if_match.load(Ordering::SeqCst)
+                    && let Some(ref req_etag) = if_match
+                    && etag.as_deref() != Some(req_etag.as_str())
+                {
+                    write_http_response(&mut stream, 412, "Precondition Failed", "", &[]).await;
+                    return;
+                }
+
+                if st_conn.force_200_on_range.load(Ordering::SeqCst) {
+                    write_http_response(&mut stream, 200, "OK", "", &data).await;
+                    return;
+                }
+
+                let Some(range_val) = range else {
+                    write_http_response(&mut stream, 400, "Bad Request", "", &[]).await;
+                    return;
+                };
+
+                let total = data.len() as u64;
+                if total == 0 {
+                    let mut hdr = String::from("Content-Range: bytes */0\r\n");
+                    if let Some(ref e) = etag {
+                        hdr.push_str(&format!("ETag: {e}\r\n"));
+                    }
+                    write_http_response(&mut stream, 416, "Range Not Satisfiable", &hdr, &[]).await;
+                    return;
+                }
+
+                let (start, req_end) = range_val
+                    .strip_prefix("bytes=")
+                    .and_then(|s| s.split_once('-'))
+                    .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                    .expect("valid Range header");
+                if start >= total {
+                    let hdr = format!("Content-Range: bytes */{total}\r\n");
+                    write_http_response(&mut stream, 416, "Range Not Satisfiable", &hdr, &[]).await;
+                    return;
+                }
+                let end = req_end.min(total - 1);
+                let slice = &data[start as usize..=end as usize];
+                let mut hdr = format!("Content-Range: bytes {start}-{end}/{total}\r\n");
+                if let Some(ref e) = etag {
+                    hdr.push_str(&format!("ETag: {e}\r\n"));
+                }
+                if st_conn.force_gzip_header.load(Ordering::SeqCst) {
+                    hdr.push_str("Content-Encoding: gzip\r\n");
+                } else {
+                    hdr.push_str("Content-Encoding: identity\r\n");
+                }
+                write_http_response(&mut stream, 206, "Partial Content", &hdr, slice).await;
+            }
         });
 
-        let addr = addr_rx.recv().expect("server addr");
+        let addr = server.addr();
         Self {
             url: format!("http://{addr}/scene/B04.tif?sig=secret_token"),
-            shutdown,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for MockRangeServer {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            _server: server,
         }
     }
 }
@@ -616,30 +535,17 @@ fn rejects_forbidden_custom_headers_cross_origin_auth_redirects_and_response_eta
 
 #[test]
 fn custom_auth_headers_refuse_cross_origin_redirect() {
-    let shutdown = CancelToken::new();
-    let stop = shutdown.clone();
-    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
-    let handle = thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async move {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let _ = addr_tx.send(addr);
-            if let Ok((mut stream, _)) = tokio::select! {
-                _ = stop.cancelled() => Err(std::io::Error::other("stop")),
-                res = listener.accept() => res,
-            } {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf).await;
-                let resp = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/evil.tif\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(resp.as_bytes()).await;
-            }
-        });
+    let server = MockHttpServer::start(|_req, mut stream, _stop| async move {
+        write_http_response(
+            &mut stream,
+            302,
+            "Found",
+            "Location: http://127.0.0.1:9/evil.tif\r\n",
+            &[],
+        )
+        .await;
     });
-    let addr = addr_rx.recv().expect("addr");
+    let addr = server.addr();
     let net = test_net(2 * RANGE_BLOCK_SIZE);
     let cancel = CancelToken::new();
     let err = HttpRangeSource::open(
@@ -656,6 +562,4 @@ fn custom_auth_headers_refuse_cross_origin_redirect() {
     let msg = err.to_string();
     assert!(!msg.contains("secret-token"), "secret leaked: {msg}");
     assert!(matches!(err, RangeOpenError::Network(_)));
-    shutdown.cancel();
-    let _ = handle.join();
 }

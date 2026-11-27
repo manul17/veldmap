@@ -1,12 +1,12 @@
-//! Presentation-only floating Geodesic Measure window bound to
-//! [`crate::measure::MeasureSession`].
+//! Presentation-only floating Geodesic Measure window driven by
+//! [`crate::measure::MeasureSummary`].
 //!
 //! Strictly action-only: emits [`MeasureAction`] values back to `VeldmapApp`
-//! without mutating [`MeasureSession`] directly from UI layout code.
+//! without mutating or borrowing `MeasureSession` directly from UI layout code.
 
 use eframe::egui;
 
-use crate::measure::{MeasureMode, MeasureSession};
+use crate::measure::{MeasureMode, MeasureSummary};
 
 use super::format;
 
@@ -36,13 +36,13 @@ impl MeasureUiState {
     }
 }
 
-/// Render the floating Geodesic Measure window when `session` is active.
+/// Render the floating Geodesic Measure window when `summary.active` is `true`.
 pub(crate) fn show_measure_window(
     ctx: &egui::Context,
-    session: &MeasureSession,
+    summary: MeasureSummary,
     state: &MeasureUiState,
 ) -> Option<MeasureAction> {
-    if !session.is_active() {
+    if !summary.active {
         return None;
     }
     let mut action = None;
@@ -52,7 +52,7 @@ pub(crate) fn show_measure_window(
         .resizable(false)
         .default_width(300.0)
         .show(ctx, |ui| {
-            let mode = session.mode();
+            let mode = summary.mode;
             ui.horizontal(|ui| {
                 if ui
                     .selectable_label(mode == MeasureMode::Distance, "Distance")
@@ -71,10 +71,10 @@ pub(crate) fn show_measure_window(
             });
             ui.separator();
             ui.weak("Click on the globe to place vertices.");
-            let point_count = session.points().len();
+            let point_count = summary.point_count;
             ui.monospace(format!("Vertices: {point_count}"));
 
-            let metrics = session.metrics();
+            let metrics = summary.metrics.unwrap_or_default();
             match mode {
                 MeasureMode::Distance => {
                     ui.strong(format!(

@@ -43,16 +43,16 @@ impl BasemapTestHarness {
             TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
             decode_shutdown.clone(),
         );
-        let manager = BasemapManager::new(
-            storage.settings().basemap_config(),
-            storage.disk_cache(),
-            Some(Arc::clone(&net)),
-            None,
-            tx.clone(),
+        let manager = BasemapManager::new(BasemapManagerDeps {
+            config: storage.settings().basemap_config(),
+            disk_cache: storage.disk_cache(),
+            net: Some(Arc::clone(&net)),
+            net_init_error: None,
+            done_tx: tx.clone(),
             wakeup,
-            decode_pool.fast_handle(),
-            decode_shutdown.clone(),
-        );
+            decode_handle: decode_pool.fast_handle(),
+            decode_shutdown: decode_shutdown.clone(),
+        });
         Self {
             _root: Some(root),
             storage: Some(storage),
@@ -75,16 +75,16 @@ impl BasemapTestHarness {
             TwoLaneDecodePoolConfig::from_budget(&MemoryBudget::default()),
             decode_shutdown.clone(),
         );
-        let manager = BasemapManager::new(
-            settings.basemap_config(),
-            None,
-            Some(Arc::clone(&net)),
-            None,
-            tx.clone(),
+        let manager = BasemapManager::new(BasemapManagerDeps {
+            config: settings.basemap_config(),
+            disk_cache: None,
+            net: Some(Arc::clone(&net)),
+            net_init_error: None,
+            done_tx: tx.clone(),
             wakeup,
-            decode_pool.fast_handle(),
-            decode_shutdown.clone(),
-        );
+            decode_handle: decode_pool.fast_handle(),
+            decode_shutdown: decode_shutdown.clone(),
+        });
         Self {
             _root: None,
             storage: None,

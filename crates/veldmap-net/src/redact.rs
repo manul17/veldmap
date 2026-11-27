@@ -70,11 +70,7 @@ impl EncodedSecret {
 /// Redact inline URL `user:pass@` authority credentials, `?query` tokens, and
 /// any configured [`EncodedSecret`] (raw or percent-encoded) from `text`.
 pub(crate) fn redact_text(text: &str, secret: Option<&EncodedSecret>) -> String {
-    let out = sanitize_urls_in_text(text);
-    match secret {
-        Some(secret) => secret.redact_in(out),
-        None => out,
-    }
+    redact_text_many(text, secret.map_or(&[], std::slice::from_ref))
 }
 
 /// Redact inline URL credentials, `?query` tokens, and all `secrets` from

@@ -4,12 +4,6 @@
 
 use crate::RasterError;
 
-use super::MAX_CACHED_TILE_DECODED_BYTES;
-
-/// Default maximum decoded RGBA8 byte size admitted for QOI tile caching
-/// (`16 MiB`, matching [`MAX_CACHED_TILE_DECODED_BYTES`]).
-pub const MAX_QOI_DECODED_BYTES: usize = MAX_CACHED_TILE_DECODED_BYTES;
-
 /// Encode an 8-bit `Rgba8UnormSrgb` tile into lossless QOI bytes.
 ///
 /// Symmetrically enforces `width > 0`, `height > 0`, exact `width * height * 4`
@@ -94,6 +88,7 @@ pub fn decode_qoi_rgba8(
 
 #[cfg(test)]
 mod tests {
+    use super::super::MAX_CACHED_TILE_DECODED_BYTES;
     use super::*;
 
     #[test]
@@ -110,8 +105,9 @@ mod tests {
                 ]);
             }
         }
-        let encoded = encode_qoi_rgba8(w, h, &rgba, MAX_QOI_DECODED_BYTES).expect("encode");
-        let (dw, dh, decoded) = decode_qoi_rgba8(&encoded, MAX_QOI_DECODED_BYTES).expect("decode");
+        let encoded = encode_qoi_rgba8(w, h, &rgba, MAX_CACHED_TILE_DECODED_BYTES).expect("encode");
+        let (dw, dh, decoded) =
+            decode_qoi_rgba8(&encoded, MAX_CACHED_TILE_DECODED_BYTES).expect("decode");
         assert_eq!((dw, dh), (w, h));
         assert_eq!(decoded, rgba);
 
@@ -122,11 +118,11 @@ mod tests {
         ));
         // Bad buffer length / zero dimensions rejected.
         assert!(matches!(
-            encode_qoi_rgba8(0, 4, &[], MAX_QOI_DECODED_BYTES),
+            encode_qoi_rgba8(0, 4, &[], MAX_CACHED_TILE_DECODED_BYTES),
             Err(RasterError::InvalidDimensions { .. })
         ));
         assert!(matches!(
-            encode_qoi_rgba8(4, 4, &[0u8; 8], MAX_QOI_DECODED_BYTES),
+            encode_qoi_rgba8(4, 4, &[0u8; 8], MAX_CACHED_TILE_DECODED_BYTES),
             Err(RasterError::InvalidDimensions { .. })
         ));
 
@@ -139,20 +135,22 @@ mod tests {
         bad_header.push(0);
         bad_header.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
         assert!(matches!(
-            decode_qoi_rgba8(&bad_header, MAX_QOI_DECODED_BYTES),
+            decode_qoi_rgba8(&bad_header, MAX_CACHED_TILE_DECODED_BYTES),
             Err(RasterError::LimitExceeded { .. })
         ));
 
         // Truncated payload after valid header is rejected cleanly.
-        assert!(decode_qoi_rgba8(&encoded[..encoded.len() / 2], MAX_QOI_DECODED_BYTES).is_err());
+        assert!(
+            decode_qoi_rgba8(&encoded[..encoded.len() / 2], MAX_CACHED_TILE_DECODED_BYTES).is_err()
+        );
 
         // 3-channel RGB QOI blob is rejected.
         let rgb_only = qoi::encode_to_vec([10u8; 4 * 4 * 3], 4, 4).expect("rgb qoi");
-        assert!(decode_qoi_rgba8(&rgb_only, MAX_QOI_DECODED_BYTES).is_err());
+        assert!(decode_qoi_rgba8(&rgb_only, MAX_CACHED_TILE_DECODED_BYTES).is_err());
 
         // Linear colorspace (colorspace = 1) header is rejected.
         let mut linear = encoded.clone();
         linear[13] = 1;
-        assert!(decode_qoi_rgba8(&linear, MAX_QOI_DECODED_BYTES).is_err());
+        assert!(decode_qoi_rgba8(&linear, MAX_CACHED_TILE_DECODED_BYTES).is_err());
     }
 }

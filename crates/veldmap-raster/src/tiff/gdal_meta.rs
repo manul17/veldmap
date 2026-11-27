@@ -4,9 +4,6 @@
 
 use std::collections::HashMap;
 
-/// TIFF tag ID for `GDAL_METADATA` XML.
-pub(super) const TAG_GDAL_METADATA: u16 = 42112;
-
 /// Parse an ASCII `GDAL_NODATA` (tag 42113) string into a numeric nodata
 /// sentinel (`Some(f64::NAN)` for `"nan"`, or finite `f64`), returning `None`
 /// when empty or unparseable.

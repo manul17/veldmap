@@ -103,6 +103,31 @@ fn default_categorical_palette(has_color_map: bool) -> CategoricalPaletteId {
     }
 }
 
+/// Origin of an [`OverlayLayer`]: either a local file on disk or a remote
+/// Cloud-Optimized GeoTIFF accessed via HTTP Range requests.
+pub(super) enum LayerOrigin {
+    Local {
+        path: PathBuf,
+    },
+    Remote {
+        display_url: String,
+        range: HttpRangeSource,
+    },
+}
+
+/// Input parameters for constructing a remote Cloud-Optimized GeoTIFF
+/// [`OverlayLayer`] via [`OverlayLayer::from_remote_source`].
+pub(super) struct RemoteLayerSpec {
+    pub(super) id: LayerId,
+    pub(super) title: String,
+    pub(super) display_url: String,
+    pub(super) range_source: HttpRangeSource,
+    pub(super) source: Arc<dyn RasterSource>,
+    pub(super) frame: Frame,
+    pub(super) options: LayerInitOptions,
+    pub(super) relaid: u64,
+}
+
 /// Single georeferenced raster overlay inside [`super::stack::LayerStack`].
 ///
 /// Invariant: `self.streams` is always non-empty (`self.streams[0]` is the
@@ -110,10 +135,7 @@ fn default_categorical_palette(has_color_map: bool) -> CategoricalPaletteId {
 pub(super) struct OverlayLayer {
     id: LayerId,
     name: String,
-    path: PathBuf,
-    is_remote: bool,
-    remote_url: Option<String>,
-    remote_range: Option<HttpRangeSource>,
+    origin: LayerOrigin,
     source: Arc<dyn RasterSource>,
     streams: Vec<LayerStream>,
     band_options: Vec<LayerBandOption>,
@@ -139,15 +161,15 @@ pub(super) struct OverlayLayer {
 }
 
 impl OverlayLayer {
-    pub(super) fn from_source(
+    fn from_parts(
         id: LayerId,
-        path: PathBuf,
+        name: String,
+        origin: LayerOrigin,
         source: Arc<dyn RasterSource>,
         frame: Frame,
         options: LayerInitOptions,
         relaid: u64,
     ) -> Self {
-        let name = display_name_from_path(&path);
         let desc = source.description();
         let band_options = build_band_options(desc);
 
@@ -182,6 +204,7 @@ impl OverlayLayer {
             }
         }
 
+        let pin_root = matches!(origin, LayerOrigin::Local { .. });
         let fingerprint_hex = source.fingerprint().to_hex();
         let source_pixel_size_m = frame.pixel_size_m(desc.width, desc.height);
         let footprint = frame.footprint_bounds();
@@ -190,17 +213,14 @@ impl OverlayLayer {
         Self {
             id,
             name,
-            path,
-            is_remote: false,
-            remote_url: None,
-            remote_range: None,
+            origin,
             source,
             streams: vec![LayerStream::new(meta)],
             band_options,
             custom_color_map,
             scientific,
             categorical,
-            pin_root: true,
+            pin_root,
             fingerprint_hex,
             frame: Arc::new(frame),
             crs_override: options.crs_override,
@@ -216,34 +236,47 @@ impl OverlayLayer {
         }
     }
 
-    /// Construct a remote Cloud-Optimized GeoTIFF overlay layer. Remote layers
-    /// do not pin root tiles in `PendingUploads` (`pin_root = false`) and carry
-    /// their [`HttpRangeSource`] for asynchronous pinned prefetching.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "remote layer constructor captures explicit remote metadata alongside decoded source"
-    )]
-    pub(super) fn from_remote_source(
+    pub(super) fn from_source(
         id: LayerId,
-        title: String,
-        display_url: String,
-        range_source: HttpRangeSource,
+        path: PathBuf,
         source: Arc<dyn RasterSource>,
         frame: Frame,
         options: LayerInitOptions,
         relaid: u64,
     ) -> Self {
-        let mut layer = Self::from_source(id, PathBuf::new(), source, frame, options, relaid);
-        layer.name = if title.trim().is_empty() {
-            display_url.clone()
+        let name = display_name_from_path(&path);
+        Self::from_parts(
+            id,
+            name,
+            LayerOrigin::Local { path },
+            source,
+            frame,
+            options,
+            relaid,
+        )
+    }
+
+    /// Construct a remote Cloud-Optimized GeoTIFF overlay layer. Remote layers
+    /// do not pin root tiles in `PendingUploads` (`pin_root = false`) and carry
+    /// their [`HttpRangeSource`] for asynchronous pinned prefetching.
+    pub(super) fn from_remote_source(spec: RemoteLayerSpec) -> Self {
+        let name = if spec.title.trim().is_empty() {
+            spec.display_url.clone()
         } else {
-            title
+            spec.title
         };
-        layer.is_remote = true;
-        layer.remote_url = Some(display_url);
-        layer.remote_range = Some(range_source);
-        layer.pin_root = false;
-        layer
+        Self::from_parts(
+            spec.id,
+            name,
+            LayerOrigin::Remote {
+                display_url: spec.display_url,
+                range: spec.range_source,
+            },
+            spec.source,
+            spec.frame,
+            spec.options,
+            spec.relaid,
+        )
     }
 
     pub(super) fn id(&self) -> LayerId {
@@ -254,16 +287,29 @@ impl OverlayLayer {
         &self.name
     }
 
+    pub(super) fn local_path(&self) -> Option<&Path> {
+        match &self.origin {
+            LayerOrigin::Local { path } => Some(path.as_path()),
+            LayerOrigin::Remote { .. } => None,
+        }
+    }
+
     pub(super) fn is_remote(&self) -> bool {
-        self.is_remote
+        matches!(self.origin, LayerOrigin::Remote { .. })
     }
 
     pub(super) fn remote_url(&self) -> Option<&str> {
-        self.remote_url.as_deref()
+        match &self.origin {
+            LayerOrigin::Remote { display_url, .. } => Some(display_url.as_str()),
+            LayerOrigin::Local { .. } => None,
+        }
     }
 
     pub(super) fn remote_range(&self) -> Option<&HttpRangeSource> {
-        self.remote_range.as_ref()
+        match &self.origin {
+            LayerOrigin::Remote { range, .. } => Some(range),
+            LayerOrigin::Local { .. } => None,
+        }
     }
 
     pub(super) fn source(&self) -> &Arc<dyn RasterSource> {
@@ -500,14 +546,15 @@ impl OverlayLayer {
         })
     }
 
-    pub(super) fn persist_entry(&self) -> OverlayPersistEntry<'_> {
-        OverlayPersistEntry {
-            path: &self.path,
+    pub(super) fn persist_entry(&self) -> Option<OverlayPersistEntry<'_>> {
+        let path = self.local_path()?;
+        Some(OverlayPersistEntry {
+            path,
             visible: self.visible,
             opacity: self.opacity,
             crs_override: self.crs_override.as_ref(),
             style: self.saved_style(),
-        }
+        })
     }
 
     pub(super) fn visible_cells(&mut self, level: u8, frustum: &CullFrustum) -> Vec<(u32, u32)> {
@@ -666,9 +713,5 @@ impl OverlayLayer {
         for s in &mut self.streams {
             s.clear_wanted();
         }
-    }
-
-    pub(super) fn path(&self) -> &Path {
-        &self.path
     }
 }

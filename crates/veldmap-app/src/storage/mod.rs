@@ -294,7 +294,7 @@ impl AppStorage {
         }
     }
 
-    /// Phase 2 of deterministic shutdown: join the maintenance worker thread
+    /// Phase 3 of deterministic shutdown: join the maintenance worker thread
     /// cleanly so pending `SaveSettings` and `SaveSession` writes flush and
     /// the final `Arc<TileDiskCache>` flushes touches on drop.
     pub(crate) fn finish_shutdown(&mut self) {

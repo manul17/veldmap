@@ -23,7 +23,7 @@ use veldmap_net::NetworkStatus;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use bundled::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG, BUNDLED_MAX_LEVEL};
-pub(crate) use manager::BasemapManager;
+pub(crate) use manager::{BasemapManager, BasemapManagerDeps};
 
 /// App-owned view of live HTTP streaming status so `ui::basemap` never depends
 /// on `veldmap-net` types directly.

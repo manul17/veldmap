@@ -8,16 +8,19 @@ use eframe::egui;
 
 use crate::layers::CrsOverride;
 use crate::measure::{MeasureMode, MeasureSession};
-use crate::stac::{StacCatalogPreset, resolve_cog_auth};
+use crate::stac::{StacSession, resolve_cog_auth};
 use crate::storage::session::SavedCameraPose;
-use crate::ui::basemap::{BasemapUiAction, SettingsTab};
+use crate::storage::settings::BasemapSelection;
+use crate::ui::basemap::BasemapUiAction;
 use crate::ui::crs_picker::CrsPickerAction;
 use crate::ui::format;
 use crate::ui::layers::{EditPersist, LayerUiAction};
 use crate::ui::measure::MeasureAction;
+use crate::ui::settings::{SettingsAction, SettingsTab};
 use crate::ui::stac::StacUiAction;
 use crate::ui::toolbar::ToolbarAction;
 use crate::ui::workbench::WorkbenchTab;
+use crate::vectors::VectorLayerId;
 
 use super::VeldmapApp;
 use super::dialogs::{DialogSpawnError, FileDialogEvent};
@@ -154,20 +157,13 @@ impl VeldmapApp {
                     }
                     needs_repaint = true;
                 }
-                LayerUiAction::ToggleVectorVisibility(id, visible) => {
-                    let changed = self.scene.set_vector_visible(id, visible);
+                LayerUiAction::EditVector { id, edit, persist } => {
+                    let changed = self.scene.edit_vector(id, edit);
                     needs_repaint |= changed;
-                    session_dirty |= changed;
-                }
-                LayerUiAction::SetVectorOpacity(id, opacity, commit) => {
-                    let changed = self.scene.set_vector_opacity(id, opacity);
-                    needs_repaint |= changed;
-                    session_dirty |= commit;
-                }
-                LayerUiAction::RemoveVector(id) => {
-                    let changed = self.scene.remove_vector(id);
-                    needs_repaint |= changed;
-                    session_dirty |= changed;
+                    session_dirty |= match persist {
+                        EditPersist::OnChange => changed,
+                        EditPersist::OnCommit(commit) => commit,
+                    };
                 }
                 LayerUiAction::UseVectorAsStacAoi(id) => {
                     self.use_vector_as_stac_aoi(id);
@@ -182,15 +178,7 @@ impl VeldmapApp {
         needs_repaint
     }
 
-    fn set_stac_local_error(&mut self, msg: String) {
-        self.scene.mutate_stac(|s| {
-            s.clear_error();
-            ((), false)
-        });
-        self.panels.stac.local_error = Some(msg);
-    }
-
-    fn use_vector_as_stac_aoi(&mut self, id: crate::vectors::VectorLayerId) {
+    fn use_vector_as_stac_aoi(&mut self, id: VectorLayerId) {
         if let Some(geom) = self.scene.vectors().first_polygon_geometry(id) {
             let label = self
                 .scene
@@ -198,11 +186,8 @@ impl VeldmapApp {
                 .layer_name(id)
                 .map_or_else(|| "GeoJSON AOI".to_owned(), str::to_owned);
             self.cancel_draw_aoi();
-            self.panels.stac.copy_notice = None;
-            self.scene.mutate_stac(|s| {
-                s.set_aoi_geometry(geom, label);
-                ((), true)
-            });
+            self.panels.stac.clear_copy_notice();
+            self.scene.mutate_stac(|s| s.set_aoi_geometry(geom, label));
         }
     }
 
@@ -214,53 +199,39 @@ impl VeldmapApp {
         let mut needs_repaint = false;
         for action in actions {
             match action {
-                StacUiAction::Search { preset, query } => {
-                    let catalog = preset.to_catalog_config(self.storage.settings());
-                    let uses_custom_auth = preset == StacCatalogPreset::Custom;
-                    self.panels.stac.local_error = None;
+                StacUiAction::Search(request) => {
+                    let settings = self.storage.settings();
                     let res = self
                         .scene
-                        .mutate_stac(|s| (s.begin_search(catalog, uses_custom_auth, query), false));
+                        .mutate_stac(|s| s.begin_search(&request, settings));
                     if let Err(err) = res {
-                        self.set_stac_local_error(err);
+                        self.scene.mutate_stac(|s| s.set_error(err));
                     }
                     needs_repaint = true;
                 }
                 StacUiAction::CancelSearch => {
-                    self.panels.stac.local_error = None;
-                    self.scene.mutate_stac(|s| {
-                        s.cancel();
-                        ((), false)
-                    });
+                    self.scene.mutate_stac(StacSession::cancel);
                     needs_repaint = true;
                 }
                 StacUiAction::ClearResults => {
-                    self.panels.stac.local_error = None;
-                    self.scene.mutate_stac(|s| {
-                        let changed = s.clear_results();
-                        ((), changed)
-                    });
+                    self.scene.mutate_stac(StacSession::clear_results);
                     needs_repaint = true;
                 }
                 StacUiAction::DismissError => {
-                    self.panels.stac.local_error = None;
-                    self.scene.mutate_stac(|s| {
-                        s.clear_error();
-                        ((), false)
-                    });
+                    self.scene.mutate_stac(StacSession::clear_error);
                     needs_repaint = true;
                 }
                 StacUiAction::CaptureViewportAoi => {
                     if let Some(bbox) = self.viewport.viewport_bbox(&self.camera) {
                         self.cancel_draw_aoi();
-                        self.scene.mutate_stac(|s| {
-                            let changed = s.set_aoi_bbox(bbox, "Viewport".to_owned());
-                            ((), changed)
-                        });
+                        self.scene
+                            .mutate_stac(|s| s.set_aoi_bbox(bbox, "Viewport".to_owned()));
                     } else {
-                        self.set_stac_local_error(
-                            "Zoom onto the globe before capturing Viewport AOI.".to_owned(),
-                        );
+                        self.scene.mutate_stac(|s| {
+                            s.set_error(
+                                "Zoom onto the globe before capturing Viewport AOI.".to_owned(),
+                            );
+                        });
                     }
                     needs_repaint = true;
                 }
@@ -274,39 +245,32 @@ impl VeldmapApp {
                 }
                 StacUiAction::ClearAoi => {
                     self.cancel_draw_aoi();
-                    self.scene.mutate_stac(|s| {
-                        let changed = s.clear_aoi();
-                        ((), changed)
-                    });
+                    self.scene.mutate_stac(StacSession::clear_aoi);
                     needs_repaint = true;
                 }
                 StacUiAction::CopyAoiGeoJson => {
                     if let Some(json) = self.scene.stac().export_aoi_geojson() {
                         ctx.copy_text(json);
-                        self.panels.stac.copy_notice = Some("Copied AOI GeoJSON.".to_owned());
+                        self.panels
+                            .stac
+                            .set_copy_notice("Copied AOI GeoJSON.".to_owned());
                         needs_repaint = true;
                     }
                 }
                 StacUiAction::CopyAoiWkt => {
                     if let Some(wkt) = self.scene.stac().export_aoi_wkt() {
                         ctx.copy_text(wkt);
-                        self.panels.stac.copy_notice = Some("Copied AOI WKT.".to_owned());
+                        self.panels
+                            .stac
+                            .set_copy_notice("Copied AOI WKT.".to_owned());
                         needs_repaint = true;
                     }
                 }
                 StacUiAction::SelectItem(idx) => {
-                    let changed = self.scene.mutate_stac(|s| {
-                        let c = s.set_selected(Some(idx));
-                        (c, c)
-                    });
-                    needs_repaint |= changed;
+                    needs_repaint |= self.scene.mutate_stac(|s| s.set_selected(Some(idx)));
                 }
                 StacUiAction::HoverItem(idx) => {
-                    let changed = self.scene.mutate_stac(|s| {
-                        let c = s.set_hovered(idx);
-                        (c, c)
-                    });
-                    needs_repaint |= changed;
+                    needs_repaint |= self.scene.mutate_stac(|s| s.set_hovered(idx));
                 }
                 StacUiAction::ZoomToExtent(bounds) => {
                     self.focus_footprint(bounds);
@@ -318,8 +282,9 @@ impl VeldmapApp {
                     auth_mode,
                     scale_offset,
                 } => {
+                    let raw_url = url.into_inner();
                     let (final_url, headers) = resolve_cog_auth(
-                        &url,
+                        &raw_url,
                         auth_mode,
                         self.scene.stac(),
                         self.storage.settings(),
@@ -331,17 +296,14 @@ impl VeldmapApp {
                         scale_offset,
                         true,
                     ) {
-                        self.set_stac_local_error(err);
+                        self.scene.mutate_stac(|s| s.set_error(err));
                     } else {
-                        self.panels.stac.local_error = None;
+                        self.scene.mutate_stac(StacSession::clear_error);
                     }
                     needs_repaint = true;
                 }
                 StacUiAction::OpenStacSettings => {
-                    self.panels
-                        .basemap
-                        .open_settings_tab(self.storage.settings(), SettingsTab::StacCloud);
-                    self.storage.maybe_refresh_disk_stats(true);
+                    self.open_settings_tab(SettingsTab::StacCloud);
                     needs_repaint = true;
                 }
             }
@@ -373,6 +335,24 @@ impl VeldmapApp {
         }
     }
 
+    pub(super) fn apply_settings_action(&mut self, action: SettingsAction) -> bool {
+        let mut needs_repaint = false;
+        match action {
+            SettingsAction::ApplyDraft(draft) => {
+                needs_repaint |= self.storage.mutate_settings(|s| draft.apply_into(s));
+                needs_repaint |= self.scene.sync_settings(self.storage.settings());
+                self.panels
+                    .settings
+                    .sync_from_settings(self.storage.settings());
+            }
+            SettingsAction::ClearDiskCache => {
+                self.storage.request_clear_disk_cache();
+                needs_repaint = true;
+            }
+        }
+        needs_repaint
+    }
+
     pub(super) fn apply_basemap_action(&mut self, action: BasemapUiAction) -> bool {
         let mut needs_repaint = false;
         match action {
@@ -382,25 +362,19 @@ impl VeldmapApp {
                     .mutate_settings(|s| s.active_basemap = selection);
                 needs_repaint |= self.scene.sync_settings(self.storage.settings());
                 self.panels
-                    .basemap
+                    .settings
                     .set_draft_active_basemap(self.storage.settings().active_basemap);
             }
-            BasemapUiAction::ApplyDraft(draft) => {
-                needs_repaint |= self.storage.mutate_settings(|s| draft.apply_into(s));
-                needs_repaint |= self.scene.sync_settings(self.storage.settings());
+            BasemapUiAction::ConfigureCustomXyz => {
+                self.open_settings_tab(SettingsTab::Basemap);
                 self.panels
-                    .basemap
-                    .sync_from_settings(self.storage.settings());
-            }
-            BasemapUiAction::SettingsOpened => {
-                self.storage.maybe_refresh_disk_stats(true);
-            }
-            BasemapUiAction::ClearDiskCache => {
-                self.storage.request_clear_disk_cache();
+                    .settings
+                    .set_draft_active_basemap(BasemapSelection::CustomXyz);
                 needs_repaint = true;
             }
-            BasemapUiAction::ClearDiskCacheNotice => {
-                self.storage.clear_disk_cache_notice();
+            BasemapUiAction::ToggleSettings => {
+                self.toggle_settings();
+                needs_repaint = true;
             }
             BasemapUiAction::RetryLive => {
                 self.scene.retry_live_and_reconcile();

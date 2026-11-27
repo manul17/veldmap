@@ -66,12 +66,25 @@ const SCALE_BAR_GAP_PT: f32 = 16.0;
 const SCALE_BAR_MIN_WIDTH_PT: f32 = 48.0;
 const SCALE_BAR_MAX_WIDTH_PT: f32 = 160.0;
 
+fn scale_bar_max_width(available_width: f32) -> f32 {
+    (available_width * 0.35).clamp(SCALE_BAR_MIN_WIDTH_PT, SCALE_BAR_MAX_WIDTH_PT)
+}
+
+fn paint_hud_card(painter: &egui::Painter, rect: egui::Rect) {
+    painter.rect_filled(rect, 6.0, HUD_PANEL_BG);
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, HUD_BORDER_SUBTLE),
+        egui::StrokeKind::Inside,
+    );
+}
+
 /// Horizontal screen width in logical points reserved on the bottom-left for
 /// the metric scale bar plus spacing, so right-aligned viewport overlays (e.g.
 /// the basemap attribution pill) never collide with it.
 fn scale_bar_reserved_width(viewport_width_pt: f32) -> f32 {
-    let max_bar_w =
-        (viewport_width_pt * 0.35).clamp(SCALE_BAR_MIN_WIDTH_PT, SCALE_BAR_MAX_WIDTH_PT);
+    let max_bar_w = scale_bar_max_width(viewport_width_pt);
     SCALE_BAR_MARGIN_PT + max_bar_w + SCALE_BAR_PAD_X_PT * 2.0 + SCALE_BAR_GAP_PT
 }
 
@@ -96,8 +109,7 @@ pub(crate) fn paint_scale_bar(
     {
         return None;
     }
-    let max_width_pt =
-        (viewport_rect.width() * 0.35).clamp(SCALE_BAR_MIN_WIDTH_PT, SCALE_BAR_MAX_WIDTH_PT);
+    let max_width_pt = scale_bar_max_width(viewport_rect.width());
     // Hide the tangent-plane scale bar at extreme orbital zoom where the bar
     // would exceed 10,000 km and no longer reflects curved planetary scale.
     if m_per_pt * f64::from(max_width_pt) > 10_000_000.0 {
@@ -118,13 +130,7 @@ pub(crate) fn paint_scale_bar(
         egui::vec2(box_w, box_h),
     );
 
-    painter.rect_filled(box_rect, 6.0, HUD_PANEL_BG);
-    painter.rect_stroke(
-        box_rect,
-        6.0,
-        egui::Stroke::new(1.0, HUD_BORDER_SUBTLE),
-        egui::StrokeKind::Inside,
-    );
+    paint_hud_card(painter, box_rect);
 
     let y_bar = box_rect.bottom() - pad_y - 3.0;
     let x0 = box_rect.left() + pad_x;
@@ -301,13 +307,7 @@ pub(crate) fn paint_colorbar(
         egui::vec2(box_w, box_h),
     );
 
-    painter.rect_filled(box_rect, 6.0, HUD_PANEL_BG);
-    painter.rect_stroke(
-        box_rect,
-        6.0,
-        egui::Stroke::new(1.0, HUD_BORDER_SUBTLE),
-        egui::StrokeKind::Inside,
-    );
+    paint_hud_card(painter, box_rect);
 
     let pad_x = 8.0;
     let unit_suffix = if info.log10_db {

@@ -26,23 +26,33 @@ pub(super) fn reclaim_space(conn: &Connection, full_vacuum: bool) {
     }
 }
 
+/// Optional behavioral knobs for [`evict_in_tx`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct EvictOptions {
+    /// Optional `tile_id` excluded from eviction (e.g. the newest inserted row).
+    pub protect_id: Option<i64>,
+    /// Start timestamp of the current multi-tile batch; entries at or after
+    /// this timestamp only evict above `max_bytes`, never into the 90% headroom.
+    pub batch_start_ts: Option<i64>,
+    /// Write `cache_meta` even when zero rows were evicted (used after inserts).
+    pub always_write_meta: bool,
+}
+
 /// Evict oldest tiles while `total_bytes > max_bytes`, returning the evicted
 /// `tile_id`s.
 ///
-/// Updates `cache_meta` once when `always_write_meta` is true or when at least
-/// one tile was evicted, avoiding duplicate `UPDATE cache_meta` writes on
+/// Updates `cache_meta` once when `opts.always_write_meta` is true or when at
+/// least one tile was evicted, avoiding duplicate `UPDATE cache_meta` writes on
 /// evicting inserts.
 pub(super) fn evict_in_tx(
     tx: &Transaction<'_>,
     mut total_bytes: u64,
     mut tile_count: u64,
     max_bytes: u64,
-    protect_id: Option<i64>,
-    batch_start_ts: Option<i64>,
-    always_write_meta: bool,
+    opts: EvictOptions,
 ) -> Result<Vec<i64>, rusqlite::Error> {
     if total_bytes <= max_bytes {
-        if always_write_meta {
+        if opts.always_write_meta {
             set_cache_meta_totals(tx, total_bytes, tile_count)?;
         }
         return Ok(Vec::new());
@@ -52,7 +62,7 @@ pub(super) fn evict_in_tx(
     let mut evicted_ids = Vec::new();
 
     {
-        let mut evictor = TileEvictor::new(tx, protect_id)?;
+        let mut evictor = TileEvictor::new(tx, opts.protect_id)?;
         while total_bytes > target {
             let batch = evictor.select_batch(EVICT_BATCH_ROWS)?;
             if batch.is_empty() {
@@ -66,7 +76,9 @@ pub(super) fn evict_in_tx(
                 // inserted by the current batch only evict while `total_bytes > max_bytes`
                 // so a batch never self-evicts into headroom while still honoring the
                 // hard `max_bytes` cap.
-                let is_current_batch = batch_start_ts.is_some_and(|start| last_used_ms >= start);
+                let is_current_batch = opts
+                    .batch_start_ts
+                    .is_some_and(|start| last_used_ms >= start);
                 let limit = if is_current_batch { max_bytes } else { target };
                 if total_bytes <= limit {
                     if is_current_batch {
@@ -89,7 +101,7 @@ pub(super) fn evict_in_tx(
         }
     }
 
-    if always_write_meta || !evicted_ids.is_empty() {
+    if opts.always_write_meta || !evicted_ids.is_empty() {
         set_cache_meta_totals(tx, total_bytes, tile_count)?;
     }
 

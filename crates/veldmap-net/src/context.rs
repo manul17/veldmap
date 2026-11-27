@@ -81,38 +81,20 @@ impl NetContext {
     /// (with same-origin redirect guards when custom auth headers are sent),
     /// shared per-host limiters, and bounded range block / prefetch pools.
     pub fn new(config: NetConfig) -> Result<Self, NetError> {
-        let range_client = build_http_client(&HttpClientConfig {
-            user_agent: &config.user_agent,
-            connect_timeout: config.connect_timeout,
-            read_timeout: config.read_timeout,
-            max_concurrent_per_host: config.max_concurrent_per_host,
-            enable_gzip: false,
-            same_origin_redirects: false,
-        })?;
-        let range_auth_client = build_http_client(&HttpClientConfig {
-            user_agent: &config.user_agent,
-            connect_timeout: config.connect_timeout,
-            read_timeout: config.read_timeout,
-            max_concurrent_per_host: config.max_concurrent_per_host,
-            enable_gzip: false,
-            same_origin_redirects: true,
-        })?;
-        let api_client = build_http_client(&HttpClientConfig {
-            user_agent: &config.user_agent,
-            connect_timeout: config.connect_timeout,
-            read_timeout: config.read_timeout,
-            max_concurrent_per_host: config.max_concurrent_per_host,
-            enable_gzip: true,
-            same_origin_redirects: false,
-        })?;
-        let api_auth_client = build_http_client(&HttpClientConfig {
-            user_agent: &config.user_agent,
-            connect_timeout: config.connect_timeout,
-            read_timeout: config.read_timeout,
-            max_concurrent_per_host: config.max_concurrent_per_host,
-            enable_gzip: true,
-            same_origin_redirects: true,
-        })?;
+        let build_client = |enable_gzip, same_origin_redirects| {
+            build_http_client(&HttpClientConfig {
+                user_agent: &config.user_agent,
+                connect_timeout: config.connect_timeout,
+                read_timeout: config.read_timeout,
+                max_concurrent_per_host: config.max_concurrent_per_host,
+                enable_gzip,
+                same_origin_redirects,
+            })
+        };
+        let range_client = build_client(false, false)?;
+        let range_auth_client = build_client(false, true)?;
+        let api_client = build_client(true, false)?;
+        let api_auth_client = build_client(true, true)?;
 
         let workers = config.worker_threads.max(DEFAULT_RUNTIME_WORKER_THREADS);
         let runtime = tokio::runtime::Builder::new_multi_thread()

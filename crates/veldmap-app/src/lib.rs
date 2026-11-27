@@ -1,5 +1,5 @@
 //! Library surface of `veldmap-app` exposing [`VeldmapApp`], [`AppError`],
-//! and [`render::clamp_to_primary_backends`] for the binary entry point, plus
+//! and [`clamp_to_primary_backends`] for the binary entry point, plus
 //! a `test-support`-gated headless rendering/upload harness for GPU smoke tests
 //! and `naga` shader validation.
 
@@ -16,6 +16,9 @@ mod gpu_tiles;
 pub mod gpu_tiles;
 mod layers;
 mod measure;
+#[cfg(not(any(test, feature = "test-support")))]
+mod render;
+#[cfg(any(test, feature = "test-support"))]
 pub mod render;
 mod scene;
 mod stac;
@@ -29,6 +32,7 @@ pub use app::{AppError, VeldmapApp};
 pub use basemap::policy as basemap_policy;
 #[cfg(any(test, feature = "test-support"))]
 pub use basemap::{BUNDLED_BASEMAP_CONFIG, BUNDLED_BASEMAP_JPEG, BUNDLED_MAX_LEVEL};
+pub use render::clamp_to_primary_backends;
 
 /// Clamp a display opacity into `0.0..=1.0`, falling back to `1.0` for
 /// non-finite values (`NaN` / infinities) so `f32::NAN.clamp(0.0, 1.0)` can

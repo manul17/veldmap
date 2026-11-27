@@ -74,12 +74,12 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
         work: Box::new(|| {}),
     }));
     assert_eq!(
-        lock_unpoisoned(&shared.0).jobs.len(),
+        lock_unpoisoned(&shared.0).jobs().len(),
         DEFAULT_MAX_PENDING_DECODE_JOBS
     );
     assert!(
         lock_unpoisoned(&shared.0)
-            .jobs
+            .jobs()
             .iter()
             .all(|j| j.key.coarseness_rank() == 5)
     );
@@ -93,8 +93,8 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
     }));
     {
         let q = lock_unpoisoned(&shared.0);
-        assert_eq!(q.jobs.len(), DEFAULT_MAX_PENDING_DECODE_JOBS);
-        assert!(q.jobs.iter().any(|j| j.key == tile_key(0, 0, 0)));
+        assert_eq!(q.jobs().len(), DEFAULT_MAX_PENDING_DECODE_JOBS);
+        assert!(q.jobs().iter().any(|j| j.key == tile_key(0, 0, 0)));
     }
 
     // Equal-coarseness incoming job (level 0 with smaller source) must NOT evict peer level-0 jobs.
@@ -146,7 +146,7 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
         }));
     }
     assert_eq!(
-        lock_unpoisoned(&byte_shared.0).queued_bytes,
+        lock_unpoisoned(&byte_shared.0).queued_bytes(),
         DEFAULT_MAX_PENDING_DECODE_BYTES
     );
     // Finer 5th job exceeding 64 MiB is rejected.
@@ -163,7 +163,7 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
         cancel: tok.clone(),
         work: Box::new(|| {}),
     }));
-    assert!(lock_unpoisoned(&byte_shared.0).queued_bytes <= DEFAULT_MAX_PENDING_DECODE_BYTES);
+    assert!(lock_unpoisoned(&byte_shared.0).queued_bytes() <= DEFAULT_MAX_PENDING_DECODE_BYTES);
 
     // Transactional rejection: when evicting ALL strictly-finer jobs still
     // cannot reclaim enough bytes against coarser jobs, the incoming job is
@@ -197,9 +197,9 @@ fn queue_cap_evicts_finer_for_coarser_and_enforces_byte_budget() {
         work: Box::new(|| {}),
     }));
     let tx_q = lock_unpoisoned(&tx_shared.0);
-    assert_eq!(tx_q.jobs.len(), 5);
+    assert_eq!(tx_q.jobs().len(), 5);
     assert!(
-        tx_q.jobs.iter().any(|j| j.key == fine_key),
+        tx_q.jobs().iter().any(|j| j.key == fine_key),
         "failed byte-cap admission must not evict finer queued jobs"
     );
 }

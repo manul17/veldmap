@@ -16,43 +16,52 @@ use tokio::sync::Notify;
 use veldmap_core::io::IoError;
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
 
+use super::transport::RangeTransportError;
+
 /// Cloneable error shared across all singleflight waiters of one range fetch.
 #[derive(Clone, Debug)]
-pub(crate) enum SharedRangeError {
-    Cancelled,
-    PreconditionFailed(String),
-    RangeNotSupported(String),
-    HttpStatus { code: u16, detail: String },
-    InvalidResponse(String),
-    Network(String),
+pub(super) enum SharedRangeError {
+    Transport(RangeTransportError),
     Aborted,
 }
 
+impl From<RangeTransportError> for SharedRangeError {
+    fn from(err: RangeTransportError) -> Self {
+        Self::Transport(err)
+    }
+}
+
 impl SharedRangeError {
-    pub(crate) fn into_io_error(self) -> IoError {
+    pub(super) fn into_io_error(self) -> IoError {
         match self {
-            Self::Cancelled => IoError::Cancelled,
-            Self::PreconditionFailed(msg) => IoError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("remote object changed (HTTP 412 Precondition Failed): {msg}"),
-            )),
-            Self::RangeNotSupported(msg) => IoError::Io(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("HTTP Range not supported: {msg}"),
-            )),
-            Self::HttpStatus { code, detail } => IoError::Io(io::Error::other(format!(
-                "HTTP {code} reading remote range: {detail}"
-            ))),
-            Self::InvalidResponse(msg) => {
+            Self::Transport(RangeTransportError::Cancelled) => IoError::Cancelled,
+            Self::Transport(RangeTransportError::PreconditionFailed(msg)) => {
+                IoError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("remote object changed (HTTP 412 Precondition Failed): {msg}"),
+                ))
+            }
+            Self::Transport(RangeTransportError::RangeNotSupported(msg)) => {
+                IoError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("HTTP Range not supported: {msg}"),
+                ))
+            }
+            Self::Transport(RangeTransportError::HttpStatus { code, detail }) => IoError::Io(
+                io::Error::other(format!("HTTP {code} reading remote range: {detail}")),
+            ),
+            Self::Transport(RangeTransportError::InvalidResponse(msg)) => {
                 IoError::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
             }
-            Self::Network(msg) => IoError::Io(io::Error::other(msg)),
+            Self::Transport(RangeTransportError::Network(msg)) => {
+                IoError::Io(io::Error::other(msg))
+            }
             Self::Aborted => IoError::Io(io::Error::other("remote range fetch task aborted")),
         }
     }
 }
 
-pub(crate) type FetchedBlocks = Arc<HashMap<u64, Arc<[u8]>>>;
+pub(super) type FetchedBlocks = Arc<HashMap<u64, Arc<[u8]>>>;
 
 struct FlightState {
     waiters: usize,
@@ -61,7 +70,7 @@ struct FlightState {
 }
 
 /// Shared state for a single in-flight multi-block HTTP Range fetch.
-pub(crate) struct BlockFlight {
+pub(super) struct BlockFlight {
     range_cancel: CancelToken,
     state: Mutex<FlightState>,
     done: Notify,
@@ -80,7 +89,7 @@ impl BlockFlight {
         }
     }
 
-    pub(crate) fn cancel_token(&self) -> &CancelToken {
+    pub(super) fn cancel_token(&self) -> &CancelToken {
         &self.range_cancel
     }
 
@@ -98,7 +107,7 @@ impl BlockFlight {
     /// Returns `None` if the flight has already finished or its last waiter
     /// dropped and cancelled `range_cancel`, preventing callers from joining a
     /// dying flight and observing a spurious `Cancelled` error.
-    pub(crate) fn try_add_waiter(self: &Arc<Self>) -> Option<WaiterGuard> {
+    pub(super) fn try_add_waiter(self: &Arc<Self>) -> Option<WaiterGuard> {
         {
             let mut st = lock_unpoisoned(&self.state);
             if st.finished || st.waiters == 0 || self.range_cancel.is_cancelled() {
@@ -114,7 +123,7 @@ impl BlockFlight {
     /// Await completion of this flight, returning `Err(IoError::Cancelled)`
     /// immediately if `caller_cancel` triggers (while leaving the underlying
     /// HTTP fetch alive if other waiters remain).
-    pub(crate) async fn wait(
+    pub(super) async fn wait(
         self: &Arc<Self>,
         _guard: WaiterGuard,
         caller_cancel: &CancelToken,
@@ -143,7 +152,7 @@ impl BlockFlight {
 
 /// RAII waiter reference; cancels the shared HTTP fetch only when the last
 /// waiter drops before the fetch finishes.
-pub(crate) struct WaiterGuard {
+pub(super) struct WaiterGuard {
     flight: Arc<BlockFlight>,
 }
 
@@ -162,7 +171,7 @@ impl Drop for WaiterGuard {
 
 /// RAII cleanup guard owned by the spawned leader fetch task so normal finish,
 /// cancellation, or panics always remove entries and wake every waiter.
-pub(crate) struct LeaderCleanupGuard {
+pub(super) struct LeaderCleanupGuard {
     table: Arc<SingleflightTable>,
     blocks: Vec<u64>,
     flight: Arc<BlockFlight>,
@@ -170,7 +179,7 @@ pub(crate) struct LeaderCleanupGuard {
 }
 
 impl LeaderCleanupGuard {
-    pub(crate) fn finish(mut self, outcome: Result<FetchedBlocks, SharedRangeError>) {
+    pub(super) fn finish(mut self, outcome: Result<FetchedBlocks, SharedRangeError>) {
         self.completed = true;
         self.complete_with(outcome);
     }
@@ -208,24 +217,24 @@ impl Drop for LeaderCleanupGuard {
 
 /// Per-source singleflight map deduplicating concurrent block fetches across
 /// aligned 64 KiB block indices.
-pub(crate) struct SingleflightTable {
+pub(super) struct SingleflightTable {
     in_flight: Mutex<HashMap<u64, Arc<BlockFlight>>>,
 }
 
-pub(crate) struct NewFlightSpan {
-    pub(crate) blocks: Vec<u64>,
-    pub(crate) flight: Arc<BlockFlight>,
-    pub(crate) waiter: WaiterGuard,
-    pub(crate) leader_guard: LeaderCleanupGuard,
+pub(super) struct NewFlightSpan {
+    pub(super) blocks: Vec<u64>,
+    pub(super) flight: Arc<BlockFlight>,
+    pub(super) waiter: WaiterGuard,
+    pub(super) leader_guard: LeaderCleanupGuard,
 }
 
-pub(crate) struct ClaimPlan {
-    pub(crate) joined: Vec<(Arc<BlockFlight>, WaiterGuard)>,
-    pub(crate) started: Vec<NewFlightSpan>,
+pub(super) struct ClaimPlan {
+    pub(super) joined: Vec<(Arc<BlockFlight>, WaiterGuard)>,
+    pub(super) started: Vec<NewFlightSpan>,
 }
 
 impl SingleflightTable {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             in_flight: Mutex::new(HashMap::new()),
         }
@@ -234,7 +243,7 @@ impl SingleflightTable {
     /// Partition `missing_blocks` (sorted, deduplicated block indices) into
     /// existing flights to join and contiguous new spans to launch, atomically
     /// registering new flights and attaching `WaiterGuard`s before unlocking.
-    pub(crate) fn claim_spans(
+    pub(super) fn claim_spans(
         self: &Arc<Self>,
         missing_blocks: &[u64],
         max_gap_blocks: u64,

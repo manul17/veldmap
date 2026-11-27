@@ -9,15 +9,25 @@ use crate::layers::{CursorReadout, CursorReadoutValue};
 
 use super::format;
 
+/// Read-only inputs rendered by the bottom GIS status bar.
+#[derive(Clone, Copy)]
+pub(crate) struct StatusBarInputs<'a> {
+    pub(crate) cursor_geo: Option<(f64, f64)>,
+    pub(crate) cursor_readout: Option<&'a CursorReadout>,
+    pub(crate) topmost_source_px: Option<(f64, f64)>,
+    pub(crate) camera: &'a Camera,
+    pub(crate) viewport_height_px: f64,
+}
+
 /// Render the bottom GIS status bar.
-pub(crate) fn show_status_bar(
-    ui: &mut egui::Ui,
-    cursor_geo: Option<(f64, f64)>,
-    cursor_readout: Option<&CursorReadout>,
-    topmost_source_px: Option<(f64, f64)>,
-    camera: &Camera,
-    viewport_height_px: f64,
-) {
+pub(crate) fn show_status_bar(ui: &mut egui::Ui, inputs: StatusBarInputs<'_>) {
+    let StatusBarInputs {
+        cursor_geo,
+        cursor_readout,
+        topmost_source_px,
+        camera,
+        viewport_height_px,
+    } = inputs;
     egui::Panel::bottom("gis_status_bar").show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             let cursor_text = match cursor_geo {

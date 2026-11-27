@@ -71,12 +71,32 @@ const SETTINGS_SCHEMA_VERSION: u32 = 1;
 /// layers.
 const DEFAULT_GIBS_DATE: &str = "2024-07-01";
 
+/// Forward-compatible deserializer for string-encoded settings enums: unknown
+/// string variants written by newer versions warn and fall back to
+/// `T::default()`, while non-string JSON still errors so corrupt
+/// `settings.json` files trigger `.corrupt` backup recovery.
+fn deserialize_lossy_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + for<'a> Deserialize<'a>,
+{
+    let raw = String::deserialize(deserializer)?;
+    let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&raw);
+    Ok(T::deserialize(de).unwrap_or_else(|_| {
+        tracing::warn!(
+            variant = %raw,
+            "Unknown settings enum variant in settings.json; falling back to default"
+        );
+        T::default()
+    }))
+}
+
 /// Active planetary basemap selection persisted across sessions.
 ///
 /// Unknown string variants encountered when loading settings written by a newer
 /// version fall back to [`Self::BundledBlueMarble`] with a warning instead of
 /// discarding the entire `settings.json` file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BasemapSelection {
     /// Bundled public-domain NASA Blue Marble (`z = 0..3` Geodetic + `z = 0` PolarCap).
@@ -92,30 +112,6 @@ pub(crate) enum BasemapSelection {
     CustomXyz,
     /// Untextured WGS84 ellipsoid rendered through the exact same quadtree.
     EllipsoidOnly,
-}
-
-impl<'de> Deserialize<'de> for BasemapSelection {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        match raw.as_str() {
-            "bundled_blue_marble" => Ok(Self::BundledBlueMarble),
-            "nasa_gibs_blue_marble" => Ok(Self::NasaGibsBlueMarble),
-            "nasa_gibs_viirs" => Ok(Self::NasaGibsViirs),
-            "eox_sentinel2_cloudless" => Ok(Self::EoxSentinel2Cloudless),
-            "custom_xyz" => Ok(Self::CustomXyz),
-            "ellipsoid_only" => Ok(Self::EllipsoidOnly),
-            other => {
-                tracing::warn!(
-                    variant = other,
-                    "Unknown active_basemap variant in settings.json; falling back to bundled_blue_marble"
-                );
-                Ok(Self::BundledBlueMarble)
-            }
-        }
-    }
 }
 
 impl BasemapSelection {
@@ -199,7 +195,7 @@ impl fmt::Debug for CustomXyzSettings {
 }
 
 /// Authentication mechanism for custom STAC API catalogs and their COG assets.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StacAuthKind {
     #[default]
@@ -207,25 +203,6 @@ pub(crate) enum StacAuthKind {
     Bearer,
     ApiKey,
     SasQuery,
-}
-
-impl<'de> Deserialize<'de> for StacAuthKind {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        Ok(match raw.as_str() {
-            "none" => Self::None,
-            "bearer" => Self::Bearer,
-            "api_key" => Self::ApiKey,
-            "sas_query" => Self::SasQuery,
-            other => {
-                tracing::warn!(
-                    auth_kind = %other,
-                    "Unknown STAC auth_kind in settings.json; falling back to none"
-                );
-                Self::None
-            }
-        })
-    }
 }
 
 impl StacAuthKind {
@@ -248,6 +225,7 @@ impl StacAuthKind {
 pub(crate) struct StacSettings {
     pub(crate) custom_endpoint: String,
     pub(crate) custom_collection: String,
+    #[serde(deserialize_with = "deserialize_lossy_default")]
     pub(crate) auth_kind: StacAuthKind,
     pub(crate) auth_header_name: String,
     pub(crate) auth_secret: String,
@@ -350,7 +328,7 @@ impl fmt::Debug for StacSettings {
 /// (such as `show_graticule`) or overwrite valid saved values with half-typed
 /// invalid inputs while keeping `ui/` free of persistence rules.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BasemapSettingsDraft {
+pub(crate) struct AppSettingsDraft {
     pub(crate) active_basemap: BasemapSelection,
     pub(crate) gibs_date: String,
     pub(crate) custom_xyz: CustomXyzSettings,
@@ -359,7 +337,7 @@ pub(crate) struct BasemapSettingsDraft {
     pub(crate) stac: StacSettings,
 }
 
-impl BasemapSettingsDraft {
+impl AppSettingsDraft {
     pub(crate) fn from_settings(settings: &AppSettings) -> Self {
         Self {
             active_basemap: settings.active_basemap,
@@ -414,6 +392,7 @@ pub(crate) struct BasemapConfigView<'a> {
 #[serde(default)]
 pub(crate) struct AppSettings {
     pub(crate) version: u32,
+    #[serde(deserialize_with = "deserialize_lossy_default")]
     pub(crate) active_basemap: BasemapSelection,
     pub(crate) gibs_date: String,
     pub(crate) custom_xyz: CustomXyzSettings,

@@ -24,13 +24,11 @@ use veldmap_core::tile::{
 use crate::image_codec::{
     decode_jpeg_pixels_to_rgba8, jpeg_codec_working_bytes, jpeg_pixel_format_channels,
 };
-use crate::pipeline::cascade::{self, Cascade, TileEmit, bleed_display_emit};
-use crate::pipeline::metadata::{
-    BandInfo, BandSample, GeoPlacement, RasterDescription, SampleType,
+use crate::pipeline::{
+    BandInfo, BandSample, Cascade, DISPLAY_STREAM_SPEC, DecodeContext, GeoPlacement, LevelPlan,
+    RasterDescription, RasterSource, SampleType, ServeMode, TileEmit, Window, bleed_display_emit,
+    cascade_bytes, resample_rgba8_window,
 };
-use crate::pipeline::plan::{DISPLAY_STREAM_SPEC, LevelPlan, ServeMode};
-use crate::pipeline::resample::{Window, resample_rgba8_window};
-use crate::pipeline::{DecodeContext, RasterSource};
 use crate::{RasterError, map_std_io_error};
 
 use super::world_file_binding_trouble;
@@ -335,7 +333,7 @@ fn jpeg_level_peak_bytes(inputs: JpegPeakInputs) -> u64 {
         .max(rgba.saturating_add(resampled));
     codec_working
         .saturating_add(max_frame_pair)
-        .saturating_add(cascade::bytes(lw, lh, PixelFormat::Rgba8UnormSrgb))
+        .saturating_add(cascade_bytes(lw, lh, PixelFormat::Rgba8UnormSrgb))
 }
 
 fn map_jpeg_error(err: jpeg_decoder::Error, cancel: &CancelToken) -> RasterError {

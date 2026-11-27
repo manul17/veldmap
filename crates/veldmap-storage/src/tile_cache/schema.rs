@@ -1,9 +1,11 @@
 //! SQLite WAL schema initialization, pragmas, schema-version upgrades, sidecar
 //! path utilities, and corrupt-file recovery for [`super::TileDiskCache`].
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
+
+use crate::paths::append_path_suffix;
 
 /// Current SQLite schema version (`PRAGMA user_version`).
 ///
@@ -20,12 +22,6 @@ const SQLITE_PAGE_SIZE: i64 = 16_384;
 /// multi-process WAL startups never fail prematurely with `SQLITE_BUSY`.
 const SQLITE_BUSY_TIMEOUT_MS: i64 = 5000;
 
-pub(super) fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut os = path.as_os_str().to_os_string();
-    os.push(suffix);
-    PathBuf::from(os)
-}
-
 pub(super) fn is_corrupt_sqlite_error(err: &rusqlite::Error) -> bool {
     matches!(
         err.sqlite_error_code(),
@@ -36,8 +32,8 @@ pub(super) fn is_corrupt_sqlite_error(err: &rusqlite::Error) -> bool {
 pub(super) fn remove_sqlite_files(path: &Path) {
     for candidate in [
         path.to_path_buf(),
-        sidecar_path(path, "-wal"),
-        sidecar_path(path, "-shm"),
+        append_path_suffix(path, "-wal"),
+        append_path_suffix(path, "-shm"),
     ] {
         if let Err(err) = std::fs::remove_file(&candidate)
             && err.kind() != std::io::ErrorKind::NotFound

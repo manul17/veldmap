@@ -7,9 +7,9 @@ use super::mesh::TileVertex;
 use super::overlay::OverlayVertex;
 use super::uniforms::{
     CameraUniform, CategoricalPatchUniform, OverlayPatchUniform, PaletteUniform,
-    ScientificPatchUniform, TileUniform, VectorUniform,
+    ScientificPatchUniform, TileUniform, UNIFORM_SLOT_COUNT, UniformSlot, VectorUniform,
 };
-use super::vector::{GpuRibbonSegment, GpuVectorVertex};
+use super::vector_pack::{GpuRibbonSegment, GpuVectorVertex};
 use super::{
     COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL, OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL,
     VECTOR_WGSL,
@@ -64,30 +64,55 @@ fn create_globe_pipeline(
     })
 }
 
+/// Owned globe body (Pass 1) and procedural graticule (Pass 2) pipelines.
+pub(super) struct BodyPipelines {
+    pub(super) ellipsoid: wgpu::RenderPipeline,
+    pub(super) textured: wgpu::RenderPipeline,
+    pub(super) grid: wgpu::RenderPipeline,
+}
+
+/// Owned Pass-2 raster overlay render pipelines passed by reference into
+/// [`super::overlay::OverlayRenderer::record_pass`].
+pub(super) struct OverlayPipelines {
+    pub(super) display: wgpu::RenderPipeline,
+    pub(super) scientific: wgpu::RenderPipeline,
+    pub(super) categorical: wgpu::RenderPipeline,
+}
+
+/// Owned Pass-2 vector render pipelines passed by reference into
+/// [`super::vector::VectorRenderer::record_pass`].
+pub(super) struct VectorPipelines {
+    pub(super) fill: wgpu::RenderPipeline,
+    pub(super) line: wgpu::RenderPipeline,
+    pub(super) point: wgpu::RenderPipeline,
+}
+
+/// Owned 1:1 offscreen-to-swapchain composite bind-group layout, sampler, and
+/// render pipeline.
+pub(super) struct CompositePipelines {
+    pub(super) layout: wgpu::BindGroupLayout,
+    pub(super) sampler: wgpu::Sampler,
+    pub(super) pipeline: wgpu::RenderPipeline,
+}
+
 pub(super) struct GlobePipelines {
     pub(super) layouts: SharedLayouts,
-    pub(super) body_ellipsoid_pipeline: wgpu::RenderPipeline,
-    pub(super) body_textured_pipeline: wgpu::RenderPipeline,
-    pub(super) overlay_pipeline: wgpu::RenderPipeline,
-    pub(super) overlay_scientific_pipeline: wgpu::RenderPipeline,
-    pub(super) overlay_categorical_pipeline: wgpu::RenderPipeline,
-    pub(super) vector_fill_pipeline: wgpu::RenderPipeline,
-    pub(super) vector_line_pipeline: wgpu::RenderPipeline,
-    pub(super) vector_point_pipeline: wgpu::RenderPipeline,
-    pub(super) grid_pipeline: wgpu::RenderPipeline,
-    pub(super) composite_layout: wgpu::BindGroupLayout,
-    pub(super) composite_sampler: wgpu::Sampler,
-    pub(super) composite_pipeline: wgpu::RenderPipeline,
+    pub(super) body: BodyPipelines,
+    pub(super) overlay: OverlayPipelines,
+    pub(super) vector: VectorPipelines,
+    pub(super) composite: CompositePipelines,
 }
 
 pub(super) struct SharedLayouts {
     pub(super) camera_layout: wgpu::BindGroupLayout,
-    pub(super) tile_uniform_layout: wgpu::BindGroupLayout,
-    pub(super) overlay_uniform_layout: wgpu::BindGroupLayout,
-    pub(super) scientific_uniform_layout: wgpu::BindGroupLayout,
-    pub(super) categorical_uniform_layout: wgpu::BindGroupLayout,
+    pub(super) dynamic_uniform_layouts: [wgpu::BindGroupLayout; UNIFORM_SLOT_COUNT],
     pub(super) palette_uniform_layout: wgpu::BindGroupLayout,
-    pub(super) vector_uniform_layout: wgpu::BindGroupLayout,
+}
+
+impl SharedLayouts {
+    pub(super) fn dynamic_uniform_layout(&self, slot: UniformSlot) -> &wgpu::BindGroupLayout {
+        &self.dynamic_uniform_layouts[slot.index()]
+    }
 }
 
 fn uniform_buffer_layout<T>(
@@ -142,71 +167,67 @@ fn create_shared_layouts(device: &wgpu::Device) -> SharedLayouts {
     let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
     let camera_layout =
         uniform_buffer_layout::<CameraUniform>(device, "globe camera bind group layout", vf, false);
-    let tile_uniform_layout = uniform_buffer_layout::<TileUniform>(
-        device,
-        "globe per-tile dynamic uniform layout",
-        vf,
-        true,
-    );
-    let overlay_uniform_layout = uniform_buffer_layout::<OverlayPatchUniform>(
-        device,
-        "overlay patch dynamic uniform layout",
-        vf,
-        true,
-    );
-    let scientific_uniform_layout = uniform_buffer_layout::<ScientificPatchUniform>(
-        device,
-        "scientific overlay patch dynamic uniform layout",
-        vf,
-        true,
-    );
-    let categorical_uniform_layout = uniform_buffer_layout::<CategoricalPatchUniform>(
-        device,
-        "categorical overlay patch dynamic uniform layout",
-        vf,
-        true,
-    );
+    let dynamic_uniform_layouts = std::array::from_fn(|idx| match UniformSlot::ALL[idx] {
+        UniformSlot::Tile => uniform_buffer_layout::<TileUniform>(
+            device,
+            "globe per-tile dynamic uniform layout",
+            vf,
+            true,
+        ),
+        UniformSlot::Overlay => uniform_buffer_layout::<OverlayPatchUniform>(
+            device,
+            "overlay patch dynamic uniform layout",
+            vf,
+            true,
+        ),
+        UniformSlot::Scientific => uniform_buffer_layout::<ScientificPatchUniform>(
+            device,
+            "scientific overlay patch dynamic uniform layout",
+            vf,
+            true,
+        ),
+        UniformSlot::Categorical => uniform_buffer_layout::<CategoricalPatchUniform>(
+            device,
+            "categorical overlay patch dynamic uniform layout",
+            vf,
+            true,
+        ),
+        UniformSlot::Vector => uniform_buffer_layout::<VectorUniform>(
+            device,
+            "vector dynamic uniform layout",
+            vf,
+            true,
+        ),
+    });
     let palette_uniform_layout = uniform_buffer_layout::<PaletteUniform>(
         device,
         "overlay palette LUT uniform layout",
         wgpu::ShaderStages::FRAGMENT,
         false,
     );
-    let vector_uniform_layout =
-        uniform_buffer_layout::<VectorUniform>(device, "vector dynamic uniform layout", vf, true);
 
     SharedLayouts {
         camera_layout,
-        tile_uniform_layout,
-        overlay_uniform_layout,
-        scientific_uniform_layout,
-        categorical_uniform_layout,
+        dynamic_uniform_layouts,
         palette_uniform_layout,
-        vector_uniform_layout,
     }
 }
 
-fn create_body_and_grid_pipelines(
+fn create_body_pipelines(
     device: &wgpu::Device,
     layouts: &SharedLayouts,
     rgba8_tile_layout: &wgpu::BindGroupLayout,
-) -> (
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-) {
+) -> BodyPipelines {
     let globe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("globe wgsl"),
         source: wgpu::ShaderSource::Wgsl(GLOBE_WGSL.into()),
     });
 
+    let tile_layout = layouts.dynamic_uniform_layout(UniformSlot::Tile);
     let untextured_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("globe untextured pipeline layout"),
-            bind_group_layouts: &[
-                Some(&layouts.camera_layout),
-                Some(&layouts.tile_uniform_layout),
-            ],
+            bind_group_layouts: &[Some(&layouts.camera_layout), Some(tile_layout)],
             immediate_size: 0,
         });
 
@@ -214,7 +235,7 @@ fn create_body_and_grid_pipelines(
         label: Some("globe textured pipeline layout"),
         bind_group_layouts: &[
             Some(&layouts.camera_layout),
-            Some(&layouts.tile_uniform_layout),
+            Some(tile_layout),
             Some(rgba8_tile_layout),
         ],
         immediate_size: 0,
@@ -230,7 +251,7 @@ fn create_body_and_grid_pipelines(
         })
     };
 
-    let body_ellipsoid_pipeline = create_globe_pipeline(
+    let ellipsoid = create_globe_pipeline(
         device,
         &globe_shader,
         &untextured_pipeline_layout,
@@ -246,7 +267,7 @@ fn create_body_and_grid_pipelines(
         },
     );
 
-    let body_textured_pipeline = create_globe_pipeline(
+    let textured = create_globe_pipeline(
         device,
         &globe_shader,
         &textured_pipeline_layout,
@@ -264,7 +285,7 @@ fn create_body_and_grid_pipelines(
 
     // Post-body graticule runs inside the depth-less (`depth_stencil_attachment: None`)
     // color pass directly above draped raster overlays and vector layers.
-    let grid_pipeline = create_globe_pipeline(
+    let grid = create_globe_pipeline(
         device,
         &globe_shader,
         &untextured_pipeline_layout,
@@ -280,11 +301,11 @@ fn create_body_and_grid_pipelines(
         },
     );
 
-    (
-        body_ellipsoid_pipeline,
-        body_textured_pipeline,
-        grid_pipeline,
-    )
+    BodyPipelines {
+        ellipsoid,
+        textured,
+        grid,
+    }
 }
 
 fn create_overlay_track_pipeline(
@@ -326,46 +347,42 @@ fn create_overlay_pipelines(
     device: &wgpu::Device,
     layouts: &SharedLayouts,
     tile_bind_groups: &TileBindGroupCache,
-) -> (
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-) {
-    let display_pipeline = create_overlay_track_pipeline(
+) -> OverlayPipelines {
+    let display = create_overlay_track_pipeline(
         device,
         "overlay warp-mesh wgsl",
         OVERLAY_WGSL,
         "overlay warp-mesh pipeline layout",
         &[
             Some(&layouts.camera_layout),
-            Some(&layouts.overlay_uniform_layout),
+            Some(layouts.dynamic_uniform_layout(UniformSlot::Overlay)),
             Some(tile_bind_groups.rgba8_layout()),
         ],
         "overlay display warp-mesh pipeline (depth-less)",
         "fs_overlay",
     );
-    let scientific_pipeline = create_overlay_track_pipeline(
+    let scientific = create_overlay_track_pipeline(
         device,
         "overlay scientific R32Float wgsl",
         OVERLAY_SCIENTIFIC_WGSL,
         "overlay scientific pipeline layout",
         &[
             Some(&layouts.camera_layout),
-            Some(&layouts.scientific_uniform_layout),
+            Some(layouts.dynamic_uniform_layout(UniformSlot::Scientific)),
             Some(tile_bind_groups.r32f_layout()),
             Some(&layouts.palette_uniform_layout),
         ],
         "overlay scientific R32Float pipeline (depth-less)",
         "fs_scientific",
     );
-    let categorical_pipeline = create_overlay_track_pipeline(
+    let categorical = create_overlay_track_pipeline(
         device,
         "overlay categorical Uint wgsl",
         OVERLAY_CATEGORICAL_WGSL,
         "overlay categorical pipeline layout",
         &[
             Some(&layouts.camera_layout),
-            Some(&layouts.categorical_uniform_layout),
+            Some(layouts.dynamic_uniform_layout(UniformSlot::Categorical)),
             Some(tile_bind_groups.uint_layout()),
             Some(&layouts.palette_uniform_layout),
         ],
@@ -373,17 +390,14 @@ fn create_overlay_pipelines(
         "fs_categorical",
     );
 
-    (display_pipeline, scientific_pipeline, categorical_pipeline)
+    OverlayPipelines {
+        display,
+        scientific,
+        categorical,
+    }
 }
 
-fn create_vector_pipelines(
-    device: &wgpu::Device,
-    layouts: &SharedLayouts,
-) -> (
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-) {
+fn create_vector_pipelines(device: &wgpu::Device, layouts: &SharedLayouts) -> VectorPipelines {
     let vector_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("vector draped wgsl"),
         source: wgpu::ShaderSource::Wgsl(VECTOR_WGSL.into()),
@@ -392,11 +406,11 @@ fn create_vector_pipelines(
         label: Some("vector draped pipeline layout"),
         bind_group_layouts: &[
             Some(&layouts.camera_layout),
-            Some(&layouts.vector_uniform_layout),
+            Some(layouts.dynamic_uniform_layout(UniformSlot::Vector)),
         ],
         immediate_size: 0,
     });
-    let vector_fill_pipeline = create_globe_pipeline(
+    let fill = create_globe_pipeline(
         device,
         &vector_shader,
         &vector_pipeline_layout,
@@ -411,7 +425,7 @@ fn create_vector_pipelines(
             depth_stencil: None,
         },
     );
-    let vector_line_pipeline = create_globe_pipeline(
+    let line = create_globe_pipeline(
         device,
         &vector_shader,
         &vector_pipeline_layout,
@@ -426,7 +440,7 @@ fn create_vector_pipelines(
             depth_stencil: None,
         },
     );
-    let vector_point_pipeline = create_globe_pipeline(
+    let point = create_globe_pipeline(
         device,
         &vector_shader,
         &vector_pipeline_layout,
@@ -441,26 +455,21 @@ fn create_vector_pipelines(
             depth_stencil: None,
         },
     );
-    (
-        vector_fill_pipeline,
-        vector_line_pipeline,
-        vector_point_pipeline,
-    )
+    VectorPipelines { fill, line, point }
 }
 
-fn create_composite_resources(
+fn create_composite_pipelines(
     device: &wgpu::Device,
     target_format: wgpu::TextureFormat,
-) -> (wgpu::BindGroupLayout, wgpu::Sampler, wgpu::RenderPipeline) {
+) -> CompositePipelines {
     let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("composite wgsl"),
         source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
     });
 
-    let composite_layout =
-        non_filtering_texture_sampler_layout(device, "composite bind group layout");
+    let layout = non_filtering_texture_sampler_layout(device, "composite bind group layout");
 
-    let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("composite nearest sampler"),
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
@@ -471,11 +480,11 @@ fn create_composite_resources(
     let composite_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("composite pipeline layout"),
-            bind_group_layouts: &[Some(&composite_layout)],
+            bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
 
-    let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("composite pipeline"),
         layout: Some(&composite_pipeline_layout),
         vertex: wgpu::VertexState {
@@ -501,7 +510,11 @@ fn create_composite_resources(
         cache: None,
     });
 
-    (composite_layout, composite_sampler, composite_pipeline)
+    CompositePipelines {
+        layout,
+        sampler,
+        pipeline,
+    }
 }
 
 impl GlobePipelines {
@@ -511,30 +524,17 @@ impl GlobePipelines {
         tile_bind_groups: &TileBindGroupCache,
     ) -> Self {
         let layouts = create_shared_layouts(device);
-
-        let (body_ellipsoid_pipeline, body_textured_pipeline, grid_pipeline) =
-            create_body_and_grid_pipelines(device, &layouts, tile_bind_groups.rgba8_layout());
-        let (overlay_pipeline, overlay_scientific_pipeline, overlay_categorical_pipeline) =
-            create_overlay_pipelines(device, &layouts, tile_bind_groups);
-        let (vector_fill_pipeline, vector_line_pipeline, vector_point_pipeline) =
-            create_vector_pipelines(device, &layouts);
-        let (composite_layout, composite_sampler, composite_pipeline) =
-            create_composite_resources(device, target_format);
+        let body = create_body_pipelines(device, &layouts, tile_bind_groups.rgba8_layout());
+        let overlay = create_overlay_pipelines(device, &layouts, tile_bind_groups);
+        let vector = create_vector_pipelines(device, &layouts);
+        let composite = create_composite_pipelines(device, target_format);
 
         Self {
             layouts,
-            body_ellipsoid_pipeline,
-            body_textured_pipeline,
-            overlay_pipeline,
-            overlay_scientific_pipeline,
-            overlay_categorical_pipeline,
-            vector_fill_pipeline,
-            vector_line_pipeline,
-            vector_point_pipeline,
-            grid_pipeline,
-            composite_layout,
-            composite_sampler,
-            composite_pipeline,
+            body,
+            overlay,
+            vector,
+            composite,
         }
     }
 }

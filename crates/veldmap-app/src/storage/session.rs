@@ -38,68 +38,46 @@ where
     }))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum WireTrackKind {
+macro_rules! wire_enum {
+    ($wire:ident <-> $domain:ident { $($variant:ident),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum $wire {
+            $($variant,)+
+        }
+
+        impl From<$domain> for $wire {
+            fn from(value: $domain) -> Self {
+                match value {
+                    $($domain::$variant => Self::$variant,)+
+                }
+            }
+        }
+
+        impl From<$wire> for $domain {
+            fn from(value: $wire) -> Self {
+                match value {
+                    $($wire::$variant => Self::$variant,)+
+                }
+            }
+        }
+    };
+}
+
+wire_enum!(WireTrackKind <-> TrackKind {
     Display,
     Scientific,
     Categorical,
-}
+});
 
-impl From<TrackKind> for WireTrackKind {
-    fn from(k: TrackKind) -> Self {
-        match k {
-            TrackKind::Display => Self::Display,
-            TrackKind::Scientific => Self::Scientific,
-            TrackKind::Categorical => Self::Categorical,
-        }
-    }
-}
-
-impl From<WireTrackKind> for TrackKind {
-    fn from(k: WireTrackKind) -> Self {
-        match k {
-            WireTrackKind::Display => Self::Display,
-            WireTrackKind::Scientific => Self::Scientific,
-            WireTrackKind::Categorical => Self::Categorical,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum WireStretchPreset {
+wire_enum!(WireStretchPreset <-> StretchPreset {
     Percentile2_98,
     MinMax,
     Log10Db,
     Custom,
-}
+});
 
-impl From<StretchPreset> for WireStretchPreset {
-    fn from(p: StretchPreset) -> Self {
-        match p {
-            StretchPreset::Percentile2_98 => Self::Percentile2_98,
-            StretchPreset::MinMax => Self::MinMax,
-            StretchPreset::Log10Db => Self::Log10Db,
-            StretchPreset::Custom => Self::Custom,
-        }
-    }
-}
-
-impl From<WireStretchPreset> for StretchPreset {
-    fn from(p: WireStretchPreset) -> Self {
-        match p {
-            WireStretchPreset::Percentile2_98 => Self::Percentile2_98,
-            WireStretchPreset::MinMax => Self::MinMax,
-            WireStretchPreset::Log10Db => Self::Log10Db,
-            WireStretchPreset::Custom => Self::Custom,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum WireColormapId {
+wire_enum!(WireColormapId <-> ColormapId {
     Grayscale,
     Viridis,
     Inferno,
@@ -107,63 +85,13 @@ enum WireColormapId {
     Turbo,
     RdBu,
     Terrain,
-}
+});
 
-impl From<ColormapId> for WireColormapId {
-    fn from(c: ColormapId) -> Self {
-        match c {
-            ColormapId::Grayscale => Self::Grayscale,
-            ColormapId::Viridis => Self::Viridis,
-            ColormapId::Inferno => Self::Inferno,
-            ColormapId::Plasma => Self::Plasma,
-            ColormapId::Turbo => Self::Turbo,
-            ColormapId::RdBu => Self::RdBu,
-            ColormapId::Terrain => Self::Terrain,
-        }
-    }
-}
-
-impl From<WireColormapId> for ColormapId {
-    fn from(c: WireColormapId) -> Self {
-        match c {
-            WireColormapId::Grayscale => Self::Grayscale,
-            WireColormapId::Viridis => Self::Viridis,
-            WireColormapId::Inferno => Self::Inferno,
-            WireColormapId::Plasma => Self::Plasma,
-            WireColormapId::Turbo => Self::Turbo,
-            WireColormapId::RdBu => Self::RdBu,
-            WireColormapId::Terrain => Self::Terrain,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum WireCategoricalPaletteId {
+wire_enum!(WireCategoricalPaletteId <-> CategoricalPaletteId {
     SourceColorMap,
     Sentinel2Scl,
     DistinctClasses,
-}
-
-impl From<CategoricalPaletteId> for WireCategoricalPaletteId {
-    fn from(p: CategoricalPaletteId) -> Self {
-        match p {
-            CategoricalPaletteId::SourceColorMap => Self::SourceColorMap,
-            CategoricalPaletteId::Sentinel2Scl => Self::Sentinel2Scl,
-            CategoricalPaletteId::DistinctClasses => Self::DistinctClasses,
-        }
-    }
-}
-
-impl From<WireCategoricalPaletteId> for CategoricalPaletteId {
-    fn from(p: WireCategoricalPaletteId) -> Self {
-        match p {
-            WireCategoricalPaletteId::SourceColorMap => Self::SourceColorMap,
-            WireCategoricalPaletteId::Sentinel2Scl => Self::Sentinel2Scl,
-            WireCategoricalPaletteId::DistinctClasses => Self::DistinctClasses,
-        }
-    }
-}
+});
 
 /// Forward-compatible `session.json` wire proxy for [`LayerStyleSpec`].
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

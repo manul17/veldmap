@@ -12,6 +12,7 @@ mod jobs;
 mod layer;
 mod manager;
 mod opener;
+mod remote_opener;
 mod runtime;
 mod stack;
 mod style;
@@ -26,7 +27,9 @@ use veldmap_raster::BandStats;
 use crate::colormap::{CategoricalPaletteId, ColormapId};
 
 pub(crate) use crs_override::CrsOverride;
-pub(crate) use manager::{OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayMutation};
+pub(crate) use manager::{
+    OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayManagerDeps, OverlayMutation,
+};
 pub(crate) use style::{ColorbarInfo, LayerBandOption, LayerStyleSpec, StretchPreset, TrackKind};
 
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].

@@ -142,3 +142,45 @@ fn scientific_mipmaps_skip_nan_and_inf_handle_npot_and_categorical_stays_1mip() 
     generate_tile_mipmaps(&mut u16_tile);
     assert_eq!(u16_tile.mip_level_count(), 1);
 }
+
+#[test]
+fn rgba8_npot_5x3_folds_trailing_column_and_row_into_2x1_mip() {
+    // 5x3 opaque black image with two non-zero edge markers:
+    // - (0, 2) on the trailing row `y = 2` is pure green
+    // - (4, 0) on the trailing column `x = 4` is pure red
+    let mut data = vec![0u8; 5 * 3 * 4];
+    for px in data.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    let green_off = (2 * 5) * 4;
+    data[green_off..green_off + 4].copy_from_slice(&[0, 255, 0, 255]);
+    let red_off = 4 * 4;
+    data[red_off..red_off + 4].copy_from_slice(&[255, 0, 0, 255]);
+
+    let mut tile =
+        DecodedTile::try_new(5, 3, PixelFormat::Rgba8UnormSrgb, data).expect("valid 5x3");
+    generate_tile_mipmaps(&mut tile);
+
+    assert_eq!(tile.mip_level_count(), 3); // 5x3 -> 2x1 -> 1x1
+    assert_eq!(tile.mip_dims(1), (2, 1));
+    let mip1 = tile.mip_data(1).expect("mip 1");
+    // Left texel (x in 0..2, y in 0..3) must include green (0, 2): linear 1/6 -> sRGB ~113.
+    assert_eq!(mip1[0], 0);
+    assert!(
+        mip1[1] > 100 && mip1[1] < 130,
+        "trailing row y=2 must contribute to left mip texel, got {:?}",
+        &mip1[0..4]
+    );
+    assert_eq!(mip1[2], 0);
+    assert_eq!(mip1[3], 255);
+
+    // Right texel (x in 2..5, y in 0..3) must include red (4, 0): linear 1/9 -> sRGB ~93.
+    assert!(
+        mip1[4] > 80 && mip1[4] < 110,
+        "trailing column x=4 must contribute to right mip texel, got {:?}",
+        &mip1[4..8]
+    );
+    assert_eq!(mip1[5], 0);
+    assert_eq!(mip1[6], 0);
+    assert_eq!(mip1[7], 255);
+}

@@ -3,15 +3,14 @@
 //! API-key / SAS auth headers, secret redaction, and built-in sample scenes.
 
 use std::sync::{Arc, Mutex};
-use std::thread;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use veldmap_core::sync::CancelToken;
 use veldmap_net::{
     NetConfig, NetContext, StacAuth, StacCatalogConfig, StacClient, StacSearchQuery,
     builtin_sample_scenes,
 };
+
+use crate::mock_http::{MockHttpServer, write_http_response};
 
 struct RecordedStacReq {
     path_and_query: String,
@@ -23,127 +22,41 @@ struct RecordedStacReq {
 struct MockStacServer {
     endpoint: String,
     recorded: Arc<Mutex<Vec<RecordedStacReq>>>,
-    shutdown: CancelToken,
-    handle: Option<thread::JoinHandle<()>>,
+    _server: MockHttpServer,
 }
 
 impl MockStacServer {
     fn start(response_json: String) -> Self {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let rec_clone = Arc::clone(&recorded);
-        let shutdown = CancelToken::new();
-        let stop = shutdown.clone();
-        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let body_shared = Arc::new(response_json);
 
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("stac mock rt");
-            rt.block_on(async move {
-                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-                let addr = listener.local_addr().expect("addr");
-                let _ = addr_tx.send(addr);
-
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = stop.cancelled() => break,
-                        res = listener.accept() => {
-                            let Ok((mut stream, _)) = res else { break; };
-                            let rec = Arc::clone(&rec_clone);
-                            let body_out = response_json.clone();
-                            let stop_c = stop.clone();
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; 16384];
-                                let mut filled = 0usize;
-                                let mut header_end = None;
-                                let mut content_len = 0usize;
-                                loop {
-                                    let n = tokio::select! {
-                                        _ = stop_c.cancelled() => return,
-                                        r = stream.read(&mut buf[filled..]) => match r {
-                                            Ok(0) | Err(_) => break,
-                                            Ok(n) => n,
-                                        }
-                                    };
-                                    filled += n;
-                                    if header_end.is_none()
-                                        && let Some(pos) = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n")
-                                    {
-                                        let h_str = String::from_utf8_lossy(&buf[..pos]);
-                                        for line in h_str.lines().skip(1) {
-                                            if let Some((k, v)) = line.split_once(':')
-                                                && k.trim().eq_ignore_ascii_case("content-length")
-                                            {
-                                                content_len = v.trim().parse().unwrap_or(0);
-                                            }
-                                        }
-                                        header_end = Some(pos + 4);
-                                    }
-                                    if let Some(he) = header_end
-                                        && filled >= he + content_len
-                                    {
-                                        break;
-                                    }
-                                    if filled == buf.len() {
-                                        break;
-                                    }
-                                }
-                                let he = header_end.unwrap_or(filled);
-                                let head_str = String::from_utf8_lossy(&buf[..he]);
-                                let first_line = head_str.lines().next().unwrap_or("");
-                                let path_and_query = first_line
-                                    .split_whitespace()
-                                    .nth(1)
-                                    .unwrap_or("")
-                                    .to_owned();
-                                let mut authorization = None;
-                                let mut api_key = None;
-                                for line in head_str.lines().skip(1) {
-                                    if let Some((k, v)) = line.split_once(':') {
-                                        if k.trim().eq_ignore_ascii_case("authorization") {
-                                            authorization = Some(v.trim().to_owned());
-                                        } else if k.trim().eq_ignore_ascii_case("x-api-key") {
-                                            api_key = Some(v.trim().to_owned());
-                                        }
-                                    }
-                                }
-                                let body = String::from_utf8_lossy(&buf[he..filled.min(he + content_len)]).to_string();
-                                rec.lock().expect("lock").push(RecordedStacReq {
-                                    path_and_query,
-                                    authorization,
-                                    api_key,
-                                    body,
-                                });
-                                let resp = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: application/geo+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                    body_out.len(),
-                                    body_out
-                                );
-                                let _ = stream.write_all(resp.as_bytes()).await;
-                            });
-                        }
-                    }
-                }
-            });
+        let server = MockHttpServer::start(move |req, mut stream, _stop| {
+            let rec = Arc::clone(&rec_clone);
+            let body_out = Arc::clone(&body_shared);
+            async move {
+                rec.lock().expect("lock").push(RecordedStacReq {
+                    path_and_query: req.path_and_query.clone(),
+                    authorization: req.header("authorization").map(str::to_owned),
+                    api_key: req.header("x-api-key").map(str::to_owned),
+                    body: req.body_string(),
+                });
+                write_http_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "Content-Type: application/geo+json\r\n",
+                    body_out.as_bytes(),
+                )
+                .await;
+            }
         });
 
-        let addr = addr_rx.recv().expect("stac addr");
+        let addr = server.addr();
         Self {
             endpoint: format!("http://{addr}/v1"),
             recorded,
-            shutdown,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for MockStacServer {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            _server: server,
         }
     }
 }
@@ -349,37 +262,19 @@ fn stac_rejects_invalid_endpoint_forbidden_header_and_redacts_error_snippets() {
     ));
 
     // Non-2xx response includes redacted diagnostic body snippet.
-    let shutdown = CancelToken::new();
-    let stop = shutdown.clone();
-    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
-    let handle = thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async move {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let _ = addr_tx.send(addr);
-            if let Ok((mut stream, _)) = tokio::select! {
-                _ = stop.cancelled() => Err(std::io::Error::other("stop")),
-                res = listener.accept() => res,
-            } {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf).await;
-                let body = r#"{"code":"BadRequest","description":"invalid datetime for secret-tok"}"#;
-                let resp = format!(
-                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes()).await;
-            }
-        });
+    let err_server = MockHttpServer::start(|_req, mut stream, _stop| async move {
+        let body = br#"{"code":"BadRequest","description":"invalid datetime for secret-tok"}"#;
+        write_http_response(
+            &mut stream,
+            400,
+            "Bad Request",
+            "Content-Type: application/json\r\n",
+            body,
+        )
+        .await;
     });
-    let addr = addr_rx.recv().expect("addr");
     let cat = StacCatalogConfig {
-        endpoint: format!("http://{addr}/v1"),
+        endpoint: format!("http://{}/v1", err_server.addr()),
         collection: "sentinel-2-l2a".to_owned(),
         auth: StacAuth::Bearer("secret-tok".to_owned()),
     };
@@ -396,6 +291,4 @@ fn stac_rejects_invalid_endpoint_forbidden_header_and_redacts_error_snippets() {
         !msg.contains("secret-tok"),
         "secret leaked in snippet: {msg}"
     );
-    shutdown.cancel();
-    let _ = handle.join();
 }

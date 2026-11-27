@@ -65,6 +65,16 @@ fn corrupt_json_backs_up_file_and_unknown_basemap_variant_is_forward_compatible(
     assert_eq!(compat.disk_cache_max_mb, MAX_DISK_CACHE_MAX_MB);
     assert_eq!(compat.gibs_date, DEFAULT_GIBS_DATE);
     assert!(compat.show_graticule);
+
+    // Non-string enum JSON still triggers `.corrupt` backup instead of silently succeeding.
+    let _ = std::fs::remove_file(&backup);
+    std::fs::write(&settings_path, br#"{"active_basemap":123}"#).expect("write non-string json");
+    let invalid_type = AppSettings::load_or_default(&paths);
+    assert_eq!(invalid_type, AppSettings::default());
+    assert_eq!(
+        std::fs::read(&backup).expect("non-string backup preserved"),
+        br#"{"active_basemap":123}"#
+    );
 }
 
 #[test]
@@ -73,7 +83,7 @@ fn basemap_draft_preserves_unrelated_app_settings_and_validates_partial_edits() 
         show_graticule: false,
         ..AppSettings::default()
     };
-    let mut draft = BasemapSettingsDraft::from_settings(&settings);
+    let mut draft = AppSettingsDraft::from_settings(&settings);
     draft.active_basemap = BasemapSelection::EoxSentinel2Cloudless;
     draft.disk_cache_max_mb = 1024;
 
@@ -140,7 +150,7 @@ fn gpu_tile_cache_cap_clamps_persists_and_loads_legacy_settings() {
     assert_eq!(settings.gpu_tile_cache_max_mb, Some(MAX_GPU_CACHE_MAX_MB));
     assert!(settings.effective_gpu_tile_cache_bytes(512 * 1024 * 1024) >= 128 * 1024 * 1024);
 
-    let mut draft = BasemapSettingsDraft::from_settings(&settings);
+    let mut draft = AppSettingsDraft::from_settings(&settings);
     draft.gpu_tile_cache_max_mb = Some(768);
     draft.apply_into(&mut settings);
     assert_eq!(settings.gpu_tile_cache_max_mb, Some(768));
@@ -166,7 +176,7 @@ fn stac_settings_round_trip_and_redact_secrets_in_debug() {
     let paths = StoragePaths::with_root(dir.path());
 
     let mut settings = AppSettings::default();
-    let mut draft = BasemapSettingsDraft::from_settings(&settings);
+    let mut draft = AppSettingsDraft::from_settings(&settings);
     draft.stac = StacSettings {
         custom_endpoint: "https://user:pw@stac.example.org/v1?sig=hidden-query".to_owned(),
         custom_collection: "sentinel-2-l2a".to_owned(),
@@ -212,10 +222,10 @@ fn stac_settings_forward_compat_normalization_validation_and_secret_scrub() {
     );
 
     // Invalid STAC endpoint or forbidden header fails validation and does not
-    // clobber previously saved valid STAC settings via BasemapSettingsDraft.
+    // clobber previously saved valid STAC settings via AppSettingsDraft.
     let mut settings = loaded;
     let saved = settings.stac.clone();
-    let mut draft = BasemapSettingsDraft::from_settings(&settings);
+    let mut draft = AppSettingsDraft::from_settings(&settings);
     draft.stac.custom_endpoint = "ftp://not-http.example/v1".to_owned();
     assert!(draft.stac.validation_error().is_some());
     draft.apply_into(&mut settings);

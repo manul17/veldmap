@@ -118,33 +118,6 @@ impl BandInfo {
             has_alpha,
         }
     }
-
-    /// Construct a scientific or categorical single-band entry (`BandKey::Index(index)`).
-    #[expect(clippy::too_many_arguments, reason = "band metadata constructor")]
-    pub(crate) fn band(
-        index: u16,
-        name: Option<String>,
-        units: Option<String>,
-        pixel_format: PixelFormat,
-        sample_type: SampleType,
-        scale: f64,
-        offset: f64,
-        nodata: Option<f64>,
-    ) -> Self {
-        Self {
-            band_key: BandKey::Index(index),
-            index,
-            name,
-            units,
-            pixel_format,
-            sample_type,
-            scale,
-            offset,
-            nodata,
-            channels: 1,
-            has_alpha: false,
-        }
-    }
 }
 
 /// Single georeference tie point mapping raster pixel `(px, py)` to geographic

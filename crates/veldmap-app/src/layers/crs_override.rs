@@ -1,7 +1,7 @@
 //! Pure domain CRS override specification decoupled from `session.json`
 //! serialization types.
 
-use veldmap_core::geo::{CrsSpec, CrsTextKind, CustomTmParams};
+use veldmap_core::geo::{CrsSpec, CrsTextKind, CustomTmParams, trim_crs_text};
 
 /// Domain CRS override applied to a local raster layer or pending file open.
 #[derive(Clone, Debug, PartialEq)]
@@ -17,7 +17,7 @@ impl CrsOverride {
     /// `EPSG:<code>` / bare numeric EPSG shorthand), stripping any leading
     /// UTF-8 BOM and surrounding whitespace once before storing.
     pub(crate) fn parse_text(input: &str) -> Result<Self, String> {
-        let trimmed = input.trim().trim_start_matches('\u{FEFF}').trim();
+        let trimmed = trim_crs_text(input);
         let (_, kind) = CrsSpec::parse_text(trimmed).map_err(|e| e.to_string())?;
         match kind {
             CrsTextKind::Wkt => Ok(Self::Wkt(trimmed.to_owned())),

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use veldmap_core::sync::{CancelToken, lock_unpoisoned, wait_unpoisoned};
 use veldmap_core::tile::{DecodedTile, PixelFormat, SourceId};
 use veldmap_raster::{
-    MAX_LZ4_RAW_DECODED_BYTES, MAX_QOI_DECODED_BYTES, decode_lz4_raw_tile, decode_qoi_rgba8,
-    encode_lz4_raw_tile, encode_qoi_rgba8, generate_tile_mipmaps,
+    MAX_CACHED_TILE_DECODED_BYTES, decode_lz4_raw_tile, decode_qoi_rgba8, encode_lz4_raw_tile,
+    encode_qoi_rgba8, generate_tile_mipmaps,
 };
 use veldmap_storage::{DiskTileKey, TileBlobEncoding, TileDiskCache};
 
@@ -47,11 +47,11 @@ fn encode_tile_blob(tile: &DecodedTile) -> Option<(TileBlobEncoding, Vec<u8>)> {
             tile.width(),
             tile.height(),
             tile.data(),
-            MAX_QOI_DECODED_BYTES,
+            MAX_CACHED_TILE_DECODED_BYTES,
         )
         .map(|bytes| (TileBlobEncoding::Qoi, bytes)),
         PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => {
-            encode_lz4_raw_tile(tile, MAX_LZ4_RAW_DECODED_BYTES)
+            encode_lz4_raw_tile(tile, MAX_CACHED_TILE_DECODED_BYTES)
                 .map(|bytes| (TileBlobEncoding::Lz4Raw, bytes))
         }
     };
@@ -83,14 +83,13 @@ pub(super) fn load_cached_tile(
         .ok()??;
 
     let decoded = match disk_key.format {
-        PixelFormat::Rgba8UnormSrgb => {
-            decode_qoi_rgba8(&payload, MAX_QOI_DECODED_BYTES).and_then(|(w, h, rgba)| {
+        PixelFormat::Rgba8UnormSrgb => decode_qoi_rgba8(&payload, MAX_CACHED_TILE_DECODED_BYTES)
+            .and_then(|(w, h, rgba)| {
                 DecodedTile::try_new(w, h, PixelFormat::Rgba8UnormSrgb, rgba)
                     .map_err(|e| veldmap_raster::RasterError::Decode(e.to_string()))
-            })
-        }
+            }),
         PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => {
-            decode_lz4_raw_tile(&payload, disk_key.format, MAX_LZ4_RAW_DECODED_BYTES)
+            decode_lz4_raw_tile(&payload, disk_key.format, MAX_CACHED_TILE_DECODED_BYTES)
         }
     };
 
@@ -297,14 +296,30 @@ impl Drop for TileWriteWorker {
     }
 }
 
+struct EncodedTileWrite {
+    key: DiskTileKey,
+    encoding: TileBlobEncoding,
+    bytes: Vec<u8>,
+    write_gen: u64,
+    source_cancel: CancelToken,
+}
+
+fn drain_up_to<T>(queue: &mut VecDeque<T>, batch: &mut Vec<T>, max_len: usize) {
+    while batch.len() < max_len {
+        let Some(next) = queue.pop_front() else {
+            break;
+        };
+        batch.push(next);
+    }
+}
+
 fn run_tile_write_worker(
     shared: SharedWriteQueue,
     disk: Arc<TileDiskCache>,
     shutdown: CancelToken,
 ) {
     let mut batch: Vec<PendingTileWrite> = Vec::with_capacity(PASS_BATCH_MAX_TILES);
-    let mut encoded: Vec<(DiskTileKey, TileBlobEncoding, Vec<u8>, u64, CancelToken)> =
-        Vec::with_capacity(PASS_BATCH_MAX_TILES);
+    let mut encoded: Vec<EncodedTileWrite> = Vec::with_capacity(PASS_BATCH_MAX_TILES);
 
     loop {
         batch.clear();
@@ -322,13 +337,7 @@ fn run_tile_write_worker(
             }
             let deadline = Instant::now() + TILE_WRITE_COALESCE_WINDOW;
             while batch.len() < PASS_BATCH_MAX_TILES && !shutdown.is_cancelled() {
-                while batch.len() < PASS_BATCH_MAX_TILES {
-                    if let Some(next) = queue.items.pop_front() {
-                        batch.push(next);
-                    } else {
-                        break;
-                    }
-                }
+                drain_up_to(&mut queue.items, &mut batch, PASS_BATCH_MAX_TILES);
                 if batch.len() >= PASS_BATCH_MAX_TILES || queue.closed {
                     break;
                 }
@@ -344,13 +353,7 @@ fn run_tile_write_worker(
                 };
                 queue = next_guard;
                 if wait_res.timed_out() {
-                    while batch.len() < PASS_BATCH_MAX_TILES {
-                        if let Some(next) = queue.items.pop_front() {
-                            batch.push(next);
-                        } else {
-                            break;
-                        }
-                    }
+                    drain_up_to(&mut queue.items, &mut batch, PASS_BATCH_MAX_TILES);
                     break;
                 }
             }
@@ -366,15 +369,15 @@ fn run_tile_write_worker(
             if shutdown.is_cancelled() || item.source_cancel.is_cancelled() {
                 continue;
             }
-            if let Some((enc, bytes)) = encode_tile_blob(&item.tile) {
+            if let Some((encoding, bytes)) = encode_tile_blob(&item.tile) {
                 encoded_bytes = encoded_bytes.saturating_add(bytes.len());
-                encoded.push((
-                    item.disk_key,
-                    enc,
+                encoded.push(EncodedTileWrite {
+                    key: item.disk_key,
+                    encoding,
                     bytes,
-                    item.write_gen,
-                    item.source_cancel,
-                ));
+                    write_gen: item.write_gen,
+                    source_cancel: item.source_cancel,
+                });
                 if encoded_bytes >= PASS_BATCH_MAX_BYTES {
                     flush_encoded_batch(&disk, &mut encoded, &shutdown);
                     encoded_bytes = 0;
@@ -387,7 +390,7 @@ fn run_tile_write_worker(
 
 fn flush_encoded_batch(
     disk: &TileDiskCache,
-    encoded: &mut Vec<(DiskTileKey, TileBlobEncoding, Vec<u8>, u64, CancelToken)>,
+    encoded: &mut Vec<EncodedTileWrite>,
     shutdown: &CancelToken,
 ) {
     if encoded.is_empty() || shutdown.is_cancelled() || disk.max_bytes() == 0 {
@@ -397,19 +400,19 @@ fn flush_encoded_batch(
     // Group by `(write_gen, source_cancel)` so each source generation passes
     // its own child-of-shutdown token into `put_encoded_batch_if_uncancelled`,
     // enforcing reload/purge cancellation strictly under SQLite's writer lock.
-    encoded.sort_unstable_by_key(|(_, _, _, write_gen, _)| *write_gen);
+    encoded.sort_unstable_by_key(|entry| entry.write_gen);
     let mut start = 0usize;
     while start < encoded.len() {
-        let write_gen = encoded[start].3;
+        let write_gen = encoded[start].write_gen;
         let mut end = start + 1;
-        while end < encoded.len() && encoded[end].3 == write_gen {
+        while end < encoded.len() && encoded[end].write_gen == write_gen {
             end += 1;
         }
-        let source_cancel = &encoded[start].4;
+        let source_cancel = &encoded[start].source_cancel;
         if !source_cancel.is_cancelled() {
             let refs: Vec<(&DiskTileKey, TileBlobEncoding, &[u8])> = encoded[start..end]
                 .iter()
-                .map(|(k, enc, bytes, _, _)| (k, *enc, bytes.as_slice()))
+                .map(|entry| (&entry.key, entry.encoding, entry.bytes.as_slice()))
                 .collect();
             let _ = disk.put_encoded_batch_if_uncancelled(&refs, source_cancel);
         }

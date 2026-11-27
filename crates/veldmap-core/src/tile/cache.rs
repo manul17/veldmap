@@ -19,7 +19,7 @@ struct Node<K, V> {
 ///
 /// Evictions return the evicted `(K, V)` entries so callers can inspect or
 /// drop released resources deterministically.
-pub struct TileCache<K: Copy + Eq + Hash, V> {
+pub struct TileCache<K: Clone + Eq + Hash, V> {
     nodes: Vec<Option<Node<K, V>>>,
     free: Vec<usize>,
     index: HashMap<K, usize>,
@@ -29,7 +29,7 @@ pub struct TileCache<K: Copy + Eq + Hash, V> {
     max_bytes: usize,
 }
 
-impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
+impl<K: Clone + Eq + Hash, V> TileCache<K, V> {
     /// Create an empty cache capped at `max_bytes` bytes.
     pub fn new(max_bytes: usize) -> Self {
         Self {
@@ -105,7 +105,7 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     }
 
     fn insert_front_entry(&mut self, key: K, value: V, byte_size: usize) {
-        let slot = self.insert_front_node(key, value, byte_size);
+        let slot = self.insert_front_node(key.clone(), value, byte_size);
         self.index.insert(key, slot);
         self.total_bytes += byte_size;
     }
@@ -125,8 +125,8 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
 
         let target_before_insert = self.max_bytes - byte_size;
         let mut evicted = Vec::new();
-        if let Some((old_val, _)) = self.remove(&key) {
-            evicted.push((key, old_val));
+        if let Some((old_key, old_val, _)) = self.remove_entry(&key) {
+            evicted.push((old_key, old_val));
         }
 
         while self.total_bytes > target_before_insert {
@@ -222,8 +222,8 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
         };
 
         let mut evicted = Vec::with_capacity(victim_slots.len() + 1);
-        if let Some((old_val, _)) = self.remove(&key) {
-            evicted.push((key, old_val));
+        if let Some((old_key, old_val, _)) = self.remove_entry(&key) {
+            evicted.push((old_key, old_val));
         }
         for slot in victim_slots {
             if let Some(victim) = self.remove_slot(slot) {
@@ -241,26 +241,30 @@ impl<K: Copy + Eq + Hash, V> TileCache<K, V> {
     where
         F: FnMut(&K) -> bool,
     {
-        let matching: Vec<K> = self
+        let matching_slots: Vec<usize> = self
             .index
-            .keys()
-            .copied()
-            .filter(|k| predicate(k))
+            .iter()
+            .filter_map(|(k, &slot)| predicate(k).then_some(slot))
             .collect();
-        let mut removed = Vec::with_capacity(matching.len());
-        for key in matching {
-            if let Some((val, _)) = self.remove(&key) {
-                removed.push((key, val));
+        let mut removed = Vec::with_capacity(matching_slots.len());
+        for slot in matching_slots {
+            if let Some(entry) = self.remove_slot(slot) {
+                removed.push(entry);
             }
         }
         removed
     }
 
-    /// Remove `key` from the cache in O(1), returning `(value, byte_size)`.
-    pub fn remove(&mut self, key: &K) -> Option<(V, usize)> {
+    fn remove_entry(&mut self, key: &K) -> Option<(K, V, usize)> {
         let slot = self.index.remove(key)?;
         let node = self.take_slot(slot)?;
-        Some((node.value, node.byte_size))
+        Some((node.key, node.value, node.byte_size))
+    }
+
+    /// Remove `key` from the cache in O(1), returning `(value, byte_size)`.
+    pub fn remove(&mut self, key: &K) -> Option<(V, usize)> {
+        let (_, value, byte_size) = self.remove_entry(key)?;
+        Some((value, byte_size))
     }
 
     /// Clear all entries and return them.

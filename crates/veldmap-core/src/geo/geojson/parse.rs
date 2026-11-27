@@ -5,7 +5,7 @@
 use serde_json::{Map, Value};
 
 use super::super::shapes::{GeoPoint, Polygon, Ring, dedup_geo_ring};
-use super::{
+use super::model::{
     GeoJsonError, GeoJsonFeature, GeoJsonFeatureCollection, GeoJsonGeometry, MAX_GEOJSON_BYTES,
     extract_feature_name,
 };

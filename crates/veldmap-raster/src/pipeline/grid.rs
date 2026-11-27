@@ -2,7 +2,7 @@
 //! mapping, and working-memory peak estimation (`Grid`, `Overview`,
 //! `Footprint`, `Region`, `region_of`).
 
-use veldmap_core::budget::MemoryBudget;
+use veldmap_core::budget::{BudgetError, MemoryBudget};
 use veldmap_core::tile::{PixelFormat, RASTER_TILE_SIZE, level_size};
 
 use super::cascade;
@@ -20,6 +20,23 @@ pub(crate) fn chunk_working_bytes(dw: u32, dh: u32, depth: u32, output_bpp: u32)
     u64::from(dw)
         .saturating_mul(u64::from(dh))
         .saturating_mul(per_pixel)
+}
+
+/// Validate a single fresh chunk's working memory against `limit_bytes`,
+/// returning a structured [`BudgetError::ExceedsCap`] when refused.
+pub(crate) fn admit_chunk_working_bytes(
+    dw: u32,
+    dh: u32,
+    depth: u32,
+    output_bpp: u32,
+    limit_bytes: u64,
+) -> Result<(), BudgetError> {
+    DecodePeak::new()
+        .with(
+            "fresh chunk",
+            chunk_working_bytes(dw, dh, depth, output_bpp),
+        )
+        .admit(limit_bytes)
 }
 
 /// Cost of reading one tile at a pointwise level.
@@ -175,7 +192,7 @@ impl Grid {
 
     /// Estimated working memory peak for a full sequential pass over `base`
     /// in `format`.
-    pub(crate) fn pass_peak(&self, base: (u32, u32), format: PixelFormat) -> DecodePeak {
+    pub(super) fn pass_peak(&self, base: (u32, u32), format: PixelFormat) -> DecodePeak {
         let (width, height) = base;
         let bpp = format.bytes_per_pixel() as u64;
         DecodePeak::new()
@@ -187,6 +204,25 @@ impl Grid {
             )
             .with("fresh chunk", self.chunk_bytes(self.chunk, format))
             .with("cascade", cascade::bytes(width, height, format))
+    }
+
+    /// Estimated working memory peak in bytes for a full sequential pass over
+    /// `base` in `format`.
+    pub(crate) fn pass_peak_bytes(&self, base: (u32, u32), format: PixelFormat) -> u64 {
+        self.pass_peak(base, format).total()
+    }
+
+    /// Validate a full sequential pass's working memory peak against
+    /// `limit_bytes`, returning the total peak bytes when admitted.
+    pub(crate) fn admit_pass_peak(
+        &self,
+        base: (u32, u32),
+        format: PixelFormat,
+        limit_bytes: u64,
+    ) -> Result<u64, BudgetError> {
+        let peak = self.pass_peak(base, format);
+        peak.admit(limit_bytes)?;
+        Ok(peak.total())
     }
 }
 

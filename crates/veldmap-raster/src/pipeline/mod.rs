@@ -6,17 +6,17 @@ use veldmap_core::budget::{DecodeBudgetTracker, MemoryBudget};
 use veldmap_core::sync::CancelToken;
 
 mod binding;
-pub(crate) mod cascade;
-pub(crate) mod chunk_cache;
-pub(crate) mod driver;
-pub(crate) mod grid;
-pub(crate) mod metadata;
-pub(crate) mod peak;
-pub(crate) mod plan;
-pub(crate) mod radiometry;
-pub(crate) mod resample;
+mod cascade;
+mod chunk_cache;
+mod driver;
+mod grid;
+mod metadata;
+mod peak;
+mod plan;
+mod radiometry;
+mod resample;
 mod scheduler;
-pub(crate) mod singleflight;
+mod singleflight;
 mod source;
 
 pub use binding::{frame_from_description, frame_from_description_with_override};
@@ -31,6 +31,21 @@ pub use plan::{
 };
 pub use scheduler::{AdmittedPass, AdmittedTile, TileFailureOutcome, TileScheduler};
 pub use source::{ByteRange, RasterSource, coalesce_byte_ranges};
+
+pub(crate) use cascade::{Cascade, bleed_display_emit, bytes as cascade_bytes};
+pub(crate) use chunk_cache::{ChunkKey, DecodedChunk};
+pub(crate) use driver::{Chunked, DirectRead, alloc_empty_surface, direct, pass, plan_direct};
+pub(crate) use grid::{Grid, Overview, admit_chunk_working_bytes, chunk_working_bytes};
+pub(crate) use metadata::is_valid_lat_lon;
+pub(crate) use plan::{build_chunked_level_table, check_max_source_side};
+pub(crate) use radiometry::{
+    DisplayMapping, PixelLayout, STRETCH_SAMPLES, compute_band_stats, expand_u8_into_rgba,
+    is_data_f64, percentile_stretch, raw_bytes_to_rgba, read_native_sample_f64,
+};
+pub(crate) use resample::{
+    DownsampleRounding, Window, downsample_r32f_2x, downsample_rgba8_2x, resample_rgba8_window,
+};
+pub(crate) use singleflight::SingleflightMap;
 
 /// Shared runtime context passed into analytical raster decoding calls.
 pub struct DecodeContext<'a> {

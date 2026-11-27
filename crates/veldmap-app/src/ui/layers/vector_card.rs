@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use crate::ui::widgets::show_opacity_slider;
-use crate::vectors::VectorLayerSummary;
+use crate::vectors::{VectorEdit, VectorLayerSummary};
 
 use super::LayerUiAction;
 
@@ -17,7 +17,10 @@ pub(super) fn show_vector_card(
             ui.horizontal(|ui| {
                 let mut visible = layer.visible;
                 if ui.checkbox(&mut visible, "").changed() {
-                    actions.push(LayerUiAction::ToggleVectorVisibility(layer.id, visible));
+                    actions.push(LayerUiAction::edit_vector(
+                        layer.id,
+                        VectorEdit::SetVisible(visible),
+                    ));
                 }
                 let swatch = egui::Color32::from_rgb(
                     layer.color_rgb[0],
@@ -50,7 +53,11 @@ pub(super) fn show_vector_card(
             if let Some((opacity, commit)) =
                 show_opacity_slider(ui, ("vector", layer.id), layer.opacity)
             {
-                actions.push(LayerUiAction::SetVectorOpacity(layer.id, opacity, commit));
+                actions.push(LayerUiAction::edit_vector_drag(
+                    layer.id,
+                    VectorEdit::SetOpacity(opacity),
+                    commit,
+                ));
             }
 
             ui.horizontal_wrapped(|ui| {
@@ -71,7 +78,7 @@ pub(super) fn show_vector_card(
                     actions.push(LayerUiAction::UseVectorAsStacAoi(layer.id));
                 }
                 if ui.small_button("Remove").clicked() {
-                    actions.push(LayerUiAction::RemoveVector(layer.id));
+                    actions.push(LayerUiAction::edit_vector(layer.id, VectorEdit::Remove));
                 }
             });
         });

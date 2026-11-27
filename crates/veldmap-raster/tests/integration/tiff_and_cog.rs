@@ -1280,44 +1280,8 @@ fn direct_raw_decoder_handles_jpeg_ycbcr_white_is_zero_i8_sparse_and_compressed_
 
 #[test]
 fn remote_cog_enforces_pointwise_plans_single_pass_ifd_ranges_and_cache_only_hover() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use veldmap_core::io::{ByteSource, IoError};
     use veldmap_core::tile::SourceFingerprint;
     use veldmap_raster::open_raster;
-
-    struct RemoteMockSource {
-        bytes: Vec<u8>,
-        reads: AtomicUsize,
-    }
-
-    impl ByteSource for RemoteMockSource {
-        fn len(&self) -> u64 {
-            self.bytes.len() as u64
-        }
-
-        fn is_remote(&self) -> bool {
-            true
-        }
-
-        fn read_at(
-            &self,
-            offset: u64,
-            buf: &mut [u8],
-            cancel: &CancelToken,
-        ) -> Result<usize, IoError> {
-            if cancel.is_cancelled() {
-                return Err(IoError::Cancelled);
-            }
-            self.reads.fetch_add(1, Ordering::SeqCst);
-            let off = usize::try_from(offset).unwrap_or(self.bytes.len());
-            if off >= self.bytes.len() || buf.is_empty() {
-                return Ok(0);
-            }
-            let n = (self.bytes.len() - off).min(buf.len());
-            buf[..n].copy_from_slice(&self.bytes[off..off + n]);
-            Ok(n)
-        }
-    }
 
     let budget = MemoryBudget::default();
     let cancel = CancelToken::new();
@@ -1331,10 +1295,9 @@ fn remote_cog_enforces_pointwise_plans_single_pass_ifd_ranges_and_cache_only_hov
         write_single_strip_u32(&mut dir, 16, &[42u8; 256]);
         dir.finish().expect("finish");
     }
-    let stripped_remote = Arc::new(RemoteMockSource {
-        bytes: stripped_buf.into_inner(),
-        reads: AtomicUsize::new(0),
-    });
+    let stripped_remote = Arc::new(CountingByteSource::new(Arc::new(
+        MemoryByteSource::from_vec(stripped_buf.into_inner()).with_remote(true),
+    )));
     let err = match open_raster(
         stripped_remote,
         SourceFingerprint::from_digest([9; 32]),
@@ -1378,10 +1341,9 @@ fn remote_cog_enforces_pointwise_plans_single_pass_ifd_ranges_and_cache_only_hov
             .expect("cnts");
         dir.finish().expect("finish");
     }
-    let cog_remote = Arc::new(RemoteMockSource {
-        bytes: cog_buf.into_inner(),
-        reads: AtomicUsize::new(0),
-    });
+    let cog_remote = Arc::new(CountingByteSource::new(Arc::new(
+        MemoryByteSource::from_vec(cog_buf.into_inner()).with_remote(true),
+    )));
     let cog_src = TiffSource::open(
         Arc::clone(&cog_remote) as Arc<dyn ByteSource>,
         SourceFingerprint::from_digest([10; 32]),
@@ -1391,7 +1353,7 @@ fn remote_cog_enforces_pointwise_plans_single_pass_ifd_ranges_and_cache_only_hov
     .expect("remote tiled COG opens");
     assert!(cog_src.is_remote());
     assert_eq!(
-        cog_remote.reads.load(Ordering::SeqCst),
+        cog_remote.read_calls(),
         1,
         "single-pass IFD reader must open compact COG in exactly 1 prefix read"
     );
@@ -1411,7 +1373,7 @@ fn remote_cog_enforces_pointwise_plans_single_pass_ifd_ranges_and_cache_only_hov
         .expect("cache-only hover");
     assert_eq!(hover_miss, BandSample::Unavailable);
     assert_eq!(
-        cog_remote.reads.load(Ordering::SeqCst),
+        cog_remote.read_calls(),
         1,
         "remote hover must never trigger network reads on cache miss"
     );
@@ -1439,12 +1401,12 @@ fn remote_cog_enforces_pointwise_plans_single_pass_ifd_ranges_and_cache_only_hov
             .expect("cached plan")
             .is_empty()
     );
-    let reads_after_decode = cog_remote.reads.load(Ordering::SeqCst);
+    let reads_after_decode = cog_remote.read_calls();
     let hover_hit = cog_src
         .sample_band(BandKey::Index(0), PixelFormat::R32Float, 10, 10, &ctx)
         .expect("cached hover");
     assert!(matches!(hover_hit, BandSample::Scalar { raw, .. } if (raw - 12.5).abs() < 1e-6));
-    assert_eq!(cog_remote.reads.load(Ordering::SeqCst), reads_after_decode);
+    assert_eq!(cog_remote.read_calls(), reads_after_decode);
 
     // Remote produce_pass is rejected as terminal.
     let mut noop = |_l: u8, _x: u32, _y: u32, _w: u32, _h: u32, _b: Vec<u8>| Ok(());

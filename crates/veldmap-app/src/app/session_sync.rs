@@ -16,12 +16,12 @@ use crate::vectors::VectorIoEvent;
 use super::VeldmapApp;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LayerKind {
+enum RestoredEntryKind {
     Raster,
     Vector,
 }
 
-impl LayerKind {
+impl RestoredEntryKind {
     fn label(self) -> &'static str {
         match self {
             Self::Raster => "local overlay",
@@ -36,10 +36,10 @@ enum SavedEntry {
 }
 
 impl SavedEntry {
-    fn kind(&self) -> LayerKind {
+    fn kind(&self) -> RestoredEntryKind {
         match self {
-            Self::Raster(_) => LayerKind::Raster,
-            Self::Vector(_) => LayerKind::Vector,
+            Self::Raster(_) => RestoredEntryKind::Raster,
+            Self::Vector(_) => RestoredEntryKind::Vector,
         }
     }
 
@@ -56,7 +56,7 @@ impl SavedEntry {
             name: display_name_from_path(path),
             path: path.to_path_buf(),
             error,
-            is_vector: self.kind() == LayerKind::Vector,
+            is_vector: self.kind() == RestoredEntryKind::Vector,
         }
     }
 }
@@ -104,7 +104,7 @@ impl SessionRestoreTracker {
     /// duplicate paths in `session.json` consume FIFO; only when no pending
     /// restore matches does a later manual open clear a preserved `unavailable`
     /// entry so `session.json` never duplicates it.
-    fn on_opened(&mut self, kind: LayerKind, path: &Path) {
+    fn on_opened(&mut self, kind: RestoredEntryKind, path: &Path) {
         if let Some(pos) = self
             .pending
             .iter()
@@ -125,7 +125,7 @@ impl SessionRestoreTracker {
     /// If `path` belonged to a pending startup restore, move its full saved
     /// entry into `unavailable` (preserving CRS override and style) and return
     /// `true`. Returns `false` for non-restore open failures.
-    fn on_failed(&mut self, kind: LayerKind, path: &Path, error: &str) -> bool {
+    fn on_failed(&mut self, kind: RestoredEntryKind, path: &Path, error: &str) -> bool {
         let Some(pos) = self
             .pending
             .iter()
@@ -293,7 +293,7 @@ impl VeldmapApp {
 
     fn handle_layer_opened(
         &mut self,
-        kind: LayerKind,
+        kind: RestoredEntryKind,
         path: PathBuf,
         bounds: Option<FootprintBounds>,
         fly_to: bool,
@@ -312,13 +312,13 @@ impl VeldmapApp {
 
     fn handle_layer_failed(
         &mut self,
-        kind: LayerKind,
+        kind: RestoredEntryKind,
         path: PathBuf,
         error: String,
         can_assign_crs: bool,
     ) {
         if self.restore_tracker.on_failed(kind, &path, &error) {
-            // Preserve the entry in `unavailable_*` rather than rewriting
+            // Preserve the entry in `unavailable` rather than rewriting
             // `session.json`, so temporarily unmounted drives never wipe custom
             // CRS overrides or stretch configurations.
             tracing::warn!(
@@ -343,11 +343,6 @@ impl VeldmapApp {
 
     pub(super) fn drain_scene_io_events(&mut self) -> bool {
         let (events, stac_changed) = self.scene.poll_io_events();
-        if stac_changed && self.scene.stac().last_error().is_some() {
-            // Clear any older local STAC error so a fresh async search error
-            // is never shadowed.
-            self.panels.stac.local_error = None;
-        }
         if events.is_empty() {
             return stac_changed;
         }
@@ -363,7 +358,7 @@ impl VeldmapApp {
                 }) => {
                     tracing::info!(?id, path = %path.display(), "Opened local overlay layer");
                     self.handle_layer_opened(
-                        LayerKind::Raster,
+                        RestoredEntryKind::Raster,
                         path,
                         bounds,
                         fly_to,
@@ -395,7 +390,12 @@ impl VeldmapApp {
                     error,
                     can_assign_crs,
                 }) => {
-                    self.handle_layer_failed(LayerKind::Raster, path, error, can_assign_crs);
+                    self.handle_layer_failed(
+                        RestoredEntryKind::Raster,
+                        path,
+                        error,
+                        can_assign_crs,
+                    );
                 }
                 SceneIoEvent::Raster(OverlayIoEvent::RemoteOpened {
                     id,
@@ -427,11 +427,7 @@ impl VeldmapApp {
                     if self.panels.workbench_open
                         && self.panels.workbench_tab == WorkbenchTab::CloudStac
                     {
-                        self.scene.mutate_stac(|s| {
-                            s.clear_error();
-                            ((), false)
-                        });
-                        self.panels.stac.local_error = Some(msg);
+                        self.scene.mutate_stac(|s| s.set_error(msg));
                     } else {
                         self.panels.layers.push_error(msg);
                         self.open_workbench_tab(WorkbenchTab::Layers);
@@ -445,7 +441,7 @@ impl VeldmapApp {
                 }) => {
                     tracing::info!(?id, path = %path.display(), "Opened GeoJSON vector layer");
                     self.handle_layer_opened(
-                        LayerKind::Vector,
+                        RestoredEntryKind::Vector,
                         path,
                         bounds,
                         fly_to,
@@ -454,7 +450,7 @@ impl VeldmapApp {
                     );
                 }
                 SceneIoEvent::Vector(VectorIoEvent::Failed { path, error }) => {
-                    self.handle_layer_failed(LayerKind::Vector, path, error, false);
+                    self.handle_layer_failed(RestoredEntryKind::Vector, path, error, false);
                 }
             }
         }
