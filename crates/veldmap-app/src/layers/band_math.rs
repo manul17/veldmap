@@ -365,8 +365,16 @@ pub(super) struct BandMathLayerData {
 }
 
 impl BandMathLayerData {
-    pub(super) fn primary_asset(&self) -> &RasterAsset {
+    pub(super) fn reference_asset(&self) -> &RasterAsset {
         &self.bands[0]
+    }
+
+    pub(super) fn footprint(&self) -> Option<veldmap_core::geo::FootprintBounds> {
+        self.bands[0].geo().footprint()
+    }
+
+    pub(super) fn source_pixel_size_m(&self) -> Option<(f64, f64)> {
+        self.bands[0].geo().source_pixel_size_m()
     }
 
     pub(super) fn output_units(&self) -> Option<String> {
@@ -397,6 +405,8 @@ pub(crate) struct BandMathInputSummary {
 /// [`super::LayerSummary`].
 #[derive(Clone, Debug)]
 pub(crate) struct BandMathSummary {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     pub(crate) formula: BandMathFormula,
     pub(crate) recipe_label: String,
     pub(crate) colormap: ColormapId,

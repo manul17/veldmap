@@ -5,7 +5,7 @@ use veldmap_core::sync::CancelToken;
 use veldmap_net::StacSearchResult;
 
 use crate::render::DrawVectorId;
-use crate::storage::settings::{StacAuthKind, StacSettings};
+use crate::storage::settings::{StacAuthKind, StacProfile, StacSettings};
 
 use super::aoi::{footprint_bounds_from_bbox, polygon_geometry_from_bbox};
 use super::*;
@@ -48,6 +48,7 @@ fn cancel_increments_seq_so_queued_search_result_is_ignored() {
         StacSearchResult {
             items: Vec::new(),
             matched: Some(7),
+            next_link: None,
         },
     );
 
@@ -58,12 +59,13 @@ fn cancel_increments_seq_so_queued_search_result_is_ignored() {
 
 #[test]
 fn resolve_cog_auth_enforces_origin_presigned_and_result_coupling() {
-    let mut stac_settings = StacSettings {
-        custom_endpoint: "https://stac.private.example/v1".to_owned(),
+    let mut stac_settings = StacSettings::from_single_profile(StacProfile {
+        name: "Private".to_owned(),
+        endpoint: "https://stac.private.example/v1".to_owned(),
         auth_kind: StacAuthKind::Bearer,
         auth_secret: "secret-bearer".to_owned(),
-        ..StacSettings::default()
-    };
+        ..StacProfile::default()
+    });
 
     let mut session = test_session();
     // Public search result must NEVER attach custom credentials.
@@ -92,8 +94,8 @@ fn resolve_cog_auth_enforces_origin_presigned_and_result_coupling() {
     assert!(cross_hdrs.is_empty());
 
     // Already-presigned URL never gets dual auth or double SAS.
-    stac_settings.auth_kind = StacAuthKind::SasQuery;
-    stac_settings.auth_secret = "sv=2024&sig=custom".to_owned();
+    stac_settings.profiles[0].auth_kind = StacAuthKind::SasQuery;
+    stac_settings.profiles[0].auth_secret = "sv=2024&sig=custom".to_owned();
     let presigned = "https://blob.example/a.tif?X-Amz-Signature=existing";
     let (u2, h2) =
         session.resolve_cog_auth(presigned, StacCogAuthMode::DirectCustom, &stac_settings);
@@ -181,6 +183,7 @@ fn hovering_already_selected_item_skips_highlight_rebuild() {
                 mk_item("b", [8.0, 46.0, 9.0, 47.0]),
             ],
             matched: Some(2),
+            next_link: None,
         },
     );
     assert!(session.poll_results());

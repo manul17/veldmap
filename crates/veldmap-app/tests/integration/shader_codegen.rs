@@ -7,10 +7,10 @@ use naga::back::{hlsl, msl, spv};
 use naga::proc::Layouter;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use veldmap_app::render::{
-    BAND_MATH_COMPOSITE_WGSL, BAND_MATH_MASK_WGSL, BAND_MATH_SCRATCH_MRT_WGSL,
-    BAND_MATH_SCRATCH_WGSL, COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL,
-    OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL, SCRATCH_NAN_FILL_WGSL, UNIFORM_LAYOUT_SPECS,
-    UniformLayoutSpec, VECTOR_WGSL,
+    BAND_MATH_COMPOSITE_WGSL, BAND_MATH_MASK_WGSL, BAND_MATH_REDUCE_WGSL,
+    BAND_MATH_SCRATCH_MRT_WGSL, BAND_MATH_SCRATCH_WGSL, COMPOSITE_WGSL, GLOBE_WGSL,
+    OVERLAY_CATEGORICAL_WGSL, OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL, SCRATCH_NAN_FILL_WGSL,
+    UNIFORM_LAYOUT_SPECS, UniformLayoutSpec, VECTOR_WGSL,
 };
 
 fn parse_and_validate(name: &str, wgsl_source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
@@ -130,6 +130,8 @@ fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
     let bm_scratch_mrt =
         validate_and_compile_all_backends("band_math_scratch_mrt.wgsl", BAND_MATH_SCRATCH_MRT_WGSL);
     let bm_mask = validate_and_compile_all_backends("band_math_mask.wgsl", BAND_MATH_MASK_WGSL);
+    let bm_reduce =
+        validate_and_compile_all_backends("band_math_reduce.wgsl", BAND_MATH_REDUCE_WGSL);
     let bm_composite =
         validate_and_compile_all_backends("band_math_composite.wgsl", BAND_MATH_COMPOSITE_WGSL);
 
@@ -152,6 +154,7 @@ fn all_wgsl_shaders_compile_and_match_rust_uniform_layouts() {
             &["CameraUniform", "ScratchMrtPatchUniform"],
         ),
         (&bm_mask, &["CameraUniform", "ScratchSinglePatchUniform"]),
+        (&bm_reduce, &["BandMathReduceUniform"]),
         (
             &bm_composite,
             &["BandMathCompositeUniform", "PaletteUniform"],

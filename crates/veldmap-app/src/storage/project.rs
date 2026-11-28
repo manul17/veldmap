@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use veldmap_storage::{StorageError, read_json_limited, write_json_durable};
 
+use super::layers::SavedTimelineEpochSource;
 use super::session::{
     CameraBookmark, SESSION_SCHEMA_VERSION, SavedBandAssetSource, SavedCameraPose, SavedLayerEntry,
     SavedSwipeState, SavedVectorEntry, WorkspaceFieldsMut, normalize_workspace_fields,
@@ -167,6 +168,26 @@ fn map_layer_paths(layers: &mut [SavedLayerEntry], mut f: impl FnMut(&Path) -> P
                 }
                 if let Some(SavedBandAssetSource::Local { path, .. }) = &mut e.scl {
                     *path = f(path);
+                }
+            }
+            SavedLayerEntry::Timeline(e) => {
+                for epoch in &mut e.epochs {
+                    match &mut epoch.source {
+                        SavedTimelineEpochSource::LocalSingle { path, .. } => {
+                            *path = f(path);
+                        }
+                        SavedTimelineEpochSource::RemoteSingle { .. } => {}
+                        SavedTimelineEpochSource::BandMath { bands, scl } => {
+                            for band in bands {
+                                if let SavedBandAssetSource::Local { path, .. } = band {
+                                    *path = f(path);
+                                }
+                            }
+                            if let Some(SavedBandAssetSource::Local { path, .. }) = scl {
+                                *path = f(path);
+                            }
+                        }
+                    }
                 }
             }
         }

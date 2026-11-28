@@ -24,7 +24,7 @@ use super::ifd::{
 };
 use super::stretch::{BandStatsCache, StretchCache};
 use super::tag_ids::{
-    TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
+    TAG_DATETIME, TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
     TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, TAG_MODEL_TRANSFORMATION,
     TAG_NEW_SUBFILE_TYPE,
 };
@@ -506,6 +506,25 @@ impl TiffSource {
             band_stats: BandStatsCache::new(),
         })
     }
+}
+
+/// Read the base IFD's TIFF `DateTime` ASCII tag (`306`) without decoding
+/// image tiles or scanning overviews, returning the trimmed non-empty tag
+/// value if present (e.g. `"2024:06:15 10:30:00"`).
+pub fn read_tiff_datetime(
+    byte_source: Arc<dyn ByteSource>,
+    cancel: &CancelToken,
+) -> Option<String> {
+    const HEADER_CAP_BYTES: u64 = 64 * 1024;
+    let mut reader = SinglePassIfdReader::open(byte_source, HEADER_CAP_BYTES, cancel).ok()?;
+    let first_ifd = reader.first_ifd;
+    let mut base_dir = reader.read_directory(first_ifd, cancel).ok()?;
+    base_dir
+        .prefetch_tags(&mut reader, &[TAG_DATETIME], HEADER_CAP_BYTES, cancel)
+        .ok()?;
+    let raw = base_dir.read_ascii_opt(&reader, TAG_DATETIME);
+    let trimmed = raw.trim().trim_end_matches('\0').trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 #[cfg(test)]

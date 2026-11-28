@@ -13,6 +13,7 @@ pub(super) const TAG_SAMPLES_PER_PIXEL: u16 = 277;
 pub(super) const TAG_ROWS_PER_STRIP: u16 = 278;
 pub(super) const TAG_STRIP_BYTE_COUNTS: u16 = 279;
 pub(super) const TAG_PLANAR_CONFIG: u16 = 284;
+pub(super) const TAG_DATETIME: u16 = 306;
 pub(super) const TAG_PREDICTOR: u16 = 317;
 pub(super) const TAG_COLOR_MAP: u16 = 320;
 pub(super) const TAG_TILE_WIDTH: u16 = 322;

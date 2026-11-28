@@ -176,7 +176,7 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
     let l1 = stack.get_mut(LayerId(1)).expect("layer 1");
     let l1_tk = l1.single_asset().expect("single").meta().tile_key(0, 0, 0);
     l1.replace_wanted([l1_tk]);
-    let prep1 = l1.begin_reload(CancelToken::new());
+    let prep1 = l1.begin_reload(CancelToken::new()).expect("reload prep");
     assert!(prep1.old_cancel.is_none());
     assert_eq!(prep1.old_source, shared_src);
     assert!(l1.is_reloading());
@@ -192,23 +192,28 @@ fn layer_stack_reorder_visibility_opacity_and_reload_transitions() {
         Some("disk read failed")
     );
 
-    let prep2 = l1.begin_reload(CancelToken::new());
+    let prep2 = l1.begin_reload(CancelToken::new()).expect("reload prep 2");
     assert!(prep2.reload_seq > prep1.reload_seq);
     assert!(!l1.matches_reload_seq(prep1.reload_seq));
     assert!(l1.matches_reload_seq(prep2.reload_seq));
 
     let new_src = StubSource::arc(9, 512, 512);
     let new_src_id = new_src.source_id();
-    let old_src = l1.replace_reloaded(
-        PathBuf::from("/tmp/reloaded.tif"),
-        new_src,
-        utm_frame(1.0),
-        99,
-    );
+    let old_src = l1
+        .replace_reloaded(
+            PathBuf::from("/tmp/reloaded.tif"),
+            new_src,
+            utm_frame(1.0),
+            99,
+        )
+        .expect("replace reloaded");
     assert_eq!(old_src, shared_src);
     assert_eq!(l1.single_asset().expect("single").source_id(), new_src_id);
     assert_eq!(l1.single_asset().expect("single").geo().relaid(), 99);
-    assert_eq!(l1.local_path(), Some(Path::new("/tmp/reloaded.tif")));
+    assert_eq!(
+        l1.reload_target().map(|(p, _)| p),
+        Some(Path::new("/tmp/reloaded.tif"))
+    );
     assert!(!l1.is_reloading());
     assert!(l1.matches_reload_seq(prep2.reload_seq));
     assert!(l1.to_summary(0, false, true, false).last_error.is_none());
@@ -314,6 +319,7 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
     bm.observe_stream_tile_bytes(k1, 1_500_000);
     bm.observe_stream_tile_bytes(kscl, 262_144);
 
+    assert_eq!(bm.appetite_weight_bytes(), 2_000_000 + 1_500_000 + 262_144);
     let mut bm_stack = LayerStack::default();
     bm_stack.push(bm);
     assert_eq!(
@@ -346,7 +352,7 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
 
     // Disabling SCL removes it from active streams, appetite weight, and pinned roots.
     let bm_ref = bm_stack.get_mut(LayerId(20)).expect("bm");
-    assert_eq!(bm_ref.set_band_math_scl_enabled(false), (true, Some(kscl)));
+    assert_eq!(bm_ref.set_band_math_scl_enabled(false), (true, vec![kscl]));
     assert_eq!(bm_ref.active_stream_count(), 2);
     assert_eq!(bm_ref.streams().count(), 2);
     assert_eq!(
@@ -403,12 +409,10 @@ fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
         layer.saved_style().is_none(),
         "untouched default Display saves as None"
     );
-    assert!(
-        layer
-            .to_summary(0, false, false, false)
-            .categorical
-            .is_none()
-    );
+    assert!(matches!(
+        layer.to_summary(0, false, false, false).kind,
+        crate::layers::LayerSummaryKind::SingleRaster(ref s) if s.categorical.is_none()
+    ));
 
     // Switch to Band 0 Scientific, load stats, apply custom range.
     let b0_spec = stream_spec_for_band(BandKey::Index(0), PixelFormat::R32Float);

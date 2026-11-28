@@ -13,6 +13,7 @@ use veldmap_core::sync::CancelToken;
 
 /// Parsed HTTP/1.1 request received by [`MockHttpServer`].
 pub(crate) struct MockHttpRequest {
+    pub(crate) method: String,
     pub(crate) path_and_query: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -87,11 +88,9 @@ pub(crate) async fn read_http_request(
     let he = header_end.unwrap_or(filled);
     let head_str = String::from_utf8_lossy(&buf[..he]);
     let first_line = head_str.lines().next().unwrap_or("");
-    let path_and_query = first_line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("/")
-        .to_owned();
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_owned();
+    let path_and_query = parts.next().unwrap_or("/").to_owned();
     let mut headers = Vec::new();
     for line in head_str.lines().skip(1) {
         if let Some((k, v)) = line.split_once(':') {
@@ -102,6 +101,7 @@ pub(crate) async fn read_http_request(
     let body = buf[he..body_end].to_vec();
 
     Some(MockHttpRequest {
+        method,
         path_and_query,
         headers,
         body,

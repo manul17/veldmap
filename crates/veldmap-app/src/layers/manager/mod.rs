@@ -36,6 +36,7 @@ use super::opener::bind_frame_with_override;
 use super::remote_opener::RemoteOpenTracker;
 use super::runtime::{OverlayRuntime, OverlayRuntimeDeps};
 use super::stack::{LayerStack, OverlayLayer};
+use super::timeline::TimelineCompareMode;
 use super::{
     ColorbarInfo, CrsOverride, CursorReadout, LayerId, LayerSummary, OverlayPersistEntry,
     StretchPreset,
@@ -59,13 +60,18 @@ pub(crate) struct OverlayManagerDeps {
     pub(crate) shutdown: CancelToken,
 }
 
-/// Typed infallible edit operation applied to a single raster or band-math
-/// overlay layer via [`OverlayManager::edit_layer`] / `SceneState::edit_overlay`.
+/// Kind-specific infallible edits for `SingleRaster` overlay layers.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum OverlayEdit {
-    SetVisible(bool),
-    SetOpacity(f32),
-    SetStretchPreset(StretchPreset),
+pub(crate) enum SingleRasterEdit {
+    StretchPreset(StretchPreset),
+    StretchRange { min: f64, max: f64 },
+    Colormap { colormap: ColormapId, invert: bool },
+    CategoricalPalette(CategoricalPaletteId),
+}
+
+/// Kind-specific infallible edits for `BandMath` overlay layers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BandMathEdit {
     SetStretchRange {
         min: f64,
         max: f64,
@@ -74,18 +80,41 @@ pub(crate) enum OverlayEdit {
         colormap: ColormapId,
         invert: bool,
     },
-    SetCategoricalPalette(CategoricalPaletteId),
-    SetBandMathRgbStretch {
+    SetRgbStretch {
         min: [f64; 3],
         max: [f64; 3],
         gamma: f32,
     },
-    ResetBandMathStretch,
-    SetBandMathSclEnabled(bool),
-    SetBandMathSclMaskBits(u32),
+    ResetStretch,
+    SetSclEnabled(bool),
+    SetSclMaskBits(u32),
+}
+
+/// Kind-specific infallible edits for `Timeline` overlay layers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TimelineEdit {
+    SetActiveEpoch(usize),
+    StepEpoch(i32),
+    SetCloudFilter(Option<f32>),
+    SetCompareMode(TimelineCompareMode),
+    SetBlendT(f32),
+    SetDiffStretchRange { min: f64, max: f64 },
+    SetDiffColormap { colormap: ColormapId, invert: bool },
+    BandMath(BandMathEdit),
+}
+
+/// Typed infallible edit operation applied to an overlay layer via
+/// [`OverlayManager::edit_layer`] / `SceneState::edit_overlay`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OverlayEdit {
+    SetVisible(bool),
+    SetOpacity(f32),
     MoveUp,
     MoveDown,
     Remove,
+    SingleRaster(SingleRasterEdit),
+    BandMath(BandMathEdit),
+    Timeline(TimelineEdit),
 }
 
 /// Per-frame camera, viewport, cache, and appetite inputs for
@@ -385,41 +414,52 @@ impl OverlayManager {
             OverlayEdit::SetOpacity(opacity) => {
                 self.mutate_layer(id, |layer| layer.set_opacity(opacity))
             }
-            OverlayEdit::SetStretchPreset(preset) => {
-                self.mutate_layer(id, |layer| layer.set_stretch_preset(preset))
-            }
-            OverlayEdit::SetStretchRange { min, max } => {
-                self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
-            }
-            OverlayEdit::SetColormap { colormap, invert } => {
-                self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
-            }
-            OverlayEdit::SetCategoricalPalette(palette) => {
-                self.mutate_layer(id, |layer| layer.set_categorical_palette(palette))
-            }
-            OverlayEdit::SetBandMathRgbStretch { min, max, gamma } => {
-                self.mutate_layer(id, |layer| layer.set_band_math_rgb_stretch(min, max, gamma))
-            }
-            OverlayEdit::ResetBandMathStretch => {
-                self.mutate_layer(id, OverlayLayer::reset_band_math_stretch)
-            }
-            OverlayEdit::SetBandMathSclEnabled(enabled) => {
-                let (changed, disabled_scl_stream) =
-                    self.stack.get_mut(id).map_or((false, None), |layer| {
-                        layer.set_band_math_scl_enabled(enabled)
-                    });
-                if let Some(sk) = disabled_scl_stream {
-                    self.cancel_stream_if_unused(sk);
+            OverlayEdit::SingleRaster(single_edit) => match single_edit {
+                SingleRasterEdit::StretchPreset(preset) => {
+                    self.mutate_layer(id, |layer| layer.set_stretch_preset(preset))
                 }
-                OverlayMutation {
-                    changed,
-                    topology_changed: changed,
-                    purge_sources: Vec::new(),
+                SingleRasterEdit::StretchRange { min, max } => {
+                    self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
                 }
-            }
-            OverlayEdit::SetBandMathSclMaskBits(bits) => {
-                self.mutate_layer(id, |layer| layer.set_band_math_scl_mask_bits(bits))
-            }
+                SingleRasterEdit::Colormap { colormap, invert } => {
+                    self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
+                }
+                SingleRasterEdit::CategoricalPalette(palette) => {
+                    self.mutate_layer(id, |layer| layer.set_categorical_palette(palette))
+                }
+            },
+            OverlayEdit::BandMath(bm_edit) => match bm_edit {
+                BandMathEdit::SetStretchRange { min, max } => {
+                    self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
+                }
+                BandMathEdit::SetColormap { colormap, invert } => {
+                    self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
+                }
+                BandMathEdit::SetRgbStretch { min, max, gamma } => {
+                    self.mutate_layer(id, |layer| layer.set_band_math_rgb_stretch(min, max, gamma))
+                }
+                BandMathEdit::ResetStretch => {
+                    self.mutate_layer(id, OverlayLayer::reset_band_math_stretch)
+                }
+                BandMathEdit::SetSclEnabled(enabled) => {
+                    let (changed, disabled_scl_streams) =
+                        self.stack.get_mut(id).map_or((false, Vec::new()), |layer| {
+                            layer.set_band_math_scl_enabled(enabled)
+                        });
+                    for sk in disabled_scl_streams {
+                        self.cancel_stream_if_unused(sk);
+                    }
+                    OverlayMutation {
+                        changed,
+                        topology_changed: changed,
+                        purge_sources: Vec::new(),
+                    }
+                }
+                BandMathEdit::SetSclMaskBits(bits) => {
+                    self.mutate_layer(id, |layer| layer.set_band_math_scl_mask_bits(bits))
+                }
+            },
+            OverlayEdit::Timeline(tl_edit) => self.edit_timeline_layer(id, tl_edit),
         }
     }
 
@@ -472,6 +512,7 @@ impl OverlayManager {
             return OverlayMutation::default();
         };
         removed.cancel_stats_job();
+        removed.cancel_timeline_loading();
         if let Some(tok) = removed.take_reload_cancel() {
             tok.cancel();
         }
@@ -669,6 +710,7 @@ impl OverlayManager {
         self.runtime.cancel_sources(all_sources);
         for layer in self.stack.layers_mut() {
             layer.cancel_stats_job();
+            layer.cancel_timeline_loading();
             if let Some(tok) = layer.take_reload_cancel() {
                 tok.cancel();
             }

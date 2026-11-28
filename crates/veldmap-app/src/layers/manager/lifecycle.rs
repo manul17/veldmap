@@ -2,31 +2,32 @@
 //! open, local Band Math builder construction, cache-bypassing reload, and
 //! background completion reconciliation for [`OverlayManager`].
 
-use std::path::Path;
-
 use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::{BandKey, PixelFormat};
-use veldmap_raster::{SampleType, stream_spec_for_band};
+use veldmap_raster::{PyramidMeta, SampleType, stream_spec_for_band};
 
 use crate::clamp_opacity;
 
 use super::super::asset::{GeoBinding, LayerOrigin, RasterAsset, has_affine_scaling};
-use super::super::band_math::BandMathStyle;
+use super::super::band_math::{BandMathLayerData, BandMathStyle};
 use super::super::io_worker::{
     OpenedPayload, OverlayIoCmd, OverlayIoResult, ReloadRequest, ReloadedPayload,
 };
-use super::super::layer::RemoteLayerSpec;
+use super::super::layer::{LayerKind, RemoteLayerSpec};
 use super::super::opener::bind_frame_with_override;
 use super::super::remote_opener::{
     OpenedBandAsset, OpenedBandAssetOrigin, RemoteBandMathOpenPayload, RemoteOpenResult,
-    RemoteSingleOpenPayload,
+    RemoteSingleOpenPayload, TimelineEpochOpenPayload, TimelineEpochOpenSpec,
+    TimelineEpochOpenedData,
 };
 use super::super::stack::{LayerStack, OverlayLayer};
+use super::super::style::{LayerStyle, LayerStyleSpec};
+use super::super::timeline::{TimelineEpochContent, TimelineEpochState, TimelineOpenRequest};
 use super::super::{
     LayerId, LayerInitOptions, LocalBandMathInput, LocalBandMathSpec, OpenOverlayRequest,
     OverlayIoEvent, RemoteBandMathRequest, RemoteCogRequest,
 };
-use super::{OverlayManager, OverlayMutation, alloc_seq};
+use super::{BandMathEdit, OverlayManager, OverlayMutation, TimelineEdit, alloc_seq};
 
 fn clone_loaded_input_asset(
     stack: &LayerStack,
@@ -217,22 +218,22 @@ impl OverlayManager {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
             };
-            let Some(local_path) = layer.local_path().map(Path::to_path_buf) else {
+            let Some((local_path, asset)) = layer.reload_target() else {
                 return Err(
                     "remote COG and band-math layers do not support local disk reload".to_owned(),
                 );
             };
-            let Some(asset) = layer.single_asset() else {
-                return Err(
-                    "remote COG and band-math layers do not support local disk reload".to_owned(),
-                );
-            };
+            let local_path = local_path.to_path_buf();
             let old_stream = asset.meta().stream_key();
             let crs_override_epoch = asset.geo().crs_override_epoch();
             let old_fingerprint_hex = asset.fingerprint_hex().to_owned();
             let crs_override = asset.geo().crs_override().cloned();
             layer.cancel_stats_job();
-            let prep = layer.begin_reload(cancel.clone());
+            let Some(prep) = layer.begin_reload(cancel.clone()) else {
+                return Err(
+                    "remote COG and band-math layers do not support local disk reload".to_owned(),
+                );
+            };
             let request = ReloadRequest {
                 id,
                 reload_seq: prep.reload_seq,
@@ -312,6 +313,12 @@ impl OverlayManager {
                         continue;
                     }
                     self.handle_remote_band_math_result(payload, &mut events, &mut mutation);
+                }
+                RemoteOpenResult::TimelineEpoch(payload) => {
+                    if payload.epoch != self.workspace_epoch {
+                        continue;
+                    }
+                    self.handle_timeline_epoch_result(payload, &mut events, &mut mutation);
                 }
             }
         }
@@ -412,7 +419,7 @@ impl OverlayManager {
                     id,
                     title,
                     display_url,
-                    is_band_math: false,
+                    kind: super::super::RemoteLayerKind::SingleCog,
                     bounds,
                     fly_to,
                     restore_id,
@@ -422,7 +429,7 @@ impl OverlayManager {
                 events.push(OverlayIoEvent::RemoteFailed {
                     title,
                     display_url: meta.display_url,
-                    is_band_math: false,
+                    kind: super::super::RemoteLayerKind::SingleCog,
                     error,
                     restore_id,
                 });
@@ -494,7 +501,7 @@ impl OverlayManager {
                     id,
                     title,
                     display_url,
-                    is_band_math: true,
+                    kind: super::super::RemoteLayerKind::BandMath,
                     bounds,
                     fly_to,
                     restore_id,
@@ -504,7 +511,7 @@ impl OverlayManager {
                 events.push(OverlayIoEvent::RemoteFailed {
                     title,
                     display_url,
-                    is_band_math: true,
+                    kind: super::super::RemoteLayerKind::BandMath,
                     error,
                     restore_id,
                 });
@@ -567,7 +574,9 @@ impl OverlayManager {
                     }
                     let new_src = source.source_id();
                     let relaid = alloc_seq(&mut self.next_relaid);
-                    let old_src = slot.replace_reloaded(path, source, frame, relaid);
+                    let Some(old_src) = slot.replace_reloaded(path, source, frame, relaid) else {
+                        return;
+                    };
                     (old_src, new_src, old_stream)
                 }
                 Err(err) => {
@@ -603,5 +612,388 @@ impl OverlayManager {
         mutation.topology_changed = true;
         self.request_band_stats_if_needed(id);
         events.push(OverlayIoEvent::Reloaded { id });
+    }
+
+    /// Create and insert a `LayerKind::Timeline` layer immediately, queuing
+    /// non-blocking opens for its active epoch, comparison reference epoch (if
+    /// any), and adjacent filtered prefetch epochs (`active_idx ± 1`).
+    pub(crate) fn open_timeline(
+        &mut self,
+        request: TimelineOpenRequest,
+    ) -> Result<(LayerId, OverlayMutation), String> {
+        if request.epochs.is_empty() {
+            return Err("timeline requires at least one epoch".to_owned());
+        }
+        let id = LayerId(alloc_seq(&mut self.next_layer_id));
+        let layer = OverlayLayer::from_timeline(id, request);
+        let mut mutation = OverlayMutation::default();
+        let _ = self.insert_opened_layer(layer, &mut mutation);
+        self.sync_timeline_epochs(id);
+        Ok((id, mutation))
+    }
+
+    /// Apply a [`TimelineEdit`] to `id`, cancelling stale in-flight opens on
+    /// scrub, keeping recently visited epochs warm in `GpuTileCache`, and
+    /// queuing opens for newly active / adjacent epochs.
+    pub(super) fn edit_timeline_layer(
+        &mut self,
+        id: LayerId,
+        edit: TimelineEdit,
+    ) -> OverlayMutation {
+        match edit {
+            TimelineEdit::BandMath(bm_edit) => match bm_edit {
+                BandMathEdit::SetStretchRange { min, max } => {
+                    self.mutate_layer(id, |l| l.set_stretch_range(min, max))
+                }
+                BandMathEdit::SetColormap { colormap, invert } => {
+                    self.mutate_layer(id, |l| l.set_colormap(colormap, invert))
+                }
+                BandMathEdit::SetRgbStretch { min, max, gamma } => {
+                    self.mutate_layer(id, |l| l.set_band_math_rgb_stretch(min, max, gamma))
+                }
+                BandMathEdit::ResetStretch => {
+                    self.mutate_layer(id, OverlayLayer::reset_band_math_stretch)
+                }
+                BandMathEdit::SetSclEnabled(enabled) => {
+                    let (changed, disabled_streams) =
+                        self.stack.get_mut(id).map_or((false, Vec::new()), |l| {
+                            l.set_band_math_scl_enabled(enabled)
+                        });
+                    for sk in disabled_streams {
+                        self.cancel_stream_if_unused(sk);
+                    }
+                    OverlayMutation {
+                        changed,
+                        topology_changed: changed,
+                        purge_sources: Vec::new(),
+                    }
+                }
+                BandMathEdit::SetSclMaskBits(bits) => {
+                    self.mutate_layer(id, |l| l.set_band_math_scl_mask_bits(bits))
+                }
+            },
+            TimelineEdit::SetBlendT(blend_t) => self.mutate_layer(id, |layer| {
+                if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                    tl.set_blend_t(blend_t)
+                } else {
+                    false
+                }
+            }),
+            TimelineEdit::SetDiffStretchRange { min, max } => self.mutate_layer(id, |layer| {
+                if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                    tl.set_diff_stretch_range(min, max)
+                } else {
+                    false
+                }
+            }),
+            TimelineEdit::SetDiffColormap { colormap, invert } => self.mutate_layer(id, |layer| {
+                if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                    tl.set_diff_colormap(colormap, invert)
+                } else {
+                    false
+                }
+            }),
+            TimelineEdit::SetActiveEpoch(idx) => {
+                let changed = self.stack.get_mut(id).is_some_and(|layer| {
+                    if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                        tl.set_active_epoch(idx)
+                    } else {
+                        false
+                    }
+                });
+                if changed {
+                    self.sync_timeline_epochs(id);
+                }
+                OverlayMutation {
+                    changed,
+                    topology_changed: changed,
+                    purge_sources: Vec::new(),
+                }
+            }
+            TimelineEdit::StepEpoch(delta) => {
+                let changed = self.stack.get_mut(id).is_some_and(|layer| {
+                    if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                        tl.step_epoch(delta)
+                    } else {
+                        false
+                    }
+                });
+                if changed {
+                    self.sync_timeline_epochs(id);
+                }
+                OverlayMutation {
+                    changed,
+                    topology_changed: changed,
+                    purge_sources: Vec::new(),
+                }
+            }
+            TimelineEdit::SetCloudFilter(limit) => {
+                let changed = self.stack.get_mut(id).is_some_and(|layer| {
+                    if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                        tl.set_cloud_filter(limit)
+                    } else {
+                        false
+                    }
+                });
+                if changed {
+                    self.sync_timeline_epochs(id);
+                }
+                OverlayMutation {
+                    changed,
+                    topology_changed: changed,
+                    purge_sources: Vec::new(),
+                }
+            }
+            TimelineEdit::SetCompareMode(mode) => {
+                let changed = self.stack.get_mut(id).is_some_and(|layer| {
+                    if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                        tl.set_compare_mode(mode)
+                    } else {
+                        false
+                    }
+                });
+                if changed {
+                    self.sync_timeline_epochs(id);
+                }
+                OverlayMutation {
+                    changed,
+                    topology_changed: changed,
+                    purge_sources: Vec::new(),
+                }
+            }
+        }
+    }
+
+    fn sync_timeline_epochs(&mut self, id: LayerId) {
+        let mut to_spawn: Vec<TimelineEpochOpenSpec> = Vec::new();
+        let mut cancelled_streams = Vec::new();
+        let workspace_epoch = self.workspace_epoch;
+        let workspace_cancel = self.workspace_cancel.clone();
+
+        if let Some(layer) = self.stack.get_mut(id)
+            && let LayerKind::Timeline(tl) = layer.kind_mut()
+        {
+            cancelled_streams = tl.trim_and_cancel_unneeded();
+            let needed = tl.needed_epoch_indices();
+            for epoch_idx in needed {
+                let Some(epoch) = tl.epochs.get_mut(epoch_idx) else {
+                    continue;
+                };
+                if matches!(epoch.state, TimelineEpochState::Unloaded) {
+                    let open_seq = alloc_seq(&mut self.next_relaid);
+                    let cancel = workspace_cancel.child_token();
+                    epoch.state = TimelineEpochState::Loading {
+                        open_seq,
+                        cancel: cancel.clone(),
+                    };
+                    to_spawn.push(TimelineEpochOpenSpec {
+                        workspace_epoch,
+                        layer_id: id,
+                        epoch_idx,
+                        open_seq,
+                        source: epoch.source.clone(),
+                        cancel,
+                    });
+                }
+            }
+        }
+
+        for sk in cancelled_streams {
+            self.cancel_stream_if_unused(sk);
+        }
+
+        for spec in to_spawn {
+            let epoch_idx = spec.epoch_idx;
+            if let Err(err) = self
+                .remote_opener
+                .begin_open_timeline_epoch(&self.runtime, spec)
+                && let Some(layer) = self.stack.get_mut(id)
+                && let LayerKind::Timeline(tl) = layer.kind_mut()
+                && let Some(epoch) = tl.epochs.get_mut(epoch_idx)
+            {
+                epoch.state = TimelineEpochState::Failed(err);
+            }
+        }
+    }
+
+    fn build_single_timeline_epoch_content(
+        &mut self,
+        label: String,
+        origin: LayerOrigin,
+        source: std::sync::Arc<dyn veldmap_raster::RasterSource>,
+        frame: veldmap_core::geo::Frame,
+        crs_override: Option<super::super::CrsOverride>,
+        style_spec: Option<&LayerStyleSpec>,
+    ) -> TimelineEpochContent {
+        let desc = source.description();
+        let preferred_spec = style_spec
+            .and_then(|s| s.resolve_stream_spec(desc))
+            .unwrap_or_else(|| source.default_stream_spec());
+        let meta = source
+            .pyramid_meta(preferred_spec)
+            .or_else(|_| source.pyramid_meta(veldmap_raster::DISPLAY_STREAM_SPEC))
+            .unwrap_or_else(|_| PyramidMeta {
+                source: source.source_id(),
+                spec: veldmap_raster::DISPLAY_STREAM_SPEC,
+                levels: desc.levels.clone(),
+            });
+        let style = LayerStyle::new(source.as_ref(), meta.spec, style_spec);
+        let relaid = alloc_seq(&mut self.next_relaid);
+        let geo = GeoBinding::new(
+            frame,
+            desc.width,
+            desc.height,
+            meta.max_level(),
+            crs_override,
+            relaid,
+        );
+        let asset = RasterAsset::new(label, origin, source, geo, meta);
+        TimelineEpochContent::Single {
+            asset: Box::new(asset),
+            style,
+        }
+    }
+
+    fn handle_timeline_epoch_result(
+        &mut self,
+        payload: TimelineEpochOpenPayload,
+        events: &mut Vec<OverlayIoEvent>,
+        mutation: &mut OverlayMutation,
+    ) {
+        let TimelineEpochOpenPayload {
+            layer_id,
+            epoch_idx,
+            open_seq,
+            outcome,
+            ..
+        } = payload;
+
+        // Verify layer & open_seq still match before allocating assets.
+        let (epoch_label, saved_single_style, shared_bm_style, recipe_preset) = {
+            let Some(layer) = self.stack.get(layer_id) else {
+                return;
+            };
+            let LayerKind::Timeline(tl) = layer.kind() else {
+                return;
+            };
+            let Some(epoch) = tl.epochs.get(epoch_idx) else {
+                return;
+            };
+            if !matches!(epoch.state, TimelineEpochState::Loading { open_seq: s, .. } if s == open_seq)
+            {
+                return;
+            }
+            (
+                epoch.label.clone(),
+                tl.single_style.clone(),
+                tl.band_math_style.clone(),
+                tl.recipe_preset,
+            )
+        };
+
+        let built: Result<TimelineEpochContent, String> = outcome.and_then(|data| match data {
+            TimelineEpochOpenedData::LocalSingle {
+                path,
+                crs_override,
+                source,
+                frame,
+            } => Ok(self.build_single_timeline_epoch_content(
+                epoch_label,
+                LayerOrigin::Local { path },
+                source,
+                frame,
+                crs_override,
+                saved_single_style.as_ref(),
+            )),
+            TimelineEpochOpenedData::RemoteSingle {
+                meta,
+                range_source,
+                source,
+                frame,
+            } => Ok(self.build_single_timeline_epoch_content(
+                epoch_label,
+                LayerOrigin::Remote {
+                    meta,
+                    range: range_source,
+                },
+                source,
+                frame,
+                None,
+                saved_single_style.as_ref(),
+            )),
+            TimelineEpochOpenedData::BandMath { bands, scl } => {
+                let band_assets: Vec<RasterAsset> = bands
+                    .into_iter()
+                    .map(|b| {
+                        let relaid = alloc_seq(&mut self.next_relaid);
+                        build_band_asset(b, PixelFormat::R32Float, relaid)
+                    })
+                    .collect::<Result<_, _>>()?;
+                let scl_asset = scl.and_then(|s| {
+                    let relaid = alloc_seq(&mut self.next_relaid);
+                    build_band_asset(s, PixelFormat::R8Uint, relaid).ok()
+                });
+                let style = shared_bm_style.unwrap_or_else(|| {
+                    BandMathStyle::from_preset(
+                        recipe_preset.unwrap_or(super::super::BandMathPreset::Ndvi),
+                        scl_asset.is_some(),
+                    )
+                });
+                Ok(TimelineEpochContent::BandMath(Box::new(
+                    BandMathLayerData {
+                        bands: band_assets,
+                        scl: scl_asset,
+                        style,
+                    },
+                )))
+            }
+        });
+
+        let mut emit_opened: Option<(Option<FootprintBounds>, bool, Option<u64>)> = None;
+        let mut evicted_streams = Vec::new();
+        if let Some(layer) = self.stack.get_mut(layer_id)
+            && let LayerKind::Timeline(tl) = layer.kind_mut()
+            && let Some(epoch) = tl.epochs.get_mut(epoch_idx)
+            && matches!(epoch.state, TimelineEpochState::Loading { open_seq: s, .. } if s == open_seq)
+        {
+            match built {
+                Ok(content) => {
+                    let fp = content.footprint();
+                    if tl.last_known_footprint.is_none() {
+                        tl.last_known_footprint = fp;
+                    }
+                    let seq = tl.next_use_seq();
+                    if let Some(epoch) = tl.epochs.get_mut(epoch_idx) {
+                        epoch.state = TimelineEpochState::Ready {
+                            content,
+                            last_used_seq: seq,
+                        };
+                    }
+                    evicted_streams = tl.trim_and_cancel_unneeded();
+                    if tl.fly_to_on_first_ready || tl.restore_id.is_some() {
+                        let fly_to = std::mem::take(&mut tl.fly_to_on_first_ready);
+                        let restore_id = tl.restore_id.take();
+                        emit_opened = Some((tl.footprint(), fly_to, restore_id));
+                    }
+                }
+                Err(err) => {
+                    epoch.state = TimelineEpochState::Failed(err);
+                }
+            }
+            mutation.changed = true;
+            mutation.topology_changed = true;
+        }
+        for sk in evicted_streams {
+            self.cancel_stream_if_unused(sk);
+        }
+
+        if let Some((bounds, fly_to, restore_id)) = emit_opened {
+            events.push(OverlayIoEvent::TimelineOpened {
+                id: layer_id,
+                bounds,
+                fly_to,
+                restore_id,
+            });
+        }
     }
 }

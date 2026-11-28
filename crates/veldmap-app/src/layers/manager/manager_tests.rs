@@ -160,7 +160,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         .begin_reload_bypass_cache(layer_id)
         .expect("queue reload");
     assert!(reload_mut.changed);
-    assert!(mgr.layer_summaries()[0].reloading);
+    assert!(mgr.layer_summaries()[0].is_reloading());
     assert!(
         mgr.topmost_visible_source_pixel_size_m().is_none(),
         "reloading layer must not leak old source pixel size into HUD"
@@ -170,7 +170,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         OverlayIoEvent::Reloaded { id } => assert_eq!(id, layer_id),
         other => panic!("expected Reloaded event, got {other:?}"),
     }
-    assert!(!mgr.layer_summaries()[0].reloading);
+    assert!(!mgr.layer_summaries()[0].is_reloading());
     assert!(mgr.topmost_visible_source_pixel_size_m().is_some());
     assert_eq!(
         disk_cache.stats().expect("stats after reload").tile_count,
@@ -192,7 +192,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         other => panic!("expected ReloadFailed event, got {other:?}"),
     }
     assert_eq!(mgr.layer_summaries().len(), 1);
-    assert!(!mgr.layer_summaries()[0].reloading);
+    assert!(!mgr.layer_summaries()[0].is_reloading());
 
     // 6. Clean 3-phase shutdown joins background threads without hanging.
     mgr.begin_shutdown();
@@ -311,6 +311,7 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
         is_scl: false,
         stac_item_href: None,
         asset_key: Some("visual".to_owned()),
+        refresh_policy: None,
         visible: true,
         opacity: 1.0,
         style: None,
@@ -324,14 +325,14 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
             id,
             title,
             display_url,
-            is_band_math,
+            kind,
             bounds,
             fly_to,
             restore_id: None,
         } => {
             assert_eq!(title, "Test Remote COG");
             assert!(!display_url.contains("secret-query"));
-            assert!(!is_band_math);
+            assert_eq!(kind, crate::layers::RemoteLayerKind::SingleCog);
             assert!(fly_to);
             (id, bounds.expect("valid remote footprint"))
         }
@@ -513,7 +514,8 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
     use crate::colormap::CategoricalPaletteId;
     use crate::layers::layer::OverlayLayer;
     use crate::layers::{
-        BandMathFormula, LayerId, LocalBandMathInput, LocalBandMathSpec, OverlayEdit,
+        BandMathEdit, BandMathFormula, LayerId, LocalBandMathInput, LocalBandMathSpec, OverlayEdit,
+        SingleRasterEdit,
     };
 
     let dir = TestTempDir::new("band-math-cursor-refcount");
@@ -609,14 +611,10 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
 
     // Verify zoom-invariant CPU BandMath cursor readout on both cloud-masked (left)
     // and clear vegetation (right) halves.
-    let frame = mgr
-        .stack
-        .get(bm_id)
-        .expect("bm layer")
-        .primary_asset()
-        .geo()
-        .frame()
-        .clone();
+    let frame = match mgr.stack.get(bm_id).expect("bm layer").kind() {
+        crate::layers::layer::LayerKind::BandMath(bm) => bm.reference_asset().geo().frame().clone(),
+        _ => panic!("expected BandMath layer"),
+    };
     let (lat_left, lon_left) = frame.geodetic(0.25, 0.5);
     let readout_left = wait_for_cursor_readout(&mgr, lat_left, lon_left);
     match readout_left.value {
@@ -652,7 +650,10 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
 
     // Disabling SCL mask triggers a topology change so VRAM reservation,
     // pinned root streams, and orphaned SCL jobs stay synchronized.
-    let mut_scl_off = mgr.edit_layer(bm_id, OverlayEdit::SetBandMathSclEnabled(false));
+    let mut_scl_off = mgr.edit_layer(
+        bm_id,
+        OverlayEdit::BandMath(BandMathEdit::SetSclEnabled(false)),
+    );
     assert!(mut_scl_off.changed && mut_scl_off.topology_changed);
 
     // Verify multi-source refcounting: removing rgbnir_id while bm_id still references its SourceId
@@ -682,7 +683,9 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
         .expect("switch scl to categorical");
     let _ = mgr.edit_layer(
         scl_id,
-        OverlayEdit::SetCategoricalPalette(CategoricalPaletteId::DistinctClasses),
+        OverlayEdit::SingleRaster(SingleRasterEdit::CategoricalPalette(
+            CategoricalPaletteId::DistinctClasses,
+        )),
     );
     let r_distinct = wait_for_cursor_readout(&mgr, lat_left, lon_left);
     assert_eq!(
@@ -694,7 +697,9 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
     );
     let _ = mgr.edit_layer(
         scl_id,
-        OverlayEdit::SetCategoricalPalette(CategoricalPaletteId::Sentinel2Scl),
+        OverlayEdit::SingleRaster(SingleRasterEdit::CategoricalPalette(
+            CategoricalPaletteId::Sentinel2Scl,
+        )),
     );
     let r_scl = wait_for_cursor_readout(&mgr, lat_left, lon_left);
     assert_eq!(
@@ -732,6 +737,349 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
         scl_layer.style().categorical_palette(),
         CategoricalPaletteId::Sentinel2Scl
     );
+
+    mgr.begin_shutdown();
+    shutdown.cancel();
+    pending.close();
+    pool.shutdown();
+    mgr.finish_shutdown();
+}
+
+#[test]
+fn restore_403_refreshes_stac_item_href_once_via_singleflight_across_bands() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use veldmap_net::{NetConfig, NetContext, StacAuth};
+
+    use crate::layers::{
+        BandMathAssetOpenSpec, BandMathPreset, RemoteBandMathRequest, RemoteLayerKind,
+        StacCogAuthMode, StacItemRefreshPolicy,
+    };
+
+    let dir = TestTempDir::new("stac-403-refresh");
+    let tif_path = dir.path().join("band.tif");
+    write_tiled_geotiff_cog(&tif_path, 512, 512, [100, 150, 200]).expect("write tiled cog");
+    let payload = Arc::new(std::fs::read(&tif_path).expect("read tif"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let stop = Arc::new(AtomicBool::new(false));
+    let item_get_count = Arc::new(AtomicUsize::new(0));
+    let stop_srv = Arc::clone(&stop);
+    let payload_srv = Arc::clone(&payload);
+    let item_hits_srv = Arc::clone(&item_get_count);
+    let srv_handle = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).is_err() {
+                        continue;
+                    }
+                    let path = req_line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                    let mut range_hdr = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line
+                            .strip_prefix("Range:")
+                            .or_else(|| line.strip_prefix("range:"))
+                        {
+                            range_hdr = Some(v.trim().to_owned());
+                        }
+                    }
+
+                    if path == "/stac/items/S2_ITEM_1" {
+                        item_hits_srv.fetch_add(1, Ordering::SeqCst);
+                        // Small delay so both concurrent bands coalesce on singleflight.
+                        std::thread::sleep(Duration::from_millis(30));
+                        let json = format!(
+                            r#"{{
+                                "type": "Feature",
+                                "id": "S2_ITEM_1",
+                                "properties": {{"datetime": "2026-06-01T10:00:00Z"}},
+                                "assets": {{
+                                    "nir": {{"href": "http://{addr}/cogs/nir.tif?sig=fresh_ok"}},
+                                    "red": {{"href": "http://{addr}/cogs/red.tif?sig=fresh_ok"}}
+                                }}
+                            }}"#
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/geo+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            json.len(),
+                            json
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if path.contains("sig=fresh_ok") {
+                        let total = payload_srv.len();
+                        let (s, e) = range_hdr
+                            .as_deref()
+                            .and_then(|r| r.strip_prefix("bytes="))
+                            .and_then(|r| r.split_once('-'))
+                            .map_or((0, total - 1), |(a, b)| {
+                                let lo = a.parse::<usize>().unwrap_or(0);
+                                let hi = b.parse::<usize>().unwrap_or(total - 1).min(total - 1);
+                                (lo, hi)
+                            });
+                        let slice = &payload_srv[s..=e];
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {s}-{e}/{total}\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(slice);
+                    } else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nexpired",
+                        );
+                    }
+                    let _ = stream.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let budget = MemoryBudget::default();
+    let shutdown = CancelToken::new();
+    let net = Arc::new(NetContext::new(NetConfig::default()).expect("net"));
+    let pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig::from_budget(&budget),
+        shutdown.clone(),
+    );
+    let mut pending = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
+    let done_tx = pending.sender().expect("upload sender");
+    let wakeup: veldmap_core::sync::Wakeup = Arc::new(|| {});
+    let mut mgr = OverlayManager::new(OverlayManagerDeps {
+        budget,
+        disk_cache: None,
+        net: Some(Arc::clone(&net)),
+        fast_pool: pool.fast_handle(),
+        bulk_pool: pool.bulk_handle(),
+        done_tx,
+        wakeup,
+        shutdown: shutdown.clone(),
+    });
+
+    let item_href = format!("http://{addr}/stac/items/S2_ITEM_1");
+    let policy = StacItemRefreshPolicy {
+        item_auth: StacAuth::None,
+        asset_auth_origin: None,
+        asset_headers: Vec::new(),
+    };
+    mgr.begin_open_remote_band_math(RemoteBandMathRequest {
+        title: "Restored NDVI".to_owned(),
+        preset: BandMathPreset::Ndvi,
+        bands: vec![
+            BandMathAssetOpenSpec::Remote {
+                label: "NIR".to_owned(),
+                url: format!("http://{addr}/cogs/nir.tif"),
+                auth_mode: StacCogAuthMode::None,
+                extra_headers: Vec::new(),
+                external_bands: Vec::new(),
+                stac_item_href: Some(item_href.clone()),
+                asset_key: Some("nir".to_owned()),
+                refresh_policy: Some(policy.clone()),
+                band_index: 1,
+            },
+            BandMathAssetOpenSpec::Remote {
+                label: "Red".to_owned(),
+                url: format!("http://{addr}/cogs/red.tif"),
+                auth_mode: StacCogAuthMode::None,
+                extra_headers: Vec::new(),
+                external_bands: Vec::new(),
+                stac_item_href: Some(item_href),
+                asset_key: Some("red".to_owned()),
+                refresh_policy: Some(policy),
+                band_index: 0,
+            },
+        ],
+        scl: None,
+        visible: true,
+        opacity: 1.0,
+        style: None,
+        fly_to: false,
+        restore_id: Some(77),
+    })
+    .expect("queue band math restore");
+
+    match wait_for_io_event(&mut mgr) {
+        OverlayIoEvent::RemoteOpened {
+            kind: RemoteLayerKind::BandMath,
+            restore_id: Some(77),
+            ..
+        } => {}
+        other => panic!("expected refreshed RemoteOpened BandMath, got {other:?}"),
+    }
+    assert_eq!(
+        item_get_count.load(Ordering::SeqCst),
+        1,
+        "concurrent band 403 refreshes on the same stac_item_href must coalesce via singleflight"
+    );
+
+    mgr.begin_shutdown();
+    shutdown.cancel();
+    net.signal_shutdown();
+    pending.close();
+    pool.shutdown();
+    mgr.finish_shutdown();
+    net.shutdown();
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv_handle.join();
+}
+
+#[test]
+fn timeline_opens_active_and_adjacent_prefetch_protects_wanted_and_switches_to_diff() {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use crate::layers::{
+        OverlayEdit, TimelineCompareMode, TimelineEdit, TimelineEpochLoadState,
+        TimelineEpochSourceSpec, TimelineEpochSpec, TimelineOpenRequest,
+    };
+
+    let tmp = TestTempDir::new("veldmap-timeline-mgr");
+    let tif_a = tmp.path().join("scene_2024-05-01.tif");
+    let tif_b = tmp.path().join("scene_2024-06-01.tif");
+    let tif_c = tmp.path().join("scene_2024-07-01.tif");
+    write_tiled_geotiff_cog(&tif_a, 256, 256, [100, 120, 140]).expect("write tif_a");
+    write_tiled_geotiff_cog(&tif_b, 256, 256, [150, 170, 190]).expect("write tif_b");
+    write_tiled_geotiff_cog(&tif_c, 256, 256, [200, 210, 220]).expect("write tif_c");
+
+    let budget = MemoryBudget::default();
+    let shutdown = CancelToken::new();
+    let pool = TwoLaneDecodePool::spawn(
+        TwoLaneDecodePoolConfig::from_budget(&budget),
+        shutdown.clone(),
+    );
+    let mut pending = PendingUploads::with_max_queued_bytes(budget.queued_upload_bytes);
+    let done_tx = pending.sender().expect("upload sender");
+    let wakeup: veldmap_core::sync::Wakeup = Arc::new(|| {});
+    let mut mgr = OverlayManager::new(OverlayManagerDeps {
+        budget,
+        disk_cache: None,
+        net: None,
+        fast_pool: pool.fast_handle(),
+        bulk_pool: pool.bulk_handle(),
+        done_tx,
+        wakeup,
+        shutdown: shutdown.clone(),
+    });
+
+    let mk_ep = |date: &str, path: PathBuf| TimelineEpochSpec {
+        label: date.to_owned(),
+        date_label: date.to_owned(),
+        sort_key: format!("0:{date}"),
+        cloud_cover: Some(5.0),
+        source: TimelineEpochSourceSpec::LocalSingle {
+            path,
+            crs_override: None,
+        },
+    };
+    let (id, mutation) = mgr
+        .open_timeline(TimelineOpenRequest {
+            title: "Local Time Series".to_owned(),
+            epochs: vec![
+                mk_ep("2024-05-01", tif_a),
+                mk_ep("2024-06-01", tif_b),
+                mk_ep("2024-07-01", tif_c),
+            ],
+            recipe_preset: None,
+            band_math_style: None,
+            single_style: None,
+            visible: true,
+            opacity: 1.0,
+            active_idx: Some(1),
+            compare: None,
+            max_cloud_cover: None,
+            diff_colormap: None,
+            diff_invert_colormap: false,
+            diff_stretch_min: None,
+            diff_stretch_max: None,
+            fly_to: false,
+            restore_id: None,
+        })
+        .expect("open timeline");
+    assert!(mutation.changed && mutation.topology_changed);
+
+    // Wait until active epoch (1) and both adjacent prefetch epochs (0 and 2) are Ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = mgr.poll_io_events();
+        let summaries = mgr.layer_summaries();
+        if let Some(s) = summaries.first()
+            && let crate::layers::LayerSummaryKind::Timeline(tl) = &s.kind
+            && tl
+                .epochs
+                .iter()
+                .all(|e| e.load_state == TimelineEpochLoadState::Ready)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for timeline epochs"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Build a frame over the timeline footprint: active (1) + adjacent prefetch (0, 2)
+    // must populate `extend_wanted_tile_sets` so `PendingUploads` protects prefetched tiles!
+    let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
+    let mut carrier_keys = HashSet::new();
+    let cam = Camera::at(46.5, 7.5, 50_000.0);
+    let total_weight = mgr.total_appetite_weight_bytes().max(1);
+    let _ = mgr.build_and_schedule(&mut OverlayFrameCtx {
+        camera: &cam,
+        width_px: 512,
+        height_px: 512,
+        gpu_cache: &mut gpu_cache,
+        pending: &pending,
+        total_appetite_weight: total_weight,
+        carrier_keys: &mut carrier_keys,
+    });
+    let mut wanted_sets = Vec::new();
+    mgr.extend_wanted_tile_sets(&mut wanted_sets);
+    assert_eq!(
+        wanted_sets.len(),
+        3,
+        "active epoch + both adjacent prefetch epochs must expose non-empty wanted sets"
+    );
+
+    // Switch to CrossFade mode (Display RGB timeline): scratch demand must
+    // immediately update to 2x Rgba8 targets (`rgba_targets = 2`, `float_bands = 0`)
+    // and scrub must NOT purge any sources from GpuTileCache!
+    let cf_mut = mgr.edit_layer(
+        id,
+        OverlayEdit::Timeline(TimelineEdit::SetCompareMode(
+            TimelineCompareMode::CrossFade {
+                ref_idx: 0,
+                blend_t: 0.5,
+            },
+        )),
+    );
+    assert!(cf_mut.changed && cf_mut.topology_changed);
+    assert!(
+        cf_mut.purge_sources.is_empty(),
+        "timeline compare/scrub must never purge GpuTileCache sources"
+    );
+    let demand = mgr.max_scratch_requirements();
+    assert_eq!(demand.float_bands, 0);
+    assert_eq!(demand.rgba_targets, 2);
+
+    // Step epoch backwards to 0 -> changes active epoch cleanly with zero GPU purges.
+    let step_mut = mgr.edit_layer(id, OverlayEdit::Timeline(TimelineEdit::StepEpoch(-1)));
+    assert!(step_mut.changed && step_mut.topology_changed);
+    assert!(step_mut.purge_sources.is_empty());
 
     mgr.begin_shutdown();
     shutdown.cancel();

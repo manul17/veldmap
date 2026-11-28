@@ -26,13 +26,16 @@ pub(super) const QUIET_NAN_BITS: u32 = 0x7FC0_0000;
 pub(super) const MASK_UNCOVERED_SENTINEL: u8 = 255;
 
 /// Viewport scratch target requirements aggregated across active analytical
-/// layers (extensible to Slice 5B DEM relief scratch targets).
+/// layers (Band Math, dual-epoch scalar diff, dual-epoch RGB cross-fade, and
+/// Slice 5B DEM relief scratch targets).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScratchDemand {
     /// Maximum concurrent `R32Float` band targets required (`0..=4`).
     pub(crate) float_bands: usize,
     /// Whether an `R8Uint` `SCL` mask target is required.
     pub(crate) needs_u8_mask: bool,
+    /// Maximum concurrent `Rgba8UnormSrgb` scratch targets required (`0..=2`).
+    pub(crate) rgba_targets: usize,
 }
 
 impl ScratchDemand {
@@ -40,11 +43,12 @@ impl ScratchDemand {
     pub(crate) const NONE: Self = Self {
         float_bands: 0,
         needs_u8_mask: false,
+        rgba_targets: 0,
     };
 
     /// Whether zero scratch targets of any kind are requested.
     pub(crate) const fn is_empty(self) -> bool {
-        self.float_bands == 0 && !self.needs_u8_mask
+        self.float_bands == 0 && !self.needs_u8_mask && self.rgba_targets == 0
     }
 
     /// Combine two demands into the shared pool capacity covering both.
@@ -56,13 +60,18 @@ impl ScratchDemand {
                 other.float_bands
             },
             needs_u8_mask: self.needs_u8_mask || other.needs_u8_mask,
+            rgba_targets: if self.rgba_targets >= other.rgba_targets {
+                self.rgba_targets
+            } else {
+                other.rgba_targets
+            },
         }
     }
 }
 
 /// Compute exact VRAM bytes occupied by viewport offscreen + scratch targets
 /// (`OffscreenTarget` = `8 B/px`, each `R32Float` scratch = `4 B/px`, optional
-/// `R8Uint` mask = `1 B/px`).
+/// `R8Uint` mask = `1 B/px`, each `Rgba8UnormSrgb` scratch = `4 B/px`).
 pub(crate) fn estimate_viewport_target_vram_bytes(
     width: u32,
     height: u32,
@@ -73,8 +82,9 @@ pub(crate) fn estimate_viewport_target_vram_bytes(
     }
     let pixels = (width as usize).saturating_mul(height as usize);
     let offscreen_bpp = 8usize; // Rgba8UnormSrgb (4) + Depth32Float (4)
-    let scratch_bpp =
-        demand.float_bands.min(4).saturating_mul(4) + usize::from(demand.needs_u8_mask);
+    let scratch_bpp = demand.float_bands.min(4).saturating_mul(4)
+        + usize::from(demand.needs_u8_mask)
+        + demand.rgba_targets.min(2).saturating_mul(4);
     pixels.saturating_mul(offscreen_bpp.saturating_add(scratch_bpp))
 }
 
@@ -83,26 +93,36 @@ struct AllocatedScratch {
     height: u32,
     float_views: Vec<wgpu::TextureView>,
     mask_view: Option<wgpu::TextureView>,
+    rgba_views: Vec<wgpu::TextureView>,
     composite_bind_group: wgpu::BindGroup,
+    rgba_bind_group: wgpu::BindGroup,
+    /// Non-overlapping read-only reduce bind groups for `N = 1, 2, 3` input
+    /// bands (`index = N - 1`): binds ONLY `float_views[0..N]` + `mask` (never
+    /// `float_views[N]`, which is the render attachment).
+    reduce_bind_groups: [Option<wgpu::BindGroup>; 3],
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl AllocatedScratch {
     fn vram_bytes(&self) -> usize {
         let pixels = (self.width as usize).saturating_mul(self.height as usize);
-        let bpp = self.float_views.len().saturating_mul(4) + usize::from(self.mask_view.is_some());
+        let bpp = self.float_views.len().saturating_mul(4)
+            + usize::from(self.mask_view.is_some())
+            + self.rgba_views.len().saturating_mul(4);
         pixels.saturating_mul(bpp)
     }
 }
 
-/// Lazily allocated shared viewport scratch targets (`1..=4` `R32Float` +
-/// optional `R8Uint` mask) plus immutable 1×1 dummy textures and the runtime
-/// quiet-NaN clear uniform buffer.
+/// Lazily allocated shared viewport scratch targets (`0..=4` `R32Float`,
+/// optional `R8Uint` mask, `0..=2` `Rgba8UnormSrgb`) plus immutable 1×1 dummy
+/// textures and the runtime quiet-NaN clear uniform buffer.
 pub(super) struct ScratchTargetPool {
     _nan_clear_buffer: wgpu::Buffer,
     nan_clear_bind_group: wgpu::BindGroup,
     dummy_float_view: wgpu::TextureView,
     dummy_mask_view: wgpu::TextureView,
+    dummy_rgba_view: wgpu::TextureView,
+    dummy_rgba_bind_group: wgpu::BindGroup,
     allocated: Option<AllocatedScratch>,
 }
 
@@ -181,12 +201,35 @@ impl ScratchTargetPool {
             wgpu::TextureFormat::R8Uint,
             &[MASK_UNCOVERED_SENTINEL],
         );
+        let dummy_rgba_view = create_dummy_1x1_view(
+            device,
+            queue,
+            "scratch 1x1 dummy Rgba8UnormSrgb",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &[0, 0, 0, 0],
+        );
+        let dummy_rgba_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scratch dummy rgba bind group (@group(3))"),
+            layout: &pipelines.rgba_scratch_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&dummy_rgba_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&dummy_rgba_view),
+                },
+            ],
+        });
 
         Self {
             _nan_clear_buffer: nan_clear_buffer,
             nan_clear_bind_group,
             dummy_float_view,
             dummy_mask_view,
+            dummy_rgba_view,
+            dummy_rgba_bind_group,
             allocated: None,
         }
     }
@@ -203,6 +246,7 @@ impl ScratchTargetPool {
     ) {
         let float_bands = demand.float_bands.min(4);
         let needs_mask = demand.needs_u8_mask;
+        let rgba_targets = demand.rgba_targets.min(2);
         if demand.is_empty() || width == 0 || height == 0 {
             self.allocated = None;
             return;
@@ -212,6 +256,7 @@ impl ScratchTargetPool {
             && cur.height == height
             && cur.float_views.len() == float_bands
             && cur.mask_view.is_some() == needs_mask
+            && cur.rgba_views.len() == rgba_targets
         {
             return;
         }
@@ -258,6 +303,26 @@ impl ScratchTargetPool {
             tex.create_view(&wgpu::TextureViewDescriptor::default())
         });
 
+        let mut rgba_views = Vec::with_capacity(rgba_targets);
+        for i in 0..rgba_targets {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(if i == 0 {
+                    "scratch Rgba8UnormSrgb [0]"
+                } else {
+                    "scratch Rgba8UnormSrgb [1]"
+                }),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            rgba_views.push(tex.create_view(&wgpu::TextureViewDescriptor::default()));
+        }
+
         let view_for = |idx: usize| -> &wgpu::TextureView {
             float_views.get(idx).unwrap_or(&self.dummy_float_view)
         };
@@ -289,12 +354,76 @@ impl ScratchTargetPool {
             ],
         });
 
+        let rgba_for = |idx: usize| -> &wgpu::TextureView {
+            rgba_views.get(idx).unwrap_or(&self.dummy_rgba_view)
+        };
+        let rgba_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scratch rgba bind group (@group(3))"),
+            layout: &pipelines.rgba_scratch_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(rgba_for(0)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(rgba_for(1)),
+                },
+            ],
+        });
+
+        // Build non-overlapping reduce bind groups for `N = 1, 2, 3` whenever
+        // `float_bands >= N + 1`: bind ONLY `float_views[0..N]` + `mask`, NEVER
+        // `float_views[N]` (which serves as the reduce render target).
+        let reduce_bind_groups: [Option<wgpu::BindGroup>; 3] = std::array::from_fn(|idx| {
+            let n = idx + 1;
+            if float_bands <= n {
+                return None;
+            }
+            let r_view = |slot: usize| -> &wgpu::TextureView {
+                if slot < n {
+                    &float_views[slot]
+                } else {
+                    &self.dummy_float_view
+                }
+            };
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(match n {
+                    1 => "band-math reduce non-overlapping bind group (N=1)",
+                    2 => "band-math reduce non-overlapping bind group (N=2)",
+                    _ => "band-math reduce non-overlapping bind group (N=3)",
+                }),
+                layout: &pipelines.reduce_scratch_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(r_view(0)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(r_view(1)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(r_view(2)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(mask_binding),
+                    },
+                ],
+            }))
+        });
+
         self.allocated = Some(AllocatedScratch {
             width,
             height,
             float_views,
             mask_view,
+            rgba_views,
             composite_bind_group,
+            rgba_bind_group,
+            reduce_bind_groups,
         });
     }
 
@@ -323,21 +452,47 @@ impl ScratchTargetPool {
         self.allocated.as_ref().and_then(|a| a.mask_view.as_ref())
     }
 
+    pub(super) fn rgba_views(&self) -> &[wgpu::TextureView] {
+        self.allocated
+            .as_ref()
+            .map_or(&[], |a| a.rgba_views.as_slice())
+    }
+
     pub(super) fn composite_bind_group(&self) -> Option<&wgpu::BindGroup> {
         self.allocated.as_ref().map(|a| &a.composite_bind_group)
+    }
+
+    pub(super) fn rgba_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.allocated.as_ref().map(|a| &a.rgba_bind_group)
+    }
+
+    pub(super) fn dummy_rgba_bind_group(&self) -> &wgpu::BindGroup {
+        &self.dummy_rgba_bind_group
+    }
+
+    /// Return the non-overlapping read-only reduce bind group for `input_bands`
+    /// (`1..=3`), guaranteeing `float_views[input_bands]` is never bound while
+    /// being written.
+    pub(super) fn reduce_bind_group(&self, input_bands: usize) -> Option<&wgpu::BindGroup> {
+        let idx = input_bands.checked_sub(1)?;
+        self.allocated
+            .as_ref()
+            .and_then(|a| a.reduce_bind_groups.get(idx))
+            .and_then(Option::as_ref)
     }
 }
 
 /// Compute a conservative clamped screen-space scissor rectangle `[x, y, w, h]`
-/// enclosing all visible patches of `bm`, falling back to full viewport
-/// `[0, 0, width, height]` whenever any projected sample has `clip.w <= near`,
-/// straddles the ellipsoid horizon limb, or spans a wide angular arc (`> 4°`),
-/// and returning `None` when the clamped scissor rectangle is empty.
-pub fn compute_band_math_scissor_rect(
+/// enclosing all visible patches across `patch_sets`, falling back to full
+/// viewport `[0, 0, width, height]` whenever any projected sample has
+/// `clip.w <= near`, straddles the ellipsoid horizon limb, or spans a wide
+/// angular arc (`> 4°`), and returning `None` when the clamped scissor
+/// rectangle is empty.
+pub(crate) fn compute_patch_sets_scissor_rect<'a>(
     camera: &Camera,
     width: u32,
     height: u32,
-    bm: &DrawBandMathLayer,
+    patch_sets: impl IntoIterator<Item = super::snapshot::WarpPatchSetRef<'a>>,
 ) -> Option<[u32; 4]> {
     if width == 0 || height == 0 {
         return None;
@@ -416,7 +571,7 @@ pub fn compute_band_math_scissor_rect(
             true
         };
 
-    for set in bm.active_warp_patch_sets(false) {
+    for set in patch_sets {
         for patch in set.patches {
             if !visit_patch(
                 set.frame,
@@ -442,4 +597,15 @@ pub fn compute_band_math_scissor_rect(
         return None;
     }
     Some([x0, y0, x1 - x0, y1 - y0])
+}
+
+/// Compute a conservative clamped screen-space scissor rectangle `[x, y, w, h]`
+/// enclosing all visible patches of `bm`.
+pub fn compute_band_math_scissor_rect(
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    bm: &DrawBandMathLayer,
+) -> Option<[u32; 4]> {
+    compute_patch_sets_scissor_rect(camera, width, height, bm.active_warp_patch_sets(false))
 }

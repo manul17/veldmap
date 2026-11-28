@@ -4,8 +4,8 @@ use serde_json::{Map, Value};
 use veldmap_core::geo::{geojson_geometry_to_value, parse_geojson_geometry_value};
 
 use super::types::{
-    MAX_STAC_SEARCH_LIMIT, StacAsset, StacError, StacItem, StacRasterBandMeta, StacSearchQuery,
-    StacSearchResult,
+    MAX_STAC_SEARCH_LIMIT, StacAsset, StacError, StacItem, StacNextLink, StacNextMethod,
+    StacRasterBandMeta, StacSearchQuery, StacSearchResult, StacSortBy,
 };
 
 pub(super) fn build_search_payload(collection: &str, query: &StacSearchQuery) -> Value {
@@ -50,10 +50,84 @@ pub(super) fn build_search_payload(collection: &str, query: &StacSearchQuery) ->
         );
     }
 
+    if let Some(sort_by) = query.sort_by {
+        let (field, direction) = match sort_by {
+            StacSortBy::Newest => ("properties.datetime", "desc"),
+            StacSortBy::LeastCloud => ("properties.eo:cloud_cover", "asc"),
+        };
+        obj.insert(
+            "sortby".to_owned(),
+            serde_json::json!([{
+                "field": field,
+                "direction": direction,
+            }]),
+        );
+    }
+
     Value::Object(obj)
 }
 
-pub(super) fn parse_search_response(val: &Value) -> Result<StacSearchResult, StacError> {
+fn parse_next_link(obj: &Map<String, Value>, request_url: &str) -> Option<StacNextLink> {
+    let links = obj.get("links").and_then(Value::as_array)?;
+    let base_url = reqwest::Url::parse(request_url).ok();
+    for link in links {
+        let Some(link_obj) = link.as_object() else {
+            continue;
+        };
+        let Some(rel) = link_obj.get("rel").and_then(Value::as_str) else {
+            continue;
+        };
+        if !rel.eq_ignore_ascii_case("next") {
+            continue;
+        }
+        let Some(raw_href) = link_obj
+            .get("href")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let resolved = match &base_url {
+            Some(base) => {
+                let Ok(joined) = base.join(raw_href) else {
+                    continue;
+                };
+                joined.to_string()
+            }
+            None => raw_href.to_owned(),
+        };
+        if !crate::url::is_valid_http_endpoint(&resolved) {
+            continue;
+        }
+        let method = match link_obj.get("method").and_then(Value::as_str) {
+            Some(m) if m.eq_ignore_ascii_case("POST") => StacNextMethod::Post,
+            Some(m) if m.eq_ignore_ascii_case("GET") => StacNextMethod::Get,
+            None => StacNextMethod::Get,
+            Some(_) => continue,
+        };
+        let body = match link_obj.get("body") {
+            Some(v) if v.is_object() => serde_json::to_string(v).ok(),
+            _ => None,
+        };
+        let merge = link_obj
+            .get("merge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return Some(StacNextLink {
+            href: resolved,
+            method,
+            body,
+            merge,
+        });
+    }
+    None
+}
+
+pub(super) fn parse_search_response(
+    val: &Value,
+    request_url: &str,
+) -> Result<StacSearchResult, StacError> {
     let obj = val.as_object().ok_or_else(|| {
         StacError::InvalidJson("STAC response root is not a JSON object".to_owned())
     })?;
@@ -78,7 +152,18 @@ pub(super) fn parse_search_response(val: &Value) -> Result<StacSearchResult, Sta
             items.push(item);
         }
     }
-    Ok(StacSearchResult { items, matched })
+    let next_link = parse_next_link(obj, request_url);
+    Ok(StacSearchResult {
+        items,
+        matched,
+        next_link,
+    })
+}
+
+pub(super) fn parse_single_item_response(val: &Value) -> Result<StacItem, StacError> {
+    parse_stac_item(val).ok_or_else(|| {
+        StacError::InvalidJson("STAC item response missing required 'id' field".to_owned())
+    })
 }
 
 /// Parse an RFC 7946 §5 2D (`[west, south, east, north]`) or 3D

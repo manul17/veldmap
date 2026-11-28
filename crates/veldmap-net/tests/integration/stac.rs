@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use veldmap_core::sync::CancelToken;
 use veldmap_net::{
-    NetConfig, NetContext, StacAuth, StacCatalogConfig, StacClient, StacSearchQuery,
+    NetConfig, NetContext, StacAuth, StacCatalogConfig, StacClient, StacError, StacNextLink,
+    StacNextMethod, StacSearchQuery, StacSortBy,
 };
 
 use crate::mock_http::{MockHttpServer, write_http_response};
@@ -128,6 +129,7 @@ fn stac_search_parses_sentinel2_assets_raster_bands_auth_and_redacts_secrets() {
         intersects: None,
         datetime: Some("2023-08-01T00:00:00Z/2023-08-31T23:59:59Z".to_owned()),
         max_cloud_cover: Some(20.0),
+        sort_by: Some(StacSortBy::Newest),
         limit: 10,
     };
 
@@ -283,4 +285,227 @@ fn stac_rejects_invalid_endpoint_forbidden_header_and_redacts_error_snippets() {
         !msg.contains("secret-tok"),
         "secret leaked in snippet: {msg}"
     );
+}
+
+#[test]
+fn stac_pagination_get_post_merge_origin_guards_and_fetch_item() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let page_hits = Arc::new(AtomicUsize::new(0));
+    let recorded = Arc::new(Mutex::new(
+        Vec::<(String, String, Option<String>, String)>::new(),
+    ));
+    let hits_srv = Arc::clone(&page_hits);
+    let rec_srv = Arc::clone(&recorded);
+
+    let server = MockHttpServer::start(move |req, mut stream, _stop| {
+        let hits = Arc::clone(&hits_srv);
+        let rec = Arc::clone(&rec_srv);
+        async move {
+            let method = req.method.clone();
+            let path = req.path_and_query.clone();
+            let auth = req.header("authorization").map(str::to_owned);
+            let body = req.body_string();
+            rec.lock()
+                .expect("lock")
+                .push((method.clone(), path.clone(), auth, body.clone()));
+
+            if path == "/v1/items/S2A_REFRESH" && method == "GET" {
+                let item_json = r#"{
+                    "type": "Feature",
+                    "id": "S2A_REFRESH",
+                    "collection": "sentinel-2-l2a",
+                    "properties": {"datetime": "2025-05-01T10:00:00Z"},
+                    "assets": {
+                        "red": {
+                            "href": "https://storage.example.org/b04.tif?sig=fresh_token_123",
+                            "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+                        }
+                    }
+                }"#;
+                write_http_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "Content-Type: application/geo+json\r\n",
+                    item_json.as_bytes(),
+                )
+                .await;
+                return;
+            }
+
+            if path == "/v1/items/REDIRECT_CROSS" {
+                write_http_response(
+                    &mut stream,
+                    302,
+                    "Found",
+                    "Location: http://evil.example.org/steal\r\n",
+                    b"",
+                )
+                .await;
+                return;
+            }
+
+            let n = hits.fetch_add(1, Ordering::SeqCst);
+            let resp = match n {
+                // Page 1: POST next with merge: true (AWS Earth Search pattern).
+                0 => {
+                    r#"{
+                    "type": "FeatureCollection",
+                    "numberMatched": 3,
+                    "features": [{"type": "Feature", "id": "ITEM_1", "properties": {"datetime": "2025-05-03T10:00:00Z"}, "assets": {}}],
+                    "links": [{
+                        "rel": "next",
+                        "href": "/v1/search",
+                        "method": "POST",
+                        "merge": true,
+                        "body": {"next": "tok-page-2"}
+                    }]
+                }"#
+                }
+                // Page 2: relative GET next link.
+                1 => {
+                    r#"{
+                    "type": "FeatureCollection",
+                    "numberMatched": 3,
+                    "features": [{"type": "Feature", "id": "ITEM_2", "properties": {"datetime": "2025-05-02T10:00:00Z"}, "assets": {}}],
+                    "links": [{
+                        "rel": "next",
+                        "href": "/v1/search?cursor=page3"
+                    }]
+                }"#
+                }
+                // Page 3: final page without next link.
+                _ => {
+                    r#"{
+                    "type": "FeatureCollection",
+                    "numberMatched": 3,
+                    "features": [{"type": "Feature", "id": "ITEM_3", "properties": {"datetime": "2025-05-01T10:00:00Z"}, "assets": {}}],
+                    "links": []
+                }"#
+                }
+            };
+            write_http_response(
+                &mut stream,
+                200,
+                "OK",
+                "Content-Type: application/geo+json\r\n",
+                resp.as_bytes(),
+            )
+            .await;
+        }
+    });
+
+    let endpoint = format!("http://{}/v1", server.addr());
+    let net = Arc::new(NetContext::new(NetConfig::default()).expect("net"));
+    let client = StacClient::new(Arc::clone(&net));
+    let cancel = CancelToken::new();
+    let catalog = StacCatalogConfig {
+        endpoint: endpoint.clone(),
+        collection: "sentinel-2-l2a".to_owned(),
+        auth: StacAuth::Bearer("page-secret".to_owned()),
+    };
+    let query = StacSearchQuery {
+        bbox: Some([10.0, 50.0, 11.0, 51.0]),
+        sort_by: Some(StacSortBy::LeastCloud),
+        limit: 1,
+        ..StacSearchQuery::default()
+    };
+
+    // Page 1 -> POST search.
+    let p1 = net
+        .handle()
+        .block_on(client.search_async(&catalog, &query, &cancel))
+        .expect("page 1");
+    assert_eq!(p1.items[0].id, "ITEM_1");
+    let next1 = p1.next_link.expect("next1");
+    assert_eq!(next1.method, StacNextMethod::Post);
+    assert!(next1.merge);
+
+    // Page 2 -> POST merge preserves original collection + bbox + sortby + adds `next`.
+    let p2 = net
+        .handle()
+        .block_on(client.search_next_async(&catalog, &query, &next1, &cancel))
+        .expect("page 2");
+    assert_eq!(p2.items[0].id, "ITEM_2");
+    let next2 = p2.next_link.expect("next2");
+    assert_eq!(next2.method, StacNextMethod::Get);
+
+    // Page 3 -> GET cursor URL.
+    let p3 = net
+        .handle()
+        .block_on(client.search_next_async(&catalog, &query, &next2, &cancel))
+        .expect("page 3");
+    assert_eq!(p3.items[0].id, "ITEM_3");
+    assert!(p3.next_link.is_none());
+
+    {
+        let reqs = recorded.lock().expect("lock");
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[1].0, "POST");
+        assert!(reqs[1].3.contains("\"sentinel-2-l2a\""));
+        assert!(reqs[1].3.contains("\"tok-page-2\""));
+        assert!(reqs[1].3.contains("\"properties.eo:cloud_cover\""));
+        assert_eq!(reqs[2].0, "GET");
+        assert_eq!(reqs[2].1, "/v1/search?cursor=page3");
+        assert_eq!(reqs[2].2.as_deref(), Some("Bearer page-secret"));
+    }
+
+    // Security guard 1: HTTPS catalog refuses HTTP next-link downgrade.
+    let https_catalog = StacCatalogConfig {
+        endpoint: "https://stac.secure.example/v1".to_owned(),
+        collection: "s2".to_owned(),
+        auth: StacAuth::None,
+    };
+    let downgrade_link = StacNextLink {
+        href: "http://stac.secure.example/v1/search?page=2".to_owned(),
+        method: StacNextMethod::Get,
+        body: None,
+        merge: false,
+    };
+    let err = net
+        .handle()
+        .block_on(client.search_next_async(&https_catalog, &query, &downgrade_link, &cancel))
+        .expect_err("downgrade rejected");
+    assert!(matches!(err, StacError::LinkRejected(_)));
+
+    // Security guard 2: Authenticated catalog refuses off-origin next link.
+    let off_origin = StacNextLink {
+        href: "http://attacker.example.org/v1/search?page=2".to_owned(),
+        method: StacNextMethod::Get,
+        body: None,
+        merge: false,
+    };
+    let err = net
+        .handle()
+        .block_on(client.search_next_async(&catalog, &query, &off_origin, &cancel))
+        .expect_err("off-origin auth rejected");
+    assert!(matches!(err, StacError::LinkRejected(_)));
+
+    // fetch_item_async succeeds with auth and returns refreshed presigned asset href.
+    let item = net
+        .handle()
+        .block_on(client.fetch_item_async(
+            &format!("{endpoint}/items/S2A_REFRESH"),
+            &catalog.auth,
+            &cancel,
+        ))
+        .expect("fetch item");
+    assert_eq!(item.id, "S2A_REFRESH");
+    assert_eq!(
+        item.assets[0].href,
+        "https://storage.example.org/b04.tif?sig=fresh_token_123"
+    );
+
+    // fetch_item_async with custom auth blocks cross-origin redirect.
+    let redir_err = net
+        .handle()
+        .block_on(client.fetch_item_async(
+            &format!("{endpoint}/items/REDIRECT_CROSS"),
+            &catalog.auth,
+            &cancel,
+        ))
+        .expect_err("cross-origin redirect blocked");
+    assert!(matches!(redir_err, StacError::Network(_)));
+    assert!(!redir_err.to_string().contains("page-secret"));
 }

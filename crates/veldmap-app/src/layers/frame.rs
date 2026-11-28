@@ -13,16 +13,20 @@ use veldmap_core::tile::{
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 use crate::render::{
-    DrawBandMathLayer, DrawOverlayContent, DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack,
-    DrawScratchBand, DrawScratchMask, OverlayMeshKey,
+    DrawBandEpoch, DrawBandMathLayer, DrawDisplayEpoch, DrawOverlayContent, DrawOverlayLayer,
+    DrawOverlayPatch, DrawOverlayTrack, DrawScratchBand, DrawScratchMask,
+    DrawTemporalCrossFadeLayer, DrawTemporalCrossFadeSource, DrawTemporalDiffLayer, OverlayMeshKey,
 };
 
 use super::asset::RasterAsset;
-use super::band_math::scl_gpu_nodata_value;
+use super::band_math::{BandMathLayerData, scl_gpu_nodata_value};
 use super::jobs::schedule_asset_rungs;
 use super::layer::{LayerKind, OverlayLayer};
 use super::runtime::OverlayRuntime;
 use super::style::LayerStyle;
+use super::timeline::{
+    TIMELINE_PREFETCH_CAP_TILES, TimelineCompareMode, TimelineEpochContent, TimelineLayerData,
+};
 
 fn build_draw_track(asset: &RasterAsset, style: &LayerStyle) -> DrawOverlayTrack {
     let spec = asset.meta().spec;
@@ -75,11 +79,24 @@ pub(super) struct PreparedAssetPlan {
     ladder_cells: Vec<(u8, Vec<(u32, u32)>)>,
 }
 
+pub(super) enum PreparedEpochPlan {
+    Single(PreparedAssetPlan),
+    BandMath {
+        bands: Vec<PreparedAssetPlan>,
+        scl: Option<PreparedAssetPlan>,
+    },
+}
+
 pub(super) enum PreparedLayerPlan {
     Single(PreparedAssetPlan),
     BandMath {
         bands: Vec<PreparedAssetPlan>,
         scl: Option<PreparedAssetPlan>,
+    },
+    Timeline {
+        active: Option<(usize, PreparedEpochPlan)>,
+        ref_epoch: Option<(usize, PreparedEpochPlan)>,
+        prefetch: Vec<(usize, PreparedEpochPlan)>,
     },
 }
 
@@ -114,16 +131,25 @@ fn select_target_rung(
     }
 }
 
-fn prepare_single_asset(asset: &mut RasterAsset, ctx: &PrepareFrameCtx<'_>) -> PreparedAssetPlan {
+fn prepare_single_asset_with_cap(
+    asset: &mut RasterAsset,
+    ctx: &PrepareFrameCtx<'_>,
+    cap_override: Option<usize>,
+) -> PreparedAssetPlan {
     let desc = asset.source().description();
     let (img_w, img_h) = (desc.width, desc.height);
     let max_level = asset.meta().max_level();
 
-    let weight = asset.appetite_weight_bytes();
-    let appetite_bytes = ctx
-        .gpu_cache
-        .proportional_pyramid_byte_cap(weight, ctx.total_appetite_weight);
-    let cap_tiles = (appetite_bytes / asset.observed_tile_bytes()).max(1);
+    let cap_tiles = match cap_override {
+        Some(cap) => cap.max(1),
+        None => {
+            let weight = asset.appetite_weight_bytes();
+            let appetite_bytes = ctx
+                .gpu_cache
+                .proportional_pyramid_byte_cap(weight, ctx.total_appetite_weight);
+            (appetite_bytes / asset.observed_tile_bytes()).max(1)
+        }
+    };
 
     let sharpest = asset
         .geo()
@@ -150,6 +176,417 @@ fn prepare_single_asset(asset: &mut RasterAsset, ctx: &PrepareFrameCtx<'_>) -> P
         target_level,
         target_cells,
         ladder_cells,
+    }
+}
+
+fn prepare_single_asset(asset: &mut RasterAsset, ctx: &PrepareFrameCtx<'_>) -> PreparedAssetPlan {
+    prepare_single_asset_with_cap(asset, ctx, None)
+}
+
+fn prepare_epoch_content(
+    content: &mut TimelineEpochContent,
+    ctx: &PrepareFrameCtx<'_>,
+    cap_override: Option<usize>,
+) -> PreparedEpochPlan {
+    match content {
+        TimelineEpochContent::Single { asset, .. } => {
+            PreparedEpochPlan::Single(prepare_single_asset_with_cap(asset, ctx, cap_override))
+        }
+        TimelineEpochContent::BandMath(bm) => {
+            let bands = bm
+                .bands
+                .iter_mut()
+                .map(|b| prepare_single_asset_with_cap(b, ctx, cap_override))
+                .collect();
+            let scl = if let Some(scl_asset) = &mut bm.scl {
+                if bm.style.scl_mask_enabled {
+                    Some(prepare_single_asset_with_cap(scl_asset, ctx, cap_override))
+                } else {
+                    scl_asset.clear_wanted();
+                    None
+                }
+            } else {
+                None
+            };
+            PreparedEpochPlan::BandMath { bands, scl }
+        }
+    }
+}
+
+fn schedule_prefetch_epoch(
+    content: &TimelineEpochContent,
+    plan: PreparedEpochPlan,
+    ctx: &mut LayerFrameCtx<'_>,
+) {
+    match (content, plan) {
+        (TimelineEpochContent::Single { asset, .. }, PreparedEpochPlan::Single(asset_plan))
+            if !asset_plan.target_cells.is_empty() =>
+        {
+            schedule_asset_rungs(
+                asset,
+                &asset_plan.ladder_cells,
+                ctx.runtime,
+                ctx.gpu_cache,
+                ctx.pending,
+            );
+        }
+        (TimelineEpochContent::BandMath(bm), PreparedEpochPlan::BandMath { bands, scl }) => {
+            for (asset, band_plan) in bm.bands.iter().zip(bands) {
+                if !band_plan.target_cells.is_empty() {
+                    schedule_asset_rungs(
+                        asset,
+                        &band_plan.ladder_cells,
+                        ctx.runtime,
+                        ctx.gpu_cache,
+                        ctx.pending,
+                    );
+                }
+            }
+            if let (Some(scl_asset), Some(scl_plan)) = (&bm.scl, scl)
+                && !scl_plan.target_cells.is_empty()
+            {
+                schedule_asset_rungs(
+                    scl_asset,
+                    &scl_plan.ladder_cells,
+                    ctx.runtime,
+                    ctx.gpu_cache,
+                    ctx.pending,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn finish_band_math_epoch(
+    bm: &BandMathLayerData,
+    band_plans: Vec<PreparedAssetPlan>,
+    scl_plan: Option<PreparedAssetPlan>,
+    ctx: &mut LayerFrameCtx<'_>,
+) -> (DrawBandEpoch, bool) {
+    let mut draw_bands = Vec::with_capacity(bm.bands.len());
+    let mut all_have_patches = !bm.bands.is_empty();
+    for (band_asset, band_plan) in bm.bands.iter().zip(band_plans) {
+        let (scale, offset) = band_asset.band_scale_offset();
+        let scheduled = finish_single_asset(band_asset, band_plan, ctx);
+        if scheduled.patches.is_empty() {
+            all_have_patches = false;
+        }
+        draw_bands.push(DrawScratchBand {
+            frame: Arc::clone(band_asset.geo().frame()),
+            image_width: scheduled.image_width,
+            image_height: scheduled.image_height,
+            segments: scheduled.segments,
+            scale: scale as f32,
+            offset: offset as f32,
+            patches: scheduled.patches,
+        });
+    }
+    let draw_scl = if let (Some(scl_asset), Some(scl_plan)) = (&bm.scl, scl_plan) {
+        let nodata_value = scl_gpu_nodata_value(scl_asset);
+        let scheduled = finish_single_asset(scl_asset, scl_plan, ctx);
+        (!scheduled.patches.is_empty()).then(|| DrawScratchMask {
+            frame: Arc::clone(scl_asset.geo().frame()),
+            image_width: scheduled.image_width,
+            image_height: scheduled.image_height,
+            segments: scheduled.segments,
+            nodata_value,
+            patches: scheduled.patches,
+        })
+    } else {
+        None
+    };
+    (
+        DrawBandEpoch {
+            bands: draw_bands,
+            scl: draw_scl,
+        },
+        all_have_patches,
+    )
+}
+
+fn finish_single_epoch_draw(
+    layer_id: u64,
+    opacity: f32,
+    content: &TimelineEpochContent,
+    plan: PreparedEpochPlan,
+    ctx: &mut LayerFrameCtx<'_>,
+) -> Option<DrawOverlayLayer> {
+    match (content, plan) {
+        (TimelineEpochContent::Single { asset, style }, PreparedEpochPlan::Single(asset_plan)) => {
+            let scheduled = finish_single_asset(asset, asset_plan, ctx);
+            let track = build_draw_track(asset, style);
+            (!scheduled.patches.is_empty()).then(|| DrawOverlayLayer {
+                layer_id,
+                opacity,
+                content: DrawOverlayContent::Direct {
+                    track,
+                    frame: Arc::clone(asset.geo().frame()),
+                    image_width: scheduled.image_width,
+                    image_height: scheduled.image_height,
+                    segments: scheduled.segments,
+                    patches: scheduled.patches,
+                },
+            })
+        }
+        (TimelineEpochContent::BandMath(bm), PreparedEpochPlan::BandMath { bands, scl }) => {
+            let (epoch, all_ready) = finish_band_math_epoch(bm, bands, scl, ctx);
+            all_ready.then(|| DrawOverlayLayer {
+                layer_id,
+                opacity,
+                content: DrawOverlayContent::BandMath(Box::new(DrawBandMathLayer {
+                    formula: bm.style.formula,
+                    colormap: bm.style.colormap,
+                    invert_colormap: bm.style.invert_colormap,
+                    stretch_min: bm.style.stretch_min as f32,
+                    stretch_max: bm.style.stretch_max as f32,
+                    rgb_min: bm.style.rgb_min.map(|v| v as f32),
+                    rgb_max: bm.style.rgb_max.map(|v| v as f32),
+                    rgb_gamma: bm.style.rgb_gamma,
+                    scl_mask_enabled: bm.style.scl_mask_enabled,
+                    scl_mask_bits: bm.style.scl_mask_bits,
+                    bands: epoch.bands,
+                    scl: epoch.scl,
+                })),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn finish_timeline_layer(
+    layer: &OverlayLayer,
+    tl: &TimelineLayerData,
+    active_plan: Option<(usize, PreparedEpochPlan)>,
+    ref_plan: Option<(usize, PreparedEpochPlan)>,
+    prefetch_plans: Vec<(usize, PreparedEpochPlan)>,
+    ctx: &mut LayerFrameCtx<'_>,
+) -> Option<DrawOverlayLayer> {
+    // Always schedule adjacent prefetched epochs (`active_idx ± 1`) onto the
+    // decode/remote pools while keeping them out of the rendered DrawSnapshot.
+    for (idx, p_plan) in prefetch_plans {
+        if let Some(content) = tl.epochs.get(idx).and_then(|e| e.ready_content()) {
+            schedule_prefetch_epoch(content, p_plan, ctx);
+        }
+    }
+
+    let layer_id = layer.id().raw();
+    let opacity = layer.opacity();
+    let (active_idx, active_plan) = active_plan?;
+    let active_content = tl.epochs.get(active_idx)?.ready_content()?;
+
+    match tl.compare {
+        TimelineCompareMode::Single => {
+            finish_single_epoch_draw(layer_id, opacity, active_content, active_plan, ctx)
+        }
+        TimelineCompareMode::ScalarDiff { .. } => {
+            let Some((ref_idx, ref_plan)) = ref_plan else {
+                return finish_single_epoch_draw(
+                    layer_id,
+                    opacity,
+                    active_content,
+                    active_plan,
+                    ctx,
+                );
+            };
+            let Some(ref_content) = tl.epochs.get(ref_idx).and_then(|e| e.ready_content()) else {
+                return finish_single_epoch_draw(
+                    layer_id,
+                    opacity,
+                    active_content,
+                    active_plan,
+                    ctx,
+                );
+            };
+            match (ref_content, ref_plan, active_content, active_plan) {
+                (
+                    TimelineEpochContent::BandMath(bm_a),
+                    PreparedEpochPlan::BandMath {
+                        bands: bands_a,
+                        scl: scl_a,
+                    },
+                    TimelineEpochContent::BandMath(bm_b),
+                    PreparedEpochPlan::BandMath {
+                        bands: bands_b,
+                        scl: scl_b,
+                    },
+                ) if bm_a.style.formula.is_scalar() && bm_b.style.formula.is_scalar() => {
+                    let (epoch_a, ready_a) = finish_band_math_epoch(bm_a, bands_a, scl_a, ctx);
+                    let (epoch_b, ready_b) = finish_band_math_epoch(bm_b, bands_b, scl_b, ctx);
+                    (ready_a && ready_b).then(|| DrawOverlayLayer {
+                        layer_id,
+                        opacity,
+                        content: DrawOverlayContent::TemporalDiff(Box::new(
+                            DrawTemporalDiffLayer {
+                                formula: Some(bm_b.style.formula),
+                                colormap: tl.diff_colormap,
+                                invert_colormap: tl.diff_invert_colormap,
+                                stretch_min: tl.diff_stretch_min as f32,
+                                stretch_max: tl.diff_stretch_max as f32,
+                                scl_mask_enabled: bm_b.style.scl_mask_enabled,
+                                scl_mask_bits: bm_b.style.scl_mask_bits,
+                                epoch_a,
+                                epoch_b,
+                            },
+                        )),
+                    })
+                }
+                (
+                    TimelineEpochContent::Single { asset: asset_a, .. },
+                    PreparedEpochPlan::Single(plan_a),
+                    TimelineEpochContent::Single { asset: asset_b, .. },
+                    PreparedEpochPlan::Single(plan_b),
+                ) if asset_a.meta().spec.format == PixelFormat::R32Float
+                    && asset_b.meta().spec.format == PixelFormat::R32Float =>
+                {
+                    let sched_a = finish_single_asset(asset_a, plan_a, ctx);
+                    let sched_b = finish_single_asset(asset_b, plan_b, ctx);
+                    if sched_a.patches.is_empty() || sched_b.patches.is_empty() {
+                        return None;
+                    }
+                    let (scale_a, offset_a) = asset_a.band_scale_offset();
+                    let (scale_b, offset_b) = asset_b.band_scale_offset();
+                    Some(DrawOverlayLayer {
+                        layer_id,
+                        opacity,
+                        content: DrawOverlayContent::TemporalDiff(Box::new(
+                            DrawTemporalDiffLayer {
+                                formula: None,
+                                colormap: tl.diff_colormap,
+                                invert_colormap: tl.diff_invert_colormap,
+                                stretch_min: tl.diff_stretch_min as f32,
+                                stretch_max: tl.diff_stretch_max as f32,
+                                scl_mask_enabled: false,
+                                scl_mask_bits: 0,
+                                epoch_a: DrawBandEpoch {
+                                    bands: vec![DrawScratchBand {
+                                        frame: Arc::clone(asset_a.geo().frame()),
+                                        image_width: sched_a.image_width,
+                                        image_height: sched_a.image_height,
+                                        segments: sched_a.segments,
+                                        scale: scale_a as f32,
+                                        offset: offset_a as f32,
+                                        patches: sched_a.patches,
+                                    }],
+                                    scl: None,
+                                },
+                                epoch_b: DrawBandEpoch {
+                                    bands: vec![DrawScratchBand {
+                                        frame: Arc::clone(asset_b.geo().frame()),
+                                        image_width: sched_b.image_width,
+                                        image_height: sched_b.image_height,
+                                        segments: sched_b.segments,
+                                        scale: scale_b as f32,
+                                        offset: offset_b as f32,
+                                        patches: sched_b.patches,
+                                    }],
+                                    scl: None,
+                                },
+                            },
+                        )),
+                    })
+                }
+                (_, _, active_c, active_p) => {
+                    finish_single_epoch_draw(layer_id, opacity, active_c, active_p, ctx)
+                }
+            }
+        }
+        TimelineCompareMode::CrossFade { blend_t, .. } => {
+            let Some((ref_idx, ref_plan)) = ref_plan else {
+                return finish_single_epoch_draw(
+                    layer_id,
+                    opacity,
+                    active_content,
+                    active_plan,
+                    ctx,
+                );
+            };
+            let Some(ref_content) = tl.epochs.get(ref_idx).and_then(|e| e.ready_content()) else {
+                return finish_single_epoch_draw(
+                    layer_id,
+                    opacity,
+                    active_content,
+                    active_plan,
+                    ctx,
+                );
+            };
+            match (ref_content, ref_plan, active_content, active_plan) {
+                (
+                    TimelineEpochContent::BandMath(bm_a),
+                    PreparedEpochPlan::BandMath {
+                        bands: bands_a,
+                        scl: scl_a,
+                    },
+                    TimelineEpochContent::BandMath(bm_b),
+                    PreparedEpochPlan::BandMath {
+                        bands: bands_b,
+                        scl: scl_b,
+                    },
+                ) if !bm_a.style.formula.is_scalar() && !bm_b.style.formula.is_scalar() => {
+                    let (epoch_a, ready_a) = finish_band_math_epoch(bm_a, bands_a, scl_a, ctx);
+                    let (epoch_b, ready_b) = finish_band_math_epoch(bm_b, bands_b, scl_b, ctx);
+                    (ready_a || ready_b).then(|| DrawOverlayLayer {
+                        layer_id,
+                        opacity,
+                        content: DrawOverlayContent::TemporalCrossFade(Box::new(
+                            DrawTemporalCrossFadeLayer {
+                                blend_t,
+                                source: DrawTemporalCrossFadeSource::BandMathRgb {
+                                    rgb_min: bm_b.style.rgb_min.map(|v| v as f32),
+                                    rgb_max: bm_b.style.rgb_max.map(|v| v as f32),
+                                    rgb_gamma: bm_b.style.rgb_gamma,
+                                    scl_mask_enabled: bm_b.style.scl_mask_enabled,
+                                    scl_mask_bits: bm_b.style.scl_mask_bits,
+                                    epoch_a,
+                                    epoch_b,
+                                },
+                            },
+                        )),
+                    })
+                }
+                (
+                    TimelineEpochContent::Single { asset: asset_a, .. },
+                    PreparedEpochPlan::Single(plan_a),
+                    TimelineEpochContent::Single { asset: asset_b, .. },
+                    PreparedEpochPlan::Single(plan_b),
+                ) if asset_a.meta().spec.format == PixelFormat::Rgba8UnormSrgb
+                    && asset_b.meta().spec.format == PixelFormat::Rgba8UnormSrgb =>
+                {
+                    let sched_a = finish_single_asset(asset_a, plan_a, ctx);
+                    let sched_b = finish_single_asset(asset_b, plan_b, ctx);
+                    (!sched_a.patches.is_empty() || !sched_b.patches.is_empty()).then(|| {
+                        DrawOverlayLayer {
+                            layer_id,
+                            opacity,
+                            content: DrawOverlayContent::TemporalCrossFade(Box::new(
+                                DrawTemporalCrossFadeLayer {
+                                    blend_t,
+                                    source: DrawTemporalCrossFadeSource::DirectDisplay {
+                                        epoch_a: DrawDisplayEpoch {
+                                            frame: Arc::clone(asset_a.geo().frame()),
+                                            image_width: sched_a.image_width,
+                                            image_height: sched_a.image_height,
+                                            segments: sched_a.segments,
+                                            patches: sched_a.patches,
+                                        },
+                                        epoch_b: DrawDisplayEpoch {
+                                            frame: Arc::clone(asset_b.geo().frame()),
+                                            image_width: sched_b.image_width,
+                                            image_height: sched_b.image_height,
+                                            segments: sched_b.segments,
+                                            patches: sched_b.patches,
+                                        },
+                                    },
+                                },
+                            )),
+                        }
+                    })
+                }
+                (_, _, active_c, active_p) => {
+                    finish_single_epoch_draw(layer_id, opacity, active_c, active_p, ctx)
+                }
+            }
+        }
     }
 }
 
@@ -225,6 +662,43 @@ pub(super) fn prepare_layer_wanted(
                 None
             };
             Some(PreparedLayerPlan::BandMath { bands, scl })
+        }
+        LayerKind::Timeline(tl) => {
+            let [active_idx, ref_idx] = tl.render_epoch_indices();
+            let prefetch_indices = tl.adjacent_prefetch_indices();
+            let needed = tl.needed_epoch_indices();
+
+            // Clear `wanted` on all open epochs outside {active, ref, prev, next}.
+            for (idx, epoch) in tl.epochs.iter_mut().enumerate() {
+                if !needed.contains(&idx)
+                    && let Some(content) = epoch.ready_content_mut()
+                {
+                    content.clear_wanted();
+                }
+            }
+
+            let active = active_idx.and_then(|idx| {
+                let content = tl.epochs.get_mut(idx)?.ready_content_mut()?;
+                Some((idx, prepare_epoch_content(content, ctx, None)))
+            });
+            let ref_epoch = ref_idx.and_then(|idx| {
+                let content = tl.epochs.get_mut(idx)?.ready_content_mut()?;
+                Some((idx, prepare_epoch_content(content, ctx, None)))
+            });
+            let mut prefetch = Vec::with_capacity(2);
+            for idx in prefetch_indices.into_iter().flatten() {
+                if let Some(content) = tl.epochs.get_mut(idx).and_then(|e| e.ready_content_mut()) {
+                    prefetch.push((
+                        idx,
+                        prepare_epoch_content(content, ctx, Some(TIMELINE_PREFETCH_CAP_TILES)),
+                    ));
+                }
+            }
+            Some(PreparedLayerPlan::Timeline {
+                active,
+                ref_epoch,
+                prefetch,
+            })
         }
     }
 }
@@ -317,6 +791,14 @@ pub(super) fn finish_scheduled_layer(
                 })),
             })
         }
+        (
+            LayerKind::Timeline(tl),
+            PreparedLayerPlan::Timeline {
+                active,
+                ref_epoch,
+                prefetch,
+            },
+        ) => finish_timeline_layer(layer, tl, active, ref_epoch, prefetch, ctx),
         _ => None,
     }
 }

@@ -16,11 +16,29 @@ use crate::colormap::{CategoricalPaletteId, sentinel2_scl_class_name};
 use super::LayerId;
 use super::asset::{RasterAsset, has_affine_scaling};
 use super::band_math::{
-    BandChannelSample, BandMathReadout, is_scl_class_masked, scl_cpu_maskable_nodata_class,
+    BandChannelSample, BandMathLayerData, BandMathReadout, is_scl_class_masked,
+    scl_cpu_maskable_nodata_class,
 };
 use super::layer::{LayerKind, OverlayLayer};
 use super::runtime::OverlayRuntime;
 use super::stack::LayerStack;
+use super::style::LayerStyle;
+use super::timeline::{TimelineCompareMode, TimelineEpochContent, TimelineLayerData};
+
+/// Zoom-invariant dual-epoch scalar difference readout (`Δ = B - A`) for a
+/// `Timeline` layer in `ScalarDiff` comparison mode.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TemporalDiffReadout {
+    pub(crate) formula_label: String,
+    pub(crate) label_a: String,
+    pub(crate) label_b: String,
+    pub(crate) value_a: Option<f64>,
+    pub(crate) value_b: Option<f64>,
+    pub(crate) delta: Option<f64>,
+    pub(crate) masked_a: bool,
+    pub(crate) masked_b: bool,
+    pub(crate) has_unavailable: bool,
+}
 
 /// Classified value returned by a zoom-invariant CPU cursor probe.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +53,7 @@ pub(crate) enum CursorReadoutValue {
         class_name: Option<&'static str>,
     },
     BandMath(BandMathReadout),
+    TemporalDiff(TemporalDiffReadout),
     Nodata,
     Pending,
     Unavailable,
@@ -70,6 +89,14 @@ enum ProbeKey {
         sources: [Option<SourceId>; 5],
         pixels: [Option<(u32, u32)>; 5],
     },
+    TemporalDiff {
+        layer_id: LayerId,
+        style_rev: u64,
+        sources_a: [Option<SourceId>; 4],
+        sources_b: [Option<SourceId>; 4],
+        pixels_a: [Option<(u32, u32)>; 4],
+        pixels_b: [Option<(u32, u32)>; 4],
+    },
 }
 
 impl ProbeKey {
@@ -77,6 +104,11 @@ impl ProbeKey {
         match self {
             Self::Single { source, .. } => source == source_id,
             Self::BandMath { sources, .. } => sources.contains(&Some(source_id)),
+            Self::TemporalDiff {
+                sources_a,
+                sources_b,
+                ..
+            } => sources_a.contains(&Some(source_id)) || sources_b.contains(&Some(source_id)),
         }
     }
 }
@@ -177,6 +209,26 @@ fn asset_pixel_at(asset: &RasterAsset, lat_deg: f64, lon_deg: f64) -> Option<(u3
     Some((px, py))
 }
 
+fn timeline_probe_content(tl: &TimelineLayerData) -> Option<&TimelineEpochContent> {
+    match tl.compare {
+        TimelineCompareMode::CrossFade { blend_t, .. } if blend_t < 0.5 => {
+            tl.ref_ready_content().or_else(|| tl.active_ready_content())
+        }
+        _ => tl.active_ready_content(),
+    }
+}
+
+fn layer_pixel_at(layer: &OverlayLayer, lat_deg: f64, lon_deg: f64) -> Option<(u32, u32)> {
+    match layer.kind() {
+        LayerKind::SingleRaster { asset, .. } => asset_pixel_at(asset, lat_deg, lon_deg),
+        LayerKind::BandMath(bm) => asset_pixel_at(bm.reference_asset(), lat_deg, lon_deg),
+        LayerKind::Timeline(tl) => {
+            let content = timeline_probe_content(tl)?;
+            asset_pixel_at(content.reference_asset(), lat_deg, lon_deg)
+        }
+    }
+}
+
 fn find_topmost_pixel(
     stack: &LayerStack,
     lat_deg: f64,
@@ -187,9 +239,31 @@ fn find_topmost_pixel(
         if !layer.is_active() || excluded_layer == Some(layer.id()) {
             return None;
         }
-        let pixel = asset_pixel_at(layer.primary_asset(), lat_deg, lon_deg)?;
+        let pixel = layer_pixel_at(layer, lat_deg, lon_deg)?;
         Some((layer, pixel))
     })
+}
+
+fn build_single_readout(
+    layer_name: String,
+    is_remote: bool,
+    asset: &RasterAsset,
+    style: &LayerStyle,
+    pixel: (u32, u32),
+    value: CursorReadoutValue,
+) -> CursorReadout {
+    let spec = asset.meta().spec;
+    let band_info = asset.source().description().band_info(spec.band);
+    CursorReadout {
+        layer_name,
+        is_remote,
+        pixel,
+        source_pixel_size_m: asset.geo().source_pixel_size_m(),
+        units: band_info.and_then(|b| b.units.clone()),
+        has_affine_scaling: band_info.is_some_and(has_affine_scaling),
+        log10_db: spec.format == PixelFormat::R32Float && style.scientific().preset.is_log10_db(),
+        value,
+    }
 }
 
 fn build_readout(
@@ -199,31 +273,76 @@ fn build_readout(
 ) -> CursorReadout {
     let is_remote = layer.is_remote();
     match layer.kind() {
-        LayerKind::SingleRaster { asset, style, .. } => {
-            let spec = asset.meta().spec;
-            let band_info = asset.source().description().band_info(spec.band);
-            CursorReadout {
-                layer_name: layer.name().to_owned(),
-                is_remote,
-                pixel,
-                source_pixel_size_m: asset.geo().source_pixel_size_m(),
-                units: band_info.and_then(|b| b.units.clone()),
-                has_affine_scaling: band_info.is_some_and(has_affine_scaling),
-                log10_db: spec.format == PixelFormat::R32Float
-                    && style.scientific().preset.is_log10_db(),
-                value,
-            }
-        }
+        LayerKind::SingleRaster { asset, style, .. } => build_single_readout(
+            layer.name().to_owned(),
+            is_remote,
+            asset,
+            style,
+            pixel,
+            value,
+        ),
         LayerKind::BandMath(bm) => CursorReadout {
             layer_name: layer.name().to_owned(),
             is_remote,
             pixel,
-            source_pixel_size_m: bm.primary_asset().geo().source_pixel_size_m(),
+            source_pixel_size_m: bm.source_pixel_size_m(),
             units: bm.output_units(),
             has_affine_scaling: false,
             log10_db: false,
             value,
         },
+        LayerKind::Timeline(tl) => {
+            let date_tag = tl
+                .active_epoch()
+                .map(|e| format!(" [{}]", e.date_label))
+                .unwrap_or_default();
+            let display_name = format!("{}{date_tag}", layer.name());
+            if tl.is_scalar_diff_ready() {
+                let units = tl.active_ready_content().and_then(|c| match c {
+                    TimelineEpochContent::BandMath(bm) => bm.output_units(),
+                    TimelineEpochContent::Single { asset, .. } => asset
+                        .source()
+                        .description()
+                        .band_info(asset.meta().spec.band)
+                        .and_then(|b| b.units.clone()),
+                });
+                return CursorReadout {
+                    layer_name: display_name,
+                    is_remote,
+                    pixel,
+                    source_pixel_size_m: tl.source_pixel_size_m(),
+                    units,
+                    has_affine_scaling: false,
+                    log10_db: false,
+                    value,
+                };
+            }
+            match timeline_probe_content(tl) {
+                Some(TimelineEpochContent::Single { asset, style }) => {
+                    build_single_readout(display_name, is_remote, asset, style, pixel, value)
+                }
+                Some(TimelineEpochContent::BandMath(bm)) => CursorReadout {
+                    layer_name: display_name,
+                    is_remote,
+                    pixel,
+                    source_pixel_size_m: bm.source_pixel_size_m(),
+                    units: bm.output_units(),
+                    has_affine_scaling: false,
+                    log10_db: false,
+                    value,
+                },
+                None => CursorReadout {
+                    layer_name: display_name,
+                    is_remote,
+                    pixel,
+                    source_pixel_size_m: tl.source_pixel_size_m(),
+                    units: None,
+                    has_affine_scaling: false,
+                    log10_db: false,
+                    value,
+                },
+            }
+        }
     }
 }
 
@@ -402,39 +521,311 @@ struct ProbeTarget {
     lon_deg: f64,
 }
 
-fn probe_key_for_layer(layer: &OverlayLayer, target: ProbeTarget) -> ProbeKey {
-    match layer.kind() {
-        LayerKind::SingleRaster { asset, style, .. } => {
-            let spec = asset.meta().spec;
-            let is_scl_palette = style.categorical_palette() == CategoricalPaletteId::Sentinel2Scl;
-            ProbeKey::Single {
-                source: asset.source_id(),
-                band: spec.band,
-                format: spec.format,
-                is_scl_palette,
-                x: target.pixel.0,
-                y: target.pixel.1,
-            }
-        }
-        LayerKind::BandMath(bm) => {
-            let mut sources = [None; 5];
-            let mut pixels = [None; 5];
-            for (idx, asset) in bm.assets().take(5).enumerate() {
-                sources[idx] = Some(asset.source_id());
-                pixels[idx] = if idx == 0 {
-                    Some(target.pixel)
-                } else {
-                    asset_pixel_at(asset, target.lat_deg, target.lon_deg)
-                };
-            }
-            ProbeKey::BandMath {
-                layer_id: layer.id(),
-                style_rev: bm.style.style_rev,
-                sources,
-                pixels,
+struct DiffEpochProbeSpec {
+    formula: Option<BandMathFormula>,
+    scl_mask_enabled: bool,
+    scl_mask_bits: u32,
+    bands: Vec<BandMathBandProbeSpec>,
+    scl: Option<BandMathBandProbeSpec>,
+}
+
+struct TemporalDiffProbeJobSpec {
+    formula_label: String,
+    label_a: String,
+    label_b: String,
+    epoch_a: DiffEpochProbeSpec,
+    epoch_b: DiffEpochProbeSpec,
+}
+
+enum EpochScalarEval {
+    Value {
+        value: Option<f64>,
+        masked: bool,
+        has_unavailable: bool,
+    },
+    Cancelled,
+}
+
+fn eval_diff_epoch_scalar(
+    rt: &OverlayRuntime,
+    spec: &DiffEpochProbeSpec,
+    cancel: &CancelToken,
+) -> EpochScalarEval {
+    let ctx = rt.decode_context(cancel);
+    let mut vals: Vec<Option<f64>> = Vec::with_capacity(spec.bands.len());
+    let mut has_unavailable = false;
+    for b in &spec.bands {
+        let Some((px, py)) = b.pixel else {
+            vals.push(None);
+            continue;
+        };
+        match b.source.sample_band(b.band, b.format, px, py, &ctx) {
+            Ok(BandSample::Scalar { physical, .. }) => vals.push(Some(physical)),
+            Ok(BandSample::Nodata) => vals.push(None),
+            Err(err) if err.is_cancelled() => return EpochScalarEval::Cancelled,
+            _ => {
+                has_unavailable = true;
+                vals.push(None);
             }
         }
     }
+    let mut masked = false;
+    if spec.scl_mask_enabled
+        && let Some(scl) = &spec.scl
+        && let Some((px, py)) = scl.pixel
+    {
+        match scl.source.sample_band(scl.band, scl.format, px, py, &ctx) {
+            Ok(BandSample::Categorical(c)) => {
+                masked = is_scl_class_masked(true, spec.scl_mask_bits, c);
+            }
+            Ok(BandSample::Nodata) => {
+                masked = scl
+                    .nodata_class_lt_32
+                    .is_some_and(|c| is_scl_class_masked(true, spec.scl_mask_bits, c));
+            }
+            Err(err) if err.is_cancelled() => return EpochScalarEval::Cancelled,
+            Ok(BandSample::Unavailable) | Err(_) => has_unavailable = true,
+            _ => {}
+        }
+    }
+    let value = if masked {
+        None
+    } else {
+        match spec.formula {
+            None => vals.first().copied().flatten(),
+            Some(formula) if vals.len() >= 2 => match (vals[0], vals[1]) {
+                (Some(v0), Some(v1)) => formula.evaluate_scalar(v0, v1),
+                _ => None,
+            },
+            Some(_) => None,
+        }
+    };
+    EpochScalarEval::Value {
+        value,
+        masked,
+        has_unavailable,
+    }
+}
+
+fn sample_temporal_diff_pixel(
+    rt: &OverlayRuntime,
+    spec: TemporalDiffProbeJobSpec,
+    cancel: &CancelToken,
+    probe_guard: CursorProbeGuard,
+) {
+    let EpochScalarEval::Value {
+        value: value_a,
+        masked: masked_a,
+        has_unavailable: unavail_a,
+    } = eval_diff_epoch_scalar(rt, &spec.epoch_a, cancel)
+    else {
+        probe_guard.clear_transient();
+        return;
+    };
+    let EpochScalarEval::Value {
+        value: value_b,
+        masked: masked_b,
+        has_unavailable: unavail_b,
+    } = eval_diff_epoch_scalar(rt, &spec.epoch_b, cancel)
+    else {
+        probe_guard.clear_transient();
+        return;
+    };
+    let has_unavailable = unavail_a || unavail_b;
+    if value_a.is_none() && value_b.is_none() && !masked_a && !masked_b && has_unavailable {
+        probe_guard.resolve(CursorReadoutValue::Unavailable);
+        return;
+    }
+    let delta = match (value_a, value_b) {
+        (Some(a), Some(b)) => {
+            let d = b - a;
+            d.is_finite().then_some(d)
+        }
+        _ => None,
+    };
+    probe_guard.resolve(CursorReadoutValue::TemporalDiff(TemporalDiffReadout {
+        formula_label: spec.formula_label,
+        label_a: spec.label_a,
+        label_b: spec.label_b,
+        value_a,
+        value_b,
+        delta,
+        masked_a,
+        masked_b,
+        has_unavailable,
+    }));
+}
+
+fn probe_key_for_single(asset: &RasterAsset, style: &LayerStyle, pixel: (u32, u32)) -> ProbeKey {
+    let spec = asset.meta().spec;
+    let is_scl_palette = style.categorical_palette() == CategoricalPaletteId::Sentinel2Scl;
+    ProbeKey::Single {
+        source: asset.source_id(),
+        band: spec.band,
+        format: spec.format,
+        is_scl_palette,
+        x: pixel.0,
+        y: pixel.1,
+    }
+}
+
+fn probe_key_for_band_math(
+    layer_id: LayerId,
+    bm: &BandMathLayerData,
+    target: ProbeTarget,
+) -> ProbeKey {
+    let mut sources = [None; 5];
+    let mut pixels = [None; 5];
+    for (idx, asset) in bm.assets().take(5).enumerate() {
+        sources[idx] = Some(asset.source_id());
+        pixels[idx] = if idx == 0 {
+            Some(target.pixel)
+        } else {
+            asset_pixel_at(asset, target.lat_deg, target.lon_deg)
+        };
+    }
+    ProbeKey::BandMath {
+        layer_id,
+        style_rev: bm.style.style_rev,
+        sources,
+        pixels,
+    }
+}
+
+type EpochKeySlots = ([Option<SourceId>; 4], [Option<(u32, u32)>; 4]);
+
+fn fill_epoch_key_slots(content: &TimelineEpochContent, target: ProbeTarget) -> EpochKeySlots {
+    let mut sources = [None; 4];
+    let mut pixels = [None; 4];
+    let mut idx = 0usize;
+    content.for_each_asset(|asset| {
+        if idx < 4 {
+            sources[idx] = Some(asset.source_id());
+            pixels[idx] = asset_pixel_at(asset, target.lat_deg, target.lon_deg);
+            idx += 1;
+        }
+    });
+    (sources, pixels)
+}
+
+fn probe_key_for_layer(layer: &OverlayLayer, target: ProbeTarget) -> ProbeKey {
+    match layer.kind() {
+        LayerKind::SingleRaster { asset, style, .. } => {
+            probe_key_for_single(asset, style, target.pixel)
+        }
+        LayerKind::BandMath(bm) => probe_key_for_band_math(layer.id(), bm, target),
+        LayerKind::Timeline(tl) => {
+            if tl.is_scalar_diff_ready()
+                && let (Some(a), Some(b)) = (tl.ref_ready_content(), tl.active_ready_content())
+            {
+                let (sources_a, pixels_a) = fill_epoch_key_slots(a, target);
+                let (sources_b, pixels_b) = fill_epoch_key_slots(b, target);
+                let style_rev = tl.band_math_style.as_ref().map_or(0, |s| s.style_rev);
+                return ProbeKey::TemporalDiff {
+                    layer_id: layer.id(),
+                    style_rev,
+                    sources_a,
+                    sources_b,
+                    pixels_a,
+                    pixels_b,
+                };
+            }
+            match timeline_probe_content(tl) {
+                Some(TimelineEpochContent::Single { asset, style }) => {
+                    probe_key_for_single(asset, style, target.pixel)
+                }
+                Some(TimelineEpochContent::BandMath(bm)) => {
+                    probe_key_for_band_math(layer.id(), bm, target)
+                }
+                None => ProbeKey::BandMath {
+                    layer_id: layer.id(),
+                    style_rev: 0,
+                    sources: [None; 5],
+                    pixels: [None; 5],
+                },
+            }
+        }
+    }
+}
+
+fn build_single_probe_job(
+    asset: &RasterAsset,
+    style: &LayerStyle,
+    pixel: (u32, u32),
+    cancel: CancelToken,
+    rt: Arc<OverlayRuntime>,
+    probe_guard: CursorProbeGuard,
+) -> (DecodeJob, bool) {
+    let spec = asset.meta().spec;
+    let source = Arc::clone(asset.source());
+    let is_remote = source.is_remote();
+    let is_scl_palette = style.categorical_palette() == CategoricalPaletteId::Sentinel2Scl;
+    let job_spec = SingleProbeJobSpec {
+        source,
+        band: spec.band,
+        format: spec.format,
+        is_scl_palette,
+        pixel,
+    };
+    let job = DecodeJob {
+        key: DecodeJobKey::Probe {
+            source: asset.source_id(),
+            band: spec.band,
+            format: spec.format,
+            x: pixel.0,
+            y: pixel.1,
+        },
+        queued_bytes: 4096,
+        cancel: cancel.clone(),
+        work: Box::new(move || {
+            sample_single_pixel(&rt, job_spec, &cancel, probe_guard);
+        }),
+    };
+    (job, is_remote)
+}
+
+fn build_band_math_probe_job(
+    bm: &BandMathLayerData,
+    target: ProbeTarget,
+    cancel: CancelToken,
+    rt: Arc<OverlayRuntime>,
+    probe_guard: CursorProbeGuard,
+) -> (DecodeJob, bool) {
+    let any_remote = bm.assets().any(|a| a.source().is_remote());
+    let bands = bm
+        .bands
+        .iter()
+        .map(|a| make_band_probe_spec(a, target.lat_deg, target.lon_deg, false))
+        .collect();
+    let scl = bm
+        .scl
+        .as_ref()
+        .map(|a| make_band_probe_spec(a, target.lat_deg, target.lon_deg, true));
+    let job_spec = BandMathProbeJobSpec {
+        formula: bm.style.formula,
+        formula_label: bm.style.recipe_label.clone(),
+        scl_mask_enabled: bm.style.scl_mask_enabled,
+        scl_mask_bits: bm.style.scl_mask_bits,
+        bands,
+        scl,
+    };
+    let ref_asset = bm.reference_asset();
+    let ref_spec = ref_asset.meta().spec;
+    let job = DecodeJob {
+        key: DecodeJobKey::Probe {
+            source: ref_asset.source_id(),
+            band: ref_spec.band,
+            format: ref_spec.format,
+            x: target.pixel.0,
+            y: target.pixel.1,
+        },
+        queued_bytes: 8192,
+        cancel: cancel.clone(),
+        work: Box::new(move || {
+            sample_band_math_pixel(&rt, job_spec, &cancel, probe_guard);
+        }),
+    };
+    (job, any_remote)
 }
 
 /// Manages single-flight cancelled-on-move base-resolution CPU pixel probes on
@@ -496,6 +887,7 @@ impl CursorProber {
             && match &state.resolved_value {
                 CursorReadoutValue::Unavailable => true,
                 CursorReadoutValue::BandMath(bm) => bm.has_unavailable,
+                CursorReadoutValue::TemporalDiff(td) => td.has_unavailable,
                 _ => false,
             };
         if should_clear {
@@ -519,69 +911,100 @@ impl CursorProber {
         );
         let (job, is_remote) = match layer.kind() {
             LayerKind::SingleRaster { asset, style, .. } => {
-                let spec = asset.meta().spec;
-                let source = Arc::clone(asset.source());
-                let is_remote = source.is_remote();
-                let is_scl_palette =
-                    style.categorical_palette() == CategoricalPaletteId::Sentinel2Scl;
-                let job_spec = SingleProbeJobSpec {
-                    source,
-                    band: spec.band,
-                    format: spec.format,
-                    is_scl_palette,
-                    pixel: target.pixel,
-                };
-                let job = DecodeJob {
-                    key: DecodeJobKey::Probe {
-                        source: asset.source_id(),
-                        band: spec.band,
-                        format: spec.format,
-                        x: target.pixel.0,
-                        y: target.pixel.1,
-                    },
-                    queued_bytes: 4096,
-                    cancel: cancel.clone(),
-                    work: Box::new(move || {
-                        sample_single_pixel(&rt, job_spec, &cancel, probe_guard);
-                    }),
-                };
-                (job, is_remote)
+                build_single_probe_job(asset, style, target.pixel, cancel, rt, probe_guard)
             }
             LayerKind::BandMath(bm) => {
-                let any_remote = bm.assets().any(|a| a.source().is_remote());
-                let bands = bm
-                    .bands
-                    .iter()
-                    .map(|a| make_band_probe_spec(a, target.lat_deg, target.lon_deg, false))
-                    .collect();
-                let scl = bm
-                    .scl
-                    .as_ref()
-                    .map(|a| make_band_probe_spec(a, target.lat_deg, target.lon_deg, true));
-                let job_spec = BandMathProbeJobSpec {
-                    formula: bm.style.formula,
-                    formula_label: bm.style.recipe_label.clone(),
-                    scl_mask_enabled: bm.style.scl_mask_enabled,
-                    scl_mask_bits: bm.style.scl_mask_bits,
-                    bands,
-                    scl,
-                };
-                let primary_spec = bm.primary_asset().meta().spec;
-                let job = DecodeJob {
-                    key: DecodeJobKey::Probe {
-                        source: bm.primary_asset().source_id(),
-                        band: primary_spec.band,
-                        format: primary_spec.format,
-                        x: target.pixel.0,
-                        y: target.pixel.1,
-                    },
-                    queued_bytes: 8192,
-                    cancel: cancel.clone(),
-                    work: Box::new(move || {
-                        sample_band_math_pixel(&rt, job_spec, &cancel, probe_guard);
-                    }),
-                };
-                (job, any_remote)
+                build_band_math_probe_job(bm, target, cancel, rt, probe_guard)
+            }
+            LayerKind::Timeline(tl) => {
+                if tl.is_scalar_diff_ready()
+                    && let TimelineCompareMode::ScalarDiff { ref_idx } = tl.compare
+                    && let (Some(content_a), Some(content_b)) =
+                        (tl.ref_ready_content(), tl.active_ready_content())
+                {
+                    let label_a = tl
+                        .epochs
+                        .get(ref_idx)
+                        .map_or_else(|| "A".to_owned(), |e| e.date_label.clone());
+                    let label_b = tl
+                        .active_epoch()
+                        .map_or_else(|| "B".to_owned(), |e| e.date_label.clone());
+                    let make_epoch_spec = |content: &TimelineEpochContent| match content {
+                        TimelineEpochContent::Single { asset, .. } => DiffEpochProbeSpec {
+                            formula: None,
+                            scl_mask_enabled: false,
+                            scl_mask_bits: 0,
+                            bands: vec![make_band_probe_spec(
+                                asset,
+                                target.lat_deg,
+                                target.lon_deg,
+                                false,
+                            )],
+                            scl: None,
+                        },
+                        TimelineEpochContent::BandMath(bm) => DiffEpochProbeSpec {
+                            formula: Some(bm.style.formula),
+                            scl_mask_enabled: bm.style.scl_mask_enabled,
+                            scl_mask_bits: bm.style.scl_mask_bits,
+                            bands: bm
+                                .bands
+                                .iter()
+                                .map(|a| {
+                                    make_band_probe_spec(a, target.lat_deg, target.lon_deg, false)
+                                })
+                                .collect(),
+                            scl: bm.scl.as_ref().map(|a| {
+                                make_band_probe_spec(a, target.lat_deg, target.lon_deg, true)
+                            }),
+                        },
+                    };
+                    let formula_label = match content_b {
+                        TimelineEpochContent::BandMath(bm) => format!("Δ{}", bm.style.recipe_label),
+                        TimelineEpochContent::Single { .. } => "Δ".to_owned(),
+                    };
+                    let ref_asset = content_b.reference_asset();
+                    let ref_spec = ref_asset.meta().spec;
+                    let is_remote = tl.is_remote();
+                    let job_spec = TemporalDiffProbeJobSpec {
+                        formula_label,
+                        label_a,
+                        label_b,
+                        epoch_a: make_epoch_spec(content_a),
+                        epoch_b: make_epoch_spec(content_b),
+                    };
+                    let job = DecodeJob {
+                        key: DecodeJobKey::Probe {
+                            source: ref_asset.source_id(),
+                            band: ref_spec.band,
+                            format: ref_spec.format,
+                            x: target.pixel.0,
+                            y: target.pixel.1,
+                        },
+                        queued_bytes: 12_288,
+                        cancel: cancel.clone(),
+                        work: Box::new(move || {
+                            sample_temporal_diff_pixel(&rt, job_spec, &cancel, probe_guard);
+                        }),
+                    };
+                    (job, is_remote)
+                } else {
+                    match timeline_probe_content(tl) {
+                        Some(TimelineEpochContent::Single { asset, style }) => {
+                            build_single_probe_job(
+                                asset,
+                                style,
+                                target.pixel,
+                                cancel,
+                                rt,
+                                probe_guard,
+                            )
+                        }
+                        Some(TimelineEpochContent::BandMath(bm)) => {
+                            build_band_math_probe_job(bm, target, cancel, rt, probe_guard)
+                        }
+                        None => return false,
+                    }
+                }
             }
         };
 

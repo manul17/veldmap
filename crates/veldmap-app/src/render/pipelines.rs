@@ -10,9 +10,10 @@ use super::uniforms::{
 };
 use super::vector_pack::{GpuRibbonSegment, GpuVectorVertex};
 use super::{
-    BAND_MATH_COMPOSITE_WGSL, BAND_MATH_MASK_WGSL, BAND_MATH_SCRATCH_MRT_WGSL,
-    BAND_MATH_SCRATCH_WGSL, COMPOSITE_WGSL, GLOBE_WGSL, OVERLAY_CATEGORICAL_WGSL,
-    OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL, SCRATCH_NAN_FILL_WGSL, VECTOR_WGSL,
+    BAND_MATH_COMPOSITE_WGSL, BAND_MATH_MASK_WGSL, BAND_MATH_REDUCE_WGSL,
+    BAND_MATH_SCRATCH_MRT_WGSL, BAND_MATH_SCRATCH_WGSL, COMPOSITE_WGSL, GLOBE_WGSL,
+    OVERLAY_CATEGORICAL_WGSL, OVERLAY_SCIENTIFIC_WGSL, OVERLAY_WGSL, SCRATCH_NAN_FILL_WGSL,
+    VECTOR_WGSL,
 };
 
 fn wgsl_module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModule {
@@ -128,6 +129,9 @@ pub(super) struct BodyPipelines {
 /// [`super::overlay::OverlayRenderer::record_direct_layer`].
 pub(super) struct OverlayPipelines {
     pub(super) display: wgpu::RenderPipeline,
+    /// `blend: None` Display pipeline targeting `Rgba8UnormSrgb` scratch slots
+    /// for 0%-bleed-through dual-epoch Display RGB cross-fade.
+    pub(super) display_scratch: wgpu::RenderPipeline,
     pub(super) scientific: wgpu::RenderPipeline,
     pub(super) categorical: wgpu::RenderPipeline,
 }
@@ -140,16 +144,23 @@ pub(super) struct VectorPipelines {
     pub(super) point: wgpu::RenderPipeline,
 }
 
-/// Owned Band Math scratch-clear, single-band/MRT float scratch, `R8Uint` mask
-/// scratch, and fullscreen composite pipelines.
+/// Owned Band Math & dual-epoch temporal scratch-clear, single-band/MRT float
+/// scratch, `R8Uint` mask scratch, non-overlapping Epoch A scalar reduce,
+/// `Rgba8UnormSrgb` scratch bake, and fullscreen composite pipelines.
 pub(super) struct BandMathPipelines {
     pub(super) clear_layout: wgpu::BindGroupLayout,
     pub(super) clear: [wgpu::RenderPipeline; 4],
     pub(super) band_single: wgpu::RenderPipeline,
     pub(super) band_mrt: [wgpu::RenderPipeline; 3], // 2, 3, 4 attachments
     pub(super) mask_u8: wgpu::RenderPipeline,
+    pub(super) reduce_scratch_layout: wgpu::BindGroupLayout,
+    pub(super) reduce: wgpu::RenderPipeline,
     pub(super) composite_scratch_layout: wgpu::BindGroupLayout,
+    pub(super) rgba_scratch_layout: wgpu::BindGroupLayout,
     pub(super) composite: wgpu::RenderPipeline,
+    /// `blend: None` variant of [`Self::composite`] for baking Epoch A's
+    /// 3-band RGB composite into `rgba_scratch[0]`.
+    pub(super) composite_rgba_bake: wgpu::RenderPipeline,
 }
 
 impl BandMathPipelines {
@@ -395,18 +406,49 @@ fn create_overlay_pipelines(
     layouts: &SharedLayouts,
     tile_bind_groups: &TileBindGroupCache,
 ) -> OverlayPipelines {
-    let display = create_overlay_track_pipeline(
+    let display_shader = wgsl_module(device, "overlay warp-mesh wgsl", OVERLAY_WGSL);
+    let display_layout = pipeline_layout(
         device,
-        "overlay warp-mesh wgsl",
-        OVERLAY_WGSL,
         "overlay warp-mesh pipeline layout",
         &[
             Some(&layouts.camera_layout),
             Some(layouts.dynamic_uniform_layout(UniformSlot::Overlay)),
             Some(tile_bind_groups.rgba8_layout()),
         ],
-        "overlay display warp-mesh pipeline (depth-less)",
-        "fs_overlay",
+    );
+    let alpha = [srgb_target(wgpu::BlendState::ALPHA_BLENDING)];
+    let display = create_mesh_pipeline(
+        device,
+        &display_shader,
+        &display_layout,
+        MeshPipelineSpec {
+            label: "overlay display warp-mesh pipeline (depth-less)",
+            vertex_entry: "vs_main",
+            vertex_layout: OverlayVertex::LAYOUT,
+            fragment_entry: "fs_overlay",
+            targets: &alpha,
+            cull_mode: Some(wgpu::Face::Back),
+            depth_stencil: None,
+        },
+    );
+    let no_blend = [Some(wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    })];
+    let display_scratch = create_mesh_pipeline(
+        device,
+        &display_shader,
+        &display_layout,
+        MeshPipelineSpec {
+            label: "overlay display scratch warp-mesh pipeline (blend: None)",
+            vertex_entry: "vs_main",
+            vertex_layout: OverlayVertex::LAYOUT,
+            fragment_entry: "fs_overlay",
+            targets: &no_blend,
+            cull_mode: Some(wgpu::Face::Back),
+            depth_stencil: None,
+        },
     );
     let scientific = create_overlay_track_pipeline(
         device,
@@ -439,6 +481,7 @@ fn create_overlay_pipelines(
 
     OverlayPipelines {
         display,
+        display_scratch,
         scientific,
         categorical,
     }
@@ -704,10 +747,50 @@ fn create_mask_pipeline(
     )
 }
 
-fn create_band_math_composite_pipeline(
+fn create_reduce_pipeline(
     device: &wgpu::Device,
     layouts: &SharedLayouts,
+    r32f_target: &Option<wgpu::ColorTargetState>,
 ) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
+    let reduce_entries: [wgpu::BindGroupLayoutEntry; 4] = [
+        texture_2d_layout_entry(0, wgpu::TextureSampleType::Float { filterable: false }),
+        texture_2d_layout_entry(1, wgpu::TextureSampleType::Float { filterable: false }),
+        texture_2d_layout_entry(2, wgpu::TextureSampleType::Float { filterable: false }),
+        texture_2d_layout_entry(3, wgpu::TextureSampleType::Uint),
+    ];
+    let reduce_scratch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("band-math reduce non-overlapping scratch textures layout"),
+        entries: &reduce_entries,
+    });
+    let reduce_shader = wgsl_module(device, "band-math reduce wgsl", BAND_MATH_REDUCE_WGSL);
+    let reduce_pipeline_layout = pipeline_layout(
+        device,
+        "band-math reduce pipeline layout",
+        &[
+            Some(&reduce_scratch_layout),
+            Some(layouts.dynamic_uniform_layout(UniformSlot::BandMathReduce)),
+        ],
+    );
+    let reduce = create_fullscreen_pipeline(
+        device,
+        "band-math Epoch A scalar reduce pipeline",
+        &reduce_pipeline_layout,
+        &reduce_shader,
+        "fs_reduce",
+        std::slice::from_ref(r32f_target),
+    );
+    (reduce_scratch_layout, reduce)
+}
+
+fn create_band_math_composite_pipelines(
+    device: &wgpu::Device,
+    layouts: &SharedLayouts,
+) -> (
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+) {
     let composite_entries: [wgpu::BindGroupLayoutEntry; 5] = std::array::from_fn(|binding| {
         let sample_type = if binding < 4 {
             wgpu::TextureSampleType::Float { filterable: false }
@@ -722,6 +805,15 @@ fn create_band_math_composite_pipeline(
             entries: &composite_entries,
         });
 
+    let rgba_entries: [wgpu::BindGroupLayoutEntry; 2] = [
+        texture_2d_layout_entry(0, wgpu::TextureSampleType::Float { filterable: false }),
+        texture_2d_layout_entry(1, wgpu::TextureSampleType::Float { filterable: false }),
+    ];
+    let rgba_scratch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("band-math rgba scratch textures layout (@group(3))"),
+        entries: &rgba_entries,
+    });
+
     let composite_shader = wgsl_module(
         device,
         "band-math fullscreen composite wgsl",
@@ -734,6 +826,7 @@ fn create_band_math_composite_pipeline(
             Some(&composite_scratch_layout),
             Some(layouts.dynamic_uniform_layout(UniformSlot::BandMathComposite)),
             Some(&layouts.palette_uniform_layout),
+            Some(&rgba_scratch_layout),
         ],
     );
     let composite = create_fullscreen_pipeline(
@@ -744,7 +837,24 @@ fn create_band_math_composite_pipeline(
         "fs_composite",
         &[srgb_target(wgpu::BlendState::ALPHA_BLENDING)],
     );
-    (composite_scratch_layout, composite)
+    let composite_rgba_bake = create_fullscreen_pipeline(
+        device,
+        "band-math fullscreen RGB scratch bake pipeline (blend: None)",
+        &composite_pipeline_layout,
+        &composite_shader,
+        "fs_composite",
+        &[Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        })],
+    );
+    (
+        composite_scratch_layout,
+        rgba_scratch_layout,
+        composite,
+        composite_rgba_bake,
+    )
 }
 
 fn create_band_math_pipelines(
@@ -761,8 +871,9 @@ fn create_band_math_pipelines(
     let (band_single, band_mrt) =
         create_scratch_band_pipelines(device, layouts, tile_bind_groups, &r32f_target);
     let mask_u8 = create_mask_pipeline(device, layouts, tile_bind_groups);
-    let (composite_scratch_layout, composite) =
-        create_band_math_composite_pipeline(device, layouts);
+    let (reduce_scratch_layout, reduce) = create_reduce_pipeline(device, layouts, &r32f_target);
+    let (composite_scratch_layout, rgba_scratch_layout, composite, composite_rgba_bake) =
+        create_band_math_composite_pipelines(device, layouts);
 
     BandMathPipelines {
         clear_layout,
@@ -770,8 +881,12 @@ fn create_band_math_pipelines(
         band_single,
         band_mrt,
         mask_u8,
+        reduce_scratch_layout,
+        reduce,
         composite_scratch_layout,
+        rgba_scratch_layout,
         composite,
+        composite_rgba_bake,
     }
 }
 

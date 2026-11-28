@@ -5,7 +5,7 @@ use eframe::egui;
 
 use crate::colormap::{DEFAULT_SCL_MASK_BITS, SENTINEL2_SCL_NAMES};
 use crate::format;
-use crate::layers::{BandMathSummary, LayerId, OverlayEdit};
+use crate::layers::{BandMathEdit, BandMathSummary, LayerId, OverlayEdit};
 use crate::ui::widgets::{DragCommit, track_drag_commit};
 
 use super::LayerUiAction;
@@ -73,10 +73,14 @@ pub(super) fn show_band_math_controls(
         show_colormap_picker(
             ui,
             ("bm_colormap", layer_id),
-            layer_id,
             bm.colormap,
             bm.invert_colormap,
-            actions,
+            |colormap, invert| {
+                actions.push(LayerUiAction::edit_raster(
+                    layer_id,
+                    OverlayEdit::BandMath(BandMathEdit::SetColormap { colormap, invert }),
+                ));
+            },
         );
         match show_min_max_drag(
             ui,
@@ -89,14 +93,14 @@ pub(super) fn show_band_math_controls(
             MinMaxEvent::Drag { min, max, commit } => {
                 actions.push(LayerUiAction::edit_raster_drag(
                     layer_id,
-                    OverlayEdit::SetStretchRange { min, max },
+                    OverlayEdit::BandMath(BandMathEdit::SetStretchRange { min, max }),
                     commit,
                 ));
             }
             MinMaxEvent::Reset => {
                 actions.push(LayerUiAction::edit_raster(
                     layer_id,
-                    OverlayEdit::ResetBandMathStretch,
+                    OverlayEdit::BandMath(BandMathEdit::ResetStretch),
                 ));
             }
         }
@@ -118,18 +122,18 @@ pub(super) fn show_band_math_controls(
             } => {
                 actions.push(LayerUiAction::edit_raster_drag(
                     layer_id,
-                    OverlayEdit::SetBandMathRgbStretch {
+                    OverlayEdit::BandMath(BandMathEdit::SetRgbStretch {
                         min: [lo; 3],
                         max: [hi; 3],
                         gamma,
-                    },
+                    }),
                     commit,
                 ));
             }
             MinMaxEvent::Reset => {
                 actions.push(LayerUiAction::edit_raster(
                     layer_id,
-                    OverlayEdit::ResetBandMathStretch,
+                    OverlayEdit::BandMath(BandMathEdit::ResetStretch),
                 ));
             }
         }
@@ -153,11 +157,11 @@ pub(super) fn show_band_math_controls(
                     let commit = matches!(state, DragCommit::Commit);
                     actions.push(LayerUiAction::edit_raster_drag(
                         layer_id,
-                        OverlayEdit::SetBandMathRgbStretch {
+                        OverlayEdit::BandMath(BandMathEdit::SetRgbStretch {
                             min: bm.rgb_min,
                             max: bm.rgb_max,
                             gamma,
-                        },
+                        }),
                         commit,
                     ));
                 }
@@ -180,7 +184,7 @@ pub(super) fn show_band_math_controls(
             {
                 actions.push(LayerUiAction::edit_raster(
                     layer_id,
-                    OverlayEdit::SetBandMathSclEnabled(enabled),
+                    OverlayEdit::BandMath(BandMathEdit::SetSclEnabled(enabled)),
                 ));
             }
             if enabled
@@ -189,7 +193,7 @@ pub(super) fn show_band_math_controls(
             {
                 actions.push(LayerUiAction::edit_raster(
                     layer_id,
-                    OverlayEdit::SetBandMathSclMaskBits(DEFAULT_SCL_MASK_BITS),
+                    OverlayEdit::BandMath(BandMathEdit::SetSclMaskBits(DEFAULT_SCL_MASK_BITS)),
                 ));
             }
         });
@@ -225,7 +229,7 @@ pub(super) fn show_band_math_controls(
             if changed {
                 actions.push(LayerUiAction::edit_raster(
                     layer_id,
-                    OverlayEdit::SetBandMathSclMaskBits(bits),
+                    OverlayEdit::BandMath(BandMathEdit::SetSclMaskBits(bits)),
                 ));
             }
         }

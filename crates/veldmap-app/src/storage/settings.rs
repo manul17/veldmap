@@ -218,24 +218,30 @@ impl StacAuthKind {
     }
 }
 
-/// Persisted Custom STAC API endpoint and optional authentication settings.
-/// Secrets and URL credentials/query parameters are redacted in `Debug`.
+/// Maximum number of named Custom STAC profiles persisted in `settings.json`.
+const MAX_STAC_PROFILES: usize = 16;
+
+/// Single named Custom STAC API profile (endpoint, default collection, and
+/// optional authentication credentials). Secrets and URL credentials/query
+/// parameters are redacted in `Debug`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct StacSettings {
-    pub(crate) custom_endpoint: String,
-    pub(crate) custom_collection: String,
+pub(crate) struct StacProfile {
+    pub(crate) name: String,
+    pub(crate) endpoint: String,
+    pub(crate) collection: String,
     #[serde(deserialize_with = "deserialize_lossy_default")]
     pub(crate) auth_kind: StacAuthKind,
     pub(crate) auth_header_name: String,
     pub(crate) auth_secret: String,
 }
 
-impl Default for StacSettings {
+impl Default for StacProfile {
     fn default() -> Self {
         Self {
-            custom_endpoint: String::new(),
-            custom_collection: String::new(),
+            name: "Custom STAC".to_owned(),
+            endpoint: String::new(),
+            collection: String::new(),
             auth_kind: StacAuthKind::None,
             auth_header_name: "x-api-key".to_owned(),
             auth_secret: String::new(),
@@ -243,7 +249,7 @@ impl Default for StacSettings {
     }
 }
 
-impl StacSettings {
+impl StacProfile {
     /// Switch the authentication mode, scrubbing any previous secret whenever
     /// the mode changes so credentials never leak across auth schemes.
     pub(crate) fn set_auth_kind(&mut self, kind: StacAuthKind) {
@@ -253,10 +259,13 @@ impl StacSettings {
         }
     }
 
-    /// Trim whitespace and scrub unused secret material when `auth_kind == None`.
-    pub(crate) fn normalize(&mut self) {
-        self.custom_endpoint = self.custom_endpoint.trim().to_owned();
-        self.custom_collection = self.custom_collection.trim().to_owned();
+    pub(crate) fn normalize(&mut self, fallback_index: usize) {
+        self.name = self.name.trim().to_owned();
+        if self.name.is_empty() {
+            self.name = format!("Custom Profile {}", fallback_index + 1);
+        }
+        self.endpoint = self.endpoint.trim().to_owned();
+        self.collection = self.collection.trim().to_owned();
         self.auth_header_name = self.auth_header_name.trim().to_owned();
         if self.auth_kind == StacAuthKind::None {
             self.auth_secret.clear();
@@ -265,20 +274,25 @@ impl StacSettings {
         }
     }
 
-    /// Return a human-readable validation error if the configured Custom STAC
-    /// endpoint URL or API-key header name is invalid.
+    pub(crate) fn is_configured(&self) -> bool {
+        !self.endpoint.trim().is_empty()
+    }
+
     pub(crate) fn validation_error(&self) -> Option<String> {
-        let ep = self.custom_endpoint.trim();
+        let ep = self.endpoint.trim();
         if !ep.is_empty() && !is_valid_http_endpoint(ep) {
-            return Some("STAC API URL must be a valid http:// or https:// URL.".to_owned());
+            return Some(format!(
+                "Profile '{}': STAC API URL must be a valid http:// or https:// URL.",
+                self.name
+            ));
         }
         if self.auth_kind == StacAuthKind::ApiKey {
             let hdr = self.auth_header_name.trim();
             if hdr.is_empty() || !is_valid_custom_header_name(hdr) {
-                return Some(
-                    "API key header name must be a valid non-protocol HTTP header (e.g. x-api-key)."
-                        .to_owned(),
-                );
+                return Some(format!(
+                    "Profile '{}': API key header name must be a valid non-protocol HTTP header (e.g. x-api-key).",
+                    self.name
+                ));
             }
         }
         None
@@ -300,31 +314,204 @@ impl StacSettings {
         }
     }
 
-    pub(crate) fn to_custom_catalog(&self) -> StacCatalogConfig {
+    pub(crate) fn to_catalog_config(&self) -> StacCatalogConfig {
         StacCatalogConfig {
-            endpoint: self.custom_endpoint.trim().to_owned(),
-            collection: self.custom_collection.trim().to_owned(),
+            endpoint: self.endpoint.trim().to_owned(),
+            collection: self.collection.trim().to_owned(),
             auth: self.to_stac_auth(),
         }
     }
 }
 
-impl fmt::Debug for StacSettings {
+impl fmt::Debug for StacProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let secret_label = if self.auth_secret.trim().is_empty() {
             "<empty>"
         } else {
             "<redacted>"
         };
-        f.debug_struct("StacSettings")
-            .field(
-                "custom_endpoint",
-                &sanitize_url_for_display(&self.custom_endpoint),
-            )
-            .field("custom_collection", &self.custom_collection)
+        f.debug_struct("StacProfile")
+            .field("name", &self.name)
+            .field("endpoint", &sanitize_url_for_display(&self.endpoint))
+            .field("collection", &self.collection)
             .field("auth_kind", &self.auth_kind)
             .field("auth_header_name", &self.auth_header_name)
             .field("auth_secret", &secret_label)
+            .finish()
+    }
+}
+
+/// Persisted Custom STAC API profiles and optional authentication settings.
+/// Transparently migrates legacy v0.5 single-endpoint fields on load.
+/// Secrets and URL credentials/query parameters are redacted in `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct StacSettings {
+    pub(crate) profiles: Vec<StacProfile>,
+    pub(crate) active_profile: usize,
+    #[serde(default, skip_serializing, rename = "custom_endpoint")]
+    legacy_custom_endpoint: String,
+    #[serde(default, skip_serializing, rename = "custom_collection")]
+    legacy_custom_collection: String,
+    #[serde(
+        default,
+        skip_serializing,
+        rename = "auth_kind",
+        deserialize_with = "deserialize_lossy_default"
+    )]
+    legacy_auth_kind: StacAuthKind,
+    #[serde(default, skip_serializing, rename = "auth_header_name")]
+    legacy_auth_header_name: String,
+    #[serde(default, skip_serializing, rename = "auth_secret")]
+    legacy_auth_secret: String,
+}
+
+impl Default for StacSettings {
+    fn default() -> Self {
+        Self {
+            profiles: Vec::new(),
+            active_profile: 0,
+            legacy_custom_endpoint: String::new(),
+            legacy_custom_collection: String::new(),
+            legacy_auth_kind: StacAuthKind::None,
+            legacy_auth_header_name: "x-api-key".to_owned(),
+            legacy_auth_secret: String::new(),
+        }
+    }
+}
+
+impl StacSettings {
+    #[cfg(test)]
+    pub(crate) fn from_single_profile(mut profile: StacProfile) -> Self {
+        profile.normalize(0);
+        Self {
+            profiles: vec![profile],
+            active_profile: 0,
+            ..Self::default()
+        }
+    }
+
+    /// Migrate any legacy single-endpoint fields into `profiles`, trim
+    /// whitespace, scrub unused secret material, and clamp `active_profile`.
+    pub(crate) fn normalize(&mut self) {
+        let has_legacy = !self.legacy_custom_endpoint.trim().is_empty()
+            || !self.legacy_custom_collection.trim().is_empty()
+            || self.legacy_auth_kind != StacAuthKind::None
+            || !self.legacy_auth_secret.trim().is_empty();
+        if self.profiles.is_empty() && has_legacy {
+            self.profiles.push(StacProfile {
+                name: "Custom STAC".to_owned(),
+                endpoint: std::mem::take(&mut self.legacy_custom_endpoint),
+                collection: std::mem::take(&mut self.legacy_custom_collection),
+                auth_kind: self.legacy_auth_kind,
+                auth_header_name: if self.legacy_auth_header_name.trim().is_empty() {
+                    "x-api-key".to_owned()
+                } else {
+                    std::mem::take(&mut self.legacy_auth_header_name)
+                },
+                auth_secret: std::mem::take(&mut self.legacy_auth_secret),
+            });
+        }
+        self.legacy_custom_endpoint.clear();
+        self.legacy_custom_collection.clear();
+        self.legacy_auth_kind = StacAuthKind::None;
+        self.legacy_auth_header_name = "x-api-key".to_owned();
+        self.legacy_auth_secret.clear();
+
+        self.profiles.truncate(MAX_STAC_PROFILES);
+        for (idx, profile) in self.profiles.iter_mut().enumerate() {
+            profile.normalize(idx);
+        }
+        if self.profiles.is_empty() {
+            self.active_profile = 0;
+        } else if self.active_profile >= self.profiles.len() {
+            self.active_profile = self.profiles.len() - 1;
+        }
+    }
+
+    pub(crate) fn active_profile(&self) -> Option<&StacProfile> {
+        self.profiles
+            .get(self.active_profile)
+            .or_else(|| self.profiles.first())
+    }
+
+    pub(crate) fn profile(&self, index: usize) -> Option<&StacProfile> {
+        self.profiles.get(index)
+    }
+
+    /// Ensure at least one editable profile exists (used by the Settings UI)
+    /// and return a mutable reference to the active profile.
+    pub(crate) fn ensure_active_profile_mut(&mut self) -> &mut StacProfile {
+        if self.profiles.is_empty() {
+            self.profiles.push(StacProfile::default());
+            self.active_profile = 0;
+        } else if self.active_profile >= self.profiles.len() {
+            self.active_profile = self.profiles.len() - 1;
+        }
+        &mut self.profiles[self.active_profile]
+    }
+
+    /// Add a new empty custom STAC profile (up to `MAX_STAC_PROFILES`) and
+    /// select it.
+    pub(crate) fn add_profile(&mut self) -> bool {
+        if self.profiles.len() >= MAX_STAC_PROFILES {
+            return false;
+        }
+        let next_num = self.profiles.len() + 1;
+        self.profiles.push(StacProfile {
+            name: format!("Custom STAC {next_num}"),
+            ..StacProfile::default()
+        });
+        self.active_profile = self.profiles.len() - 1;
+        true
+    }
+
+    /// Remove the currently selected profile, keeping `active_profile` valid.
+    pub(crate) fn remove_active_profile(&mut self) -> bool {
+        if self.profiles.is_empty() {
+            return false;
+        }
+        let idx = self.active_profile.min(self.profiles.len() - 1);
+        self.profiles.remove(idx);
+        if self.profiles.is_empty() {
+            self.active_profile = 0;
+        } else if self.active_profile >= self.profiles.len() {
+            self.active_profile = self.profiles.len() - 1;
+        }
+        true
+    }
+
+    /// Find the first configured profile whose endpoint shares the exact HTTP
+    /// origin with `url` (checking `active_profile` first).
+    pub(crate) fn profile_matching_origin(&self, url: &str) -> Option<&StacProfile> {
+        if let Some(active) = self.active_profile()
+            && active.is_configured()
+            && veldmap_net::same_http_origin(&active.endpoint, url)
+        {
+            return Some(active);
+        }
+        self.profiles
+            .iter()
+            .find(|p| p.is_configured() && veldmap_net::same_http_origin(&p.endpoint, url))
+    }
+
+    /// Return a human-readable validation error if any configured Custom STAC
+    /// profile has an invalid endpoint URL or API-key header name.
+    pub(crate) fn validation_error(&self) -> Option<String> {
+        self.profiles.iter().find_map(StacProfile::validation_error)
+    }
+
+    pub(crate) fn to_stac_auth(&self) -> StacAuth {
+        self.active_profile()
+            .map_or(StacAuth::None, StacProfile::to_stac_auth)
+    }
+}
+
+impl fmt::Debug for StacSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StacSettings")
+            .field("active_profile", &self.active_profile)
+            .field("profiles", &self.profiles)
             .finish()
     }
 }

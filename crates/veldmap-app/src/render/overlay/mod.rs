@@ -19,8 +19,8 @@ use super::bind_groups::TileBindGroupCache;
 use super::palette_cache::PaletteCache;
 use super::pipelines::OverlayPipelines;
 use super::snapshot::{
-    DrawBandMathLayer, DrawOverlayContent, DrawOverlayLayer, DrawOverlayTrack, DrawSnapshot,
-    WarpPatchSetRef,
+    DrawBandEpoch, DrawOverlayContent, DrawOverlayLayer, DrawOverlayTrack, DrawSnapshot,
+    DrawTemporalCrossFadeSource, WarpPatchSetRef,
 };
 use super::swipe::ResolvedSwipe;
 use super::uniforms::{
@@ -30,8 +30,10 @@ use super::uniforms::{
 
 pub(super) use band_math::BandMathPassCtx;
 use band_math::{
-    PreparedBandMath, mrt_tiles_for_patch, push_band_math_uniforms, record_composite,
-    record_scratch_passes,
+    CompositeDrawSpec, PreparedBandMath, PreparedTemporalCrossFade, PreparedTemporalDiff,
+    mrt_tiles_for_bands, push_band_math_uniforms, push_temporal_cross_fade_uniforms,
+    push_temporal_diff_uniforms, record_composite_draw, record_scratch_passes,
+    record_temporal_cross_fade_scratch_passes, record_temporal_diff_scratch_passes,
 };
 use mesh::OverlayMeshPool;
 pub(super) use mesh::OverlayVertex;
@@ -178,6 +180,8 @@ impl PreparedTrackParams {
 enum PreparedLayerDraw {
     Direct { patch_offsets: Vec<Option<u32>> },
     BandMath(PreparedBandMath),
+    TemporalDiff(PreparedTemporalDiff),
+    TemporalCrossFade(PreparedTemporalCrossFade),
 }
 
 /// Manages shared per-density index buffers, bounded LRU cache of lazily built
@@ -186,9 +190,9 @@ enum PreparedLayerDraw {
 pub(super) struct OverlayRenderer {
     meshes: OverlayMeshPool,
     palettes: PaletteCache,
-    /// Per-layer cached `can_use_mrt()` flag evaluated once in
+    /// Per-layer cached `(mrt_a, mrt_b)` flags evaluated once in
     /// [`Self::prepare_resources`] and reused in [`Self::push_uniforms`].
-    layer_mrt_flags: Vec<bool>,
+    layer_mrt_flags: Vec<(bool, bool)>,
     prepared_layers: Vec<PreparedLayerDraw>,
 }
 
@@ -211,6 +215,34 @@ impl OverlayRenderer {
         for patch in set.patches {
             bind_groups.ensure(device, &patch.texture);
             self.meshes.ensure_patch_mesh(device, set, patch);
+        }
+    }
+
+    fn ensure_band_epoch_resources(
+        &mut self,
+        device: &wgpu::Device,
+        bind_groups: &mut TileBindGroupCache,
+        epoch: &DrawBandEpoch,
+        scl_mask_enabled: bool,
+        mrt: bool,
+    ) {
+        if mrt {
+            let first_set = epoch.bands[0].warp_patch_set();
+            for (patch_idx, patch) in first_set.patches.iter().enumerate() {
+                if let Some(tiles) = mrt_tiles_for_bands(&epoch.bands, patch_idx) {
+                    bind_groups.ensure_mrt(device, tiles);
+                }
+                self.meshes.ensure_patch_mesh(device, first_set, patch);
+            }
+        } else {
+            for band in &epoch.bands {
+                self.ensure_patch_set_resources(device, bind_groups, band.warp_patch_set());
+            }
+        }
+        if let Some(scl) = &epoch.scl
+            && scl_mask_enabled
+        {
+            self.ensure_patch_set_resources(device, bind_groups, scl.warp_patch_set());
         }
     }
 
@@ -238,18 +270,68 @@ impl OverlayRenderer {
         for layer in &snapshot.overlays {
             match &layer.content {
                 DrawOverlayContent::Direct { .. } => {
-                    self.layer_mrt_flags.push(false);
+                    self.layer_mrt_flags.push((false, false));
                     if let Some(set) = layer.content.direct_warp_patch_set() {
                         OverlayMeshPool::account_patch_set(set, &mut needed_bytes, &mut live_keys);
                     }
                 }
                 DrawOverlayContent::BandMath(bm) => {
                     let mrt = bm.can_use_mrt();
-                    self.layer_mrt_flags.push(mrt);
+                    self.layer_mrt_flags.push((mrt, false));
                     for set in bm.active_warp_patch_sets(mrt) {
                         OverlayMeshPool::account_patch_set(set, &mut needed_bytes, &mut live_keys);
                     }
                 }
+                DrawOverlayContent::TemporalDiff(diff) => {
+                    let mrt_a = diff.epoch_a.can_use_mrt();
+                    let mrt_b = diff.epoch_b.can_use_mrt();
+                    self.layer_mrt_flags.push((mrt_a, mrt_b));
+                    for set in diff
+                        .epoch_a
+                        .active_warp_patch_sets(mrt_a, diff.scl_mask_enabled)
+                        .chain(
+                            diff.epoch_b
+                                .active_warp_patch_sets(mrt_b, diff.scl_mask_enabled),
+                        )
+                    {
+                        OverlayMeshPool::account_patch_set(set, &mut needed_bytes, &mut live_keys);
+                    }
+                }
+                DrawOverlayContent::TemporalCrossFade(cf) => match &cf.source {
+                    DrawTemporalCrossFadeSource::BandMathRgb {
+                        scl_mask_enabled,
+                        epoch_a,
+                        epoch_b,
+                        ..
+                    } => {
+                        let mrt_a = epoch_a.can_use_mrt();
+                        let mrt_b = epoch_b.can_use_mrt();
+                        self.layer_mrt_flags.push((mrt_a, mrt_b));
+                        for set in epoch_a
+                            .active_warp_patch_sets(mrt_a, *scl_mask_enabled)
+                            .chain(epoch_b.active_warp_patch_sets(mrt_b, *scl_mask_enabled))
+                        {
+                            OverlayMeshPool::account_patch_set(
+                                set,
+                                &mut needed_bytes,
+                                &mut live_keys,
+                            );
+                        }
+                    }
+                    DrawTemporalCrossFadeSource::DirectDisplay { epoch_a, epoch_b } => {
+                        self.layer_mrt_flags.push((false, false));
+                        OverlayMeshPool::account_patch_set(
+                            epoch_a.warp_patch_set(),
+                            &mut needed_bytes,
+                            &mut live_keys,
+                        );
+                        OverlayMeshPool::account_patch_set(
+                            epoch_b.warp_patch_set(),
+                            &mut needed_bytes,
+                            &mut live_keys,
+                        );
+                    }
+                },
             }
         }
         self.meshes.begin_frame(needed_bytes, live_keys.iter());
@@ -265,11 +347,11 @@ impl OverlayRenderer {
                 DrawOverlayContent::BandMath(bm) => {
                     self.palettes
                         .ensure_colormap(device, palette_layout, bm.colormap);
-                    let mrt = self.layer_mrt_flags[layer_idx];
+                    let mrt = self.layer_mrt_flags[layer_idx].0;
                     if mrt {
                         let first_set = bm.bands[0].warp_patch_set();
                         for (patch_idx, patch) in first_set.patches.iter().enumerate() {
-                            if let Some(tiles) = mrt_tiles_for_patch(bm, patch_idx) {
+                            if let Some(tiles) = mrt_tiles_for_bands(&bm.bands, patch_idx) {
                                 bind_groups.ensure_mrt(device, tiles);
                             }
                             self.meshes.ensure_patch_mesh(device, first_set, patch);
@@ -287,6 +369,68 @@ impl OverlayRenderer {
                         && bm.scl_mask_enabled
                     {
                         self.ensure_patch_set_resources(device, bind_groups, scl.warp_patch_set());
+                    }
+                }
+                DrawOverlayContent::TemporalDiff(diff) => {
+                    self.palettes
+                        .ensure_colormap(device, palette_layout, diff.colormap);
+                    let (mrt_a, mrt_b) = self.layer_mrt_flags[layer_idx];
+                    self.ensure_band_epoch_resources(
+                        device,
+                        bind_groups,
+                        &diff.epoch_a,
+                        diff.scl_mask_enabled,
+                        mrt_a,
+                    );
+                    self.ensure_band_epoch_resources(
+                        device,
+                        bind_groups,
+                        &diff.epoch_b,
+                        diff.scl_mask_enabled,
+                        mrt_b,
+                    );
+                }
+                DrawOverlayContent::TemporalCrossFade(cf) => {
+                    self.palettes.ensure_colormap(
+                        device,
+                        palette_layout,
+                        crate::colormap::ColormapId::Viridis,
+                    );
+                    match &cf.source {
+                        DrawTemporalCrossFadeSource::BandMathRgb {
+                            scl_mask_enabled,
+                            epoch_a,
+                            epoch_b,
+                            ..
+                        } => {
+                            let (mrt_a, mrt_b) = self.layer_mrt_flags[layer_idx];
+                            self.ensure_band_epoch_resources(
+                                device,
+                                bind_groups,
+                                epoch_a,
+                                *scl_mask_enabled,
+                                mrt_a,
+                            );
+                            self.ensure_band_epoch_resources(
+                                device,
+                                bind_groups,
+                                epoch_b,
+                                *scl_mask_enabled,
+                                mrt_b,
+                            );
+                        }
+                        DrawTemporalCrossFadeSource::DirectDisplay { epoch_a, epoch_b } => {
+                            self.ensure_patch_set_resources(
+                                device,
+                                bind_groups,
+                                epoch_a.warp_patch_set(),
+                            );
+                            self.ensure_patch_set_resources(
+                                device,
+                                bind_groups,
+                                epoch_b.warp_patch_set(),
+                            );
+                        }
                     }
                 }
             }
@@ -367,8 +511,7 @@ impl OverlayRenderer {
                     let use_mrt = self
                         .layer_mrt_flags
                         .get(layer_idx)
-                        .copied()
-                        .unwrap_or_else(|| bm.can_use_mrt());
+                        .map_or_else(|| bm.can_use_mrt(), |f| f.0);
                     let uniform_ctx = band_math::BandMathUniformCtx {
                         meshes: &self.meshes,
                         snapshot,
@@ -387,6 +530,58 @@ impl OverlayRenderer {
                     );
                     self.prepared_layers
                         .push(PreparedLayerDraw::BandMath(prepared));
+                }
+                DrawOverlayContent::TemporalDiff(diff) => {
+                    let mrt = self
+                        .layer_mrt_flags
+                        .get(layer_idx)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            (diff.epoch_a.can_use_mrt(), diff.epoch_b.can_use_mrt())
+                        });
+                    let uniform_ctx = band_math::BandMathUniformCtx {
+                        meshes: &self.meshes,
+                        snapshot,
+                        eye,
+                        width,
+                        height,
+                    };
+                    let prepared = push_temporal_diff_uniforms(
+                        &uniform_ctx,
+                        arena,
+                        layer.layer_id,
+                        diff,
+                        mrt,
+                        opacity,
+                        swipe,
+                    );
+                    self.prepared_layers
+                        .push(PreparedLayerDraw::TemporalDiff(prepared));
+                }
+                DrawOverlayContent::TemporalCrossFade(cf) => {
+                    let mrt = self
+                        .layer_mrt_flags
+                        .get(layer_idx)
+                        .copied()
+                        .unwrap_or((false, false));
+                    let uniform_ctx = band_math::BandMathUniformCtx {
+                        meshes: &self.meshes,
+                        snapshot,
+                        eye,
+                        width,
+                        height,
+                    };
+                    let prepared = push_temporal_cross_fade_uniforms(
+                        &uniform_ctx,
+                        arena,
+                        layer.layer_id,
+                        cf,
+                        mrt,
+                        opacity,
+                        swipe,
+                    );
+                    self.prepared_layers
+                        .push(PreparedLayerDraw::TemporalCrossFade(prepared));
                 }
             }
         }
@@ -451,29 +646,45 @@ impl OverlayRenderer {
         }
     }
 
-    /// Record the shared viewport scratch passes (quiet-NaN initialization +
-    /// MRT or per-band `R32Float` draws + optional `R8Uint` `SCL` mask pass)
-    /// for a `BandMath` layer, constrained to its clamped projected-AABB
-    /// scissor rect. Returns `true` if the layer should proceed to fullscreen
-    /// composite.
-    pub(super) fn record_band_math_scratch_passes<'a>(
+    /// Record the shared viewport scratch passes for any scratch-backed overlay
+    /// layer (`BandMath`, `TemporalDiff`, or `TemporalCrossFade`), constrained
+    /// to its clamped projected-AABB scissor rect. Returns `true` if the layer
+    /// should proceed to fullscreen composite.
+    pub(super) fn record_scratch_layer_passes<'a>(
         &'a self,
         encoder: &mut wgpu::CommandEncoder,
         layer_idx: usize,
-        bm: &'a DrawBandMathLayer,
+        content: &'a DrawOverlayContent,
         ctx: &BandMathPassCtx<'a>,
     ) -> bool {
-        let Some(PreparedLayerDraw::BandMath(prepared)) = self.prepared_layers.get(layer_idx)
-        else {
-            return false;
-        };
-        record_scratch_passes(&self.meshes, encoder, prepared, bm, ctx)
+        match (content, self.prepared_layers.get(layer_idx)) {
+            (DrawOverlayContent::BandMath(bm), Some(PreparedLayerDraw::BandMath(prepared))) => {
+                record_scratch_passes(&self.meshes, encoder, prepared, bm, ctx)
+            }
+            (
+                DrawOverlayContent::TemporalDiff(diff),
+                Some(PreparedLayerDraw::TemporalDiff(prepared)),
+            ) => record_temporal_diff_scratch_passes(&self.meshes, encoder, prepared, diff, ctx),
+            (
+                DrawOverlayContent::TemporalCrossFade(cf),
+                Some(PreparedLayerDraw::TemporalCrossFade(prepared)),
+            ) => record_temporal_cross_fade_scratch_passes(
+                &self.meshes,
+                &self.palettes,
+                encoder,
+                prepared,
+                cf,
+                ctx,
+            ),
+            _ => false,
+        }
     }
 
-    /// Record the scissored fullscreen Band Math + `SCL` mask + colormap
-    /// composite draw inside an open depth-less `Rgba8UnormSrgb` color pass,
-    /// then restore the full-viewport scissor rect for subsequent draws.
-    pub(super) fn record_band_math_composite<'a>(
+    /// Record the scissored fullscreen composite draw for a scratch-backed
+    /// layer (`BandMath`, `TemporalDiff`, or `TemporalCrossFade`) inside an
+    /// open depth-less `Rgba8UnormSrgb` color pass, then restore the
+    /// full-viewport scissor rect for subsequent draws.
+    pub(super) fn record_scratch_layer_composite<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         layer_idx: usize,
@@ -481,10 +692,44 @@ impl OverlayRenderer {
         full_height: u32,
         ctx: &BandMathPassCtx<'a>,
     ) {
-        let Some(PreparedLayerDraw::BandMath(prepared)) = self.prepared_layers.get(layer_idx)
-        else {
-            return;
-        };
-        record_composite(&self.palettes, pass, prepared, full_width, full_height, ctx);
+        match self.prepared_layers.get(layer_idx) {
+            Some(PreparedLayerDraw::BandMath(prepared)) => record_composite_draw(
+                &self.palettes,
+                pass,
+                CompositeDrawSpec {
+                    scissor: prepared.scissor,
+                    composite_offset: prepared.composite_offset,
+                    colormap: prepared.colormap,
+                    use_rgba_scratch: false,
+                    viewport: [full_width, full_height],
+                },
+                ctx,
+            ),
+            Some(PreparedLayerDraw::TemporalDiff(prepared)) => record_composite_draw(
+                &self.palettes,
+                pass,
+                CompositeDrawSpec {
+                    scissor: prepared.scissor,
+                    composite_offset: prepared.composite_offset,
+                    colormap: prepared.colormap,
+                    use_rgba_scratch: false,
+                    viewport: [full_width, full_height],
+                },
+                ctx,
+            ),
+            Some(PreparedLayerDraw::TemporalCrossFade(prepared)) => record_composite_draw(
+                &self.palettes,
+                pass,
+                CompositeDrawSpec {
+                    scissor: prepared.scissor,
+                    composite_offset: prepared.composite_offset,
+                    colormap: crate::colormap::ColormapId::Viridis,
+                    use_rgba_scratch: true,
+                    viewport: [full_width, full_height],
+                },
+                ctx,
+            ),
+            _ => {}
+        }
     }
 }

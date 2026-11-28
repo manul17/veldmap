@@ -28,7 +28,7 @@ fn parses_3d_bbox_start_datetime_fallback_mgrs_and_nan_nodata() {
             }
         }]
     });
-    let parsed = parse_search_response(&json).expect("parse");
+    let parsed = parse_search_response(&json, "https://stac.example.org/v1/search").expect("parse");
     assert_eq!(parsed.items.len(), 1);
     let item = &parsed.items[0];
     assert_eq!(item.bbox, Some([7.5, 45.8, 9.2, 47.1]));
@@ -127,7 +127,7 @@ fn parses_stac11_bands_processing_level_scl_and_skips_visual_for_spectral() {
             "assets": {}
         }]
     });
-    let parsed = parse_search_response(&json).expect("parse");
+    let parsed = parse_search_response(&json, "https://stac.example.org/v1/search").expect("parse");
     let item = &parsed.items[0];
     assert_eq!(item.processing_level.as_deref(), Some("level-2a"));
     assert_eq!(item.platform.as_deref(), Some("sentinel-2a"));
@@ -183,10 +183,76 @@ fn parse_stac_item_sanitizes_self_href_and_ignores_relative_or_non_self_links() 
             }
         ]
     });
-    let parsed = parse_search_response(&json).expect("parse");
+    let parsed = parse_search_response(&json, "https://stac.example.org/v1/search").expect("parse");
     assert_eq!(
         parsed.items[0].self_href.as_deref(),
         Some("https://stac.example.org/items/s2")
     );
     assert_eq!(parsed.items[1].self_href, None);
+}
+
+#[test]
+fn build_search_payload_emits_sortby_only_when_requested_and_parses_next_links() {
+    let base = build_search_payload("sentinel-2-l2a", &StacSearchQuery::default());
+    assert!(base.get("sortby").is_none());
+
+    let newest = build_search_payload(
+        "sentinel-2-l2a",
+        &StacSearchQuery {
+            sort_by: Some(StacSortBy::Newest),
+            ..StacSearchQuery::default()
+        },
+    );
+    assert_eq!(
+        newest["sortby"],
+        serde_json::json!([{"field": "properties.datetime", "direction": "desc"}])
+    );
+
+    let cloud = build_search_payload(
+        "sentinel-2-l2a",
+        &StacSearchQuery {
+            sort_by: Some(StacSortBy::LeastCloud),
+            ..StacSearchQuery::default()
+        },
+    );
+    assert_eq!(
+        cloud["sortby"],
+        serde_json::json!([{"field": "properties.eo:cloud_cover", "direction": "asc"}])
+    );
+
+    // Relative GET next link resolves against request_url.
+    let get_resp = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": [],
+        "links": [
+            {"rel": "next", "href": "/v1/search?token=abc"}
+        ]
+    });
+    let parsed_get =
+        parse_search_response(&get_resp, "https://stac.example.org/v1/search").expect("parse get");
+    let next = parsed_get.next_link.expect("next link");
+    assert_eq!(next.href, "https://stac.example.org/v1/search?token=abc");
+    assert_eq!(next.method, StacNextMethod::Get);
+    assert!(!next.merge);
+
+    // POST next link with body + merge: true (AWS Earth Search style).
+    let post_resp = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": [],
+        "links": [
+            {
+                "rel": "next",
+                "href": "https://stac.example.org/v1/search",
+                "method": "POST",
+                "merge": true,
+                "body": {"next": "cursor-2"}
+            }
+        ]
+    });
+    let parsed_post = parse_search_response(&post_resp, "https://stac.example.org/v1/search")
+        .expect("parse post");
+    let next_post = parsed_post.next_link.expect("post next link");
+    assert_eq!(next_post.method, StacNextMethod::Post);
+    assert!(next_post.merge);
+    assert!(next_post.body.as_deref().unwrap().contains("cursor-2"));
 }

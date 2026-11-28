@@ -6,8 +6,9 @@ mod client;
 mod parse;
 mod types;
 
-pub use self::client::StacClient;
+pub use self::client::{StacClient, StacItemFlightCache};
 pub use self::types::{
-    StacAsset, StacAuth, StacCatalogConfig, StacError, StacItem, StacRasterBandMeta,
-    StacSearchQuery, StacSearchResult,
+    MAX_STAC_PAGINATED_ITEMS, StacAsset, StacAuth, StacCatalogConfig, StacError, StacItem,
+    StacNextLink, StacNextMethod, StacRasterBandMeta, StacSearchQuery, StacSearchResult,
+    StacSortBy,
 };

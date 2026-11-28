@@ -10,7 +10,7 @@ use crate::export::CartographicOverlaySpec;
 use crate::format;
 use crate::layers::{
     BandMathAssetOpenSpec, CrsOverride, LayerId, OverlayEdit, RemoteBandMathRequest,
-    RemoteCogRequest,
+    RemoteCogRequest, TimelineEpochSourceSpec, TimelineEpochSpec, TimelineOpenRequest,
 };
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::stac::{AuthTrust, StacSession};
@@ -126,6 +126,57 @@ impl VeldmapApp {
                 FileDialogEvent::OpenFiles(paths) => {
                     self.open_user_paths(paths, None);
                 }
+                FileDialogEvent::TimelineFolderScanned { dir, result } => match result {
+                    Ok(files) => {
+                        let title = format!("{} Timeline", crate::display_name_from_path(&dir));
+                        let epochs = files
+                            .into_iter()
+                            .map(|f| TimelineEpochSpec {
+                                label: crate::display_name_from_path(&f.path),
+                                date_label: f.date_label,
+                                sort_key: f.sort_key,
+                                cloud_cover: None,
+                                source: TimelineEpochSourceSpec::LocalSingle {
+                                    path: f.path,
+                                    crs_override: None,
+                                },
+                            })
+                            .collect();
+                        let req = TimelineOpenRequest {
+                            title,
+                            epochs,
+                            recipe_preset: None,
+                            band_math_style: None,
+                            single_style: None,
+                            visible: true,
+                            opacity: 1.0,
+                            active_idx: None,
+                            compare: None,
+                            max_cloud_cover: None,
+                            diff_colormap: None,
+                            diff_invert_colormap: false,
+                            diff_stretch_min: None,
+                            diff_stretch_max: None,
+                            fly_to: true,
+                            restore_id: None,
+                        };
+                        match self.scene.open_timeline(req) {
+                            Ok(_) => {
+                                self.panels.layers.clear_error();
+                                self.open_workbench_tab(WorkbenchTab::Layers);
+                                self.persist_session_snapshot(false, &[]);
+                            }
+                            Err(err) => {
+                                self.panels.layers.push_error(err);
+                                self.open_workbench_tab(WorkbenchTab::Layers);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.panels.layers.push_error(err);
+                        self.open_workbench_tab(WorkbenchTab::Layers);
+                    }
+                },
                 FileDialogEvent::GeoJsonSaved { path, result } => match result {
                     Ok(()) => {
                         self.panels
@@ -208,6 +259,12 @@ impl VeldmapApp {
             match action {
                 LayerUiAction::OpenFileDialog => {
                     self.trigger_native_open_dialog(frame);
+                    needs_repaint = true;
+                }
+                LayerUiAction::OpenTimelineFolderDialog => {
+                    if let Err(err) = self.dialogs.spawn_open_folder_timeline(frame) {
+                        self.set_status_notice(err.notice(DialogKind::Open).to_owned());
+                    }
                     needs_repaint = true;
                 }
                 LayerUiAction::OpenPath(path) => {
@@ -341,6 +398,13 @@ impl VeldmapApp {
                     }
                     needs_repaint = true;
                 }
+                StacUiAction::LoadMore => {
+                    let res = self.scene.mutate_stac(StacSession::begin_load_more);
+                    if let Err(err) = res {
+                        self.scene.mutate_stac(|s| s.set_error(err));
+                    }
+                    needs_repaint = true;
+                }
                 StacUiAction::CancelSearch => {
                     self.scene.mutate_stac(StacSession::cancel);
                     needs_repaint = true;
@@ -428,6 +492,7 @@ impl VeldmapApp {
                         is_scl: spec.is_scl,
                         stac_item_href: spec.stac_item_href,
                         asset_key: spec.asset_key,
+                        refresh_policy: None,
                         visible: true,
                         opacity: 1.0,
                         style: None,
@@ -463,6 +528,7 @@ impl VeldmapApp {
                             external_bands: asset.external_bands,
                             stac_item_href: asset.stac_item_href,
                             asset_key: asset.asset_key,
+                            refresh_policy: None,
                             band_index: 0,
                         }
                     };
@@ -486,6 +552,25 @@ impl VeldmapApp {
                         self.scene.mutate_stac(|s| s.set_error(err));
                     } else {
                         self.scene.mutate_stac(StacSession::clear_error);
+                    }
+                    needs_repaint = true;
+                }
+                StacUiAction::CreateTimeline { group_key, mode } => {
+                    let stac_settings = self.storage.settings().stac.clone();
+                    match self
+                        .scene
+                        .stac()
+                        .build_timeline_request(&group_key, mode, &stac_settings)
+                        .and_then(|req| self.scene.open_timeline(req))
+                    {
+                        Ok(_) => {
+                            self.scene.mutate_stac(StacSession::clear_error);
+                            self.open_workbench_tab(WorkbenchTab::Layers);
+                            self.persist_session_snapshot(false, &[]);
+                        }
+                        Err(err) => {
+                            self.scene.mutate_stac(|s| s.set_error(err));
+                        }
                     }
                     needs_repaint = true;
                 }

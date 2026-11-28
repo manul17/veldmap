@@ -178,16 +178,32 @@ fn stac_settings_round_trip_and_redact_secrets_in_debug() {
     let mut settings = AppSettings::default();
     let mut draft = AppSettingsDraft::from_settings(&settings);
     draft.stac = StacSettings {
-        custom_endpoint: "https://user:pw@stac.example.org/v1?sig=hidden-query".to_owned(),
-        custom_collection: "sentinel-2-l2a".to_owned(),
-        auth_kind: StacAuthKind::Bearer,
-        auth_header_name: "x-api-key".to_owned(),
-        auth_secret: "stac-bearer-secret-xyz".to_owned(),
+        profiles: vec![
+            StacProfile {
+                name: "Primary Corp".to_owned(),
+                endpoint: "https://user:pw@stac.example.org/v1?sig=hidden-query".to_owned(),
+                collection: "sentinel-2-l2a".to_owned(),
+                auth_kind: StacAuthKind::Bearer,
+                auth_header_name: "x-api-key".to_owned(),
+                auth_secret: "stac-bearer-secret-xyz".to_owned(),
+            },
+            StacProfile {
+                name: "Planetary".to_owned(),
+                endpoint: "https://planetary.example.org/api/stac/v1".to_owned(),
+                collection: "landsat-c2-l2".to_owned(),
+                auth_kind: StacAuthKind::SasQuery,
+                auth_header_name: "x-api-key".to_owned(),
+                auth_secret: "sv=2024&sig=second-secret".to_owned(),
+            },
+        ],
+        active_profile: 0,
+        ..StacSettings::default()
     };
     draft.apply_into(&mut settings);
 
     let dbg = format!("{settings:?}");
     assert!(!dbg.contains("stac-bearer-secret-xyz"));
+    assert!(!dbg.contains("second-secret"));
     assert!(!dbg.contains("user:pw"));
     assert!(!dbg.contains("hidden-query"));
     assert!(dbg.contains("<redacted>"));
@@ -195,15 +211,24 @@ fn stac_settings_round_trip_and_redact_secrets_in_debug() {
     settings.save(&paths).expect("save stac settings");
     let loaded = AppSettings::load_or_default(&paths);
     assert_eq!(loaded.stac, settings.stac);
+    assert_eq!(loaded.stac.profiles.len(), 2);
     assert_eq!(
         loaded.stac.to_stac_auth(),
         StacAuth::Bearer("stac-bearer-secret-xyz".to_owned())
     );
+    assert_eq!(
+        loaded
+            .stac
+            .profile_matching_origin("https://planetary.example.org/items/x")
+            .map(|p| p.name.as_str()),
+        Some("Planetary")
+    );
 }
 
 #[test]
-fn stac_settings_forward_compat_normalization_validation_and_secret_scrub() {
-    // Unknown future StacAuthKind deserializes forward-compatibly to None.
+fn stac_settings_forward_compat_legacy_migration_validation_and_secret_scrub() {
+    // Legacy v0.5 flat JSON migrates seamlessly into profiles[0], and unknown
+    // future StacAuthKind deserializes forward-compatibly to None (scrubbing secret).
     let dir = TestTempDir::new("settings-stac-compat");
     let paths = StoragePaths::with_root(dir.path());
     let settings_path = paths.settings_path();
@@ -214,10 +239,12 @@ fn stac_settings_forward_compat_normalization_validation_and_secret_scrub() {
     )
     .expect("write future auth");
     let loaded = AppSettings::load_or_default(&paths);
-    assert_eq!(loaded.stac.auth_kind, StacAuthKind::None);
-    assert_eq!(loaded.stac.custom_endpoint, "https://stac.example/v1");
+    assert_eq!(loaded.stac.profiles.len(), 1);
+    let p0 = &loaded.stac.profiles[0];
+    assert_eq!(p0.auth_kind, StacAuthKind::None);
+    assert_eq!(p0.endpoint, "https://stac.example/v1");
     assert!(
-        loaded.stac.auth_secret.is_empty(),
+        p0.auth_secret.is_empty(),
         "switching/falling back to None must scrub auth_secret"
     );
 
@@ -226,41 +253,42 @@ fn stac_settings_forward_compat_normalization_validation_and_secret_scrub() {
     let mut settings = loaded;
     let saved = settings.stac.clone();
     let mut draft = AppSettingsDraft::from_settings(&settings);
-    draft.stac.custom_endpoint = "ftp://not-http.example/v1".to_owned();
+    draft.stac.ensure_active_profile_mut().endpoint = "ftp://not-http.example/v1".to_owned();
     assert!(draft.stac.validation_error().is_some());
     draft.apply_into(&mut settings);
     assert_eq!(settings.stac, saved);
 
-    draft.stac.custom_endpoint = "https://stac.example/v1".to_owned();
-    draft.stac.auth_kind = StacAuthKind::ApiKey;
+    let prof = draft.stac.ensure_active_profile_mut();
+    prof.endpoint = "https://stac.example/v1".to_owned();
+    prof.auth_kind = StacAuthKind::ApiKey;
     for forbidden in ["Range", "Content-Type", "Accept"] {
-        draft.stac.auth_header_name = forbidden.to_owned();
+        draft.stac.ensure_active_profile_mut().auth_header_name = forbidden.to_owned();
         assert!(
             draft.stac.validation_error().is_some(),
             "expected protocol-owned header '{forbidden}' to fail validation"
         );
     }
-    draft.stac.auth_header_name = "x-api-key".to_owned();
+    draft.stac.ensure_active_profile_mut().auth_header_name = "x-api-key".to_owned();
     assert!(draft.stac.validation_error().is_none());
 
     // Changing auth kind scrubs previous secret; keeping the same mode preserves it.
-    let mut stac = StacSettings {
+    let mut profile = StacProfile {
         auth_kind: StacAuthKind::Bearer,
         auth_secret: "bearer-secret".to_owned(),
-        ..StacSettings::default()
+        ..StacProfile::default()
     };
-    stac.set_auth_kind(StacAuthKind::Bearer);
-    assert_eq!(stac.auth_secret, "bearer-secret");
-    stac.set_auth_kind(StacAuthKind::SasQuery);
-    assert_eq!(stac.auth_kind, StacAuthKind::SasQuery);
+    profile.set_auth_kind(StacAuthKind::Bearer);
+    assert_eq!(profile.auth_secret, "bearer-secret");
+    profile.set_auth_kind(StacAuthKind::SasQuery);
+    assert_eq!(profile.auth_kind, StacAuthKind::SasQuery);
     assert!(
-        stac.auth_secret.is_empty(),
+        profile.auth_secret.is_empty(),
         "switching Bearer -> SasQuery must scrub secret"
     );
-    stac.auth_secret = "sv=2024&sig=abc".to_owned();
-    stac.set_auth_kind(StacAuthKind::ApiKey);
+    profile.auth_secret = "sv=2024&sig=abc".to_owned();
+    profile.set_auth_kind(StacAuthKind::ApiKey);
     assert!(
-        stac.auth_secret.is_empty(),
+        profile.auth_secret.is_empty(),
         "switching SasQuery -> ApiKey must scrub secret"
     );
 }

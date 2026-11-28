@@ -1,15 +1,17 @@
 //! Origin-aware authentication resolution for remote Cloud-Optimized GeoTIFFs
-//! opened from STAC search results, built-in sample scenes, or direct URLs.
+//! opened from STAC search results, built-in sample scenes, direct URLs, and
+//! `401`/`403` `stac_item_href` restore refreshes across named Custom STAC
+//! profiles.
 
 use veldmap_net::{StacAuth, same_http_origin};
 
-use crate::layers::StacCogAuthMode;
-use crate::storage::settings::StacSettings;
+use crate::layers::{StacCogAuthMode, StacItemRefreshPolicy};
+use crate::storage::settings::{StacProfile, StacSettings};
 
 /// Return `true` if `url` already carries a cloud presigned-URL signature query
 /// parameter (AWS S3, Azure SAS, GCS) so we never double-sign or attach
 /// conflicting auth headers.
-fn url_has_presigned_query(url: &str) -> bool {
+pub(crate) fn url_has_presigned_query(url: &str) -> bool {
     let before_frag = url.split('#').next().unwrap_or(url);
     let Some((_, query)) = before_frag.split_once('?') else {
         return false;
@@ -23,32 +25,20 @@ fn url_has_presigned_query(url: &str) -> bool {
     })
 }
 
-/// Resolve the final URL and custom HTTP headers for opening a remote COG,
-/// preventing accidental credential leaks onto public or cross-origin hosts and
-/// avoiding dual-auth errors on already-presigned URLs.
-pub(super) fn resolve_cog_auth(
+fn apply_profile_cog_auth(
     url: &str,
     mode: StacCogAuthMode,
-    result_uses_custom_auth: bool,
-    result_catalog_endpoint: Option<&str>,
-    stac_settings: &StacSettings,
+    origin_ep: Option<&str>,
+    auth: &StacAuth,
 ) -> (String, Vec<(String, String)>) {
-    if mode == StacCogAuthMode::None || url_has_presigned_query(url) {
-        return (url.to_owned(), Vec::new());
-    }
-    if mode == StacCogAuthMode::FromSearchResult && !result_uses_custom_auth {
-        return (url.to_owned(), Vec::new());
-    }
-
-    let auth = stac_settings.to_stac_auth();
-    match &auth {
+    match auth {
         StacAuth::None => (url.to_owned(), Vec::new()),
         // SAS query tokens are intentionally used across storage domains (e.g.
         // STAC catalog on one host, COGs on `*.blob.core.windows.net`).
         StacAuth::SasQuery(_) => (auth.apply_to_url(url), Vec::new()),
         StacAuth::Bearer(_) | StacAuth::ApiKey { .. } => {
             if mode == StacCogAuthMode::FromSearchResult
-                && result_catalog_endpoint.is_none_or(|origin_ep| !same_http_origin(origin_ep, url))
+                && origin_ep.is_none_or(|ep| !same_http_origin(ep, url))
             {
                 tracing::debug!(
                     "Skipping custom STAC auth headers for cross-origin or unverified-origin asset URL"
@@ -58,6 +48,54 @@ pub(super) fn resolve_cog_auth(
             (url.to_owned(), auth.extra_headers())
         }
     }
+}
+
+/// Resolve the final URL and custom HTTP headers for opening a remote COG,
+/// preventing accidental credential leaks onto public or cross-origin hosts and
+/// avoiding dual-auth errors on already-presigned URLs.
+pub(super) fn resolve_cog_auth(
+    url: &str,
+    mode: StacCogAuthMode,
+    result_uses_custom_auth: bool,
+    result_catalog_endpoint: Option<&str>,
+    result_auth: Option<&StacAuth>,
+    stac_settings: &StacSettings,
+) -> (String, Vec<(String, String)>) {
+    if mode == StacCogAuthMode::None || url_has_presigned_query(url) {
+        return (url.to_owned(), Vec::new());
+    }
+    if mode == StacCogAuthMode::FromSearchResult && !result_uses_custom_auth {
+        return (url.to_owned(), Vec::new());
+    }
+
+    let (auth, origin_ep): (StacAuth, Option<&str>) = match mode {
+        StacCogAuthMode::FromSearchResult => {
+            if let Some(a) = result_auth {
+                (a.clone(), result_catalog_endpoint)
+            } else if let Some(profile) = stac_settings
+                .profile_matching_origin(url)
+                .or_else(|| {
+                    result_catalog_endpoint.and_then(|ep| stac_settings.profile_matching_origin(ep))
+                })
+                .or_else(|| stac_settings.active_profile())
+            {
+                let ep = result_catalog_endpoint
+                    .or_else(|| profile.is_configured().then_some(profile.endpoint.as_str()));
+                (profile.to_stac_auth(), ep)
+            } else {
+                (StacAuth::None, None)
+            }
+        }
+        StacCogAuthMode::DirectCustom => {
+            let auth = stac_settings
+                .profile_matching_origin(url)
+                .map_or_else(|| stac_settings.to_stac_auth(), StacProfile::to_stac_auth);
+            (auth, result_catalog_endpoint)
+        }
+        StacCogAuthMode::None => (StacAuth::None, None),
+    };
+
+    apply_profile_cog_auth(url, mode, origin_ep, &auth)
 }
 
 /// Normalize `mode` against whether the active STAC search used custom auth so
@@ -87,7 +125,7 @@ pub(crate) enum AuthTrust {
     LocalSession,
     /// Portable/shareable `.veldmap.json` project file (potentially from an
     /// external source): credentials from private `settings.json` are attached
-    /// strictly to URLs matching `stac_settings.custom_endpoint`'s origin.
+    /// strictly to URLs matching a configured Custom STAC profile's origin.
     ImportedProject,
 }
 
@@ -103,10 +141,9 @@ pub(crate) fn sanitize_imported_auth_mode(
     if mode == StacCogAuthMode::None {
         return StacCogAuthMode::None;
     }
-    let custom_ep = stac_settings.custom_endpoint.trim();
-    if !custom_ep.is_empty() && same_http_origin(custom_ep, url) {
+    if stac_settings.profile_matching_origin(url).is_some() {
         // Downgrade `DirectCustom` to `FromSearchResult` so later changing
-        // `custom_endpoint` will not send headers to a stale imported origin.
+        // profiles will not send headers to a stale imported origin.
         StacCogAuthMode::FromSearchResult
     } else {
         StacCogAuthMode::None
@@ -121,8 +158,6 @@ pub(crate) fn resolve_persisted_cog_auth(
     trust: AuthTrust,
     stac_settings: &StacSettings,
 ) -> (String, Vec<(String, String)>) {
-    let custom_ep = stac_settings.custom_endpoint.trim();
-    let origin_ep = (!custom_ep.is_empty()).then_some(custom_ep);
     let effective_mode = match trust {
         AuthTrust::LocalSession => mode,
         AuthTrust::ImportedProject => {
@@ -133,13 +168,78 @@ pub(crate) fn resolve_persisted_cog_auth(
             safe_mode
         }
     };
-    resolve_cog_auth(
-        url,
-        effective_mode,
-        effective_mode != StacCogAuthMode::None,
-        origin_ep,
-        stac_settings,
-    )
+    if effective_mode == StacCogAuthMode::None || url_has_presigned_query(url) {
+        return (url.to_owned(), Vec::new());
+    }
+    let matched_profile = stac_settings.profile_matching_origin(url);
+    if let Some(profile) = matched_profile {
+        return apply_profile_cog_auth(
+            url,
+            effective_mode,
+            Some(profile.endpoint.as_str()),
+            &profile.to_stac_auth(),
+        );
+    }
+    // No profile origin matched `url`: for `LocalSession`, `DirectCustom` or
+    // `SasQuery` on the active profile may still apply (e.g. SAS query across
+    // Azure Blob storage host), whereas `Bearer`/`ApiKey` with
+    // `FromSearchResult` require an explicit matching profile origin.
+    if let Some(active) = stac_settings.active_profile() {
+        let origin_ep = active.is_configured().then_some(active.endpoint.as_str());
+        return apply_profile_cog_auth(url, effective_mode, origin_ep, &active.to_stac_auth());
+    }
+    (url.to_owned(), Vec::new())
+}
+
+/// Build an origin-fenced [`StacItemRefreshPolicy`] for refreshing expired
+/// presigned asset URLs via `stac_item_href` on HTTP `401`/`403` during
+/// session/project restore.
+///
+/// Security invariants:
+/// - For `AuthTrust::ImportedProject`, never sends private credentials from
+///   `settings.json` to `stac_item_href` or the refreshed asset URL (only
+///   unauthenticated public STAC item refresh is permitted).
+/// - For `AuthTrust::LocalSession`, attaches a profile's credentials to the
+///   `stac_item_href` GET strictly when `same_http_origin(profile.endpoint,
+///   stac_item_href)` holds.
+pub(crate) fn build_stac_item_refresh_policy(
+    stac_item_href: Option<&str>,
+    asset_key: Option<&str>,
+    trust: AuthTrust,
+    stac_settings: &StacSettings,
+) -> Option<StacItemRefreshPolicy> {
+    let item_href = stac_item_href?.trim();
+    let key = asset_key?.trim();
+    if item_href.is_empty() || key.is_empty() {
+        return None;
+    }
+    match trust {
+        AuthTrust::ImportedProject => Some(StacItemRefreshPolicy {
+            item_auth: StacAuth::None,
+            asset_auth_origin: None,
+            asset_headers: Vec::new(),
+        }),
+        AuthTrust::LocalSession => {
+            let matched = stac_settings.profile_matching_origin(item_href);
+            let item_auth = matched.map_or(StacAuth::None, StacProfile::to_stac_auth);
+            let (asset_auth_origin, asset_headers) = match matched {
+                Some(profile) => {
+                    let hdrs = item_auth.extra_headers();
+                    if hdrs.is_empty() {
+                        (None, Vec::new())
+                    } else {
+                        (Some(profile.endpoint.clone()), hdrs)
+                    }
+                }
+                None => (None, Vec::new()),
+            };
+            Some(StacItemRefreshPolicy {
+                item_auth,
+                asset_auth_origin,
+                asset_headers,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,15 +249,16 @@ mod tests {
 
     #[test]
     fn persisted_from_search_result_never_leaks_headers_without_matching_custom_origin() {
-        let mut settings = StacSettings {
-            custom_endpoint: String::new(),
-            custom_collection: String::new(),
+        let mut settings = StacSettings::from_single_profile(StacProfile {
+            name: "Corp".to_owned(),
+            endpoint: String::new(),
+            collection: String::new(),
             auth_kind: StacAuthKind::Bearer,
             auth_secret: "super-secret-token".to_owned(),
             auth_header_name: "X-API-Key".to_owned(),
-        };
+        });
 
-        // Empty custom_endpoint must NOT attach Bearer headers to arbitrary URLs.
+        // Empty endpoint must NOT attach Bearer headers to arbitrary URLs.
         let (_, headers_empty) = resolve_persisted_cog_auth(
             "https://evil.example/data/scene.tif",
             StacCogAuthMode::FromSearchResult,
@@ -166,11 +267,11 @@ mod tests {
         );
         assert!(
             headers_empty.is_empty(),
-            "empty custom_endpoint must block FromSearchResult headers"
+            "empty profile endpoint must block FromSearchResult headers"
         );
 
         // Matching origin attaches headers; mismatched origin strips them.
-        settings.custom_endpoint = "https://stac.corp.example/v1".to_owned();
+        settings.profiles[0].endpoint = "https://stac.corp.example/v1".to_owned();
         let (_, headers_same) = resolve_persisted_cog_auth(
             "https://stac.corp.example/assets/b04.tif",
             StacCogAuthMode::FromSearchResult,
@@ -194,13 +295,14 @@ mod tests {
             StacAuthKind::ApiKey,
             StacAuthKind::SasQuery,
         ] {
-            let settings = StacSettings {
-                custom_endpoint: "https://stac.corp.example/v1".to_owned(),
-                custom_collection: String::new(),
+            let settings = StacSettings::from_single_profile(StacProfile {
+                name: "Corp".to_owned(),
+                endpoint: "https://stac.corp.example/v1".to_owned(),
+                collection: String::new(),
                 auth_kind: kind,
                 auth_secret: "sig=topsecret".to_owned(),
                 auth_header_name: "X-API-Key".to_owned(),
-            };
+            });
             for claimed_mode in [
                 StacCogAuthMode::DirectCustom,
                 StacCogAuthMode::FromSearchResult,
@@ -230,5 +332,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn refresh_policy_origin_fences_local_session_and_strips_imported_credentials() {
+        let settings = StacSettings::from_single_profile(StacProfile {
+            name: "Corp".to_owned(),
+            endpoint: "https://stac.corp.example/v1".to_owned(),
+            collection: "s2".to_owned(),
+            auth_kind: StacAuthKind::Bearer,
+            auth_header_name: "x-api-key".to_owned(),
+            auth_secret: "corp-secret".to_owned(),
+        });
+
+        // LocalSession + matching origin -> attaches Bearer auth for item fetch.
+        let p_same = build_stac_item_refresh_policy(
+            Some("https://stac.corp.example/v1/collections/s2/items/abc"),
+            Some("red"),
+            AuthTrust::LocalSession,
+            &settings,
+        )
+        .expect("policy");
+        assert_eq!(p_same.item_auth, StacAuth::Bearer("corp-secret".to_owned()));
+        assert_eq!(p_same.asset_headers.len(), 1);
+
+        // LocalSession + off-origin item_href -> public unauthenticated refresh only.
+        let p_off = build_stac_item_refresh_policy(
+            Some("https://other.example/items/abc"),
+            Some("red"),
+            AuthTrust::LocalSession,
+            &settings,
+        )
+        .expect("policy");
+        assert_eq!(p_off.item_auth, StacAuth::None);
+        assert!(p_off.asset_headers.is_empty());
+
+        // ImportedProject -> NEVER attaches private credentials even if origin matches.
+        let p_imp = build_stac_item_refresh_policy(
+            Some("https://stac.corp.example/v1/collections/s2/items/abc"),
+            Some("red"),
+            AuthTrust::ImportedProject,
+            &settings,
+        )
+        .expect("policy");
+        assert_eq!(p_imp.item_auth, StacAuth::None);
+        assert!(p_imp.asset_headers.is_empty());
     }
 }

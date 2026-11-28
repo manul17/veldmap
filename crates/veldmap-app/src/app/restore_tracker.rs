@@ -18,6 +18,7 @@ pub(super) enum RestoredEntryKind {
     LocalRaster,
     RemoteCog,
     BandMath,
+    Timeline,
     Vector,
 }
 
@@ -27,6 +28,7 @@ impl RestoredEntryKind {
             Self::LocalRaster => "local overlay",
             Self::RemoteCog => "remote COG",
             Self::BandMath => "band-math recipe",
+            Self::Timeline => "timeline",
             Self::Vector => "GeoJSON vector",
         }
     }
@@ -36,6 +38,7 @@ impl RestoredEntryKind {
             Self::LocalRaster => "Raster",
             Self::RemoteCog => "Cloud COG",
             Self::BandMath => "Band Math",
+            Self::Timeline => "Timeline",
             Self::Vector => "Vector",
         }
     }
@@ -54,6 +57,7 @@ impl SavedEntry {
                 SavedLayerEntry::LocalRaster(_) => RestoredEntryKind::LocalRaster,
                 SavedLayerEntry::RemoteCog(_) => RestoredEntryKind::RemoteCog,
                 SavedLayerEntry::BandMath(_) => RestoredEntryKind::BandMath,
+                SavedLayerEntry::Timeline(_) => RestoredEntryKind::Timeline,
             },
             Self::Vector(_) => RestoredEntryKind::Vector,
         }
@@ -63,7 +67,9 @@ impl SavedEntry {
         match self {
             Self::Raster(entry) => match entry.as_ref() {
                 SavedLayerEntry::LocalRaster(e) => Some(&e.path),
-                SavedLayerEntry::RemoteCog(_) | SavedLayerEntry::BandMath(_) => None,
+                SavedLayerEntry::RemoteCog(_)
+                | SavedLayerEntry::BandMath(_)
+                | SavedLayerEntry::Timeline(_) => None,
             },
             Self::Vector(e) => Some(&e.path),
         }

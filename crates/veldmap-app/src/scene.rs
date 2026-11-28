@@ -434,6 +434,18 @@ impl SceneState {
         self.overlays.begin_open_file(request)
     }
 
+    /// Create and insert a multi-temporal `Timeline` overlay layer, queuing
+    /// async opens for its active, comparison reference, and adjacent prefetch
+    /// epochs.
+    pub(crate) fn open_timeline(
+        &mut self,
+        request: crate::layers::TimelineOpenRequest,
+    ) -> Result<LayerId, String> {
+        let (id, mutation) = self.overlays.open_timeline(request)?;
+        let _ = self.apply_overlay_mutation(mutation);
+        Ok(id)
+    }
+
     /// Queue a non-blocking GeoJSON vector layer open with explicit initial
     /// visibility, opacity, outline-only mode, and optional restore token.
     pub(crate) fn begin_open_vector(
@@ -795,9 +807,30 @@ mod tests {
         let full_demand = ScratchDemand {
             float_bands: 4,
             needs_u8_mask: true,
+            rgba_targets: 0,
         };
         let vram_4k = estimate_viewport_target_vram_bytes(3840, 2160, full_demand);
         assert_eq!(vram_4k, 3840 * 2160 * 25);
+        // BandMath RGB cross-fade: offscreen (8 B/px) + 3x R32Float (12) + 1x R8Uint (1) + 1x Rgba8 (4) = 25 B/px.
+        let rgb_cf_demand = ScratchDemand {
+            float_bands: 3,
+            needs_u8_mask: true,
+            rgba_targets: 1,
+        };
+        assert_eq!(
+            estimate_viewport_target_vram_bytes(3840, 2160, rgb_cf_demand),
+            3840 * 2160 * 25
+        );
+        // DirectDisplay cross-fade: offscreen (8 B/px) + 2x Rgba8 (8 B/px) = 16 B/px.
+        let disp_cf_demand = ScratchDemand {
+            float_bands: 0,
+            needs_u8_mask: false,
+            rgba_targets: 2,
+        };
+        assert_eq!(
+            estimate_viewport_target_vram_bytes(3840, 2160, disp_cf_demand),
+            3840 * 2160 * 16
+        );
         // 5K viewport: ~351.6 MiB total offscreen + 4-band + mask scratch.
         let vram_5k = estimate_viewport_target_vram_bytes(5120, 2880, full_demand);
         assert_eq!(vram_5k, 5120 * 2880 * 25);

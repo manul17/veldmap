@@ -111,6 +111,15 @@ pub(super) struct ScratchMrtPatchUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+pub(super) struct BandMathReduceUniform {
+    pub(super) mode: u32,
+    pub(super) scl_mask_enabled: u32,
+    pub(super) scl_mask_bits: u32,
+    pub(super) nan_bits: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct BandMathCompositeUniform {
     pub(super) opacity: f32,
     pub(super) mode: u32,
@@ -121,7 +130,7 @@ pub(super) struct BandMathCompositeUniform {
     pub(super) invert_colormap: u32,
     pub(super) scl_mask_enabled: u32,
     pub(super) scl_mask_bits: u32,
-    pub(super) _pad0: u32,
+    pub(super) diff_slot: u32,
 }
 
 /// Rust-side WGSL uniform struct layout descriptor computed directly from
@@ -241,6 +250,12 @@ define_uniform_layouts! {
         scale_offsets => 80,
         mip_counts => 144,
     },
+    BandMathReduceUniform (16) {
+        mode => 0,
+        scl_mask_enabled => 4,
+        scl_mask_bits => 8,
+        nan_bits => 12,
+    },
     BandMathCompositeUniform (64) {
         opacity => 0,
         mode => 4,
@@ -251,12 +266,13 @@ define_uniform_layouts! {
         invert_colormap => 48,
         scl_mask_enabled => 52,
         scl_mask_bits => 56,
+        diff_slot => 60,
     },
 }
 
 /// Number of typed dynamic-uniform bind-group slots backed by
 /// [`DynamicUniformArena`].
-pub(super) const UNIFORM_SLOT_COUNT: usize = 8;
+pub(super) const UNIFORM_SLOT_COUNT: usize = 9;
 
 /// Typed index into the frame-wide [`DynamicUniformArena`] bind-group slots and
 /// [`super::pipelines::SharedLayouts`] dynamic-uniform layouts.
@@ -271,6 +287,7 @@ pub(super) enum UniformSlot {
     ScratchSingle = 5,
     ScratchMrt = 6,
     BandMathComposite = 7,
+    BandMathReduce = 8,
 }
 
 impl UniformSlot {
@@ -283,6 +300,7 @@ impl UniformSlot {
         Self::ScratchSingle,
         Self::ScratchMrt,
         Self::BandMathComposite,
+        Self::BandMathReduce,
     ];
 
     pub(super) const fn index(self) -> usize {
@@ -299,6 +317,7 @@ impl UniformSlot {
             Self::ScratchSingle => "scratch single-band patch dynamic uniform layout",
             Self::ScratchMrt => "scratch MRT patch dynamic uniform layout",
             Self::BandMathComposite => "band-math composite dynamic uniform layout",
+            Self::BandMathReduce => "band-math reduce dynamic uniform layout",
         }
     }
 
@@ -312,6 +331,7 @@ impl UniformSlot {
             Self::ScratchSingle => "arena scratch single-band dynamic uniform bind group",
             Self::ScratchMrt => "arena scratch MRT dynamic uniform bind group",
             Self::BandMathComposite => "arena band-math composite dynamic uniform bind group",
+            Self::BandMathReduce => "arena band-math reduce dynamic uniform bind group",
         }
     }
 
@@ -325,6 +345,7 @@ impl UniformSlot {
             Self::ScratchSingle => std::mem::size_of::<ScratchSinglePatchUniform>(),
             Self::ScratchMrt => std::mem::size_of::<ScratchMrtPatchUniform>(),
             Self::BandMathComposite => std::mem::size_of::<BandMathCompositeUniform>(),
+            Self::BandMathReduce => std::mem::size_of::<BandMathReduceUniform>(),
         }
     }
 }

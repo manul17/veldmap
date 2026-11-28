@@ -151,6 +151,45 @@ fn format_cursor_readout(readout: &CursorReadout) -> (String, String) {
             hover_extra = Some(extra);
             text
         }
+        CursorReadoutValue::TemporalDiff(td) => {
+            let fmt_opt = |v: Option<f64>, masked: bool| {
+                if masked {
+                    "masked".to_owned()
+                } else {
+                    match v {
+                        Some(x) => format::format_scalar(x),
+                        None => "nodata".to_owned(),
+                    }
+                }
+            };
+            hover_extra = Some(format!(
+                "A ({}): {}\nB ({}): {} @ ({},{})",
+                td.label_a,
+                fmt_opt(td.value_a, td.masked_a),
+                td.label_b,
+                fmt_opt(td.value_b, td.masked_b),
+                readout.pixel.0,
+                readout.pixel.1
+            ));
+            match td.delta {
+                Some(d) => {
+                    let sign = if d > 0.0 { "+" } else { "" };
+                    let unit = readout
+                        .units
+                        .as_deref()
+                        .map(|u| format!(" {u}"))
+                        .unwrap_or_default();
+                    format!(
+                        "{}: {sign}{}{unit}",
+                        td.formula_label,
+                        format::format_scalar(d)
+                    )
+                }
+                None if td.masked_a || td.masked_b => format!("{}: [masked]", td.formula_label),
+                None if td.has_unavailable => format!("{}: n/a", td.formula_label),
+                None => format!("{}: nodata", td.formula_label),
+            }
+        }
         CursorReadoutValue::Pending => format!("… @ ({},{})", readout.pixel.0, readout.pixel.1),
         CursorReadoutValue::Nodata => format!("nodata @ ({},{})", readout.pixel.0, readout.pixel.1),
         CursorReadoutValue::Unavailable => {
@@ -161,6 +200,7 @@ fn format_cursor_readout(readout: &CursorReadout) -> (String, String) {
         && match &readout.value {
             CursorReadoutValue::Unavailable => true,
             CursorReadoutValue::BandMath(bm) => bm.has_unavailable,
+            CursorReadoutValue::TemporalDiff(td) => td.has_unavailable,
             _ => false,
         };
     let mut tip = match hover_extra {

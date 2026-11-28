@@ -4,7 +4,7 @@
 use eframe::egui;
 
 use crate::colormap::sample_colormap_srgb;
-use crate::layers::{LayerId, OverlayEdit, ScientificSummary};
+use crate::layers::{LayerId, OverlayEdit, ScientificSummary, SingleRasterEdit};
 use crate::ui::widgets::paint_colormap_ramp;
 
 use super::LayerUiAction;
@@ -154,10 +154,10 @@ fn handle_histogram_interaction(
         }
         actions.push(LayerUiAction::edit_raster_drag(
             layer_id,
-            OverlayEdit::SetStretchRange {
+            OverlayEdit::SingleRaster(SingleRasterEdit::StretchRange {
                 min: next_lo,
                 max: next_hi,
-            },
+            }),
             commit,
         ));
     } else if response.drag_stopped() {
@@ -168,10 +168,10 @@ fn handle_histogram_interaction(
         if was_changed {
             actions.push(LayerUiAction::edit_raster_drag(
                 layer_id,
-                OverlayEdit::SetStretchRange {
+                OverlayEdit::SingleRaster(SingleRasterEdit::StretchRange {
                     min: sci.min,
                     max: sci.max,
-                },
+                }),
                 true,
             ));
         }

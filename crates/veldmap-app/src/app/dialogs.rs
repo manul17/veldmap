@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use veldmap_core::sync::Wakeup;
+use veldmap_core::sync::{CancelToken, Wakeup};
 
+use crate::layers::{ScannedTimelineFile, scan_dated_raster_folder};
 use crate::storage::project::ProjectFile;
 
 /// Completed result from a background native file dialog or background project
@@ -25,6 +26,10 @@ use crate::storage::project::ProjectFile;
 #[derive(Clone, Debug)]
 pub(super) enum FileDialogEvent {
     OpenFiles(Vec<PathBuf>),
+    TimelineFolderScanned {
+        dir: PathBuf,
+        result: Result<Vec<ScannedTimelineFile>, String>,
+    },
     GeoJsonSaved {
         path: PathBuf,
         result: Result<(), String>,
@@ -223,6 +228,29 @@ impl DialogHost {
             let handles = fut.await?;
             let paths: Vec<PathBuf> = handles.into_iter().map(PathBuf::from).collect();
             (!paths.is_empty()).then_some(FileDialogEvent::OpenFiles(paths))
+        })
+    }
+
+    /// Spawn a non-blocking native folder picker for building a local dated
+    /// multi-temporal `Timeline` layer, running the directory + TIFF DateTime
+    /// scan off the UI thread.
+    pub(super) fn spawn_open_folder_timeline(
+        &self,
+        frame: &eframe::Frame,
+    ) -> Result<(), DialogSpawnError> {
+        if !self.try_acquire_busy() {
+            return Err(DialogSpawnError::Busy);
+        }
+        let fut = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Open Dated Raster Folder as Timeline")
+            .pick_folder();
+        self.spawn_dialog_future("veldmap-folder-timeline", async move {
+            let handle = fut.await?;
+            let dir = PathBuf::from(handle);
+            let cancel = CancelToken::new();
+            let result = scan_dated_raster_folder(&dir, &cancel);
+            Some(FileDialogEvent::TimelineFolderScanned { dir, result })
         })
     }
 

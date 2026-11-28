@@ -42,9 +42,10 @@ pub(crate) use scratch::{ScratchDemand, estimate_viewport_target_vram_bytes};
 #[cfg(any(test, feature = "test-support"))]
 pub use snapshot::DrawTile;
 pub use snapshot::{
-    DrawBandMathLayer, DrawOverlayContent, DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack,
-    DrawScratchBand, DrawScratchMask, DrawSnapshot, DrawVectorId, DrawVectorLayer, OverlayMeshKey,
-    SnapshotBuildParams, TileCarrierPolicy,
+    DrawBandEpoch, DrawBandMathLayer, DrawDisplayEpoch, DrawOverlayContent, DrawOverlayLayer,
+    DrawOverlayPatch, DrawOverlayTrack, DrawScratchBand, DrawScratchMask, DrawSnapshot,
+    DrawTemporalCrossFadeLayer, DrawTemporalCrossFadeSource, DrawTemporalDiffLayer, DrawVectorId,
+    DrawVectorLayer, OverlayMeshKey, SnapshotBuildParams, TileCarrierPolicy,
 };
 pub use swipe::{SwipeRenderState, snap_split_x};
 #[cfg(any(test, feature = "test-support"))]
@@ -106,6 +107,8 @@ pub const BAND_MATH_SCRATCH_MRT_WGSL: &str = concat!(
 );
 /// Embedded WGSL source for nearest-neighbor `R8Uint` `SCL` mask scratch rasterization.
 pub const BAND_MATH_MASK_WGSL: &str = include_str!("../shaders/band_math_mask.wgsl");
+/// Embedded WGSL source for Epoch A scalar reduction in dual-epoch temporal diffing.
+pub const BAND_MATH_REDUCE_WGSL: &str = include_str!("../shaders/band_math_reduce.wgsl");
 /// Embedded WGSL source for fullscreen screen-space Band Math + `SCL` mask + colormap compositing.
 pub const BAND_MATH_COMPOSITE_WGSL: &str = include_str!("../shaders/band_math_composite.wgsl");
 /// Embedded WGSL source for depth-less post-body draped vector geometry.

@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use veldmap_app::gpu_tiles::{GpuTile, GpuTileCache};
 use veldmap_app::render::{
-    BandMathFormula, CategoricalPaletteId, ColormapId, DrawBandMathLayer, DrawOverlayContent,
-    DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack, DrawScratchBand, DrawScratchMask,
-    OverlayMeshKey, RenderParams, compute_band_math_scissor_rect,
+    BandMathFormula, CategoricalPaletteId, ColormapId, DrawBandEpoch, DrawBandMathLayer,
+    DrawDisplayEpoch, DrawOverlayContent, DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack,
+    DrawScratchBand, DrawScratchMask, DrawTemporalCrossFadeLayer, DrawTemporalCrossFadeSource,
+    DrawTemporalDiffLayer, OverlayMeshKey, RenderParams, compute_band_math_scissor_rect,
 };
 use veldmap_core::geo::{Camera, Frame, Projection};
 use veldmap_core::tile::{
@@ -1586,5 +1587,598 @@ fn split_screen_swipe_clips_direct_and_band_math_without_rebuilding_snapshot_or_
     assert!(
         left_at_0[0] > 230 && left_at_0[1] > 110 && left_at_0[1] < 145 && left_at_0[2] < 20,
         "at split_t=0.0 left side must show orange BandMath layer (Direct skipped), got {left_at_0:?}"
+    );
+}
+
+#[test]
+fn temporal_scalar_diff_n1_and_n2_preserve_zero_diff_and_independent_scl_masks() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let (width, height) = (128u32, 128u32);
+    let mut globe = TestGlobe::new_srgb(device);
+    let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
+
+    let frame_a = utm37_test_frame();
+    // Non-co-registered Epoch B on a 256x256 (half-res) grid covering the same
+    // geographic footprint to prove screen-space diff works across mismatched
+    // carrier grids without CPU reprojection.
+    let utm37 = Projection::from_epsg(32637).expect("UTM 37N");
+    let frame_b = Arc::new(
+        Frame::from_pixel_affine(
+            utm37,
+            [200.0, 0.0, 500_000.0, 0.0, -200.0, 5_250_000.0],
+            256,
+            256,
+        )
+        .expect("utm37 20m"),
+    );
+
+    let (clat, clon) = frame_a.geodetic(0.5, 0.5);
+    let cam = Camera::at(clat, clon, 25_000.0);
+    let config = QuadtreeConfig::default();
+
+    // Solid green base layer beneath TemporalDiff so discarded/masked pixels
+    // are unmistakably pure green (0, 255, 0), whereas valid 0.0 diff on RdBu
+    // over [-1, 1] is near-white (~247, ~247, ~247).
+    let src_base = SourceId::new(1100);
+    let (_, tex_base) =
+        upload_overlay_tile(device, queue, &mut gpu_cache, src_base, 16, 16, |_, _| {
+            [0, 255, 0, 255]
+        });
+    let is_green_base = |px: [u8; 4]| px[0] < 25 && px[1] > 230 && px[2] < 25;
+
+    // 1. N = 2 scalar diff (dNDVI = NDVI(B) - NDVI(A)) across 4 quadrants:
+    //   TL (x<16, y<16): Epoch A NDVI = +0.5, Epoch B NDVI = +0.5 -> dNDVI = 0.0 (valid zero -> RdBu white!)
+    //   TR (x>=16, y<16): Epoch A NDVI = -0.5, Epoch B NDVI = +0.5 -> dNDVI = +1.0 (RdBu high = blue)
+    //   BL (x<16, y>=16): Epoch A has SCL = 9 (Cloud High), Epoch B has NO SCL mask -> A is masked -> discard to green base!
+    //   BR (x>=16, y>=16): Epoch A has valid SCL = 4 (Vegetation), Epoch B has NO SCL mask, NDVI(A)=+0.5, NDVI(B)=-0.5 -> dNDVI = -1.0 (RdBu low = red), proving Epoch A's mask does NOT bleed into Epoch B!
+    let (src_a_nir, src_a_red, src_a_scl) = (
+        SourceId::new(1101),
+        SourceId::new(1102),
+        SourceId::new(1103),
+    );
+    let (src_b_nir, src_b_red) = (SourceId::new(1104), SourceId::new(1105));
+
+    let (_, tex_a_nir) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_a_nir,
+        BandKey::Index(0),
+        32,
+        32,
+        |x, y| if x >= 16 && y < 16 { 0.25 } else { 0.75 },
+    );
+    let (_, tex_a_red) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_a_red,
+        BandKey::Index(0),
+        32,
+        32,
+        |x, y| if x >= 16 && y < 16 { 0.75 } else { 0.25 },
+    );
+    let (_, tex_a_scl) =
+        upload_r8u_tile(device, queue, &mut gpu_cache, src_a_scl, 32, 32, |x, y| {
+            if x < 16 && y >= 16 { 9 } else { 4 }
+        });
+    let (_, tex_b_nir) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_b_nir,
+        BandKey::Index(0),
+        32,
+        32,
+        |x, y| if x >= 16 && y >= 16 { 0.25 } else { 0.75 },
+    );
+    let (_, tex_b_red) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_b_red,
+        BandKey::Index(0),
+        32,
+        32,
+        |x, y| if x >= 16 && y >= 16 { 0.75 } else { 0.25 },
+    );
+
+    let diff_n2 = DrawTemporalDiffLayer {
+        formula: Some(BandMathFormula::NormalizedDiff),
+        colormap: ColormapId::RdBu,
+        invert_colormap: false,
+        stretch_min: -1.0,
+        stretch_max: 1.0,
+        scl_mask_enabled: true,
+        scl_mask_bits: 1u32 << 9,
+        epoch_a: DrawBandEpoch {
+            bands: vec![
+                scratch_band(
+                    &frame_a,
+                    src_a_nir,
+                    1,
+                    512,
+                    512,
+                    1.0,
+                    0.0,
+                    Arc::clone(&tex_a_nir),
+                ),
+                scratch_band(
+                    &frame_a,
+                    src_a_red,
+                    2,
+                    512,
+                    512,
+                    1.0,
+                    0.0,
+                    Arc::clone(&tex_a_red),
+                ),
+            ],
+            scl: Some(DrawScratchMask {
+                frame: Arc::clone(&frame_a),
+                image_width: 512,
+                image_height: 512,
+                segments: MIN_WARP_SEGMENTS,
+                nodata_value: None,
+                patches: vec![DrawOverlayPatch {
+                    mesh_key: OverlayMeshKey {
+                        source: src_a_scl,
+                        relaid: 3,
+                        level: 0,
+                        x: 0,
+                        y: 0,
+                    },
+                    cell_rect: [0.0, 0.0, 512.0, 512.0],
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    texture: Arc::clone(&tex_a_scl),
+                }],
+            }),
+        },
+        epoch_b: DrawBandEpoch {
+            bands: vec![
+                scratch_band(
+                    &frame_b,
+                    src_b_nir,
+                    4,
+                    256,
+                    256,
+                    1.0,
+                    0.0,
+                    Arc::clone(&tex_b_nir),
+                ),
+                scratch_band(
+                    &frame_b,
+                    src_b_red,
+                    5,
+                    256,
+                    256,
+                    1.0,
+                    0.0,
+                    Arc::clone(&tex_b_red),
+                ),
+            ],
+            scl: None,
+        },
+    };
+
+    let mut snap_n2 = build_empty_snapshot(cam, width, height, &config);
+    snap_n2.overlays.push(single_patch_layer(
+        &frame_a,
+        src_base,
+        1,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Display,
+        Arc::clone(&tex_base),
+    ));
+    snap_n2.overlays.push(DrawOverlayLayer {
+        layer_id: 9101,
+        opacity: 1.0,
+        content: DrawOverlayContent::TemporalDiff(Box::new(diff_n2)),
+    });
+    let pixels_n2 = render_srgb(&mut globe, device, queue, width, height, &Arc::new(snap_n2));
+
+    // Scratch demand for N=2 + SCL: 3x R32Float (12 B/px) + 1x R8Uint (1 B/px) = 13 B/px.
+    assert_eq!(
+        globe.renderer.scratch_vram_bytes(),
+        (width * height * 13) as usize,
+        "N=2 scalar diff with SCL must allocate exact 3x R32Float + 1x R8Uint (13 B/px)"
+    );
+
+    let tl = pixel_at(&pixels_n2, width, width / 2 - 20, height / 2 - 20);
+    let tr = pixel_at(&pixels_n2, width, width / 2 + 20, height / 2 - 20);
+    let bl = pixel_at(&pixels_n2, width, width / 2 - 20, height / 2 + 20);
+    let br = pixel_at(&pixels_n2, width, width / 2 + 20, height / 2 + 20);
+    assert!(
+        !is_green_base(tl) && tl[0] > 210 && tl[1] > 210 && tl[2] > 210,
+        "TL valid 0.0 dNDVI must render RdBu neutral white (not discarded to green base), got {tl:?}"
+    );
+    // ColorBrewer RdBu endpoints: +1.0 = deep blue #053061 (5, 48, 97),
+    // -1.0 = deep crimson #67001f (103, 0, 31), 0.0 = neutral white ~#f7f7f7.
+    assert!(
+        !is_green_base(tr) && tr[2] > 80 && tr[2] > tr[0] + 50,
+        "TR +1.0 dNDVI must render RdBu blue (#053061), got {tr:?}"
+    );
+    assert!(
+        is_green_base(bl),
+        "BL Epoch A SCL=9 cloud mask must reduce to quiet-NaN and reveal green base, got {bl:?}"
+    );
+    assert!(
+        !is_green_base(br) && br[0] > 80 && br[0] > br[2] + 50,
+        "BR -1.0 dNDVI (unmasked Epoch A & no-SCL Epoch B) must render RdBu red (#67001f), got {br:?}"
+    );
+
+    // 2. N = 1 single-band passthrough diff (`formula: None`, e.g. SAR / DEM delta):
+    //   Left half: A = 10.0, B = 10.0 -> diff = 0.0 (valid zero -> Grayscale mid-gray ~128 over [-10, 10])
+    //   Right half: A = 2.0, B = 12.0 -> diff = +10.0 (Grayscale white ~255)
+    let (src_s_a, src_s_b) = (SourceId::new(1106), SourceId::new(1107));
+    let (_, tex_s_a) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_s_a,
+        BandKey::Index(0),
+        32,
+        32,
+        |x, _| if x < 16 { 10.0 } else { 2.0 },
+    );
+    let (_, tex_s_b) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_s_b,
+        BandKey::Index(0),
+        32,
+        32,
+        |x, _| if x < 16 { 10.0 } else { 12.0 },
+    );
+    let diff_n1 = DrawTemporalDiffLayer {
+        formula: None,
+        colormap: ColormapId::Grayscale,
+        invert_colormap: false,
+        stretch_min: -10.0,
+        stretch_max: 10.0,
+        scl_mask_enabled: false,
+        scl_mask_bits: 0,
+        epoch_a: DrawBandEpoch {
+            bands: vec![scratch_band(
+                &frame_a, src_s_a, 6, 512, 512, 1.0, 0.0, tex_s_a,
+            )],
+            scl: None,
+        },
+        epoch_b: DrawBandEpoch {
+            bands: vec![scratch_band(
+                &frame_b, src_s_b, 7, 256, 256, 1.0, 0.0, tex_s_b,
+            )],
+            scl: None,
+        },
+    };
+    let mut snap_n1 = build_empty_snapshot(cam, width, height, &config);
+    snap_n1.overlays.push(single_patch_layer(
+        &frame_a,
+        src_base,
+        1,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Display,
+        tex_base,
+    ));
+    snap_n1.overlays.push(DrawOverlayLayer {
+        layer_id: 9102,
+        opacity: 1.0,
+        content: DrawOverlayContent::TemporalDiff(Box::new(diff_n1)),
+    });
+    let pixels_n1 = render_srgb(&mut globe, device, queue, width, height, &Arc::new(snap_n1));
+    assert_eq!(
+        globe.renderer.scratch_vram_bytes(),
+        (width * height * 8) as usize,
+        "N=1 scalar diff without SCL must allocate exact 2x R32Float (8 B/px)"
+    );
+    let left_n1 = pixel_at(&pixels_n1, width, width / 2 - 20, height / 2);
+    let right_n1 = pixel_at(&pixels_n1, width, width / 2 + 20, height / 2);
+    assert!(
+        !is_green_base(left_n1)
+            && left_n1[0].abs_diff(left_n1[1]) <= 2
+            && left_n1[0] > 100
+            && left_n1[0] < 160,
+        "N=1 valid 0.0 diff must render mid-gray (~128), got {left_n1:?}"
+    );
+    assert!(
+        right_n1[0] > 240 && right_n1[1] > 240 && right_n1[2] > 240,
+        "N=1 +10.0 diff must render white, got {right_n1:?}"
+    );
+}
+
+#[test]
+fn temporal_rgb_cross_fade_band_math_and_direct_display_have_zero_basemap_bleed_through() {
+    use veldmap_app::render::SwipeRenderState;
+
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let (width, height) = (128u32, 128u32);
+    let mut globe = TestGlobe::new_srgb(device);
+    let mut gpu_cache = GpuTileCache::new(16 * 1024 * 1024);
+
+    let frame = utm37_test_frame();
+    let (clat, clon) = frame.geodetic(0.5, 0.5);
+    let cam = Camera::at(clat, clon, 25_000.0);
+    let config = QuadtreeConfig::default();
+
+    // Bright green base layer beneath the cross-fade layer to catch ANY
+    // basemap bleed-through at t = 0.5 (if two separate 50% alpha passes were
+    // drawn over green, the green channel would be >= 64!).
+    let src_base = SourceId::new(1120);
+    let (_, tex_base) =
+        upload_overlay_tile(device, queue, &mut gpu_cache, src_base, 16, 16, |_, _| {
+            [0, 255, 0, 255]
+        });
+
+    // 1. DirectDisplay cross-fade (`float_bands = 0`, `rgba_targets = 2`, 8 B/px):
+    //   Epoch A: left+right opaque pure red (255, 0, 0, 255)
+    //   Epoch B: left half transparent nodata (0, 0, 0, 0), right half opaque pure blue (0, 0, 255, 255)
+    //   At blend_t = 0.5:
+    //     - Right half (both valid): pure red<->blue blend with ZERO green bleed-through (`g < 5`)!
+    //     - Left half (only A valid): graceful single-valid fade of A at 50% opacity over green base (`r > 120 && g > 120 && b < 15`)!
+    let (src_da, src_db) = (SourceId::new(1121), SourceId::new(1122));
+    let (_, tex_da) = upload_overlay_tile(device, queue, &mut gpu_cache, src_da, 32, 32, |_, _| {
+        [255, 0, 0, 255]
+    });
+    let (_, tex_db) = upload_overlay_tile(device, queue, &mut gpu_cache, src_db, 32, 32, |x, _| {
+        if x < 16 {
+            [0, 0, 0, 0]
+        } else {
+            [0, 0, 255, 255]
+        }
+    });
+
+    let cf_direct = DrawTemporalCrossFadeLayer {
+        blend_t: 0.5,
+        source: DrawTemporalCrossFadeSource::DirectDisplay {
+            epoch_a: DrawDisplayEpoch {
+                frame: Arc::clone(&frame),
+                image_width: 512,
+                image_height: 512,
+                segments: MIN_WARP_SEGMENTS,
+                patches: vec![DrawOverlayPatch {
+                    mesh_key: OverlayMeshKey {
+                        source: src_da,
+                        relaid: 1,
+                        level: 0,
+                        x: 0,
+                        y: 0,
+                    },
+                    cell_rect: [0.0, 0.0, 512.0, 512.0],
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    texture: tex_da,
+                }],
+            },
+            epoch_b: DrawDisplayEpoch {
+                frame: Arc::clone(&frame),
+                image_width: 512,
+                image_height: 512,
+                segments: MIN_WARP_SEGMENTS,
+                patches: vec![DrawOverlayPatch {
+                    mesh_key: OverlayMeshKey {
+                        source: src_db,
+                        relaid: 2,
+                        level: 0,
+                        x: 0,
+                        y: 0,
+                    },
+                    cell_rect: [0.0, 0.0, 512.0, 512.0],
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    texture: tex_db,
+                }],
+            },
+        },
+    };
+
+    let mut snap_disp = build_empty_snapshot(cam, width, height, &config);
+    snap_disp.overlays.push(single_patch_layer(
+        &frame,
+        src_base,
+        1,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Display,
+        Arc::clone(&tex_base),
+    ));
+    snap_disp.overlays.push(DrawOverlayLayer {
+        layer_id: 9201,
+        opacity: 1.0,
+        content: DrawOverlayContent::TemporalCrossFade(Box::new(cf_direct)),
+    });
+    let pixels_disp = render_srgb(
+        &mut globe,
+        device,
+        queue,
+        width,
+        height,
+        &Arc::new(snap_disp),
+    );
+    assert_eq!(
+        globe.renderer.scratch_vram_bytes(),
+        (width * height * 8) as usize,
+        "DirectDisplay cross-fade must allocate exact 2x Rgba8UnormSrgb (8 B/px) and 0 R32Float"
+    );
+    let disp_right = pixel_at(&pixels_disp, width, width / 2 + 20, height / 2);
+    assert!(
+        disp_right[0] > 160 && disp_right[1] < 5 && disp_right[2] > 160,
+        "DirectDisplay cross-fade at t=0.5 must blend red+blue with ZERO green bleed-through, got {disp_right:?}"
+    );
+    let disp_left = pixel_at(&pixels_disp, width, width / 2 - 20, height / 2);
+    assert!(
+        disp_left[0] > 140 && disp_left[1] > 140 && disp_left[2] < 15,
+        "DirectDisplay single-valid left half must fade Epoch A smoothly over green base, got {disp_left:?}"
+    );
+
+    // 2. BandMathRgb cross-fade (`float_bands = 3`, `needs_u8_mask = true`, `rgba_targets = 1`, 17 B/px):
+    //   Epoch A: pure red (1.0, 0.0, 0.0), SCL = 4 everywhere
+    //   Epoch B: pure blue (0.0, 0.0, 1.0), SCL = 9 (Cloud) on left half, 4 on right half
+    //   At blend_t = 0.5:
+    //     - Right half (both unmasked): red<->blue with ZERO green bleed-through (`g < 5`)!
+    //     - Left half (Epoch B cloud-masked): fades Epoch A red over green base!
+    let (sa_r, sa_g, sa_b, sa_scl) = (
+        SourceId::new(1130),
+        SourceId::new(1131),
+        SourceId::new(1132),
+        SourceId::new(1133),
+    );
+    let (sb_r, sb_g, sb_b, sb_scl) = (
+        SourceId::new(1134),
+        SourceId::new(1135),
+        SourceId::new(1136),
+        SourceId::new(1137),
+    );
+    let (_, tex_one) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        sa_r,
+        BandKey::Index(0),
+        16,
+        16,
+        |_, _| 1.0,
+    );
+    let (_, tex_zero) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        sa_g,
+        BandKey::Index(0),
+        16,
+        16,
+        |_, _| 0.0,
+    );
+    let (_, tex_scl_clear) =
+        upload_r8u_tile(device, queue, &mut gpu_cache, sa_scl, 16, 16, |_, _| 4);
+    let (_, tex_scl_half) =
+        upload_r8u_tile(device, queue, &mut gpu_cache, sb_scl, 32, 32, |x, _| {
+            if x < 16 { 9 } else { 4 }
+        });
+
+    let cf_bm = DrawTemporalCrossFadeLayer {
+        blend_t: 0.5,
+        source: DrawTemporalCrossFadeSource::BandMathRgb {
+            rgb_min: [0.0; 3],
+            rgb_max: [1.0; 3],
+            rgb_gamma: 1.0,
+            scl_mask_enabled: true,
+            scl_mask_bits: 1u32 << 9,
+            epoch_a: DrawBandEpoch {
+                bands: vec![
+                    scratch_band(&frame, sa_r, 10, 512, 512, 1.0, 0.0, Arc::clone(&tex_one)),
+                    scratch_band(&frame, sa_g, 11, 512, 512, 1.0, 0.0, Arc::clone(&tex_zero)),
+                    scratch_band(&frame, sa_b, 12, 512, 512, 1.0, 0.0, Arc::clone(&tex_zero)),
+                ],
+                scl: Some(DrawScratchMask {
+                    frame: Arc::clone(&frame),
+                    image_width: 512,
+                    image_height: 512,
+                    segments: MIN_WARP_SEGMENTS,
+                    nodata_value: None,
+                    patches: vec![DrawOverlayPatch {
+                        mesh_key: OverlayMeshKey {
+                            source: sa_scl,
+                            relaid: 13,
+                            level: 0,
+                            x: 0,
+                            y: 0,
+                        },
+                        cell_rect: [0.0, 0.0, 512.0, 512.0],
+                        uv_rect: [0.0, 0.0, 1.0, 1.0],
+                        texture: tex_scl_clear,
+                    }],
+                }),
+            },
+            epoch_b: DrawBandEpoch {
+                bands: vec![
+                    scratch_band(&frame, sb_r, 14, 512, 512, 1.0, 0.0, Arc::clone(&tex_zero)),
+                    scratch_band(&frame, sb_g, 15, 512, 512, 1.0, 0.0, Arc::clone(&tex_zero)),
+                    scratch_band(&frame, sb_b, 16, 512, 512, 1.0, 0.0, Arc::clone(&tex_one)),
+                ],
+                scl: Some(DrawScratchMask {
+                    frame: Arc::clone(&frame),
+                    image_width: 512,
+                    image_height: 512,
+                    segments: MIN_WARP_SEGMENTS,
+                    nodata_value: None,
+                    patches: vec![DrawOverlayPatch {
+                        mesh_key: OverlayMeshKey {
+                            source: sb_scl,
+                            relaid: 17,
+                            level: 0,
+                            x: 0,
+                            y: 0,
+                        },
+                        cell_rect: [0.0, 0.0, 512.0, 512.0],
+                        uv_rect: [0.0, 0.0, 1.0, 1.0],
+                        texture: tex_scl_half,
+                    }],
+                }),
+            },
+        },
+    };
+    let mut snap_bm = build_empty_snapshot(cam, width, height, &config);
+    snap_bm.overlays.push(single_patch_layer(
+        &frame,
+        src_base,
+        1,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Display,
+        tex_base,
+    ));
+    snap_bm.overlays.push(DrawOverlayLayer {
+        layer_id: 9202,
+        opacity: 1.0,
+        content: DrawOverlayContent::TemporalCrossFade(Box::new(cf_bm)),
+    });
+    let snap_bm = Arc::new(snap_bm);
+    let pixels_bm = render_srgb(&mut globe, device, queue, width, height, &snap_bm);
+    assert_eq!(
+        globe.renderer.scratch_vram_bytes(),
+        (width * height * 17) as usize,
+        "BandMathRgb cross-fade with SCL must allocate exact 3x R32Float + 1x R8Uint + 1x Rgba8 (17 B/px)"
+    );
+    let bm_right = pixel_at(&pixels_bm, width, width / 2 + 20, height / 2);
+    assert!(
+        bm_right[0] > 160 && bm_right[1] < 5 && bm_right[2] > 160,
+        "BandMathRgb cross-fade at t=0.5 must have ZERO green bleed-through, got {bm_right:?}"
+    );
+    let bm_left = pixel_at(&pixels_bm, width, width / 2 - 20, height / 2);
+    assert!(
+        bm_left[0] > 140 && bm_left[1] > 140 && bm_left[2] < 15,
+        "BandMathRgb cross-fade where Epoch B is SCL-masked must fade Epoch A over green base, got {bm_left:?}"
+    );
+
+    // 3. Swipe scissor clipping on TemporalCrossFade (right half only -> left half reveals pure green base).
+    let pixels_swiped = render_with(
+        &mut globe,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width,
+            height,
+            snapshot: &snap_bm,
+            swipe: Some(SwipeRenderState {
+                split_t: 0.5,
+                left_layer: None,
+                right_layer: Some(9202),
+            }),
+        },
+        true,
+    );
+    let swiped_left = pixel_at(&pixels_swiped, width, width / 4, height / 2);
+    let swiped_right = pixel_at(&pixels_swiped, width, (width * 3) / 4, height / 2);
+    assert!(
+        swiped_left[0] < 20 && swiped_left[1] > 235 && swiped_left[2] < 20,
+        "swipe left side must reveal pure green base, got {swiped_left:?}"
+    );
+    assert!(
+        swiped_right[0] > 160 && swiped_right[1] < 5 && swiped_right[2] > 160,
+        "swipe right side must keep zero-bleed-through BandMathRgb cross-fade, got {swiped_right:?}"
     );
 }

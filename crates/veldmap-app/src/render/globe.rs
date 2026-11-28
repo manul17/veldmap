@@ -518,10 +518,11 @@ impl GlobeRenderer {
         let overlay_len = snapshot.overlays.len();
 
         while layer_cursor < overlay_len {
-            let bm_to_composite = if let DrawOverlayContent::BandMath(bm) =
-                &snapshot.overlays[layer_cursor].content
+            let scratch_to_composite = if snapshot.overlays[layer_cursor]
+                .content
+                .uses_scratch_passes()
             {
-                let bm_idx = layer_cursor;
+                let scratch_idx = layer_cursor;
                 layer_cursor += 1;
                 let Some(scratch) = self.viewport.scratch() else {
                     continue;
@@ -529,29 +530,33 @@ impl GlobeRenderer {
                 let bm_ctx = BandMathPassCtx {
                     camera_bg: self.viewport.camera_bind_group(),
                     pipelines: &self.pipelines.band_math,
+                    display_scratch: &self.pipelines.overlay.display_scratch,
                     scratch,
                     arena: self.viewport.uniform_arena(),
                     bind_groups,
                 };
-                let drawn = self
-                    .overlay
-                    .record_band_math_scratch_passes(encoder, bm_idx, bm, &bm_ctx);
+                let drawn = self.overlay.record_scratch_layer_passes(
+                    encoder,
+                    scratch_idx,
+                    &snapshot.overlays[scratch_idx].content,
+                    &bm_ctx,
+                );
                 if !drawn {
                     continue;
                 }
-                Some((bm_idx, bm_ctx))
+                Some((scratch_idx, bm_ctx))
             } else {
                 None
             };
 
-            // Batch an optional BandMath fullscreen composite plus any
+            // Batch an optional scratch-backed fullscreen composite plus any
             // immediately following direct overlays (and final vectors /
             // graticule if this reaches the tail) into one `LoadOp::Load` pass.
             let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
-            if let Some((bm_idx, bm_ctx)) = bm_to_composite {
-                self.overlay.record_band_math_composite(
+            if let Some((scratch_idx, bm_ctx)) = scratch_to_composite {
+                self.overlay.record_scratch_layer_composite(
                     &mut post_pass,
-                    bm_idx,
+                    scratch_idx,
                     target.width,
                     target.height,
                     &bm_ctx,

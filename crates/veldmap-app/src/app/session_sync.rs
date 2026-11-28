@@ -9,14 +9,19 @@ use veldmap_raster::ExternalBandMeta;
 use crate::display_name_from_path;
 use crate::layers::{
     BandMathAssetOpenSpec, LayerId, OpenOverlayRequest, OverlayIoEvent, RemoteBandMathRequest,
-    RemoteCogRequest,
+    RemoteCogRequest, RemoteLayerKind, TimelineCompareMode, TimelineEpochSourceSpec,
+    TimelineEpochSpec, TimelineOpenRequest,
 };
 use crate::measure::MeasureMode;
 use crate::scene::SceneIoEvent;
-use crate::stac::{AuthTrust, resolve_persisted_cog_auth, sanitize_imported_auth_mode};
+use crate::stac::{
+    AuthTrust, build_stac_item_refresh_policy, resolve_persisted_cog_auth,
+    sanitize_imported_auth_mode,
+};
 use crate::storage::project::ProjectFile;
 use crate::storage::session::{
-    SavedBandAssetSource, SavedCameraPose, SavedLayerEntry, SavedSwipeState, SavedVectorEntry,
+    SavedBandAssetSource, SavedCameraPose, SavedLayerEntry, SavedSwipeState, SavedTimelineEntry,
+    SavedTimelineEpochSource, SavedVectorEntry,
 };
 use crate::storage::settings::StacSettings;
 use crate::ui::workbench::WorkbenchTab;
@@ -54,6 +59,12 @@ fn build_band_math_asset_spec(
             let auth_mode = src.remote_auth_mode();
             let (final_url, extra_headers) =
                 resolve_persisted_cog_auth(url, auth_mode, trust, stac_settings);
+            let refresh_policy = build_stac_item_refresh_policy(
+                stac_item_href.as_deref(),
+                asset_key.as_deref(),
+                trust,
+                stac_settings,
+            );
             BandMathAssetOpenSpec::Remote {
                 label: label.clone(),
                 url: final_url,
@@ -62,9 +73,95 @@ fn build_band_math_asset_spec(
                 external_bands: external_bands.iter().map(ExternalBandMeta::from).collect(),
                 stac_item_href: stac_item_href.clone(),
                 asset_key: asset_key.clone(),
+                refresh_policy,
                 band_index: *band_index,
             }
         }
+    }
+}
+
+fn build_timeline_open_request(
+    entry: &SavedTimelineEntry,
+    trust: AuthTrust,
+    stac_settings: &StacSettings,
+) -> TimelineOpenRequest {
+    let epochs = entry
+        .epochs
+        .iter()
+        .map(|e| {
+            let source = match &e.source {
+                SavedTimelineEpochSource::LocalSingle { path, .. } => {
+                    TimelineEpochSourceSpec::LocalSingle {
+                        path: path.clone(),
+                        crs_override: e.source.local_crs_override(),
+                    }
+                }
+                SavedTimelineEpochSource::RemoteSingle {
+                    url,
+                    external_bands,
+                    is_scl,
+                    stac_item_href,
+                    asset_key,
+                    ..
+                } => {
+                    let auth_mode = e.source.remote_auth_mode();
+                    let (final_url, extra_headers) =
+                        resolve_persisted_cog_auth(url, auth_mode, trust, stac_settings);
+                    let refresh_policy = build_stac_item_refresh_policy(
+                        stac_item_href.as_deref(),
+                        asset_key.as_deref(),
+                        trust,
+                        stac_settings,
+                    );
+                    TimelineEpochSourceSpec::RemoteSingle {
+                        url: final_url,
+                        auth_mode,
+                        extra_headers,
+                        external_bands: external_bands.iter().map(ExternalBandMeta::from).collect(),
+                        is_scl: *is_scl,
+                        stac_item_href: stac_item_href.clone(),
+                        asset_key: asset_key.clone(),
+                        refresh_policy,
+                    }
+                }
+                SavedTimelineEpochSource::BandMath { bands, scl } => {
+                    TimelineEpochSourceSpec::BandMath {
+                        bands: bands
+                            .iter()
+                            .map(|b| build_band_math_asset_spec(b, trust, stac_settings))
+                            .collect(),
+                        scl: scl
+                            .as_ref()
+                            .map(|s| build_band_math_asset_spec(s, trust, stac_settings)),
+                    }
+                }
+            };
+            TimelineEpochSpec {
+                label: e.label.clone(),
+                date_label: e.date_label.clone(),
+                sort_key: e.sort_key.clone(),
+                cloud_cover: e.cloud_cover,
+                source,
+            }
+        })
+        .collect();
+    TimelineOpenRequest {
+        title: entry.title.clone(),
+        epochs,
+        recipe_preset: entry.recipe_preset(),
+        band_math_style: entry.band_math_style.as_ref().map(|s| s.to_spec()),
+        single_style: entry.single_style(),
+        visible: entry.visible,
+        opacity: entry.opacity,
+        active_idx: Some(entry.active_idx),
+        compare: Some(TimelineCompareMode::from(entry.compare)),
+        max_cloud_cover: entry.max_cloud_cover,
+        diff_colormap: Some(entry.diff_colormap()),
+        diff_invert_colormap: entry.diff_invert_colormap,
+        diff_stretch_min: Some(entry.diff_stretch_min),
+        diff_stretch_max: Some(entry.diff_stretch_max),
+        fly_to: false,
+        restore_id: None,
     }
 }
 
@@ -122,6 +219,12 @@ impl VeldmapApp {
                     let auth_mode = entry.auth_mode();
                     let (final_url, extra_headers) =
                         resolve_persisted_cog_auth(&entry.url, auth_mode, trust, &stac_settings);
+                    let refresh_policy = build_stac_item_refresh_policy(
+                        entry.stac_item_href.as_deref(),
+                        entry.asset_key.as_deref(),
+                        trust,
+                        &stac_settings,
+                    );
                     self.scene.begin_open_remote_cog(RemoteCogRequest {
                         url: final_url,
                         title: entry.title.clone(),
@@ -131,6 +234,7 @@ impl VeldmapApp {
                         is_scl: entry.is_scl,
                         stac_item_href: entry.stac_item_href.clone(),
                         asset_key: entry.asset_key.clone(),
+                        refresh_policy,
                         visible: entry.visible,
                         opacity: entry.opacity,
                         style: entry.style(),
@@ -162,6 +266,27 @@ impl VeldmapApp {
                             restore_id: Some(restore_id),
                         })
                 }
+                SavedLayerEntry::Timeline(entry) => {
+                    let req = build_timeline_open_request(entry, trust, &stac_settings);
+                    match self.scene.open_timeline(req) {
+                        Ok(id) => {
+                            self.restore_tracker
+                                .push_layer(restore_id, layer_idx, saved);
+                            let saved_slot = self.restore_tracker.on_opened(
+                                Some(restore_id),
+                                Some(id),
+                                RestoredEntryKind::Timeline,
+                                None,
+                            );
+                            self.place_restored_layer_in_order(id, saved_slot);
+                        }
+                        Err(err) => {
+                            self.restore_tracker
+                                .record_unavailable_layer(layer_idx, saved, err);
+                        }
+                    }
+                    continue;
+                }
             };
             match res {
                 Ok(()) => self
@@ -188,6 +313,21 @@ impl VeldmapApp {
                     .restore_tracker
                     .record_unavailable_vector(saved_vec, err),
             }
+        }
+        // Synchronously restored `Timeline` layers may immediately satisfy a
+        // restored split-screen swipe layout without emitting a deferred event.
+        self.resolve_pending_swipe_if_ready();
+    }
+
+    fn resolve_pending_swipe_if_ready(&mut self) {
+        if let Some((split_t, left, right)) = self.restore_tracker.try_resolve_pending_swipe()
+            && matches!(
+                self.active_viewport_tool(),
+                super::viewport_input::ViewportToolMode::Navigate
+                    | super::viewport_input::ViewportToolMode::Swipe
+            )
+        {
+            self.swipe.restore(split_t, left, right);
         }
     }
 
@@ -496,20 +636,19 @@ impl VeldmapApp {
                     id,
                     title,
                     display_url,
-                    is_band_math,
+                    kind,
                     bounds,
                     fly_to,
                     restore_id,
                 }) => {
-                    tracing::info!(?id, title = %title, url = %display_url, "Opened remote COG / BandMath overlay layer");
-                    let kind = if is_band_math {
-                        RestoredEntryKind::BandMath
-                    } else {
-                        RestoredEntryKind::RemoteCog
+                    tracing::info!(?id, ?kind, title = %title, url = %display_url, "Opened remote overlay layer");
+                    let restored_kind = match kind {
+                        RemoteLayerKind::SingleCog => RestoredEntryKind::RemoteCog,
+                        RemoteLayerKind::BandMath => RestoredEntryKind::BandMath,
                     };
                     self.finish_opened_layer(
                         OpenedLayerParams {
-                            kind,
+                            kind: restored_kind,
                             opened_layer_id: Some(id),
                             local_path: None,
                             bounds,
@@ -523,30 +662,27 @@ impl VeldmapApp {
                 SceneIoEvent::Raster(OverlayIoEvent::RemoteFailed {
                     title,
                     display_url,
-                    is_band_math,
+                    kind,
                     error,
                     restore_id,
                 }) => {
                     if self.restore_tracker.on_failed(restore_id, &error) {
                         tracing::warn!(
+                            ?kind,
                             title = %title,
                             url = %display_url,
                             error = %error,
-                            "Saved remote COG / BandMath layer unavailable; preserving entry in session.json"
+                            "Saved remote overlay layer unavailable; preserving entry in session.json"
                         );
                     } else {
                         tracing::warn!(
+                            ?kind,
                             title = %title,
                             url = %display_url,
                             error = %error,
-                            "Failed to open remote COG / BandMath overlay layer"
+                            "Failed to open remote overlay layer"
                         );
-                        let prefix = if is_band_math {
-                            "Band Math"
-                        } else {
-                            "Remote COG"
-                        };
-                        let msg = format!("{prefix} '{title}': {error}");
+                        let msg = format!("{} '{title}': {error}", kind.label());
                         if self.panels.workbench_open
                             && self.panels.workbench_tab == WorkbenchTab::CloudStac
                         {
@@ -556,6 +692,27 @@ impl VeldmapApp {
                             self.open_workbench_tab(WorkbenchTab::Layers);
                         }
                     }
+                }
+                SceneIoEvent::Raster(OverlayIoEvent::TimelineOpened {
+                    id,
+                    bounds,
+                    fly_to,
+                    restore_id,
+                }) => {
+                    tracing::info!(?id, "Timeline initial epoch ready");
+                    if fly_to && let Some(b) = bounds {
+                        self.focus_footprint(b);
+                    }
+                    if restore_id.is_some() {
+                        let saved_slot = self.restore_tracker.on_opened(
+                            restore_id,
+                            Some(id),
+                            RestoredEntryKind::Timeline,
+                            None,
+                        );
+                        self.place_restored_layer_in_order(id, saved_slot);
+                    }
+                    session_changed = true;
                 }
                 SceneIoEvent::Vector(VectorIoEvent::Opened {
                     id,
@@ -593,15 +750,7 @@ impl VeldmapApp {
                 }
             }
         }
-        if let Some((split_t, left, right)) = self.restore_tracker.try_resolve_pending_swipe()
-            && matches!(
-                self.active_viewport_tool(),
-                super::viewport_input::ViewportToolMode::Navigate
-                    | super::viewport_input::ViewportToolMode::Swipe
-            )
-        {
-            self.swipe.restore(split_t, left, right);
-        }
+        self.resolve_pending_swipe_if_ready();
         if session_changed || !newly_opened_paths.is_empty() {
             self.persist_session_snapshot(false, &newly_opened_paths);
         }

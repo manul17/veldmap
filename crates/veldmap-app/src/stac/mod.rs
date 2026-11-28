@@ -8,6 +8,7 @@
 mod aoi;
 mod auth;
 mod session;
+mod timeline;
 mod views;
 
 use std::fmt;
@@ -19,8 +20,14 @@ use veldmap_raster::ExternalBandMeta;
 use crate::layers::BandMathPreset;
 pub(crate) use crate::layers::StacCogAuthMode;
 
-pub(crate) use auth::{AuthTrust, resolve_persisted_cog_auth, sanitize_imported_auth_mode};
-pub(crate) use session::{StacCatalogPreset, StacSearchRequest, StacSession};
+pub(crate) use auth::{
+    AuthTrust, build_stac_item_refresh_policy, resolve_persisted_cog_auth,
+    sanitize_imported_auth_mode,
+};
+pub(crate) use session::{
+    StacCatalogPreset, StacProfileView, StacSearchRequest, StacSession, StacSortOption,
+};
+pub(crate) use timeline::{StacTimelineGroupView, StacTimelineMode};
 
 /// URL string wrapper whose [`fmt::Debug`] implementation delegates to
 /// [`veldmap_net::sanitize_url_for_display`] so userinfo and query tokens
@@ -184,9 +191,12 @@ pub(crate) struct StacItemView {
 /// Borrowed read-only snapshot of STAC session and catalog configuration state
 /// passed into `ui::stac` so UI panels never depend on [`StacSession`],
 /// `AppSettings`, or `veldmap-net`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StacViewSnapshot<'a> {
     pub(crate) is_searching: bool,
+    pub(crate) is_loading_more: bool,
+    pub(crate) can_load_more: bool,
+    pub(crate) reached_page_cap: bool,
     pub(crate) has_aoi: bool,
     pub(crate) aoi_bbox: Option<[f64; 4]>,
     pub(crate) aoi_label: Option<&'a str>,
@@ -195,9 +205,10 @@ pub(crate) struct StacViewSnapshot<'a> {
     pub(crate) selected_idx: Option<usize>,
     pub(crate) hovered_idx: Option<usize>,
     pub(crate) items: &'a [StacItemView],
+    pub(crate) timeline_groups: &'a [StacTimelineGroupView],
     pub(crate) sample_scenes: &'static [SampleSceneView],
     pub(crate) sample_recipes: &'static [SampleRecipeView],
-    pub(crate) custom_endpoint_configured: bool,
+    pub(crate) custom_profiles: Vec<StacProfileView>,
 }
 
 #[cfg(test)]

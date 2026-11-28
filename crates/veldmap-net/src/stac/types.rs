@@ -21,13 +21,18 @@ const COLLECTION_COP_DEM_GLO30: &str = "cop-dem-glo-30";
 /// Maximum items requested in a single STAC search call.
 pub(super) const MAX_STAC_SEARCH_LIMIT: usize = 100;
 
-/// Errors returned by STAC catalog search requests.
+/// Maximum cumulative items loaded across STAC `links[rel="next"]` pagination.
+pub const MAX_STAC_PAGINATED_ITEMS: usize = 500;
+
+/// Errors returned by STAC catalog search and item-fetch requests.
 #[derive(Debug, Error)]
 pub enum StacError {
     #[error("STAC request cancelled")]
     Cancelled,
     #[error("invalid STAC endpoint URL: {0}")]
     InvalidEndpoint(String),
+    #[error("STAC link/redirect rejected: {0}")]
+    LinkRejected(String),
     #[error("invalid STAC auth header '{name}': {reason}")]
     InvalidAuthHeader { name: String, reason: String },
     #[error("STAC HTTP {code}: {detail}")]
@@ -110,12 +115,16 @@ impl StacAuth {
     }
 
     /// Append a configured SAS query string to `url` when using [`Self::SasQuery`],
-    /// preserving any existing `?query` and `#fragment`.
+    /// preserving any existing `?query` and `#fragment` and skipping if the
+    /// exact token is already present in the query string.
     pub fn apply_to_url(&self, url: &str) -> String {
         let Some(token) = self.trimmed_sas_token() else {
             return url.to_owned();
         };
         let (base, query, frag) = split_url_query_fragment(url);
+        if query.is_some_and(|q| q == token || q.contains(token)) {
+            return url.to_owned();
+        }
         let mut out = match query {
             Some(q) if !q.is_empty() => format!("{base}?{q}&{token}"),
             _ => format!("{base}?{token}"),
@@ -181,6 +190,15 @@ impl StacCatalogConfig {
     }
 }
 
+/// Optional server-side sort order for STAC `/search` `sortby`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StacSortBy {
+    /// Newest acquisitions first (`properties.datetime` descending).
+    Newest,
+    /// Lowest cloud cover first (`properties.eo:cloud_cover` ascending).
+    LeastCloud,
+}
+
 /// Parameters for a STAC `/search` POST query.
 #[derive(Clone, Debug)]
 pub struct StacSearchQuery {
@@ -194,6 +212,9 @@ pub struct StacSearchQuery {
     /// Callers querying optical collections (e.g. Sentinel-2 L2A) should set
     /// this explicitly; `None` omits the `eo:cloud_cover` query filter.
     pub max_cloud_cover: Option<f32>,
+    /// Optional STAC API `sortby` directive (`None` omits `"sortby"` for
+    /// compatibility with minimal catalogs).
+    pub sort_by: Option<StacSortBy>,
     /// Maximum items to return (`1..=100`).
     pub limit: usize,
 }
@@ -205,6 +226,7 @@ impl Default for StacSearchQuery {
             intersects: None,
             datetime: None,
             max_cloud_cover: None,
+            sort_by: None,
             limit: 20,
         }
     }
@@ -379,9 +401,41 @@ impl StacItem {
     }
 }
 
+/// HTTP method specified by a STAC `links[rel="next"]` pagination link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StacNextMethod {
+    Get,
+    Post,
+}
+
+/// Parsed STAC `links[rel="next"]` pagination descriptor supporting both
+/// `GET` cursor URLs and `POST` `body` + `merge` (e.g. AWS Earth Search).
+#[derive(Clone, PartialEq, Eq)]
+pub struct StacNextLink {
+    pub href: String,
+    pub method: StacNextMethod,
+    /// Optional JSON object payload string for `POST` pagination links.
+    pub body: Option<String>,
+    /// When `true` and `method == Post`, shallow-merge `body` into the original
+    /// `/search` POST payload.
+    pub merge: bool,
+}
+
+impl fmt::Debug for StacNextLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StacNextLink")
+            .field("href", &sanitize_url_for_display(&self.href))
+            .field("method", &self.method)
+            .field("has_body", &self.body.is_some())
+            .field("merge", &self.merge)
+            .finish()
+    }
+}
+
 /// Parsed STAC `/search` response.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StacSearchResult {
     pub items: Vec<StacItem>,
     pub matched: Option<u64>,
+    pub next_link: Option<StacNextLink>,
 }

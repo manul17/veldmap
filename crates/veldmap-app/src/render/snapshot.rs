@@ -205,6 +205,32 @@ fn frames_share_exact_grid(a: &Arc<Frame>, b: &Arc<Frame>) -> bool {
     true
 }
 
+pub(super) fn can_bands_use_mrt(bands: &[DrawScratchBand]) -> bool {
+    if bands.len() < 2 || bands.len() > 4 {
+        return false;
+    }
+    let first = &bands[0];
+    if first.patches.is_empty()
+        || !first
+            .patches
+            .iter()
+            .all(|p| p.texture.format == veldmap_core::tile::PixelFormat::R32Float)
+    {
+        return false;
+    }
+    bands[1..].iter().all(|band| {
+        first.image_width == band.image_width
+            && first.image_height == band.image_height
+            && first.segments == band.segments
+            && first.patches.len() == band.patches.len()
+            && frames_share_exact_grid(&first.frame, &band.frame)
+            && first.patches.iter().zip(&band.patches).all(|(p0, p1)| {
+                p0.cell_rect == p1.cell_rect
+                    && p1.texture.format == veldmap_core::tile::PixelFormat::R32Float
+            })
+    })
+}
+
 impl DrawBandMathLayer {
     /// Return whether all active float bands share one geodetic grid, image
     /// dimensions, subdivision density, `R32Float` tile format, and identical
@@ -212,29 +238,7 @@ impl DrawBandMathLayer {
     /// pass (`2..=4` `R32Float` attachments, fitting `downlevel_defaults()`
     /// `max_color_attachments = 4`).
     pub fn can_use_mrt(&self) -> bool {
-        if self.bands.len() < 2 || self.bands.len() > 4 {
-            return false;
-        }
-        let first = &self.bands[0];
-        if first.patches.is_empty()
-            || !first
-                .patches
-                .iter()
-                .all(|p| p.texture.format == veldmap_core::tile::PixelFormat::R32Float)
-        {
-            return false;
-        }
-        self.bands[1..].iter().all(|band| {
-            first.image_width == band.image_width
-                && first.image_height == band.image_height
-                && first.segments == band.segments
-                && first.patches.len() == band.patches.len()
-                && frames_share_exact_grid(&first.frame, &band.frame)
-                && first.patches.iter().zip(&band.patches).all(|(p0, p1)| {
-                    p0.cell_rect == p1.cell_rect
-                        && p1.texture.format == veldmap_core::tile::PixelFormat::R32Float
-                })
-        })
+        can_bands_use_mrt(&self.bands)
     }
 
     /// Iterate over active warp-mesh patch sets needed for this layer (band 0
@@ -259,6 +263,122 @@ impl DrawBandMathLayer {
     }
 }
 
+/// One epoch's float bands (`1..=3` `R32Float`) and optional `R8Uint` `SCL`
+/// mask inside a dual-epoch scalar diff or RGB cross-fade draw payload.
+#[derive(Clone, Debug)]
+pub struct DrawBandEpoch {
+    pub bands: Vec<DrawScratchBand>,
+    pub scl: Option<DrawScratchMask>,
+}
+
+impl DrawBandEpoch {
+    pub fn can_use_mrt(&self) -> bool {
+        can_bands_use_mrt(&self.bands)
+    }
+
+    pub(super) fn active_warp_patch_sets(
+        &self,
+        mrt: bool,
+        scl_mask_enabled: bool,
+    ) -> impl Iterator<Item = WarpPatchSetRef<'_>> {
+        let band_limit = if mrt { 1 } else { self.bands.len() };
+        let bands = self
+            .bands
+            .iter()
+            .take(band_limit)
+            .map(DrawScratchBand::warp_patch_set);
+        let mask = self
+            .scl
+            .as_ref()
+            .filter(|_| scl_mask_enabled)
+            .map(DrawScratchMask::warp_patch_set);
+        bands.chain(mask)
+    }
+}
+
+/// One epoch's direct `Rgba8UnormSrgb` warp patches inside a dual-epoch Display
+/// RGB cross-fade layer.
+#[derive(Clone, Debug)]
+pub struct DrawDisplayEpoch {
+    pub frame: Arc<Frame>,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub segments: u32,
+    pub patches: Vec<DrawOverlayPatch>,
+}
+
+impl DrawDisplayEpoch {
+    pub(super) fn warp_patch_set(&self) -> WarpPatchSetRef<'_> {
+        WarpPatchSetRef {
+            frame: &self.frame,
+            image_width: self.image_width,
+            image_height: self.image_height,
+            segments: self.segments,
+            patches: &self.patches,
+        }
+    }
+}
+
+/// Dual-epoch scalar temporal difference draw payload (`formula(B, mask_B) -
+/// formula(A, mask_A)`), supporting `N = 1` single-band scientific/SAR
+/// passthrough (`formula: None`) and `N = 2` scalar formulas (`dNDVI`, `dNBR`,
+/// `dNDWI`, `dRatio`) within `N + 1 <= 4` `R32Float` targets.
+#[derive(Clone, Debug)]
+pub struct DrawTemporalDiffLayer {
+    /// Scalar formula (`None` = single-band passthrough `B0 - A0`).
+    pub formula: Option<BandMathFormula>,
+    pub colormap: ColormapId,
+    pub invert_colormap: bool,
+    pub stretch_min: f32,
+    pub stretch_max: f32,
+    pub scl_mask_enabled: bool,
+    pub scl_mask_bits: u32,
+    pub epoch_a: DrawBandEpoch,
+    pub epoch_b: DrawBandEpoch,
+}
+
+impl DrawTemporalDiffLayer {
+    pub(super) fn required_input_bands(&self) -> usize {
+        self.formula
+            .map_or(1, BandMathFormula::required_bands)
+            .clamp(1, 3)
+    }
+
+    pub(super) fn shader_mode(&self) -> u32 {
+        self.formula.map_or(4, BandMathFormula::shader_mode)
+    }
+}
+
+/// Source track backing a 0%-bleed-through dual-epoch RGB cross-fade layer.
+#[derive(Clone, Debug)]
+pub enum DrawTemporalCrossFadeSource {
+    /// 3-band physical RGB `BandMath` cross-fade (`float_bands = 3`,
+    /// `rgba_targets = 1`, optional `SCL`).
+    BandMathRgb {
+        rgb_min: [f32; 3],
+        rgb_max: [f32; 3],
+        rgb_gamma: f32,
+        scl_mask_enabled: bool,
+        scl_mask_bits: u32,
+        epoch_a: DrawBandEpoch,
+        epoch_b: DrawBandEpoch,
+    },
+    /// Direct `Display` (`Rgba8UnormSrgb`) cross-fade (`float_bands = 0`,
+    /// `needs_u8_mask = false`, `rgba_targets = 2`).
+    DirectDisplay {
+        epoch_a: DrawDisplayEpoch,
+        epoch_b: DrawDisplayEpoch,
+    },
+}
+
+/// Dual-epoch RGB cross-fade draw payload (`0.0` = Epoch A, `1.0` = Epoch B)
+/// with 0% basemap bleed-through.
+#[derive(Clone, Debug)]
+pub struct DrawTemporalCrossFadeLayer {
+    pub blend_t: f32,
+    pub source: DrawTemporalCrossFadeSource,
+}
+
 /// Direct single-asset or multi-asset scratch-backed overlay draw content.
 #[derive(Clone, Debug)]
 pub enum DrawOverlayContent {
@@ -271,6 +391,8 @@ pub enum DrawOverlayContent {
         patches: Vec<DrawOverlayPatch>,
     },
     BandMath(Box<DrawBandMathLayer>),
+    TemporalDiff(Box<DrawTemporalDiffLayer>),
+    TemporalCrossFade(Box<DrawTemporalCrossFadeLayer>),
 }
 
 impl DrawOverlayContent {
@@ -290,8 +412,12 @@ impl DrawOverlayContent {
                 segments: *segments,
                 patches,
             }),
-            Self::BandMath(_) => None,
+            Self::BandMath(_) | Self::TemporalDiff(_) | Self::TemporalCrossFade(_) => None,
         }
+    }
+
+    pub(super) const fn uses_scratch_passes(&self) -> bool {
+        !matches!(self, Self::Direct { .. })
     }
 }
 
@@ -319,8 +445,50 @@ impl DrawOverlayLayer {
                 ScratchDemand {
                     float_bands,
                     needs_u8_mask,
+                    rgba_targets: 0,
                 }
             }
+            DrawOverlayContent::TemporalDiff(diff) => {
+                let n = diff.required_input_bands();
+                let needs_u8_mask = diff.scl_mask_enabled
+                    && (diff
+                        .epoch_a
+                        .scl
+                        .as_ref()
+                        .is_some_and(|m| !m.patches.is_empty())
+                        || diff
+                            .epoch_b
+                            .scl
+                            .as_ref()
+                            .is_some_and(|m| !m.patches.is_empty()));
+                ScratchDemand {
+                    float_bands: (n + 1).min(4),
+                    needs_u8_mask,
+                    rgba_targets: 0,
+                }
+            }
+            DrawOverlayContent::TemporalCrossFade(cf) => match &cf.source {
+                DrawTemporalCrossFadeSource::BandMathRgb {
+                    scl_mask_enabled,
+                    epoch_a,
+                    epoch_b,
+                    ..
+                } => {
+                    let needs_u8_mask = *scl_mask_enabled
+                        && (epoch_a.scl.as_ref().is_some_and(|m| !m.patches.is_empty())
+                            || epoch_b.scl.as_ref().is_some_and(|m| !m.patches.is_empty()));
+                    ScratchDemand {
+                        float_bands: 3,
+                        needs_u8_mask,
+                        rgba_targets: 1,
+                    }
+                }
+                DrawTemporalCrossFadeSource::DirectDisplay { .. } => ScratchDemand {
+                    float_bands: 0,
+                    needs_u8_mask: false,
+                    rgba_targets: 2,
+                },
+            },
         }
     }
 }

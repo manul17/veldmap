@@ -8,13 +8,13 @@ Build VeldMap as a fast, purely native Rust desktop **Analytical Earth-Observati
 
 A simplified browser/mobile companion is intentionally deferred to a separate project later (enabled by keeping `veldmap-core` permanently UI/GPU/network-free).
 
-> **Document lifecycle:** `plan.md` is the vertical-slice roadmap and exit-criteria tracker (update `Next Step` as each slice closes). Upcoming slices (`5B-2a`–`5B-1b`, `4B-1`–`3B-2`) are **working design hypotheses**—revise them freely as real code and benchmarks prove better designs. Settled "why not X" decisions and hard cross-slice invariants live in [docs/decisions.md](docs/decisions.md) once implemented; module details live in Rust `//!` docstrings (`cargo doc --document-private-items`).
+> **Document lifecycle:** `plan.md` is the vertical-slice roadmap and exit-criteria tracker (update `Next Step` as each slice closes). Upcoming slices (`5B-2b`–`5B-1b`, `4B-1`–`3B-2`) are **working design hypotheses**—revise them freely as real code and benchmarks prove better designs. Settled "why not X" decisions and hard cross-slice invariants live in [docs/decisions.md](docs/decisions.md) once implemented; module details live in Rust `//!` docstrings (`cargo doc --document-private-items`).
 
 ---
 
 ## Working Cross-Slice Principles
 
-Implemented decisions and hard cross-slice invariants are maintained in [docs/decisions.md](docs/decisions.md) (§1–§13). Working principles for upcoming slices:
+Implemented decisions and hard cross-slice invariants are maintained in [docs/decisions.md](docs/decisions.md) (§1–§14). Working principles for upcoming slices:
 
 1. **Natural workspace crate boundaries (CI-enforced):**
    - Keep `veldmap-core` a permanently pure leaf (`geo`, `tile` keys/LRU, std-only `sync`/`io` traits/`MemoryBudget`, `#![forbid(unsafe_code)]`, zero OS probing or `tokio`/`reqwest`/`image`/`tiff`/`rusqlite`/`egui`/`wgpu`/`rfd`/`directories`).
@@ -40,7 +40,7 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 
 ## Completed Foundation `[x]`
 
-*(Settled rationale and cross-slice invariants live in [docs/decisions.md](docs/decisions.md) §1–§13.)*
+*(Settled rationale and cross-slice invariants live in [docs/decisions.md](docs/decisions.md) §1–§14.)*
 
 | Milestone / Slice | Scope Delivered | Decisions |
 |---|---|---|
@@ -54,6 +54,7 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 | **v0.5 — Slice 4A** `[x]` | Shared `NetContext` (split identity/gzip clients, split timeouts, host-scoped cooldowns, 64 KiB `RangeBlockPool` & `PrefetchBudget`), `HttpRangeSource` (1-RTT `0..256 KiB` head probe, strong-ETag `If-Match`, refcounted singleflight, pinned coalesced prefetch), pure-`ByteSource` `SinglePassIfdReader` (`tiff` dev-only), isolated `veldmap-remote-io` + offloaded `veldmap-tile-write`, AWS Earth Search Sentinel-2 L2A & COP-DEM GLO-30 + custom-auth STAC + sample scenes, retained vector AOIs + GeoJSON/WKT export, HiDPI ribbon/hatch globe footprints, 3-tab Settings modal, collapsible `Layers` \| `Cloud / STAC` workbench | §11 |
 | **v0.5 — Slice 5A-1** `[x]` | Tagged `LayerKind::{SingleRaster, BandMath}` + `RasterAsset`, presentation-only `ui/` over STAC view DTOs, lazy shared quiet-`NaN`-filled `R32Float` + `R8Uint` `SCL` scratch pool (`ScratchDemand`) with co-grid MRT & clamped scissor bounds, floored dynamic target VRAM accounting (`64 MiB` floor), per-band GDAL/STAC 1.0 & 1.1 `(scale, offset, nodata, unit)` propagation, 1-click STAC Scene Recipes + local Band Math builder, `RdYlGn`/`BrBG` colormaps, zoom-invariant `BandMath` CPU cursor readouts | §12 |
 | **v0.5 — Slice 5A-2** `[x]` | Split-screen swipe curtain (`SwipeRenderState` outside `DrawSnapshot`, physical `split_x` in `LastRenderKey`, pre-scratch `BandMath` scissor intersection, swipe-aware cursor readout), tagged v2 `session.json` & portable `.veldmap.json` project files (relative paths, sanitized URLs, same-origin imported-project credential boundary, offline-resilient slot-preserving `SessionRestoreTracker`), pure-Rust WGS84 → MGRS formatter & DD/DMS/MGRS copy, single-line fixed-height status bar, vector `"Outline only"`, Measure-to-STAC-AOI, rolling 90d UTC STAC defaults, `NBR`/`NDSI` 1-click STAC recipes, clean-frame `COPY_SRC` non-blocking cartographic PNG export via `veldmap-raster`, workspace bumped to `0.5.0` | §13 |
+| **v1.0 — Pre-5B & Slice 5B-2a** `[x]` | Pre-5B capability refactor (`LayerSummaryKind`, nested `OverlayEdit`, tagged `RemoteLayerKind`, `OverlayLayer::contribute_appetite`, `compute_patch_sets_scissor_rect`, split `storage/layers.rs`), STAC `sortby` & bounded `GET`/`POST`+`merge` `links[rel="next"]` pagination (500 cap), named Custom STAC profiles + `30d`/`90d`/`1y` presets + collection override, origin-fenced singleflight `401`/`403` `stac_item_href` restore refresh, `LayerKind::Timeline` (STAC MGRS-tile L2A grouping, local dated-folder `ISO -> TIFF Tag 306 -> lexicographic` scan, bounded LRU open epochs, cloud filter, adjacent-date prefetch-wanted protection, zero-purge scrub, dual-epoch CPU cursor readout & tagged persistence), and unified offscreen dual-epoch GPU scalar diff (`band_math_reduce.wgsl`, `N = 1..=3`) + 0%-bleed-through RGB cross-fade (`rgba_targets: 0..=2` on `@group(3)`) within `downlevel_defaults()` | §14 |
 
 ---
 
@@ -66,35 +67,6 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 ---
 
 ### Milestone v1.0 — Multi-Temporal EO Analytics, Export & Analytical Terrain Relief
-
-> **Pre-5B architectural prep (do right before starting `5B-2a` / `5B-1a`):**
-> - Remove `OverlayLayer::primary_asset()` (replaced by capability/per-kind accessors such as `footprint()`, `source_pixel_size_m()`, `reload_target()`, per-kind `to_summary()` and cursor hit-testing, plus explicit `is_remote()`/`remote_url()` that stay accurate when `0` dynamic assets are open) so `Timeline` with swappable epochs and `DemMosaic` with `0..N` open geocells fit cleanly without panicking accessors. *(Note: `source()`/`geo()`/`meta()`/`source_id()` are already on `RasterAsset`.)*
-> - Refactor `LayerSummary` to embed a tagged `LayerSummaryKind` enum (removing `.band_math.is_none()` UI discriminators and SingleRaster-only top-level fields), nest kind-specific variants inside `OverlayEdit`, and replace `OverlayIoEvent`'s `is_band_math: bool` with a tagged kind enum.
-> - Move VRAM appetite weighting to `OverlayLayer::appetite_weight_bytes()` (so `DemMosaic` with `N` open geocells counts as `1` logical pyramid), generalize `compute_band_math_scissor_rect` over a `WarpPatchSetRef` iterator (intersecting `ResolvedSwipe::scissor_for_layer` before every new Pass-2 scratch pass), and split `storage/session.rs` (`wire.rs`/`layers.rs`/`mod.rs`) and `SessionRestoreTracker` out of `app/session_sync.rs` before adding `Timeline`/`DemMosaic` persistence schemas.
-
-#### Slice 5B-2a — STAC Pagination/Profiles, Multi-Temporal Timeline & Dual-Epoch Diffing `[ ]`
-- [ ] **STAC `links[rel="next"]` pagination, `sortby`, multi-profile UX & `stac_item_href` refresh (`veldmap-net` / `veldmap-app`):**
-  - Extend `StacClient` / `StacSearchQuery` with `sortby` (newest / lowest cloud) and bounded `links[rel="next"]` pagination (handling both `GET` `href` and `POST` `href` + `body` + `merge: true` used by AWS Earth Search, enforcing HTTPS no-downgrade and same-origin auth guards, capped at e.g. `500` items).
-  - Add quick relative date presets (`30d` / `90d` / `1y`), inline Collection ID override in the Search form, and named Custom STAC profiles in `settings.json`.
-  - On `401`/`403` during session/project restore (surfaced via a structured HTTP status from `HttpRangeSource::open_async` rather than string matching), refresh expired presigned asset URLs using the already-persisted `stac_item_href` + `asset_key`:
-    - Origin-fence `stac_item_href` against configured Custom STAC profile endpoints (`same_http_origin` + `NetContext::api_auth_client()` blocking cross-origin redirects; never send credentials for untrusted imported `.veldmap.json` items).
-    - Validate refreshed `assets[asset_key].href` (`http(s)://`, HTTPS no-downgrade, sanitized canonical URL match against persisted URL, never attach `Bearer`/`ApiKey` to presigned-query or off-origin storage URLs).
-    - Singleflight concurrent band refreshes for the same `stac_item_href` and cap at `1` refresh attempt per restore.
-- [ ] **Multi-temporal timeline scrubber:**
-  - Reuse unified `TileKey` for epoch ingestion from STAC AOI search (grouped by MGRS tile + AOI coverage, defaulting to L2A) and local dated folders (deterministic date parsing: ISO `YYYY-MM-DD`/`YYYYMMDD` filename → TIFF `DateTime` tag `306` → lexicographic fallback), with cloud-cover filtering, instant stale-request cancellation, and `pin_root = false`.
-  - Ensure adjacent-date prefetch warms `TileDiskCache` / `RangeBlockPool` (or explicitly joins `wanted` via a dedicated prefetch-wanted seam under capped VRAM appetite) so `PendingUploads::drain_and_upload` does not drop prefetched tiles, and avoid `purge_source` on recently visited epochs during scrub switching.
-- [ ] **Unified offscreen dual-epoch diffing & RGB cross-fade (`ScratchTargetPool` within `downlevel_defaults()`):**
-  - Keep all passes strictly within `downlevel_defaults()` (`max_color_attachments == 4`, `max_bind_groups == 4`, `max_sampled_textures_per_shader_stage == 16`) and `wgpu` texture-usage hazard rules over the **union scissor rect `S_AB`** (intersected with `ResolvedSwipe::scissor_for_layer` before scratch passes), updating `ScratchDemand` and `sync_viewport_target_vram()` (`topology_changed`) whenever diff/cross-fade modes toggle:
-    - **Scalar dual-epoch diff (`N <= 3` input bands per epoch, including `N = 1` single-band SAR/scientific passthrough and `N = 2` `dNDVI`/`dNBR`/`dNDWI`; `N + 1 <= 4` `R32Float` targets):**
-      1. Rasterize Epoch A (`b0..bN` → `scratch[0..N]`, `SCL_A` → `mask`), then reduce Epoch A via a **dedicated non-overlapping read-only bind group** (binding ONLY `scratch[0..N]` + `mask`, never `scratch[N]`) into `scratch[N]` (baking masked/uncovered pixels across `S_AB` to quiet-`NaN`).
-      2. Rasterize Epoch B (`b0..bN` → `scratch[0..N]`, `SCL_B` → `mask`, leaving `scratch[N]` intact), then evaluate `formula(B, mask_B) - scratch[N]` (preserving valid `0.0` diffs, independent `SCL` masks, mismatched carrier levels, and non-co-registered swaths).
-    - **Dual-epoch RGB cross-fade (0% basemap bleed-through via `rgba_targets: 0..=2` `Rgba8UnormSrgb` scratch slots in `ScratchTargetPool`, `+4 B/px` per slot, bound in a dedicated bind group `@group(3)` rather than `composite_scratch_layout` `@group(0)` to avoid read/write hazards):**
-      - *`BandMath` RGB (`3` float bands + optional `SCL`):* Stretch + mask Epoch A into `rgba_scratch[0]` (`blend: None`, `(0,0,0,0)` uncovered/masked; `+4 B/px`, total `17 B/px` scratch), rasterize Epoch B into `scratch[0..3]` + `mask`, then composite `mix(rgb_A, rgb_B, t)` with graceful single-valid fade.
-      - *Direct `Display` (`Rgba8UnormSrgb`):* Rasterize Epoch A into `rgba_scratch[0]` and Epoch B into `rgba_scratch[1]` (`blend: None`; `8 B/px` scratch, zero `R32Float`), then single fullscreen cross-fade composite.
-- [ ] **Docs:** Update `docs/decisions.md` and `docs/limitations.md`.
-- **Exit criteria:**
-  - *Automated CI:* Mock STAC `GET`/`POST` `next`-link pagination + redirect/origin guards, `401`/`403` `stac_item_href` refresh & anti-hijack/origin-fence tests, multi-profile settings persistence, local dated-folder parsing, temporal scalar diff & RGB cross-fade shaders (`naga` SPV/HLSL/MSL + headless GPU smoke verifying zero `wgpu` read/write hazard and zero basemap bleed-through), and float pre-stretch diff math (`0.0` diff vs. `NaN`) pass.
-  - *Manual QA:* Multi-month STAC timeline scrubbing, adjacent-date prefetch, and dual-epoch `dNDVI` / `dNBR` / RGB cross-fade comparison work smoothly.
 
 #### Slice 5B-2b — Multi-Polygon AOI Zonal Statistics, 1D Time-Series & CSV Export `[ ]`
 - [ ] **Off-UI-thread chunk/tile region reader (`veldmap-raster` / `veldmap-app`):**
@@ -215,5 +187,5 @@ Audited safety, correctness, and architecture hazards preserved from retired `ol
 
 ## Next Step
 
-- **Current state:** Milestone **v0.2** (`1`–`3A-2`) and Milestone **v0.5** (`3B`, `4A`, `5A-1`, `5A-2`, version `0.5.0`) are complete (see **Completed Foundation** above and [docs/decisions.md](docs/decisions.md) §1–§13).
-- **Immediate task:** Begin **Milestone v1.0** with the **Pre-5B architectural prep** (remove `OverlayLayer::primary_asset()`, embed `LayerSummaryKind` in `LayerSummary`, nest kind-specific `OverlayEdit` variants, tag `OverlayIoEvent`, move VRAM appetite weighting to `OverlayLayer::appetite_weight_bytes()`, generalize `compute_band_math_scissor_rect`, and split `storage/session.rs` + `SessionRestoreTracker`), then start **Slice 5B-2a** (STAC Pagination/Profiles, Multi-Temporal Timeline & Dual-Epoch Diffing).
+- **Current state:** Milestones **v0.2** (`1`–`3A-2`), **v0.5** (`3B`, `4A`, `5A-1`, `5A-2`), and **v1.0 Pre-5B + Slice 5B-2a** (STAC pagination/profiles/refresh, multi-temporal `Timeline` layer, and dual-epoch GPU scalar diff & RGB cross-fade) are complete (see **Completed Foundation** above and [docs/decisions.md](docs/decisions.md) §1–§14).
+- **Immediate task:** Start **Slice 5B-2b** (Off-UI-thread chunk/tile region reader, multi-polygon AOI zonal statistics, 1D pixel & parcel time-series charts via custom `egui::Painter`, and RFC 4180 CSV export).

@@ -16,7 +16,8 @@ use veldmap_core::geo::FootprintBounds;
 use crate::layers::BandMathPreset;
 use crate::stac::{
     RedactedUrl, SampleRecipeView, SampleSceneView, StacCatalogPreset, StacCogAuthMode,
-    StacCogStreamSpec, StacRecipeAssetView, StacSearchRequest, StacViewSnapshot,
+    StacCogStreamSpec, StacRecipeAssetView, StacSearchRequest, StacSortOption,
+    StacTimelineGroupView, StacTimelineMode, StacViewSnapshot,
 };
 use crate::vectors::{VectorLayerId, VectorLayerSummary};
 
@@ -31,6 +32,7 @@ use search_form::show_search_form;
 #[derive(Clone, Debug)]
 pub(crate) enum StacUiAction {
     Search(StacSearchRequest),
+    LoadMore,
     CancelSearch,
     ClearResults,
     DismissError,
@@ -51,6 +53,10 @@ pub(crate) enum StacUiAction {
         bands: Vec<StacRecipeAssetView>,
         scl: Option<StacRecipeAssetView>,
     },
+    CreateTimeline {
+        group_key: String,
+        mode: StacTimelineMode,
+    },
     OpenStacSettings,
 }
 
@@ -58,14 +64,18 @@ pub(crate) enum StacUiAction {
 #[derive(Clone, Debug)]
 pub(crate) struct StacUiState {
     preset: StacCatalogPreset,
+    collection_override: String,
     datetime_input: String,
     filter_clouds: bool,
     max_cloud_cover: f32,
+    sort_by: StacSortOption,
     limit: usize,
     direct_cog_url: RedactedUrl,
     direct_cog_title: String,
     direct_cog_use_custom_auth: bool,
     copy_notice: Option<String>,
+    timeline_group_idx: usize,
+    timeline_mode_idx: usize,
 }
 
 /// Convert days since Unix epoch (`1970-01-01`) into proleptic Gregorian
@@ -84,15 +94,14 @@ fn civil_from_unix_days(days_since_epoch: i64) -> (i64, u32, u32) {
     (year, m as u32, d as u32)
 }
 
-/// Build a rolling last-90-days UTC ISO-8601 STAC datetime interval from `now`.
-fn rolling_last_90_days_utc_interval(now: std::time::SystemTime) -> String {
+/// Build a rolling last-`window_days` UTC ISO-8601 STAC datetime interval from `now`.
+pub(super) fn rolling_days_utc_interval(now: std::time::SystemTime, window_days: i64) -> String {
     const SECS_PER_DAY: u64 = 86_400;
-    const WINDOW_DAYS: i64 = 90;
     let end_days = now
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| (d.as_secs() / SECS_PER_DAY) as i64)
         .unwrap_or(20_000);
-    let start_days = end_days.saturating_sub(WINDOW_DAYS);
+    let start_days = end_days.saturating_sub(window_days.max(1));
     let (sy, sm, sd) = civil_from_unix_days(start_days);
     let (ey, em, ed) = civil_from_unix_days(end_days);
     format!("{sy:04}-{sm:02}-{sd:02}T00:00:00Z/{ey:04}-{em:02}-{ed:02}T23:59:59Z")
@@ -102,14 +111,18 @@ impl Default for StacUiState {
     fn default() -> Self {
         Self {
             preset: StacCatalogPreset::AwsSentinel2L2a,
-            datetime_input: rolling_last_90_days_utc_interval(std::time::SystemTime::now()),
+            collection_override: String::new(),
+            datetime_input: rolling_days_utc_interval(std::time::SystemTime::now(), 90),
             filter_clouds: true,
             max_cloud_cover: 20.0,
+            sort_by: StacSortOption::Newest,
             limit: 15,
             direct_cog_url: RedactedUrl::default(),
             direct_cog_title: String::new(),
             direct_cog_use_custom_auth: false,
             copy_notice: None,
+            timeline_group_idx: 0,
+            timeline_mode_idx: 0,
         }
     }
 }
@@ -229,6 +242,86 @@ fn show_direct_cog_section(
         });
 }
 
+fn show_timeline_builder_bar(
+    ui: &mut egui::Ui,
+    groups: &[StacTimelineGroupView],
+    state: &mut StacUiState,
+    actions: &mut Vec<StacUiAction>,
+) {
+    if groups.is_empty() {
+        return;
+    }
+    if state.timeline_group_idx >= groups.len() {
+        state.timeline_group_idx = 0;
+        state.timeline_mode_idx = 0;
+    }
+    let group = &groups[state.timeline_group_idx];
+    if state.timeline_mode_idx >= group.available_modes.len() {
+        state.timeline_mode_idx = 0;
+    }
+    let selected_mode = group.available_modes[state.timeline_mode_idx];
+
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.colored_label(
+                BADGE_RECIPE_COLOR,
+                egui::RichText::new("Timeline").small().strong(),
+            );
+            ui.weak(
+                egui::RichText::new(format!("{} · {}", group.scene_count, group.date_span)).small(),
+            );
+        });
+        ui.horizontal(|ui| {
+            if groups.len() > 1 {
+                egui::ComboBox::from_id_salt("stac_tl_group")
+                    .selected_text(egui::RichText::new(&group.group_key).small())
+                    .width(76.0)
+                    .show_ui(ui, |ui| {
+                        for (idx, g) in groups.iter().enumerate() {
+                            let label = format!("{} ({})", g.group_key, g.scene_count);
+                            if ui
+                                .selectable_label(state.timeline_group_idx == idx, label)
+                                .clicked()
+                            {
+                                state.timeline_group_idx = idx;
+                                state.timeline_mode_idx = 0;
+                            }
+                        }
+                    });
+            }
+            let group = &groups[state.timeline_group_idx];
+            if state.timeline_mode_idx >= group.available_modes.len() {
+                state.timeline_mode_idx = 0;
+            }
+            egui::ComboBox::from_id_salt("stac_tl_mode")
+                .selected_text(egui::RichText::new(selected_mode.label()).small())
+                .width(126.0)
+                .show_ui(ui, |ui| {
+                    for (idx, &mode) in group.available_modes.iter().enumerate() {
+                        if ui
+                            .selectable_label(state.timeline_mode_idx == idx, mode.label())
+                            .clicked()
+                        {
+                            state.timeline_mode_idx = idx;
+                        }
+                    }
+                });
+            if ui
+                .small_button("Build")
+                .on_hover_text("Create a multi-temporal Timeline layer from these STAC scenes")
+                .clicked()
+            {
+                let g = &groups[state.timeline_group_idx];
+                let m = g.available_modes[state.timeline_mode_idx.min(g.available_modes.len() - 1)];
+                actions.push(StacUiAction::CreateTimeline {
+                    group_key: g.group_key.clone(),
+                    mode: m,
+                });
+            }
+        });
+    });
+}
+
 /// Render the Cloud / STAC tab contents inside the left workbench panel.
 pub(crate) fn show_stac_tab_contents(
     ui: &mut egui::Ui,
@@ -253,6 +346,7 @@ pub(crate) fn show_stac_tab_contents(
 
             if !stac.items.is_empty() {
                 ui.separator();
+                show_timeline_builder_bar(ui, stac.timeline_groups, state, &mut actions);
                 let header = match stac.matched {
                     Some(total) => format!("Results ({} of {total})", stac.items.len()),
                     None => format!("Results ({})", stac.items.len()),
@@ -271,6 +365,27 @@ pub(crate) fn show_stac_tab_contents(
                 }
                 if hovered_any != stac.hovered_idx {
                     actions.push(StacUiAction::HoverItem(hovered_any));
+                }
+                if stac.is_loading_more {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak(egui::RichText::new("Loading next page…").small());
+                    });
+                } else if stac.can_load_more {
+                    if ui
+                        .button("Load More")
+                        .on_hover_text("Fetch next STAC page via links[rel=\"next\"]")
+                        .clicked()
+                    {
+                        actions.push(StacUiAction::LoadMore);
+                    }
+                } else if stac.reached_page_cap {
+                    ui.weak(
+                        egui::RichText::new(
+                            "Page cap reached (500 items). Narrow AOI or date range.",
+                        )
+                        .small(),
+                    );
                 }
             }
         });
@@ -309,13 +424,17 @@ mod tests {
     }
 
     #[test]
-    fn rolling_last_90_days_utc_interval_handles_leap_years_and_exact_span() {
+    fn rolling_days_utc_interval_handles_leap_years_and_exact_span() {
         // 2024-03-01T12:00:00Z = day 19783 since 1970-01-01 (leap year 2024).
-        // 90 days earlier = 2023-12-02.
+        // 90 days earlier = 2023-12-02; 30 days earlier = 2024-01-31.
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(19_783 * 86_400 + 43_200);
         assert_eq!(
-            rolling_last_90_days_utc_interval(t),
+            rolling_days_utc_interval(t, 90),
             "2023-12-02T00:00:00Z/2024-03-01T23:59:59Z"
+        );
+        assert_eq!(
+            rolling_days_utc_interval(t, 30),
+            "2024-01-31T00:00:00Z/2024-03-01T23:59:59Z"
         );
     }
 }

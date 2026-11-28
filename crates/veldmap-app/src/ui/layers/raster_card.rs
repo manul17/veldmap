@@ -3,13 +3,14 @@
 use eframe::egui;
 
 use crate::format;
-use crate::layers::{LayerSummary, OverlayEdit};
+use crate::layers::{LayerSummary, LayerSummaryKind, OverlayEdit};
 use crate::ui::widgets::{paint_loading_shimmer, show_opacity_slider};
 use crate::ui::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 
 use super::LayerUiAction;
 use super::band_math_card::show_band_math_controls;
 use super::style_controls::{show_categorical_controls, show_scientific_controls};
+use super::timeline_card::show_timeline_controls;
 
 fn show_layer_status_banners(ui: &mut egui::Ui, layer: &LayerSummary) {
     if layer.detail_limit_level > 0 {
@@ -44,48 +45,63 @@ fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Ve
         ));
     }
 
-    if layer.band_options.len() > 1 {
-        let current_label = layer
-            .band_options
-            .iter()
-            .find(|opt| opt.spec == layer.active_spec)
-            .map_or("Display (RGB)", |opt| opt.label.as_str());
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Band").small());
-            egui::ComboBox::from_id_salt(("band_select", layer.id))
-                .selected_text(egui::RichText::new(current_label).small())
-                .width(172.0)
-                .show_ui(ui, |ui| {
-                    for opt in &layer.band_options {
-                        let selected = opt.spec == layer.active_spec;
-                        if ui.selectable_label(selected, &opt.label).clicked() && !selected {
-                            actions.push(LayerUiAction::SetStream(layer.id, opt.spec));
-                        }
-                    }
+    match &layer.kind {
+        LayerSummaryKind::SingleRaster(single) => {
+            if single.band_options.len() > 1 {
+                let current_label = single
+                    .band_options
+                    .iter()
+                    .find(|opt| opt.spec == single.active_spec)
+                    .map_or("Display (RGB)", |opt| opt.label.as_str());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Band").small());
+                    egui::ComboBox::from_id_salt(("band_select", layer.id))
+                        .selected_text(egui::RichText::new(current_label).small())
+                        .width(172.0)
+                        .show_ui(ui, |ui| {
+                            for opt in &single.band_options {
+                                let selected = opt.spec == single.active_spec;
+                                if ui.selectable_label(selected, &opt.label).clicked() && !selected
+                                {
+                                    actions.push(LayerUiAction::SetStream(layer.id, opt.spec));
+                                }
+                            }
+                        });
                 });
-        });
-    }
+            }
 
-    if let Some(ref bm) = layer.band_math {
-        show_band_math_controls(ui, layer.id, bm, actions);
-    } else if let Some(ref sci) = layer.scientific {
-        show_scientific_controls(ui, layer.id, sci, actions);
-    } else if let Some(cat) = layer.categorical {
-        show_categorical_controls(ui, layer.id, cat, actions);
+            if let Some(ref sci) = single.scientific {
+                show_scientific_controls(ui, layer.id, sci, actions);
+            } else if let Some(cat) = single.categorical {
+                show_categorical_controls(ui, layer.id, cat, actions);
+            }
+        }
+        LayerSummaryKind::BandMath(bm) => {
+            show_band_math_controls(ui, layer.id, bm, actions);
+        }
+        LayerSummaryKind::Timeline(tl) => {
+            show_timeline_controls(ui, layer.id, tl, actions);
+        }
     }
 
     egui::CollapsingHeader::new(egui::RichText::new("CRS & Metadata").small())
         .id_salt(("meta", layer.id))
         .default_open(false)
         .show(ui, |ui| {
-            let crs_tag = if layer.has_crs_override {
+            let has_crs_override = matches!(
+                &layer.kind,
+                LayerSummaryKind::SingleRaster(s) if s.has_crs_override
+            );
+            let crs_tag = if has_crs_override {
                 format!("CRS: {} (override)", layer.crs_label)
             } else {
                 format!("CRS: {}", layer.crs_label)
             };
             ui.small(crs_tag);
             ui.small(format!("Radiometry: {}", layer.sample_info));
-            if let Some(ref sci) = layer.scientific {
+            if let LayerSummaryKind::SingleRaster(single) = &layer.kind
+                && let Some(ref sci) = single.scientific
+            {
                 if let Some(ref units) = sci.units {
                     ui.small(format!("Units: {units}"));
                 }
@@ -95,16 +111,27 @@ fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Ve
             }
             if let Some(ref url) = layer.remote_url {
                 ui.small(format!("URL: {url}"));
-            } else if !layer.path.as_os_str().is_empty() {
-                ui.small(format!("Path: {}", layer.path.display()));
-            } else if let Some(ref bm) = layer.band_math {
-                let inputs = bm
-                    .inputs
-                    .iter()
-                    .map(|i| i.label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ui.small(format!("Sources: {inputs}"));
+            } else {
+                match &layer.kind {
+                    LayerSummaryKind::SingleRaster(single)
+                        if !single.path.as_os_str().is_empty() =>
+                    {
+                        ui.small(format!("Path: {}", single.path.display()));
+                    }
+                    LayerSummaryKind::BandMath(bm) => {
+                        let inputs = bm
+                            .inputs
+                            .iter()
+                            .map(|i| i.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ui.small(format!("Sources: {inputs}"));
+                    }
+                    LayerSummaryKind::Timeline(tl) => {
+                        ui.small(format!("Epochs: {}", tl.epochs.len()));
+                    }
+                    LayerSummaryKind::SingleRaster(_) => {}
+                }
             }
         });
 }
@@ -119,23 +146,24 @@ fn show_layer_actions(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Vec
         {
             actions.push(LayerUiAction::ZoomToExtent(bounds));
         }
-        if !layer.is_remote
-            && layer.can_override_crs
-            && ui
-                .small_button("CRS…")
-                .on_hover_text("Override CRS or custom Transverse Mercator parameters")
-                .clicked()
-        {
-            actions.push(LayerUiAction::OpenCrsPicker(layer.id, layer.name.clone()));
-        }
-        if !layer.is_remote
-            && layer.band_math.is_none()
-            && ui
-                .add_enabled(!layer.reloading, egui::Button::new("Reload").small())
-                .on_hover_text("Reload from disk (bypass fingerprint & tile cache)")
-                .clicked()
-        {
-            actions.push(LayerUiAction::ReloadBypassCache(layer.id));
+        if let LayerSummaryKind::SingleRaster(single) = &layer.kind {
+            if !layer.is_remote
+                && single.can_override_crs
+                && ui
+                    .small_button("CRS…")
+                    .on_hover_text("Override CRS or custom Transverse Mercator parameters")
+                    .clicked()
+            {
+                actions.push(LayerUiAction::OpenCrsPicker(layer.id, layer.name.clone()));
+            }
+            if !layer.is_remote
+                && ui
+                    .add_enabled(!single.reloading, egui::Button::new("Reload").small())
+                    .on_hover_text("Reload from disk (bypass fingerprint & tile cache)")
+                    .clicked()
+            {
+                actions.push(LayerUiAction::ReloadBypassCache(layer.id));
+            }
         }
         if ui
             .small_button("Remove")
@@ -165,9 +193,11 @@ pub(super) fn show_raster_card(
                 let hover_tip = layer
                     .remote_url
                     .clone()
-                    .or_else(|| {
-                        (!layer.path.as_os_str().is_empty())
-                            .then(|| layer.path.display().to_string())
+                    .or_else(|| match &layer.kind {
+                        LayerSummaryKind::SingleRaster(s) if !s.path.as_os_str().is_empty() => {
+                            Some(s.path.display().to_string())
+                        }
+                        _ => None,
                     })
                     .unwrap_or_else(|| layer.sample_info.clone());
                 ui.add(egui::Label::new(egui::RichText::new(&layer.name).strong()).truncate())
@@ -190,22 +220,29 @@ pub(super) fn show_raster_card(
                 });
             });
 
-            let px_label = match layer.source_pixel_size_m {
-                Some((mx, my)) => format!(
-                    "{}×{} · {}",
-                    layer.width,
-                    layer.height,
-                    format::format_source_pixel_size(mx, my)
-                ),
-                None => format!("{}×{}", layer.width, layer.height),
+            let px_label = match (layer.dimensions(), layer.source_pixel_size_m) {
+                (Some((w, h)), Some((mx, my))) => {
+                    format!("{w}×{h} · {}", format::format_source_pixel_size(mx, my))
+                }
+                (Some((w, h)), None) => format!("{w}×{h}"),
+                (None, Some((mx, my))) => format::format_source_pixel_size(mx, my),
+                (None, None) => String::new(),
             };
+            let reloading = layer.is_reloading();
             let is_loading =
-                layer.reloading || (layer.visible && (layer.pass_active || layer.in_flight > 0));
+                reloading || (layer.visible && (layer.pass_active || layer.in_flight > 0));
             ui.horizontal(|ui| {
-                if let Some(ref bm) = layer.band_math {
+                if let LayerSummaryKind::BandMath(ref bm) = layer.kind {
                     ui.colored_label(
                         crate::ui::BADGE_RECIPE_COLOR,
                         egui::RichText::new(&bm.recipe_label).small().strong(),
+                    );
+                } else if let LayerSummaryKind::Timeline(ref tl) = layer.kind {
+                    ui.colored_label(
+                        crate::ui::BADGE_RECIPE_COLOR,
+                        egui::RichText::new(format!("Timeline ({})", tl.epochs.len()))
+                            .small()
+                            .strong(),
                     );
                 }
                 if layer.is_remote {
@@ -214,8 +251,10 @@ pub(super) fn show_raster_card(
                         egui::RichText::new("Cloud COG").small().strong(),
                     );
                 }
-                ui.weak(egui::RichText::new(px_label).small());
-                if layer.reloading {
+                if !px_label.is_empty() {
+                    ui.weak(egui::RichText::new(px_label).small());
+                }
+                if reloading {
                     ui.weak(egui::RichText::new("· reloading…").small());
                 } else if is_loading {
                     ui.weak(egui::RichText::new("· loading…").small());

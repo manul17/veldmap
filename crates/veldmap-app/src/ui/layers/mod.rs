@@ -9,6 +9,7 @@ mod band_math_card;
 mod histogram;
 mod raster_card;
 mod style_controls;
+mod timeline_card;
 mod vector_card;
 
 use std::path::PathBuf;
@@ -53,6 +54,7 @@ pub(crate) enum EditPersist {
 #[derive(Clone, Debug)]
 pub(crate) enum LayerUiAction {
     OpenFileDialog,
+    OpenTimelineFolderDialog,
     OpenPath(PathBuf),
     RetryUnavailableSessionLayers,
     HideUnavailableSessionNotice,
@@ -181,6 +183,13 @@ fn show_panel_header(
                 if state.open_prompt_visible {
                     state.focus_path_input = true;
                 }
+            }
+            if ui
+                .small_button("Folder…")
+                .on_hover_text("Open a folder of dated rasters as a multi-temporal Timeline")
+                .clicked()
+            {
+                actions.push(LayerUiAction::OpenTimelineFolderDialog);
             }
             if ui
                 .small_button("Open…")

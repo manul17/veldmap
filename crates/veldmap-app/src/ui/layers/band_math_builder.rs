@@ -6,7 +6,7 @@ use eframe::egui;
 use veldmap_core::tile::{BandKey, PixelFormat};
 
 use crate::layers::{
-    BandMathFormula, LayerId, LayerSummary, LocalBandMathInput, LocalBandMathSpec,
+    BandMathFormula, LayerId, LayerSummary, LayerSummaryKind, LocalBandMathInput, LocalBandMathSpec,
 };
 use crate::ui::WARN_TEXT_COLOR;
 
@@ -31,22 +31,25 @@ impl BandChoice {
 
 pub(super) fn has_band_math_inputs(layers: &[LayerSummary]) -> bool {
     layers.iter().any(|layer| {
-        layer.band_math.is_none()
-            && layer
-                .band_options
-                .iter()
-                .any(|opt| matches!(opt.spec.band, BandKey::Index(_)))
+        matches!(
+            &layer.kind,
+            LayerSummaryKind::SingleRaster(single)
+                if single
+                    .band_options
+                    .iter()
+                    .any(|opt| matches!(opt.spec.band, BandKey::Index(_)))
+        )
     })
 }
 
 fn collect_band_choices(layers: &[LayerSummary]) -> Vec<BandChoice> {
     let mut choices = Vec::new();
     for layer in layers {
-        if layer.band_math.is_some() {
+        let LayerSummaryKind::SingleRaster(single) = &layer.kind else {
             continue;
-        }
+        };
         let mut seen_bands = Vec::new();
-        for opt in &layer.band_options {
+        for opt in &single.band_options {
             let BandKey::Index(idx) = opt.spec.band else {
                 continue;
             };
@@ -54,7 +57,7 @@ fn collect_band_choices(layers: &[LayerSummary]) -> Vec<BandChoice> {
                 continue;
             }
             seen_bands.push(idx);
-            let supports_u8 = layer.band_options.iter().any(|o| {
+            let supports_u8 = single.band_options.iter().any(|o| {
                 o.spec.band == BandKey::Index(idx) && o.spec.format == PixelFormat::R8Uint
             });
             choices.push(BandChoice {

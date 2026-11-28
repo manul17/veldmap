@@ -4,21 +4,22 @@
 use eframe::egui;
 
 use crate::colormap::{CategoricalPaletteId, ColormapId};
-use crate::layers::{CategoricalSummary, LayerId, OverlayEdit, ScientificSummary, StretchPreset};
+use crate::layers::{
+    CategoricalSummary, LayerId, OverlayEdit, ScientificSummary, SingleRasterEdit, StretchPreset,
+};
 use crate::ui::widgets::{DragCommit, track_drag_commit};
 
 use super::LayerUiAction;
 use super::histogram::paint_interactive_histogram;
 
-/// Shared `Ramp` ComboBox + `Inv` checkbox reused across scientific single-band
-/// and scalar Band Math layer cards.
+/// Shared `Ramp` ComboBox + `Inv` checkbox reused across scientific single-band,
+/// scalar Band Math, and temporal diff layer cards.
 pub(super) fn show_colormap_picker(
     ui: &mut egui::Ui,
     id_salt: (&str, LayerId),
-    layer_id: LayerId,
     colormap: ColormapId,
     invert_colormap: bool,
-    actions: &mut Vec<LayerUiAction>,
+    mut on_change: impl FnMut(ColormapId, bool),
 ) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Ramp").small());
@@ -29,13 +30,7 @@ pub(super) fn show_colormap_picker(
             .show_ui(ui, |ui| {
                 for opt in ColormapId::ALL {
                     if ui.selectable_value(&mut cmap, opt, opt.label()).clicked() {
-                        actions.push(LayerUiAction::edit_raster(
-                            layer_id,
-                            OverlayEdit::SetColormap {
-                                colormap: opt,
-                                invert: invert_colormap,
-                            },
-                        ));
+                        on_change(opt, invert_colormap);
                     }
                 }
             });
@@ -44,10 +39,7 @@ pub(super) fn show_colormap_picker(
             .checkbox(&mut invert, egui::RichText::new("Inv").small())
             .changed()
         {
-            actions.push(LayerUiAction::edit_raster(
-                layer_id,
-                OverlayEdit::SetColormap { colormap, invert },
-            ));
+            on_change(colormap, invert);
         }
     });
 }
@@ -125,7 +117,7 @@ pub(super) fn show_scientific_controls(
                     if ui.selectable_value(&mut preset, opt, opt.label()).clicked() {
                         actions.push(LayerUiAction::edit_raster(
                             layer_id,
-                            OverlayEdit::SetStretchPreset(opt),
+                            OverlayEdit::SingleRaster(SingleRasterEdit::StretchPreset(opt)),
                         ));
                     }
                 }
@@ -135,10 +127,14 @@ pub(super) fn show_scientific_controls(
     show_colormap_picker(
         ui,
         ("colormap", layer_id),
-        layer_id,
         sci.colormap,
         sci.invert_colormap,
-        actions,
+        |colormap, invert| {
+            actions.push(LayerUiAction::edit_raster(
+                layer_id,
+                OverlayEdit::SingleRaster(SingleRasterEdit::Colormap { colormap, invert }),
+            ));
+        },
     );
 
     if let MinMaxEvent::Drag { min, max, commit } =
@@ -146,7 +142,7 @@ pub(super) fn show_scientific_controls(
     {
         actions.push(LayerUiAction::edit_raster_drag(
             layer_id,
-            OverlayEdit::SetStretchRange { min, max },
+            OverlayEdit::SingleRaster(SingleRasterEdit::StretchRange { min, max }),
             commit,
         ));
     }
@@ -174,7 +170,7 @@ pub(super) fn show_categorical_controls(
                     if ui.selectable_value(&mut pal, opt, opt.label()).clicked() {
                         actions.push(LayerUiAction::edit_raster(
                             layer_id,
-                            OverlayEdit::SetCategoricalPalette(opt),
+                            OverlayEdit::SingleRaster(SingleRasterEdit::CategoricalPalette(opt)),
                         ));
                     }
                 }

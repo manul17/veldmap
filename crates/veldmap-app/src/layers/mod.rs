@@ -20,13 +20,17 @@ mod runtime;
 mod stack;
 mod style;
 mod summary;
+mod timeline;
+mod timeline_scan;
 
 use std::path::{Path, PathBuf};
 
 use veldmap_core::geo::FootprintBounds;
+use veldmap_net::StacAuth;
 use veldmap_raster::ExternalBandMeta;
 
 pub(crate) use crate::band_math::BandMathFormula;
+pub(crate) use crate::colormap::ColormapId;
 pub(crate) use asset::StacCogAuthMode;
 pub(crate) use band_math::{
     BandChannelSample, BandMathPreset, BandMathReadout, BandMathStyleSpec, BandMathSummary,
@@ -34,10 +38,17 @@ pub(crate) use band_math::{
 pub(crate) use crs_override::CrsOverride;
 pub(crate) use cursor::{CursorReadout, CursorReadoutValue};
 pub(crate) use manager::{
-    OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayManagerDeps, OverlayMutation,
+    BandMathEdit, OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayManagerDeps,
+    OverlayMutation, SingleRasterEdit, TimelineEdit,
 };
 pub(crate) use style::{ColorbarInfo, LayerStyleSpec, StretchPreset, TrackKind};
-pub(crate) use summary::{CategoricalSummary, LayerSummary, ScientificSummary};
+pub(crate) use summary::{CategoricalSummary, LayerSummary, LayerSummaryKind, ScientificSummary};
+pub(crate) use timeline::{
+    TimelineCompareMode, TimelineEpochLoadState, TimelineEpochPersistEntry,
+    TimelineEpochPersistSource, TimelineEpochSourceSpec, TimelineEpochSpec, TimelineOpenRequest,
+    TimelineSummary,
+};
+pub(crate) use timeline_scan::{ScannedTimelineFile, scan_dated_raster_folder};
 
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -77,6 +88,21 @@ pub(crate) struct OpenOverlayRequest<'a> {
     pub(crate) restore_id: Option<u64>,
 }
 
+/// Origin-fenced credentials policy for single-attempt `401`/`403`
+/// `stac_item_href` asset URL refresh during session/project restore.
+#[derive(Clone, Debug)]
+pub(crate) struct StacItemRefreshPolicy {
+    /// Auth attached strictly to `GET stac_item_href` (always `StacAuth::None`
+    /// for imported `.veldmap.json` projects or off-origin item URLs).
+    pub(crate) item_auth: StacAuth,
+    /// Optional profile origin URL that a refreshed non-presigned asset URL
+    /// must match before `asset_headers` may be attached.
+    pub(crate) asset_auth_origin: Option<String>,
+    /// Optional custom headers eligible only for non-presigned, same-origin
+    /// refreshed asset URLs.
+    pub(crate) asset_headers: Vec<(String, String)>,
+}
+
 /// Parameters for queuing a non-blocking remote Cloud-Optimized GeoTIFF open.
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteCogRequest {
@@ -90,6 +116,7 @@ pub(crate) struct RemoteCogRequest {
     pub(crate) is_scl: bool,
     pub(crate) stac_item_href: Option<String>,
     pub(crate) asset_key: Option<String>,
+    pub(crate) refresh_policy: Option<StacItemRefreshPolicy>,
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
     pub(crate) style: Option<LayerStyleSpec>,
@@ -116,6 +143,7 @@ pub(crate) enum BandMathAssetOpenSpec {
         external_bands: Vec<ExternalBandMeta>,
         stac_item_href: Option<String>,
         asset_key: Option<String>,
+        refresh_policy: Option<StacItemRefreshPolicy>,
         band_index: u16,
     },
 }
@@ -216,6 +244,38 @@ pub(crate) enum OverlayPersistEntry {
         scl: Option<BandAssetPersistEntry>,
         style: BandMathStyleSpec,
     },
+    Timeline {
+        title: String,
+        visible: bool,
+        opacity: f32,
+        epochs: Vec<TimelineEpochPersistEntry>,
+        recipe_preset: Option<BandMathPreset>,
+        band_math_style: Option<BandMathStyleSpec>,
+        single_style: Option<LayerStyleSpec>,
+        active_idx: usize,
+        compare: TimelineCompareMode,
+        max_cloud_cover: Option<f32>,
+        diff_colormap: ColormapId,
+        diff_invert_colormap: bool,
+        diff_stretch_min: f64,
+        diff_stretch_max: f64,
+    },
+}
+
+/// Tagged kind of a remote overlay layer reported by [`OverlayIoEvent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteLayerKind {
+    SingleCog,
+    BandMath,
+}
+
+impl RemoteLayerKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::SingleCog => "Remote COG",
+            Self::BandMath => "Band Math",
+        }
+    }
 }
 
 /// Asynchronous result of a background local or remote raster open or reload
@@ -247,7 +307,7 @@ pub(crate) enum OverlayIoEvent {
         id: LayerId,
         title: String,
         display_url: String,
-        is_band_math: bool,
+        kind: RemoteLayerKind,
         bounds: Option<FootprintBounds>,
         fly_to: bool,
         restore_id: Option<u64>,
@@ -255,8 +315,14 @@ pub(crate) enum OverlayIoEvent {
     RemoteFailed {
         title: String,
         display_url: String,
-        is_band_math: bool,
+        kind: RemoteLayerKind,
         error: String,
+        restore_id: Option<u64>,
+    },
+    TimelineOpened {
+        id: LayerId,
+        bounds: Option<FootprintBounds>,
+        fly_to: bool,
         restore_id: Option<u64>,
     },
 }

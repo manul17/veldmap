@@ -1,6 +1,8 @@
 use veldmap_core::geo::{CustomTmParams, DatumPreset, LinearUnit};
 use veldmap_storage::test_support::TestTempDir;
 
+use crate::layers::CrsOverride;
+
 use super::*;
 
 #[test]
@@ -254,4 +256,105 @@ fn session_layer_style_round_trips_and_tolerates_unknown_future_variants() {
     assert_eq!(st.stretch_preset, None);
     assert_eq!(st.colormap, None);
     assert_eq!(st.categorical_palette, None);
+}
+
+#[test]
+fn timeline_entry_sanitizes_urls_and_round_trips_project_relative_paths() {
+    use crate::colormap::ColormapId;
+    use crate::layers::{
+        OverlayPersistEntry, StacCogAuthMode, TimelineCompareMode, TimelineEpochPersistEntry,
+        TimelineEpochPersistSource,
+    };
+    use crate::storage::project::ProjectFile;
+
+    let tmp = TestTempDir::new("veldmap-timeline-persist");
+    let proj_path = tmp.path().join("study.veldmap.json");
+    let local_tif = tmp.path().join("scenes").join("2024-06-01.tif");
+
+    let entry = SavedLayerEntry::from_persist(OverlayPersistEntry::Timeline {
+        title: "Study Timeline".to_owned(),
+        visible: true,
+        opacity: 0.9,
+        epochs: vec![
+            TimelineEpochPersistEntry {
+                label: "2024-06-01".to_owned(),
+                date_label: "2024-06-01".to_owned(),
+                sort_key: "0:2024-06-01".to_owned(),
+                cloud_cover: Some(4.5),
+                source: TimelineEpochPersistSource::LocalSingle {
+                    path: local_tif.clone(),
+                    crs_override: None,
+                },
+            },
+            TimelineEpochPersistEntry {
+                label: "2024-07-01".to_owned(),
+                date_label: "2024-07-01".to_owned(),
+                sort_key: "0:2024-07-01".to_owned(),
+                cloud_cover: Some(12.0),
+                source: TimelineEpochPersistSource::RemoteSingle {
+                    canonical_url: "https://user:pw@cdn.example/b.tif?sig=secret_sas".to_owned(),
+                    auth_mode: StacCogAuthMode::DirectCustom,
+                    external_bands: Vec::new(),
+                    is_scl: false,
+                    stac_item_href: Some("https://stac.example/items/i1?api_key=leak".to_owned()),
+                    asset_key: Some("visual".to_owned()),
+                },
+            },
+        ],
+        recipe_preset: None,
+        band_math_style: None,
+        single_style: None,
+        active_idx: 1,
+        compare: TimelineCompareMode::CrossFade {
+            ref_idx: 0,
+            blend_t: 0.4,
+        },
+        max_cloud_cover: Some(25.0),
+        diff_colormap: ColormapId::RdBu,
+        diff_invert_colormap: false,
+        diff_stretch_min: -0.5,
+        diff_stretch_max: 0.5,
+    });
+
+    let project = ProjectFile {
+        open_layers: vec![entry],
+        ..ProjectFile::default()
+    };
+    project.save_to(&proj_path).expect("save project");
+    let raw_json = std::fs::read_to_string(&proj_path).expect("read json");
+    assert!(
+        !raw_json.contains("secret_sas") && !raw_json.contains("api_key=leak"),
+        "project file must strip all query tokens and userinfo: {raw_json}"
+    );
+    assert!(
+        raw_json.contains("\"kind\": \"timeline\""),
+        "timeline must serialize with tagged kind: {raw_json}"
+    );
+
+    let loaded = ProjectFile::load_from(&proj_path).expect("load project");
+    assert_eq!(loaded.open_layers.len(), 1);
+    let SavedLayerEntry::Timeline(tl) = &loaded.open_layers[0] else {
+        panic!("expected Timeline entry");
+    };
+    assert_eq!(tl.epochs.len(), 2);
+    assert_eq!(tl.active_idx, 1);
+    assert_eq!(tl.max_cloud_cover, Some(25.0));
+    match &tl.epochs[0].source {
+        SavedTimelineEpochSource::LocalSingle { path, .. } => assert_eq!(path, &local_tif),
+        other => panic!("expected LocalSingle, got {other:?}"),
+    }
+    match &tl.epochs[1].source {
+        SavedTimelineEpochSource::RemoteSingle {
+            url,
+            stac_item_href,
+            ..
+        } => {
+            assert_eq!(url, "https://cdn.example/b.tif");
+            assert_eq!(
+                stac_item_href.as_deref(),
+                Some("https://stac.example/items/i1")
+            );
+        }
+        other => panic!("expected RemoteSingle, got {other:?}"),
+    }
 }

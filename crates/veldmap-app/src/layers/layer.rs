@@ -24,9 +24,10 @@ use crate::{clamp_opacity, display_name_from_path};
 use super::asset::{GeoBinding, LayerOrigin, LayerStream, RasterAsset, RemoteAssetMeta};
 use super::band_math::{BandMathLayerData, BandMathStyle};
 use super::style::{LayerStyle, LayerStyleSpec, ScientificStyle, TrackKind};
+use super::timeline::{TimelineEpochPersistEntry, TimelineLayerData, TimelineOpenRequest};
 use super::{CrsOverride, LayerId, LayerInitOptions, OverlayPersistEntry};
 
-/// Zero-allocation iterator over every actively rendered [`LayerStream`] owned
+/// Iterator over every actively rendered or prefetched [`LayerStream`] owned
 /// by an [`OverlayLayer`] (omitting a `BandMath` layer's `SCL` stream while its
 /// cloud mask is toggled off).
 pub(super) enum ActiveStreams<'a> {
@@ -35,6 +36,7 @@ pub(super) enum ActiveStreams<'a> {
         bands: std::slice::Iter<'a, RasterAsset>,
         scl: Option<&'a LayerStream>,
     },
+    Timeline(std::vec::IntoIter<&'a LayerStream>),
 }
 
 impl<'a> Iterator for ActiveStreams<'a> {
@@ -46,6 +48,7 @@ impl<'a> Iterator for ActiveStreams<'a> {
             Self::BandMath { bands, scl } => {
                 bands.next().map(RasterAsset::stream).or_else(|| scl.take())
             }
+            Self::Timeline(iter) => iter.next(),
         }
     }
 }
@@ -121,15 +124,16 @@ pub(super) struct RemoteLayerSpec {
     pub(super) relaid: u64,
 }
 
-/// Tagged overlay kind distinguishing single-asset rasters from multi-asset
-/// GPU band-math / RGB composite layers (and future Slice 5B DEM mosaics and
-/// multi-temporal timelines).
+/// Tagged overlay kind distinguishing single-asset rasters, multi-asset GPU
+/// band-math / RGB composites, and multi-temporal timelines (extensible to
+/// future `DemMosaic`).
 pub(super) enum LayerKind {
     SingleRaster {
         asset: Box<RasterAsset>,
         style: LayerStyle,
     },
     BandMath(Box<BandMathLayerData>),
+    Timeline(Box<TimelineLayerData>),
 }
 
 /// Georeferenced raster overlay inside [`super::stack::LayerStack`].
@@ -314,6 +318,28 @@ impl OverlayLayer {
         }
     }
 
+    /// Construct a multi-temporal `Timeline` overlay layer (`pin_root = false`).
+    pub(super) fn from_timeline(id: LayerId, req: TimelineOpenRequest) -> Self {
+        let name = if req.title.trim().is_empty() {
+            "Timeline".to_owned()
+        } else {
+            req.title.trim().to_owned()
+        };
+        let visible = req.visible;
+        let opacity = clamp_opacity(req.opacity);
+        let data = TimelineLayerData::from_request(req);
+        Self {
+            id,
+            name,
+            kind: LayerKind::Timeline(Box::new(data)),
+            pin_root: false,
+            last_error: None,
+            visible,
+            opacity,
+            reload: ReloadState::default(),
+        }
+    }
+
     pub(super) fn id(&self) -> LayerId {
         self.id
     }
@@ -330,25 +356,28 @@ impl OverlayLayer {
         &mut self.kind
     }
 
-    pub(super) fn primary_asset(&self) -> &RasterAsset {
-        match &self.kind {
-            LayerKind::SingleRaster { asset, .. } => asset,
-            LayerKind::BandMath(bm) => bm.primary_asset(),
-        }
-    }
-
     pub(super) fn single_asset(&self) -> Option<&RasterAsset> {
         match &self.kind {
             LayerKind::SingleRaster { asset, .. } => Some(asset),
-            LayerKind::BandMath(_) => None,
+            LayerKind::BandMath(_) | LayerKind::Timeline(_) => None,
         }
+    }
+
+    /// Return the local disk reload target `(path, asset)` for reloadable
+    /// single-raster local layers, or `None` for remote / multi-asset layers.
+    pub(super) fn reload_target(&self) -> Option<(&Path, &RasterAsset)> {
+        let asset = self.single_asset()?;
+        let path = asset.local_path()?;
+        Some((path, asset))
     }
 
     #[cfg(test)]
     pub(super) fn style(&self) -> &LayerStyle {
         match &self.kind {
             LayerKind::SingleRaster { style, .. } => style,
-            LayerKind::BandMath(_) => panic!("style() called on BandMath layer"),
+            LayerKind::BandMath(_) | LayerKind::Timeline(_) => {
+                panic!("style() called on non-SingleRaster layer")
+            }
         }
     }
 
@@ -356,14 +385,9 @@ impl OverlayLayer {
     pub(super) fn style_mut(&mut self) -> &mut LayerStyle {
         match &mut self.kind {
             LayerKind::SingleRaster { style, .. } => style,
-            LayerKind::BandMath(_) => panic!("style_mut() called on BandMath layer"),
-        }
-    }
-
-    pub(super) fn local_path(&self) -> Option<&Path> {
-        match &self.kind {
-            LayerKind::SingleRaster { asset, .. } => asset.local_path(),
-            LayerKind::BandMath(_) => None,
+            LayerKind::BandMath(_) | LayerKind::Timeline(_) => {
+                panic!("style_mut() called on non-SingleRaster layer")
+            }
         }
     }
 
@@ -371,6 +395,7 @@ impl OverlayLayer {
         match &self.kind {
             LayerKind::SingleRaster { asset, .. } => asset.is_remote(),
             LayerKind::BandMath(bm) => bm.assets().any(RasterAsset::is_remote),
+            LayerKind::Timeline(tl) => tl.is_remote(),
         }
     }
 
@@ -378,11 +403,11 @@ impl OverlayLayer {
         match &self.kind {
             LayerKind::SingleRaster { asset, .. } => asset.remote_url(),
             LayerKind::BandMath(bm) => bm.assets().find_map(RasterAsset::remote_url),
+            LayerKind::Timeline(tl) => tl.remote_url(),
         }
     }
 
-    /// Collect all distinct [`SourceId`]s referenced by this layer (1 for
-    /// `SingleRaster`, 1–4 for `BandMath`).
+    /// Collect all distinct [`SourceId`]s referenced by this layer.
     pub(super) fn all_source_ids(&self) -> Vec<SourceId> {
         let mut out = Vec::new();
         match &self.kind {
@@ -395,6 +420,7 @@ impl OverlayLayer {
                     }
                 }
             }
+            LayerKind::Timeline(tl) => out = tl.all_source_ids(),
         }
         out
     }
@@ -403,6 +429,7 @@ impl OverlayLayer {
         match &self.kind {
             LayerKind::SingleRaster { asset, .. } => asset.source_id() == source_id,
             LayerKind::BandMath(bm) => bm.assets().any(|a| a.source_id() == source_id),
+            LayerKind::Timeline(tl) => tl.has_source(source_id),
         }
     }
 
@@ -414,12 +441,13 @@ impl OverlayLayer {
             LayerKind::BandMath(bm) => bm
                 .assets()
                 .any(|a| a.source_id() == source_id && a.source().is_remote()),
+            LayerKind::Timeline(tl) => tl.has_remote_source(source_id),
         }
     }
 
-    /// Iterate over every actively rendered [`LayerStream`] owned by this layer
-    /// without heap allocation (omitting a `BandMath` layer's `SCL` stream
-    /// while its cloud mask is toggled off).
+    /// Iterate over every actively rendered or prefetched [`LayerStream`] owned
+    /// by this layer (omitting a `BandMath` layer's `SCL` stream while its
+    /// cloud mask is toggled off).
     pub(super) fn streams(&self) -> ActiveStreams<'_> {
         match &self.kind {
             LayerKind::SingleRaster { asset, .. } => ActiveStreams::Single(Some(asset.stream())),
@@ -431,21 +459,24 @@ impl OverlayLayer {
                     .then(|| bm.scl.as_ref().map(RasterAsset::stream))
                     .flatten(),
             },
+            LayerKind::Timeline(tl) => ActiveStreams::Timeline(tl.active_streams().into_iter()),
         }
     }
 
-    /// Number of actively rendered streams yielded by [`Self::streams`] (O(1)).
+    /// Number of active/prefetched streams yielded by [`Self::streams`].
     pub(super) fn active_stream_count(&self) -> usize {
         match &self.kind {
             LayerKind::SingleRaster { .. } => 1,
             LayerKind::BandMath(bm) => {
                 bm.bands.len() + usize::from(bm.style.scl_mask_enabled && bm.scl.is_some())
             }
+            LayerKind::Timeline(tl) => tl.active_stream_count(),
         }
     }
 
     /// Collect every [`StreamKey`] owned by this layer (including disabled
-    /// `SCL`), used for cancelling orphaned jobs when hiding or removing.
+    /// `SCL` and inactive open timeline epochs), used for cancelling orphaned
+    /// jobs when hiding or removing.
     pub(super) fn all_stream_keys(&self) -> Vec<StreamKey> {
         match &self.kind {
             LayerKind::SingleRaster { asset, .. } => vec![asset.meta().stream_key()],
@@ -459,6 +490,7 @@ impl OverlayLayer {
                 }
                 keys
             }
+            LayerKind::Timeline(tl) => tl.all_stream_keys(),
         }
     }
 
@@ -494,7 +526,9 @@ impl OverlayLayer {
             LayerKind::BandMath(bm) => ScratchDemand {
                 float_bands: bm.bands.len().min(4),
                 needs_u8_mask: bm.scl.is_some() && bm.style.scl_mask_enabled,
+                rgba_targets: 0,
             },
+            LayerKind::Timeline(tl) => tl.scratch_requirements(),
         }
     }
 
@@ -511,7 +545,7 @@ impl OverlayLayer {
                     None
                 }
             }
-            LayerKind::BandMath(_) => None,
+            LayerKind::BandMath(_) | LayerKind::Timeline(_) => None,
         }
     }
 
@@ -573,7 +607,7 @@ impl OverlayLayer {
             LayerKind::SingleRaster { asset, style, .. } => {
                 style.saved_style(asset.source().as_ref(), asset.meta().spec)
             }
-            LayerKind::BandMath(_) => None,
+            LayerKind::BandMath(_) | LayerKind::Timeline(_) => None,
         }
     }
 
@@ -612,6 +646,32 @@ impl OverlayLayer {
                 scl: bm.scl.as_ref().map(RasterAsset::persist_band_asset),
                 style: bm.style.to_spec(),
             },
+            LayerKind::Timeline(tl) => OverlayPersistEntry::Timeline {
+                title: self.name.clone(),
+                visible: self.visible,
+                opacity: self.opacity,
+                epochs: tl
+                    .epochs
+                    .iter()
+                    .map(|e| TimelineEpochPersistEntry {
+                        label: e.label.clone(),
+                        date_label: e.date_label.clone(),
+                        sort_key: e.sort_key.clone(),
+                        cloud_cover: e.cloud_cover,
+                        source: e.source.to_persist(),
+                    })
+                    .collect(),
+                recipe_preset: tl.recipe_preset,
+                band_math_style: tl.band_math_style.as_ref().map(BandMathStyle::to_spec),
+                single_style: tl.single_style.clone(),
+                active_idx: tl.active_idx,
+                compare: tl.compare,
+                max_cloud_cover: tl.max_cloud_cover,
+                diff_colormap: tl.diff_colormap,
+                diff_invert_colormap: tl.diff_invert_colormap,
+                diff_stretch_min: tl.diff_stretch_min,
+                diff_stretch_max: tl.diff_stretch_max,
+            },
         }
     }
 
@@ -638,7 +698,7 @@ impl OverlayLayer {
     pub(super) fn set_stretch_preset(&mut self, preset: super::StretchPreset) -> bool {
         match &mut self.kind {
             LayerKind::SingleRaster { style, .. } => style.set_stretch_preset(preset),
-            LayerKind::BandMath(_) => false,
+            LayerKind::BandMath(_) | LayerKind::Timeline(_) => false,
         }
     }
 
@@ -646,6 +706,16 @@ impl OverlayLayer {
         match &mut self.kind {
             LayerKind::SingleRaster { style, .. } => style.set_stretch_range(min, max),
             LayerKind::BandMath(bm) => bm.style.set_stretch_range(min, max),
+            LayerKind::Timeline(tl) => {
+                let changed = tl
+                    .band_math_style
+                    .as_mut()
+                    .is_some_and(|s| s.set_stretch_range(min, max));
+                if changed {
+                    let _ = tl.sync_band_math_style_to_epochs();
+                }
+                changed
+            }
         }
     }
 
@@ -657,13 +727,23 @@ impl OverlayLayer {
         match &mut self.kind {
             LayerKind::SingleRaster { style, .. } => style.set_colormap(colormap, invert),
             LayerKind::BandMath(bm) => bm.style.set_colormap(colormap, invert),
+            LayerKind::Timeline(tl) => {
+                let changed = tl
+                    .band_math_style
+                    .as_mut()
+                    .is_some_and(|s| s.set_colormap(colormap, invert));
+                if changed {
+                    let _ = tl.sync_band_math_style_to_epochs();
+                }
+                changed
+            }
         }
     }
 
     pub(super) fn set_categorical_palette(&mut self, palette: CategoricalPaletteId) -> bool {
         match &mut self.kind {
             LayerKind::SingleRaster { style, .. } => style.set_categorical_palette(palette),
-            LayerKind::BandMath(_) => false,
+            LayerKind::BandMath(_) | LayerKind::Timeline(_) => false,
         }
     }
 
@@ -675,6 +755,16 @@ impl OverlayLayer {
     ) -> bool {
         match &mut self.kind {
             LayerKind::BandMath(bm) => bm.style.set_rgb_stretch(min, max, gamma),
+            LayerKind::Timeline(tl) => {
+                let changed = tl
+                    .band_math_style
+                    .as_mut()
+                    .is_some_and(|s| s.set_rgb_stretch(min, max, gamma));
+                if changed {
+                    let _ = tl.sync_band_math_style_to_epochs();
+                }
+                changed
+            }
             LayerKind::SingleRaster { .. } => false,
         }
     }
@@ -682,33 +772,61 @@ impl OverlayLayer {
     pub(super) fn reset_band_math_stretch(&mut self) -> bool {
         match &mut self.kind {
             LayerKind::BandMath(bm) => bm.style.reset_stretch(),
+            LayerKind::Timeline(tl) => {
+                let changed = tl
+                    .band_math_style
+                    .as_mut()
+                    .is_some_and(BandMathStyle::reset_stretch);
+                if changed {
+                    let _ = tl.sync_band_math_style_to_epochs();
+                }
+                changed
+            }
             LayerKind::SingleRaster { .. } => false,
         }
     }
 
-    pub(super) fn set_band_math_scl_enabled(&mut self, enabled: bool) -> (bool, Option<StreamKey>) {
-        let LayerKind::BandMath(bm) = &mut self.kind else {
-            return (false, None);
-        };
-        if !bm.style.set_scl_mask_enabled(enabled) {
-            return (false, None);
-        }
-        let disabled_stream = if !enabled {
-            if let Some(scl) = &mut bm.scl {
-                scl.clear_wanted();
-                Some(scl.meta().stream_key())
-            } else {
-                None
+    pub(super) fn set_band_math_scl_enabled(&mut self, enabled: bool) -> (bool, Vec<StreamKey>) {
+        match &mut self.kind {
+            LayerKind::BandMath(bm) => {
+                if !bm.style.set_scl_mask_enabled(enabled) {
+                    return (false, Vec::new());
+                }
+                let mut disabled = Vec::new();
+                if !enabled && let Some(scl) = &mut bm.scl {
+                    scl.clear_wanted();
+                    disabled.push(scl.meta().stream_key());
+                }
+                (true, disabled)
             }
-        } else {
-            None
-        };
-        (true, disabled_stream)
+            LayerKind::Timeline(tl) => {
+                let changed = tl
+                    .band_math_style
+                    .as_mut()
+                    .is_some_and(|s| s.set_scl_mask_enabled(enabled));
+                if !changed {
+                    return (false, Vec::new());
+                }
+                let disabled = tl.sync_band_math_style_to_epochs();
+                (true, disabled)
+            }
+            LayerKind::SingleRaster { .. } => (false, Vec::new()),
+        }
     }
 
     pub(super) fn set_band_math_scl_mask_bits(&mut self, bits: u32) -> bool {
         match &mut self.kind {
             LayerKind::BandMath(bm) => bm.style.set_scl_mask_bits(bits),
+            LayerKind::Timeline(tl) => {
+                let changed = tl
+                    .band_math_style
+                    .as_mut()
+                    .is_some_and(|s| s.set_scl_mask_bits(bits));
+                if changed {
+                    let _ = tl.sync_band_math_style_to_epochs();
+                }
+                changed
+            }
             LayerKind::SingleRaster { .. } => false,
         }
     }
@@ -723,6 +841,7 @@ impl OverlayLayer {
                     a.observe_stream_tile_bytes(stream, bytes);
                 }
             }
+            LayerKind::Timeline(tl) => tl.observe_stream_tile_bytes(stream, bytes),
         }
     }
 
@@ -739,7 +858,76 @@ impl OverlayLayer {
     }
 
     pub(super) fn footprint(&self) -> Option<FootprintBounds> {
-        self.primary_asset().geo().footprint()
+        match &self.kind {
+            LayerKind::SingleRaster { asset, .. } => asset.geo().footprint(),
+            LayerKind::BandMath(bm) => bm.footprint(),
+            LayerKind::Timeline(tl) => tl.footprint(),
+        }
+    }
+
+    pub(super) fn source_pixel_size_m(&self) -> Option<(f64, f64)> {
+        match &self.kind {
+            LayerKind::SingleRaster { asset, .. } => asset.geo().source_pixel_size_m(),
+            LayerKind::BandMath(bm) => bm.source_pixel_size_m(),
+            LayerKind::Timeline(tl) => tl.source_pixel_size_m(),
+        }
+    }
+
+    /// Contribute this active layer's VRAM appetite weights into `seen_streams`
+    /// (deduplicating shared `StreamKey`s across layers) or `logical_extra`
+    /// (for future logical-pyramid layers such as `DemMosaic` with `N` geocells).
+    pub(super) fn contribute_appetite(
+        &self,
+        seen_streams: &mut Vec<(StreamKey, u64)>,
+        _logical_extra: &mut u64,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        // For Timeline layers, only count actively rendered epochs (`active` +
+        // comparison `ref`) in full appetite so adjacent prefetch streams stay
+        // lightly capped and never reduce the active epoch's LOD budget.
+        match &self.kind {
+            LayerKind::Timeline(tl) => {
+                let mut render_streams = Vec::new();
+                for idx in tl.render_epoch_indices().into_iter().flatten() {
+                    if let Some(content) = tl.epochs.get(idx).and_then(|e| e.ready_content()) {
+                        content.push_active_streams(&mut render_streams);
+                    }
+                }
+                for s in render_streams {
+                    let key = s.stream_key();
+                    let weight = (s.observed_tile_bytes() as u64).max(1024);
+                    if let Some((_, existing)) = seen_streams.iter_mut().find(|(k, _)| *k == key) {
+                        *existing = (*existing).max(weight);
+                    } else {
+                        seen_streams.push((key, weight));
+                    }
+                }
+            }
+            _ => {
+                for s in self.streams() {
+                    let key = s.stream_key();
+                    let weight = (s.observed_tile_bytes() as u64).max(1024);
+                    if let Some((_, existing)) = seen_streams.iter_mut().find(|(k, _)| *k == key) {
+                        *existing = (*existing).max(weight);
+                    } else {
+                        seen_streams.push((key, weight));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return this layer's standalone VRAM appetite weight in bytes (`0` when
+    /// inactive).
+    #[cfg(test)]
+    pub(super) fn appetite_weight_bytes(&self) -> u64 {
+        let mut seen = Vec::new();
+        let mut extra = 0u64;
+        self.contribute_appetite(&mut seen, &mut extra);
+        seen.into_iter()
+            .fold(extra, |acc, (_, w)| acc.saturating_add(w))
     }
 
     pub(super) fn is_active(&self) -> bool {
@@ -750,14 +938,15 @@ impl OverlayLayer {
         self.reload.is_in_progress()
     }
 
-    pub(super) fn begin_reload(&mut self, cancel: CancelToken) -> ReloadPrep {
+    pub(super) fn begin_reload(&mut self, cancel: CancelToken) -> Option<ReloadPrep> {
+        let old_source = self.single_asset()?.source_id();
         let (reload_seq, old_cancel) = self.reload.begin(cancel);
         self.clear_wanted();
-        ReloadPrep {
+        Some(ReloadPrep {
             reload_seq,
-            old_source: self.primary_asset().source_id(),
+            old_source,
             old_cancel,
-        }
+        })
     }
 
     pub(super) fn abort_reload(&mut self) {
@@ -779,11 +968,11 @@ impl OverlayLayer {
         source: Arc<dyn RasterSource>,
         frame: Frame,
         relaid: u64,
-    ) -> SourceId {
-        let primary = self.primary_asset();
-        let old_src = primary.source_id();
-        let old_override = primary.geo().crs_override().cloned();
-        let old_epoch = primary.geo().crs_override_epoch();
+    ) -> Option<SourceId> {
+        let asset = self.single_asset()?;
+        let old_src = asset.source_id();
+        let old_override = asset.geo().crs_override().cloned();
+        let old_epoch = asset.geo().crs_override_epoch();
         let saved_style = self.saved_style();
         let mut replacement = Self::from_source(
             self.id,
@@ -804,7 +993,7 @@ impl OverlayLayer {
             asset.geo_mut().set_crs_override_epoch(old_epoch);
         }
         *self = replacement;
-        old_src
+        Some(old_src)
     }
 
     pub(super) fn take_reload_cancel(&mut self) -> Option<CancelToken> {
@@ -813,12 +1002,18 @@ impl OverlayLayer {
 
     #[cfg(test)]
     pub(super) fn wanted(&self) -> &HashSet<TileKey> {
-        self.primary_asset().stream().wanted()
+        self.streams()
+            .next()
+            .expect("layer has at least one active stream")
+            .wanted()
     }
 
     #[cfg(test)]
     pub(super) fn wanted_shared(&self) -> Arc<Mutex<HashSet<TileKey>>> {
-        self.primary_asset().stream().wanted_shared()
+        self.streams()
+            .next()
+            .expect("layer has at least one active stream")
+            .wanted_shared()
     }
 
     #[cfg(test)]
@@ -826,6 +1021,20 @@ impl OverlayLayer {
         match &mut self.kind {
             LayerKind::SingleRaster { asset, .. } => asset.stream_mut().replace_wanted(tiles),
             LayerKind::BandMath(bm) => bm.bands[0].stream_mut().replace_wanted(tiles),
+            LayerKind::Timeline(tl) => {
+                if let Some(epoch) = tl.epochs.get_mut(tl.active_idx)
+                    && let Some(content) = epoch.ready_content_mut()
+                {
+                    match content {
+                        super::timeline::TimelineEpochContent::Single { asset, .. } => {
+                            asset.stream_mut().replace_wanted(tiles);
+                        }
+                        super::timeline::TimelineEpochContent::BandMath(bm) => {
+                            bm.bands[0].stream_mut().replace_wanted(tiles);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -839,6 +1048,13 @@ impl OverlayLayer {
                     a.clear_wanted();
                 }
             }
+            LayerKind::Timeline(tl) => tl.clear_all_wanted(),
+        }
+    }
+
+    pub(super) fn cancel_timeline_loading(&mut self) {
+        if let LayerKind::Timeline(tl) = &mut self.kind {
+            tl.cancel_all_loading();
         }
     }
 }

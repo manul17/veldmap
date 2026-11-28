@@ -41,8 +41,9 @@ pub use range::RANGE_BLOCK_SIZE;
 pub use range::{HttpRangeConfig, HttpRangeSource, PrefetchPin, RangeOpenError};
 pub use redact::sanitize_url_for_display;
 pub use stac::{
-    StacAsset, StacAuth, StacCatalogConfig, StacClient, StacError, StacItem, StacRasterBandMeta,
-    StacSearchQuery, StacSearchResult,
+    MAX_STAC_PAGINATED_ITEMS, StacAsset, StacAuth, StacCatalogConfig, StacClient, StacError,
+    StacItem, StacItemFlightCache, StacNextLink, StacNextMethod, StacRasterBandMeta,
+    StacSearchQuery, StacSearchResult, StacSortBy,
 };
 pub use url::{is_valid_http_endpoint, same_http_origin, sanitize_url_for_persistence};
 

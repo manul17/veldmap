@@ -51,6 +51,8 @@ const BIG_MAGIC: [&[u8]; 2] = [b"II\x2b\x00", b"MM\x00\x2b"];
 /// Classic TIFF file header signatures (`version = 42`).
 const CLASSIC_MAGIC: [&[u8]; 2] = [b"II\x2a\x00", b"MM\x00\x2a"];
 
+pub use open::read_tiff_datetime;
+
 /// Maximum number of IFD directories scanned during `open` to guard against
 /// malformed or pathological multi-IFD files.
 pub const MAX_IFDS: usize = 64;
