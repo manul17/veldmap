@@ -298,6 +298,7 @@ pub(crate) enum CursorReadoutValue {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CursorReadout {
     pub(crate) layer_name: String,
+    pub(crate) is_remote: bool,
     pub(crate) pixel: (u32, u32),
     pub(crate) source_pixel_size_m: Option<(f64, f64)>,
     pub(crate) units: Option<String>,

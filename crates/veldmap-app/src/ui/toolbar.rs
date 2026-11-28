@@ -215,7 +215,7 @@ pub(crate) fn show_top_toolbar(
             if ui
                 .button("Open…")
                 .on_hover_text(
-                    "Open local GeoTIFF / PNG / JPEG / GeoJSON / .veldmap.json project via native picker",
+                    "Open local GeoTIFF / world-file PNG or JPEG / GeoJSON / .veldmap.json project via native picker",
                 )
                 .clicked()
             {

@@ -95,6 +95,83 @@ jobs:
           print("English-only hygiene check passed.")
           EOF
 
+      - name: Check workspace DAG and presentation-only ui/ isolation
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re, sys, tomllib
+
+          errors = []
+
+          def collect_deps(manifest, sections):
+              deps = set()
+              for sec in sections:
+                  deps.update(manifest.get(sec, {}).keys())
+              for tgt in manifest.get("target", {}).values():
+                  if isinstance(tgt, dict):
+                      for sec in sections:
+                          deps.update(tgt.get(sec, {}).keys())
+              return deps
+
+          # 1. Strict 3-tier workspace DAG + dependency purity checks.
+          manifests = {
+              p.parent.name: tomllib.loads(p.read_text(encoding="utf-8"))
+              for p in sorted(pathlib.Path("crates").glob("*/Cargo.toml"))
+          }
+          core_forbidden = {
+              "tokio", "reqwest", "rusqlite", "image", "tiff",
+              "egui", "eframe", "wgpu", "rfd", "directories",
+          }
+          app_forbidden_direct = {"serde_json", "reqwest", "tokio", "rusqlite", "tiff"}
+          middle_crates = {"veldmap-raster", "veldmap-storage", "veldmap-net"}
+
+          for crate_name, data in manifests.items():
+              prod_deps = collect_deps(data, ("dependencies", "build-dependencies"))
+              dev_deps = collect_deps(data, ("dev-dependencies",))
+              ws_prod = {d for d in prod_deps if d.startswith("veldmap-")}
+              ws_dev = {d for d in dev_deps if d.startswith("veldmap-")}
+
+              if crate_name == "veldmap-core":
+                  if ws_prod:
+                      errors.append(f"veldmap-core must have no workspace deps, found: {sorted(ws_prod)}")
+                  bad_dev = ws_dev - {"veldmap-core"}
+                  if bad_dev:
+                      errors.append(f"veldmap-core dev-deps may not depend on: {sorted(bad_dev)}")
+                  bad_ext = (prod_deps | dev_deps) & core_forbidden
+                  if bad_ext:
+                      errors.append(f"veldmap-core imports forbidden crate(s): {sorted(bad_ext)}")
+              elif crate_name in middle_crates:
+                  bad_prod = ws_prod - {"veldmap-core"}
+                  if bad_prod:
+                      errors.append(f"{crate_name} violates zero-horizontal-deps rule: {sorted(bad_prod)}")
+                  bad_dev = ws_dev - {"veldmap-core", crate_name}
+                  if bad_dev:
+                      errors.append(f"{crate_name} dev-deps violate zero-horizontal-deps rule: {sorted(bad_dev)}")
+              elif crate_name == "veldmap-app":
+                  bad_direct = prod_deps & app_forbidden_direct
+                  if bad_direct:
+                      errors.append(f"veldmap-app must not directly depend on: {sorted(bad_direct)}")
+
+          # 2. Presentation-only ui/ isolation check (strip comments first).
+          comment_re = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+          ui_forbidden = re.compile(
+              r"\b(veldmap_net|veldmap_raster|veldmap_storage|wgpu|egui_wgpu|rfd|"
+              r"reqwest|tokio|rusqlite|serde_json|OverlayManager|VectorManager|"
+              r"BasemapManager|StacSession|MeasureSession|SceneState|GlobeRenderer)\b|"
+              r"\bcrate::(render|scene|gpu_tiles|app)\b"
+          )
+          for rs_path in sorted(pathlib.Path("crates/veldmap-app/src/ui").rglob("*.rs")):
+              stripped = comment_re.sub("", rs_path.read_text(encoding="utf-8"))
+              for match in ui_forbidden.finditer(stripped):
+                  errors.append(f"{rs_path}: forbidden ui/ reference `{match.group(0)}`")
+
+          if errors:
+              print("Architecture boundary check failed:", file=sys.stderr)
+              for err in errors:
+                  print(f"  - {err}", file=sys.stderr)
+              sys.exit(1)
+          print("Workspace DAG and ui/ isolation checks passed.")
+          EOF
+
       - name: Check offline markdown links in docs/ and root markdown
         uses: lycheeverse/lychee-action@v2
         with:

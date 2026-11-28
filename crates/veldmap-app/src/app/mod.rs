@@ -1,7 +1,8 @@
 //! Thin `eframe::App` shell coordinating globe input, GIS HUD layout,
-//! collapsible `Layers` / `Cloud / STAC` workbench, storage/session persistence,
-//! native file dialogs, geodesic measurement, AOI drawing, CRS overrides, and
-//! [`SceneState`] frame updates.
+//! collapsible `Layers` / `Cloud / STAC` workbench, split-screen swipe,
+//! cartographic PNG export, `session.json` & `.veldmap.json` project
+//! persistence, native file dialogs, geodesic measurement, AOI drawing, CRS
+//! overrides, and [`SceneState`] frame updates.
 
 mod actions;
 mod dialogs;
@@ -24,7 +25,7 @@ use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
 use crate::gpu_tiles::UploadChannelClosed;
-use crate::layers::OverlayEdit;
+use crate::layers::{LayerSummary, OverlayEdit};
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::scene::{SceneRepaintHint, SceneState};
 use crate::stac::{AuthTrust, StacSession};
@@ -507,18 +508,19 @@ impl VeldmapApp {
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         frame: &eframe::Frame,
-    ) -> bool {
+    ) -> (bool, Option<Vec<LayerSummary>>) {
         if !self.panels.workbench_open {
-            return false;
+            return (false, None);
         }
         let total_layers = self.scene.total_layer_count();
-        let layer_summaries = if self.panels.workbench_tab == WorkbenchTab::Layers {
+        let fetched_layer_summaries = self.panels.workbench_tab == WorkbenchTab::Layers;
+        let layer_summaries = if fetched_layer_summaries {
             self.scene.overlays().layer_summaries()
         } else {
             Vec::new()
         };
         let vector_summaries = self.scene.vectors().summaries();
-        let visible_notices = if self.panels.workbench_tab == WorkbenchTab::Layers {
+        let visible_notices = if fetched_layer_summaries {
             self.restore_tracker.visible_notices()
         } else {
             Vec::new()
@@ -541,6 +543,8 @@ impl VeldmapApp {
             &mut self.panels.layers,
             &mut self.panels.stac,
         );
+        let reusable_summaries =
+            (fetched_layer_summaries && wb_out.layer_actions.is_empty()).then_some(layer_summaries);
         let mut needs_repaint = self.apply_layer_actions(wb_out.layer_actions, frame);
         needs_repaint |= self.apply_stac_actions(wb_out.stac_actions, ctx);
         if wb_out.close_requested {
@@ -550,7 +554,7 @@ impl VeldmapApp {
             self.open_workbench_tab(tab);
             needs_repaint = true;
         }
-        needs_repaint
+        (needs_repaint, reusable_summaries)
     }
 
     fn copy_coord_to_clipboard(&mut self, ctx: &egui::Context, label: &str, text: String) {
@@ -563,11 +567,13 @@ impl VeldmapApp {
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         frame: &eframe::Frame,
+        cached_layer_summaries: Option<Vec<LayerSummary>>,
     ) -> (Option<egui::Rect>, bool) {
         let mut viewport_rect = None;
         let mut viewport_needs_repaint = false;
         let swipe_reconcile_summaries = if self.swipe.is_active() {
-            let s = self.scene.overlays().layer_summaries();
+            let s =
+                cached_layer_summaries.unwrap_or_else(|| self.scene.overlays().layer_summaries());
             if self.swipe.reconcile_layers(&s) {
                 self.persist_session_snapshot(false, &[]);
             }
@@ -1009,9 +1015,11 @@ impl eframe::App for VeldmapApp {
             },
         );
 
-        needs_repaint |= self.show_workbench_if_open(&ctx, ui, frame);
+        let (wb_repaint, cached_summaries) = self.show_workbench_if_open(&ctx, ui, frame);
+        needs_repaint |= wb_repaint;
 
-        let (viewport_rect, viewport_repaint) = self.show_globe_viewport(&ctx, ui, frame);
+        let (viewport_rect, viewport_repaint) =
+            self.show_globe_viewport(&ctx, ui, frame, cached_summaries);
         needs_repaint |= viewport_repaint;
         let scene_hint = self.scene.end_frame();
 

@@ -268,23 +268,33 @@ impl OverlayManager {
             .flat_map(|l| l.streams().map(|s| s.stream_key()))
             .collect();
         let flat_stats = self.runtime.layer_flight_stats(all_stream_keys);
-        let mut cursor_idx = 0usize;
+        let mut stats_iter = flat_stats.into_iter();
         let len = layers.len();
-        layers
+        let summaries = layers
             .iter()
             .enumerate()
             .map(|(idx, layer)| {
                 let count = layer.active_stream_count();
                 let mut in_flight = 0usize;
                 let mut pass_active = false;
-                for &(f, p) in &flat_stats[cursor_idx..cursor_idx + count] {
+                let mut consumed = 0usize;
+                for (f, p) in stats_iter.by_ref().take(count) {
                     in_flight = in_flight.saturating_add(f);
                     pass_active |= p;
+                    consumed += 1;
                 }
-                cursor_idx += count;
+                debug_assert_eq!(
+                    consumed, count,
+                    "layer active_stream_count() must match streams().count()"
+                );
                 layer.to_summary(in_flight, pass_active, idx + 1 < len, idx > 0)
             })
-            .collect()
+            .collect();
+        debug_assert!(
+            stats_iter.next().is_none(),
+            "all layer stream flight stats should be consumed"
+        );
+        summaries
     }
 
     /// Number of loaded raster layers (O(1), lock-free).

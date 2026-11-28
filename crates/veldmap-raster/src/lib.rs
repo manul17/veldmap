@@ -1,8 +1,8 @@
 //! Native raster decoding, bounded CPU decode pools, linear-light &
 //! NaN-skipping mipmap generation, lossless `Qoi` / byte-shuffled `Lz4Raw`
-//! tile codecs, virtual offline equirectangular basemap tiling, PNG/JPEG
-//! world-file adapters, and analytical GeoTIFF/BigTIFF/COG pyramid decoding
-//! for VeldMap.
+//! tile codecs, RGBA8 PNG encoding (`encode_png_rgba8`), virtual offline
+//! equirectangular basemap tiling, PNG/JPEG world-file adapters, and analytical
+//! GeoTIFF/BigTIFF/COG pyramid decoding for VeldMap.
 //!
 //! Keeps `veldmap-core` permanently free of image/codec dependencies and keeps
 //! `veldmap-net` decoupled from raster codecs via an injected decode executor.

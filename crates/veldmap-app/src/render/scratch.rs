@@ -42,6 +42,11 @@ impl ScratchDemand {
         needs_u8_mask: false,
     };
 
+    /// Whether zero scratch targets of any kind are requested.
+    pub(crate) const fn is_empty(self) -> bool {
+        self.float_bands == 0 && !self.needs_u8_mask
+    }
+
     /// Combine two demands into the shared pool capacity covering both.
     pub(crate) const fn merge(self, other: Self) -> Self {
         Self {
@@ -197,7 +202,7 @@ impl ScratchTargetPool {
     }
 
     /// Ensure scratch targets match `(width, height, demand)`, releasing all
-    /// scratch VRAM immediately when `demand.float_bands == 0`.
+    /// scratch VRAM immediately when `demand.is_empty()`.
     pub(super) fn ensure(
         &mut self,
         device: &wgpu::Device,
@@ -208,7 +213,7 @@ impl ScratchTargetPool {
     ) {
         let float_bands = demand.float_bands.min(4);
         let needs_mask = demand.needs_u8_mask;
-        if float_bands == 0 || width == 0 || height == 0 {
+        if demand.is_empty() || width == 0 || height == 0 {
             self.allocated = None;
             return;
         }

@@ -165,12 +165,14 @@ fn build_readout(
     pixel: (u32, u32),
     value: CursorReadoutValue,
 ) -> CursorReadout {
+    let is_remote = layer.is_remote();
     match layer.kind() {
         LayerKind::SingleRaster { asset, style, .. } => {
             let spec = asset.meta().spec;
             let band_info = asset.source().description().band_info(spec.band);
             CursorReadout {
                 layer_name: layer.name().to_owned(),
+                is_remote,
                 pixel,
                 source_pixel_size_m: asset.geo().source_pixel_size_m(),
                 units: band_info.and_then(|b| b.units.clone()),
@@ -182,6 +184,7 @@ fn build_readout(
         }
         LayerKind::BandMath(bm) => CursorReadout {
             layer_name: layer.name().to_owned(),
+            is_remote,
             pixel,
             source_pixel_size_m: bm.primary_asset().geo().source_pixel_size_m(),
             units: bm.output_units(),

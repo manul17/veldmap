@@ -7,7 +7,7 @@
 //! ## Modules
 //! - [`budget`] — Pure host-RAM-scaled [`budget::MemoryBudget`] math.
 //! - [`geo`] — WGS84 geodesy, Krueger & pure-Rust `proj4rs`/`proj4wkt` CRS
-//!   projections, MGRS/DD/DMS parsing, Karney geodesics, GeoJSON/WKT &
+//!   projections, MGRS/DD/DMS parsing & formatting, Karney geodesics, GeoJSON/WKT &
 //!   spherical tessellation, encapsulated raster [`geo::Frame`] bindings,
 //!   nadir `f64` Reverse-Z [`geo::Camera`], and oblate culling.
 //! - [`io`] — Synchronous caller-buffered [`io::ByteSource`] &

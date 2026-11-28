@@ -1,7 +1,8 @@
 //! Individual STAC search result card displaying precomputed scene metadata
 //! (`processing_level` L1C/L2A & `platform` badges), 1-click Band Math scene
-//! recipes (`True Color`, `NDVI + SCL`, `NDWI + SCL`, `False Color NIR`,
-//! `SWIR`), primary COG stream trigger, camera zoom button, and asset picker.
+//! recipes (`True Color`, `NDVI + SCL`, `NDWI + SCL`, `NBR + SCL`,
+//! `NDSI + SCL`, `False Color NIR`, `SWIR`), primary COG stream trigger,
+//! camera zoom button, and asset picker.
 
 use eframe::egui;
 

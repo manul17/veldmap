@@ -1,16 +1,19 @@
 //! Standalone offscreen `wgpu` WGS84 quadtree globe renderer (`GlobeRenderer`).
 //!
 //! Renders in two distinct phases:
-//! 1. **Pass 1 (Opaque globe body):** `Rgba8UnormSrgb` color clear +
-//!    `Depth32Float` Reverse-Z (`TRANSIENT_ATTACHMENT`, `StoreOp::Discard`).
+//! 1. **Pass 1 (Opaque globe body):** `Rgba8UnormSrgb` color clear (`COPY_SRC`
+//!    for clean-frame PNG export readback) + `Depth32Float` Reverse-Z
+//!    (`TRANSIENT_ATTACHMENT`, `StoreOp::Discard`).
 //! 2. **Pass 2 (Segmented depth-less post-body overlays, Band Math scratch
-//!    passes, vectors & procedural graticule):** `depth_stencil_attachment: None`,
-//!    `LoadOp::Load` over the globe body. Consecutive direct display / scientific
-//!    (`R32Float`) / categorical (`R8Uint`/`R16Uint`) warp meshes batch together,
-//!    while each multi-asset `BandMath` layer interleaves lazy shared
-//!    `R32Float` + `R8Uint` `SCL` scratch passes ([`super::scratch::ScratchTargetPool`])
-//!    and a scissored fullscreen composite in exact painter's order before
-//!    draped vectors and the procedural graticule.
+//!    passes, split-screen swipe scissors, vectors & procedural graticule):**
+//!    `depth_stencil_attachment: None`, `LoadOp::Load` over the globe body.
+//!    Consecutive direct display / scientific (`R32Float`) / categorical
+//!    (`R8Uint`/`R16Uint`) warp meshes batch together, while each multi-asset
+//!    `BandMath` layer interleaves lazy shared `R32Float` + `R8Uint` `SCL`
+//!    scratch passes ([`super::scratch::ScratchTargetPool`]) and a scissored
+//!    fullscreen composite in exact painter's order (intersected with
+//!    [`super::swipe::ResolvedSwipe`] before scratch passes) before restoring
+//!    the full viewport scissor for draped vectors and the procedural graticule.
 
 use veldmap_core::tile::{POLAR_R_CAP, PixelFormat};
 

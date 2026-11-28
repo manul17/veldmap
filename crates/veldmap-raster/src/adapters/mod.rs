@@ -16,7 +16,7 @@ pub(super) fn world_file_binding_trouble(
 ) -> Option<String> {
     match placement {
         None => Some(format!(
-            "{format_name} has no accompanying world file ({ext_hint}); add a world file + .prj or assign a CRS"
+            "{format_name} has no accompanying world file ({ext_hint}); add a world file + .prj to place it on the globe"
         )),
         Some(p) if p.crs.is_none() => Some(crate::sidecar::missing_prj_trouble(&format!(
             "{format_name} has a world file ({ext_hint})"

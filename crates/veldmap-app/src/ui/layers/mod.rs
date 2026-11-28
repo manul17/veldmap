@@ -211,7 +211,10 @@ fn show_open_prompt(
     actions: &mut Vec<LayerUiAction>,
 ) {
     ui.label(
-        egui::RichText::new("Local GeoTIFF / PNG / JPEG / GeoJSON path (or drag & drop):").small(),
+        egui::RichText::new(
+            "Local GeoTIFF / world-file PNG or JPEG / GeoJSON path (or drag & drop):",
+        )
+        .small(),
     );
     ui.horizontal(|ui| {
         let resp = ui.add(
@@ -345,7 +348,7 @@ pub(crate) fn show_layers_tab_contents(
     if total == 0 {
         ui.weak("No raster or GeoJSON layers loaded.");
         ui.weak(
-            "Drop a GeoTIFF/PNG/JPEG/GeoJSON onto the globe, click Open…, or stream a public COG from the Cloud / STAC tab.",
+            "Drop a GeoTIFF, world-file PNG/JPEG, or GeoJSON onto the globe, click Open…, or stream a public COG from the Cloud / STAC tab.",
         );
         return actions;
     }

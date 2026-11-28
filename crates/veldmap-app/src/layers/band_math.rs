@@ -116,6 +116,8 @@ pub(crate) enum BandMathPreset {
     TrueColor,
     Ndvi,
     Ndwi,
+    Nbr,
+    Ndsi,
     FalseColorNir,
     Swir,
     CustomNormalizedDiff,
@@ -130,7 +132,9 @@ impl BandMathPreset {
             Self::TrueColor | Self::FalseColorNir | Self::Swir | Self::CustomRgb => {
                 BandMathFormula::RgbComposite
             }
-            Self::Ndvi | Self::Ndwi | Self::CustomNormalizedDiff => BandMathFormula::NormalizedDiff,
+            Self::Ndvi | Self::Ndwi | Self::Nbr | Self::Ndsi | Self::CustomNormalizedDiff => {
+                BandMathFormula::NormalizedDiff
+            }
             Self::CustomDifference => BandMathFormula::Difference,
             Self::CustomRatio => BandMathFormula::Ratio,
         }
@@ -141,6 +145,8 @@ impl BandMathPreset {
             Self::TrueColor => "True Color",
             Self::Ndvi => "NDVI",
             Self::Ndwi => "NDWI",
+            Self::Nbr => "NBR",
+            Self::Ndsi => "NDSI",
             Self::FalseColorNir => "False Color NIR",
             Self::Swir => "SWIR",
             Self::CustomNormalizedDiff => "Norm. Diff",
@@ -152,8 +158,8 @@ impl BandMathPreset {
 
     pub(crate) const fn default_colormap(self) -> ColormapId {
         match self {
-            Self::Ndvi | Self::CustomNormalizedDiff => ColormapId::RdYlGn,
-            Self::Ndwi => ColormapId::BrBG,
+            Self::Ndvi | Self::Nbr | Self::CustomNormalizedDiff => ColormapId::RdYlGn,
+            Self::Ndwi | Self::Ndsi => ColormapId::BrBG,
             Self::CustomDifference => ColormapId::RdBu,
             _ => ColormapId::Viridis,
         }
@@ -163,6 +169,8 @@ impl BandMathPreset {
         match self {
             Self::Ndvi => (-0.2, 0.9),
             Self::Ndwi => (-0.5, 0.5),
+            Self::Nbr => (-0.5, 0.8),
+            Self::Ndsi => (-0.2, 0.8),
             Self::CustomNormalizedDiff => (-1.0, 1.0),
             Self::CustomDifference => (-0.5, 0.5),
             Self::CustomRatio => (0.0, 3.0),

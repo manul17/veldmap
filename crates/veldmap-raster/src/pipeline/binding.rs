@@ -141,8 +141,9 @@ pub fn frame_from_description_with_override(
     }
 
     Err(RasterError::Binding(
-        desc.binding_trouble
-            .clone()
-            .unwrap_or_else(|| "raster carries no supported georeference binding".to_owned()),
+        desc.binding_trouble.clone().unwrap_or_else(|| {
+            "raster carries no supported georeference binding (requires embedded GeoTIFF tags/tie points or a world file + .prj sidecar)"
+                .to_owned()
+        }),
     ))
 }

@@ -132,7 +132,7 @@ impl ViewportState {
         height: u32,
         demand: ScratchDemand,
     ) {
-        if demand.float_bands == 0 {
+        if demand.is_empty() {
             if let Some(pool) = &mut self.scratch {
                 pool.release();
             }

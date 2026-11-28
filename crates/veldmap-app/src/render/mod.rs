@@ -6,10 +6,12 @@
 //! rendering in exact painter's order: direct display / scientific (`R32Float`)
 //! / categorical (`R8Uint`/`R16Uint`) raster warp meshes, multi-asset
 //! screen-space `BandMath` + `SCL` masking (backed by the lazy shared
-//! quiet-`NaN`-filled `R32Float` + `R8Uint` `ScratchTargetPool` with
-//! co-grid MRT & clamped scissor bounds), draped GeoJSON / measurement / STAC
-//! AOI & HiDPI ribbon/hatch vector overlays, and the post-overlay procedural
-//! `fwidth()` graticule, then composites 1:1 with `FilterMode::Nearest` onto
+//! `R32Float` + `R8Uint` `ScratchTargetPool` with co-grid MRT & clamped
+//! scissor bounds), split-screen swipe curtain scissor clipping
+//! ([`SwipeRenderState`]), draped GeoJSON / measurement / STAC AOI & HiDPI
+//! ribbon/hatch vector overlays, and the post-overlay procedural `fwidth()`
+//! graticule, supports clean-frame `COPY_SRC` offscreen PNG readback
+//! ([`OffscreenReadback`]), and composites 1:1 with `FilterMode::Nearest` onto
 //! `egui_wgpu`'s target format via `view_formats`.
 
 mod bind_groups;

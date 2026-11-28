@@ -1,6 +1,7 @@
 //! `egui` workstation UI chrome: top toolbar, collapsible `Layers` | `Cloud /
-//! STAC` workbench, 3-tab Settings modal, CRS picker, geodesic measurement
-//! panel, status bar, and floating GIS HUD widgets.
+//! STAC` workbench, 3-tab Settings modal, Export PNG modal, CRS picker,
+//! geodesic measurement panel, status bar, and floating GIS HUD widgets
+//! (including split-screen swipe controls).
 
 pub(crate) mod basemap;
 pub(crate) mod crs_picker;

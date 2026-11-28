@@ -29,9 +29,9 @@ fn main() -> eframe::Result<()> {
             }
             if flag == "-h" || flag == "--help" {
                 println!(
-                    "Usage: veldmap [OPTIONS] [RASTER_OR_GEOJSON_PATH...]\n\
+                    "Usage: veldmap [OPTIONS] [FILE_PATH...]\n\
                      \n\
-                     Supported files: GeoTIFF/BigTIFF/COG, PNG/JPEG (with world-file/.prj sidecars), GeoJSON.\n\
+                     Supported files: GeoTIFF/BigTIFF/COG, PNG/JPEG (with world-file/.prj sidecars), GeoJSON, .veldmap.json projects.\n\
                      \n\
                      Options:\n\
                        -h, --help     Print this help message\n\

@@ -275,13 +275,25 @@ pub(crate) fn format_cursor_readout(readout: &CursorReadout) -> (String, String)
             format!("n/a @ ({},{})", readout.pixel.0, readout.pixel.1)
         }
     };
-    let tip = match hover_extra {
+    let remote_cache_hint = readout.is_remote
+        && match &readout.value {
+            CursorReadoutValue::Unavailable => true,
+            CursorReadoutValue::BandMath(bm) => bm
+                .channels
+                .iter()
+                .any(|(_, s)| matches!(s, BandChannelSample::Unavailable)),
+            _ => false,
+        };
+    let mut tip = match hover_extra {
         Some(details) => format!(
             "Native base-resolution readout: {}\n{details}",
             readout.layer_name
         ),
         None => format!("Native base-resolution readout: {}", readout.layer_name),
     };
+    if remote_cache_hint {
+        tip.push_str("\nRemote COG hover is cache-only: zoom in to load native-resolution tiles.");
+    }
     (val_text, tip)
 }
 
@@ -339,5 +351,29 @@ mod tests {
         assert_eq!(format_mgrs_compact(f64::NAN, 0.0), "—");
         assert!(format_mgrs_copy(-85.0, 10.0).starts_with("UPS S ("));
         assert_eq!(format_mgrs_copy(f64::NAN, 0.0), "—");
+    }
+
+    #[test]
+    fn remote_unavailable_cursor_readout_tooltip_explains_cache_only_zoom_behavior() {
+        let base = CursorReadout {
+            layer_name: "S2 Red".to_owned(),
+            is_remote: true,
+            pixel: (10, 20),
+            source_pixel_size_m: Some((10.0, 10.0)),
+            units: None,
+            has_affine_scaling: false,
+            log10_db: false,
+            value: CursorReadoutValue::Unavailable,
+        };
+        let (text, tip) = format_cursor_readout(&base);
+        assert_eq!(text, "n/a @ (10,20)");
+        assert!(tip.contains("cache-only"), "expected remote hint: {tip}");
+
+        let local = CursorReadout {
+            is_remote: false,
+            ..base
+        };
+        let (_, local_tip) = format_cursor_readout(&local);
+        assert!(!local_tip.contains("cache-only"));
     }
 }

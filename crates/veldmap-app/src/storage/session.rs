@@ -131,6 +131,8 @@ wire_enum!(WireBandMathPreset <-> BandMathPreset {
     TrueColor,
     Ndvi,
     Ndwi,
+    Nbr,
+    Ndsi,
     FalseColorNir,
     Swir,
     CustomNormalizedDiff,
