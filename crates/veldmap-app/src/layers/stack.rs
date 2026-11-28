@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use veldmap_core::geo::CullFrustum;
 use veldmap_core::tile::{SourceId, StreamKey, TileKey};
 
 use crate::render::ScratchDemand;
@@ -97,11 +98,27 @@ impl LayerStack {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn total_appetite_weight_bytes(&self) -> u64 {
         let mut seen: Vec<(StreamKey, u64)> = Vec::new();
         let mut logical_extra = 0u64;
         for layer in &self.layers {
             layer.contribute_appetite(&mut seen, &mut logical_extra);
+        }
+        seen.into_iter()
+            .fold(logical_extra, |acc, (_, w)| acc.saturating_add(w))
+    }
+
+    /// Sum VRAM appetite weights strictly across active layers whose footprint
+    /// intersects the current camera `frustum` so off-screen overlays never
+    /// starve the basemap or on-screen layers.
+    pub(super) fn visible_appetite_weight_bytes(&mut self, frustum: &CullFrustum) -> u64 {
+        let mut seen: Vec<(StreamKey, u64)> = Vec::new();
+        let mut logical_extra = 0u64;
+        for layer in &mut self.layers {
+            if layer.intersects_frustum(frustum) {
+                layer.contribute_appetite(&mut seen, &mut logical_extra);
+            }
         }
         seen.into_iter()
             .fold(logical_extra, |acc, (_, w)| acc.saturating_add(w))

@@ -30,7 +30,10 @@ mod tiff;
 mod tile_codec;
 
 pub use adapters::{JpegSource, PngSource};
-pub use basemap::{BundledBasemap, BundledBasemapConfig, decode_map_tile_with_mipmaps};
+pub use basemap::{
+    BundledBasemap, BundledBasemapConfig, POLAR_RIM_BINS, PolarRimPyramid,
+    decode_map_tile_with_mipmaps, extract_srgb_rim_row, render_harmonic_polar_cap_with_mipmaps,
+};
 pub use image_codec::{encode_png_rgba8, has_jpeg_magic, has_png_magic};
 pub use mipmap::generate_tile_mipmaps;
 pub use open::{

@@ -200,3 +200,65 @@ fn hovering_already_selected_item_skips_highlight_rebuild() {
     assert!(session.set_hovered(Some(1)));
     assert_ne!(session.rev(), rev_selected_0);
 }
+
+#[test]
+fn earth_scale_bbox_aoi_tessellates_compactly_and_splits_global_spans() {
+    let mut session = test_session();
+
+    // Continental Earth-scale bbox (like clicking Viewport at 7,400 km altitude):
+    // adaptive chord must keep triangle count compact (thousands, never 500k).
+    assert!(session.set_aoi_bbox([-3.0, 16.0, 103.0, 68.5], "Viewport".to_owned()));
+    let mut layers = Vec::new();
+    session.push_draw_layers(&mut layers);
+    assert_eq!(layers.len(), 1);
+    let tris = layers[0].mesh.fill_triangle_count();
+    assert!(
+        tris > 10 && tris < 20_000,
+        "expected compact Earth-scale AOI mesh (10..20k tris), got {tris}"
+    );
+
+    // Full polar/global longitude span [-180, 20, 180, 89.9] renders as a single
+    // closed parallel-circle cap (compact triangles, no interior meridian seam).
+    assert!(session.set_aoi_bbox([-180.0, 20.0, 180.0, 89.9], "Viewport".to_owned()));
+    layers.clear();
+    session.push_draw_layers(&mut layers);
+    assert_eq!(layers.len(), 1);
+    let polar_tris = layers[0].mesh.fill_triangle_count();
+    assert!(
+        polar_tris > 20 && polar_tris < 30_000,
+        "expected compact global/polar AOI mesh, got {polar_tris}"
+    );
+    // Exported GeoJSON for polar [-180, 20, 180, 89.9] splits into <=120° slices
+    // so every ring is non-degenerate CCW (never a zero-area ±180° slit).
+    let polar_json = session.export_aoi_geojson().expect("polar geojson");
+    assert!(polar_json.contains("\"MultiPolygon\""));
+
+    // Zoomed-in high-latitude polar cap [-180, 88.2, 180, 89.9] must NEVER
+    // collapse to 0 fill triangles.
+    assert!(session.set_aoi_bbox([-180.0, 88.2, 180.0, 89.9], "Viewport".to_owned()));
+    layers.clear();
+    session.push_draw_layers(&mut layers);
+    assert_eq!(layers.len(), 1);
+    let tight_polar_tris = layers[0].mesh.fill_triangle_count();
+    assert!(
+        tight_polar_tris > 20 && tight_polar_tris < 10_000,
+        "expected valid zoomed-in polar cap mesh, got {tight_polar_tris}"
+    );
+
+    // Full-Earth [-180, -89.9, 180, 89.9] stays compact and exports cleanly.
+    assert!(session.set_aoi_bbox([-180.0, -89.9, 180.0, 89.9], "Viewport".to_owned()));
+    layers.clear();
+    session.push_draw_layers(&mut layers);
+    assert_eq!(layers.len(), 1);
+    let earth_tris = layers[0].mesh.fill_triangle_count();
+    assert!(
+        earth_tris > 20 && earth_tris < 30_000,
+        "expected compact full-Earth AOI mesh, got {earth_tris}"
+    );
+
+    // Wide non-polar bbox [-110, 20, 110, 80] (220° > 180°) splits into <=120°
+    // exported slices so RFC 7946 winding never flips clockwise.
+    assert!(session.set_aoi_bbox([-110.0, 20.0, 110.0, 80.0], "Wide".to_owned()));
+    let wide_json = session.export_aoi_geojson().expect("wide geojson");
+    assert!(wide_json.contains("\"MultiPolygon\""));
+}

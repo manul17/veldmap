@@ -9,7 +9,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
-use veldmap_core::geo::{FootprintBounds, Frame};
+use veldmap_core::geo::{CullFrustum, FootprintBounds, Frame};
 use veldmap_core::sync::CancelToken;
 #[cfg(test)]
 use veldmap_core::tile::TileKey;
@@ -870,6 +870,47 @@ impl OverlayLayer {
             LayerKind::SingleRaster { asset, .. } => asset.geo().source_pixel_size_m(),
             LayerKind::BandMath(bm) => bm.source_pixel_size_m(),
             LayerKind::Timeline(tl) => tl.source_pixel_size_m(),
+        }
+    }
+
+    /// Return whether any actively rendered asset of this layer intersects the
+    /// camera `frustum` (O(1) coarsest-level bounding sphere check).
+    pub(super) fn intersects_frustum(&mut self, frustum: &CullFrustum) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        fn band_math_intersects(bm: &mut BandMathLayerData, frustum: &CullFrustum) -> bool {
+            bm.bands
+                .iter_mut()
+                .any(|b| b.geo_mut().intersects_frustum(frustum))
+                || (bm.style.scl_mask_enabled
+                    && bm
+                        .scl
+                        .as_mut()
+                        .is_some_and(|s| s.geo_mut().intersects_frustum(frustum)))
+        }
+        match &mut self.kind {
+            LayerKind::SingleRaster { asset, .. } => asset.geo_mut().intersects_frustum(frustum),
+            LayerKind::BandMath(bm) => band_math_intersects(bm, frustum),
+            LayerKind::Timeline(tl) => {
+                for idx in tl.render_epoch_indices().into_iter().flatten() {
+                    if let Some(content) = tl.epochs.get_mut(idx).and_then(|e| e.ready_content_mut())
+                    {
+                        let hit = match content {
+                            super::timeline::TimelineEpochContent::Single { asset, .. } => {
+                                asset.geo_mut().intersects_frustum(frustum)
+                            }
+                            super::timeline::TimelineEpochContent::BandMath(bm) => {
+                                band_math_intersects(bm, frustum)
+                            }
+                        };
+                        if hit {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
         }
     }
 

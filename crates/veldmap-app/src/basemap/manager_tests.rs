@@ -178,11 +178,13 @@ fn unavailable_live_pipeline_degrades_cleanly_to_full_bundled_basemap() {
     );
     let mut pending = PendingUploads::new();
     let tx = pending.sender().expect("sender");
+    let polar_rim = Arc::new(PolarRimTracker::new());
     let bundled_provider = BundledBasemapProvider::new(
         decode_pool.handle(),
         tx,
         Arc::new(|| {}),
         decode_shutdown.clone(),
+        Arc::clone(&polar_rim),
     );
     let mut manager = BasemapManager {
         active_basemap: BasemapSelection::EoxSentinel2Cloudless,
@@ -192,6 +194,9 @@ fn unavailable_live_pipeline_degrades_cleanly_to_full_bundled_basemap() {
         active_live_spec: None,
         config_error: None,
         observed_live_tile_bytes: 0,
+        polar_rim,
+        polar_revs: [0, 0],
+        polar_fallback_revs: [0, 0],
         wanted_bundled: HashSet::new(),
         wanted_live: HashSet::new(),
     };
@@ -322,6 +327,7 @@ fn rejected_or_cancelled_decode_request_signals_aborted() {
         done_tx,
         wakeup: Arc::new(|| {}),
         shutdown: shutdown.clone(),
+        polar_rim: Arc::new(PolarRimTracker::new()),
     };
 
     let cancel = CancelToken::new();
@@ -391,4 +397,127 @@ fn in_place_custom_xyz_spec_edit_marks_changed_without_evicting_source() {
     let noop = h.manager.sync_settings(settings.basemap_config());
     assert!(!noop.changed);
     assert_eq!(noop.evict_source, None);
+}
+
+#[test]
+fn tight_live_budget_prioritizes_center_tiles_and_rim_ingestion_bumps_polar_rev() {
+    let settings = AppSettings {
+        active_basemap: BasemapSelection::NasaGibsBlueMarble,
+        ..AppSettings::default()
+    };
+    let mut h = BasemapTestHarness::without_storage(&settings);
+    let gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
+    let live_src = h.manager.active_source();
+
+    // Horizon z=3 tile (dist_sq = 1e12) vs screen-center z=5 tile (dist_sq = 10.0).
+    // Even with a tight budget where bundled fallbacks are capped at 25% of
+    // appetite, live streaming retains >=75% (never deadlocking) and admits
+    // z=0 root + z=2 center carrier + z=5 center leaf ahead of the horizon tile.
+    let horizon_coarse = QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 3,
+        x: 0,
+        y: 0,
+    };
+    let center_fine = QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 5,
+        x: 16,
+        y: 16,
+    };
+    let tile_bytes = BasemapManager::bundled_tile_byte_size();
+    h.manager.schedule_for_prioritized_tiles(
+        [(horizon_coarse, 1e12), (center_fine, 10.0)],
+        &gpu_cache,
+        &h.pending,
+        tile_bytes * 4,
+    );
+    let center_key = source_tile_key(live_src, center_fine);
+    let center_z2_key = source_tile_key(live_src, center_fine.clamp_to_level(2).0);
+    let horizon_key = source_tile_key(live_src, horizon_coarse);
+    assert!(
+        h.manager.wanted_live.contains(&center_key),
+        "screen-center tile must be admitted ahead of distant horizon tile; wanted={:?}",
+        h.manager.wanted_live
+    );
+    assert!(
+        h.manager.wanted_live.contains(&center_z2_key),
+        "z=2 progressive carrier for center tile must be admitted; wanted={:?}",
+        h.manager.wanted_live
+    );
+    assert!(
+        !h.manager.wanted_live.contains(&horizon_key),
+        "distant horizon tile must wait behind screen-center tiles under tight budget"
+    );
+
+    // Ingesting a South polar-rim live WebMercator tile bumps south polar rev
+    // (leaving north polar rev at 0), and a second update within the debounce
+    // window reports a non-None `polar_rim_retry_delay` so idle UI flushes it.
+    let south_rim_id = QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 2,
+        x: 1,
+        y: 3,
+    };
+    let rim_tile_a = DecodedTile::try_new(
+        4,
+        4,
+        PixelFormat::Rgba8UnormSrgb,
+        [220, 230, 240, 255].repeat(16),
+    )
+    .expect("valid tile");
+    assert!(
+        h.manager
+            .polar_rim
+            .ingest_live_tile(live_src, south_rim_id, &rim_tile_a)
+    );
+    assert_eq!(h.manager.sync_polar_rim(&gpu_cache), (true, true));
+    assert_eq!(h.manager.polar_revs[0], 0);
+    assert_eq!(h.manager.polar_revs[1], 1);
+    assert!(h.manager.polar_rim_retry_delay().is_none());
+
+    // Second rim tile with higher level within 250ms debounce sets dirty + retry delay.
+    let south_rim_fine = QuadTileId {
+        scheme: PlanetaryScheme::WebMercator,
+        level: 3,
+        x: 2,
+        y: 7,
+    };
+    let rim_tile_b = DecodedTile::try_new(
+        4,
+        4,
+        PixelFormat::Rgba8UnormSrgb,
+        [180, 190, 200, 255].repeat(16),
+    )
+    .expect("valid tile");
+    assert!(
+        h.manager
+            .polar_rim
+            .ingest_live_tile(live_src, south_rim_fine, &rim_tile_b)
+    );
+    assert!(
+        h.manager.polar_rim_retry_delay().is_some(),
+        "debounced polar rim update must expose a flush delay for idle UI repaint"
+    );
+
+    // Switching live basemaps allocates strictly monotonic revision IDs (never
+    // reusing rev=1 across sources, eliminating cross-source ABA).
+    let next_settings = AppSettings {
+        active_basemap: BasemapSelection::EoxSentinel2Cloudless,
+        ..AppSettings::default()
+    };
+    let outcome = h.manager.sync_settings(next_settings.basemap_config());
+    assert!(outcome.evict_polar_revs);
+    assert_eq!(h.manager.polar_revs, [0, 0]);
+    let eox_src = h.manager.active_source();
+    assert!(
+        h.manager
+            .polar_rim
+            .ingest_live_tile(eox_src, south_rim_id, &rim_tile_a)
+    );
+    assert_eq!(h.manager.sync_polar_rim(&gpu_cache), (true, true));
+    assert_eq!(
+        h.manager.polar_revs[1], 2,
+        "new live source must receive monotonic rev=2 instead of reusing rev=1"
+    );
 }

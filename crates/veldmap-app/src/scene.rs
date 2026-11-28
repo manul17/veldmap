@@ -14,7 +14,7 @@ use std::time::Duration;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileStreamSpec};
+use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec};
 use veldmap_net::{NetConfig, NetContext};
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
@@ -570,6 +570,12 @@ impl SceneState {
         if let Some(evict) = outcome.evict_source {
             self.purge_source_caches(evict);
         }
+        if outcome.evict_polar_revs {
+            let is_stale_polar =
+                |k: &TileKey| matches!(k.scheme, TileScheme::PolarCap { .. }) && k.decode_rev > 0;
+            self.gpu_tile_cache.remove_where(is_stale_polar);
+            self.pending_uploads.clear_where(is_stale_polar);
+        }
         if outcome.changed {
             self.mark_topology_changed();
         } else if gpu_changed {
@@ -635,7 +641,18 @@ impl SceneState {
         );
         self.basemap.record_upload_report(&report);
         self.overlays.record_upload_report(&report);
-        if report.uploaded > 0 || self.overlays.take_reschedule_needed() {
+        let (polar_changed, evict_old_polar) = self.basemap.sync_polar_rim(&self.gpu_tile_cache);
+        if evict_old_polar {
+            let basemap = &self.basemap;
+            let is_unreachable_polar = |k: &TileKey| {
+                matches!(k.scheme, TileScheme::PolarCap { .. })
+                    && k.decode_rev > 0
+                    && !basemap.is_retained_polar_rev(k)
+            };
+            self.gpu_tile_cache.remove_where(is_unreachable_polar);
+            self.pending_uploads.clear_where(is_unreachable_polar);
+        }
+        if report.uploaded > 0 || polar_changed || self.overlays.take_reschedule_needed() {
             self.mark_dirty();
         }
         report
@@ -683,12 +700,23 @@ impl SceneState {
             carrier,
         );
 
-        let basemap_weight = if textured {
+        let raw_basemap_weight = if textured {
             self.basemap.appetite_weight_bytes()
         } else {
             0
         };
-        let overlay_weight = self.overlays.total_appetite_weight_bytes();
+        let overlay_weight =
+            self.overlays
+                .visible_appetite_weight_bytes(&camera, width_px, height_px);
+        // Reserve at least 25% of the combined `< 50%` VRAM appetite ceiling for
+        // the basemap whenever overlays are on screen (and 100% when all
+        // overlays are off-screen) so multi-band overlay stacks never starve
+        // visible basemap tiles into permanent low-LOD mosaics.
+        let basemap_weight = if textured {
+            raw_basemap_weight.max(overlay_weight.div_ceil(3))
+        } else {
+            0
+        };
         let total_weight = basemap_weight.saturating_add(overlay_weight).max(1);
 
         let overlay_layers = self.overlays.build_and_schedule(&mut OverlayFrameCtx {
@@ -713,8 +741,8 @@ impl SceneState {
         let basemap_appetite_bytes = self
             .gpu_tile_cache
             .proportional_pyramid_byte_cap(basemap_weight, total_weight);
-        self.basemap.schedule_for_tiles(
-            snapshot.visible_tex_ids(),
+        self.basemap.schedule_for_prioritized_tiles(
+            snapshot.visible_tex_priorities(),
             &self.gpu_tile_cache,
             &self.pending_uploads,
             basemap_appetite_bytes,
@@ -743,11 +771,19 @@ impl SceneState {
         }
 
         if frame.remaining_ready > 0 || (frame.uploaded > 0 && frame.deferred_protected > 0) {
-            SceneRepaintHint::Immediate
-        } else if let Some(delay) = self.overlays.retry_delay() {
-            SceneRepaintHint::After(delay)
-        } else {
-            SceneRepaintHint::None
+            return SceneRepaintHint::Immediate;
+        }
+        let min_delay = match (
+            self.overlays.retry_delay(),
+            self.basemap.polar_rim_retry_delay(),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match min_delay {
+            Some(delay) if delay.is_zero() => SceneRepaintHint::Immediate,
+            Some(delay) => SceneRepaintHint::After(delay),
+            None => SceneRepaintHint::None,
         }
     }
 

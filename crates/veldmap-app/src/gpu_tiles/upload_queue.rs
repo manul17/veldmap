@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use veldmap_core::sync::{CancelToken, lock_unpoisoned};
-use veldmap_core::tile::{DecodedTile, SourceId, StreamKey, TileKey};
+use veldmap_core::tile::{DecodedTile, SourceId, StreamKey, TileKey, TileScheme};
 
 use super::gpu_cache::{GpuTileCache, UploadInsertOutcome};
 
@@ -96,6 +96,11 @@ impl UploadBatchReport {
 }
 
 fn is_pinned_root(key: &TileKey, pinned_root_streams: &[StreamKey]) -> bool {
+    // Harmonic PolarCap revisions (`decode_rev > 0`) are transient and must be
+    // pruned when superseded instead of staying permanently pinned as roots.
+    if matches!(key.scheme, TileScheme::PolarCap { .. }) && key.decode_rev > 0 {
+        return false;
+    }
     pinned_root_streams.contains(&key.stream_key()) && key.is_root_of(key.source)
 }
 
@@ -333,6 +338,7 @@ impl PendingUploads {
     }
 
     /// Count queued decoded tiles belonging to `source`.
+    #[cfg(test)]
     pub(crate) fn count_for_source(&self, source: SourceId) -> usize {
         lock_unpoisoned(&self.shared)
             .queued
@@ -347,7 +353,7 @@ impl PendingUploads {
     }
 
     /// Discard any queued decoded tiles matching `predicate`.
-    fn clear_where<F>(&mut self, mut predicate: F)
+    pub(crate) fn clear_where<F>(&mut self, mut predicate: F)
     where
         F: FnMut(&TileKey) -> bool,
     {

@@ -1,12 +1,13 @@
 //! Live + offline basemap coordinator ([`BasemapManager`]) and visible-tile
 //! scheduling helpers over [`BundledBasemapProvider`] and `LiveTilePipeline`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use veldmap_core::sync::{CancelToken, Wakeup};
 use veldmap_core::tile::{
-    PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, StreamKey, TileKey,
+    PlanetaryScheme, QuadTileId, QuadtreeConfig, SourceId, StreamKey, TileKey, TileScheme,
 };
 use veldmap_net::{
     FetcherConfig, LiveBasemapSpec, LiveTilePipeline, NetContext, NetError, TileBlobStore,
@@ -19,6 +20,7 @@ use super::adapters::{RasterDecodeExecutor, SqliteBlobStore};
 use super::bundled::{
     BUNDLED_MAX_LEVEL, BUNDLED_POLAR_MAX_LEVEL, BUNDLED_TILE_PX, BundledBasemapProvider,
 };
+use super::polar_rim::PolarRimTracker;
 use super::policy::BasemapCarrierPolicy;
 use super::{BasemapStatusSnapshot, BasemapSyncOutcome, LiveStreamStatus};
 use crate::gpu_tiles::{
@@ -73,6 +75,9 @@ pub(crate) struct BasemapManager {
     active_live_spec: Option<LiveBasemapSpec>,
     config_error: Option<String>,
     observed_live_tile_bytes: usize,
+    polar_rim: Arc<PolarRimTracker>,
+    polar_revs: [u32; 2],
+    polar_fallback_revs: [u32; 2],
     wanted_bundled: HashSet<TileKey>,
     wanted_live: HashSet<TileKey>,
 }
@@ -100,17 +105,20 @@ impl BasemapManager {
             decode_handle,
             decode_shutdown,
         } = deps;
+        let polar_rim = Arc::new(PolarRimTracker::new());
         let bundled_provider = BundledBasemapProvider::new(
             decode_handle.clone(),
             done_tx.clone(),
             Arc::clone(&wakeup),
             decode_shutdown.clone(),
+            Arc::clone(&polar_rim),
         );
         let decode_executor: Arc<dyn TileDecodeExecutor> = Arc::new(RasterDecodeExecutor {
             pool: decode_handle,
             done_tx,
             wakeup: Arc::clone(&wakeup),
             shutdown: decode_shutdown,
+            polar_rim: Arc::clone(&polar_rim),
         });
         let blob_store: Option<Arc<dyn TileBlobStore>> =
             disk_cache.map(|cache| Arc::new(SqliteBlobStore(cache)) as Arc<dyn TileBlobStore>);
@@ -140,6 +148,9 @@ impl BasemapManager {
             active_live_spec: None,
             config_error: None,
             observed_live_tile_bytes: 0,
+            polar_rim,
+            polar_revs: [0, 0],
+            polar_fallback_revs: [0, 0],
             wanted_bundled: HashSet::new(),
             wanted_live: HashSet::new(),
         };
@@ -177,9 +188,76 @@ impl BasemapManager {
         }
     }
 
-    /// Pure carrier-routing policy matching the active basemap source.
+    /// Pure carrier-routing policy matching the active basemap source and
+    /// latest live polar-rim harmonic revisions.
     pub(crate) fn carrier_policy(&self) -> BasemapCarrierPolicy {
-        BasemapCarrierPolicy::new(self.active_source())
+        BasemapCarrierPolicy::with_polar_revs(
+            self.active_source(),
+            self.polar_revs,
+            self.polar_fallback_revs,
+        )
+    }
+
+    /// Poll live polar-rim tracker updates and promote fallback revisions once
+    /// the latest harmonic polar root tile is cached in VRAM.
+    ///
+    /// Returns `(snapshot_dirty, evict_old_polar)`:
+    /// - `snapshot_dirty` is `true` when a pole's active revision advanced and
+    ///   `DrawSnapshot` should rebuild.
+    /// - `evict_old_polar` is `true` when active or fallback revisions changed
+    ///   and unreachable `PolarCap` `decode_rev > 0` entries can be purged from
+    ///   `GpuTileCache` / `PendingUploads`.
+    pub(crate) fn sync_polar_rim(&mut self, gpu_cache: &GpuTileCache) -> (bool, bool) {
+        if self.active_live_spec.is_none() {
+            return (false, false);
+        }
+        let now = Instant::now();
+        let mut changed = false;
+        let mut evict_old_polar = false;
+        for (idx, north) in [(0usize, true), (1usize, false)] {
+            let rev = self.polar_rim.poll_revision(north, now);
+            if rev != self.polar_revs[idx] && rev > 0 {
+                self.polar_revs[idx] = rev;
+                changed = true;
+                evict_old_polar = true;
+            }
+            if self.polar_fallback_revs[idx] != self.polar_revs[idx] && self.polar_revs[idx] > 0 {
+                let root_key = super::policy::bundled_polar_tile_key(
+                    QuadTileId {
+                        scheme: PlanetaryScheme::PolarCap { north },
+                        level: 0,
+                        x: 0,
+                        y: 0,
+                    },
+                    self.polar_revs[idx],
+                );
+                if gpu_cache.contains(&root_key) {
+                    self.polar_fallback_revs[idx] = self.polar_revs[idx];
+                    evict_old_polar = true;
+                }
+            }
+        }
+        (changed, evict_old_polar)
+    }
+
+    /// Remaining debounce delay before pending polar-rim updates should flush
+    /// (`None` when idle or in offline/ellipsoid mode).
+    pub(crate) fn polar_rim_retry_delay(&self) -> Option<Duration> {
+        self.active_live_spec.as_ref()?;
+        self.polar_rim.next_flush_delay(Instant::now())
+    }
+
+    /// Return whether `key` is a currently reachable `PolarCap` revision
+    /// (base `decode_rev == 0`, active `polar_revs`, or warm `polar_fallback_revs`).
+    pub(crate) fn is_retained_polar_rev(&self, key: &TileKey) -> bool {
+        let TileScheme::PolarCap { north } = key.scheme else {
+            return true;
+        };
+        if key.decode_rev == 0 {
+            return true;
+        }
+        let idx = usize::from(!north);
+        key.decode_rev == self.polar_revs[idx] || key.decode_rev == self.polar_fallback_revs[idx]
     }
 
     /// Active planetary [`QuadtreeConfig`] matched to the selected basemap.
@@ -266,13 +344,19 @@ impl BasemapManager {
         let next_source = self.active_source();
 
         let mut evict_source = None;
+        let mut evict_polar_revs = false;
         if prev_source != next_source {
             // Keep bundled fallback tiles warm in VRAM; instruct caller to
-            // purge stale tiles from the previous live source.
+            // purge stale tiles from the previous live source and any
+            // source-specific harmonic polar-cap revisions.
             if prev_source != SourceId::BUNDLED_BASEMAP {
                 evict_source = Some(prev_source);
             }
+            evict_polar_revs = true;
+            self.bundled_provider.cancel_polar_revs();
             self.observed_live_tile_bytes = 0;
+            self.polar_revs = [0, 0];
+            self.polar_fallback_revs = [0, 0];
             self.wanted_live.clear();
             self.wanted_bundled.clear();
             if self.is_textured() {
@@ -289,6 +373,7 @@ impl BasemapManager {
                 || prev_mode != self.active_basemap
                 || prev_spec != self.active_live_spec,
             evict_source,
+            evict_polar_revs,
         }
     }
 
@@ -301,15 +386,22 @@ impl BasemapManager {
                 // bundled Blue Marble while `live_pipeline_error` surfaces the
                 // `"Live unavailable"` toolbar badge.
                 if let Some(pipeline) = &self.live_pipeline {
+                    let prev_id = self.active_live_spec.as_ref().map(LiveBasemapSpec::source_id);
+                    let next_id = spec.as_ref().map(LiveBasemapSpec::source_id);
                     self.active_live_spec = spec.clone();
+                    if prev_id != next_id {
+                        self.polar_rim.reset_for_source(next_id);
+                    }
                     pipeline.set_active_spec(spec);
                 } else {
                     self.active_live_spec = None;
+                    self.polar_rim.reset_for_source(None);
                 }
             }
             Err(err) => {
                 self.config_error = Some(err.to_string());
                 self.active_live_spec = None;
+                self.polar_rim.reset_for_source(None);
                 if let Some(pipeline) = &self.live_pipeline {
                     pipeline.set_active_spec(None);
                 }
@@ -321,9 +413,28 @@ impl BasemapManager {
     /// `QuadTileId`s, keeping `basemap` decoupled from `render::DrawSnapshot`)
     /// for both the bundled offline provider and the active live HTTP pipeline
     /// within the caller-provided VRAM `appetite_bytes` ceiling.
+    #[cfg(test)]
     pub(crate) fn schedule_for_tiles(
         &mut self,
         visible_tex_ids: impl IntoIterator<Item = QuadTileId>,
+        gpu_cache: &GpuTileCache,
+        pending_uploads: &PendingUploads,
+        appetite_bytes: usize,
+    ) {
+        self.schedule_for_prioritized_tiles(
+            visible_tex_ids.into_iter().map(|id| (id, 0.0)),
+            gpu_cache,
+            pending_uploads,
+            appetite_bytes,
+        );
+    }
+
+    /// Schedule missing visible tiles prioritized by squared ECEF distance from
+    /// the camera eye (closest / screen-center tiles admitted before distant
+    /// horizon tiles whenever VRAM appetite is constrained).
+    pub(crate) fn schedule_for_prioritized_tiles(
+        &mut self,
+        visible_tiles: impl IntoIterator<Item = (QuadTileId, f64)>,
         gpu_cache: &GpuTileCache,
         pending_uploads: &PendingUploads,
         appetite_bytes: usize,
@@ -336,12 +447,12 @@ impl BasemapManager {
             return;
         }
 
-        let candidates = self.collect_tile_candidates(visible_tex_ids, gpu_cache, pending_uploads);
+        let candidates = self.collect_tile_candidates(visible_tiles, gpu_cache);
         let default_tile_bytes = Self::bundled_tile_byte_size();
 
         let (bundled_to_request, bundled_total_bytes) = self.plan_bundled_requests(
-            candidates.missing_bundled,
-            candidates.cached_bundled_wanted,
+            candidates.bundled_candidates,
+            gpu_cache,
             pending_uploads,
             default_tile_bytes,
             appetite_bytes,
@@ -350,8 +461,6 @@ impl BasemapManager {
         if self.active_live_spec.is_some() {
             self.admit_live_candidates(
                 candidates.live_candidates,
-                candidates.cached_live_wanted,
-                candidates.queued_live_wanted,
                 default_tile_bytes,
                 appetite_bytes.saturating_sub(bundled_total_bytes),
             );
@@ -369,57 +478,75 @@ impl BasemapManager {
     }
 
     fn collect_tile_candidates(
-        &mut self,
-        visible_tex_ids: impl IntoIterator<Item = QuadTileId>,
+        &self,
+        visible_tiles: impl IntoIterator<Item = (QuadTileId, f64)>,
         gpu_cache: &GpuTileCache,
-        pending_uploads: &PendingUploads,
     ) -> ScheduledCandidates {
         let mut out = ScheduledCandidates::default();
         let policy = self.carrier_policy();
-        let wanted_bundled = &mut self.wanted_bundled;
-        let bundled_provider = &self.bundled_provider;
-        let mut record_bundled_candidate = |key: TileKey| {
-            if wanted_bundled.insert(key) {
-                if gpu_cache.contains(&key) {
-                    out.cached_bundled_wanted += 1;
-                } else if !pending_uploads.contains(&key) && !bundled_provider.is_in_flight(&key) {
-                    out.missing_bundled.push(key);
-                }
+        let mut seen_bundled: HashSet<TileKey> = HashSet::new();
+        let mut record_bundled_candidate = |key: TileKey, is_polar: bool| {
+            if seen_bundled.insert(key) {
+                out.bundled_candidates.push((key, is_polar));
             }
         };
 
         if let Some(spec) = &self.active_live_spec {
-            let mut seen_live = HashSet::new();
-            for tex_id in visible_tex_ids {
+            let mut live_dist_by_key: HashMap<TileKey, f64> = HashMap::new();
+            let mut record_live_key = |live_key: TileKey, dist_sq: f64| {
+                let d = if dist_sq.is_finite() {
+                    dist_sq
+                } else {
+                    f64::INFINITY
+                };
+                live_dist_by_key
+                    .entry(live_key)
+                    .and_modify(|prev| *prev = prev.min(d))
+                    .or_insert(d);
+            };
+
+            for (tex_id, dist_sq) in visible_tiles {
                 if matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. }) {
                     let (polar_id, _) = tex_id.clamp_to_level(BUNDLED_POLAR_MAX_LEVEL);
-                    record_bundled_candidate(policy.primary_key(polar_id));
+                    let primary_polar = policy.primary_key(polar_id);
+                    record_bundled_candidate(primary_polar, true);
+                    if polar_id.level > 0 && primary_polar.decode_rev > 0 {
+                        let (polar_root, _) = polar_id.clamp_to_level(0);
+                        record_bundled_candidate(policy.primary_key(polar_root), true);
+                    }
                 } else {
                     let (clamped_live, _) = tex_id.clamp_to_level(spec.max_level());
                     let live_key = policy.primary_key(clamped_live);
-                    if seen_live.insert(live_key) {
-                        if gpu_cache.contains(&live_key) {
-                            out.cached_live_wanted += 1;
-                            self.wanted_live.insert(live_key);
-                        } else if pending_uploads.contains(&live_key) {
-                            out.queued_live_wanted += 1;
-                            self.wanted_live.insert(live_key);
-                        } else {
-                            out.live_candidates.push(live_key);
+                    record_live_key(live_key, dist_sq);
+
+                    let carrier_level = gpu_cache.carrier_level(&live_key);
+                    if carrier_level.is_none() {
+                        // No live carrier yet: request the single z=0 live root
+                        // plus an offline bundled fallback while streaming.
+                        if clamped_live.level > 0 {
+                            let (root_id, _) = clamped_live.clamp_to_level(0);
+                            record_live_key(policy.primary_key(root_id), 0.0);
+                        }
+                        let (fb_id, _) = tex_id.clamp_to_level(BUNDLED_MAX_LEVEL.min(2));
+                        if let Some(fb_key) = policy.fallback_key(fb_id) {
+                            record_bundled_candidate(fb_key, false);
                         }
                     }
-
-                    if !gpu_cache.has_carrier(&live_key) {
-                        let (fb_id, _) = tex_id.clamp_to_level(BUNDLED_MAX_LEVEL.min(1));
-                        if let Some(fb_key) = policy.fallback_key(fb_id) {
-                            record_bundled_candidate(fb_key);
-                        }
+                    // Keep requesting a coarse z=2 progressive live carrier
+                    // until at least a z>=2 live ancestor is cached (so z=0
+                    // uploading never cancels z=2 mid-flight).
+                    if clamped_live.level > 2 && carrier_level.is_none_or(|lvl| lvl < 2) {
+                        let (coarse_id, _) = clamped_live.clamp_to_level(2);
+                        record_live_key(policy.primary_key(coarse_id), dist_sq);
                     }
                 }
             }
+
+            out.live_candidates = live_dist_by_key.into_iter().collect();
         } else {
-            for tex_id in visible_tex_ids {
-                record_bundled_candidate(policy.primary_key(tex_id));
+            for (tex_id, _) in visible_tiles {
+                let is_polar = matches!(tex_id.scheme, PlanetaryScheme::PolarCap { .. });
+                record_bundled_candidate(policy.primary_key(tex_id), is_polar);
             }
         }
 
@@ -427,47 +554,72 @@ impl BasemapManager {
     }
 
     fn plan_bundled_requests(
-        &self,
-        mut missing_bundled: Vec<TileKey>,
-        cached_bundled_wanted: usize,
+        &mut self,
+        mut bundled_candidates: Vec<(TileKey, bool)>,
+        gpu_cache: &GpuTileCache,
         pending_uploads: &PendingUploads,
         default_tile_bytes: usize,
         total_appetite_bytes: usize,
     ) -> (Vec<TileKey>, usize) {
-        let bundled_queued = pending_uploads.count_for_source(SourceId::BUNDLED_BASEMAP);
-        let bundled_committed_tiles = cached_bundled_wanted
-            .saturating_add(self.bundled_provider.in_flight_count())
-            .saturating_add(bundled_queued);
-        let bundled_committed_bytes = bundled_committed_tiles.saturating_mul(default_tile_bytes);
-        let bundled_room_tiles =
-            total_appetite_bytes.saturating_sub(bundled_committed_bytes) / default_tile_bytes;
+        if bundled_candidates.is_empty() {
+            return (Vec::new(), 0);
+        }
+        // Under a live basemap, reserve at least 75% of basemap VRAM appetite
+        // for live tiles so bundled fallbacks can never deadlock live streaming
+        // under tight budgets; prioritize primary PolarCap tiles ahead of
+        // temporary non-polar fallbacks.
+        let has_polar = bundled_candidates.iter().any(|(_, is_polar)| *is_polar);
+        let bundled_budget_bytes = if self.active_live_spec.is_some() {
+            (total_appetite_bytes / 4).max(if has_polar { default_tile_bytes } else { 0 })
+        } else {
+            total_appetite_bytes
+        };
+        let bundled_cap_tiles = bundled_budget_bytes / default_tile_bytes;
 
-        missing_bundled.sort_by_key(TileKey::coarsest_first_key);
-        let bundled_to_request: Vec<TileKey> = missing_bundled
-            .into_iter()
-            .take(bundled_room_tiles)
-            .collect();
-        let bundled_total_bytes = bundled_committed_tiles
-            .saturating_add(bundled_to_request.len())
-            .saturating_mul(default_tile_bytes);
-        (bundled_to_request, bundled_total_bytes)
+        bundled_candidates.sort_by(|(ka, pa), (kb, pb)| {
+            // Primary PolarCap tiles first, then coarsest-first.
+            pb.cmp(pa)
+                .then_with(|| ka.coarsest_first_key().cmp(&kb.coarsest_first_key()))
+        });
+
+        let mut to_request = Vec::new();
+        let mut admitted_count = 0usize;
+        for (key, _) in bundled_candidates.into_iter().take(bundled_cap_tiles) {
+            self.wanted_bundled.insert(key);
+            admitted_count += 1;
+            if !gpu_cache.contains(&key)
+                && !pending_uploads.contains(&key)
+                && !self.bundled_provider.is_in_flight(&key)
+            {
+                to_request.push(key);
+            }
+        }
+
+        let bundled_total_bytes = admitted_count.saturating_mul(default_tile_bytes);
+        (to_request, bundled_total_bytes)
     }
 
     fn admit_live_candidates(
         &mut self,
-        mut live_candidates: Vec<TileKey>,
-        cached_live_wanted: usize,
-        queued_live_wanted: usize,
+        mut live_candidates: Vec<(TileKey, f64)>,
         default_tile_bytes: usize,
         live_appetite_bytes: usize,
     ) {
         let live_tile_bytes = default_tile_bytes.max(self.observed_live_tile_bytes);
         let live_tile_cap = live_appetite_bytes / live_tile_bytes;
-        let live_budget = live_tile_cap
-            .saturating_sub(cached_live_wanted)
-            .saturating_sub(queued_live_wanted);
-        live_candidates.sort_by_key(TileKey::coarsest_first_key);
-        for k in live_candidates.into_iter().take(live_budget) {
+        // Sort ALL visible live tiles (cached, queued, or uncached) together:
+        // pinned z=0 root first, then closest-to-camera (screen center) before
+        // distant horizon tiles, breaking ties coarsest-first. Sorting cached
+        // and uncached together ensures cached horizon tiles from prior frames
+        // never starve newly exposed screen-center tiles under tight caps.
+        live_candidates.sort_by(|(ka, da), (kb, db)| {
+            let ra = u8::from(ka.level > 0);
+            let rb = u8::from(kb.level > 0);
+            ra.cmp(&rb)
+                .then_with(|| da.total_cmp(db))
+                .then_with(|| ka.coarsest_first_key().cmp(&kb.coarsest_first_key()))
+        });
+        for (k, _) in live_candidates.into_iter().take(live_tile_cap) {
             self.wanted_live.insert(k);
         }
     }
@@ -508,11 +660,8 @@ impl BasemapManager {
 
 #[derive(Default)]
 struct ScheduledCandidates {
-    missing_bundled: Vec<TileKey>,
-    cached_bundled_wanted: usize,
-    live_candidates: Vec<TileKey>,
-    cached_live_wanted: usize,
-    queued_live_wanted: usize,
+    bundled_candidates: Vec<(TileKey, bool)>,
+    live_candidates: Vec<(TileKey, f64)>,
 }
 
 #[cfg(test)]

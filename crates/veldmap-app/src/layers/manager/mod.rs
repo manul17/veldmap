@@ -223,8 +223,22 @@ impl OverlayManager {
         self.stack.extend_wanted_tile_sets(out);
     }
 
+    #[cfg(test)]
     pub(crate) fn total_appetite_weight_bytes(&self) -> u64 {
         self.stack.total_appetite_weight_bytes()
+    }
+
+    /// Sum VRAM appetite weights strictly across active layers intersecting the
+    /// current camera frustum so off-screen overlays never starve the basemap.
+    pub(crate) fn visible_appetite_weight_bytes(
+        &mut self,
+        camera: &Camera,
+        width_px: u32,
+        height_px: u32,
+    ) -> u64 {
+        let aspect = f64::from(width_px.max(1)) / f64::from(height_px.max(1));
+        let frustum = camera.frustum(aspect);
+        self.stack.visible_appetite_weight_bytes(&frustum)
     }
 
     pub(crate) fn topmost_visible_source_pixel_size_m(&self) -> Option<(f64, f64)> {

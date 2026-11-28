@@ -88,11 +88,12 @@ pub struct BundledBasemapConfig {
 
 impl BundledBasemapConfig {
     /// Default bundled basemap tiling configuration (`256 px`, `max_level = 3`,
-    /// `polar_max_level = 0`).
+    /// `polar_max_level = 2` so `PolarCap` preserves full perimeter detail up
+    /// to `1024 x 1024` across `±85.05112878°`).
     pub const DEFAULT: Self = Self {
         tile_px: 256,
         max_level: 3,
-        polar_max_level: 0,
+        polar_max_level: 2,
     };
 }
 

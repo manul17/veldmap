@@ -13,6 +13,8 @@ use veldmap_storage::{DiskTileEntry, DiskTileKey, StorageError, TileBlobEncoding
 
 use crate::gpu_tiles::UploadSender;
 
+use super::polar_rim::PolarRimTracker;
+
 /// Adapter bridging `veldmap-storage`'s [`TileDiskCache`] into `veldmap-net`'s
 /// storage-agnostic [`TileBlobStore`] trait using ABA-safe [`DiskTileEntry`]
 /// leases and cancellation-checked writes.
@@ -88,6 +90,7 @@ pub(super) struct RasterDecodeExecutor {
     pub(super) done_tx: UploadSender,
     pub(super) wakeup: Wakeup,
     pub(super) shutdown: CancelToken,
+    pub(super) polar_rim: Arc<PolarRimTracker>,
 }
 
 impl TileDecodeExecutor for RasterDecodeExecutor {
@@ -98,6 +101,7 @@ impl TileDecodeExecutor for RasterDecodeExecutor {
         let done_tx = self.done_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
         let shutdown = self.shutdown.clone();
+        let polar_rim = Arc::clone(&self.polar_rim);
         let bytes = req.bytes;
         let on_decoded = req.on_decoded;
 
@@ -107,9 +111,12 @@ impl TileDecodeExecutor for RasterDecodeExecutor {
             cancel: req.cancel,
             work: Box::new(move || match decode_map_tile_with_mipmaps(&bytes) {
                 Ok(tile) => {
-                    if shutdown.is_cancelled() {
+                    if shutdown.is_cancelled() || cancel.is_cancelled() {
                         on_decoded.complete(Err(DecodeFailure::Aborted));
                         return;
+                    }
+                    if let Some(quad_id) = key.quad_id() {
+                        polar_rim.ingest_live_tile(key.source, quad_id, &tile);
                     }
                     match done_tx.send_if_uncancelled((key, tile), &cancel) {
                         Ok(true) => {

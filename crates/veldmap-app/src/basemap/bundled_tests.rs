@@ -47,8 +47,13 @@ fn reconcile_cancels_and_clears_satisfied_and_terminal_failures() {
     );
     let mut uploads = PendingUploads::new();
     let tx = uploads.sender().expect("sender");
-    let provider =
-        BundledBasemapProvider::new(pool.handle(), tx, Arc::new(|| {}), shutdown.clone());
+    let provider = BundledBasemapProvider::new(
+        pool.handle(),
+        tx,
+        Arc::new(|| {}),
+        shutdown.clone(),
+        Arc::new(PolarRimTracker::new()),
+    );
 
     let tok_sat = shutdown.child_token();
     let tok_fail = shutdown.child_token();
@@ -90,8 +95,13 @@ fn evicted_bundled_job_clears_in_flight_via_captured_guard() {
     );
     let mut uploads = PendingUploads::new();
     let tx = uploads.sender().expect("sender");
-    let provider =
-        BundledBasemapProvider::new(pool.handle(), tx, Arc::new(|| {}), shutdown.clone());
+    let provider = BundledBasemapProvider::new(
+        pool.handle(),
+        tx,
+        Arc::new(|| {}),
+        shutdown.clone(),
+        Arc::new(PolarRimTracker::new()),
+    );
 
     // Block the single worker thread so the next queued job sits in `DecodeQueue`.
     // Guard the release barrier with `Drop` so an assertion failure never hangs

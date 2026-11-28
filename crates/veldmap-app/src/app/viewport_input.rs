@@ -4,7 +4,8 @@
 //! (`ViewportInteraction`).
 
 use eframe::egui;
-use veldmap_core::geo::{Camera, GeoPoint, ZOOM_PER_CLICK};
+use veldmap_core::geo::{Camera, GeoPoint, WGS84, ZOOM_PER_CLICK};
+use veldmap_core::glam::DVec4;
 
 /// Logical scroll points mapped to one discrete globe zoom notch.
 const SCROLL_PT_PER_STEP: f64 = 48.0;
@@ -358,21 +359,101 @@ impl ViewportInteraction {
         self.aoi_drag_start = None;
     }
 
-    /// Approximate `[west, south, east, north]` covering the current visible
-    /// globe viewport by probing a 5×5 screen grid, or `None` if fewer than
-    /// two rays intersect the WGS84 ellipsoid.
+    /// Binary-search along the normalized screen ray from `(0.5, 0.5)` toward an
+    /// off-globe point `(tx, ty)` to locate the visible horizon limb point.
+    fn probe_horizon_limb(&self, camera: &Camera, tx: f64, ty: f64) -> Option<(f64, f64)> {
+        let mut lo = 0.0_f64;
+        let mut hi = 1.0_f64;
+        let mut best: Option<(f64, f64)> = None;
+        for _ in 0..18 {
+            let mid = 0.5 * (lo + hi);
+            let nx = 0.5 + (tx - 0.5) * mid;
+            let ny = 0.5 + (ty - 0.5) * mid;
+            if let Some(pt) = camera.probe(nx, ny, self.last_viewport_aspect) {
+                lo = mid;
+                best = Some(pt);
+            } else {
+                hi = mid;
+            }
+        }
+        best
+    }
+
+    /// Return whether a geographic pole (`+90` or `-90`) is both above the
+    /// ellipsoid horizon and projected inside the visible viewport.
+    fn is_pole_visible(&self, camera: &Camera, lat_deg: f64) -> bool {
+        let (pole_ecef, normal) = WGS84.surface_ecef_and_normal(lat_deg, 0.0);
+        let rel = pole_ecef - camera.eye_ecef();
+        if normal.dot(-rel) <= 0.0 {
+            return false;
+        }
+        let vp = camera.view_projection(self.last_viewport_aspect);
+        let clip = vp * DVec4::new(rel.x, rel.y, rel.z, 1.0);
+        if !clip.w.is_finite() || clip.w <= 0.0 {
+            return false;
+        }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        ndc_x.is_finite()
+            && ndc_y.is_finite()
+            && ndc_x.abs() <= 1.0
+            && ndc_y.abs() <= 1.0
+    }
+
+    /// Compute `[west, south, east, north]` covering the current visible globe
+    /// viewport by probing a 9×9 screen grid, tracing off-globe rays back to
+    /// the visible horizon limb, and handling visible poles cleanly.
     pub(super) fn viewport_bbox(&self, camera: &Camera) -> Option<[f64; 4]> {
-        let mut hits = Vec::with_capacity(25);
-        for gy in 0..=4 {
-            let ny = 0.08 + 0.84 * (f64::from(gy) / 4.0);
-            for gx in 0..=4 {
-                let nx = 0.08 + 0.84 * (f64::from(gx) / 4.0);
+        let mut hits = Vec::with_capacity(97);
+        let mut any_missed = false;
+        const GRID_STEPS: u32 = 8;
+        for gy in 0..=GRID_STEPS {
+            let ny = 0.02 + 0.96 * (f64::from(gy) / f64::from(GRID_STEPS));
+            for gx in 0..=GRID_STEPS {
+                let nx = 0.02 + 0.96 * (f64::from(gx) / f64::from(GRID_STEPS));
                 if let Some(pt) = camera.probe(nx, ny, self.last_viewport_aspect) {
+                    hits.push(pt);
+                } else {
+                    any_missed = true;
+                    // Only trace outer perimeter misses back to the limb to
+                    // capture the visible globe edge without redundant searches.
+                    if (gx == 0 || gx == GRID_STEPS || gy == 0 || gy == GRID_STEPS)
+                        && let Some(limb_pt) = self.probe_horizon_limb(camera, nx, ny)
+                    {
+                        hits.push(limb_pt);
+                    }
+                }
+            }
+        }
+        if any_missed {
+            // Also sample 16 evenly spaced radial directions around screen
+            // center so a circular Earth limb is captured evenly at all headings.
+            for k in 0..16u32 {
+                let angle = f64::from(k) * (std::f64::consts::TAU / 16.0);
+                let tx = 0.5 + 0.5 * angle.cos();
+                let ty = 0.5 + 0.5 * angle.sin();
+                if let Some(pt) = camera
+                    .probe(tx, ty, self.last_viewport_aspect)
+                    .or_else(|| self.probe_horizon_limb(camera, tx, ty))
+                {
                     hits.push(pt);
                 }
             }
         }
-        minimal_circular_bbox(&hits)
+        let mut bbox = minimal_circular_bbox(&hits)?;
+        let north_visible = self.is_pole_visible(camera, 90.0);
+        let south_visible = self.is_pole_visible(camera, -90.0);
+        if north_visible || south_visible {
+            bbox[0] = -180.0;
+            bbox[2] = 180.0;
+            if north_visible {
+                bbox[3] = 89.9;
+            }
+            if south_visible {
+                bbox[1] = -89.9;
+            }
+        }
+        Some(bbox)
     }
 
     fn handle_swipe_drag(
@@ -634,5 +715,63 @@ mod tests {
             aoi_drag_bbox((5.0, -175.0), (-5.0, 175.0)),
             Some([175.0, -5.0, -175.0, 5.0])
         );
+    }
+
+    #[test]
+    fn viewport_bbox_traces_earth_limb_and_visible_pole() {
+        let vp = ViewportInteraction::default();
+
+        // Earth-scale equatorial view: limb tracing must span close to the full
+        // visible hemisphere (not collapse to an inset 5x5 core).
+        let eq_cam = Camera::at(0.0, 20.0, 12_000_000.0);
+        let eq_bbox = vp.viewport_bbox(&eq_cam).expect("equatorial globe bbox");
+        assert!(
+            (eq_bbox[3] - eq_bbox[1]) > 100.0,
+            "expected wide latitude span on full-globe view, got {eq_bbox:?}"
+        );
+        assert!(
+            (eq_bbox[2] - eq_bbox[0]) > 100.0,
+            "expected wide longitude span on full-globe view, got {eq_bbox:?}"
+        );
+
+        // High-latitude globe view where North Pole is visible inside viewport:
+        // must span full [-180, 180] longitude and reach +89.9 deg latitude.
+        let pole_cam = Camera::at(80.0, 60.0, 5_000_000.0);
+        let pole_bbox = vp.viewport_bbox(&pole_cam).expect("polar globe bbox");
+        assert_eq!(pole_bbox[0], -180.0);
+        assert_eq!(pole_bbox[2], 180.0);
+        assert_eq!(pole_bbox[3], 89.9);
+
+        // Rotated continental globe view where North Pole is visible inside
+        // viewport (matching the user's 48.8°N, 65.7°E, Alt = 7404 km, Hdg = -78.8°).
+        let mut rot_cam = Camera::at(48.84, 65.66, 7_404_000.0);
+        rot_cam.rotate_heading((-78.8_f64).to_radians());
+        let rot_bbox = vp.viewport_bbox(&rot_cam).expect("rotated polar globe bbox");
+        assert_eq!(rot_bbox[0], -180.0);
+        assert_eq!(rot_bbox[2], 180.0);
+        assert_eq!(rot_bbox[3], 89.9);
+
+        // Pole sitting between 0.98 and 1.0 NDC must still be detected cleanly
+        // (matching the [0.0, 1.0] radial probe range).
+        let edge_pole_cam = Camera::at(49.2, 65.7, 7_404_000.0);
+        let edge_bbox = vp.viewport_bbox(&edge_pole_cam).expect("edge pole bbox");
+        assert_eq!(edge_bbox[0], -180.0);
+        assert_eq!(edge_bbox[2], 180.0);
+        assert_eq!(edge_bbox[3], 89.9);
+
+        // Deep orbit (80,000 km): 18-step limb bisection reaches close to true
+        // ~85.8° horizon angular radius (not falling >6° short).
+        let deep_cam = Camera::at(0.0, 0.0, 80_000_000.0);
+        let deep_bbox = vp.viewport_bbox(&deep_cam).expect("deep orbit bbox");
+        assert!(
+            (deep_bbox[3] - deep_bbox[1]) > 165.0,
+            "expected deep-orbit limb span > 165°, got {deep_bbox:?}"
+        );
+
+        // Extreme close zoom (2 m altitude) stays valid and finite.
+        let close_cam = Camera::at(46.0, 7.7, 2.0);
+        let close_bbox = vp.viewport_bbox(&close_cam).expect("2m zoom bbox");
+        assert!(close_bbox.iter().all(|v| v.is_finite()));
+        assert!((close_bbox[3] - close_bbox[1]) > 0.0 && (close_bbox[3] - close_bbox[1]) < 0.01);
     }
 }

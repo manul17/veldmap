@@ -14,6 +14,28 @@ use crate::render::{DrawVectorId, DrawVectorLayer};
 const STAC_AOI_FILL: [f32; 4] = [0.16, 0.88, 0.56, 0.14];
 const STAC_AOI_LINE: [f32; 4] = [0.22, 0.96, 0.66, 0.96];
 
+/// Maximum chord length (degrees) used for continental/global AOI and footprint
+/// meshes so Earth-scale bboxes triangulate in ~1–2 ms on the UI thread instead
+/// of hitting the 500k-triangle cap at 0.5 deg.
+const MAX_AOI_CHORD_DEG: f64 = 6.0;
+
+/// Compute adaptive chord length from the largest *individual* geometry's
+/// angular span (rather than the whole collection's bounding sphere) so
+/// globally scattered STAC footprints stay crisp at `0.5°` while single
+/// continental/Earth-scale AOI polygons coarsen smoothly up to `6.0°`.
+fn adaptive_aoi_chord_deg(geometries: &[GeoJsonGeometry]) -> f64 {
+    let max_span_deg = geometries
+        .iter()
+        .filter_map(GeoJsonGeometry::bounds)
+        .map(|b| (b.radius_deg * 2.0).max(0.0))
+        .fold(0.0_f64, f64::max);
+    if max_span_deg <= 0.0 {
+        DEFAULT_VECTOR_MAX_CHORD_DEG
+    } else {
+        (max_span_deg / 20.0).clamp(DEFAULT_VECTOR_MAX_CHORD_DEG, MAX_AOI_CHORD_DEG)
+    }
+}
+
 fn rect_polygon(west: f64, south: f64, east: f64, north: f64) -> Polygon {
     Polygon {
         exterior: Ring {
@@ -29,8 +51,158 @@ fn rect_polygon(west: f64, south: f64, east: f64, north: f64) -> Polygon {
     }
 }
 
-/// Construct a closed CCW WGS84 polygon (or antimeridian-split `MultiPolygon`
-/// when RFC 7946 `west > east`) from `[west, south, east, north]`.
+/// Build a CCW polar-cap circle along constant latitude `lat_deg` enclosing the
+/// North Pole (`enclose_north = true`, ascending longitude) or South Pole
+/// (`enclose_north = false`, descending longitude) without any interior
+/// meridian stroke seam or polar hole.
+fn polar_cap_circle_polygon(lat_deg: f64, enclose_north: bool, step_deg: f64) -> Polygon {
+    let arc = 360.0 * lat_deg.to_radians().cos().abs();
+    let steps = ((arc / step_deg.max(0.5)).ceil() as usize).clamp(24, 96);
+    let mut points = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let frac = i as f64 / steps as f64;
+        let lon = if enclose_north {
+            -180.0 + 360.0 * frac
+        } else {
+            180.0 - 360.0 * frac
+        };
+        points.push(GeoPoint::new(lat_deg, lon));
+    }
+    Polygon {
+        exterior: Ring { points },
+        holes: Vec::new(),
+    }
+}
+
+/// Build a CCW rectangle whose South and North boundaries are sampled along
+/// constant-latitude parallels using both true spherical arc length
+/// (`lon_span * cos(lat)`) and a `<= 15°` longitude floor so zoomed-in polar
+/// spans never collapse to zero-area 1D geodesics across the pole.
+fn rect_polygon_parallels(
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    step_deg: f64,
+) -> Polygon {
+    let lon_span = (east - west).abs();
+    let step = step_deg.max(0.5);
+    let parallel_steps = |lat_deg: f64| -> usize {
+        if lat_deg.abs() >= 89.8 {
+            // Avoid tiny microscopic chords on clamped pole boundaries (±89.9°).
+            1
+        } else {
+            let min_steps = ((lon_span / 15.0).ceil() as usize).clamp(1, 48);
+            let arc = lon_span * lat_deg.to_radians().cos().abs();
+            ((arc / step).ceil() as usize).clamp(min_steps, 48)
+        }
+    };
+    let south_steps = parallel_steps(south);
+    let north_steps = parallel_steps(north);
+    let mut points = Vec::with_capacity(south_steps + north_steps + 3);
+    // South parallel: west -> east
+    for i in 0..=south_steps {
+        let lon = west + (east - west) * (i as f64 / south_steps as f64);
+        points.push(GeoPoint::new(south, lon));
+    }
+    // North parallel: east -> west (meridians are already exact geodesics)
+    for i in 0..=north_steps {
+        let lon = east + (west - east) * (i as f64 / north_steps as f64);
+        points.push(GeoPoint::new(north, lon));
+    }
+    points.push(GeoPoint::new(south, west));
+    Polygon {
+        exterior: Ring { points },
+        holes: Vec::new(),
+    }
+}
+
+/// Construct a render-ready constant-latitude parallel geometry for `bbox`.
+///
+/// - Polar caps (`[-180, south, 180, ~90]` or `[-180, ~-90, 180, north]`)
+///   render as a single closed parallel circle enclosing the pole (zero
+///   interior meridian stroke seam).
+/// - Full-circle non-polar bands (`> 350°`, including full Earth) split cleanly
+///   into two non-self-touching halves.
+/// - All other rectangles (including wide `179°..350°` spans) render as a
+///   single parallel-sampled polygon with no interior seam.
+fn render_geometry_from_bbox(bbox: [f64; 4]) -> Option<GeoJsonGeometry> {
+    if !bbox.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let west = bbox[0].clamp(-180.0, 180.0);
+    let east = bbox[2].clamp(-180.0, 180.0);
+    let south = bbox[1].min(bbox[3]).clamp(-89.9, 89.9);
+    let north = bbox[1].max(bbox[3]).clamp(-89.9, 89.9);
+    if (north - south) <= 1e-9 {
+        return None;
+    }
+
+    let is_full_lon = west <= -179.999 && east >= 179.999;
+    if is_full_lon && north >= 89.85 && south > -89.85 {
+        let eff_span = (90.0 - south).max(360.0 * south.to_radians().cos().abs());
+        let step_deg = (eff_span / 24.0).clamp(DEFAULT_VECTOR_MAX_CHORD_DEG, MAX_AOI_CHORD_DEG);
+        return Some(GeoJsonGeometry::Polygon(polar_cap_circle_polygon(
+            south, true, step_deg,
+        )));
+    }
+    if is_full_lon && south <= -89.85 && north < 89.85 {
+        let eff_span = (north + 90.0).max(360.0 * north.to_radians().cos().abs());
+        let step_deg = (eff_span / 24.0).clamp(DEFAULT_VECTOR_MAX_CHORD_DEG, MAX_AOI_CHORD_DEG);
+        return Some(GeoJsonGeometry::Polygon(polar_cap_circle_polygon(
+            north, false, step_deg,
+        )));
+    }
+
+    let mut intervals: Vec<(f64, f64)> = Vec::with_capacity(3);
+    let push_split = |a: f64, b: f64, out: &mut Vec<(f64, f64)>| {
+        let span = b - a;
+        if span <= 1e-9 {
+            return;
+        }
+        // Only split full-circle (`> 350°`) spans where West and East approach
+        // the same meridian at ±180°, avoiding interior stroke lines on wide
+        // regional/continental boxes.
+        if span > 350.0 {
+            let mid = 0.5 * (a + b);
+            out.push((a, mid));
+            out.push((mid, b));
+        } else {
+            out.push((a, b));
+        }
+    };
+
+    if west <= east {
+        push_split(west, east, &mut intervals);
+    } else {
+        push_split(west, 180.0, &mut intervals);
+        push_split(-180.0, east, &mut intervals);
+    }
+
+    let total_lon_span: f64 = intervals.iter().map(|(a, b)| b - a).sum();
+    let max_cos = south
+        .to_radians()
+        .cos()
+        .abs()
+        .max(north.to_radians().cos().abs());
+    let eff_span = (north - south).max(total_lon_span * max_cos);
+    let step_deg = (eff_span / 24.0).clamp(DEFAULT_VECTOR_MAX_CHORD_DEG, MAX_AOI_CHORD_DEG);
+    let polys: Vec<Polygon> = intervals
+        .into_iter()
+        .map(|(a, b)| rect_polygon_parallels(a, south, b, north, step_deg))
+        .collect();
+
+    match polys.len() {
+        0 => None,
+        1 => polys.into_iter().next().map(GeoJsonGeometry::Polygon),
+        _ => Some(GeoJsonGeometry::MultiPolygon(polys)),
+    }
+}
+
+/// Construct a closed CCW RFC 7946 WGS84 polygon (or `MultiPolygon` when
+/// crossing the antimeridian `west > east` or spanning `> 120°` in longitude)
+/// from `[west, south, east, north]` so every slice has `< 180°` edges and
+/// unambiguous positive CCW geodesic area on spherical STAC/GeoJSON backends.
 pub(super) fn polygon_geometry_from_bbox(bbox: [f64; 4]) -> Option<GeoJsonGeometry> {
     if !bbox.iter().all(|v| v.is_finite()) {
         return None;
@@ -43,28 +215,31 @@ pub(super) fn polygon_geometry_from_bbox(bbox: [f64; 4]) -> Option<GeoJsonGeomet
         return None;
     }
 
+    let mut polys: Vec<Polygon> = Vec::with_capacity(4);
+    let mut push_slices = |a: f64, b: f64| {
+        let span = b - a;
+        if span <= 1e-9 {
+            return;
+        }
+        let slices = ((span / 120.0).ceil() as usize).max(1);
+        for i in 0..slices {
+            let s0 = a + span * (i as f64 / slices as f64);
+            let s1 = a + span * ((i + 1) as f64 / slices as f64);
+            polys.push(rect_polygon(s0, south, s1, north));
+        }
+    };
+
     if west <= east {
-        if (east - west) <= 1e-9 {
-            return None;
-        }
-        Some(GeoJsonGeometry::Polygon(rect_polygon(
-            west, south, east, north,
-        )))
+        push_slices(west, east);
     } else {
-        // RFC 7946 antimeridian-crossing bbox: split into [west..=180] and [-180..=east],
-        // skipping degenerate zero-width halves.
-        let mut polys = Vec::with_capacity(2);
-        if (180.0 - west) > 1e-9 {
-            polys.push(rect_polygon(west, south, 180.0, north));
-        }
-        if (east - -180.0) > 1e-9 {
-            polys.push(rect_polygon(-180.0, south, east, north));
-        }
-        match polys.len() {
-            0 => None,
-            1 => polys.into_iter().next().map(GeoJsonGeometry::Polygon),
-            _ => Some(GeoJsonGeometry::MultiPolygon(polys)),
-        }
+        push_slices(west, 180.0);
+        push_slices(-180.0, east);
+    }
+
+    match polys.len() {
+        0 => None,
+        1 => polys.into_iter().next().map(GeoJsonGeometry::Polygon),
+        _ => Some(GeoJsonGeometry::MultiPolygon(polys)),
     }
 }
 
@@ -114,13 +289,14 @@ pub(super) fn build_vector_layer(
     if geometries.is_empty() {
         return None;
     }
+    let chord_deg = adaptive_aoi_chord_deg(&geometries);
     let fc = GeoJsonFeatureCollection {
         features: geometries
             .into_iter()
             .map(|g| GeoJsonFeature::new(None, g))
             .collect(),
     };
-    let mesh = VectorMesh::from_collection(&fc, DEFAULT_VECTOR_MAX_CHORD_DEG);
+    let mesh = VectorMesh::from_collection(&fc, chord_deg);
     if mesh.is_empty() {
         return None;
     }
@@ -177,9 +353,20 @@ impl AoiState {
         let Some(geom) = polygon_geometry_from_bbox(bbox) else {
             return false;
         };
+        let render_geom = render_geometry_from_bbox(bbox).unwrap_or_else(|| geom.clone());
         self.preview_draw = None;
         self.display_bbox = Some(bbox);
-        self.set_geometry_inner(geom, label, rev);
+        self.geometry = Some(geom);
+        self.label = Some(label);
+        self.draw = build_vector_layer(
+            DrawVectorId::StacAoi,
+            rev,
+            vec![render_geom],
+            STAC_AOI_FILL,
+            STAC_AOI_LINE,
+            3.0,
+            10.0,
+        );
         true
     }
 
@@ -206,13 +393,13 @@ impl AoiState {
     /// Update the live drag preview rectangle without overwriting any existing
     /// committed AOI until the drag finishes.
     pub(super) fn set_preview_bbox(&mut self, bbox: [f64; 4], rev: u64) -> bool {
-        let Some(geom) = polygon_geometry_from_bbox(bbox) else {
+        let Some(render_geom) = render_geometry_from_bbox(bbox) else {
             return false;
         };
         self.preview_draw = build_vector_layer(
             DrawVectorId::StacAoi,
             rev,
-            vec![geom],
+            vec![render_geom],
             STAC_AOI_FILL,
             STAC_AOI_LINE,
             3.0,

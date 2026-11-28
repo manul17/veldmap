@@ -554,9 +554,14 @@ pub struct DrawSnapshot {
 }
 
 impl DrawSnapshot {
-    /// Iterator over the texture tile IDs needed by the basemap quadtree.
-    pub(crate) fn visible_tex_ids(&self) -> impl Iterator<Item = QuadTileId> + '_ {
-        self.tiles.iter().map(|t| t.visible.tex_id)
+    /// Iterator over the texture tile IDs needed by the basemap quadtree paired
+    /// with their squared ECEF distance from the camera eye (smaller = closer
+    /// to screen center under the nadir camera).
+    pub(crate) fn visible_tex_priorities(&self) -> impl Iterator<Item = (QuadTileId, f64)> + '_ {
+        let eye = self.camera.eye_ecef();
+        self.tiles
+            .iter()
+            .map(move |t| (t.visible.tex_id, t.visible.origin_ecef_m.distance_squared(eye)))
     }
 
     /// Build a draw snapshot and its referenced GPU carrier tile keys from

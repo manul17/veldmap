@@ -33,6 +33,13 @@ pub enum GeoJsonGeometry {
 }
 
 impl GeoJsonGeometry {
+    /// Spherical framing circle enclosing all vertices in this geometry.
+    pub fn bounds(&self) -> Option<FootprintBounds> {
+        frame_visit(|emit| {
+            for_each_geometry_point(self, |p| emit(p.lat, p.lon));
+        })
+    }
+
     /// Axis-aligned WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]`
     /// across all finite vertices in this geometry.
     pub fn bbox(&self) -> Option<[f64; 4]> {

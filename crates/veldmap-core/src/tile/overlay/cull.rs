@@ -89,6 +89,25 @@ impl OverlayCullTree {
         self.balls[keep_level].clear();
     }
 
+    /// Return whether any coarsest-level cell of this overlay intersects `frustum`.
+    pub fn intersects_frustum(&mut self, frame: &Frame, frustum: &CullFrustum) -> bool {
+        if !frame.measurable() {
+            return false;
+        }
+        let top = self.max_level;
+        let top_w = grid_dim(level_size(self.width, u32::from(top)));
+        let top_h = grid_dim(level_size(self.height, u32::from(top)));
+        for y in 0..top_h {
+            for x in 0..top_w {
+                let ball = self.ball(frame, top, x, y);
+                if frustum.admits(&ball) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Collect all visible `(x, y)` cells at `target_level` using top-down lazy
     /// [`Ball`] pruning against `frustum`.
     pub fn visible_cells(

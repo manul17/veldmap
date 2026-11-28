@@ -112,6 +112,10 @@ impl GeoBinding {
         self.footprint
     }
 
+    pub(super) fn intersects_frustum(&mut self, frustum: &CullFrustum) -> bool {
+        self.cull.intersects_frustum(&self.frame, frustum)
+    }
+
     pub(super) fn visible_cells(&mut self, level: u8, frustum: &CullFrustum) -> Vec<(u32, u32)> {
         self.cull.visible_cells(&self.frame, level, frustum)
     }

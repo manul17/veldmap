@@ -109,9 +109,10 @@ impl GpuTileCache {
         self.cache.contains(key)
     }
 
-    /// Read-only check whether `key` or any coarser ancestor carrier is cached.
-    pub(crate) fn has_carrier(&self, key: &TileKey) -> bool {
-        self.cache.has_carrier(key)
+    /// Read-only lookup returning the zoom `level` of the finest cached carrier
+    /// covering `key` (exact or coarser ancestor).
+    pub(crate) fn carrier_level(&self, key: &TileKey) -> Option<u8> {
+        self.cache.carrier_level(key)
     }
 
     /// Remove every cached GPU tile belonging to `source`, returning how many

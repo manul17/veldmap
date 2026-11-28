@@ -13,9 +13,12 @@ use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{GlobeScheme, PlanetaryScheme, QuadTileId, SourceId, TileKey};
 use veldmap_raster::{
     BundledBasemap, BundledBasemapConfig, DecodeJob, DecodeJobKey, DecodePoolHandle,
+    render_harmonic_polar_cap_with_mipmaps,
 };
 
 use crate::gpu_tiles::UploadSender;
+
+use super::polar_rim::PolarRimTracker;
 
 /// Tiling configuration matching [`BUNDLED_BASEMAP_JPEG`].
 pub const BUNDLED_BASEMAP_CONFIG: BundledBasemapConfig = BundledBasemapConfig::DEFAULT;
@@ -70,6 +73,7 @@ pub(super) struct BundledBasemapProvider {
     wakeup: Wakeup,
     shutdown: CancelToken,
     basemap: Arc<OnceLock<Result<BundledBasemap, String>>>,
+    polar_rim: Arc<PolarRimTracker>,
     state: Arc<Mutex<BundledState>>,
 }
 
@@ -80,6 +84,7 @@ impl BundledBasemapProvider {
         done_tx: UploadSender,
         wakeup: Wakeup,
         shutdown: CancelToken,
+        polar_rim: Arc<PolarRimTracker>,
     ) -> Self {
         Self {
             pool,
@@ -87,10 +92,12 @@ impl BundledBasemapProvider {
             wakeup,
             shutdown,
             basemap: Arc::new(OnceLock::new()),
+            polar_rim,
             state: Arc::new(Mutex::new(BundledState::default())),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn in_flight_count(&self) -> usize {
         lock_unpoisoned(&self.state).in_flight.len()
     }
@@ -124,6 +131,7 @@ impl BundledBasemapProvider {
 
         let state = Arc::clone(&self.state);
         let basemap = Arc::clone(&self.basemap);
+        let polar_rim = Arc::clone(&self.polar_rim);
         let done_tx = self.done_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
         let work_cancel = job_cancel.clone();
@@ -150,6 +158,34 @@ impl BundledBasemapProvider {
                     lock_unpoisoned(&state).failed.insert(key);
                     return;
                 };
+                if let PlanetaryScheme::PolarCap { north } = quad_id.scheme
+                    && key.decode_rev > 0
+                {
+                    // Never fall through to offline Blue Marble for a harmonic
+                    // `decode_rev > 0` key; if superseded or reset, drop cleanly.
+                    if let Some(rim) = polar_rim.pyramid_for_revision(north, key.decode_rev) {
+                        match render_harmonic_polar_cap_with_mipmaps(
+                            quad_id,
+                            BUNDLED_TILE_PX,
+                            BUNDLED_POLAR_MAX_LEVEL,
+                            &rim,
+                        ) {
+                            Ok(tile) => {
+                                if matches!(
+                                    done_tx.send_if_uncancelled((key, tile), &work_cancel),
+                                    Ok(true)
+                                ) {
+                                    (wakeup)();
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(?key, error = %err, "Skipping out-of-range harmonic polar tile");
+                                lock_unpoisoned(&state).failed.insert(key);
+                            }
+                        }
+                    }
+                    return;
+                }
                 let decoded_basemap = basemap.get_or_init(|| {
                     BundledBasemap::from_encoded_bytes_with_config(
                         BUNDLED_BASEMAP_JPEG,
@@ -205,9 +241,9 @@ impl BundledBasemapProvider {
                     .keys()
                     .copied()
                     .filter(|k| {
-                        is_satisfied(k)
-                            || failed.contains(k)
-                            || (!wanted.contains(k) && !k.is_root_of(SourceId::BUNDLED_BASEMAP))
+                        let is_base_root =
+                            k.is_root_of(SourceId::BUNDLED_BASEMAP) && k.decode_rev == 0;
+                        is_satisfied(k) || failed.contains(k) || (!wanted.contains(k) && !is_base_root)
                     })
                     .collect();
                 for k in remove_keys {
@@ -252,6 +288,32 @@ impl BundledBasemapProvider {
                     y: 0,
                 },
             ));
+        }
+    }
+
+    /// Cancel all in-flight harmonic `PolarCap` (`decode_rev > 0`) jobs and
+    /// prune their failure markers (called on basemap switch before clearing
+    /// `PendingUploads` so stale workers cannot race past queue purging).
+    pub(super) fn cancel_polar_revs(&self) {
+        let is_polar_rev = |k: &TileKey| {
+            matches!(k.scheme, veldmap_core::tile::TileScheme::PolarCap { .. }) && k.decode_rev > 0
+        };
+        let tokens: Vec<CancelToken> = {
+            let mut st = lock_unpoisoned(&self.state);
+            st.failed.retain(|k| !is_polar_rev(k));
+            let remove_keys: Vec<TileKey> = st
+                .in_flight
+                .keys()
+                .copied()
+                .filter(is_polar_rev)
+                .collect();
+            remove_keys
+                .into_iter()
+                .filter_map(|k| st.in_flight.remove(&k).map(|(_, tok)| tok))
+                .collect()
+        };
+        for tok in tokens {
+            tok.cancel();
         }
     }
 

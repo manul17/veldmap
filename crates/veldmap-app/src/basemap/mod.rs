@@ -16,6 +16,7 @@
 mod adapters;
 mod bundled;
 mod manager;
+mod polar_rim;
 #[cfg(not(any(test, feature = "test-support")))]
 mod policy;
 #[cfg(any(test, feature = "test-support"))]
@@ -66,4 +67,5 @@ pub(crate) struct BasemapStatusSnapshot {
 pub(crate) struct BasemapSyncOutcome {
     pub(crate) changed: bool,
     pub(crate) evict_source: Option<SourceId>,
+    pub(crate) evict_polar_revs: bool,
 }
