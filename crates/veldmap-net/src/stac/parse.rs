@@ -160,6 +160,19 @@ fn parse_stac_item(val: &Value) -> Option<StacItem> {
         .get("collection")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let self_href = obj
+        .get("links")
+        .and_then(Value::as_array)
+        .and_then(|links| {
+            links.iter().find_map(|link| {
+                let rel = link.get("rel").and_then(Value::as_str)?;
+                if !rel.eq_ignore_ascii_case("self") {
+                    return None;
+                }
+                let href = link.get("href").and_then(Value::as_str)?;
+                crate::url::sanitize_url_for_persistence(href)
+            })
+        });
     let props = obj.get("properties").and_then(Value::as_object);
 
     let datetime = props
@@ -198,6 +211,7 @@ fn parse_stac_item(val: &Value) -> Option<StacItem> {
     Some(StacItem {
         id,
         collection,
+        self_href,
         datetime,
         cloud_cover,
         platform,

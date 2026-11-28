@@ -192,6 +192,35 @@ impl MeasureSession {
         })
     }
 
+    /// Return the active Area measurement as a [`GeoJsonGeometry::Polygon`]
+    /// when in [`MeasureMode::Area`] with at least 3 distinct vertices
+    /// (suitable for promoting directly into a Cloud / STAC search AOI).
+    pub(crate) fn polygon_geometry(&self) -> Option<GeoJsonGeometry> {
+        if self.mode != MeasureMode::Area {
+            return None;
+        }
+        let mut deduped: Vec<GeoPoint> = Vec::with_capacity(self.points.len());
+        for &pt in &self.points {
+            if !pt.lat.is_finite() || !pt.lon.is_finite() {
+                continue;
+            }
+            if deduped.last().is_some_and(|prev| {
+                (prev.lat - pt.lat).abs() < 1e-12 && (prev.lon - pt.lon).abs() < 1e-12
+            }) {
+                continue;
+            }
+            deduped.push(pt);
+        }
+        if deduped.len() >= 2
+            && (deduped[0].lat - deduped[deduped.len() - 1].lat).abs() < 1e-12
+            && (deduped[0].lon - deduped[deduped.len() - 1].lon).abs() < 1e-12
+        {
+            deduped.pop();
+        }
+        (deduped.len() >= 3)
+            .then(|| GeoJsonGeometry::Polygon(Polygon::new(Ring { points: deduped })))
+    }
+
     /// Serialize the current measurement feature as RFC 7946 GeoJSON.
     pub(crate) fn export_geojson_string(&self) -> Option<String> {
         self.to_geojson_collection()
@@ -279,7 +308,18 @@ mod tests {
         s.set_mode(MeasureMode::Area);
         s.add_point(GeoPoint::new(1.0, 1.0));
         assert!(s.metrics().polygon.area_m2 > 6.0e9);
+        assert!(matches!(
+            s.polygon_geometry(),
+            Some(GeoJsonGeometry::Polygon(_))
+        ));
         let area_json = s.export_geojson_string().expect("area geojson");
+        // Repeated identical clicks must NOT form a degenerate 3-vertex polygon.
+        let mut degen = MeasureSession::default();
+        degen.set_mode(MeasureMode::Area);
+        for _ in 0..4 {
+            degen.add_point(GeoPoint::new(10.0, 20.0));
+        }
+        assert!(degen.polygon_geometry().is_none());
         assert!(area_json.contains(r#""measurement_type": "area""#));
         assert!(area_json.contains(r#""area_m2""#));
         assert!(area_json.contains(r#""perimeter_m""#));

@@ -298,6 +298,9 @@ impl StacAsset {
 pub struct StacItem {
     pub id: String,
     pub collection: Option<String>,
+    /// Optional sanitized `links[rel="self"]` item URL for workspace metadata
+    /// persistence.
+    pub self_href: Option<String>,
     pub datetime: Option<String>,
     pub cloud_cover: Option<f32>,
     pub platform: Option<String>,

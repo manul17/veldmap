@@ -18,7 +18,10 @@ use veldmap_raster::ExternalBandMeta;
 
 use crate::layers::BandMathPreset;
 
-pub(crate) use auth::StacCogAuthMode;
+pub(crate) use auth::{
+    AuthTrust, StacCogAuthMode, effective_persisted_auth_mode, resolve_persisted_cog_auth,
+    sanitize_imported_auth_mode,
+};
 pub(crate) use session::{StacCatalogPreset, StacSearchRequest, StacSession};
 
 /// URL string wrapper whose [`fmt::Debug`] implementation delegates to
@@ -60,6 +63,8 @@ pub(crate) struct StacCogStreamSpec {
     pub(crate) auth_mode: StacCogAuthMode,
     pub(crate) external_bands: Vec<ExternalBandMeta>,
     pub(crate) is_scl: bool,
+    pub(crate) stac_item_href: Option<String>,
+    pub(crate) asset_key: Option<String>,
 }
 
 impl StacCogStreamSpec {
@@ -70,6 +75,8 @@ impl StacCogStreamSpec {
             auth_mode,
             external_bands: Vec::new(),
             is_scl: false,
+            stac_item_href: None,
+            asset_key: None,
         }
     }
 }
@@ -91,6 +98,8 @@ impl SampleSceneView {
             auth_mode: StacCogAuthMode::None,
             external_bands: self.external_bands.clone(),
             is_scl: false,
+            stac_item_href: None,
+            asset_key: None,
         }
     }
 }
@@ -102,6 +111,8 @@ pub(crate) struct StacRecipeAssetView {
     pub(crate) label: String,
     pub(crate) href: RedactedUrl,
     pub(crate) external_bands: Vec<ExternalBandMeta>,
+    pub(crate) stac_item_href: Option<String>,
+    pub(crate) asset_key: Option<String>,
 }
 
 /// UI-facing view of one 1-click STAC Scene Recipe (`True Color`, `NDVI + SCL`,
@@ -141,6 +152,7 @@ impl StacCogAssetView {
         &self,
         title: String,
         auth_mode: StacCogAuthMode,
+        stac_item_href: Option<String>,
     ) -> StacCogStreamSpec {
         StacCogStreamSpec {
             url: self.href.clone(),
@@ -148,6 +160,8 @@ impl StacCogAssetView {
             auth_mode,
             external_bands: self.external_bands.clone(),
             is_scl: self.is_scl,
+            stac_item_href,
+            asset_key: Some(self.key.clone()),
         }
     }
 }
@@ -158,6 +172,7 @@ impl StacCogAssetView {
 #[derive(Clone, Debug)]
 pub(crate) struct StacItemView {
     pub(crate) id: String,
+    pub(crate) self_href: Option<String>,
     pub(crate) meta_line: Option<String>,
     pub(crate) platform: Option<String>,
     pub(crate) processing_level: Option<String>,

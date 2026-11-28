@@ -31,7 +31,7 @@ mod tile_codec;
 
 pub use adapters::{JpegSource, PngSource};
 pub use basemap::{BundledBasemap, BundledBasemapConfig, decode_map_tile_with_mipmaps};
-pub use image_codec::{has_jpeg_magic, has_png_magic};
+pub use image_codec::{encode_png_rgba8, has_jpeg_magic, has_png_magic};
 pub use mipmap::generate_tile_mipmaps;
 pub use open::{
     OpenRasterOptions, OpenedRaster, SidecarReader, open_raster, open_raster_with_options,
@@ -92,9 +92,11 @@ pub enum RasterError {
     Budget(BudgetError),
     #[error("raster decode failed: {0}")]
     Decode(String),
-    #[error("invalid decoded image dimensions {width}x{height}")]
+    #[error("raster encode failed: {0}")]
+    Encode(String),
+    #[error("invalid image dimensions {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },
-    #[error("image {width}x{height} exceeds decode limits ({estimated_bytes} B > {limit_bytes} B)")]
+    #[error("image {width}x{height} exceeds image limits ({estimated_bytes} B > {limit_bytes} B)")]
     LimitExceeded {
         width: u32,
         height: u32,
@@ -132,7 +134,8 @@ impl RasterError {
             | Self::LimitExceeded { .. }
             | Self::TileOutOfRange { .. }
             | Self::Binding(_)
-            | Self::RemotePassUnsupported(_) => true,
+            | Self::RemotePassUnsupported(_)
+            | Self::Encode(_) => true,
             Self::Cancelled
             | Self::Budget(BudgetError::Cancelled)
             | Self::DecoderPanicked(_)
@@ -193,6 +196,7 @@ mod tests {
             },
             RasterError::Binding("bad crs".to_owned()),
             RasterError::RemotePassUnsupported("stripped remote".to_owned()),
+            RasterError::Encode("bad length".to_owned()),
         ];
         for err in &terminal {
             assert!(err.is_terminal(), "expected terminal for {err:?}");

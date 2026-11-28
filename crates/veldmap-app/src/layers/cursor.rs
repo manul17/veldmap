@@ -149,9 +149,10 @@ fn find_topmost_pixel(
     stack: &LayerStack,
     lat_deg: f64,
     lon_deg: f64,
+    excluded_layer: Option<LayerId>,
 ) -> Option<(&OverlayLayer, (u32, u32))> {
     stack.layers().iter().rev().find_map(|layer| {
-        if !layer.is_active() {
+        if !layer.is_active() || excluded_layer == Some(layer.id()) {
             return None;
         }
         let pixel = asset_pixel_at(layer.primary_asset(), lat_deg, lon_deg)?;
@@ -573,8 +574,10 @@ impl CursorProber {
         runtime: &Arc<OverlayRuntime>,
         lat_deg: f64,
         lon_deg: f64,
+        excluded_layer: Option<LayerId>,
     ) -> Option<CursorReadout> {
-        let Some((layer, pixel)) = find_topmost_pixel(stack, lat_deg, lon_deg) else {
+        let Some((layer, pixel)) = find_topmost_pixel(stack, lat_deg, lon_deg, excluded_layer)
+        else {
             self.cancel();
             return None;
         };

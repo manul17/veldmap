@@ -196,6 +196,12 @@ impl StacSession {
         )
     }
 
+    /// Normalize `mode` against this session's active search-result auth flag
+    /// for safe persistence in `session.json` / `.veldmap.json`.
+    pub(crate) fn effective_persisted_auth_mode(&self, mode: StacCogAuthMode) -> StacCogAuthMode {
+        super::effective_persisted_auth_mode(mode, self.result_uses_custom_auth)
+    }
+
     #[cfg(test)]
     pub(crate) fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()

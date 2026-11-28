@@ -4,12 +4,68 @@
 
 use std::io::{BufRead, Read, Seek};
 
+use crate::RasterError;
+
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
+/// Maximum image dimension accepted by [`encode_png_rgba8`].
+const MAX_PNG_ENCODE_SIDE: u32 = 16_384;
+/// Maximum uncompressed RGBA8 byte payload accepted by [`encode_png_rgba8`] (256 MiB).
+const MAX_PNG_ENCODE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Return whether `head` begins with an 8-byte PNG file signature.
 pub fn has_png_magic(head: &[u8]) -> bool {
     head.starts_with(&PNG_MAGIC)
+}
+
+/// Encode tightly packed 8-bit RGBA pixels (`width * height * 4` bytes) into a
+/// PNG byte stream.
+///
+/// Keeps PNG encoding inside `veldmap-raster` so downstream UI crates can
+/// export screenshots without depending directly on image/codec crates.
+pub fn encode_png_rgba8(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, RasterError> {
+    if width == 0 || height == 0 || width > MAX_PNG_ENCODE_SIDE || height > MAX_PNG_ENCODE_SIDE {
+        return Err(RasterError::InvalidDimensions { width, height });
+    }
+    let expected_u64 = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4);
+    if expected_u64 > MAX_PNG_ENCODE_BYTES {
+        return Err(RasterError::LimitExceeded {
+            width,
+            height,
+            estimated_bytes: expected_u64,
+            limit_bytes: MAX_PNG_ENCODE_BYTES,
+        });
+    }
+    let expected_len = usize::try_from(expected_u64).map_err(|_| RasterError::LimitExceeded {
+        width,
+        height,
+        estimated_bytes: expected_u64,
+        limit_bytes: MAX_PNG_ENCODE_BYTES,
+    })?;
+    if rgba.len() != expected_len {
+        return Err(RasterError::Encode(format!(
+            "RGBA8 buffer length {} does not match {width}x{height}x4 ({expected_len})",
+            rgba.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity((expected_len / 4).max(1024));
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|err| RasterError::Encode(err.to_string()))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|err| RasterError::Encode(err.to_string()))?;
+    writer
+        .finish()
+        .map_err(|err| RasterError::Encode(err.to_string()))?;
+    Ok(out)
 }
 
 /// Return whether `head` begins with a JPEG SOI + marker prefix (`FF D8 FF`).
@@ -286,5 +342,45 @@ mod tests {
         assert_eq!(&rgb[3..6], &[0, 255, 255]);
         assert_eq!(&rgb[6..9], &[0, 0, 0]);
         assert_eq!(&rgb[9..12], &[127, 127, 127]);
+    }
+
+    #[test]
+    fn encode_png_rgba8_round_trips_and_validates_inputs() {
+        let width = 4;
+        let height = 3;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[(x * 60) as u8, (y * 80) as u8, 128, 255]);
+            }
+        }
+        let encoded = encode_png_rgba8(width, height, &rgba).expect("encode png");
+        assert!(has_png_magic(&encoded));
+
+        let decoder = build_normalized_png_decoder(std::io::Cursor::new(&encoded), 1024 * 1024);
+        let mut reader = decoder.read_info().expect("read png header");
+        let mut decoded = vec![0u8; reader.output_buffer_size().expect("buf size")];
+        let info = reader.next_frame(&mut decoded).expect("decode png");
+        assert_eq!(info.width, width);
+        assert_eq!(info.height, height);
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(&decoded[..rgba.len()], rgba.as_slice());
+
+        assert!(matches!(
+            encode_png_rgba8(0, 4, &[]),
+            Err(RasterError::InvalidDimensions { .. })
+        ));
+        assert!(matches!(
+            encode_png_rgba8(MAX_PNG_ENCODE_SIDE + 1, 1, &[]),
+            Err(RasterError::InvalidDimensions { .. })
+        ));
+        assert!(matches!(
+            encode_png_rgba8(MAX_PNG_ENCODE_SIDE, MAX_PNG_ENCODE_SIDE, &[]),
+            Err(RasterError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            encode_png_rgba8(2, 2, &[0u8; 12]),
+            Err(RasterError::Encode(_))
+        ));
     }
 }

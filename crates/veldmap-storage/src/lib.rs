@@ -2,9 +2,10 @@
 //! RAM probing, positioned local file I/O, BLAKE3 fingerprinting, and
 //! crash-safe SQLite WAL LRU tile disk caching for VeldMap.
 //!
-//! Focused strictly on storage mechanics: application-level preference and
-//! session schemas live in `veldmap-app` and persist through
-//! [`read_json_or_default_with_backup`] / [`write_json_durable_private`].
+//! Focused strictly on storage mechanics: application-level preference,
+//! session, and project schemas live in `veldmap-app` and persist through
+//! [`read_json_or_default_with_backup`], [`write_json_durable_private`],
+//! [`read_json_limited`], and [`write_json_durable`].
 
 #![cfg_attr(not(target_os = "windows"), forbid(unsafe_code))]
 #![cfg_attr(target_os = "windows", deny(unsafe_code))]
@@ -20,7 +21,8 @@ mod paths;
 mod tile_cache;
 
 pub use atomic::{
-    read_json_or_default_with_backup, write_atomic_durable, write_json_durable_private,
+    read_json_limited, read_json_or_default_with_backup, write_atomic_durable, write_json_durable,
+    write_json_durable_private,
 };
 pub use file_source::{LocalFileSource, read_regular_file_utf8_limited};
 pub use fingerprint::{LocalFingerprintCache, fingerprint_byte_source};

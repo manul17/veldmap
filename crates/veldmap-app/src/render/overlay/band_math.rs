@@ -17,6 +17,7 @@ use super::super::scratch::{
     MASK_UNCOVERED_SENTINEL, QUIET_NAN_BITS, ScratchTargetPool, compute_band_math_scissor_rect,
 };
 use super::super::snapshot::{DrawBandMathLayer, DrawOverlayPatch, DrawSnapshot};
+use super::super::swipe::{ResolvedSwipe, intersect_scissor_rects};
 use super::super::uniforms::{
     BandMathCompositeUniform, DynamicUniformArena, ScratchMrtPatchUniform,
     ScratchSinglePatchUniform, UniformSlot,
@@ -87,9 +88,11 @@ pub(super) struct BandMathUniformCtx<'a> {
 pub(super) fn push_band_math_uniforms(
     ctx: &BandMathUniformCtx<'_>,
     arena: &mut DynamicUniformArena,
+    layer_id: u64,
     bm: &DrawBandMathLayer,
     use_mrt: bool,
     opacity: f32,
+    swipe: Option<ResolvedSwipe>,
 ) -> PreparedBandMath {
     let meshes = ctx.meshes;
     let snapshot = ctx.snapshot;
@@ -97,9 +100,16 @@ pub(super) fn push_band_math_uniforms(
     let width = ctx.width;
     let height = ctx.height;
     let has_required_bands = bm.bands.len() >= bm.formula.required_bands();
-    let scissor = has_required_bands
+    let projected_scissor = has_required_bands
         .then(|| compute_band_math_scissor_rect(&snapshot.camera, width, height, bm))
         .flatten();
+    let scissor = match (projected_scissor, swipe) {
+        (Some(proj), Some(sw)) => sw
+            .scissor_for_layer(layer_id, width, height)
+            .and_then(|half| intersect_scissor_rects(proj, half)),
+        (proj, None) => proj,
+        (None, _) => None,
+    };
     if scissor.is_none() {
         return PreparedBandMath {
             scissor: None,

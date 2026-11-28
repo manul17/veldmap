@@ -33,6 +33,7 @@ fn single_patch_layer(
     texture: Arc<GpuTile>,
 ) -> DrawOverlayLayer {
     DrawOverlayLayer {
+        layer_id: relaid,
         opacity: 1.0,
         content: DrawOverlayContent::Direct {
             track,
@@ -178,6 +179,7 @@ fn overlay_warp_mesh_drapes_with_south_up_winding_graticule_on_top_and_zero_idle
                 width,
                 height,
                 snapshot: &snap,
+                swipe: None,
             },
             false,
         );
@@ -934,6 +936,7 @@ fn band_math_nan_fill_preserves_zero_reflectance_and_scl_masking() {
         Arc::clone(&tex_base),
     ));
     snap.overlays.push(DrawOverlayLayer {
+        layer_id: 9001,
         opacity: 1.0,
         content: DrawOverlayContent::BandMath(Box::new(make_bm(true))),
     });
@@ -977,6 +980,7 @@ fn band_math_nan_fill_preserves_zero_reflectance_and_scl_masking() {
         Arc::clone(&tex_base),
     ));
     snap_unmasked.overlays.push(DrawOverlayLayer {
+        layer_id: 9001,
         opacity: 1.0,
         content: DrawOverlayContent::BandMath(Box::new(make_bm(false))),
     });
@@ -1175,6 +1179,7 @@ fn band_math_mrt_vs_non_mrt_parity_scissor_painter_order_and_lazy_scratch_releas
 
     let mut snap_mrt = build_empty_snapshot(cam, width, height, &config);
     snap_mrt.overlays.push(DrawOverlayLayer {
+        layer_id: 9002,
         opacity: 1.0,
         content: DrawOverlayContent::BandMath(Box::new(bm_mrt.clone())),
     });
@@ -1195,6 +1200,7 @@ fn band_math_mrt_vs_non_mrt_parity_scissor_painter_order_and_lazy_scratch_releas
 
     let mut snap_non_mrt = build_empty_snapshot(cam, width, height, &config);
     snap_non_mrt.overlays.push(DrawOverlayLayer {
+        layer_id: 9003,
         opacity: 1.0,
         content: DrawOverlayContent::BandMath(Box::new(bm_non_mrt)),
     });
@@ -1238,6 +1244,7 @@ fn band_math_mrt_vs_non_mrt_parity_scissor_painter_order_and_lazy_scratch_releas
     top_direct.opacity = 0.5;
     let mut snap_interleaved = build_empty_snapshot(cam, width, height, &config);
     snap_interleaved.overlays.push(DrawOverlayLayer {
+        layer_id: 9004,
         opacity: 1.0,
         content: DrawOverlayContent::BandMath(Box::new(bm_mrt)),
     });
@@ -1347,6 +1354,7 @@ fn band_math_mrt_vs_non_mrt_parity_scissor_painter_order_and_lazy_scratch_releas
     let mut snap_trailing_empty = build_empty_snapshot(cam, width, height, &config);
     snap_trailing_empty.show_graticule = true;
     snap_trailing_empty.overlays.push(DrawOverlayLayer {
+        layer_id: 9005,
         opacity: 1.0,
         content: DrawOverlayContent::BandMath(Box::new(DrawBandMathLayer {
             bands: Vec::new(),
@@ -1365,5 +1373,218 @@ fn band_math_mrt_vs_non_mrt_parity_scissor_painter_order_and_lazy_scratch_releas
     assert_eq!(
         pixels_grat_ref, pixels_trailing_empty,
         "trailing empty BandMath layer must preserve post-overlay graticule rendering"
+    );
+}
+
+#[test]
+fn split_screen_swipe_clips_direct_and_band_math_without_rebuilding_snapshot_or_zero_scissors() {
+    use veldmap_app::render::SwipeRenderState;
+
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let (width, height) = (161, 120);
+    let config = QuadtreeConfig::geodetic(2);
+    let frame = Arc::new(
+        Frame::quad([(45.3, 10.0), (45.3, 10.6), (44.7, 10.6), (44.7, 10.0)]).expect("frame"),
+    );
+    let cam = Camera::at(45.0, 10.3, 30_000.0);
+    let mut gpu_cache = GpuTileCache::new(64 * 1024 * 1024);
+
+    // Left layer: Direct solid cyan (layer_id = 101).
+    let src_direct = SourceId::new(980);
+    let (_, tex_cyan) =
+        upload_overlay_tile(device, queue, &mut gpu_cache, src_direct, 16, 16, |_, _| {
+            [0, 230, 230, 255]
+        });
+    let mut direct_layer = single_patch_layer(
+        &frame,
+        src_direct,
+        1,
+        MIN_WARP_SEGMENTS,
+        DrawOverlayTrack::Display,
+        tex_cyan,
+    );
+    direct_layer.layer_id = 101;
+
+    // Right layer: BandMath RGB solid orange (layer_id = 202).
+    let src_r = SourceId::new(981);
+    let src_g = SourceId::new(982);
+    let src_b = SourceId::new(983);
+    let (_, tex_r) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_r,
+        BandKey::Index(0),
+        16,
+        16,
+        |_, _| 1.0,
+    );
+    let (_, tex_g) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_g,
+        BandKey::Index(0),
+        16,
+        16,
+        |_, _| 0.5,
+    );
+    let (_, tex_b) = upload_r32f_tile(
+        device,
+        queue,
+        &mut gpu_cache,
+        src_b,
+        BandKey::Index(0),
+        16,
+        16,
+        |_, _| 0.0,
+    );
+    let bm_layer = DrawOverlayLayer {
+        layer_id: 202,
+        opacity: 1.0,
+        content: DrawOverlayContent::BandMath(Box::new(DrawBandMathLayer {
+            formula: BandMathFormula::RgbComposite,
+            colormap: ColormapId::Grayscale,
+            invert_colormap: false,
+            stretch_min: 0.0,
+            stretch_max: 1.0,
+            rgb_min: [0.0; 3],
+            rgb_max: [1.0; 3],
+            rgb_gamma: 1.0,
+            scl_mask_enabled: false,
+            scl_mask_bits: 0,
+            bands: vec![
+                scratch_band(&frame, src_r, 2, 512, 512, 1.0, 0.0, tex_r),
+                scratch_band(&frame, src_g, 3, 512, 512, 1.0, 0.0, tex_g),
+                scratch_band(&frame, src_b, 4, 512, 512, 1.0, 0.0, tex_b),
+            ],
+            scl: None,
+        })),
+    };
+
+    let mut snap = build_empty_snapshot(cam, width, height, &config);
+    snap.overlays.push(bm_layer);
+    snap.overlays.push(direct_layer);
+    snap.show_graticule = true;
+    let snap = Arc::new(snap);
+    let mut globe = TestGlobe::new_srgb(device);
+
+    // 1. Mid-split (`split_t = 0.43` on odd width `161`): verify exact physical
+    //    seam pixel (`split_x - 1` is cyan Direct, `split_x` is orange BandMath).
+    let mid_swipe = SwipeRenderState {
+        split_t: 0.43,
+        left_layer: Some(101),
+        right_layer: Some(202),
+    };
+    let split_x = veldmap_app::render::snap_split_x(mid_swipe.split_t, width);
+    let px_mid = render_with(
+        &mut globe,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width,
+            height,
+            snapshot: &snap,
+            swipe: Some(mid_swipe),
+        },
+        true,
+    );
+    // Probe off the exact 45.0° N graticule parallel (`y = height / 2`) for
+    // pure cyan/orange seam verification, and also assert the graticule renders
+    // unclipped on BOTH sides of `split_x` after the trailing clipped Direct pass.
+    let probe_y = height / 2 + 12;
+    let left_seam = pixel_at(&px_mid, width, split_x - 1, probe_y);
+    let right_seam = pixel_at(&px_mid, width, split_x, probe_y);
+    assert!(
+        left_seam[0] < 20 && left_seam[1] > 210 && left_seam[2] > 210,
+        "pixel split_x-1 ({}) must render cyan Direct layer, got {left_seam:?}",
+        split_x - 1
+    );
+    assert!(
+        right_seam[0] > 230 && right_seam[1] > 110 && right_seam[1] < 145 && right_seam[2] < 20,
+        "pixel split_x ({split_x}) must render orange BandMath layer, got {right_seam:?}"
+    );
+    // The 45.0° N graticule parallel at `y = height / 2` must blend visibly
+    // across BOTH half-planes (confirming full-viewport scissor restore after
+    // the trailing clipped Direct layer).
+    let left_grat = pixel_at(&px_mid, width, split_x - 4, height / 2);
+    let right_grat = pixel_at(&px_mid, width, split_x + 4, height / 2);
+    assert!(
+        left_grat[0] > left_seam[0] + 40,
+        "graticule must remain visible on left half-plane: seam={left_seam:?}, grat={left_grat:?}"
+    );
+    assert!(
+        right_grat[2] > right_seam[2] + 40,
+        "graticule must remain visible on right half-plane: seam={right_seam:?}, grat={right_grat:?}"
+    );
+
+    // 2. Identical snapshot + identical swipe triggers 0 idle GPU re-renders.
+    let _ = render_with(
+        &mut globe,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width,
+            height,
+            snapshot: &snap,
+            swipe: Some(mid_swipe),
+        },
+        false,
+    );
+
+    // 3. Curtain dragged to `split_t = 1.0` on the SAME `Arc<DrawSnapshot>`:
+    //    `LastRenderKey` must trigger a re-render, Direct covers full width, and
+    //    BandMath has empty scissor intersection (skipped cleanly with zero wgpu error!).
+    let px_full_left = render_with(
+        &mut globe,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width,
+            height,
+            snapshot: &snap,
+            swipe: Some(SwipeRenderState {
+                split_t: 1.0,
+                left_layer: Some(101),
+                right_layer: Some(202),
+            }),
+        },
+        true,
+    );
+    let right_at_1 = pixel_at(&px_full_left, width, (width * 3) / 4, probe_y);
+    assert!(
+        right_at_1[0] < 20 && right_at_1[1] > 210 && right_at_1[2] > 210,
+        "at split_t=1.0 right side must show cyan Direct layer (BandMath skipped), got {right_at_1:?}"
+    );
+
+    // 4. Curtain dragged to `split_t = 0.0` on the SAME `Arc<DrawSnapshot>`:
+    //    Direct has empty scissor (skipped cleanly), BandMath covers full width.
+    let px_full_right = render_with(
+        &mut globe,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        RenderParams {
+            width,
+            height,
+            snapshot: &snap,
+            swipe: Some(SwipeRenderState {
+                split_t: 0.0,
+                left_layer: Some(101),
+                right_layer: Some(202),
+            }),
+        },
+        true,
+    );
+    let left_at_0 = pixel_at(&px_full_right, width, width / 4, probe_y);
+    assert!(
+        left_at_0[0] > 230 && left_at_0[1] > 110 && left_at_0[1] < 145 && left_at_0[2] < 20,
+        "at split_t=0.0 left side must show orange BandMath layer (Direct skipped), got {left_at_0:?}"
     );
 }

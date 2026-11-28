@@ -68,11 +68,41 @@ pub(crate) struct StacUiState {
     copy_notice: Option<String>,
 }
 
+/// Convert days since Unix epoch (`1970-01-01`) into proleptic Gregorian
+/// `(year, month, day)` using Howard Hinnant's exact civil-from-days algorithm.
+fn civil_from_unix_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    (year, m as u32, d as u32)
+}
+
+/// Build a rolling last-90-days UTC ISO-8601 STAC datetime interval from `now`.
+fn rolling_last_90_days_utc_interval(now: std::time::SystemTime) -> String {
+    const SECS_PER_DAY: u64 = 86_400;
+    const WINDOW_DAYS: i64 = 90;
+    let end_days = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / SECS_PER_DAY) as i64)
+        .unwrap_or(20_000);
+    let start_days = end_days.saturating_sub(WINDOW_DAYS);
+    let (sy, sm, sd) = civil_from_unix_days(start_days);
+    let (ey, em, ed) = civil_from_unix_days(end_days);
+    format!("{sy:04}-{sm:02}-{sd:02}T00:00:00Z/{ey:04}-{em:02}-{ed:02}T23:59:59Z")
+}
+
 impl Default for StacUiState {
     fn default() -> Self {
         Self {
             preset: StacCatalogPreset::AwsSentinel2L2a,
-            datetime_input: "2024-06-01T00:00:00Z/2024-09-01T23:59:59Z".to_owned(),
+            datetime_input: rolling_last_90_days_utc_interval(std::time::SystemTime::now()),
             filter_clouds: true,
             max_cloud_cover: 20.0,
             limit: 15,
@@ -276,5 +306,16 @@ mod tests {
             "leaked query: {action_dbg}"
         );
         assert!(!action_dbg.contains("pw"), "leaked userinfo: {action_dbg}");
+    }
+
+    #[test]
+    fn rolling_last_90_days_utc_interval_handles_leap_years_and_exact_span() {
+        // 2024-03-01T12:00:00Z = day 19783 since 1970-01-01 (leap year 2024).
+        // 90 days earlier = 2023-12-02.
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(19_783 * 86_400 + 43_200);
+        assert_eq!(
+            rolling_last_90_days_utc_interval(t),
+            "2023-12-02T00:00:00Z/2024-03-01T23:59:59Z"
+        );
     }
 }

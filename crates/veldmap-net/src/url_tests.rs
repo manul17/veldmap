@@ -65,28 +65,44 @@ fn url_authority_parsing_and_host_extraction_handle_edge_cases() {
 #[test]
 fn canonical_endpoint_origin_and_query_fragment_helpers_work() {
     assert_eq!(
-        canonical_url_without_query("  HTTPS://user:pw@Example.COM:443/path/a.tif?sig=abc#frag  ")
+        sanitize_url_for_persistence("  HTTPS://user:pw@Example.COM:443/path/a.tif?sig=abc#frag  ")
             .as_deref(),
         Some("https://example.com/path/a.tif")
     );
     assert_eq!(
-        canonical_url_without_query("https://example.com:443/a.tif"),
-        canonical_url_without_query("https://example.com/a.tif")
+        sanitize_url_for_persistence("https://user:pass@[::1]:443/a.tif?sig=1#f").as_deref(),
+        Some("https://[::1]/a.tif")
     );
     assert_eq!(
-        canonical_url_without_query("http://example.com:80/a.tif").as_deref(),
+        sanitize_url_for_persistence("http://user@example.com:80/a.tif").as_deref(),
         Some("http://example.com/a.tif")
     );
     assert_eq!(
-        canonical_url_without_query("https://example.com:8443/a.tif").as_deref(),
+        sanitize_url_for_persistence("https://@example.com/a.tif").as_deref(),
+        Some("https://example.com/a.tif")
+    );
+    assert_eq!(
+        sanitize_url_for_persistence("https://u%3A1:p%402@example.com/a.tif?token=1").as_deref(),
+        Some("https://example.com/a.tif")
+    );
+    assert_eq!(
+        sanitize_url_for_persistence("https://example.com:443/a.tif"),
+        sanitize_url_for_persistence("https://example.com/a.tif")
+    );
+    assert_eq!(
+        sanitize_url_for_persistence("http://example.com:80/a.tif").as_deref(),
+        Some("http://example.com/a.tif")
+    );
+    assert_eq!(
+        sanitize_url_for_persistence("https://example.com:8443/a.tif").as_deref(),
         Some("https://example.com:8443/a.tif")
     );
     assert_eq!(
-        canonical_url_without_query("https://example.com"),
+        sanitize_url_for_persistence("https://example.com"),
         Some("https://example.com/".to_owned())
     );
-    assert!(canonical_url_without_query("https://example.com/a b.tif").is_none());
-    assert!(canonical_url_without_query("ftp://example.com/a.tif").is_none());
+    assert!(sanitize_url_for_persistence("https://example.com/a b.tif").is_none());
+    assert!(sanitize_url_for_persistence("ftp://example.com/a.tif").is_none());
     // Reject slash-missing special-scheme URLs (which WHATWG Url::parse would
     // otherwise normalize while bypassing `://` credential redaction) and
     // internal ASCII control characters.
@@ -99,8 +115,8 @@ fn canonical_endpoint_origin_and_query_fragment_helpers_work() {
         "https://example.com/a\x7fb.tif",
     ] {
         assert!(
-            canonical_url_without_query(malformed).is_none(),
-            "canonical_url_without_query must reject {malformed:?}"
+            sanitize_url_for_persistence(malformed).is_none(),
+            "sanitize_url_for_persistence must reject {malformed:?}"
         );
         assert!(
             !is_valid_http_endpoint(malformed),

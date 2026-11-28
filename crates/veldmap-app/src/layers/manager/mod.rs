@@ -117,6 +117,8 @@ pub(crate) struct OverlayManager {
     stack: LayerStack,
     next_layer_id: u64,
     next_relaid: u64,
+    workspace_epoch: u64,
+    workspace_cancel: CancelToken,
     runtime: Arc<OverlayRuntime>,
     remote_pool: Option<DecodePool>,
     tile_writer: Option<TileWriteWorker>,
@@ -166,11 +168,14 @@ impl OverlayManager {
             wakeup,
             shutdown,
         }));
+        let workspace_cancel = runtime.shutdown.child_token();
         let io_worker = spawn_overlay_io_worker(Arc::clone(&runtime));
         Self {
             stack: LayerStack::default(),
             next_layer_id: 1,
             next_relaid: 1,
+            workspace_epoch: 1,
+            workspace_cancel,
             runtime,
             remote_pool: Some(remote_pool),
             tile_writer,
@@ -287,6 +292,11 @@ impl OverlayManager {
         self.stack.layers().len()
     }
 
+    /// Ordered live raster layer IDs in painter's order (bottom-to-top).
+    pub(crate) fn layer_ids(&self) -> Vec<LayerId> {
+        self.stack.layers().iter().map(OverlayLayer::id).collect()
+    }
+
     /// Look up the current CRS override for a single-raster layer `id`, if any.
     pub(crate) fn layer_crs_override(&self, id: LayerId) -> Option<CrsOverride> {
         self.stack
@@ -295,13 +305,46 @@ impl OverlayManager {
             .and_then(|a| a.geo().crs_override().cloned())
     }
 
-    /// Borrowed view of loaded local raster layers in painter's order for
-    /// session persistence (remote HTTP COGs are intentionally excluded).
-    pub(crate) fn saved_entries_iter(&self) -> impl Iterator<Item = OverlayPersistEntry<'_>> {
+    /// Owned persistence snapshots of all loaded raster layers paired with
+    /// their [`LayerId`] in painter's order (bottom-to-top).
+    pub(crate) fn saved_entries_iter(
+        &self,
+    ) -> impl Iterator<Item = (LayerId, OverlayPersistEntry)> + '_ {
         self.stack
             .layers()
             .iter()
-            .filter_map(OverlayLayer::persist_entry)
+            .filter_map(|layer| layer.persist_entry().map(|entry| (layer.id(), entry)))
+    }
+
+    /// Move an existing layer to painter's-order index `target_idx` (used when
+    /// asynchronously restored layers settle out of order).
+    pub(crate) fn move_layer_to_index(
+        &mut self,
+        id: LayerId,
+        target_idx: usize,
+    ) -> OverlayMutation {
+        OverlayMutation {
+            changed: self.stack.move_to_index(id, target_idx),
+            ..OverlayMutation::default()
+        }
+    }
+
+    /// Remove every loaded raster layer and cancel/fence any in-flight local or
+    /// remote opens from the prior workspace (e.g., before loading a
+    /// `.veldmap.json` project), returning purged `SourceId`s.
+    pub(crate) fn clear_all(&mut self) -> OverlayMutation {
+        self.workspace_cancel.cancel();
+        self.workspace_cancel = self.runtime.shutdown.child_token();
+        self.workspace_epoch = self.workspace_epoch.saturating_add(1);
+        let ids: Vec<LayerId> = self.layer_ids();
+        let mut combined = OverlayMutation::default();
+        for id in ids {
+            let m = self.remove_layer(id);
+            combined.changed |= m.changed;
+            combined.topology_changed |= m.topology_changed;
+            combined.purge_sources.extend(m.purge_sources);
+        }
+        combined
     }
 
     fn mutate_layer(
@@ -594,9 +637,14 @@ impl OverlayManager {
         self.cursor.cancel();
     }
 
-    pub(crate) fn query_cursor_readout(&self, lat_deg: f64, lon_deg: f64) -> Option<CursorReadout> {
+    pub(crate) fn query_cursor_readout(
+        &self,
+        lat_deg: f64,
+        lon_deg: f64,
+        excluded_layer: Option<LayerId>,
+    ) -> Option<CursorReadout> {
         self.cursor
-            .query(&self.stack, &self.runtime, lat_deg, lon_deg)
+            .query(&self.stack, &self.runtime, lat_deg, lon_deg, excluded_layer)
     }
 
     /// Phase 1 shutdown: cancel active overlay passes, pointwise jobs, reloads,

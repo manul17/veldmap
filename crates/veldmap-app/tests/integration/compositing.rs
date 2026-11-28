@@ -33,6 +33,7 @@ fn srgb_and_unorm_compositing_parity_and_zero_idle_rerender() {
         width: w,
         height: h,
         snapshot: &snap,
+        swipe: None,
     };
 
     let mut srgb_renderer = TestGlobe::new_srgb(device);
@@ -205,6 +206,7 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
             width: 0,
             height: 0,
             snapshot: &empty_snap,
+            swipe: None,
         },
     ));
 
@@ -213,6 +215,7 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
         width: 65,
         height: 65,
         snapshot: &snap,
+        swipe: None,
     };
     let mut dropped_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     assert!(renderer.render_if_dirty(device, queue, &mut dropped_enc, params));
@@ -223,5 +226,87 @@ fn dropped_encoder_recovery_and_zero_viewport_safety() {
     assert!(
         center[0] > 180 && center[1] > 170 && center[2] > 150,
         "recovered render did not produce lit globe center: {center:?}"
+    );
+}
+
+#[test]
+fn clean_frame_offscreen_png_readback_captures_and_encodes_valid_png() {
+    let Some((device, queue)) = shared_headless_device() else {
+        return;
+    };
+
+    let (w, h) = (131, 97); // Odd non-256-aligned width tests 256 B row-padding unpad.
+    let cfg = QuadtreeConfig::geodetic(BUNDLED_MAX_LEVEL);
+    let snap = build_snapshot(
+        Camera::default(),
+        w,
+        h,
+        true,
+        SourceId::BUNDLED_BASEMAP,
+        &cfg,
+        None,
+    );
+    let mut globe = TestGlobe::new_srgb(device);
+    let params = RenderParams {
+        width: w,
+        height: h,
+        snapshot: &snap,
+        swipe: None,
+    };
+
+    // Frame 1: render & composite so `is_clean_for` becomes `true`.
+    let reference = render_with(
+        &mut globe,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        params,
+        true,
+    );
+
+    // Frame 2 (clean frame): `render_if_dirty` returns `false`, yet
+    // `encode_offscreen_readback` still captures the exact retained offscreen color target.
+    let mut clean_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("clean frame png readback"),
+    });
+    assert!(
+        !globe.render_if_dirty(device, queue, &mut clean_enc, params),
+        "second identical frame must be clean"
+    );
+    let readback = globe
+        .renderer
+        .encode_offscreen_readback(device, &mut clean_enc)
+        .expect("offscreen readback must succeed on clean frame");
+    queue.submit(Some(clean_enc.finish()));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    readback.map_async(move |res| {
+        let _ = tx.send(res);
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("map callback")
+        .expect("map_async succeeded");
+
+    let rgba = readback.read_tight_rgba8().expect("read mapped RGBA8");
+    assert_eq!(rgba.len(), (w * h * 4) as usize);
+    assert_eq!(
+        rgba, reference,
+        "clean-frame offscreen readback must match composited sRGB pixels byte-for-byte"
+    );
+
+    let png_bytes = veldmap_raster::encode_png_rgba8(w, h, &rgba).expect("encode clean-frame PNG");
+    assert!(veldmap_raster::has_png_magic(&png_bytes));
+
+    // After collapsing viewport targets, readback returns None cleanly.
+    globe.renderer.release_viewport_targets();
+    let mut collapsed_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("collapsed readback encoder"),
+    });
+    assert!(
+        globe
+            .renderer
+            .encode_offscreen_readback(device, &mut collapsed_enc)
+            .is_none()
     );
 }

@@ -61,6 +61,19 @@ pub(super) fn show_vector_card(
             }
 
             ui.horizontal_wrapped(|ui| {
+                if layer.has_polygons {
+                    let mut outline_only = layer.outline_only;
+                    if ui
+                        .checkbox(&mut outline_only, "Outline only")
+                        .on_hover_text("Render polygon strokes without interior fill")
+                        .changed()
+                    {
+                        actions.push(LayerUiAction::edit_vector(
+                            layer.id,
+                            VectorEdit::SetOutlineOnly(outline_only),
+                        ));
+                    }
+                }
                 if let Some(bounds) = layer.footprint
                     && ui
                         .small_button("Zoom")

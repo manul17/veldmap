@@ -17,7 +17,7 @@ use crate::context::NetContext;
 use crate::http::{link_cancel_token, parse_custom_headers};
 use crate::limiter::HostLimiters;
 use crate::redact::{EncodedSecret, sanitize_url_for_display};
-use crate::url::{canonical_url_without_query, extract_host};
+use crate::url::extract_host;
 
 use super::config::{HttpRangeConfig, RangeOpenError};
 use super::pool::{BlockPoolKey, PrefetchBudget, RANGE_BLOCK_SIZE, RangeBlockPool};
@@ -342,7 +342,7 @@ impl HttpRangeSource {
             return Err(RangeOpenError::Cancelled);
         }
         let trimmed_url = url.trim();
-        let canonical = canonical_url_without_query(trimmed_url)
+        let canonical = crate::url::sanitize_url_for_persistence(trimmed_url)
             .ok_or_else(|| RangeOpenError::InvalidUrl(sanitize_url_for_display(trimmed_url)))?;
         let host = extract_host(trimmed_url);
 

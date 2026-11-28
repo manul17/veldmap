@@ -28,9 +28,12 @@ use veldmap_core::tile::TileStreamSpec;
 use veldmap_raster::{BandStats, ExternalBandMeta};
 
 use crate::colormap::{CategoricalPaletteId, ColormapId};
+use crate::stac::StacCogAuthMode;
 
 pub use band_math::BandMathFormula;
-pub(crate) use band_math::{BandChannelSample, BandMathPreset, BandMathReadout, BandMathSummary};
+pub(crate) use band_math::{
+    BandChannelSample, BandMathPreset, BandMathReadout, BandMathStyleSpec, BandMathSummary,
+};
 pub(crate) use crs_override::CrsOverride;
 pub(crate) use manager::{
     OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayManagerDeps, OverlayMutation,
@@ -40,6 +43,18 @@ pub(crate) use style::{ColorbarInfo, LayerBandOption, LayerStyleSpec, StretchPre
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct LayerId(u64);
+
+impl LayerId {
+    /// Return the raw numeric identifier for renderer scissor/swipe matching.
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw_for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
 
 /// Initial display, style, and georeference override options when inserting an
 /// opened raster layer into [`stack::LayerStack`].
@@ -60,6 +75,7 @@ pub(crate) struct OpenOverlayRequest<'a> {
     pub(crate) opacity: f32,
     pub(crate) crs_override: Option<CrsOverride>,
     pub(crate) style: Option<LayerStyleSpec>,
+    pub(crate) restore_id: Option<u64>,
 }
 
 /// Parameters for queuing a non-blocking remote Cloud-Optimized GeoTIFF open.
@@ -67,34 +83,64 @@ pub(crate) struct OpenOverlayRequest<'a> {
 pub(crate) struct RemoteCogRequest {
     pub(crate) url: String,
     pub(crate) title: String,
+    pub(crate) auth_mode: StacCogAuthMode,
     pub(crate) extra_headers: Vec<(String, String)>,
     pub(crate) external_bands: Vec<ExternalBandMeta>,
     /// When `true`, explicitly opens the asset on the `R8Uint` track with
     /// [`CategoricalPaletteId::Sentinel2Scl`].
     pub(crate) is_scl: bool,
+    pub(crate) stac_item_href: Option<String>,
+    pub(crate) asset_key: Option<String>,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
+    pub(crate) style: Option<LayerStyleSpec>,
     pub(crate) fly_to: bool,
+    pub(crate) restore_id: Option<u64>,
 }
 
-/// One constituent remote COG asset inside a [`RemoteBandMathRequest`].
+/// One constituent local or remote asset inside a [`RemoteBandMathRequest`],
+/// supporting both live STAC recipe opens and heterogeneous local/remote
+/// workspace restoration.
 #[derive(Clone, Debug)]
-pub(crate) struct RemoteBandAssetSpec {
-    pub(crate) label: String,
-    pub(crate) url: String,
-    pub(crate) extra_headers: Vec<(String, String)>,
-    pub(crate) external_bands: Vec<ExternalBandMeta>,
-    pub(crate) band_index: u16,
+pub(crate) enum BandMathAssetOpenSpec {
+    Local {
+        label: String,
+        path: PathBuf,
+        crs_override: Option<CrsOverride>,
+        band_index: u16,
+    },
+    Remote {
+        label: String,
+        url: String,
+        auth_mode: StacCogAuthMode,
+        extra_headers: Vec<(String, String)>,
+        external_bands: Vec<ExternalBandMeta>,
+        stac_item_href: Option<String>,
+        asset_key: Option<String>,
+        band_index: u16,
+    },
 }
 
-/// Parameters for opening a multi-asset remote STAC Band Math / RGB Composite
-/// recipe as a single `LayerKind::BandMath` layer without duplicate raw layers
-/// or redundant camera flights.
+impl BandMathAssetOpenSpec {
+    pub(crate) fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
+}
+
+/// Parameters for opening a multi-asset Band Math / RGB Composite recipe
+/// (remote STAC or heterogeneous local/remote restored workspace) as a single
+/// `LayerKind::BandMath` layer.
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteBandMathRequest {
     pub(crate) title: String,
     pub(crate) preset: BandMathPreset,
-    pub(crate) bands: Vec<RemoteBandAssetSpec>,
-    pub(crate) scl: Option<RemoteBandAssetSpec>,
+    pub(crate) bands: Vec<BandMathAssetOpenSpec>,
+    pub(crate) scl: Option<BandMathAssetOpenSpec>,
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
+    pub(crate) style: Option<BandMathStyleSpec>,
     pub(crate) fly_to: bool,
+    pub(crate) restore_id: Option<u64>,
 }
 
 /// One constituent band reference selected from an already-loaded raster layer
@@ -173,16 +219,60 @@ pub(crate) struct LayerSummary {
     pub(crate) band_math: Option<BandMathSummary>,
 }
 
-/// Borrowed persistence view of a loaded raster overlay layer for
-/// `session.json` serialization without coupling `layers` to
-/// `crate::storage::session`.
+/// Constituent local or remote asset snapshot inside
+/// [`OverlayPersistEntry::BandMath`].
 #[derive(Clone, Debug)]
-pub(crate) struct OverlayPersistEntry<'a> {
-    pub(crate) path: &'a Path,
-    pub(crate) visible: bool,
-    pub(crate) opacity: f32,
-    pub(crate) crs_override: Option<&'a CrsOverride>,
-    pub(crate) style: Option<LayerStyleSpec>,
+pub(crate) enum BandAssetPersistEntry {
+    Local {
+        label: String,
+        path: PathBuf,
+        crs_override: Option<CrsOverride>,
+        band_index: u16,
+    },
+    Remote {
+        label: String,
+        canonical_url: String,
+        auth_mode: StacCogAuthMode,
+        external_bands: Vec<ExternalBandMeta>,
+        stac_item_href: Option<String>,
+        asset_key: Option<String>,
+        band_index: u16,
+    },
+}
+
+/// Owned persistence snapshot of a loaded raster overlay layer (local raster,
+/// remote COG, or heterogeneous local/remote Band Math recipe) for
+/// `session.json` and `.veldmap.json` serialization without coupling `layers`
+/// to `crate::storage::session`.
+#[derive(Clone, Debug)]
+pub(crate) enum OverlayPersistEntry {
+    LocalRaster {
+        path: PathBuf,
+        visible: bool,
+        opacity: f32,
+        crs_override: Option<CrsOverride>,
+        style: Option<LayerStyleSpec>,
+    },
+    RemoteCog {
+        canonical_url: String,
+        title: String,
+        auth_mode: StacCogAuthMode,
+        external_bands: Vec<ExternalBandMeta>,
+        is_scl: bool,
+        stac_item_href: Option<String>,
+        asset_key: Option<String>,
+        visible: bool,
+        opacity: f32,
+        style: Option<LayerStyleSpec>,
+    },
+    BandMath {
+        title: String,
+        visible: bool,
+        opacity: f32,
+        bands: Vec<BandAssetPersistEntry>,
+        scl: Option<BandAssetPersistEntry>,
+        style: BandMathStyleSpec,
+    },
 }
 
 /// Classified value returned by a zoom-invariant CPU cursor probe.
@@ -225,6 +315,7 @@ pub(crate) enum OverlayIoEvent {
         path: PathBuf,
         bounds: Option<FootprintBounds>,
         fly_to: bool,
+        restore_id: Option<u64>,
     },
     Reloaded {
         id: LayerId,
@@ -238,17 +329,22 @@ pub(crate) enum OverlayIoEvent {
         path: PathBuf,
         error: String,
         can_assign_crs: bool,
+        restore_id: Option<u64>,
     },
     RemoteOpened {
         id: LayerId,
         title: String,
         display_url: String,
+        is_band_math: bool,
         bounds: Option<FootprintBounds>,
         fly_to: bool,
+        restore_id: Option<u64>,
     },
     RemoteFailed {
         title: String,
         display_url: String,
+        is_band_math: bool,
         error: String,
+        restore_id: Option<u64>,
     },
 }

@@ -84,6 +84,12 @@ impl CrsPickerState {
         }
     }
 
+    pub(crate) fn close(&mut self) {
+        self.open = false;
+        self.target = None;
+        self.error = None;
+    }
+
     pub(crate) fn open_for_layer(
         &mut self,
         id: LayerId,

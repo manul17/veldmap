@@ -12,13 +12,16 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use veldmap_core::sync::Wakeup;
 
-/// Completed result from a background native file dialog.
+use crate::storage::project::ProjectFile;
+
+/// Completed result from a background native file dialog or background project
+/// load.
 #[derive(Clone, Debug)]
 pub(super) enum FileDialogEvent {
     OpenFiles(Vec<PathBuf>),
@@ -26,6 +29,60 @@ pub(super) enum FileDialogEvent {
         path: PathBuf,
         result: Result<(), String>,
     },
+    ProjectSaved {
+        path: PathBuf,
+        result: Result<(), String>,
+    },
+    ProjectLoaded {
+        seq: u64,
+        path: PathBuf,
+        result: Result<ProjectFile, String>,
+    },
+    PngExportPathPicked(PathBuf),
+}
+
+/// Normalize a user-picked save path to end with `.veldmap.json` without
+/// producing `.json.veldmap.json` or `.veldmap.veldmap.json` when the OS save
+/// dialog auto-appends `.json` from the filter.
+fn normalize_project_save_path(path: PathBuf) -> PathBuf {
+    if crate::storage::project::is_project_path(&path) {
+        return path;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let mut os = path.into_os_string();
+        os.push(crate::storage::project::PROJECT_FILE_SUFFIX);
+        return PathBuf::from(os);
+    };
+    let lower = name.to_ascii_lowercase();
+    let base_name = if lower.ends_with(".json") {
+        &name[..name.len() - ".json".len()]
+    } else {
+        name
+    };
+    let final_name = if base_name.to_ascii_lowercase().ends_with(".veldmap") {
+        format!("{base_name}.json")
+    } else {
+        format!(
+            "{base_name}{}",
+            crate::storage::project::PROJECT_FILE_SUFFIX
+        )
+    };
+    path.with_file_name(final_name)
+}
+
+/// Append `.png` to a user-picked PNG save path unless it already ends with
+/// `.png`, preserving dotted stems such as `sentinel2.2026.11.27`.
+fn normalize_png_save_path(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+    {
+        return path;
+    }
+    let mut os = path.into_os_string();
+    os.push(".png");
+    PathBuf::from(os)
 }
 
 /// Error returned when a native file dialog cannot be spawned.
@@ -53,6 +110,7 @@ pub(super) struct DialogHost {
     tx: Sender<FileDialogEvent>,
     rx: Receiver<FileDialogEvent>,
     busy: Arc<AtomicBool>,
+    project_load_seq: Arc<AtomicU64>,
     wakeup: Wakeup,
 }
 
@@ -63,8 +121,34 @@ impl DialogHost {
             tx,
             rx,
             busy: Arc::new(AtomicBool::new(false)),
+            project_load_seq: Arc::new(AtomicU64::new(0)),
             wakeup,
         }
+    }
+
+    /// Return the latest dispatched project-load sequence number so older slow
+    /// background loads never overwrite a newer selection.
+    pub(super) fn latest_project_load_seq(&self) -> u64 {
+        self.project_load_seq.load(Ordering::Acquire)
+    }
+
+    /// Load a `.veldmap.json` project file off the UI thread (used for
+    /// drag-and-drop, Recent Files, Open Path prompt, and CLI startup args
+    /// without blocking on or racing with native OS dialog state).
+    pub(super) fn spawn_load_project_path(&self, path: PathBuf) -> Result<u64, DialogSpawnError> {
+        let seq = self.project_load_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let tx = self.tx.clone();
+        let wakeup = Arc::clone(&self.wakeup);
+        thread::Builder::new()
+            .name("veldmap-load-project".to_owned())
+            .spawn(move || {
+                let result = ProjectFile::load_from(&path)
+                    .map_err(|e| format!("failed to load '{}': {e}", path.display()));
+                let _ = tx.send(FileDialogEvent::ProjectLoaded { seq, path, result });
+                (wakeup)();
+            })
+            .map_err(|_| DialogSpawnError::SpawnFailed)?;
+        Ok(seq)
     }
 
     fn spawn_dialog_future<F>(&self, thread_name: &str, fut: F) -> Result<(), DialogSpawnError>
@@ -148,6 +232,78 @@ impl DialogHost {
         })
     }
 
+    /// Spawn a non-blocking native save dialog for a `.veldmap.json` project
+    /// file, writing the sanitized/relativized project off the UI thread.
+    pub(super) fn spawn_save_project(
+        &self,
+        default_name: &str,
+        project: ProjectFile,
+        frame: &eframe::Frame,
+    ) -> Result<(), DialogSpawnError> {
+        if !self.try_acquire_busy() {
+            return Err(DialogSpawnError::Busy);
+        }
+        let fut = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Save VeldMap Project")
+            .set_file_name(default_name)
+            .add_filter("VeldMap Project (*.veldmap.json)", &["json"])
+            .save_file();
+        self.spawn_dialog_future("veldmap-save-project", async move {
+            let handle = fut.await?;
+            let path = normalize_project_save_path(PathBuf::from(handle));
+            let result = project
+                .save_to(&path)
+                .map_err(|e| format!("failed to save '{}': {e}", path.display()));
+            Some(FileDialogEvent::ProjectSaved { path, result })
+        })
+    }
+
+    /// Spawn a non-blocking native open dialog for a `.veldmap.json` project
+    /// file, reading and resolving relative paths off the UI thread.
+    pub(super) fn spawn_open_project(&self, frame: &eframe::Frame) -> Result<(), DialogSpawnError> {
+        if !self.try_acquire_busy() {
+            return Err(DialogSpawnError::Busy);
+        }
+        let seq_counter = Arc::clone(&self.project_load_seq);
+        let fut = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Open VeldMap Project")
+            .add_filter("VeldMap Project (*.veldmap.json)", &["json"])
+            .pick_file();
+        self.spawn_dialog_future("veldmap-open-project", async move {
+            let handle = fut.await?;
+            let path = PathBuf::from(handle);
+            let seq = seq_counter.fetch_add(1, Ordering::AcqRel) + 1;
+            let result = ProjectFile::load_from(&path)
+                .map_err(|e| format!("failed to load '{}': {e}", path.display()));
+            Some(FileDialogEvent::ProjectLoaded { seq, path, result })
+        })
+    }
+
+    /// Spawn a non-blocking native save dialog selecting a destination `.png`
+    /// path for cartographic PNG export.
+    pub(super) fn spawn_pick_png_export_path(
+        &self,
+        default_name: &str,
+        frame: &eframe::Frame,
+    ) -> Result<(), DialogSpawnError> {
+        if !self.try_acquire_busy() {
+            return Err(DialogSpawnError::Busy);
+        }
+        let fut = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Export Globe Viewport as PNG")
+            .set_file_name(default_name)
+            .add_filter("PNG Image", &["png"])
+            .save_file();
+        self.spawn_dialog_future("veldmap-export-png-dialog", async move {
+            let handle = fut.await?;
+            let path = normalize_png_save_path(PathBuf::from(handle));
+            Some(FileDialogEvent::PngExportPathPicked(path))
+        })
+    }
+
     /// Drain any completed file dialog events without blocking.
     pub(super) fn poll(&self) -> Vec<FileDialogEvent> {
         let mut out = Vec::new();
@@ -155,5 +311,39 @@ impl DialogHost {
             out.push(ev);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_path_normalization_avoids_double_extensions_and_preserves_dotted_stems() {
+        assert_eq!(
+            normalize_project_save_path(PathBuf::from("study.json")),
+            PathBuf::from("study.veldmap.json")
+        );
+        assert_eq!(
+            normalize_project_save_path(PathBuf::from("study.veldmap")),
+            PathBuf::from("study.veldmap.json")
+        );
+        assert_eq!(
+            normalize_project_save_path(PathBuf::from("study.veldmap.json")),
+            PathBuf::from("study.veldmap.json")
+        );
+        assert_eq!(
+            normalize_project_save_path(PathBuf::from("dir/site.2026.11")),
+            PathBuf::from("dir/site.2026.11.veldmap.json")
+        );
+
+        assert_eq!(
+            normalize_png_save_path(PathBuf::from("sentinel2.2026.11.27")),
+            PathBuf::from("sentinel2.2026.11.27.png")
+        );
+        assert_eq!(
+            normalize_png_save_path(PathBuf::from("figure.PNG")),
+            PathBuf::from("figure.PNG")
+        );
     }
 }

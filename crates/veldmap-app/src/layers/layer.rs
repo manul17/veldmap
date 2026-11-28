@@ -21,7 +21,7 @@ use crate::colormap::CategoricalPaletteId;
 use crate::render::ScratchDemand;
 use crate::{clamp_opacity, display_name_from_path};
 
-use super::asset::{GeoBinding, LayerOrigin, LayerStream, RasterAsset};
+use super::asset::{GeoBinding, LayerOrigin, LayerStream, RasterAsset, RemoteAssetMeta};
 use super::band_math::{BandMathLayerData, BandMathStyle};
 use super::style::{LayerStyle, LayerStyleSpec, ScientificStyle, TrackKind};
 use super::{CrsOverride, LayerId, LayerInitOptions, OverlayPersistEntry};
@@ -70,12 +70,11 @@ struct ReloadState {
 pub(super) struct RemoteLayerSpec {
     pub(super) id: LayerId,
     pub(super) title: String,
-    pub(super) display_url: String,
+    pub(super) meta: RemoteAssetMeta,
     pub(super) range_source: HttpRangeSource,
     pub(super) source: Arc<dyn RasterSource>,
     pub(super) frame: Frame,
     pub(super) options: LayerInitOptions,
-    pub(super) is_scl: bool,
     pub(super) relaid: u64,
 }
 
@@ -227,21 +226,22 @@ impl OverlayLayer {
     /// their [`HttpRangeSource`] for asynchronous pinned prefetching.
     pub(super) fn from_remote_source(spec: RemoteLayerSpec) -> Self {
         let name = if spec.title.trim().is_empty() {
-            spec.display_url.clone()
+            spec.meta.canonical_url.clone()
         } else {
             spec.title
         };
+        let is_scl = spec.meta.is_scl;
         Self::from_single_parts(
             spec.id,
             name,
             LayerOrigin::Remote {
-                display_url: spec.display_url,
+                meta: spec.meta,
                 range: spec.range_source,
             },
             spec.source,
             spec.frame,
             spec.options,
-            spec.is_scl,
+            is_scl,
             spec.relaid,
         )
     }
@@ -256,6 +256,8 @@ impl OverlayLayer {
         bands: Vec<RasterAsset>,
         scl: Option<RasterAsset>,
         style: BandMathStyle,
+        visible: bool,
+        opacity: f32,
     ) -> Self {
         debug_assert!(!bands.is_empty());
         let any_remote = bands.iter().any(RasterAsset::is_remote)
@@ -266,8 +268,8 @@ impl OverlayLayer {
             kind: LayerKind::BandMath(Box::new(BandMathLayerData { bands, scl, style })),
             pin_root: !any_remote,
             last_error: None,
-            visible: true,
-            opacity: 1.0,
+            visible,
+            opacity: clamp_opacity(opacity),
             reload: ReloadState::default(),
         }
     }
@@ -335,7 +337,7 @@ impl OverlayLayer {
     pub(super) fn remote_url(&self) -> Option<&str> {
         match &self.kind {
             LayerKind::SingleRaster { asset, .. } => asset.remote_url(),
-            LayerKind::BandMath(bm) => bm.bands.first().and_then(RasterAsset::remote_url),
+            LayerKind::BandMath(bm) => bm.assets().find_map(RasterAsset::remote_url),
         }
     }
 
@@ -535,18 +537,46 @@ impl OverlayLayer {
         }
     }
 
-    pub(super) fn persist_entry(&self) -> Option<OverlayPersistEntry<'_>> {
-        let LayerKind::SingleRaster { asset, .. } = &self.kind else {
-            return None;
-        };
-        let path = asset.local_path()?;
-        Some(OverlayPersistEntry {
-            path,
-            visible: self.visible,
-            opacity: self.opacity,
-            crs_override: asset.geo().crs_override(),
-            style: self.saved_style(),
-        })
+    pub(super) fn persist_entry(&self) -> Option<OverlayPersistEntry> {
+        match &self.kind {
+            LayerKind::SingleRaster { asset, .. } => {
+                if let Some(path) = asset.local_path() {
+                    Some(OverlayPersistEntry::LocalRaster {
+                        path: path.to_path_buf(),
+                        visible: self.visible,
+                        opacity: self.opacity,
+                        crs_override: asset.geo().crs_override().cloned(),
+                        style: self.saved_style(),
+                    })
+                } else {
+                    let meta = asset.remote_meta()?;
+                    Some(OverlayPersistEntry::RemoteCog {
+                        canonical_url: meta.canonical_url.clone(),
+                        title: self.name.clone(),
+                        auth_mode: meta.auth_mode,
+                        external_bands: meta.external_bands.clone(),
+                        is_scl: meta.is_scl,
+                        stac_item_href: meta.stac_item_href.clone(),
+                        asset_key: meta.asset_key.clone(),
+                        visible: self.visible,
+                        opacity: self.opacity,
+                        style: self.saved_style(),
+                    })
+                }
+            }
+            LayerKind::BandMath(bm) => Some(OverlayPersistEntry::BandMath {
+                title: self.name.clone(),
+                visible: self.visible,
+                opacity: self.opacity,
+                bands: bm
+                    .bands
+                    .iter()
+                    .map(RasterAsset::persist_band_asset)
+                    .collect(),
+                scl: bm.scl.as_ref().map(RasterAsset::persist_band_asset),
+                style: bm.style.to_spec(),
+            }),
+        }
     }
 
     pub(super) fn set_visible(&mut self, visible: bool) -> bool {

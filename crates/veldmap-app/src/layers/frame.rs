@@ -214,6 +214,7 @@ pub(super) fn finish_scheduled_layer(
             let scheduled = finish_single_asset(asset, asset_plan, ctx);
             let track = style.draw_track(asset.source().as_ref(), asset.meta().spec);
             (!scheduled.patches.is_empty()).then(|| DrawOverlayLayer {
+                layer_id: layer.id().raw(),
                 opacity,
                 content: DrawOverlayContent::Direct {
                     track,
@@ -279,6 +280,7 @@ pub(super) fn finish_scheduled_layer(
             // least one cached carrier tile so we avoid allocating scratch
             // targets for all-NaN frames while bands are still opening/streaming.
             (all_bands_have_patches && !draw_bands.is_empty()).then(|| DrawOverlayLayer {
+                layer_id: layer.id().raw(),
                 opacity,
                 content: DrawOverlayContent::BandMath(Box::new(DrawBandMathLayer {
                     formula: bm.style.formula,

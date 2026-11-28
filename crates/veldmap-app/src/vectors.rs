@@ -26,6 +26,7 @@ pub(crate) struct VectorLayerId(u64);
 pub(crate) enum VectorEdit {
     SetVisible(bool),
     SetOpacity(f32),
+    SetOutlineOnly(bool),
     Remove,
 }
 
@@ -37,6 +38,7 @@ pub(crate) struct VectorLayerSummary {
     pub(crate) path: PathBuf,
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
+    pub(crate) outline_only: bool,
     pub(crate) feature_count: usize,
     pub(crate) triangle_count: usize,
     pub(crate) line_segment_count: usize,
@@ -54,6 +56,7 @@ pub(crate) struct VectorPersistEntry<'a> {
     pub(crate) path: &'a Path,
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
+    pub(crate) outline_only: bool,
 }
 
 /// Asynchronous result of a background local GeoJSON open operation.
@@ -64,10 +67,12 @@ pub(crate) enum VectorIoEvent {
         path: PathBuf,
         bounds: Option<FootprintBounds>,
         fly_to: bool,
+        restore_id: Option<u64>,
     },
     Failed {
         path: PathBuf,
         error: String,
+        restore_id: Option<u64>,
     },
 }
 
@@ -122,17 +127,24 @@ fn load_vector_file(path: &Path) -> Result<LoadedVectorData, String> {
 }
 
 struct VectorIoCmd {
+    epoch: u64,
+    cancel: CancelToken,
     path: PathBuf,
     fly_to: bool,
     visible: bool,
     opacity: f32,
+    outline_only: bool,
+    restore_id: Option<u64>,
 }
 
 struct VectorIoResult {
+    epoch: u64,
     path: PathBuf,
     fly_to: bool,
     visible: bool,
     opacity: f32,
+    outline_only: bool,
+    restore_id: Option<u64>,
     outcome: Result<LoadedVectorData, String>,
 }
 
@@ -150,15 +162,24 @@ fn spawn_vector_io_worker(
                 if shutdown.is_cancelled() {
                     break;
                 }
+                if cmd.cancel.is_cancelled() {
+                    continue;
+                }
                 let outcome = load_vector_file(&cmd.path);
                 if shutdown.is_cancelled() {
                     break;
                 }
+                if cmd.cancel.is_cancelled() {
+                    continue;
+                }
                 let _ = res_tx.send(VectorIoResult {
+                    epoch: cmd.epoch,
                     path: cmd.path,
                     fly_to: cmd.fly_to,
                     visible: cmd.visible,
                     opacity: cmd.opacity,
+                    outline_only: cmd.outline_only,
+                    restore_id: cmd.restore_id,
                     outcome,
                 });
                 (wakeup)();
@@ -173,6 +194,7 @@ struct VectorLayer {
     path: PathBuf,
     visible: bool,
     opacity: f32,
+    outline_only: bool,
     fill_color: [f32; 4],
     line_color: [f32; 4],
     color_rgb: [u8; 3],
@@ -236,6 +258,7 @@ impl VectorLayerStack {
         data: LoadedVectorData,
         visible: bool,
         opacity: f32,
+        outline_only: bool,
     ) -> (VectorLayerId, Option<FootprintBounds>) {
         let bounds = data.mesh.bounds;
         let id = VectorLayerId(self.next_id);
@@ -250,6 +273,7 @@ impl VectorLayerStack {
             path: data.path,
             visible,
             opacity: clamp_opacity(opacity),
+            outline_only,
             fill_color,
             line_color,
             color_rgb,
@@ -284,12 +308,29 @@ impl VectorLayerStack {
         true
     }
 
+    fn set_outline_only(&mut self, id: VectorLayerId, outline_only: bool) -> bool {
+        let Some(layer) = self.layers.iter_mut().find(|l| l.id == id) else {
+            return false;
+        };
+        if layer.outline_only == outline_only {
+            return false;
+        }
+        layer.outline_only = outline_only;
+        true
+    }
+
     fn remove(&mut self, id: VectorLayerId) -> bool {
         let Some(idx) = self.layers.iter().position(|l| l.id == id) else {
             return false;
         };
         self.layers.remove(idx);
         true
+    }
+
+    fn clear(&mut self) -> bool {
+        let had = !self.layers.is_empty();
+        self.layers.clear();
+        had
     }
 
     fn len(&self) -> usize {
@@ -305,6 +346,7 @@ impl VectorLayerStack {
                 path: l.path.clone(),
                 visible: l.visible,
                 opacity: l.opacity,
+                outline_only: l.outline_only,
                 feature_count: l.feature_count,
                 triangle_count: l.mesh.fill_triangle_count(),
                 line_segment_count: l.mesh.line_segment_count(),
@@ -320,15 +362,23 @@ impl VectorLayerStack {
         self.layers
             .iter()
             .filter(|l| l.visible && l.opacity > 0.001)
-            .map(|l| DrawVectorLayer {
-                id: DrawVectorId::Layer(l.id.0),
-                rev: 1,
-                opacity: l.opacity,
-                fill_color: l.fill_color,
-                line_color: l.line_color,
-                stroke_width_px: 1.5,
-                hatch_spacing_px: 0.0,
-                mesh: Arc::clone(&l.mesh),
+            .map(|l| {
+                // Reuses `VectorRenderer`'s existing `fill_alpha <= 0.001` fill-skip
+                // so outline-only mode issues zero polygon fill draw calls.
+                let mut fill_color = l.fill_color;
+                if l.outline_only {
+                    fill_color[3] = 0.0;
+                }
+                DrawVectorLayer {
+                    id: DrawVectorId::Layer(l.id.0),
+                    rev: 1,
+                    opacity: l.opacity,
+                    fill_color,
+                    line_color: l.line_color,
+                    stroke_width_px: 1.5,
+                    hatch_spacing_px: 0.0,
+                    mesh: Arc::clone(&l.mesh),
+                }
             })
             .collect()
     }
@@ -338,6 +388,7 @@ impl VectorLayerStack {
             path: &l.path,
             visible: l.visible,
             opacity: l.opacity,
+            outline_only: l.outline_only,
         })
     }
 
@@ -367,13 +418,20 @@ impl VectorLayerStack {
 /// off-UI-thread I/O worker.
 pub(crate) struct VectorManager {
     stack: VectorLayerStack,
+    shutdown: CancelToken,
+    workspace_cancel: CancelToken,
+    workspace_epoch: u64,
     io: SingleThreadWorker<VectorIoCmd, VectorIoResult>,
 }
 
 impl VectorManager {
     pub(crate) fn new(wakeup: Wakeup, shutdown: CancelToken) -> Self {
+        let workspace_cancel = shutdown.child_token();
         Self {
             stack: VectorLayerStack::default(),
+            shutdown: shutdown.clone(),
+            workspace_cancel,
+            workspace_epoch: 1,
             io: spawn_vector_io_worker(wakeup, shutdown),
         }
     }
@@ -385,12 +443,18 @@ impl VectorManager {
         fly_to: bool,
         visible: bool,
         opacity: f32,
+        outline_only: bool,
+        restore_id: Option<u64>,
     ) -> Result<(), String> {
         let cmd = VectorIoCmd {
+            epoch: self.workspace_epoch,
+            cancel: self.workspace_cancel.child_token(),
             path: path.to_path_buf(),
             fly_to,
             visible,
             opacity: clamp_opacity(opacity),
+            outline_only,
+            restore_id,
         };
         if self.io.send(cmd) {
             Ok(())
@@ -403,26 +467,40 @@ impl VectorManager {
     pub(crate) fn poll_events(&mut self) -> Vec<VectorIoEvent> {
         let mut events = Vec::new();
         while let Some(res) = self.io.try_recv() {
+            if res.epoch != self.workspace_epoch {
+                continue;
+            }
             match res.outcome {
                 Ok(data) => {
                     let path = data.path.clone();
-                    let (id, bounds) = self.stack.push_loaded(data, res.visible, res.opacity);
+                    let (id, bounds) =
+                        self.stack
+                            .push_loaded(data, res.visible, res.opacity, res.outline_only);
                     events.push(VectorIoEvent::Opened {
                         id,
                         path,
                         bounds,
                         fly_to: res.fly_to,
+                        restore_id: res.restore_id,
                     });
                 }
                 Err(error) => {
                     events.push(VectorIoEvent::Failed {
                         path: res.path,
                         error,
+                        restore_id: res.restore_id,
                     });
                 }
             }
         }
         events
+    }
+
+    pub(crate) fn clear(&mut self) -> bool {
+        self.workspace_cancel.cancel();
+        self.workspace_cancel = self.shutdown.child_token();
+        self.workspace_epoch = self.workspace_epoch.saturating_add(1);
+        self.stack.clear()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -442,6 +520,9 @@ impl VectorManager {
         match edit {
             VectorEdit::SetVisible(visible) => self.stack.set_visible(id, visible),
             VectorEdit::SetOpacity(opacity) => self.stack.set_opacity(id, opacity),
+            VectorEdit::SetOutlineOnly(outline_only) => {
+                self.stack.set_outline_only(id, outline_only)
+            }
             VectorEdit::Remove => self.stack.remove(id),
         }
     }
@@ -513,7 +594,8 @@ mod tests {
         // Push enough layers to verify painter's order AND palette wrap-around.
         let mut ids = Vec::new();
         for idx in 0..=VECTOR_PALETTE.len() {
-            let (id, bounds) = stack.push_loaded(sample_loaded(&format!("layer_{idx}")), true, 1.0);
+            let (id, bounds) =
+                stack.push_loaded(sample_loaded(&format!("layer_{idx}")), true, 1.0, false);
             assert!(bounds.is_some());
             ids.push(id);
         }
@@ -528,6 +610,12 @@ mod tests {
             summaries[VECTOR_PALETTE.len()].color_rgb,
             VECTOR_PALETTE[0].2
         );
+        // Outline-only mode zeroes fill alpha (reusing fill-skip in VectorRenderer).
+        assert!(stack.set_outline_only(ids[0], true));
+        assert!(!stack.set_outline_only(ids[0], true));
+        let draw = stack.draw_layers();
+        assert_eq!(draw[0].fill_color[3], 0.0);
+        assert!(draw[1].fill_color[3] > 0.1);
 
         // Visibility transitions are idempotent and filter `draw_layers`.
         let first_id = ids[0];

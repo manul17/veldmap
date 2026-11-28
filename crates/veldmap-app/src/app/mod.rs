@@ -6,12 +6,15 @@
 mod actions;
 mod dialogs;
 mod fonts;
+mod png_export;
 mod session_sync;
+mod swipe;
 mod viewport_bridge;
 mod viewport_input;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use eframe::egui_wgpu;
@@ -21,15 +24,21 @@ use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
 use crate::gpu_tiles::UploadChannelClosed;
+use crate::layers::OverlayEdit;
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::scene::{SceneRepaintHint, SceneState};
-use crate::stac::StacSession;
+use crate::stac::{AuthTrust, StacSession};
 use crate::storage::AppStorage;
-use crate::storage::session::SavedCameraPose;
+use crate::storage::project::is_project_path;
+use crate::storage::session::{
+    SavedCameraPose, SavedLayerEntry, SavedSwipeState, SavedVectorEntry,
+};
 use crate::storage::settings::AppSettings;
 use crate::ui;
 use crate::ui::crs_picker::{CrsPickerState, show_crs_picker_window};
-use crate::ui::hud;
+use crate::ui::export_png::{ExportPngUiAction, ExportPngWindowInputs, show_export_png_window};
+use crate::ui::format;
+use crate::ui::hud::{self, SwipeHudAction};
 use crate::ui::layers::LayersPanelState;
 use crate::ui::measure::{MeasureUiState, show_measure_window};
 use crate::ui::settings::{SettingsTab, SettingsWindowState, show_settings_window};
@@ -40,9 +49,20 @@ use crate::ui::workbench::{WorkbenchInputs, WorkbenchTab, show_workbench_panel};
 
 use dialogs::DialogHost;
 use fonts::build_font_definitions;
+use png_export::PngExportController;
 use session_sync::SessionRestoreTracker;
+use swipe::SwipeState;
 use viewport_bridge::{GlobePaintCallback, GpuFaultState, install_wgpu_resources, viewport_pixels};
 use viewport_input::{ViewportEvent, ViewportInteraction, ViewportToolMode};
+
+const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(4);
+const PNG_GPU_POLL_INTERVAL: Duration = Duration::from_millis(8);
+
+type DeferredStartupSession = (
+    Vec<SavedLayerEntry>,
+    Vec<SavedVectorEntry>,
+    Option<SavedSwipeState>,
+);
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -99,6 +119,11 @@ pub struct VeldmapApp {
     panels: UiPanels,
     viewport: ViewportInteraction,
     restore_tracker: SessionRestoreTracker,
+    deferred_startup_session: Option<DeferredStartupSession>,
+    swipe: SwipeState,
+    png_export: PngExportController,
+    context_menu_geo: Option<(f64, f64)>,
+    status_notice: Option<(String, Instant)>,
 }
 
 impl Drop for VeldmapApp {
@@ -110,10 +135,11 @@ impl Drop for VeldmapApp {
         // Deterministic shutdown order:
         // 1. Cancel tokens / signal background workers (`overlays`, `vectors`, `basemap`, `stac`, `decode_shutdown`, `NetContext`, `storage`)
         // 2. Close bounded upload queue (`PendingUploads::close`)
-        // 3. Join `TwoLaneDecodePool` -> join `veldmap-remote-io`, overlay/tile-write & vector I/O workers -> shut down `LiveTilePipeline` -> shut down `NetContext` (`tokio::Runtime`) -> join `DiskCacheWorker`
+        // 3. Join background PNG export, `TwoLaneDecodePool`, `veldmap-remote-io`, overlay/tile-write & vector I/O workers -> shut down `LiveTilePipeline` -> shut down `NetContext` (`tokio::Runtime`) -> join `DiskCacheWorker`
         self.scene.begin_shutdown();
         self.storage.begin_shutdown();
         self.scene.close_uploads();
+        self.png_export.join_background_encode();
         self.scene.finish_shutdown();
         self.storage.finish_shutdown();
     }
@@ -153,6 +179,7 @@ impl VeldmapApp {
         let budget = detect_memory_budget();
         let storage = AppStorage::open(Arc::clone(&wakeup), None);
         let dialogs = DialogHost::new(Arc::clone(&wakeup));
+        let png_export = PngExportController::new(Arc::clone(&wakeup));
         let settings = storage.settings();
         let scene = SceneState::new(
             settings.basemap_config(),
@@ -180,12 +207,55 @@ impl VeldmapApp {
             panels,
             viewport: ViewportInteraction::default(),
             restore_tracker: SessionRestoreTracker::default(),
+            deferred_startup_session: None,
+            swipe: SwipeState::default(),
+            png_export,
+            context_menu_geo: None,
+            status_notice: None,
         };
 
-        app.queue_restored_session(restored_session.open_layers, restored_session.open_vectors);
+        if startup_files.iter().any(|p| is_project_path(p)) {
+            app.deferred_startup_session = Some((
+                restored_session.open_layers,
+                restored_session.open_vectors,
+                restored_session.swipe,
+            ));
+        } else {
+            app.queue_restored_session(
+                restored_session.open_layers,
+                restored_session.open_vectors,
+                restored_session.swipe,
+                AuthTrust::LocalSession,
+            );
+        }
         app.open_user_paths(startup_files, None);
 
         Ok(app)
+    }
+
+    pub(super) fn set_status_notice(&mut self, msg: String) {
+        self.status_notice = Some((msg, Instant::now()));
+    }
+
+    fn active_status_notice(&mut self) -> Option<&str> {
+        if let Some((_, ts)) = &self.status_notice
+            && ts.elapsed() >= STATUS_NOTICE_DURATION
+        {
+            self.status_notice = None;
+        }
+        self.status_notice.as_ref().map(|(s, _)| s.as_str())
+    }
+
+    pub(super) fn default_export_caption(&self) -> String {
+        let summaries = self.scene.overlays().layer_summaries();
+        if let Some(top) = summaries.iter().rev().find(|l| l.visible) {
+            return top.name.clone();
+        }
+        let settings = self.storage.settings();
+        if !settings.gibs_date.trim().is_empty() {
+            return format!("VeldMap · {}", settings.gibs_date.trim());
+        }
+        "VeldMap".to_owned()
     }
 
     fn focus_footprint(&mut self, bounds: FootprintBounds) {
@@ -219,6 +289,8 @@ impl VeldmapApp {
             ViewportToolMode::DrawAoiBox
         } else if self.scene.measure().is_active() {
             ViewportToolMode::Measure
+        } else if self.swipe.is_active() {
+            ViewportToolMode::Swipe
         } else {
             ViewportToolMode::Navigate
         }
@@ -233,9 +305,9 @@ impl VeldmapApp {
     }
 
     /// Single transition point enforcing mutual exclusion between `Navigate`,
-    /// `DrawAoiBox`, and `Measure` (preserving remembered `last_active_mode`
-    /// when `explicit_measure_mode` is `None`).
-    fn set_viewport_tool(
+    /// `DrawAoiBox`, `Measure`, and `Swipe` (preserving remembered
+    /// `last_active_mode` when `explicit_measure_mode` is `None`).
+    pub(in crate::app) fn set_viewport_tool(
         &mut self,
         tool: ViewportToolMode,
         explicit_measure_mode: Option<MeasureMode>,
@@ -245,6 +317,13 @@ impl VeldmapApp {
         }
         if tool != ViewportToolMode::Measure {
             self.scene.mutate_measure(|m| m.set_mode(MeasureMode::Off));
+        }
+        if tool != ViewportToolMode::Swipe && self.swipe.is_active() {
+            self.swipe.deactivate();
+            self.restore_tracker.clear_pending_swipe();
+            self.viewport.cancel_swipe_drag();
+            self.viewport.set_swipe_bar_rect(None);
+            self.persist_session_snapshot(false, &[]);
         }
         match tool {
             ViewportToolMode::Navigate => {}
@@ -261,11 +340,28 @@ impl VeldmapApp {
                     }
                 }
             },
+            ViewportToolMode::Swipe => {
+                let summaries = self.scene.overlays().layer_summaries();
+                if !summaries.is_empty() {
+                    self.restore_tracker.clear_pending_swipe();
+                    self.swipe.activate(&summaries);
+                    self.persist_session_snapshot(false, &[]);
+                }
+            }
+        }
+    }
+
+    /// Toggle split-screen swipe mode cleanly via unified tool transitions.
+    pub(super) fn toggle_swipe_tool(&mut self) {
+        if self.swipe.is_active() {
+            self.set_viewport_tool(ViewportToolMode::Navigate, None);
+        } else {
+            self.set_viewport_tool(ViewportToolMode::Swipe, None);
         }
     }
 
     /// Enable or disable interactive AOI box drawing, enforcing mutual
-    /// exclusion with geodesic measurement.
+    /// exclusion with geodesic measurement and swipe.
     fn set_draw_aoi_active(&mut self, active: bool) {
         if active {
             self.set_viewport_tool(ViewportToolMode::DrawAoiBox, None);
@@ -285,7 +381,7 @@ impl VeldmapApp {
     }
 
     /// Set geodesic measurement mode explicitly (`Distance`, `Area`, or `Off`),
-    /// enforcing mutual exclusion with AOI box drawing.
+    /// enforcing mutual exclusion with AOI box drawing and swipe.
     fn set_measure_mode(&mut self, mode: MeasureMode) {
         if mode == MeasureMode::Off {
             self.set_viewport_tool(ViewportToolMode::Navigate, None);
@@ -340,12 +436,14 @@ impl VeldmapApp {
                 basemap_status: &basemap_status,
                 adapter_label: &self.adapter_label,
                 layer_count: self.scene.total_layer_count(),
+                raster_layer_count: self.scene.overlays().layer_count(),
                 unavailable_layer_count: self.restore_tracker.unavailable_count(),
                 layers_open: self.panels.workbench_open
                     && self.panels.workbench_tab == WorkbenchTab::Layers,
                 cloud_open: self.panels.workbench_open
                     && self.panels.workbench_tab == WorkbenchTab::CloudStac,
                 measure_active: self.scene.measure().is_active(),
+                swipe_active: self.swipe.is_active(),
                 recent_files: &self.storage.session().recent_files,
                 bookmarks: &self.storage.session().bookmarks,
             },
@@ -383,6 +481,23 @@ impl VeldmapApp {
             show_measure_window(ctx, measure_summary, &self.panels.measure)
         {
             needs_repaint |= self.apply_measure_action(measure_action, frame);
+        }
+        let has_colorbar = self.scene.overlays().topmost_colorbar_info().is_some();
+        let export_busy = self.png_export.is_busy();
+        let export_notice = self.png_export.last_notice().map(str::to_owned);
+        let (export_open, export_opts) = self.png_export.modal_state_mut();
+        if let Some(ExportPngUiAction::SaveAs) = show_export_png_window(
+            ctx,
+            export_open,
+            export_opts,
+            ExportPngWindowInputs {
+                has_colorbar,
+                busy: export_busy,
+                last_notice: export_notice.as_deref(),
+            },
+        ) {
+            self.trigger_export_png_save_dialog(frame);
+            needs_repaint = true;
         }
         needs_repaint
     }
@@ -438,13 +553,29 @@ impl VeldmapApp {
         needs_repaint
     }
 
+    fn copy_coord_to_clipboard(&mut self, ctx: &egui::Context, label: &str, text: String) {
+        ctx.copy_text(text.clone());
+        self.set_status_notice(format!("Copied {label}: {text}"));
+    }
+
     fn show_globe_viewport(
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         frame: &eframe::Frame,
-    ) -> Option<egui::Rect> {
+    ) -> (Option<egui::Rect>, bool) {
         let mut viewport_rect = None;
+        let mut viewport_needs_repaint = false;
+        let swipe_reconcile_summaries = if self.swipe.is_active() {
+            let s = self.scene.overlays().layer_summaries();
+            if self.swipe.reconcile_layers(&s) {
+                self.persist_session_snapshot(false, &[]);
+            }
+            s
+        } else {
+            Vec::new()
+        };
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
@@ -455,9 +586,95 @@ impl VeldmapApp {
 
                 if rect.is_positive() {
                     viewport_rect = Some(rect);
-                    let (width_px, height_px, aspect) = viewport_pixels(ctx, rect);
+                    let vp = viewport_pixels(ctx, rect);
+                    let width_px = vp.width_px;
+                    let height_px = vp.height_px;
+                    let aspect = vp.aspect;
+                    let ppp = ctx.pixels_per_point().max(0.5);
                     let height_pt = f64::from(rect.height()).max(1.0);
                     self.viewport.record_viewport(rect, height_px, aspect);
+
+                    // Open the Copy Coordinates popup strictly on clean
+                    // secondary clicks over the globe (never over painted HUD
+                    // cards or conflicting with secondary-drag heading rotation).
+                    let open_coord_menu = if response.secondary_clicked()
+                        && let Some(pos) = response.interact_pointer_pos()
+                        && !self.viewport.is_over_hud(pos)
+                    {
+                        self.context_menu_geo =
+                            self.viewport.probe_screen_pos(&self.camera, rect, pos);
+                        Some(egui::SetOpenCommand::Bool(true))
+                    } else {
+                        None
+                    };
+
+                    let mut copied_choice: Option<(&'static str, String)> = None;
+                    let menu_cursor = self.context_menu_geo;
+                    let center_geo = self.camera.center();
+                    egui::Popup::menu(&response)
+                        .id(response.id.with("globe_coord_context_menu"))
+                        .at_pointer_fixed()
+                        .open_memory(open_coord_menu)
+                        .show(|ui| {
+                            if let Some((lat, lon)) = menu_cursor {
+                                ui.label(
+                                    egui::RichText::new("Copy Cursor Coordinates")
+                                        .strong()
+                                        .small(),
+                                );
+                                if ui.button("Decimal Degrees (DD)").clicked() {
+                                    copied_choice =
+                                        Some(("Cursor DD", format::format_signed_dd(lat, lon)));
+                                    ui.close();
+                                }
+                                if ui.button("Degrees Minutes Seconds (DMS)").clicked() {
+                                    copied_choice =
+                                        Some(("Cursor DMS", format::format_dms(lat, lon)));
+                                    ui.close();
+                                }
+                                if ui.button("MGRS").clicked() {
+                                    copied_choice =
+                                        Some(("Cursor MGRS", format::format_mgrs_copy(lat, lon)));
+                                    ui.close();
+                                }
+                                ui.separator();
+                            }
+                            ui.label(
+                                egui::RichText::new("Copy Center Coordinates")
+                                    .strong()
+                                    .small(),
+                            );
+                            if ui.button("Center DD").clicked() {
+                                copied_choice = Some((
+                                    "Center DD",
+                                    format::format_signed_dd(center_geo.0, center_geo.1),
+                                ));
+                                ui.close();
+                            }
+                            if ui.button("Center DMS").clicked() {
+                                copied_choice = Some((
+                                    "Center DMS",
+                                    format::format_dms(center_geo.0, center_geo.1),
+                                ));
+                                ui.close();
+                            }
+                            if ui.button("Center MGRS").clicked() {
+                                copied_choice = Some((
+                                    "Center MGRS",
+                                    format::format_mgrs_copy(center_geo.0, center_geo.1),
+                                ));
+                                ui.close();
+                            }
+                        });
+                    if let Some((label, text)) = copied_choice {
+                        self.copy_coord_to_clipboard(ctx, label, text);
+                        viewport_needs_repaint = true;
+                    }
+
+                    let swipe_divider_x = self
+                        .swipe
+                        .is_active()
+                        .then(|| vp.swipe_divider_x(self.swipe.split_t(), ppp).0);
 
                     let tool_mode = self.active_viewport_tool();
                     if let Some(ev) = self.viewport.handle_viewport_input(
@@ -467,6 +684,7 @@ impl VeldmapApp {
                         rect,
                         height_pt,
                         tool_mode,
+                        swipe_divider_x,
                     ) {
                         match ev {
                             ViewportEvent::MeasurePoint(clicked_pt) => {
@@ -486,26 +704,62 @@ impl VeldmapApp {
                             ViewportEvent::AoiBoxCancelled => {
                                 self.set_viewport_tool(ViewportToolMode::Navigate, None);
                             }
+                            ViewportEvent::SwipeSplitT { split_t, finished } => {
+                                self.restore_tracker.clear_pending_swipe();
+                                self.swipe.set_split_t(split_t);
+                                if finished {
+                                    self.persist_session_snapshot(false, &[]);
+                                }
+                            }
                         }
                     }
 
+                    let m_per_pt = self.camera.metres_per_pixel(height_pt);
                     let show_graticule = self.storage.settings().show_graticule;
                     let snapshot = self.scene.snapshot_for_frame(
                         self.camera,
                         width_px,
                         height_px,
-                        ctx.pixels_per_point(),
+                        ppp,
                         show_graticule,
                     );
+                    let swipe_render = self.swipe.to_render_state();
+                    self.png_export.refresh_capture_metrics(
+                        ppp,
+                        m_per_pt,
+                        self.camera.heading_deg(),
+                    );
+                    let png_readback = self.png_export.take_bridge_for_callback();
 
                     // Register offscreen globe + 1:1 nearest composite paint callback.
                     painter.add(egui_wgpu::Callback::new_paint_callback(
                         rect,
-                        GlobePaintCallback { rect, snapshot },
+                        GlobePaintCallback {
+                            rect,
+                            snapshot,
+                            swipe: swipe_render,
+                            png_readback,
+                        },
                     ));
 
+                    // Paint HiDPI-snapped split-screen swipe curtain divider & handle.
+                    if self.swipe.is_active() {
+                        let (div_x, _) = vp.swipe_divider_x(self.swipe.split_t(), ppp);
+                        let (left_lbl, right_lbl) =
+                            self.swipe.side_labels(&swipe_reconcile_summaries);
+                        let hovered_or_drag = self.viewport.is_swipe_dragging()
+                            || self.viewport.is_hovering_swipe_divider(&response, div_x);
+                        hud::paint_swipe_curtain(
+                            &painter,
+                            rect,
+                            div_x,
+                            &left_lbl,
+                            &right_lbl,
+                            hovered_or_drag,
+                        );
+                    }
+
                     // Floating dynamic metric scale bar, scientific colorbar, and basemap attribution pill.
-                    let m_per_pt = self.camera.metres_per_pixel(height_pt);
                     let scale_rect = hud::paint_scale_bar(&painter, rect, m_per_pt);
                     let attr_rect = self
                         .scene
@@ -523,12 +777,71 @@ impl VeldmapApp {
                     let was_positive = self.viewport.viewport_rect().is_some();
                     self.scene.on_viewport_collapsed();
                     self.viewport.clear_viewport();
+                    if let Some(err) = self.png_export.abort_unsubmitted_capture(
+                        "Viewport is collapsed; cannot capture screenshot.",
+                    ) {
+                        self.set_status_notice(err);
+                        viewport_needs_repaint = true;
+                    }
                     if was_positive {
                         viewport_bridge::release_viewport_resources(frame);
                     }
                 }
             });
-        viewport_rect
+
+        // Floating Swipe controls bar in its own Background-ordered Area.
+        if let Some(rect) = viewport_rect
+            && self.swipe.is_active()
+        {
+            let (action, bar_rect) = hud::show_swipe_controls(
+                ctx,
+                rect,
+                &swipe_reconcile_summaries,
+                self.swipe.left_layer(),
+                self.swipe.right_layer(),
+            );
+            self.viewport.set_swipe_bar_rect(Some(bar_rect));
+            if let Some(act) = action {
+                match act {
+                    SwipeHudAction::SetLeft(id) => {
+                        self.restore_tracker.clear_pending_swipe();
+                        let mut changed = self.swipe.set_left_layer(id);
+                        if let Some(lid) = id {
+                            changed |= self.scene.edit_overlay(lid, OverlayEdit::SetVisible(true));
+                        }
+                        if changed {
+                            self.persist_session_snapshot(false, &[]);
+                            viewport_needs_repaint = true;
+                        }
+                    }
+                    SwipeHudAction::SetRight(id) => {
+                        self.restore_tracker.clear_pending_swipe();
+                        let mut changed = self.swipe.set_right_layer(id);
+                        if let Some(lid) = id {
+                            changed |= self.scene.edit_overlay(lid, OverlayEdit::SetVisible(true));
+                        }
+                        if changed {
+                            self.persist_session_snapshot(false, &[]);
+                            viewport_needs_repaint = true;
+                        }
+                    }
+                    SwipeHudAction::Swap => {
+                        self.restore_tracker.clear_pending_swipe();
+                        self.swipe.swap_sides();
+                        self.persist_session_snapshot(false, &[]);
+                        viewport_needs_repaint = true;
+                    }
+                    SwipeHudAction::Close => {
+                        self.set_viewport_tool(ViewportToolMode::Navigate, None);
+                        viewport_needs_repaint = true;
+                    }
+                }
+            }
+        } else {
+            self.viewport.set_swipe_bar_rect(None);
+        }
+
+        (viewport_rect, viewport_needs_repaint)
     }
 
     fn handle_global_input_and_drops(&mut self, ctx: &egui::Context) -> bool {
@@ -543,15 +856,29 @@ impl VeldmapApp {
             .viewport
             .handle_keyboard_navigation(ctx, &mut self.camera, dt_s);
 
-        if self.panels.draw_aoi_active
-            && !ctx.egui_wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-        {
-            self.set_viewport_tool(ViewportToolMode::Navigate, None);
-            active = true;
+        if !ctx.egui_wants_keyboard_input() {
+            if (self.panels.draw_aoi_active || self.swipe.is_active())
+                && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                self.set_viewport_tool(ViewportToolMode::Navigate, None);
+                active = true;
+            }
+            // `Ctrl+Shift+C` / `Cmd+Shift+C`: quick copy cursor (or center) DD coordinates.
+            if ctx.input(|i| {
+                (i.modifiers.ctrl || i.modifiers.command)
+                    && i.modifiers.shift
+                    && i.key_pressed(egui::Key::C)
+            }) {
+                let (label, (lat, lon)) = match self.viewport.cursor_geo() {
+                    Some(pt) => ("Cursor DD", pt),
+                    None => ("Center DD", self.camera.center()),
+                };
+                self.copy_coord_to_clipboard(ctx, label, format::format_signed_dd(lat, lon));
+                active = true;
+            }
         }
 
-        // Handle OS drag-and-drop of local GeoTIFF/PNG/JPEG/GeoJSON files.
+        // Handle OS drag-and-drop of local GeoTIFF/PNG/JPEG/GeoJSON/.veldmap.json files.
         let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -601,7 +928,21 @@ impl VeldmapApp {
             || matches!(scene_hint, SceneRepaintHint::Immediate)
         {
             ctx.request_repaint();
-        } else if let SceneRepaintHint::After(delay) = scene_hint {
+            return;
+        }
+        let mut min_delay: Option<Duration> = match scene_hint {
+            SceneRepaintHint::After(delay) => Some(delay),
+            SceneRepaintHint::None | SceneRepaintHint::Immediate => None,
+        };
+        if self.png_export.needs_gpu_poll() {
+            min_delay =
+                Some(min_delay.map_or(PNG_GPU_POLL_INTERVAL, |d| d.min(PNG_GPU_POLL_INTERVAL)));
+        }
+        if let Some((_, ts)) = &self.status_notice {
+            let remaining = STATUS_NOTICE_DURATION.saturating_sub(ts.elapsed());
+            min_delay = Some(min_delay.map_or(remaining, |d| d.min(remaining)));
+        }
+        if let Some(delay) = min_delay {
             ctx.request_repaint_after(delay);
         }
     }
@@ -610,8 +951,18 @@ impl VeldmapApp {
 impl eframe::App for VeldmapApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // Drain native file dialogs & scene I/O events BEFORE `begin_frame`.
-        let mut needs_repaint = self.drain_file_dialog_events();
+        // Drain native file dialogs, PNG readback/encode completions & scene I/O events BEFORE `begin_frame`.
+        let mut needs_repaint = self.drain_file_dialog_events(&ctx);
+        if let Some(done) = self.png_export.poll(&self.device) {
+            match done.result {
+                Ok(()) => self.set_status_notice(format!(
+                    "Saved PNG {}",
+                    crate::display_name_from_path(&done.path)
+                )),
+                Err(err) => self.set_status_notice(format!("PNG export failed: {err}")),
+            }
+            needs_repaint = true;
+        }
         needs_repaint |= self.drain_scene_io_events();
         self.scene.begin_frame(&self.device, &self.queue);
 
@@ -627,10 +978,24 @@ impl eframe::App for VeldmapApp {
 
         self.viewport.update_cursor_probe(&ctx, &self.camera);
         let cursor_geo = self.viewport.cursor_geo();
-        let cursor_readout = self.scene.update_cursor_readout(cursor_geo);
+        let swipe_excluded_layer = if self.swipe.is_active()
+            && let Some(cursor_pos) = self.viewport.cursor_screen_pos()
+            && let Some(rect) = self.viewport.viewport_rect()
+        {
+            let vp = viewport_pixels(&ctx, rect);
+            let (div_x, split_x) = vp.swipe_divider_x(self.swipe.split_t(), ctx.pixels_per_point());
+            self.swipe
+                .excluded_layer_for_cursor(cursor_pos.x, div_x, split_x, vp.width_px)
+        } else {
+            None
+        };
+        let cursor_readout = self
+            .scene
+            .update_cursor_readout(cursor_geo, swipe_excluded_layer);
         let topmost_source_px = self.scene.overlays().topmost_visible_source_pixel_size_m();
         let camera_before = self.camera;
         let rect_before = self.viewport.viewport_rect();
+        let status_notice = self.active_status_notice().map(str::to_owned);
 
         status_bar::show_status_bar(
             ui,
@@ -640,12 +1005,14 @@ impl eframe::App for VeldmapApp {
                 topmost_source_px,
                 camera: &self.camera,
                 viewport_height_px: self.viewport.viewport_height_px(),
+                status_notice: status_notice.as_deref(),
             },
         );
 
         needs_repaint |= self.show_workbench_if_open(&ctx, ui, frame);
 
-        let viewport_rect = self.show_globe_viewport(&ctx, ui, frame);
+        let (viewport_rect, viewport_repaint) = self.show_globe_viewport(&ctx, ui, frame);
+        needs_repaint |= viewport_repaint;
         let scene_hint = self.scene.end_frame();
 
         // Floating North compass in its own Background-ordered Area (above the

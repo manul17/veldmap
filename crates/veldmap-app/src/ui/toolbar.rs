@@ -1,6 +1,7 @@
-//! Top workstation toolbar (native File Open, Recent files, Bookmarks,
-//! `Layers` and `Cloud / STAC` workbench toggles, Geodesic Measure toggle,
-//! Go-To navigation, basemap selector, graticule toggle, and GPU adapter badge).
+//! Top workstation toolbar (native File Open, Project save/open & Export PNG
+//! menu, Recent files, Bookmarks, `Layers` and `Cloud / STAC` workbench
+//! toggles, Geodesic Measure & Split-Screen Swipe toggles, Go-To navigation,
+//! basemap selector, graticule toggle, and GPU adapter badge).
 //!
 //! Strictly action-only: emits [`ToolbarAction`] values back to `VeldmapApp`
 //! without mutating `Camera`, storage, or scene state directly from UI layout
@@ -28,10 +29,14 @@ pub(crate) enum ToolbarAction {
     OpenPathPrompt,
     OpenRecentFile(PathBuf),
     ClearRecentFiles,
+    SaveProjectDialog,
+    OpenProjectDialog,
+    OpenExportPngModal,
     ToggleLayersPanel,
     ToggleCloudPanel,
     ShowUnavailableSessionLayers,
     ToggleMeasureTool,
+    ToggleSwipeTool,
     SaveBookmark(String),
     GoToBookmark(CameraBookmark),
     DeleteBookmark(usize),
@@ -49,10 +54,12 @@ pub(crate) struct ToolbarInputs<'a> {
     pub(crate) basemap_status: &'a BasemapStatusSnapshot,
     pub(crate) adapter_label: &'a str,
     pub(crate) layer_count: usize,
+    pub(crate) raster_layer_count: usize,
     pub(crate) unavailable_layer_count: usize,
     pub(crate) layers_open: bool,
     pub(crate) cloud_open: bool,
     pub(crate) measure_active: bool,
+    pub(crate) swipe_active: bool,
     pub(crate) recent_files: &'a [PathBuf],
     pub(crate) bookmarks: &'a [CameraBookmark],
 }
@@ -200,18 +207,52 @@ pub(crate) fn show_top_toolbar(
     egui::Panel::top("top_toolbar").show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.strong(veldmap_core::APP_NAME).on_hover_text(format!(
-                "GPU: {}\nControls: Drag orbit · Right/Shift+drag or Q/E rotate · WASD/Arrows pan · Scroll/+/- zoom · N reset North",
+                "GPU: {}\nControls: Drag orbit · Right/Shift+drag or Q/E rotate · WASD/Arrows pan · Scroll/+/- zoom · N reset North · Right-click or Ctrl/Cmd+Shift+C copy coords · Esc exit Swipe/AOI",
                 inputs.adapter_label
             ));
             ui.separator();
 
             if ui
                 .button("Open…")
-                .on_hover_text("Open local GeoTIFF / PNG / JPEG / GeoJSON via native picker")
+                .on_hover_text(
+                    "Open local GeoTIFF / PNG / JPEG / GeoJSON / .veldmap.json project via native picker",
+                )
                 .clicked()
             {
                 actions.push(ToolbarAction::OpenFileDialog);
             }
+
+            ui.menu_button("Project", |ui| {
+                if ui
+                    .button("Save Project (.veldmap.json)…")
+                    .on_hover_text(
+                        "Save layers, sanitized cloud COGs, Band Math recipes, swipe & camera pose",
+                    )
+                    .clicked()
+                {
+                    actions.push(ToolbarAction::SaveProjectDialog);
+                    ui.close();
+                }
+                if ui
+                    .button("Open Project (.veldmap.json)…")
+                    .on_hover_text("Load a saved .veldmap.json workspace project")
+                    .clicked()
+                {
+                    actions.push(ToolbarAction::OpenProjectDialog);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .button("Export PNG…")
+                    .on_hover_text(
+                        "Export the current globe viewport as a cartographic PNG with optional overlays",
+                    )
+                    .clicked()
+                {
+                    actions.push(ToolbarAction::OpenExportPngModal);
+                    ui.close();
+                }
+            });
 
             show_recent_menu(ui, inputs.recent_files, &mut actions);
 
@@ -237,7 +278,7 @@ pub(crate) fn show_top_toolbar(
                 if ui
                     .button(egui::RichText::new(badge).color(WARN_TEXT_COLOR).small())
                     .on_hover_text(
-                        "Saved session layers could not be reopened (preserved in session.json). Click to view.",
+                        "Saved workspace layers could not be reopened (preserved in session.json). Click to view.",
                     )
                     .clicked()
                 {
@@ -251,6 +292,19 @@ pub(crate) fn show_top_toolbar(
                 .clicked()
             {
                 actions.push(ToolbarAction::ToggleMeasureTool);
+            }
+
+            let can_swipe = inputs.raster_layer_count > 0 || inputs.swipe_active;
+            if ui
+                .add_enabled(
+                    can_swipe,
+                    egui::Button::selectable(inputs.swipe_active, "Swipe"),
+                )
+                .on_hover_text("Interactive split-screen swipe curtain across any two raster layers")
+                .on_disabled_hover_text("Load at least one raster layer to compare with Swipe")
+                .clicked()
+            {
+                actions.push(ToolbarAction::ToggleSwipeTool);
             }
 
             show_bookmarks_menu(ui, inputs.bookmarks, state, &mut actions);

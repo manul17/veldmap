@@ -22,6 +22,7 @@ mod palette_cache;
 mod pipelines;
 mod scratch;
 mod snapshot;
+mod swipe;
 mod uniforms;
 mod vector;
 mod vector_pack;
@@ -32,7 +33,7 @@ pub use crate::colormap::{CategoricalPaletteId, ColormapId};
 #[cfg(any(test, feature = "test-support"))]
 pub use crate::layers::BandMathFormula;
 pub use bind_groups::TileBindGroupCache;
-pub use globe::GlobeRenderer;
+pub use globe::{GlobeRenderer, OffscreenReadback};
 #[cfg(any(test, feature = "test-support"))]
 pub use scratch::compute_band_math_scissor_rect;
 pub(crate) use scratch::{ScratchDemand, estimate_viewport_target_vram_bytes};
@@ -43,6 +44,7 @@ pub use snapshot::{
     DrawScratchBand, DrawScratchMask, DrawSnapshot, DrawVectorId, DrawVectorLayer, OverlayMeshKey,
     SnapshotBuildParams, TileCarrierPolicy,
 };
+pub use swipe::{SwipeRenderState, snap_split_x};
 #[cfg(any(test, feature = "test-support"))]
 pub use uniforms::{UNIFORM_LAYOUT_SPECS, UniformLayoutSpec};
 pub use viewport::RenderParams;

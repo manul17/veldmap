@@ -13,11 +13,12 @@ use veldmap_core::tile::{
     OverlayCullTree, RASTER_TILE_SIZE, SourceId, StreamKey, TileKey, TileStreamSpec,
 };
 use veldmap_net::HttpRangeSource;
-use veldmap_raster::{PyramidMeta, RasterSource};
+use veldmap_raster::{ExternalBandMeta, PyramidMeta, RasterSource};
 
 use crate::gpu_tiles::tile_format_bytes;
+use crate::stac::StacCogAuthMode;
 
-use super::CrsOverride;
+use super::{BandAssetPersistEntry, CrsOverride};
 
 /// Cohesive georeferencing, CRS override, and frustum-culling state for one
 /// [`RasterAsset`].
@@ -182,6 +183,20 @@ impl LayerStream {
     }
 }
 
+/// Sanitized metadata retained for a remote Cloud-Optimized GeoTIFF asset so
+/// `session.json` and `.veldmap.json` can persist and reload remote layers and
+/// STAC Band Math recipes without leaking query tokens or credentials.
+#[derive(Clone, Debug)]
+pub(super) struct RemoteAssetMeta {
+    pub(super) canonical_url: String,
+    pub(super) display_url: String,
+    pub(super) auth_mode: StacCogAuthMode,
+    pub(super) external_bands: Vec<ExternalBandMeta>,
+    pub(super) is_scl: bool,
+    pub(super) stac_item_href: Option<String>,
+    pub(super) asset_key: Option<String>,
+}
+
 /// Origin of a [`RasterAsset`]: either a local file on disk or a remote
 /// Cloud-Optimized GeoTIFF accessed via HTTP Range requests.
 #[derive(Clone)]
@@ -190,7 +205,7 @@ pub(super) enum LayerOrigin {
         path: PathBuf,
     },
     Remote {
-        display_url: String,
+        meta: RemoteAssetMeta,
         range: HttpRangeSource,
     },
 }
@@ -276,7 +291,14 @@ impl RasterAsset {
 
     pub(super) fn remote_url(&self) -> Option<&str> {
         match &self.origin {
-            LayerOrigin::Remote { display_url, .. } => Some(display_url.as_str()),
+            LayerOrigin::Remote { meta, .. } => Some(meta.display_url.as_str()),
+            LayerOrigin::Local { .. } => None,
+        }
+    }
+
+    pub(super) fn remote_meta(&self) -> Option<&RemoteAssetMeta> {
+        match &self.origin {
+            LayerOrigin::Remote { meta, .. } => Some(meta),
             LayerOrigin::Local { .. } => None,
         }
     }
@@ -285,6 +307,31 @@ impl RasterAsset {
         match &self.origin {
             LayerOrigin::Remote { range, .. } => Some(range),
             LayerOrigin::Local { .. } => None,
+        }
+    }
+
+    /// Snapshot this constituent band asset for workspace persistence.
+    pub(super) fn persist_band_asset(&self) -> BandAssetPersistEntry {
+        let band_index = match self.stream.meta().spec.band {
+            veldmap_core::tile::BandKey::Index(idx) => idx,
+            _ => 0,
+        };
+        match &self.origin {
+            LayerOrigin::Local { path } => BandAssetPersistEntry::Local {
+                label: self.label.clone(),
+                path: path.clone(),
+                crs_override: self.geo.crs_override().cloned(),
+                band_index,
+            },
+            LayerOrigin::Remote { meta, .. } => BandAssetPersistEntry::Remote {
+                label: self.label.clone(),
+                canonical_url: meta.canonical_url.clone(),
+                auth_mode: meta.auth_mode,
+                external_bands: meta.external_bands.clone(),
+                stac_item_href: meta.stac_item_href.clone(),
+                asset_key: meta.asset_key.clone(),
+                band_index,
+            },
         }
     }
 

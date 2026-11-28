@@ -156,3 +156,37 @@ fn parses_stac11_bands_processing_level_scl_and_skips_visual_for_spectral() {
     assert_eq!(scl.key, "SCL_20m");
     assert!(scl.is_scl_asset());
 }
+
+#[test]
+fn parse_stac_item_sanitizes_self_href_and_ignores_relative_or_non_self_links() {
+    let json = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "id": "S2_WITH_SELF",
+                "links": [
+                    {"rel": "parent", "href": "https://stac.example.org/collections/s2"},
+                    {"rel": "SELF", "href": "https://user:secret@stac.example.org/items/s2?sig=abc#frag"}
+                ],
+                "properties": {"datetime": "2026-10-01T10:00:00Z"},
+                "assets": {}
+            },
+            {
+                "type": "Feature",
+                "id": "S2_RELATIVE_SELF",
+                "links": [
+                    {"rel": "self", "href": "/collections/s2/items/rel"}
+                ],
+                "properties": {"datetime": "2026-10-01T10:00:00Z"},
+                "assets": {}
+            }
+        ]
+    });
+    let parsed = parse_search_response(&json).expect("parse");
+    assert_eq!(
+        parsed.items[0].self_href.as_deref(),
+        Some("https://stac.example.org/items/s2")
+    );
+    assert_eq!(parsed.items[1].self_href, None);
+}

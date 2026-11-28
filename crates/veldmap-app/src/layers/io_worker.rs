@@ -39,9 +39,12 @@ pub(super) struct ReloadedPayload {
 /// Commands processed off the UI thread by the overlay I/O worker.
 pub(super) enum OverlayIoCmd {
     Open {
+        epoch: u64,
+        cancel: CancelToken,
         path: PathBuf,
         fly_to: bool,
         options: LayerInitOptions,
+        restore_id: Option<u64>,
     },
     Reload(ReloadRequest),
 }
@@ -49,9 +52,11 @@ pub(super) enum OverlayIoCmd {
 /// Results posted back from the overlay I/O worker to `OverlayManager`.
 pub(super) enum OverlayIoResult {
     Opened {
+        epoch: u64,
         path: PathBuf,
         fly_to: bool,
         options: LayerInitOptions,
+        restore_id: Option<u64>,
         outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
     },
     Reloaded(ReloadedPayload),
@@ -60,11 +65,14 @@ pub(super) enum OverlayIoResult {
 fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<OverlayIoResult>) {
     match cmd {
         OverlayIoCmd::Open {
+            epoch,
+            cancel,
             path,
             fly_to,
             options,
+            restore_id,
         } => {
-            if runtime.shutdown.is_cancelled() {
+            if cancel.is_cancelled() {
                 return;
             }
             let outcome = open_local_raster(
@@ -73,15 +81,17 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
                 &runtime.budget,
                 false,
                 options.crs_override.as_ref(),
-                &runtime.shutdown,
+                &cancel,
             );
-            if runtime.shutdown.is_cancelled() {
+            if cancel.is_cancelled() {
                 return;
             }
             let _ = res_tx.send(OverlayIoResult::Opened {
+                epoch,
                 path,
                 fly_to,
                 options,
+                restore_id,
                 outcome,
             });
             (runtime.wakeup)();

@@ -36,6 +36,7 @@ pub use geojson::{
     export_geojson_feature_collection, export_geojson_geometry, export_wkt_geometry,
     geojson_geometry_to_value, parse_geojson, parse_geojson_geometry_value,
 };
+pub use mgrs::format_wgs84_to_mgrs;
 pub use shapes::{GeoPoint, Polygon, Ring};
 
 /// Local WGS84 surface distance approximation in metres for unit test error assertions.
@@ -44,5 +45,6 @@ fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {
     let lat = ((first.0 + second.0) / 2.0).to_radians();
     let per_lat = 111_132.92 - 559.82 * (2.0 * lat).cos();
     let per_lon = 111_412.84 * lat.cos() - 93.5 * (3.0 * lat).cos();
-    ((first.0 - second.0) * per_lat).hypot((first.1 - second.1) * per_lon)
+    let dlon = unwind(0.0, first.1 - second.1);
+    ((first.0 - second.0) * per_lat).hypot(dlon * per_lon)
 }

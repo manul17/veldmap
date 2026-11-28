@@ -8,6 +8,7 @@ use std::sync::{Arc, Weak};
 use super::DrawSnapshot;
 use super::pipelines::{BandMathPipelines, GlobePipelines};
 use super::scratch::{ScratchDemand, ScratchTargetPool};
+use super::swipe::{ResolvedSwipe, SwipeRenderState};
 use super::uniforms::{CameraUniform, DynamicUniformArena};
 
 /// Parameters for a single offscreen globe frame.
@@ -16,29 +17,46 @@ pub struct RenderParams<'a> {
     pub width: u32,
     pub height: u32,
     pub snapshot: &'a Arc<DrawSnapshot>,
+    /// Optional split-screen swipe curtain state passed outside
+    /// [`DrawSnapshot`] so curtain drag never rebuilds quadtree/cull lists.
+    pub swipe: Option<SwipeRenderState>,
 }
 
-/// O(1) pointer-identity dirty check (`Weak<DrawSnapshot>` + target dimensions)
-/// avoiding per-frame tile hashing and ABA pointer reuse without pinning old
-/// snapshots or their `Arc<GpuTile>` references.
+/// O(1) pointer-identity dirty check (`Weak<DrawSnapshot>`, target dimensions,
+/// and physical swipe split) avoiding per-frame tile hashing and ABA pointer
+/// reuse without pinning old snapshots or their `Arc<GpuTile>` references.
 struct LastRenderKey {
     width: u32,
     height: u32,
     snapshot: Weak<DrawSnapshot>,
+    swipe: Option<ResolvedSwipe>,
 }
 
 impl LastRenderKey {
-    fn from_params(width: u32, height: u32, snapshot: &Arc<DrawSnapshot>) -> Self {
+    fn from_params(
+        width: u32,
+        height: u32,
+        snapshot: &Arc<DrawSnapshot>,
+        swipe: Option<ResolvedSwipe>,
+    ) -> Self {
         Self {
             width,
             height,
             snapshot: Arc::downgrade(snapshot),
+            swipe,
         }
     }
 
-    fn matches(&self, width: u32, height: u32, snapshot: &Arc<DrawSnapshot>) -> bool {
+    fn matches(
+        &self,
+        width: u32,
+        height: u32,
+        snapshot: &Arc<DrawSnapshot>,
+        swipe: Option<ResolvedSwipe>,
+    ) -> bool {
         self.width == width
             && self.height == height
+            && self.swipe == swipe
             && self
                 .snapshot
                 .upgrade()
@@ -49,6 +67,7 @@ impl LastRenderKey {
 pub(super) struct OffscreenTarget {
     pub(super) width: u32,
     pub(super) height: u32,
+    pub(super) color_texture: wgpu::Texture,
     pub(super) color_srgb_view: wgpu::TextureView,
     pub(super) depth_view: wgpu::TextureView,
     pub(super) composite_bind_group: wgpu::BindGroup,
@@ -173,20 +192,27 @@ impl ViewportState {
         width: u32,
         height: u32,
         snapshot: &Arc<DrawSnapshot>,
+        swipe: Option<ResolvedSwipe>,
     ) -> bool {
         !self.pending_present.load(Ordering::Relaxed)
             && self
                 .last_render
                 .as_ref()
-                .is_some_and(|last| last.matches(width, height, snapshot))
+                .is_some_and(|last| last.matches(width, height, snapshot, swipe))
             && self
                 .offscreen
                 .as_ref()
                 .is_some_and(|t| t.width == width && t.height == height)
     }
 
-    pub(super) fn mark_rendered(&mut self, width: u32, height: u32, snapshot: &Arc<DrawSnapshot>) {
-        self.last_render = Some(LastRenderKey::from_params(width, height, snapshot));
+    pub(super) fn mark_rendered(
+        &mut self,
+        width: u32,
+        height: u32,
+        snapshot: &Arc<DrawSnapshot>,
+        swipe: Option<ResolvedSwipe>,
+    ) {
+        self.last_render = Some(LastRenderKey::from_params(width, height, snapshot, swipe));
         self.pending_present.store(true, Ordering::Relaxed);
     }
 
@@ -222,7 +248,9 @@ impl ViewportState {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
         });
 
@@ -277,6 +305,7 @@ impl ViewportState {
         self.offscreen = Some(OffscreenTarget {
             width,
             height,
+            color_texture,
             color_srgb_view,
             depth_view,
             composite_bind_group,

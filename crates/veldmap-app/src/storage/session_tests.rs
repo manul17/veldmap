@@ -58,6 +58,7 @@ fn session_persists_all_crs_override_variants_flat_json_recent_files_and_bookmar
         path: PathBuf::from("/tmp/parcels.geojson"),
         visible: true,
         opacity: 0.9,
+        outline_only: true,
     });
     session.record_recent_file(Path::new("/tmp/a.tif"));
     session.record_recent_file(Path::new("/tmp/b.tif"));
@@ -157,13 +158,15 @@ fn session_custom_tm_omitted_datum_defaults_to_wgs84() {
 #[test]
 fn session_normalize_rejects_out_of_range_poses_and_nan_opacity() {
     let mut session = AppSession::default();
-    session.open_layers.push(SavedLayerEntry {
-        path: PathBuf::from("/tmp/a.tif"),
-        visible: true,
-        opacity: f32::NAN,
-        crs_override: None,
-        style: None,
-    });
+    session
+        .open_layers
+        .push(SavedLayerEntry::LocalRaster(SavedLocalRasterEntry {
+            path: PathBuf::from("/tmp/a.tif"),
+            visible: true,
+            opacity: f32::NAN,
+            crs_override: None,
+            style: None,
+        }));
     session.bookmarks.push(CameraBookmark {
         name: "Invalid Lat".to_string(),
         pose: SavedCameraPose {
@@ -180,7 +183,10 @@ fn session_normalize_rejects_out_of_range_poses_and_nan_opacity() {
         heading_deg: 0.0,
     });
     session.normalize();
-    assert_eq!(session.open_layers[0].opacity, 1.0);
+    match &session.open_layers[0] {
+        SavedLayerEntry::LocalRaster(e) => assert_eq!(e.opacity, 1.0),
+        other => panic!("expected LocalRaster, got {other:?}"),
+    }
     assert!(session.bookmarks.is_empty());
     assert!(session.last_camera.is_none());
 }

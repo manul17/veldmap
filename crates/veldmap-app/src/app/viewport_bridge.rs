@@ -9,7 +9,35 @@ use eframe::egui;
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, RenderState, ScreenDescriptor};
 use veldmap_core::sync::{Wakeup, lock_unpoisoned};
 
-use crate::render::{DrawSnapshot, GlobeRenderer, RenderParams, TileBindGroupCache};
+use crate::render::{
+    DrawSnapshot, GlobeRenderer, OffscreenReadback, RenderParams, SwipeRenderState,
+    TileBindGroupCache,
+};
+
+/// Shared synchronization slot bridging a single-frame offscreen PNG readback
+/// from `GlobePaintCallback::prepare` back to `VeldmapApp` without ever
+/// blocking the UI thread.
+pub(super) struct PngReadbackBridge {
+    /// Set by `GlobePaintCallback::prepare` once `copy_texture_to_buffer` is
+    /// submitted and `map_async` has been initiated.
+    pub(super) readback: Option<OffscreenReadback>,
+    /// Set asynchronously by the `wgpu::BufferSlice::map_async` callback.
+    pub(super) mapped: Option<Result<(), String>>,
+    /// Set if the offscreen target was unavailable during `prepare`.
+    pub(super) capture_error: Option<String>,
+    pub(super) wakeup: Wakeup,
+}
+
+impl PngReadbackBridge {
+    pub(super) fn new(wakeup: Wakeup) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            readback: None,
+            mapped: None,
+            capture_error: None,
+            wakeup,
+        }))
+    }
+}
 
 #[derive(Default)]
 struct GpuFaultInner {
@@ -147,11 +175,33 @@ pub(super) fn release_viewport_resources(frame: &eframe::Frame) {
     }
 }
 
-/// Estimate physical viewport dimensions from `egui::Context` during `App::ui`
-/// (where `egui_wgpu::ScreenDescriptor::size_in_pixels` is not exposed yet;
-/// `GlobePaintCallback::prepare` uses the exact framebuffer size during
-/// rendering).
-pub(super) fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (u32, u32, f64) {
+/// Physical viewport origin and dimensions computed via
+/// `ViewportInPixels::from_points` so `egui::Painter` overlays (such as the
+/// split-screen swipe divider) align to the exact physical scissor seam without
+/// fractional-HiDPI 1-px drift.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ViewportPixels {
+    pub(super) left_px: i32,
+    pub(super) width_px: u32,
+    pub(super) height_px: u32,
+    pub(super) aspect: f64,
+}
+
+impl ViewportPixels {
+    /// Compute the exact HiDPI-aligned logical X coordinate and physical pixel
+    /// offset `(div_x_pt, split_x_px)` of the split-screen swipe curtain.
+    pub(super) fn swipe_divider_x(self, split_t: f32, ppp: f32) -> (f32, u32) {
+        let split_x = crate::render::snap_split_x(split_t, self.width_px);
+        let div_x = (self.left_px as f32 + split_x as f32) / ppp.max(0.5);
+        (div_x, split_x)
+    }
+}
+
+/// Estimate physical viewport origin and dimensions from `egui::Context` during
+/// `App::ui` (where `egui_wgpu::ScreenDescriptor::size_in_pixels` is not
+/// exposed yet; `GlobePaintCallback::prepare` uses the exact framebuffer size
+/// during rendering).
+pub(super) fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> ViewportPixels {
     let ppp = ctx.pixels_per_point();
     let screen_rect = ctx.content_rect();
     let screen_px = [
@@ -161,18 +211,23 @@ pub(super) fn viewport_pixels(ctx: &egui::Context, rect: egui::Rect) -> (u32, u3
     let vp = egui::epaint::ViewportInPixels::from_points(&rect, ppp, screen_px);
     let width_px = vp.width_px.max(1) as u32;
     let height_px = vp.height_px.max(1) as u32;
-    (
+    ViewportPixels {
+        left_px: vp.left_px,
         width_px,
         height_px,
-        f64::from(width_px) / f64::from(height_px),
-    )
+        aspect: f64::from(width_px) / f64::from(height_px),
+    }
 }
 
-/// `egui_wgpu` paint callback bridging an immutable `Arc<DrawSnapshot>` into
-/// the offscreen [`GlobeRenderer`] and hoisted [`TileBindGroupCache`].
+/// `egui_wgpu` paint callback bridging an immutable `Arc<DrawSnapshot>`,
+/// optional split-screen [`SwipeRenderState`], and optional clean-frame PNG
+/// readback request into the offscreen [`GlobeRenderer`] and hoisted
+/// [`TileBindGroupCache`].
 pub(super) struct GlobePaintCallback {
     pub(super) rect: egui::Rect,
     pub(super) snapshot: Arc<DrawSnapshot>,
+    pub(super) swipe: Option<SwipeRenderState>,
+    pub(super) png_readback: Option<Arc<Mutex<PngReadbackBridge>>>,
 }
 
 impl CallbackTrait for GlobePaintCallback {
@@ -189,6 +244,14 @@ impl CallbackTrait for GlobePaintCallback {
             screen_descriptor.pixels_per_point,
             screen_descriptor.size_in_pixels,
         );
+        let fail_readback = |bridge: &Arc<Mutex<PngReadbackBridge>>, msg: &str| {
+            let mut guard = lock_unpoisoned(bridge);
+            guard.capture_error = Some(msg.to_owned());
+            let wake = Arc::clone(&guard.wakeup);
+            drop(guard);
+            (wake)();
+        };
+
         let Some(bind_groups_arc) = callback_resources
             .get::<Arc<Mutex<TileBindGroupCache>>>()
             .cloned()
@@ -197,6 +260,9 @@ impl CallbackTrait for GlobePaintCallback {
                 false,
                 "hoisted Arc<Mutex<TileBindGroupCache>> missing from CallbackResources"
             );
+            if let Some(bridge) = &self.png_readback {
+                fail_readback(bridge, "GPU tile bind-group cache is unavailable.");
+            }
             return Vec::new();
         };
 
@@ -205,22 +271,65 @@ impl CallbackTrait for GlobePaintCallback {
                 renderer.release_viewport_targets();
             }
             lock_unpoisoned(&bind_groups_arc).sweep_stale();
+            if let Some(bridge) = &self.png_readback {
+                fail_readback(bridge, "Viewport is collapsed; cannot capture screenshot.");
+            }
             return Vec::new();
         }
 
         if let Some(renderer) = callback_resources.get_mut::<GlobeRenderer>() {
             let mut bind_groups = lock_unpoisoned(&bind_groups_arc);
-            renderer.render_if_dirty(
-                device,
-                queue,
-                egui_encoder,
-                RenderParams {
-                    width: vp.width_px as u32,
-                    height: vp.height_px as u32,
-                    snapshot: &self.snapshot,
-                },
-                &mut bind_groups,
-            );
+            let params = RenderParams {
+                width: vp.width_px as u32,
+                height: vp.height_px as u32,
+                snapshot: &self.snapshot,
+                swipe: self.swipe,
+            };
+
+            if let Some(bridge) = &self.png_readback {
+                // Use a dedicated command encoder submitted immediately so
+                // `map_async` can begin right away on BOTH dirty and clean
+                // frames (`is_clean_for == true`) without blocking the UI thread.
+                let mut capture_encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("globe offscreen PNG capture encoder"),
+                    });
+                renderer.render_if_dirty(
+                    device,
+                    queue,
+                    &mut capture_encoder,
+                    params,
+                    &mut bind_groups,
+                );
+                let readback = renderer.encode_offscreen_readback(device, &mut capture_encoder);
+                queue.submit(Some(capture_encoder.finish()));
+
+                if let Some(rb) = readback {
+                    let cb_bridge = Arc::clone(bridge);
+                    rb.map_async(move |res| {
+                        let wake = {
+                            let mut guard = lock_unpoisoned(&cb_bridge);
+                            guard.mapped = Some(res.map_err(|e| e.to_string()));
+                            Arc::clone(&guard.wakeup)
+                        };
+                        (wake)();
+                    });
+                    let mut guard = lock_unpoisoned(bridge);
+                    guard.readback = Some(rb);
+                    let wake = Arc::clone(&guard.wakeup);
+                    drop(guard);
+                    (wake)();
+                } else {
+                    fail_readback(
+                        bridge,
+                        "Offscreen color target is unavailable for PNG readback.",
+                    );
+                }
+            } else {
+                renderer.render_if_dirty(device, queue, egui_encoder, params, &mut bind_groups);
+            }
+        } else if let Some(bridge) = &self.png_readback {
+            fail_readback(bridge, "Globe renderer is unavailable for PNG readback.");
         }
         Vec::new()
     }

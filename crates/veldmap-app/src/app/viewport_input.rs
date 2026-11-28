@@ -103,26 +103,36 @@ pub(super) enum ViewportToolMode {
     Navigate,
     Measure,
     DrawAoiBox,
+    Swipe,
 }
 
-/// Interactive geodetic event captured by [`ViewportInteraction::handle_viewport_input`].
+/// Interactive geodetic or swipe event captured by
+/// [`ViewportInteraction::handle_viewport_input`].
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ViewportEvent {
     MeasurePoint(GeoPoint),
     AoiBox { bbox: [f64; 4], finished: bool },
     AoiBoxCancelled,
+    SwipeSplitT { split_t: f32, finished: bool },
 }
+
+/// Half-width hit radius (logical points) for split-screen swipe divider
+/// hover highlighting, resize cursor, and drag capture.
+pub(super) const SWIPE_HIT_HALF_PT: f32 = 14.0;
 
 /// Tracks globe viewport geometry, HUD overlay bounds, hovered geodetic
 /// cursor coordinates, and pointer/keyboard navigation gestures.
 pub(super) struct ViewportInteraction {
     cursor_geo: Option<(f64, f64)>,
+    cursor_screen_pos: Option<egui::Pos2>,
     aoi_drag_start: Option<(f64, f64)>,
+    swipe_dragging: bool,
     last_viewport_rect: Option<egui::Rect>,
     last_compass_rect: Option<egui::Rect>,
     last_scale_bar_rect: Option<egui::Rect>,
     last_attribution_rect: Option<egui::Rect>,
     last_colorbar_rect: Option<egui::Rect>,
+    last_swipe_bar_rect: Option<egui::Rect>,
     last_viewport_height_px: f64,
     last_viewport_aspect: f64,
 }
@@ -131,12 +141,15 @@ impl Default for ViewportInteraction {
     fn default() -> Self {
         Self {
             cursor_geo: None,
+            cursor_screen_pos: None,
             aoi_drag_start: None,
+            swipe_dragging: false,
             last_viewport_rect: None,
             last_compass_rect: None,
             last_scale_bar_rect: None,
             last_attribution_rect: None,
             last_colorbar_rect: None,
+            last_swipe_bar_rect: None,
             last_viewport_height_px: 800.0,
             last_viewport_aspect: 1.6,
         }
@@ -168,10 +181,24 @@ impl ViewportInteraction {
         self.last_scale_bar_rect = None;
         self.last_attribution_rect = None;
         self.last_colorbar_rect = None;
+        self.last_swipe_bar_rect = None;
+        self.swipe_dragging = false;
     }
 
     pub(super) fn set_compass_rect(&mut self, rect: egui::Rect) {
         self.last_compass_rect = Some(rect);
+    }
+
+    pub(super) fn set_swipe_bar_rect(&mut self, rect: Option<egui::Rect>) {
+        self.last_swipe_bar_rect = rect;
+    }
+
+    pub(super) fn is_swipe_dragging(&self) -> bool {
+        self.swipe_dragging
+    }
+
+    pub(super) fn cancel_swipe_drag(&mut self) {
+        self.swipe_dragging = false;
     }
 
     pub(super) fn set_hud_rects(
@@ -185,11 +212,31 @@ impl ViewportInteraction {
         self.last_colorbar_rect = colorbar;
     }
 
-    fn is_over_hud(&self, pos: egui::Pos2) -> bool {
+    pub(super) fn is_over_hud(&self, pos: egui::Pos2) -> bool {
         self.last_compass_rect.is_some_and(|r| r.contains(pos))
             || self.last_scale_bar_rect.is_some_and(|r| r.contains(pos))
             || self.last_attribution_rect.is_some_and(|r| r.contains(pos))
             || self.last_colorbar_rect.is_some_and(|r| r.contains(pos))
+            || self.last_swipe_bar_rect.is_some_and(|r| r.contains(pos))
+    }
+
+    pub(super) fn cursor_screen_pos(&self) -> Option<egui::Pos2> {
+        self.cursor_screen_pos
+    }
+
+    pub(super) fn is_hovering_swipe_divider(&self, response: &egui::Response, div_x: f32) -> bool {
+        response
+            .hover_pos()
+            .is_some_and(|p| !self.is_over_hud(p) && (p.x - div_x).abs() <= SWIPE_HIT_HALF_PT)
+    }
+
+    pub(super) fn probe_screen_pos(
+        &self,
+        camera: &Camera,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<(f64, f64)> {
+        self.probe_pointer(camera, rect, pos)
     }
 
     fn probe_pointer(
@@ -211,18 +258,26 @@ impl ViewportInteraction {
     pub(super) fn update_cursor_probe(&mut self, ctx: &egui::Context, camera: &Camera) {
         if let Some(rect) = self.last_viewport_rect.filter(|r| r.is_positive()) {
             let hover_pos = ctx.input(|i| i.pointer.hover_pos());
+            let mut valid_pos = None;
             self.cursor_geo = hover_pos.and_then(|pos| {
                 // Skip probing whenever a floating window, menu, or compass
                 // `Area` sits above the globe `CentralPanel` (`LayerId::background`).
                 let covered_by_ui_layer = ctx
                     .layer_id_at(pos)
                     .is_some_and(|layer| layer != egui::LayerId::background());
-                (rect.contains(pos) && !covered_by_ui_layer && !self.is_over_hud(pos))
+                let over_globe =
+                    rect.contains(pos) && !covered_by_ui_layer && !self.is_over_hud(pos);
+                if over_globe {
+                    valid_pos = Some(pos);
+                }
+                over_globe
                     .then(|| self.probe_pointer(camera, rect, pos))
                     .flatten()
             });
+            self.cursor_screen_pos = valid_pos;
         } else {
             self.cursor_geo = None;
+            self.cursor_screen_pos = None;
         }
     }
 
@@ -318,9 +373,14 @@ impl ViewportInteraction {
         minimal_circular_bbox(&hits)
     }
 
-    /// Apply primary-button orbit dragging, secondary / `Shift+Primary` manual
-    /// heading rotation, scroll/pinch cursor-anchored zoom, and optional
-    /// measurement click or AOI box drag capture to `camera`.
+    /// Apply primary-button orbit dragging, split-screen swipe curtain dragging,
+    /// secondary / `Shift+Primary` manual heading rotation, scroll/pinch
+    /// cursor-anchored zoom, and optional measurement click or AOI box drag
+    /// capture to `camera`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Cohesive per-frame viewport pointer dispatch keeping input state localized."
+    )]
     pub(super) fn handle_viewport_input(
         &mut self,
         ctx: &egui::Context,
@@ -329,12 +389,63 @@ impl ViewportInteraction {
         rect: egui::Rect,
         height_pt: f64,
         tool_mode: ViewportToolMode,
+        swipe_divider_x: Option<f32>,
     ) -> Option<ViewportEvent> {
         let shift_held = ctx.input(|i| i.modifiers.shift);
-        let rotating = response.dragged_by(egui::PointerButton::Secondary)
-            || (shift_held && response.dragged_by(egui::PointerButton::Primary));
-
         let mut captured_event = None;
+
+        // Split-screen swipe curtain drag capture (within ±SWIPE_HIT_HALF_PT of
+        // divider). An already-started drag continues until release even if
+        // `Shift` is pressed mid-drag so session persistence is never skipped.
+        if tool_mode == ViewportToolMode::Swipe
+            && let Some(div_x) = swipe_divider_x
+        {
+            let width_pt = rect.width().max(1.0);
+            if !self.swipe_dragging
+                && !shift_held
+                && response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pos) = ctx
+                    .input(|i| i.pointer.press_origin())
+                    .or_else(|| response.interact_pointer_pos())
+                && !self.is_over_hud(pos)
+                && (pos.x - div_x).abs() <= SWIPE_HIT_HALF_PT
+            {
+                self.swipe_dragging = true;
+            }
+            if self.swipe_dragging {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                if response.dragged_by(egui::PointerButton::Primary)
+                    && let Some(pos) = response.interact_pointer_pos()
+                {
+                    let split_t = ((pos.x - rect.left()) / width_pt).clamp(0.0, 1.0);
+                    captured_event = Some(ViewportEvent::SwipeSplitT {
+                        split_t,
+                        finished: false,
+                    });
+                } else if response.drag_stopped_by(egui::PointerButton::Primary)
+                    || !ctx.input(|i| i.pointer.primary_down())
+                {
+                    self.swipe_dragging = false;
+                    let split_t = response
+                        .interact_pointer_pos()
+                        .map_or(((div_x - rect.left()) / width_pt).clamp(0.0, 1.0), |pos| {
+                            ((pos.x - rect.left()) / width_pt).clamp(0.0, 1.0)
+                        });
+                    captured_event = Some(ViewportEvent::SwipeSplitT {
+                        split_t,
+                        finished: true,
+                    });
+                }
+            }
+        } else {
+            self.swipe_dragging = false;
+        }
+
+        let rotating = response.dragged_by(egui::PointerButton::Secondary)
+            || (!self.swipe_dragging
+                && shift_held
+                && response.dragged_by(egui::PointerButton::Primary));
+
         if tool_mode == ViewportToolMode::DrawAoiBox && !shift_held {
             if response.hovered() || self.aoi_drag_start.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -383,7 +494,7 @@ impl ViewportInteraction {
             if delta.x != 0.0 {
                 camera.rotate_heading(f64::from(delta.x) * ROTATE_RAD_PER_PT);
             }
-        } else if tool_mode != ViewportToolMode::DrawAoiBox {
+        } else if tool_mode != ViewportToolMode::DrawAoiBox && !self.swipe_dragging {
             if response.dragged_by(egui::PointerButton::Primary) {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 let delta = response.drag_delta();
@@ -394,7 +505,12 @@ impl ViewportInteraction {
                     );
                 }
             } else if response.hovered() {
-                ctx.set_cursor_icon(if tool_mode == ViewportToolMode::Measure {
+                let over_swipe_handle = tool_mode == ViewportToolMode::Swipe
+                    && swipe_divider_x
+                        .is_some_and(|div_x| self.is_hovering_swipe_divider(response, div_x));
+                ctx.set_cursor_icon(if over_swipe_handle {
+                    egui::CursorIcon::ResizeHorizontal
+                } else if tool_mode == ViewportToolMode::Measure {
                     egui::CursorIcon::Crosshair
                 } else {
                     egui::CursorIcon::Grab

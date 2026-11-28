@@ -33,9 +33,9 @@ use vector_card::show_vector_card;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnavailableLayerNotice {
     pub(crate) name: String,
-    pub(crate) path: PathBuf,
+    pub(crate) detail: String,
+    pub(crate) kind_tag: &'static str,
     pub(crate) error: String,
-    pub(crate) is_vector: bool,
 }
 
 /// Session persistence policy for an infallible [`OverlayEdit`] or [`VectorEdit`]
@@ -250,20 +250,19 @@ fn show_unavailable_session_banner(
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.colored_label(
             WARN_TEXT_COLOR,
-            format!("{count} saved session {noun} unavailable"),
+            format!("{count} saved workspace {noun} unavailable"),
         );
         ui.small(
             egui::RichText::new("Preserved in session.json with style/CRS settings intact.").weak(),
         );
         for item in unavailable.iter().take(4) {
-            let kind_tag = if item.is_vector { "Vector" } else { "Raster" };
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(format!("• [{kind_tag}] {}", item.name)).small(),
+                    egui::RichText::new(format!("• [{}] {}", item.kind_tag, item.name)).small(),
                 )
                 .truncate(),
             )
-            .on_hover_text(format!("{}\n{}", item.path.display(), item.error));
+            .on_hover_text(format!("{}\n{}", item.detail, item.error));
         }
         if count > 4 {
             ui.small(egui::RichText::new(format!("… and {} more", count - 4)).weak());
@@ -271,7 +270,7 @@ fn show_unavailable_session_banner(
         ui.horizontal(|ui| {
             if ui
                 .small_button("Retry")
-                .on_hover_text("Retry opening unavailable layers from the previous session")
+                .on_hover_text("Retry opening unavailable layers from the saved workspace")
                 .clicked()
             {
                 actions.push(LayerUiAction::RetryUnavailableSessionLayers);
@@ -285,7 +284,7 @@ fn show_unavailable_session_banner(
             }
             if ui
                 .small_button("Forget")
-                .on_hover_text("Remove unavailable layers from saved session.json")
+                .on_hover_text("Remove unavailable layers from saved workspace state")
                 .clicked()
             {
                 actions.push(LayerUiAction::ForgetUnavailableSessionLayers);

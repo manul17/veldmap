@@ -22,6 +22,7 @@ use super::snapshot::{
     DrawBandMathLayer, DrawOverlayContent, DrawOverlayLayer, DrawOverlayTrack, DrawSnapshot,
     WarpPatchSetRef,
 };
+use super::swipe::ResolvedSwipe;
 use super::uniforms::{
     CategoricalPatchUniform, DynamicUniformArena, OverlayPatchUniform, ScientificPatchUniform,
     UniformSlot,
@@ -296,7 +297,8 @@ impl OverlayRenderer {
 
     /// Push per-patch and per-composite uniforms for every overlay layer into
     /// the frame-wide `arena`, recording aligned dynamic byte offsets and
-    /// projected-AABB scissor rects.
+    /// projected-AABB scissor rects (intersected with any active swipe
+    /// half-plane before scratch passes run).
     pub(super) fn push_uniforms(
         &mut self,
         arena: &mut DynamicUniformArena,
@@ -304,6 +306,7 @@ impl OverlayRenderer {
         eye: DVec3,
         width: u32,
         height: u32,
+        swipe: Option<ResolvedSwipe>,
     ) {
         self.prepared_layers.clear();
         for (layer_idx, layer) in snapshot.overlays.iter().enumerate() {
@@ -373,8 +376,15 @@ impl OverlayRenderer {
                         width,
                         height,
                     };
-                    let prepared =
-                        push_band_math_uniforms(&uniform_ctx, arena, bm, use_mrt, opacity);
+                    let prepared = push_band_math_uniforms(
+                        &uniform_ctx,
+                        arena,
+                        layer.layer_id,
+                        bm,
+                        use_mrt,
+                        opacity,
+                        swipe,
+                    );
                     self.prepared_layers
                         .push(PreparedLayerDraw::BandMath(prepared));
                 }

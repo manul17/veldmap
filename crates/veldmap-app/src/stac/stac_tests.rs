@@ -162,6 +162,7 @@ fn hovering_already_selected_item_skips_highlight_rebuild() {
     let mk_item = |id: &str, bbox: [f64; 4]| veldmap_net::StacItem {
         id: id.to_owned(),
         collection: None,
+        self_href: None,
         datetime: None,
         cloud_cover: None,
         platform: None,

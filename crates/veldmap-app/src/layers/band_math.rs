@@ -181,6 +181,27 @@ impl BandMathPreset {
     }
 }
 
+/// Serde-free persisted style descriptor for [`BandMathStyle`] (analogous to
+/// [`super::LayerStyleSpec`]), allowing `session.json` and `.veldmap.json` to
+/// round-trip stretch ranges, colormaps, gamma, and `SCL` masking without
+/// leaking serde into `layers/`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BandMathStyleSpec {
+    pub(crate) preset: BandMathPreset,
+    pub(crate) formula: BandMathFormula,
+    pub(crate) recipe_label: String,
+    pub(crate) colormap: ColormapId,
+    pub(crate) invert_colormap: bool,
+    pub(crate) stretch_min: f64,
+    pub(crate) stretch_max: f64,
+    pub(crate) rgb_min: [f64; 3],
+    pub(crate) rgb_max: [f64; 3],
+    pub(crate) default_rgb_range: ([f64; 3], [f64; 3]),
+    pub(crate) rgb_gamma: f32,
+    pub(crate) scl_mask_enabled: bool,
+    pub(crate) scl_mask_bits: u32,
+}
+
 /// Live GPU styling, stretch, colormap, and `SCL` mask configuration for a
 /// [`BandMathLayerData`] layer.
 #[derive(Clone, Debug)]
@@ -220,6 +241,62 @@ impl BandMathStyle {
             scl_mask_enabled: has_scl,
             scl_mask_bits: DEFAULT_SCL_MASK_BITS,
             style_rev: 1,
+        }
+    }
+
+    /// Reconstruct a live [`BandMathStyle`] from a saved [`BandMathStyleSpec`],
+    /// sanitizing non-finite or inverted ranges while preserving valid values.
+    pub(super) fn from_spec(spec: &BandMathStyleSpec, has_scl: bool) -> Self {
+        let mut style = Self::from_preset(spec.preset, has_scl);
+        style.formula = spec.formula;
+        if !spec.recipe_label.trim().is_empty() {
+            style.recipe_label = spec.recipe_label.trim().to_owned();
+        }
+        style.colormap = spec.colormap;
+        style.invert_colormap = spec.invert_colormap;
+        if spec.stretch_min.is_finite()
+            && spec.stretch_max.is_finite()
+            && spec.stretch_max > spec.stretch_min
+        {
+            style.stretch_min = spec.stretch_min;
+            style.stretch_max = spec.stretch_max;
+        }
+        if spec.rgb_min.iter().all(|v| v.is_finite())
+            && spec.rgb_max.iter().all(|v| v.is_finite())
+            && (0..3).all(|i| spec.rgb_max[i] > spec.rgb_min[i])
+        {
+            style.rgb_min = spec.rgb_min;
+            style.rgb_max = spec.rgb_max;
+        }
+        if spec.default_rgb_range.0.iter().all(|v| v.is_finite())
+            && spec.default_rgb_range.1.iter().all(|v| v.is_finite())
+            && (0..3).all(|i| spec.default_rgb_range.1[i] > spec.default_rgb_range.0[i])
+        {
+            style.default_rgb_range = spec.default_rgb_range;
+        }
+        if spec.rgb_gamma.is_finite() {
+            style.rgb_gamma = spec.rgb_gamma.clamp(0.2, 4.0);
+        }
+        style.scl_mask_enabled = has_scl && spec.scl_mask_enabled;
+        style.scl_mask_bits = spec.scl_mask_bits;
+        style
+    }
+
+    pub(super) fn to_spec(&self) -> BandMathStyleSpec {
+        BandMathStyleSpec {
+            preset: self.preset,
+            formula: self.formula,
+            recipe_label: self.recipe_label.clone(),
+            colormap: self.colormap,
+            invert_colormap: self.invert_colormap,
+            stretch_min: self.stretch_min,
+            stretch_max: self.stretch_max,
+            rgb_min: self.rgb_min,
+            rgb_max: self.rgb_max,
+            default_rgb_range: self.default_rgb_range,
+            rgb_gamma: self.rgb_gamma,
+            scl_mask_enabled: self.scl_mask_enabled,
+            scl_mask_bits: self.scl_mask_bits,
         }
     }
 

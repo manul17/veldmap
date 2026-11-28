@@ -8,13 +8,13 @@ Build VeldMap as a fast, purely native Rust desktop **Analytical Earth-Observati
 
 A simplified browser/mobile companion is intentionally deferred to a separate project later (enabled by keeping `veldmap-core` permanently UI/GPU/network-free).
 
-> **Document lifecycle:** `plan.md` is the vertical-slice roadmap and exit-criteria tracker (update `Next Step` as each slice closes). Upcoming slices (`5A-2`–`6`, `3B-2`) are **working design hypotheses**—revise them freely as real code and benchmarks prove better designs. Settled "why not X" decisions and hard cross-slice invariants live in [docs/decisions.md](docs/decisions.md) once implemented; module details live in Rust `//!` docstrings (`cargo doc --document-private-items`).
+> **Document lifecycle:** `plan.md` is the vertical-slice roadmap and exit-criteria tracker (update `Next Step` as each slice closes). Upcoming slices (`5B-1a`–`6`, `3B-2`) are **working design hypotheses**—revise them freely as real code and benchmarks prove better designs. Settled "why not X" decisions and hard cross-slice invariants live in [docs/decisions.md](docs/decisions.md) once implemented; module details live in Rust `//!` docstrings (`cargo doc --document-private-items`).
 
 ---
 
 ## Working Cross-Slice Principles
 
-Implemented decisions and hard cross-slice invariants are maintained in [docs/decisions.md](docs/decisions.md) (§1–§12). Working principles for upcoming slices:
+Implemented decisions and hard cross-slice invariants are maintained in [docs/decisions.md](docs/decisions.md) (§1–§13). Working principles for upcoming slices:
 
 1. **Natural workspace crate boundaries:** Keep `veldmap-core` a permanently pure leaf (`geo`, `tile` keys/LRU, std-only `sync`/`io` traits/`MemoryBudget`, `#![forbid(unsafe_code)]`, zero OS probing or `tokio`/`reqwest`/`image`/`tiff`/`rusqlite`/`egui`/`wgpu`). Split focused workspace crates (`veldmap-raster`, `veldmap-net`, `veldmap-storage`) along real dependency seams with zero horizontal dependencies among middle crates. Keep `veldmap-app` unified (avoid speculative crate splits while internal module boundaries and headless `test-support` GPU tests remain clean).
 2. **Deadlock-free memory & deduplication invariants:** Bound CPU caches with startup host-RAM-scaled fixed per-cache caps (avoiding lock-reentrant cross-cache shrinking), track dynamic viewport/scratch GPU VRAM in `veldmap-app` via typed `ScratchDemand` against `GpuTileCache`'s effective budget with a hard `64 MiB` minimum floor (keeping `veldmap-core::MemoryBudget` pure/static), bound decode working memory and queued upload bytes so small tiled reads never stall behind full-image decodes and large passes never starve, deduplicate concurrent chunk/block fetches with panic/cancel-safe singleflight, and scale GPU tile VRAM budgets proportionally for multi-band EO working sets.
@@ -30,7 +30,7 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 
 ## Completed Foundation `[x]`
 
-*(Settled rationale and cross-slice invariants live in [docs/decisions.md](docs/decisions.md) §1–§12.)*
+*(Settled rationale and cross-slice invariants live in [docs/decisions.md](docs/decisions.md) §1–§13.)*
 
 | Milestone / Slice | Scope Delivered | Decisions |
 |---|---|---|
@@ -43,33 +43,13 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 | **v0.5 — Slice 3B** `[x]` | `StreamKey`-keyed uploads & multi-band VRAM appetite budgeting (`128–4096 MiB`), hoisted `TileBindGroupCache`, Display/Scientific (`R32Float` NaN-skipping mips, 8-tap nodata-trilinear WGSL, linear/`log10` dB stretch, histogram, colorbar, native-`f64` local cursor readout)/Categorical (`R8Uint`/`R16Uint`) tracks, lock-free direct raw-chunk GeoTIFF decoding (`Planar-1/2`, RGB+NIR, `Palette`, `ZSTD`/`YCbCr`/`WebP`), byte-shuffled `Lz4Raw` disk cache | §10 |
 | **v0.5 — Slice 4A** `[x]` | Shared `NetContext` (split identity/gzip clients, split timeouts, host-scoped cooldowns, 64 KiB `RangeBlockPool` & `PrefetchBudget`), `HttpRangeSource` (1-RTT `0..256 KiB` head probe, strong-ETag `If-Match`, refcounted singleflight, pinned coalesced prefetch), pure-`ByteSource` `SinglePassIfdReader` (`tiff` dev-only), isolated `veldmap-remote-io` + offloaded `veldmap-tile-write`, AWS Earth Search Sentinel-2 L2A & COP-DEM GLO-30 + custom-auth STAC + sample scenes, retained vector AOIs + GeoJSON/WKT export, HiDPI ribbon/hatch globe footprints, 3-tab Settings modal, collapsible `Layers` \| `Cloud / STAC` workbench | §11 |
 | **v0.5 — Slice 5A-1** `[x]` | Tagged `LayerKind::{SingleRaster, BandMath}` + `RasterAsset`, presentation-only `ui/` over STAC view DTOs, lazy shared quiet-`NaN`-filled `R32Float` + `R8Uint` `SCL` scratch pool (`ScratchDemand`) with co-grid MRT & clamped scissor bounds, floored dynamic target VRAM accounting (`64 MiB` floor), per-band GDAL/STAC 1.0 & 1.1 `(scale, offset, nodata, unit)` propagation, 1-click STAC Scene Recipes + local Band Math builder, `RdYlGn`/`BrBG` colormaps, zoom-invariant `BandMath` CPU cursor readouts | §12 |
+| **v0.5 — Slice 5A-2** `[x]` | Split-screen swipe curtain (`SwipeRenderState` outside `DrawSnapshot`, physical `split_x` in `LastRenderKey`, pre-scratch `BandMath` scissor intersection, swipe-aware cursor readout), tagged v2 `session.json` & portable `.veldmap.json` project files (relative paths, sanitized URLs, same-origin imported-project credential boundary, offline-resilient slot-preserving `SessionRestoreTracker`), pure-Rust WGS84 → MGRS formatter & DD/DMS/MGRS copy, single-line fixed-height status bar, vector `"Outline only"`, Measure-to-STAC-AOI, rolling 90d UTC STAC defaults, clean-frame `COPY_SRC` non-blocking cartographic PNG export via `veldmap-raster`, workspace bumped to `0.5.0` | §13 |
 
 ---
 
-## Upcoming Vertical Slices (`v0.5` → `v1.0` → `v1.1`)
+## Upcoming Vertical Slices (`v1.0` → `v1.1`)
 
-> **Execution order:** Slices are grouped into shippable milestones (`v0.5` completion → `v1.0` → `v1.1`). Slice IDs (`5A-2`, `5B-1a/b`, `5B-2a/b`, `4B-1`, `3C-1`, `6`, `3B-2`) are retained from original roadmap tracks for git-history continuity; execution follows the milestone order below.
-
----
-
-### Milestone v0.5 Completion — Swipe, Cloud Workspaces & Cartographic Export
-
-#### Slice 5A-2 — Split-Screen Swipe, Cloud Workspace Persistence & Cartographic PNG Export `[ ]`
-- [ ] **Split-screen swipe curtain:**
-  - Interactive swipe comparison across any two layers (including non-co-registered swaths and `BandMath` layers), integrated into `VeldmapApp`'s unified viewport tool transitions alongside `Measure` and `DrawAoiBox`.
-  - Pass normalized split `t ∈ [0.0, 1.0]` outside `DrawSnapshot::build` (avoiding 120 Hz quadtree/cull rebuilds during curtain drag) while keying `LastRenderKey` on the swipe state so dragging always triggers a repaint, snapping `split_x` to exact physical framebuffer width inside `GlobePaintCallback::prepare()` to prevent HiDPI 1-px drift vs. the `egui::Painter` divider.
-  - Apply explicit left/right half-plane scissor rects to batched `Direct` layers, intersect each `BandMath` layer's projected scissor rect with its swipe half-plane *before* scratch passes (skipping both scratch and composite on empty intersection so `wgpu` never sees zero-sized scissors), and restore full-viewport scissor before vectors and graticule.
-- [ ] **Full workspace/project persistence (local + sanitized cloud & `BandMath`):**
-  - Retain `auth_mode`, `external_bands`, `is_scl`, and optional `(stac_item_href, asset_key)` on `LayerOrigin::Remote`, evolve `SavedLayerEntry` into a tagged schema supporting local rasters, remote COGs, and heterogeneous local/remote `BandMath` recipes (plus swipe state and vector outline-only style), and add explicit Save/Load `.veldmap.json` project files alongside `session.json` (resolving `.veldmap.json` local paths relative to the project file directory when on the same root/drive, with absolute fallback).
-  - **Secret hygiene & offline resilience:** Strip query strings, presigned `?sig=` / `?X-Amz-Signature=` tokens, `user:pass@` userinfo, and custom auth headers before writing; persist only sanitized canonical URLs, `auth_mode` references (resolved from `settings.json` on load), `(scale, offset, nodata, unit)`, and optional `(stac_item_href, asset_key)`. Generalize `SessionRestoreTracker` beyond `Path`-only keys so offline/401/403 remote and `BandMath` restore failures preserve styles and recipes across transient outages.
-- [ ] **Copy coordinates, MGRS formatter, workstation UX polish & cartographic PNG export:**
-  - Add a pure-Rust WGS84 → MGRS formatter in `veldmap-core::geo::mgrs` (UTM bands `C`–`X` with Norway/Svalbard exceptions and clean polar fallback), copy cursor/center coordinates (DD / DMS / MGRS), and display compact MGRS alongside DD in the strictly single-line status bar (never wrapping or resizing the globe viewport).
-  - High-leverage workstation polish: add a vector `"Outline only"` toggle (reusing existing `fill_alpha <= 0.001` fill-skip in `render/vector.rs`), `"Use as STAC AOI"` from Measure Area polygons, and a rolling last-90-days UTC default STAC date range instead of a hardcoded 2024 window.
-  - Retain `OffscreenTarget`'s `color_texture` handle with `COPY_SRC` usage, support screenshot readback even on clean frames (`is_clean_for == true`), copy via `256 B`-aligned staging buffer with non-blocking `map_async` + `Wakeup` (never blocking the UI thread), composite optional cartographic overlays (scale bar, north arrow, colorbar, acquisition date) on CPU off the UI thread, and expose a narrow RGBA8 → PNG encoder helper in `veldmap-raster` (keeping codec deps out of `veldmap-app`) invoked via `rfd` save dialog.
-- [ ] **Milestone v0.5 release prep & docs:** Bump workspace version (`0.2.0` → `0.5.0`) in `Cargo.toml` on slice close; update `docs/decisions.md`, `docs/limitations.md`, and `README.md`.
-- **Exit criteria:**
-  - *Automated CI:* Tagged `session.json` / `.veldmap.json` round-trip (relative paths, secret stripping, offline remote/`BandMath` restore preservation), WGS84 ↔ MGRS round-trip (including Norway/Svalbard & polar fallback), swipe scissor/empty-intersection tests, and clean-frame offscreen PNG readback/encode tests pass.
-  - *Manual QA:* Swipe curtain across arbitrary layers (including `BandMath`), save/reload of cloud + band-math workspaces without leaking credentials, copy-coordinates, and PNG export work smoothly.
+> **Execution order:** Slices are grouped into shippable milestones (`v1.0` → `v1.1`). Slice IDs (`5B-1a/b`, `5B-2a/b`, `4B-1`, `3C-1`, `6`, `3B-2`) are retained from original roadmap tracks for git-history continuity; execution follows the milestone order below.
 
 ---
 
@@ -77,8 +57,7 @@ Implemented decisions and hard cross-slice invariants are maintained in [docs/de
 
 > **Pre-5B architectural prep (do right before starting `5B-1a` / `5B-2a`):**
 > - Decouple `OverlayLayer` from its unconditional `primary_asset()` / `source()` / `geo()` / `meta()` / `source_id()` assumption (replace with collection/capability accessors so `DemMosaic` with 0..N open geocells and `Timeline` with swappable epochs fit cleanly without panicking accessors).
-> - Refactor `LayerSummary` to embed a tagged `LayerSummaryKind` enum (removing `.band_math.is_none()` UI discriminators) and nest kind-specific variants inside `OverlayEdit`.
-> - Split `crates/veldmap-app/src/render/overlay.rs` (>1,000 LOC) into focused submodules (`direct`, `band_math`, shared warp-mesh cache) as Pass-2 grows a third pass-breaking target for DEM relief.
+> - Refactor `LayerSummary` to embed a tagged `LayerSummaryKind` enum (removing `.band_math.is_none()` UI discriminators) and nest kind-specific variants inside `OverlayEdit`. *(Note: `render/overlay/` is already split into `mod.rs`, `band_math.rs`, and `mesh.rs`; new Pass-2 scratch targets for `5B-1b` relief and `5B-2a` dual-epoch diff must intersect `ResolvedSwipe::scissor_for_layer` before scratch passes and extend the tagged v2 `SavedLayerEntry` + `SessionRestoreTracker` schema.)*
 >
 > **Execution flexibility:** `5B-1a` (single-file local DEM/DSM relief), `5B-2a` (STAC pagination, timeline & dual-epoch diff), and `5B-2b` (AOI zonal stats & Float32 GeoTIFF export) are independent after `5A-2` + prep; `5B-2a`/`5B-2b` may execute ahead of `5B-1b` (global COP-DEM virtual mosaic) to complete the core EO analytical loop earlier.
 
@@ -190,5 +169,5 @@ Audited safety, correctness, and architecture hazards preserved from retired `ol
 
 ## Next Step
 
-- **Current state:** Milestone **v0.2** (`1`–`3A-2`) and Milestone **v0.5** Slices `3B`, `4A`, and `5A-1` are complete (see **Completed Foundation** above and [docs/decisions.md](docs/decisions.md) §1–§12).
-- **Immediate task:** Start **Milestone v0.5 — Slice 5A-2: Split-Screen Swipe, Cloud Workspace Persistence & Cartographic PNG Export** (swipe curtain with `LastRenderKey`-keyed split & `BandMath` scissor intersection, tagged `session.json` / `.veldmap.json` with secret stripping, relative paths, and generalized `SessionRestoreTracker`, WGS84 → MGRS formatter & coordinate copy, vector outline-only / Measure-to-STAC-AOI / rolling 90d STAC defaults, clean-frame offscreen PNG export via `veldmap-raster`, and workspace version bump `0.2.0` → `0.5.0`).
+- **Current state:** Milestone **v0.2** (`1`–`3A-2`) and Milestone **v0.5** (`3B`, `4A`, `5A-1`, `5A-2`, version `0.5.0`) are complete (see **Completed Foundation** above and [docs/decisions.md](docs/decisions.md) §1–§13).
+- **Immediate task:** Begin **Milestone v1.0** with the **Pre-5B architectural prep** (decouple `OverlayLayer` from unconditional `primary_asset()`/`source()`/`geo()`/`meta()`/`source_id()`, embed `LayerSummaryKind` in `LayerSummary`, and nest kind-specific `OverlayEdit` variants), then start **Slice 5B-1a** (Single-File Local DEM/DSM Terrain Relief & `gutter = 1` Tiles) or **Slice 5B-2a** (STAC Pagination/Profiles, Multi-Temporal Timeline & Dual-Epoch Diffing).

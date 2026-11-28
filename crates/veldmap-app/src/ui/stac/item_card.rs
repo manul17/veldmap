@@ -58,6 +58,7 @@ pub(super) fn show_item_card(
                     actions.push(StacUiAction::StreamCog(asset.to_stream_spec(
                         format!("{} ({})", item.id, asset.key),
                         StacCogAuthMode::FromSearchResult,
+                        item.self_href.clone(),
                     )));
                 }
                 if let Some(bounds) = item.zoom_bounds
@@ -112,6 +113,7 @@ pub(super) fn show_item_card(
                             actions.push(StacUiAction::StreamCog(asset.to_stream_spec(
                                 format!("{} ({})", item.id, asset.key),
                                 StacCogAuthMode::FromSearchResult,
+                                item.self_href.clone(),
                             )));
                         }
                     }

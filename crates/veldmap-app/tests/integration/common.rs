@@ -330,6 +330,7 @@ pub(crate) fn render_srgb(
             width,
             height,
             snapshot,
+            swipe: None,
         },
         true,
     )

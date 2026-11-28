@@ -29,10 +29,10 @@ fn wait_for_io_event(mgr: &mut OverlayManager) -> OverlayIoEvent {
 }
 
 fn wait_for_cursor_readout(mgr: &OverlayManager, lat_deg: f64, lon_deg: f64) -> CursorReadout {
-    let _ = mgr.query_cursor_readout(lat_deg, lon_deg);
+    let _ = mgr.query_cursor_readout(lat_deg, lon_deg, None);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if let Some(readout) = mgr.query_cursor_readout(lat_deg, lon_deg)
+        if let Some(readout) = mgr.query_cursor_readout(lat_deg, lon_deg, None)
             && readout.value != CursorReadoutValue::Pending
         {
             return readout;
@@ -85,6 +85,7 @@ fn multi_level_pointwise_cog_populates_all_ladder_rungs_in_wanted_and_supports_a
         opacity: 1.0,
         crs_override: None,
         style: None,
+        restore_id: None,
     })
     .expect("queue open");
     let (layer_id, bounds) = match wait_for_io_event(&mut mgr) {
@@ -304,10 +305,17 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
     mgr.begin_open_remote_cog(RemoteCogRequest {
         url,
         title: "Test Remote COG".to_owned(),
+        auth_mode: crate::stac::StacCogAuthMode::None,
         extra_headers: Vec::new(),
         external_bands: Vec::new(),
         is_scl: false,
+        stac_item_href: None,
+        asset_key: Some("visual".to_owned()),
+        visible: true,
+        opacity: 1.0,
+        style: None,
         fly_to: true,
+        restore_id: None,
     })
     .expect("queue remote open");
 
@@ -316,20 +324,37 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
             id,
             title,
             display_url,
+            is_band_math,
             bounds,
             fly_to,
+            restore_id: None,
         } => {
             assert_eq!(title, "Test Remote COG");
             assert!(!display_url.contains("secret-query"));
+            assert!(!is_band_math);
             assert!(fly_to);
             (id, bounds.expect("valid remote footprint"))
         }
         other => panic!("expected RemoteOpened, got {other:?}"),
     };
 
-    // Remote layers must NEVER leak into local session persistence and must
-    // reject local disk reload cleanly.
-    assert_eq!(mgr.saved_entries_iter().count(), 0);
+    // Remote layers persist strictly as sanitized canonical URLs (query tokens
+    // stripped) and reject local disk reload cleanly.
+    let persisted: Vec<_> = mgr.saved_entries_iter().collect();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].0, layer_id);
+    match &persisted[0].1 {
+        crate::layers::OverlayPersistEntry::RemoteCog {
+            canonical_url,
+            asset_key,
+            ..
+        } => {
+            assert!(!canonical_url.contains("secret-query"));
+            assert!(canonical_url.ends_with("/scene.tif"));
+            assert_eq!(asset_key.as_deref(), Some("visual"));
+        }
+        other => panic!("expected RemoteCog persist entry, got {other:?}"),
+    }
     assert!(mgr.layer_summaries()[0].is_remote);
     assert!(mgr.begin_reload_bypass_cache(layer_id).is_err());
 
@@ -534,6 +559,7 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
         opacity: 1.0,
         crs_override: None,
         style: None,
+        restore_id: None,
     })
     .expect("open rgbnir");
     let (rgbnir_id, _bounds) = match wait_for_io_event(&mut mgr) {
@@ -548,6 +574,7 @@ fn band_math_multi_asset_refcounting_scl_r8uint_and_zoom_invariant_cursor_readou
         opacity: 1.0,
         crs_override: None,
         style: None,
+        restore_id: None,
     })
     .expect("open scl");
     let (scl_id, _) = match wait_for_io_event(&mut mgr) {

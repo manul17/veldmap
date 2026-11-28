@@ -49,6 +49,19 @@ impl LayerStack {
         true
     }
 
+    pub(super) fn move_to_index(&mut self, id: LayerId, target_idx: usize) -> bool {
+        let Some(idx) = self.layers.iter().position(|l| l.id() == id) else {
+            return false;
+        };
+        let clamped = target_idx.min(self.layers.len().saturating_sub(1));
+        if idx == clamped {
+            return false;
+        }
+        let layer = self.layers.remove(idx);
+        self.layers.insert(clamped, layer);
+        true
+    }
+
     pub(super) fn get(&self, id: LayerId) -> Option<&OverlayLayer> {
         self.layers.iter().find(|l| l.id() == id)
     }

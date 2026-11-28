@@ -8,17 +8,20 @@
 //!   dialogs, `egui_wgpu::CallbackResources` bridge, and session restoration.
 //! - `basemap` — Bundled NASA Blue Marble & live HTTP basemap policy/streaming.
 //! - `colormap` — Linear-light scientific colormaps & categorical palettes.
+//! - `export` — Pure-Rust CPU cartographic PNG overlay compositor (metric scale
+//!   bar, rotated North arrow, scientific colorbar, and caption pill).
 //! - `gpu_tiles` — Bounded `GpuTileCache` and enqueue-bounded `PendingUploads`.
 //! - `layers` — `OverlayManager`, `LayerStack`, multi-asset `BandMath`,
 //!   background I/O/decode/tile-write orchestration, and CPU cursor probing.
 //! - `measure` — Interactive Karney WGS84 distance/area measurement session.
 //! - `render` — Offscreen two-pass `wgpu` `GlobeRenderer` (Pass 1
 //!   body + segmented depth-less Pass 2 overlays, `BandMath` scratch pool,
-//!   vectors, and procedural graticule).
+//!   split-screen swipe scissors, vectors, and procedural graticule).
 //! - `scene` — `SceneState` mediator coordinating camera snapshots, caches,
 //!   VRAM budgeting, and deterministic shutdown.
 //! - `stac` — Cloud/STAC search session, AOI state, and read-only UI DTOs.
-//! - `storage` — `settings.json` / `session.json` persistence & `DiskCacheWorker`.
+//! - `storage` — `settings.json`, `session.json`, portable `.veldmap.json`
+//!   project files, and `DiskCacheWorker`.
 //! - `ui` — Presentation-only `egui` views emitting typed actions (zero
 //!   `veldmap-net`/`veldmap-raster`/`veldmap-storage` imports).
 //! - `vectors` — Retained GeoJSON vector layers and background tessellation.
@@ -31,6 +34,7 @@ use std::path::Path;
 mod app;
 mod basemap;
 mod colormap;
+mod export;
 #[cfg(not(any(test, feature = "test-support")))]
 mod gpu_tiles;
 #[cfg(any(test, feature = "test-support"))]

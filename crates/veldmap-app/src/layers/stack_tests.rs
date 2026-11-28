@@ -304,6 +304,8 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
         ],
         Some(make_asset(22, 0, PixelFormat::R8Uint)),
         BandMathStyle::from_preset(BandMathPreset::Ndvi, true),
+        true,
+        1.0,
     );
     let stream_keys: Vec<_> = bm.streams().map(|s| s.stream_key()).collect();
     assert_eq!(stream_keys.len(), 3);
@@ -330,6 +332,8 @@ fn multi_stream_appetite_weight_and_opt_in_pin_root() {
         ],
         None,
         BandMathStyle::from_preset(BandMathPreset::Ndvi, false),
+        true,
+        1.0,
     );
     let k_unique = shared_dup.streams().nth(1).expect("band 1").stream_key();
     shared_dup.observe_stream_tile_bytes(k0, 2_500_000);

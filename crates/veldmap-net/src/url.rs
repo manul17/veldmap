@@ -137,8 +137,9 @@ pub(crate) fn extract_host(url: &str) -> String {
 /// Normalize an HTTP(S) URL into `scheme://host[:port]/path` with lowercased
 /// scheme and authority, default ports (`:80` for `http`, `:443` for `https`)
 /// stripped, and any inline `user:pass@`, `?query`, and `#fragment` removed so
-/// presigned URLs for the same immutable object share a stable cache identity.
-pub(crate) fn canonical_url_without_query(url: &str) -> Option<String> {
+/// presigned URLs for the same immutable object share a stable cache identity
+/// and persisted workspace files never retain credentials or presigned tokens.
+pub fn sanitize_url_for_persistence(url: &str) -> Option<String> {
     let mut parsed = parse_http_url(url)?;
     parsed.set_password(None).ok()?;
     parsed.set_username("").ok()?;

@@ -298,6 +298,8 @@ impl DrawOverlayContent {
 /// Ordered draped raster overlay layer in painter's order (bottom-to-top).
 #[derive(Clone, Debug)]
 pub struct DrawOverlayLayer {
+    /// Stable per-layer numeric identifier used for split-screen swipe matching.
+    pub layer_id: u64,
     pub opacity: f32,
     pub content: DrawOverlayContent,
 }

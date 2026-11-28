@@ -18,6 +18,7 @@ pub(crate) enum MeasureAction {
     Clear,
     Close,
     ExportGeoJson,
+    UseAsStacAoi,
 }
 
 /// Transient UI state for the Geodesic Measure window (export status notice).
@@ -124,6 +125,16 @@ pub(crate) fn show_measure_window(
                     action = Some(MeasureAction::ExportGeoJson);
                 }
             });
+            if mode == MeasureMode::Area && point_count >= 3 {
+                ui.add_space(4.0);
+                if ui
+                    .button("Use as STAC AOI")
+                    .on_hover_text("Promote this measured polygon into the Cloud / STAC search AOI")
+                    .clicked()
+                {
+                    action = Some(MeasureAction::UseAsStacAoi);
+                }
+            }
 
             if let Some(note) = &state.notice {
                 ui.separator();

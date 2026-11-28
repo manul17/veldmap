@@ -16,7 +16,7 @@ use super::super::band_math::BandMathStyle;
 use super::super::io_worker::{OverlayIoCmd, OverlayIoResult, ReloadRequest, ReloadedPayload};
 use super::super::layer::RemoteLayerSpec;
 use super::super::opener::{OpenRasterError, bind_frame_with_override};
-use super::super::remote_opener::{OpenedRemoteBandAsset, RemoteOpenResult};
+use super::super::remote_opener::{OpenedBandAsset, OpenedBandAssetOrigin, RemoteOpenResult};
 use super::super::stack::OverlayLayer;
 use super::super::{
     LayerId, LayerInitOptions, LocalBandMathSpec, OpenOverlayRequest, OverlayIoEvent,
@@ -24,8 +24,8 @@ use super::super::{
 };
 use super::{OverlayManager, OverlayMutation, alloc_seq};
 
-fn build_remote_band_asset(
-    opened: OpenedRemoteBandAsset,
+fn build_band_asset(
+    opened: OpenedBandAsset,
     format: PixelFormat,
     relaid: u64,
 ) -> Result<RasterAsset, String> {
@@ -35,20 +35,29 @@ fn build_remote_band_asset(
         .pyramid_meta(spec)
         .map_err(|e| format!("band '{}': {e}", opened.label))?;
     let desc = opened.source.description();
+    let (origin, crs_override) = match opened.origin {
+        OpenedBandAssetOrigin::Local { path, crs_override } => {
+            (LayerOrigin::Local { path }, crs_override)
+        }
+        OpenedBandAssetOrigin::Remote { meta, range_source } => (
+            LayerOrigin::Remote {
+                meta,
+                range: range_source,
+            },
+            None,
+        ),
+    };
     let geo = GeoBinding::new(
         opened.frame,
         desc.width,
         desc.height,
         meta.max_level(),
-        None,
+        crs_override,
         relaid,
     );
     Ok(RasterAsset::new(
         opened.label,
-        LayerOrigin::Remote {
-            display_url: opened.display_url,
-            range: opened.range_source,
-        },
+        origin,
         opened.source,
         geo,
         meta,
@@ -77,7 +86,12 @@ impl OverlayManager {
     /// [`veldmap_net::NetContext`] + `remote_pool`, completely isolated from
     /// local file open/reload I/O and `fast_pool`.
     pub(crate) fn begin_open_remote_cog(&self, request: RemoteCogRequest) -> Result<(), String> {
-        self.remote_opener.begin_open(&self.runtime, request)
+        self.remote_opener.begin_open(
+            &self.runtime,
+            self.workspace_epoch,
+            &self.workspace_cancel,
+            request,
+        )
     }
 
     /// Queue a non-blocking concurrent multi-asset remote STAC Band Math / RGB
@@ -87,8 +101,12 @@ impl OverlayManager {
         &self,
         request: RemoteBandMathRequest,
     ) -> Result<(), String> {
-        self.remote_opener
-            .begin_open_band_math(&self.runtime, request)
+        self.remote_opener.begin_open_band_math(
+            &self.runtime,
+            self.workspace_epoch,
+            &self.workspace_cancel,
+            request,
+        )
     }
 
     /// Build and insert a `LayerKind::BandMath` layer from already-loaded local
@@ -146,7 +164,8 @@ impl OverlayManager {
         } else {
             spec.title.trim().to_owned()
         };
-        let layer = OverlayLayer::from_band_math(id, title, band_assets, scl_asset, style);
+        let layer =
+            OverlayLayer::from_band_math(id, title, band_assets, scl_asset, style, true, 1.0);
         let mut mutation = OverlayMutation::default();
         let bounds = self.insert_opened_layer(layer, &mut mutation);
         Ok((id, bounds, mutation))
@@ -156,6 +175,8 @@ impl OverlayManager {
     /// opacity, optional CRS override, and optional saved analytical style.
     pub(crate) fn begin_open_file(&self, request: OpenOverlayRequest<'_>) -> Result<(), String> {
         if self.io_worker.send(OverlayIoCmd::Open {
+            epoch: self.workspace_epoch,
+            cancel: self.workspace_cancel.child_token(),
             path: request.path.to_path_buf(),
             fly_to: request.fly_to,
             options: LayerInitOptions {
@@ -164,6 +185,7 @@ impl OverlayManager {
                 crs_override: request.crs_override,
                 style: request.style,
             },
+            restore_id: request.restore_id,
         }) {
             Ok(())
         } else {
@@ -179,7 +201,7 @@ impl OverlayManager {
         &mut self,
         id: LayerId,
     ) -> Result<OverlayMutation, String> {
-        let cancel = self.runtime.shutdown.child_token();
+        let cancel = self.workspace_cancel.child_token();
         let (mut request, prep, old_stream) = {
             let Some(layer) = self.stack.get_mut(id) else {
                 return Err("layer no longer exists".to_owned());
@@ -255,18 +277,26 @@ impl OverlayManager {
         while let Some(res) = self.io_worker.try_recv() {
             match res {
                 OverlayIoResult::Opened {
+                    epoch,
                     path,
                     fly_to,
                     options,
+                    restore_id,
                     outcome,
-                } => self.handle_opened_result(
-                    path,
-                    fly_to,
-                    options,
-                    outcome,
-                    &mut events,
-                    &mut mutation,
-                ),
+                } => {
+                    if epoch != self.workspace_epoch {
+                        continue;
+                    }
+                    self.handle_opened_result(
+                        path,
+                        fly_to,
+                        options,
+                        restore_id,
+                        outcome,
+                        &mut events,
+                        &mut mutation,
+                    );
+                }
                 OverlayIoResult::Reloaded(payload) => {
                     self.handle_reloaded_result(payload, &mut events, &mut mutation);
                 }
@@ -276,114 +306,145 @@ impl OverlayManager {
         for remote in self.remote_opener.drain() {
             match remote {
                 RemoteOpenResult::Single {
+                    epoch,
                     title,
-                    display_url,
-                    is_scl,
+                    meta,
+                    options,
                     fly_to,
+                    restore_id,
                     outcome,
-                } => match outcome {
-                    Ok((range_source, source, frame)) => {
-                        let id = LayerId(alloc_seq(&mut self.next_layer_id));
-                        let relaid = alloc_seq(&mut self.next_relaid);
-                        let layer = OverlayLayer::from_remote_source(RemoteLayerSpec {
-                            id,
-                            title: title.clone(),
-                            display_url: display_url.clone(),
-                            range_source,
-                            source,
-                            frame,
-                            options: LayerInitOptions {
-                                visible: true,
-                                opacity: 1.0,
-                                crs_override: None,
-                                style: None,
-                            },
-                            is_scl,
-                            relaid,
-                        });
-                        let bounds = self.insert_opened_layer(layer, &mut mutation);
-                        events.push(OverlayIoEvent::RemoteOpened {
-                            id,
-                            title,
-                            display_url,
-                            bounds,
-                            fly_to,
-                        });
+                } => {
+                    if epoch != self.workspace_epoch {
+                        continue;
                     }
-                    Err(error) => {
-                        events.push(OverlayIoEvent::RemoteFailed {
-                            title,
-                            display_url,
-                            error,
-                        });
+                    match outcome {
+                        Ok((range_source, source, frame)) => {
+                            let id = LayerId(alloc_seq(&mut self.next_layer_id));
+                            let relaid = alloc_seq(&mut self.next_relaid);
+                            let display_url = meta.display_url.clone();
+                            let layer = OverlayLayer::from_remote_source(RemoteLayerSpec {
+                                id,
+                                title: title.clone(),
+                                meta,
+                                range_source,
+                                source,
+                                frame,
+                                options,
+                                relaid,
+                            });
+                            let bounds = self.insert_opened_layer(layer, &mut mutation);
+                            events.push(OverlayIoEvent::RemoteOpened {
+                                id,
+                                title,
+                                display_url,
+                                is_band_math: false,
+                                bounds,
+                                fly_to,
+                                restore_id,
+                            });
+                        }
+                        Err(error) => {
+                            events.push(OverlayIoEvent::RemoteFailed {
+                                title,
+                                display_url: meta.display_url,
+                                is_band_math: false,
+                                error,
+                                restore_id,
+                            });
+                        }
                     }
-                },
+                }
                 RemoteOpenResult::BandMath {
+                    epoch,
                     title,
                     display_url,
                     preset,
+                    visible,
+                    opacity,
+                    style: saved_style,
                     fly_to,
+                    restore_id,
                     outcome,
-                } => match outcome {
-                    Ok((opened_bands, opened_scl)) => {
-                        let built_bands: Result<Vec<RasterAsset>, String> = opened_bands
-                            .into_iter()
-                            .map(|b| {
-                                let relaid = alloc_seq(&mut self.next_relaid);
-                                build_remote_band_asset(b, PixelFormat::R32Float, relaid)
-                            })
-                            .collect();
-                        match built_bands {
-                            Ok(band_assets) => {
-                                let scl_asset = opened_scl.and_then(|s| {
+                } => {
+                    if epoch != self.workspace_epoch {
+                        continue;
+                    }
+                    match outcome {
+                        Ok((opened_bands, opened_scl)) => {
+                            let built_bands: Result<Vec<RasterAsset>, String> = opened_bands
+                                .into_iter()
+                                .map(|b| {
                                     let relaid = alloc_seq(&mut self.next_relaid);
-                                    match build_remote_band_asset(s, PixelFormat::R8Uint, relaid) {
-                                        Ok(asset) => Some(asset),
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                title = %title,
-                                                error = %err,
-                                                "Optional SCL asset stream incompatible; continuing without cloud mask"
-                                            );
-                                            None
+                                    build_band_asset(b, PixelFormat::R32Float, relaid)
+                                })
+                                .collect();
+                            match built_bands {
+                                Ok(band_assets) => {
+                                    let scl_asset = opened_scl.and_then(|s| {
+                                        let relaid = alloc_seq(&mut self.next_relaid);
+                                        match build_band_asset(s, PixelFormat::R8Uint, relaid) {
+                                            Ok(asset) => Some(asset),
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    title = %title,
+                                                    error = %err,
+                                                    "Optional SCL asset stream incompatible; continuing without cloud mask"
+                                                );
+                                                None
+                                            }
                                         }
-                                    }
-                                });
-                                let id = LayerId(alloc_seq(&mut self.next_layer_id));
-                                let style = BandMathStyle::from_preset(preset, scl_asset.is_some());
-                                let layer = OverlayLayer::from_band_math(
-                                    id,
-                                    title.clone(),
-                                    band_assets,
-                                    scl_asset,
-                                    style,
-                                );
-                                let bounds = self.insert_opened_layer(layer, &mut mutation);
-                                events.push(OverlayIoEvent::RemoteOpened {
-                                    id,
-                                    title,
-                                    display_url,
-                                    bounds,
-                                    fly_to,
-                                });
-                            }
-                            Err(error) => {
-                                events.push(OverlayIoEvent::RemoteFailed {
-                                    title,
-                                    display_url,
-                                    error,
-                                });
+                                    });
+                                    let id = LayerId(alloc_seq(&mut self.next_layer_id));
+                                    let style = match saved_style {
+                                        Some(spec) => {
+                                            BandMathStyle::from_spec(&spec, scl_asset.is_some())
+                                        }
+                                        None => {
+                                            BandMathStyle::from_preset(preset, scl_asset.is_some())
+                                        }
+                                    };
+                                    let layer = OverlayLayer::from_band_math(
+                                        id,
+                                        title.clone(),
+                                        band_assets,
+                                        scl_asset,
+                                        style,
+                                        visible,
+                                        opacity,
+                                    );
+                                    let bounds = self.insert_opened_layer(layer, &mut mutation);
+                                    events.push(OverlayIoEvent::RemoteOpened {
+                                        id,
+                                        title,
+                                        display_url,
+                                        is_band_math: true,
+                                        bounds,
+                                        fly_to,
+                                        restore_id,
+                                    });
+                                }
+                                Err(error) => {
+                                    events.push(OverlayIoEvent::RemoteFailed {
+                                        title,
+                                        display_url,
+                                        is_band_math: true,
+                                        error,
+                                        restore_id,
+                                    });
+                                }
                             }
                         }
+                        Err(error) => {
+                            events.push(OverlayIoEvent::RemoteFailed {
+                                title,
+                                display_url,
+                                is_band_math: true,
+                                error,
+                                restore_id,
+                            });
+                        }
                     }
-                    Err(error) => {
-                        events.push(OverlayIoEvent::RemoteFailed {
-                            title,
-                            display_url,
-                            error,
-                        });
-                    }
-                },
+                }
             }
         }
 
@@ -408,11 +469,16 @@ impl OverlayManager {
         bounds
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Private result handler forwarding OverlayIoResult::Opened fields."
+    )]
     fn handle_opened_result(
         &mut self,
         path: PathBuf,
         fly_to: bool,
         options: LayerInitOptions,
+        restore_id: Option<u64>,
         outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
         events: &mut Vec<OverlayIoEvent>,
         mutation: &mut OverlayMutation,
@@ -429,6 +495,7 @@ impl OverlayManager {
                     path: event_path,
                     bounds,
                     fly_to,
+                    restore_id,
                 });
             }
             Err(err) => {
@@ -436,6 +503,7 @@ impl OverlayManager {
                     path,
                     error: err.message,
                     can_assign_crs: err.can_assign_crs,
+                    restore_id,
                 });
             }
         }

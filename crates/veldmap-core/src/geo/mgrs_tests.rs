@@ -102,3 +102,92 @@ fn partial_boundary_mgrs_squares_stay_inside_their_zone() {
     assert!((64.0..=72.0).contains(&lat_m), "lat_m={lat_m}");
     assert!((54.0..=60.0).contains(&lon_m), "lon_m={lon_m}");
 }
+
+#[test]
+fn format_wgs84_to_mgrs_round_trips_globally_including_norway_svalbard_and_poles() {
+    use crate::geo::ground_m;
+
+    // Equator / prime meridian exact match.
+    assert_eq!(
+        format_wgs84_to_mgrs(0.0, 0.0, 5).as_deref(),
+        Some("31N AA 66021 00000")
+    );
+    assert_eq!(format_wgs84_to_mgrs(0.0, 0.0, 0).as_deref(), Some("31N AA"));
+
+    // Norway widened zone 32V (Bergen, 5.322 E lies inside 3..12 E -> 32V)
+    // and narrowed zone 31V (1.5 E -> 31V).
+    let bergen = format_wgs84_to_mgrs(60.3913, 5.3221, 5).expect("Bergen MGRS");
+    assert!(bergen.starts_with("32V "), "expected 32V, got {bergen}");
+    let north_sea = format_wgs84_to_mgrs(60.0, 1.5, 5).expect("31V MGRS");
+    assert!(
+        north_sea.starts_with("31V "),
+        "expected 31V, got {north_sea}"
+    );
+
+    // Svalbard widened odd zones 31X, 33X, 35X, 37X.
+    for (lon, expected_prefix) in [
+        (4.0, "31X "),
+        (15.6, "33X "),
+        (25.0, "35X "),
+        (38.0, "37X "),
+    ] {
+        let code = format_wgs84_to_mgrs(78.2232, lon, 5).expect("Svalbard MGRS");
+        assert!(
+            code.starts_with(expected_prefix),
+            "lon={lon} expected {expected_prefix}, got {code}"
+        );
+        let (rlat, rlon, _) = parse_to_wgs84(&code).expect("parse Svalbard MGRS");
+        let err_m = ground_m((78.2232, lon), (rlat, rlon));
+        assert!(err_m < 2.0, "Svalbard round-trip err={err_m} m for {code}");
+    }
+
+    // Broad global round-trip including exact boundaries, sub-ULP negative
+    // latitudes, antimeridian, and high-convergence Norway/Svalbard edges.
+    let samples = [
+        (47.2357, 39.7015),
+        (-33.8688, 151.2093),
+        (-54.8019, -68.3030),
+        (21.3095, -157.9168),
+        (0.0001, -179.999),
+        (-0.0001, 179.999),
+        (-80.0, -180.0),
+        (-8e-15, 0.0),
+        (-1e-15, 0.0),
+        (-0.0, 0.0),
+        (84.0, 15.0),
+        (83.9999, 9.0001), // Svalbard 33X high-convergence west/north corner
+        (60.0, 3.0001),    // Norway 32V west/south boundary
+        (60.3913, 5.3221),
+    ];
+    for (lat, lon) in samples {
+        for prec in 1_u8..=5 {
+            let formatted = format_wgs84_to_mgrs(lat, lon, prec).expect("valid UTM band");
+            let (rlat, rlon, _) = parse_to_wgs84(&formatted).unwrap_or_else(|e| {
+                panic!("round-trip parse failed for {formatted} ({lat},{lon},p={prec}): {e:?}")
+            });
+            let tol_m = 10_f64.powi(5 - i32::from(prec)) * 1.1;
+            let err_m = ground_m((lat, lon), (rlat, rlon));
+            assert!(
+                err_m <= tol_m,
+                "lat={lat}, lon={lon}, prec={prec}, code={formatted}: err={err_m} m > {tol_m} m"
+            );
+        }
+    }
+
+    // Sub-ULP negative latitude stays consistently in southern band `M` with row `V`.
+    let tiny_south = format_wgs84_to_mgrs(-8e-15, 0.0, 5).expect("sub-ULP south");
+    assert_eq!(tiny_south, "31M AV 66021 99999");
+
+    // Longitude +180 wraps cleanly into Zone 01; precision > 5 clamps to 5.
+    let anti = format_wgs84_to_mgrs(10.0, 180.0, 4).expect("+180 lon");
+    assert!(anti.starts_with("01P "), "got {anti}");
+    assert_eq!(
+        format_wgs84_to_mgrs(0.0, 0.0, 9),
+        format_wgs84_to_mgrs(0.0, 0.0, 5)
+    );
+
+    // Polar and non-finite inputs return None.
+    assert!(format_wgs84_to_mgrs(84.5, 10.0, 4).is_none());
+    assert!(format_wgs84_to_mgrs(-80.5, 10.0, 4).is_none());
+    assert!(format_wgs84_to_mgrs(f64::NAN, 0.0, 4).is_none());
+}

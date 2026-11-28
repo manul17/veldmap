@@ -44,7 +44,7 @@ pub use stac::{
     StacAsset, StacAuth, StacCatalogConfig, StacClient, StacError, StacItem, StacRasterBandMeta,
     StacSearchQuery, StacSearchResult,
 };
-pub use url::{is_valid_http_endpoint, same_http_origin};
+pub use url::{is_valid_http_endpoint, same_http_origin, sanitize_url_for_persistence};
 
 /// Errors produced by live basemap configuration and HTTP streaming pipeline
 /// setup.

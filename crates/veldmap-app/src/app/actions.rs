@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::layers::{CrsOverride, RemoteBandAssetSpec, RemoteBandMathRequest, RemoteCogRequest};
+use crate::export::CartographicOverlaySpec;
+use crate::layers::{BandMathAssetOpenSpec, CrsOverride, RemoteBandMathRequest, RemoteCogRequest};
 use crate::measure::{MeasureMode, MeasureSession};
-use crate::stac::StacSession;
+use crate::stac::{AuthTrust, StacSession};
+use crate::storage::project::is_project_path;
 use crate::storage::session::SavedCameraPose;
 use crate::storage::settings::BasemapSelection;
 use crate::ui::basemap::BasemapUiAction;
@@ -24,11 +26,16 @@ use crate::vectors::VectorLayerId;
 
 use super::VeldmapApp;
 use super::dialogs::{DialogSpawnError, FileDialogEvent};
+use super::viewport_input::ViewportToolMode;
 
 impl VeldmapApp {
     /// Open a user-initiated batch of local paths (drag-and-drop, native file
     /// dialog, CLI args, or path prompt), clearing previous layer errors once
     /// per batch so multi-file errors are preserved together.
+    ///
+    /// If the batch contains a `.veldmap.json` project file, it is loaded off
+    /// the UI thread via [`super::dialogs::DialogHost::spawn_load_project_path`]
+    /// without queuing sibling files from the same batch.
     pub(super) fn open_user_paths(
         &mut self,
         paths: Vec<PathBuf>,
@@ -38,8 +45,29 @@ impl VeldmapApp {
             return;
         }
         self.panels.layers.clear_error();
+        if let Some(proj_path) = paths.iter().find(|p| is_project_path(p)).cloned() {
+            if let Err(err) = self.dialogs.spawn_load_project_path(proj_path.clone()) {
+                let reason = match err {
+                    DialogSpawnError::Busy => "another project load is in progress",
+                    DialogSpawnError::SpawnFailed => "failed to spawn background project loader",
+                };
+                self.panels.layers.push_error(format!(
+                    "Failed to load project '{}': {reason}",
+                    proj_path.display()
+                ));
+                self.open_workbench_tab(WorkbenchTab::Layers);
+                self.restore_deferred_startup_session();
+            }
+            return;
+        }
         for path in paths {
             self.open_local_path(&path, true, crs_override.clone());
+        }
+    }
+
+    pub(super) fn restore_deferred_startup_session(&mut self) {
+        if let Some((open_layers, open_vectors, swipe)) = self.deferred_startup_session.take() {
+            self.queue_restored_session(open_layers, open_vectors, swipe, AuthTrust::LocalSession);
         }
     }
 
@@ -59,7 +87,50 @@ impl VeldmapApp {
         }
     }
 
-    pub(super) fn drain_file_dialog_events(&mut self) -> bool {
+    pub(super) fn trigger_save_project_dialog(&mut self, frame: &eframe::Frame) {
+        let project = self.build_project_file();
+        if let Err(err) = self
+            .dialogs
+            .spawn_save_project("workspace.veldmap.json", project, frame)
+        {
+            let msg = match err {
+                DialogSpawnError::Busy => "Another file dialog is already open.",
+                DialogSpawnError::SpawnFailed => {
+                    "Unable to open native save dialog on this system."
+                }
+            };
+            self.set_status_notice(msg.to_owned());
+        }
+    }
+
+    pub(super) fn trigger_open_project_dialog(&mut self, frame: &eframe::Frame) {
+        if let Err(err) = self.dialogs.spawn_open_project(frame) {
+            let msg = match err {
+                DialogSpawnError::Busy => "Another file dialog is already open.",
+                DialogSpawnError::SpawnFailed => {
+                    "Unable to open native file dialog on this system."
+                }
+            };
+            self.set_status_notice(msg.to_owned());
+        }
+    }
+
+    pub(super) fn trigger_export_png_save_dialog(&mut self, frame: &eframe::Frame) {
+        if let Err(err) = self
+            .dialogs
+            .spawn_pick_png_export_path("veldmap_export.png", frame)
+        {
+            let msg = match err {
+                DialogSpawnError::Busy => "Another file dialog is already open.",
+                DialogSpawnError::SpawnFailed => {
+                    "Unable to open native save dialog on this system."
+                }
+            };
+            self.set_status_notice(msg.to_owned());
+        }
+    }
+
+    pub(super) fn drain_file_dialog_events(&mut self, ctx: &egui::Context) -> bool {
         let events = self.dialogs.poll();
         if events.is_empty() {
             return false;
@@ -81,6 +152,60 @@ impl VeldmapApp {
                             .set_notice(format!("Export failed: {err}"));
                     }
                 },
+                FileDialogEvent::ProjectSaved { path, result } => match result {
+                    Ok(()) => {
+                        let _ = self.storage.mutate_session(|s| s.record_recent_file(&path));
+                        self.set_status_notice(format!(
+                            "Saved project {}",
+                            crate::display_name_from_path(&path)
+                        ));
+                    }
+                    Err(err) => {
+                        self.panels.layers.push_error(err);
+                        self.open_workbench_tab(WorkbenchTab::Layers);
+                    }
+                },
+                FileDialogEvent::ProjectLoaded { seq, path, result } => {
+                    if seq != self.dialogs.latest_project_load_seq() {
+                        continue;
+                    }
+                    match result {
+                        Ok(project) => {
+                            self.deferred_startup_session = None;
+                            self.apply_loaded_project(project, &path);
+                        }
+                        Err(err) => {
+                            self.panels.layers.push_error(err);
+                            self.open_workbench_tab(WorkbenchTab::Layers);
+                            self.restore_deferred_startup_session();
+                        }
+                    }
+                }
+                FileDialogEvent::PngExportPathPicked(path) => {
+                    let opts = self.png_export.options().clone();
+                    let ppp = ctx.pixels_per_point();
+                    let height_pt = self.viewport.viewport_rect().map_or(
+                        self.viewport.viewport_height_px() / f64::from(ppp.max(0.5)),
+                        |r| f64::from(r.height()).max(1.0),
+                    );
+                    let m_per_pt = self.camera.metres_per_pixel(height_pt);
+                    let colorbar = self.scene.overlays().topmost_colorbar_info();
+                    let caption = opts
+                        .include_caption
+                        .then(|| opts.caption_text.trim().to_owned())
+                        .filter(|s| !s.is_empty());
+                    let spec = CartographicOverlaySpec {
+                        pixels_per_point: ppp,
+                        m_per_pt,
+                        heading_deg: self.camera.heading_deg(),
+                        include_scale_bar: opts.include_scale_bar,
+                        include_north_arrow: opts.include_north_arrow,
+                        include_colorbar: opts.include_colorbar,
+                        colorbar,
+                        caption,
+                    };
+                    self.png_export.begin_capture(path, spec);
+                }
             }
         }
         true
@@ -183,6 +308,7 @@ impl VeldmapApp {
                             if let Some(b) = bounds {
                                 self.focus_footprint(b);
                             }
+                            session_dirty = true;
                         }
                         Err(err) => {
                             self.panels.layers.push_error(err);
@@ -298,6 +424,10 @@ impl VeldmapApp {
                 }
                 StacUiAction::StreamCog(spec) => {
                     let raw_url = spec.url.into_inner();
+                    let persisted_auth = self
+                        .scene
+                        .stac()
+                        .effective_persisted_auth_mode(spec.auth_mode);
                     let (final_url, headers) = self.scene.stac().resolve_cog_auth(
                         &raw_url,
                         spec.auth_mode,
@@ -306,10 +436,17 @@ impl VeldmapApp {
                     if let Err(err) = self.scene.begin_open_remote_cog(RemoteCogRequest {
                         url: final_url,
                         title: spec.title,
+                        auth_mode: persisted_auth,
                         extra_headers: headers,
                         external_bands: spec.external_bands,
                         is_scl: spec.is_scl,
+                        stac_item_href: spec.stac_item_href,
+                        asset_key: spec.asset_key,
+                        visible: true,
+                        opacity: 1.0,
+                        style: None,
                         fly_to: true,
+                        restore_id: None,
                     }) {
                         self.scene.mutate_stac(|s| s.set_error(err));
                     } else {
@@ -325,21 +462,25 @@ impl VeldmapApp {
                     scl,
                 } => {
                     let stac_settings = &self.storage.settings().stac;
+                    let persisted_auth = self.scene.stac().effective_persisted_auth_mode(auth_mode);
                     let resolve_asset = |asset: crate::stac::StacRecipeAssetView| {
                         let raw_url = asset.href.into_inner();
                         let (final_url, extra_headers) =
                             self.scene
                                 .stac()
                                 .resolve_cog_auth(&raw_url, auth_mode, stac_settings);
-                        RemoteBandAssetSpec {
+                        BandMathAssetOpenSpec::Remote {
                             label: asset.label,
                             url: final_url,
+                            auth_mode: persisted_auth,
                             extra_headers,
                             external_bands: asset.external_bands,
+                            stac_item_href: asset.stac_item_href,
+                            asset_key: asset.asset_key,
                             band_index: 0,
                         }
                     };
-                    let resolved_bands: Vec<RemoteBandAssetSpec> =
+                    let resolved_bands: Vec<BandMathAssetOpenSpec> =
                         bands.into_iter().map(resolve_asset).collect();
                     let resolved_scl = scl.map(resolve_asset);
                     if let Err(err) =
@@ -349,7 +490,11 @@ impl VeldmapApp {
                                 preset,
                                 bands: resolved_bands,
                                 scl: resolved_scl,
+                                visible: true,
+                                opacity: 1.0,
+                                style: None,
                                 fly_to: true,
+                                restore_id: None,
                             })
                     {
                         self.scene.mutate_stac(|s| s.set_error(err));
@@ -471,6 +616,19 @@ impl VeldmapApp {
                     let _ = self.storage.mutate_session(|s| s.recent_files.clear());
                     needs_repaint = true;
                 }
+                ToolbarAction::SaveProjectDialog => {
+                    self.trigger_save_project_dialog(frame);
+                    needs_repaint = true;
+                }
+                ToolbarAction::OpenProjectDialog => {
+                    self.trigger_open_project_dialog(frame);
+                    needs_repaint = true;
+                }
+                ToolbarAction::OpenExportPngModal => {
+                    let caption = self.default_export_caption();
+                    self.png_export.open_modal(caption);
+                    needs_repaint = true;
+                }
                 ToolbarAction::ToggleLayersPanel => {
                     self.toggle_workbench_tab(WorkbenchTab::Layers);
                     needs_repaint = true;
@@ -486,6 +644,10 @@ impl VeldmapApp {
                 }
                 ToolbarAction::ToggleMeasureTool => {
                     self.toggle_measure_tool();
+                    needs_repaint = true;
+                }
+                ToolbarAction::ToggleSwipeTool => {
+                    self.toggle_swipe_tool();
                     needs_repaint = true;
                 }
                 ToolbarAction::SaveBookmark(raw_name) => {
@@ -572,6 +734,17 @@ impl VeldmapApp {
                         }
                     };
                     self.panels.measure.set_notice(msg.to_owned());
+                }
+                true
+            }
+            MeasureAction::UseAsStacAoi => {
+                if let Some(poly) = self.scene.measure().polygon_geometry() {
+                    self.set_viewport_tool(ViewportToolMode::Navigate, None);
+                    self.panels.stac.clear_copy_notice();
+                    self.scene
+                        .mutate_stac(|s| s.set_aoi_geometry(poly, "Measured Area".to_owned()));
+                    self.open_workbench_tab(WorkbenchTab::CloudStac);
+                    self.set_status_notice("Measured polygon set as STAC AOI.".to_owned());
                 }
                 true
             }

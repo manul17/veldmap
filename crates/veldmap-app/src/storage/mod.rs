@@ -10,6 +10,7 @@
 //! local/offline storage never depends on HTTP streaming, while
 //! [`settings`] reuses `veldmap-net` config and validation helpers.
 
+pub(crate) mod project;
 pub(crate) mod session;
 pub(crate) mod settings;
 mod worker;

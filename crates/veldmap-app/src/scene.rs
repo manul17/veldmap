@@ -381,18 +381,28 @@ impl SceneState {
     }
 
     /// Update the zoom-invariant CPU cursor readout for `cursor_geo`, cancelling
-    /// any in-flight probe when the cursor leaves the globe.
+    /// any in-flight probe when the cursor leaves the globe, and skipping
+    /// `excluded_layer` when split-screen swipe clips that layer away on the
+    /// cursor's half-plane.
     pub(crate) fn update_cursor_readout(
         &self,
         cursor_geo: Option<(f64, f64)>,
+        excluded_layer: Option<LayerId>,
     ) -> Option<CursorReadout> {
         match cursor_geo {
-            Some((lat, lon)) => self.overlays.query_cursor_readout(lat, lon),
+            Some((lat, lon)) => self.overlays.query_cursor_readout(lat, lon, excluded_layer),
             None => {
                 self.overlays.cancel_cursor_readout();
                 None
             }
         }
+    }
+
+    /// Move a raster overlay to painter's-order index `target_idx` (used when
+    /// asynchronously restored layers open out of order).
+    pub(crate) fn move_overlay_to_index(&mut self, id: LayerId, target_idx: usize) -> bool {
+        let mutation = self.overlays.move_layer_to_index(id, target_idx);
+        self.apply_overlay_mutation(mutation)
     }
 
     /// Queue a non-blocking local raster or GeoJSON vector open based on path
@@ -404,7 +414,7 @@ impl SceneState {
         crs_override: Option<CrsOverride>,
     ) -> Result<(), String> {
         if is_geojson_path(path) {
-            self.begin_open_vector(path, fly_to, true, 1.0)
+            self.begin_open_vector(path, fly_to, true, 1.0, false, None)
         } else {
             self.begin_open_overlay(OpenOverlayRequest {
                 path,
@@ -413,6 +423,7 @@ impl SceneState {
                 opacity: 1.0,
                 crs_override,
                 style: None,
+                restore_id: None,
             })
         }
     }
@@ -424,15 +435,31 @@ impl SceneState {
     }
 
     /// Queue a non-blocking GeoJSON vector layer open with explicit initial
-    /// visibility and opacity.
+    /// visibility, opacity, outline-only mode, and optional restore token.
     pub(crate) fn begin_open_vector(
         &self,
         path: &Path,
         fly_to: bool,
         visible: bool,
         opacity: f32,
+        outline_only: bool,
+        restore_id: Option<u64>,
     ) -> Result<(), String> {
-        self.vectors.begin_open(path, fly_to, visible, opacity)
+        self.vectors
+            .begin_open(path, fly_to, visible, opacity, outline_only, restore_id)
+    }
+
+    /// Clear all loaded raster overlays and vector layers (used when replacing
+    /// the workspace via Load `.veldmap.json` project).
+    pub(crate) fn clear_workspace_layers(&mut self) -> bool {
+        let overlay_mutation = self.overlays.clear_all();
+        let mut changed = self.apply_overlay_mutation(overlay_mutation);
+        let vec_changed = self.vectors.clear();
+        if vec_changed {
+            self.mark_dirty();
+            changed = true;
+        }
+        changed
     }
 
     /// Apply an infallible [`VectorEdit`] to `id` and mark the scene dirty

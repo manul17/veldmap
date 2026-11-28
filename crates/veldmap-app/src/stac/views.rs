@@ -67,6 +67,8 @@ fn s2_reflectance_band(label: &str, url: &str) -> StacRecipeAssetView {
             Some(0.0),
             Some("reflectance"),
         ),
+        stac_item_href: None,
+        asset_key: None,
     }
 }
 
@@ -122,6 +124,8 @@ pub(super) fn builtin_sample_recipe_views() -> &'static [SampleRecipeView] {
             label: "SCL".to_owned(),
             href: RedactedUrl::new(S2_ALPS_SCL_URL),
             external_bands: Vec::new(),
+            stac_item_href: None,
+            asset_key: None,
         };
         vec![
             SampleRecipeView {
@@ -161,11 +165,17 @@ fn build_asset_view(asset: &StacAsset) -> StacCogAssetView {
     }
 }
 
-fn recipe_asset_from_stac(label: &str, asset: &StacAsset) -> StacRecipeAssetView {
+fn recipe_asset_from_stac(
+    label: &str,
+    asset: &StacAsset,
+    item_href: Option<&str>,
+) -> StacRecipeAssetView {
     StacRecipeAssetView {
         label: label.to_owned(),
         href: RedactedUrl::new(asset.href.clone()),
         external_bands: external_bands_from_asset(asset),
+        stac_item_href: item_href.map(str::to_owned),
+        asset_key: Some(asset.key.clone()),
     }
 }
 
@@ -176,6 +186,7 @@ fn push_recipe(
     tooltip: String,
     bands: &[(&str, &StacAsset)],
     scl: Option<StacRecipeAssetView>,
+    item_href: Option<&str>,
 ) {
     let scl_tag = if scl.is_some() { " + SCL" } else { "" };
     out.push(StacRecipeView {
@@ -185,7 +196,11 @@ fn push_recipe(
         bands: bands
             .iter()
             .map(|(role, asset)| {
-                recipe_asset_from_stac(&format_recipe_band_label(&asset.key, role), asset)
+                recipe_asset_from_stac(
+                    &format_recipe_band_label(&asset.key, role),
+                    asset,
+                    item_href,
+                )
             })
             .collect(),
         scl,
@@ -193,12 +208,15 @@ fn push_recipe(
 }
 
 fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
+    let item_href = item.self_href.as_deref();
     let red = item.find_band_asset(&["red", "B04", "b04"]);
     let green = item.find_band_asset(&["green", "B03", "b03"]);
     let blue = item.find_band_asset(&["blue", "B02", "b02"]);
     let nir = item.find_band_asset(&["nir", "B08", "b08", "nir08", "B8A", "b8a"]);
     let swir = item.find_band_asset(&["swir22", "B12", "b12", "swir16", "B11", "b11"]);
-    let scl = item.scl_asset().map(|a| recipe_asset_from_stac("SCL", a));
+    let scl = item
+        .scl_asset()
+        .map(|a| recipe_asset_from_stac("SCL", a, item_href));
 
     let mut recipes = Vec::new();
     if let (Some(r), Some(g), Some(b)) = (red, green, blue) {
@@ -212,6 +230,7 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
             ),
             &[("Red", r), ("Green", g), ("Blue", b)],
             scl.clone(),
+            item_href,
         );
     }
     if let (Some(n), Some(r)) = (nir, red) {
@@ -225,6 +244,7 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
             ),
             &[("NIR", n), ("Red", r)],
             scl.clone(),
+            item_href,
         );
     }
     if let (Some(g), Some(n)) = (green, nir) {
@@ -238,6 +258,7 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
             ),
             &[("Green", g), ("NIR", n)],
             scl.clone(),
+            item_href,
         );
     }
     if let (Some(n), Some(r), Some(g)) = (nir, red, green) {
@@ -251,6 +272,7 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
             ),
             &[("NIR", n), ("Red", r), ("Green", g)],
             scl.clone(),
+            item_href,
         );
     }
     if let (Some(s), Some(n), Some(r)) = (swir, nir, red) {
@@ -264,6 +286,7 @@ fn build_item_recipes(item: &StacItem) -> Vec<StacRecipeView> {
             ),
             &[("SWIR", s), ("NIR", n), ("Red", r)],
             scl,
+            item_href,
         );
     }
     recipes
@@ -308,6 +331,7 @@ pub(super) fn build_item_view(item: &StacItem) -> StacItemView {
         .is_some_and(is_surface_reflectance_level);
     StacItemView {
         id: item.id.clone(),
+        self_href: item.self_href.clone(),
         meta_line,
         platform: item.platform.clone(),
         processing_level: item.processing_level.clone(),
@@ -356,6 +380,7 @@ mod tests {
         let item = StacItem {
             id: "S2B_32TMS_20240801_0_L2A".to_owned(),
             collection: Some("sentinel-2-l2a".to_owned()),
+            self_href: Some("https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items/S2B_32TMS_20240801_0_L2A".to_owned()),
             datetime: Some("2024-08-01T10:15:00Z".to_owned()),
             cloud_cover: Some(2.5),
             platform: Some("sentinel-2b".to_owned()),

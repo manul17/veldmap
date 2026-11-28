@@ -15,6 +15,67 @@ pub(crate) fn format_lat_lon(lat_deg: f64, lon_deg: f64) -> String {
     )
 }
 
+/// Format a latitude/longitude pair as signed decimal degrees (`lat, lon`)
+/// suitable for clipboard pasting into GIS tools and Go-To search boxes.
+pub(crate) fn format_signed_dd(lat_deg: f64, lon_deg: f64) -> String {
+    format!("{lat_deg:.6}, {lon_deg:.6}")
+}
+
+fn split_dms(abs_deg: f64) -> (u32, u32, u32, u32) {
+    if !abs_deg.is_finite() {
+        return (0, 0, 0, 0);
+    }
+    let total_cs = (abs_deg.clamp(0.0, 360.0) * 360_000.0).round() as u64;
+    let deg = (total_cs / 360_000) as u32;
+    let rem_deg = total_cs % 360_000;
+    let min = (rem_deg / 6_000) as u32;
+    let rem_min = rem_deg % 6_000;
+    let sec = (rem_min / 100) as u32;
+    let cs = (rem_min % 100) as u32;
+    (deg, min, sec, cs)
+}
+
+/// Format a latitude/longitude pair in Degrees Minutes Seconds (`DD°MM'SS.SS" N`).
+pub(crate) fn format_dms(lat_deg: f64, lon_deg: f64) -> String {
+    if !lat_deg.is_finite() || !lon_deg.is_finite() {
+        return "—".to_owned();
+    }
+    let lat_hem = if lat_deg >= 0.0 { 'N' } else { 'S' };
+    let lon_hem = if lon_deg >= 0.0 { 'E' } else { 'W' };
+    let (ld, lm, ls, lcs) = split_dms(lat_deg.abs());
+    let (od, om, os, ocs) = split_dms(lon_deg.abs());
+    format!("{ld}°{lm:02}'{ls:02}.{lcs:02}\" {lat_hem}, {od}°{om:02}'{os:02}.{ocs:02}\" {lon_hem}")
+}
+
+fn polar_mgrs_fallback(lat_deg: f64, lon_deg: f64) -> Option<&'static str> {
+    if !lat_deg.is_finite() || !lon_deg.is_finite() || !(-90.0..=90.0).contains(&lat_deg) {
+        return None;
+    }
+    Some(if lat_deg >= 0.0 { "UPS N" } else { "UPS S" })
+}
+
+/// Format a WGS84 coordinate as compact MGRS (10 m precision / 4 digits per
+/// axis, or `"UPS N"` / `"UPS S"` in polar zones) for the single-line GIS
+/// status bar.
+pub(crate) fn format_mgrs_compact(lat_deg: f64, lon_deg: f64) -> String {
+    veldmap_core::geo::format_wgs84_to_mgrs(lat_deg, lon_deg, 4).unwrap_or_else(|| {
+        polar_mgrs_fallback(lat_deg, lon_deg)
+            .unwrap_or("—")
+            .to_owned()
+    })
+}
+
+/// Format a WGS84 coordinate as 1 m precision MGRS (5 digits per axis) for
+/// clipboard copy, with clean polar fallback including DD coordinates.
+pub(crate) fn format_mgrs_copy(lat_deg: f64, lon_deg: f64) -> String {
+    veldmap_core::geo::format_wgs84_to_mgrs(lat_deg, lon_deg, 5).unwrap_or_else(|| {
+        match polar_mgrs_fallback(lat_deg, lon_deg) {
+            Some(zone) => format!("{zone} ({})", format_lat_lon(lat_deg, lon_deg)),
+            None => "—".to_owned(),
+        }
+    })
+}
+
 /// Format an altitude or ground distance in metres/kilometres.
 pub(crate) fn format_distance_m(metres: f64) -> String {
     if metres >= 100_000.0 {
@@ -261,5 +322,22 @@ mod tests {
         assert_eq!(format_scalar(250.4), "250.4");
         assert_eq!(format_scalar(25_000.0), "2.50e4");
         assert_eq!(format_scalar(f64::NAN), "—");
+        assert_eq!(format_signed_dd(47.2357, 39.7015), "47.235700, 39.701500");
+        assert_eq!(
+            format_dms(47.5, -122.25),
+            "47°30'00.00\" N, 122°15'00.00\" W"
+        );
+        // 59.9999 seconds rollover must carry cleanly into the next degree/minute, never `60.00"`.
+        assert_eq!(
+            format_dms(47.999_999_9, -0.000_000_1),
+            "48°00'00.00\" N, 0°00'00.00\" W"
+        );
+        assert_eq!(format_dms(f64::NAN, 0.0), "—");
+        assert_eq!(format_mgrs_compact(0.0, 0.0), "31N AA 6602 0000");
+        assert_eq!(format_mgrs_compact(85.0, 10.0), "UPS N");
+        assert_eq!(format_mgrs_compact(95.0, 10.0), "—");
+        assert_eq!(format_mgrs_compact(f64::NAN, 0.0), "—");
+        assert!(format_mgrs_copy(-85.0, 10.0).starts_with("UPS S ("));
+        assert_eq!(format_mgrs_copy(f64::NAN, 0.0), "—");
     }
 }

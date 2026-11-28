@@ -160,6 +160,15 @@ fn write_atomic_impl(path: &Path, bytes: &[u8], private: bool) -> Result<(), Sto
     Ok(())
 }
 
+/// Serialize `value` as pretty JSON and persist it via atomic durable write
+/// with standard user permissions (suitable for sanitized user-exported project
+/// files such as `.veldmap.json`).
+pub fn write_json_durable<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    write_atomic_durable(path, &bytes)
+}
+
 /// Serialize `value` as pretty JSON and persist it via private atomic durable
 /// write (`0600` permissions on Unix).
 pub fn write_json_durable_private<T: Serialize>(
@@ -169,6 +178,16 @@ pub fn write_json_durable_private<T: Serialize>(
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     write_atomic_durable_private(path, &bytes)
+}
+
+/// Read and deserialize a bounded regular UTF-8 JSON file without renaming it
+/// on parse failure (suitable for explicitly opened user project files).
+pub fn read_json_limited<T: DeserializeOwned>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<T, StorageError> {
+    let text = crate::read_regular_file_utf8_limited(path, max_bytes)?;
+    Ok(serde_json::from_str(&text)?)
 }
 
 /// Read JSON from `path`, returning `T::default()` if the file does not exist.
@@ -315,6 +334,45 @@ mod tests {
         assert_eq!(
             fs::read(&backup).expect("backup preserved"),
             b"{not valid json"
+        );
+    }
+
+    #[test]
+    fn write_json_durable_and_read_json_limited_enforce_limits_without_renaming_corrupt_files() {
+        #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct Project {
+            name: String,
+        }
+
+        let dir = TestTempDir::new("json-limited");
+        let path = dir.path().join("study.veldmap.json");
+
+        assert!(matches!(
+            read_json_limited::<Project>(&path, 1024),
+            Err(StorageError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound
+        ));
+
+        let payload = Project {
+            name: "alpha".to_owned(),
+        };
+        write_json_durable(&path, &payload).expect("write durable json");
+        let loaded: Project = read_json_limited(&path, 1024).expect("read limited json");
+        assert_eq!(loaded, payload);
+
+        assert!(matches!(
+            read_json_limited::<Project>(&path, 4),
+            Err(StorageError::FileTooLarge { .. })
+        ));
+
+        fs::write(&path, b"{broken").expect("write invalid json");
+        assert!(matches!(
+            read_json_limited::<Project>(&path, 1024),
+            Err(StorageError::Json(_))
+        ));
+        assert!(path.exists(), "invalid project file must remain in place");
+        assert!(
+            !append_path_suffix(&path, ".corrupt").exists(),
+            "read_json_limited must not create a .corrupt backup"
         );
     }
 }
