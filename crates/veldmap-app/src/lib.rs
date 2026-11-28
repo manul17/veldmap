@@ -6,10 +6,14 @@
 //! ## Internal Modules
 //! - `app` — Top-level `eframe::App` shell, input/tool state, native `rfd`
 //!   dialogs, `egui_wgpu::CallbackResources` bridge, and session restoration.
+//! - `band_math` — Dependency-free Band Math formula contract and shared RGB
+//!   gamma bounds.
 //! - `basemap` — Bundled NASA Blue Marble & live HTTP basemap policy/streaming.
 //! - `colormap` — Linear-light scientific colormaps & categorical palettes.
 //! - `export` — Pure-Rust CPU cartographic PNG overlay compositor (metric scale
 //!   bar, rotated North arrow, scientific colorbar, and caption pill).
+//! - `format` — Pure-Rust GIS display formatters (coordinates, MGRS, metric
+//!   distances, GSD, areas, and 1–2–5 scale bar geometry).
 //! - `gpu_tiles` — Bounded `GpuTileCache` and enqueue-bounded `PendingUploads`.
 //! - `layers` — `OverlayManager`, `LayerStack`, multi-asset `BandMath`,
 //!   background I/O/decode/tile-write orchestration, and CPU cursor probing.
@@ -32,9 +36,11 @@
 use std::path::Path;
 
 mod app;
+mod band_math;
 mod basemap;
 mod colormap;
 mod export;
+mod format;
 #[cfg(not(any(test, feature = "test-support")))]
 mod gpu_tiles;
 #[cfg(any(test, feature = "test-support"))]

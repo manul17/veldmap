@@ -101,16 +101,20 @@ impl StacAuth {
         }
     }
 
+    fn trimmed_sas_token(&self) -> Option<&str> {
+        let Self::SasQuery(sas) = self else {
+            return None;
+        };
+        let token = sas.trim().trim_start_matches('?').trim_start_matches('&');
+        (!token.is_empty()).then_some(token)
+    }
+
     /// Append a configured SAS query string to `url` when using [`Self::SasQuery`],
     /// preserving any existing `?query` and `#fragment`.
     pub fn apply_to_url(&self, url: &str) -> String {
-        let Self::SasQuery(sas) = self else {
+        let Some(token) = self.trimmed_sas_token() else {
             return url.to_owned();
         };
-        let token = sas.trim().trim_start_matches('?').trim_start_matches('&');
-        if token.is_empty() {
-            return url.to_owned();
-        }
         let (base, query, frag) = split_url_query_fragment(url);
         let mut out = match query {
             Some(q) if !q.is_empty() => format!("{base}?{q}&{token}"),
@@ -123,12 +127,19 @@ impl StacAuth {
         out
     }
 
-    pub(super) fn encoded_secret(&self) -> Option<EncodedSecret> {
-        let raw = match self {
-            Self::None => return None,
-            Self::Bearer(v) | Self::ApiKey { value: v, .. } | Self::SasQuery(v) => v.trim(),
-        };
-        (!raw.is_empty()).then(|| EncodedSecret::new(raw.to_owned()))
+    /// Return an explicit error-redaction secret for auth modes that may not be
+    /// covered by generic header heuristics (`SasQuery`, which is appended to
+    /// the URL rather than headers, and `ApiKey`, which may use a short value
+    /// on a non-standard header name). `Bearer` is always covered by
+    /// `parse_custom_headers` via the `Authorization` header.
+    pub(crate) fn redaction_secret(&self) -> Option<EncodedSecret> {
+        match self {
+            Self::SasQuery(_) => self
+                .trimmed_sas_token()
+                .map(|token| EncodedSecret::new(token.to_owned())),
+            Self::ApiKey { value, .. } => crate::redact::extract_explicit_header_secret(value),
+            Self::None | Self::Bearer(_) => None,
+        }
     }
 }
 

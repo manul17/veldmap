@@ -213,7 +213,7 @@ fn uniform_buffer_layout(
     })
 }
 
-fn texture_2d_layout_entry(
+pub(super) fn texture_2d_layout_entry(
     binding: u32,
     sample_type: wgpu::TextureSampleType,
 ) -> wgpu::BindGroupLayoutEntry {
@@ -559,11 +559,10 @@ fn create_scratch_warp_pipeline(
     )
 }
 
-fn create_band_math_pipelines(
+fn create_nan_clear_pipelines(
     device: &wgpu::Device,
-    layouts: &SharedLayouts,
-    tile_bind_groups: &TileBindGroupCache,
-) -> BandMathPipelines {
+    r32f_target: &Option<wgpu::ColorTargetState>,
+) -> (wgpu::BindGroupLayout, [wgpu::RenderPipeline; 4]) {
     let clear_shader = wgsl_module(device, "scratch quiet-NaN fill wgsl", SCRATCH_NAN_FILL_WGSL);
     let clear_layout = uniform_buffer_layout(
         device,
@@ -577,11 +576,6 @@ fn create_band_math_pipelines(
         "scratch quiet-NaN clear pipeline layout",
         &[Some(&clear_layout)],
     );
-    let r32f_target = Some(wgpu::ColorTargetState {
-        format: wgpu::TextureFormat::R32Float,
-        blend: None,
-        write_mask: wgpu::ColorWrites::ALL,
-    });
     let clear_specs = [
         ("scratch quiet-NaN clear pipeline (1x)", "fs_clear_1"),
         ("scratch quiet-NaN clear pipeline (2x)", "fs_clear_2"),
@@ -601,7 +595,15 @@ fn create_band_math_pipelines(
             &targets,
         )
     });
+    (clear_layout, clear)
+}
 
+fn create_scratch_band_pipelines(
+    device: &wgpu::Device,
+    layouts: &SharedLayouts,
+    tile_bind_groups: &TileBindGroupCache,
+    r32f_target: &Option<wgpu::ColorTargetState>,
+) -> (wgpu::RenderPipeline, [wgpu::RenderPipeline; 3]) {
     let scratch_single_shader = wgsl_module(
         device,
         "band-math single scratch wgsl",
@@ -622,7 +624,7 @@ fn create_band_math_pipelines(
         &scratch_single_layout,
         &scratch_single_shader,
         "fs_band_single",
-        std::slice::from_ref(&r32f_target),
+        std::slice::from_ref(r32f_target),
     );
 
     let scratch_mrt_shader = wgsl_module(
@@ -666,7 +668,14 @@ fn create_band_math_pipelines(
             &targets,
         )
     });
+    (band_single, band_mrt)
+}
 
+fn create_mask_pipeline(
+    device: &wgpu::Device,
+    layouts: &SharedLayouts,
+    tile_bind_groups: &TileBindGroupCache,
+) -> wgpu::RenderPipeline {
     let mask_shader = wgsl_module(
         device,
         "band-math R8Uint SCL mask scratch wgsl",
@@ -681,7 +690,7 @@ fn create_band_math_pipelines(
             Some(tile_bind_groups.uint_layout()),
         ],
     );
-    let mask_u8 = create_scratch_warp_pipeline(
+    create_scratch_warp_pipeline(
         device,
         "band-math R8Uint SCL mask scratch pipeline",
         &mask_layout,
@@ -692,8 +701,13 @@ fn create_band_math_pipelines(
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })],
-    );
+    )
+}
 
+fn create_band_math_composite_pipeline(
+    device: &wgpu::Device,
+    layouts: &SharedLayouts,
+) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
     let composite_entries: [wgpu::BindGroupLayoutEntry; 5] = std::array::from_fn(|binding| {
         let sample_type = if binding < 4 {
             wgpu::TextureSampleType::Float { filterable: false }
@@ -730,6 +744,25 @@ fn create_band_math_pipelines(
         "fs_composite",
         &[srgb_target(wgpu::BlendState::ALPHA_BLENDING)],
     );
+    (composite_scratch_layout, composite)
+}
+
+fn create_band_math_pipelines(
+    device: &wgpu::Device,
+    layouts: &SharedLayouts,
+    tile_bind_groups: &TileBindGroupCache,
+) -> BandMathPipelines {
+    let r32f_target = Some(wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::R32Float,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    });
+    let (clear_layout, clear) = create_nan_clear_pipelines(device, &r32f_target);
+    let (band_single, band_mrt) =
+        create_scratch_band_pipelines(device, layouts, tile_bind_groups, &r32f_target);
+    let mask_u8 = create_mask_pipeline(device, layouts, tile_bind_groups);
+    let (composite_scratch_layout, composite) =
+        create_band_math_composite_pipeline(device, layouts);
 
     BandMathPipelines {
         clear_layout,

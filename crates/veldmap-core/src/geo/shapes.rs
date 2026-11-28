@@ -43,7 +43,7 @@ impl Polygon {
     }
 
     /// Construct a polygon with explicit interior holes.
-    pub fn with_holes(exterior: Ring, holes: Vec<Ring>) -> Self {
+    pub(in crate::geo) fn with_holes(exterior: Ring, holes: Vec<Ring>) -> Self {
         Self { exterior, holes }
     }
 }

@@ -365,18 +365,20 @@ fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
     use veldmap_core::tile::{BandKey, PixelFormat};
     use veldmap_raster::{BandStats, DISPLAY_STREAM_SPEC, stream_spec_for_band};
 
-    let sample_stats = |lo: f64, hi: f64| BandStats {
-        min: lo,
-        max: hi,
-        p2: lo + 1.0,
-        p98: hi - 1.0,
-        db_min: Some(-20.0),
-        db_max: Some(0.0),
-        db_p2: Some(-18.0),
-        db_p98: Some(-2.0),
-        sample_count: 100,
-        histogram: [0; 64],
-        db_histogram: [0; 64],
+    let sample_stats = |lo: f64, hi: f64| {
+        Arc::new(BandStats {
+            min: lo,
+            max: hi,
+            p2: lo + 1.0,
+            p98: hi - 1.0,
+            db_min: Some(-20.0),
+            db_max: Some(0.0),
+            db_p2: Some(-18.0),
+            db_p98: Some(-2.0),
+            sample_count: 100,
+            histogram: [0; 64],
+            db_histogram: [0; 64],
+        })
     };
 
     // Restoring `SourceColorMap` on a source without a TIFF ColorMap falls back cleanly.

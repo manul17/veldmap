@@ -41,12 +41,12 @@ impl Ellipsoid {
     }
 
     /// Square of the first eccentricity, `e^2 = 2f - f^2`.
-    pub const fn eccentricity_sq(&self) -> f64 {
+    pub(in crate::geo) const fn eccentricity_sq(&self) -> f64 {
         self.flattening * (2.0 - self.flattening)
     }
 
     /// Third flattening, `n = f / (2 - f)`.
-    pub const fn third_flattening(&self) -> f64 {
+    pub(in crate::geo) const fn third_flattening(&self) -> f64 {
         self.flattening / (2.0 - self.flattening)
     }
 
@@ -302,7 +302,7 @@ pub(in crate::geo) fn spherical_centroid(
 
 /// Shift `lon_deg` by an integer multiple of 360 degrees so it lies within
 /// `[-180, +180]` of `base`.
-pub(crate) fn unwind(base: f64, lon_deg: f64) -> f64 {
+pub(in crate::geo) fn unwind(base: f64, lon_deg: f64) -> f64 {
     let apart = lon_deg - base;
     let turns = if apart > 180.0 {
         ((apart - 180.0) / TURN_DEG).ceil()

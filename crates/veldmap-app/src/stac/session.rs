@@ -10,11 +10,12 @@ use veldmap_net::{
     NetContext, StacCatalogConfig, StacClient, StacItem, StacSearchQuery, StacSearchResult,
 };
 
+use crate::layers::StacCogAuthMode;
 use crate::render::{DrawVectorId, DrawVectorLayer};
 use crate::storage::settings::StacSettings;
 
 use super::aoi::{AoiState, build_vector_layer};
-use super::auth::{StacCogAuthMode, resolve_cog_auth};
+use super::auth::{effective_persisted_auth_mode, resolve_cog_auth};
 use super::views::{
     build_item_view, builtin_sample_recipe_views, builtin_sample_scene_views, item_geometry,
 };
@@ -199,7 +200,7 @@ impl StacSession {
     /// Normalize `mode` against this session's active search-result auth flag
     /// for safe persistence in `session.json` / `.veldmap.json`.
     pub(crate) fn effective_persisted_auth_mode(&self, mode: StacCogAuthMode) -> StacCogAuthMode {
-        super::effective_persisted_auth_mode(mode, self.result_uses_custom_auth)
+        effective_persisted_auth_mode(mode, self.result_uses_custom_auth)
     }
 
     #[cfg(test)]

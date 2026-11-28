@@ -172,7 +172,7 @@ impl Datum {
 
     /// Convert 2D WGS84 `(lat_deg, lon_deg)` into this datum (discarding
     /// phantom Helmert `Delta h` on 2D output).
-    pub fn from_wgs84(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
+    pub(in crate::geo) fn shift_from_wgs84(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         if self.is_wgs84() {
             return (lat_deg, lon_deg);
         }

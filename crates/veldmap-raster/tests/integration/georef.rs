@@ -19,8 +19,9 @@ use veldmap_core::io::testing::MemoryByteSource;
 use veldmap_core::sync::CancelToken;
 use veldmap_core::tile::{MIN_WARP_SEGMENTS, SourceFingerprint, build_warp_patch};
 use veldmap_raster::{
-    DISPLAY_STREAM_SPEC, DecodeContext, PlacementCrs, RasterError, RasterSource, SharedChunkCache,
-    SidecarGeoref, TiffSource, frame_from_description, has_tiff_magic,
+    DISPLAY_STREAM_SPEC, DecodeContext, OpenRasterOptions, PlacementCrs, RasterError, RasterSource,
+    SharedChunkCache, SidecarGeoref, TiffSource, frame_from_description, has_tiff_magic,
+    open_raster_with_options,
 };
 
 use crate::common::{
@@ -383,7 +384,11 @@ fn user_defined_geotiff_handles_false_origin_lcc_1sp_2sp_and_2048_32767_datum_fa
     assert!((lat_l1 - 46.8).abs() < 1e-3 && (lon_l1 - 2.337_229).abs() < 1e-3);
 
     // 4) TIFF with embedded tiepoint+pixelscale (no GeoKeys) + `.prj`-only sidecar.
-    let tiff_prj_only = TiffSource::open_with_sidecar(
+    let prj_sidecar = SidecarGeoref {
+        affine: None,
+        crs: Some(CrsSpec::from_epsg(32637).expect("UTM 37N")),
+    };
+    let tiff_prj_only = open_raster_with_options(
         Arc::new(MemoryByteSource::new(
             build_rgb_4x4_tiff(
                 &[
@@ -395,15 +400,16 @@ fn user_defined_geotiff_handles_false_origin_lcc_1sp_2sp_and_2048_32767_datum_fa
             .into(),
         )),
         SourceFingerprint::from_digest([23; 32]),
-        Some(SidecarGeoref {
-            affine: None,
-            crs: Some(CrsSpec::from_epsg(32637).expect("UTM 37N")),
-        }),
+        OpenRasterOptions {
+            sidecars: Some(&prj_sidecar),
+            external_bands: &[],
+        },
         &budget,
         &cancel,
     )
     .expect("TIFF with embedded affine + .prj-only sidecar opens");
-    let frame_prj = frame_from_description(tiff_prj_only.description()).expect("binds via .prj");
+    let frame_prj =
+        frame_from_description(tiff_prj_only.source.description()).expect("binds via .prj");
     let (lat_p, lon_p) = frame_prj.geodetic(0.0, 0.0);
     assert!((lat_p - 47.22).abs() < 0.05 && (lon_p - 39.0).abs() < 0.05);
 }

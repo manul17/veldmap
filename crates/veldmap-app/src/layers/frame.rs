@@ -7,20 +7,48 @@ use std::sync::Arc;
 
 use veldmap_core::geo::CullFrustum;
 use veldmap_core::tile::{
-    CarrierLayout, TileKey, cell_image_rect, cell_uv_rect, grid_dim, level_segments, level_size,
+    CarrierLayout, PixelFormat, TileKey, cell_image_rect, cell_uv_rect, grid_dim, level_segments,
+    level_size,
 };
 
 use crate::gpu_tiles::{GpuTileCache, PendingUploads};
 use crate::render::{
-    DrawBandMathLayer, DrawOverlayContent, DrawOverlayLayer, DrawOverlayPatch, DrawScratchBand,
-    DrawScratchMask, OverlayMeshKey,
+    DrawBandMathLayer, DrawOverlayContent, DrawOverlayLayer, DrawOverlayPatch, DrawOverlayTrack,
+    DrawScratchBand, DrawScratchMask, OverlayMeshKey,
 };
 
 use super::asset::RasterAsset;
+use super::band_math::scl_gpu_nodata_value;
 use super::jobs::schedule_asset_rungs;
 use super::layer::{LayerKind, OverlayLayer};
 use super::runtime::OverlayRuntime;
 use super::style::LayerStyle;
+
+fn build_draw_track(asset: &RasterAsset, style: &LayerStyle) -> DrawOverlayTrack {
+    let spec = asset.meta().spec;
+    match spec.format {
+        PixelFormat::Rgba8UnormSrgb => DrawOverlayTrack::Display,
+        PixelFormat::R32Float => {
+            let (scale, offset) = asset.band_scale_offset();
+            let sci = style.scientific();
+            DrawOverlayTrack::Scientific {
+                scale: scale as f32,
+                offset: offset as f32,
+                stretch_min: sci.min as f32,
+                stretch_max: sci.max as f32,
+                log10_db: sci.preset.is_log10_db(),
+                colormap: sci.colormap,
+                invert_colormap: sci.invert_colormap,
+            }
+        }
+        PixelFormat::R8Uint | PixelFormat::R16Uint => DrawOverlayTrack::Categorical {
+            source: asset.source_id(),
+            palette: style.categorical_palette(),
+            custom_color_map: style.custom_color_map().cloned(),
+            nodata_value: asset.categorical_nodata_value(),
+        },
+    }
+}
 
 /// Shared read-only inputs for Phase 1 (`prepare_layer_wanted`), before the
 /// frame-wide unioned `reconcile_pointwise_streams` pass runs.
@@ -212,7 +240,7 @@ pub(super) fn finish_scheduled_layer(
     match (layer.kind(), plan) {
         (LayerKind::SingleRaster { asset, style }, PreparedLayerPlan::Single(asset_plan)) => {
             let scheduled = finish_single_asset(asset, asset_plan, ctx);
-            let track = style.draw_track(asset.source().as_ref(), asset.meta().spec);
+            let track = build_draw_track(asset, style);
             (!scheduled.patches.is_empty()).then(|| DrawOverlayLayer {
                 layer_id: layer.id().raw(),
                 opacity,
@@ -253,16 +281,7 @@ pub(super) fn finish_scheduled_layer(
             }
 
             let draw_scl = if let (Some(scl_asset), Some(scl_plan)) = (&bm.scl, scl_plan) {
-                // Never discard maskable SCL class IDs (`0..32`, notably class
-                // `0` = ESA "No Data" declared as `GDAL_NODATA = 0` on real
-                // Sentinel-2 COGs): write them into the `R8Uint` scratch target
-                // so `scl_mask_bits` controls them while `255u` stays strictly
-                // the uncovered-footprint sentinel.
-                let nodata_value = LayerStyle::categorical_nodata_value(
-                    scl_asset.source().description(),
-                    scl_asset.meta().spec.band,
-                )
-                .filter(|&nd| nd >= super::band_math::MAX_SCL_MASK_CLASSES);
+                let nodata_value = scl_gpu_nodata_value(scl_asset);
                 let scheduled = finish_single_asset(scl_asset, scl_plan, ctx);
                 (!scheduled.patches.is_empty()).then(|| DrawScratchMask {
                     frame: Arc::clone(scl_asset.geo().frame()),

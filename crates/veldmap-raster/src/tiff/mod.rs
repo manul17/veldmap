@@ -19,6 +19,7 @@ mod open;
 mod probe;
 mod raw_decode;
 mod stretch;
+mod tag_ids;
 mod view;
 mod ycbcr;
 
@@ -39,7 +40,10 @@ use chunk_reader::{ChunkReadMode, TiffChunkReader};
 use ifd::{CachedIfd, Photometric};
 use probe::{sample_display_rgba, sample_indexed_band};
 use stretch::{BandStatsCache, StretchCache, StretchRequest, pick_sample_chunks};
-use view::{RawTiffAccess, TiffSourceView, find_ifd};
+use view::{
+    RawTiffAccess, TiffSourceView, find_ifd, needs_display_stretch, planes_for_stream,
+    resolve_band_index, stretch_planes,
+};
 
 /// BigTIFF file header signatures (`version = 43`).
 const BIG_MAGIC: [&[u8]; 2] = [b"II\x2b\x00", b"MM\x00\x2b"];
@@ -143,15 +147,10 @@ impl TiffSource {
         match (spec.band, spec.format) {
             (BandKey::Display, PixelFormat::Rgba8UnormSrgb) => Ok(()),
             (
-                BandKey::Index(b),
+                BandKey::Index(_),
                 PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint,
             ) => {
-                if b >= base.samples_per_pixel {
-                    return Err(RasterError::Decode(format!(
-                        "band {b} out of range ({} samples/pixel)",
-                        base.samples_per_pixel
-                    )));
-                }
+                resolve_band_index(base, spec.band)?;
                 match (spec.format, base.sample_type) {
                     (PixelFormat::R32Float, _)
                     | (PixelFormat::R8Uint, SampleType::U8)
@@ -251,18 +250,18 @@ impl RasterSource for TiffSource {
             budget,
         )?;
         let ifd = find_ifd(&self.ifds, plan.image())?;
-        let planes = ifd.planes_for_stream(spec)?;
+        let planes = planes_for_stream(ifd, spec)?;
         let indices = plan.unique_chunk_indices();
         self.collect_validated_spans(ifd, &planes, &indices)
     }
 
     fn plan_stretch_byte_ranges(&self) -> Result<Vec<ByteRange>, RasterError> {
-        if self.stretch.is_ready() || !self.base_ifd().needs_display_stretch() {
+        if self.stretch.is_ready() || !needs_display_stretch(self.base_ifd()) {
             return Ok(Vec::new());
         }
         let ifd = self.stats_ifd_ref();
         let picks = pick_sample_chunks(ifd.chunks_per_plane);
-        self.collect_validated_spans(ifd, ifd.stretch_planes(), &picks)
+        self.collect_validated_spans(ifd, stretch_planes(ifd), &picks)
     }
 
     fn plan_band_stats_byte_ranges(&self, band: BandKey) -> Result<Vec<ByteRange>, RasterError> {

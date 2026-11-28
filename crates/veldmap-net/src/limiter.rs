@@ -112,16 +112,30 @@ impl HostLimiters {
             if cancel.is_cancelled() {
                 return Err(PermitCancelled);
             }
-            let cooldown_notify = self.with_entry(host, |entry| Arc::clone(&entry.cooldown_notify));
-            let notified = cooldown_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
 
-            let (semaphore, cooldown_until) = self.with_entry(host, |entry| {
-                (Arc::clone(&entry.semaphore), entry.cooldown_until)
+            let now = Instant::now();
+            let (semaphore, active_cooldown) = self.with_entry(host, |entry| {
+                let cooldown = entry
+                    .cooldown_until
+                    .filter(|&u| u > now)
+                    .map(|u| (u, Arc::clone(&entry.cooldown_notify)));
+                (Arc::clone(&entry.semaphore), cooldown)
             });
 
-            if let Some(until) = cooldown_until.filter(|&u| u > Instant::now()) {
+            if let Some((_, cooldown_notify)) = active_cooldown {
+                let notified = cooldown_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                // Re-check `cooldown_until` after registering on `Notify` so a
+                // concurrent `clear_cooldowns_for` cannot race into a lost wakeup.
+                let rechecked_until = self.with_entry(host, |entry| {
+                    entry.cooldown_until.filter(|&u| u > Instant::now())
+                });
+                let Some(until) = rechecked_until else {
+                    continue;
+                };
+
                 let deadline = tokio::time::Instant::from_std(until);
                 tokio::select! {
                     biased;

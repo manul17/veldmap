@@ -54,7 +54,7 @@ fn prepare_search_request(
         .map_err(|(name, reason)| StacError::InvalidAuthHeader { name, reason })?;
     let custom_headers = parsed.headers;
     let mut secrets = parsed.secrets;
-    if let Some(secret) = catalog.auth.encoded_secret()
+    if let Some(secret) = catalog.auth.redaction_secret()
         && !secrets.contains(&secret)
     {
         secrets.push(secret);
@@ -271,5 +271,46 @@ mod tests {
             sas.apply_to_url("https://blob.example/a.tif?x=1#band1"),
             "https://blob.example/a.tif?x=1&sv=2024&sig=abc#band1"
         );
+    }
+
+    #[test]
+    fn prepare_search_request_redacts_short_custom_api_key_and_sas_and_bearer() {
+        let query = StacSearchQuery {
+            bbox: Some([0.0, 0.0, 1.0, 1.0]),
+            intersects: None,
+            datetime: None,
+            max_cloud_cover: None,
+            limit: 10,
+        };
+
+        let api_key_cfg = StacCatalogConfig {
+            endpoint: "https://stac.example.org/v1".to_owned(),
+            collection: "sentinel-2-l2a".to_owned(),
+            auth: StacAuth::ApiKey {
+                header_name: "X-Custom-Pass".to_owned(),
+                value: "s3cr!".to_owned(),
+            },
+        };
+        let (prepared_key, _) = prepare_search_request(&api_key_cfg, &query).expect("api key");
+        assert!(prepared_key.secrets.iter().any(|s| s.raw() == "s3cr!"));
+
+        let sas_cfg = StacCatalogConfig {
+            auth: StacAuth::SasQuery("?sv=2024&sig=tok".to_owned()),
+            ..api_key_cfg.clone()
+        };
+        let (prepared_sas, _) = prepare_search_request(&sas_cfg, &query).expect("sas");
+        assert!(
+            prepared_sas
+                .secrets
+                .iter()
+                .any(|s| s.raw() == "sv=2024&sig=tok")
+        );
+
+        let bearer_cfg = StacCatalogConfig {
+            auth: StacAuth::Bearer("abc".to_owned()),
+            ..api_key_cfg
+        };
+        let (prepared_bearer, _) = prepare_search_request(&bearer_cfg, &query).expect("bearer");
+        assert!(prepared_bearer.secrets.iter().any(|s| s.raw() == "abc"));
     }
 }

@@ -165,6 +165,16 @@ impl OverlayRuntime {
         }
     }
 
+    /// Select the decode pool honoring pool isolation (`remote_pool` for
+    /// remote sources so HTTP I/O can never stall local `fast_pool` decodes).
+    pub(super) fn pool_for_source(&self, is_remote: bool) -> &DecodePoolHandle {
+        if is_remote {
+            &self.remote_pool
+        } else {
+            &self.fast_pool
+        }
+    }
+
     /// Build a [`DecodeContext`] borrowing this runtime's shared chunk cache,
     /// decode working-memory tracker, budget, and the caller's `cancel` token.
     pub(super) fn decode_context<'a>(&'a self, cancel: &'a CancelToken) -> DecodeContext<'a> {

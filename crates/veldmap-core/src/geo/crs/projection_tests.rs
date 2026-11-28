@@ -96,12 +96,12 @@ fn system_origin_latitude_and_linear_units_round_trip() {
         false_northing_m: 0.0,
         unit_to_metres: US_SURVEY_FOOT_M,
     };
-    let (e_origin, n_origin) = sys.from_geodetic(38.0, -75.0);
+    let (e_origin, n_origin) = sys.project_from_geodetic(38.0, -75.0);
     assert!((e_origin * US_SURVEY_FOOT_M - 200_000.0).abs() < 1e-6);
     assert!(n_origin.abs() < 1e-6);
 
     for (lat, lon) in [(39.5, -74.2), (37.1, -76.3), (40.7, -74.0)] {
-        let (e, n) = sys.from_geodetic(lat, lon);
+        let (e, n) = sys.project_from_geodetic(lat, lon);
         let back = sys.to_geodetic(e, n);
         assert!(
             ground_m(back, (lat, lon)) < 1e-4,
@@ -114,7 +114,7 @@ fn system_origin_latitude_and_linear_units_round_trip() {
         unit_to_metres: INTERNATIONAL_FOOT_M,
         ..sys
     };
-    let (e_ft, n_ft) = sys_ft.from_geodetic(39.5, -74.2);
+    let (e_ft, n_ft) = sys_ft.project_from_geodetic(39.5, -74.2);
     let back_ft = sys_ft.to_geodetic(e_ft, n_ft);
     assert!(ground_m(back_ft, (39.5, -74.2)) < 1e-4);
 }
@@ -204,7 +204,7 @@ fn roundtrip_converges_across_zone() {
         for lat in latitudes {
             for offset in [-2.5, 0.0, 1.7, 2.9] {
                 let lon = middle + offset;
-                let (e, n) = system.from_geodetic(lat, lon);
+                let (e, n) = system.project_from_geodetic(lat, lon);
                 let back = system.to_geodetic(e, n);
                 let off = ground_m(back, (lat, lon));
                 assert!(off < tolerance_m, "{system:?}: {back:?} — {off} m");
@@ -218,7 +218,7 @@ fn a_longitude_across_the_seam_lands_in_its_zone() {
     let zone = System::utm(1, false);
     assert!((zone.central_meridian_deg + 177.0).abs() < 1e-12);
 
-    let (east, north) = zone.from_geodetic(10.0, 179.0);
+    let (east, north) = zone.project_from_geodetic(10.0, 179.0);
     assert!((0.0..500_000.0).contains(&east));
     assert!((1_000_000.0..1_200_000.0).contains(&north));
 
@@ -241,19 +241,19 @@ fn a_system_beyond_the_seam_keeps_its_branch() {
 #[test]
 fn axis_anchors_are_exact() {
     let north = System::utm(31, false);
-    let (e, n) = north.from_geodetic(0.0, 3.0);
+    let (e, n) = north.project_from_geodetic(0.0, 3.0);
     assert!((e - 500_000.0).abs() < 1e-6 && n.abs() < 1e-6);
 
     let south = System::utm(31, true);
-    let (_, n) = south.from_geodetic(0.0, 3.0);
+    let (_, n) = south.project_from_geodetic(0.0, 3.0);
     assert!((n - 10_000_000.0).abs() < 1e-6);
 }
 
 #[test]
 fn hemispheres_mirror() {
     let zone = System::utm(40, false);
-    let (e1, n1) = zone.from_geodetic(30.0, 58.0);
-    let (e2, n2) = zone.from_geodetic(-30.0, 58.0);
+    let (e1, n1) = zone.project_from_geodetic(30.0, 58.0);
+    let (e2, n2) = zone.project_from_geodetic(-30.0, 58.0);
     assert!((e1 - e2).abs() < 1e-6);
     assert!((n1 + n2).abs() < 1e-6);
 }
@@ -268,7 +268,7 @@ fn sentinel_tile_corner_lands_where_the_tile_is() {
     for step in 0..9 {
         let northing = 500_000.0 + f64::from(step) * 1_000_000.0;
         let (lat, lon) = zone.to_geodetic(600_000.0, northing);
-        let (e, n) = zone.from_geodetic(lat, lon);
+        let (e, n) = zone.project_from_geodetic(lat, lon);
         assert!((e - 600_000.0).abs() < 1e-6);
         assert!((n - northing).abs() < 1e-6);
     }

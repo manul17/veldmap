@@ -2,9 +2,10 @@
 
 use eframe::egui;
 
+use crate::format;
 use crate::layers::{LayerSummary, OverlayEdit};
 use crate::ui::widgets::{paint_loading_shimmer, show_opacity_slider};
-use crate::ui::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format};
+use crate::ui::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 
 use super::LayerUiAction;
 use super::band_math_card::show_band_math_controls;
@@ -88,7 +89,7 @@ fn show_layer_controls(ui: &mut egui::Ui, layer: &LayerSummary, actions: &mut Ve
                 if let Some(ref units) = sci.units {
                     ui.small(format!("Units: {units}"));
                 }
-                if (sci.scale - 1.0).abs() > 1e-12 || sci.offset.abs() > 1e-12 {
+                if sci.has_affine_scaling() {
                     ui.small(format!("Scale: {} · Offset: {}", sci.scale, sci.offset));
                 }
             }

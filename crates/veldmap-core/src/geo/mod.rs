@@ -28,7 +28,7 @@ pub use crs::{
 pub use cull::{Ball, CullFrustum};
 pub use footprint::FootprintBounds;
 pub use geodesic::{GeodesicPolygonMeasurement, polyline_length_m, ring_perimeter_and_area};
-pub(crate) use geodesy::{EQUATORIAL_CIRCUMFERENCE_M, unwind};
+pub(crate) use geodesy::EQUATORIAL_CIRCUMFERENCE_M;
 pub use geodesy::{Ellipsoid, Geodetic, SEMI_MAJOR_M, WGS84};
 pub use geojson::{
     DEFAULT_VECTOR_MAX_CHORD_DEG, GeoJsonError, GeoJsonFeature, GeoJsonFeatureCollection,
@@ -45,6 +45,6 @@ fn ground_m(first: (f64, f64), second: (f64, f64)) -> f64 {
     let lat = ((first.0 + second.0) / 2.0).to_radians();
     let per_lat = 111_132.92 - 559.82 * (2.0 * lat).cos();
     let per_lon = 111_412.84 * lat.cos() - 93.5 * (3.0 * lat).cos();
-    let dlon = unwind(0.0, first.1 - second.1);
+    let dlon = geodesy::unwind(0.0, first.1 - second.1);
     ((first.0 - second.0) * per_lat).hypot(dlon * per_lon)
 }

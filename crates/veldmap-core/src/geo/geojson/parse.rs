@@ -2,6 +2,8 @@
 //! `Feature`, and bare `Geometry` / `GeometryCollection` inputs with strict
 //! memory and nesting safety caps.
 
+use std::ops::ControlFlow;
+
 use serde_json::{Map, Value};
 
 use super::super::shapes::{GeoPoint, Polygon, Ring, dedup_geo_ring};
@@ -47,14 +49,19 @@ pub fn parse_geojson(input: &str) -> Result<GeoJsonFeatureCollection, GeoJsonErr
 /// collection contains no concrete geometries.
 pub fn parse_geojson_geometry_value(val: &Value) -> Result<Option<GeoJsonGeometry>, GeoJsonError> {
     let mut vertex_count = 0usize;
-    parse_first_geometry_value(val, 0, &mut vertex_count)
+    match visit_concrete_geometries(val, 0, &mut |kind, obj| {
+        parse_geometry(kind, obj, &mut vertex_count).map(ControlFlow::Break)
+    })? {
+        ControlFlow::Break(found) => Ok(Some(found)),
+        ControlFlow::Continue(()) => Ok(None),
+    }
 }
 
-fn parse_first_geometry_value(
+fn visit_concrete_geometries<T>(
     val: &Value,
     depth: usize,
-    vertex_count: &mut usize,
-) -> Result<Option<GeoJsonGeometry>, GeoJsonError> {
+    on_concrete: &mut impl FnMut(&str, &Map<String, Value>) -> Result<ControlFlow<T>, GeoJsonError>,
+) -> Result<ControlFlow<T>, GeoJsonError> {
     let (obj, kind) = object_and_type(val, "Geometry")?;
     if kind == "GeometryCollection" {
         if depth >= MAX_GEOMETRY_COLLECTION_DEPTH {
@@ -69,13 +76,14 @@ fn parse_first_geometry_value(
                 GeoJsonError::Structure("GeometryCollection missing 'geometries' array".into())
             })?;
         for g in geoms {
-            if let Some(found) = parse_first_geometry_value(g, depth + 1, vertex_count)? {
-                return Ok(Some(found));
+            if let ControlFlow::Break(done) = visit_concrete_geometries(g, depth + 1, on_concrete)?
+            {
+                return Ok(ControlFlow::Break(done));
             }
         }
-        return Ok(None);
+        return Ok(ControlFlow::Continue(()));
     }
-    parse_geometry(kind, obj, vertex_count).map(Some)
+    on_concrete(kind, obj)
 }
 
 fn parse_root_value(
@@ -98,7 +106,7 @@ fn parse_root_value(
             Ok(())
         }
         "Feature" => parse_feature_object(val, out, vertex_count),
-        _ => parse_geometry_value(val, None, 0, out, vertex_count),
+        _ => parse_geometry_value(val, None, out, vertex_count),
     }
 }
 
@@ -124,47 +132,31 @@ fn parse_feature_object(
     if geom.is_null() {
         return Ok(());
     }
-    parse_geometry_value(geom, Some(&props), 0, out, vertex_count)
+    parse_geometry_value(geom, Some(&props), out, vertex_count)
 }
 
 fn parse_geometry_value(
     val: &Value,
     inherited_props: Option<&Map<String, Value>>,
-    depth: usize,
     out: &mut Vec<GeoJsonFeature>,
     vertex_count: &mut usize,
 ) -> Result<(), GeoJsonError> {
-    let (obj, kind) = object_and_type(val, "Geometry")?;
-    if kind == "GeometryCollection" {
-        if depth >= MAX_GEOMETRY_COLLECTION_DEPTH {
+    let _ = visit_concrete_geometries::<()>(val, 0, &mut |kind, obj| {
+        if out.len() >= MAX_GEOJSON_FEATURES {
             return Err(GeoJsonError::LimitExceeded(format!(
-                "GeometryCollection nesting exceeds {MAX_GEOMETRY_COLLECTION_DEPTH}"
+                "feature count exceeds {MAX_GEOJSON_FEATURES}"
             )));
         }
-        let geoms = obj
-            .get("geometries")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                GeoJsonError::Structure("GeometryCollection missing 'geometries' array".into())
-            })?;
-        for g in geoms {
-            parse_geometry_value(g, inherited_props, depth + 1, out, vertex_count)?;
-        }
-        return Ok(());
-    }
-    if out.len() >= MAX_GEOJSON_FEATURES {
-        return Err(GeoJsonError::LimitExceeded(format!(
-            "feature count exceeds {MAX_GEOJSON_FEATURES}"
-        )));
-    }
-    let geometry = parse_geometry(kind, obj, vertex_count)?;
-    let properties = inherited_props.cloned().unwrap_or_default();
-    let name = extract_feature_name(&properties);
-    out.push(GeoJsonFeature {
-        name,
-        properties,
-        geometry,
-    });
+        let geometry = parse_geometry(kind, obj, vertex_count)?;
+        let properties = inherited_props.cloned().unwrap_or_default();
+        let name = extract_feature_name(&properties);
+        out.push(GeoJsonFeature {
+            name,
+            properties,
+            geometry,
+        });
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(())
 }
 

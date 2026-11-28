@@ -106,7 +106,7 @@ impl QuadTileId {
     }
 
     /// Return the coarser parent node, or `None` at `level == 0`.
-    pub const fn parent(self) -> Option<Self> {
+    pub(super) const fn parent(self) -> Option<Self> {
         let Some((level, x, y)) = self.scheme.parent(self.level, self.x, self.y) else {
             return None;
         };
@@ -245,7 +245,7 @@ impl TileKey {
     }
 
     /// Return this tile's immediate coarser parent key, or `None` at the root.
-    pub const fn parent(&self) -> Option<Self> {
+    pub(super) const fn parent(&self) -> Option<Self> {
         let Some((level, x, y)) = self.scheme.parent(self.level, self.x, self.y) else {
             return None;
         };

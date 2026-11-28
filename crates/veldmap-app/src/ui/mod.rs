@@ -6,7 +6,6 @@
 pub(crate) mod basemap;
 pub(crate) mod crs_picker;
 pub(crate) mod export_png;
-pub(crate) mod format;
 pub(crate) mod hud;
 pub(crate) mod layers;
 pub(crate) mod measure;

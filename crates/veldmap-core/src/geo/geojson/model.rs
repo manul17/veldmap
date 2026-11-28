@@ -3,7 +3,7 @@
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use super::super::footprint::{FootprintBounds, frame_coords};
+use super::super::footprint::{FootprintBounds, frame_visit};
 use super::super::shapes::{GeoPoint, Polygon};
 
 /// Hard safety cap on input GeoJSON byte length (`64 MiB`) enforced before
@@ -84,16 +84,17 @@ pub struct GeoJsonFeatureCollection {
 impl GeoJsonFeatureCollection {
     /// Spherical framing circle enclosing all geometries in the collection.
     pub fn bounds(&self) -> Option<FootprintBounds> {
-        let mut pts = Vec::new();
-        for feature in &self.features {
-            collect_geometry_points(&feature.geometry, &mut pts);
-        }
-        frame_coords(pts.iter().map(|p| (p.lat, p.lon)))
+        frame_visit(|emit| {
+            for feature in &self.features {
+                for_each_geometry_point(&feature.geometry, |p| emit(p.lat, p.lon));
+            }
+        })
     }
 
     /// Axis-aligned WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]`
     /// across all finite vertices in the collection.
-    pub fn bbox(&self) -> Option<[f64; 4]> {
+    #[cfg(test)]
+    pub(crate) fn bbox(&self) -> Option<[f64; 4]> {
         let mut acc = BboxAccumulator::new();
         for feature in &self.features {
             acc.extend_geometry(&feature.geometry);
@@ -169,10 +170,6 @@ fn for_each_geometry_point(geom: &GeoJsonGeometry, mut visit: impl FnMut(GeoPoin
             }
         }
     }
-}
-
-fn collect_geometry_points(geom: &GeoJsonGeometry, out: &mut Vec<GeoPoint>) {
-    for_each_geometry_point(geom, |p| out.push(p));
 }
 
 pub(super) fn extract_feature_name(props: &Map<String, Value>) -> Option<String> {

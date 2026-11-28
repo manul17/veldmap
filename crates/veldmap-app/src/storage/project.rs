@@ -9,7 +9,7 @@ use veldmap_storage::{StorageError, read_json_limited, write_json_durable};
 
 use super::session::{
     CameraBookmark, SESSION_SCHEMA_VERSION, SavedBandAssetSource, SavedCameraPose, SavedLayerEntry,
-    SavedSwipeState, SavedVectorEntry, normalize_workspace_fields,
+    SavedSwipeState, SavedVectorEntry, WorkspaceFieldsMut, normalize_workspace_fields,
 };
 
 /// File suffix identifying portable VeldMap project files.
@@ -200,17 +200,27 @@ impl Default for ProjectFile {
     }
 }
 
+fn anchor_to_cwd(path: &Path, cwd: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(dir) = cwd {
+        dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 impl ProjectFile {
     /// Normalize bounds, sanitize all remote URLs, and drop invalid entries.
     pub(crate) fn normalize(&mut self) {
-        normalize_workspace_fields(
-            &mut self.version,
-            &mut self.open_layers,
-            &mut self.open_vectors,
-            &mut self.bookmarks,
-            &mut self.last_camera,
-            &mut self.swipe,
-        );
+        normalize_workspace_fields(WorkspaceFieldsMut {
+            version: &mut self.version,
+            open_layers: &mut self.open_layers,
+            open_vectors: &mut self.open_vectors,
+            bookmarks: &mut self.bookmarks,
+            last_camera: &mut self.last_camera,
+            swipe: &mut self.swipe,
+        });
     }
 
     /// Save a normalized, sanitized copy to `project_path`, relativizing local
@@ -221,23 +231,14 @@ impl ProjectFile {
         let mut copy = self.clone();
         copy.normalize();
         let cwd = std::env::current_dir().ok();
-        let anchor = |p: &Path| -> PathBuf {
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else if let Some(ref dir) = cwd {
-                dir.join(p)
-            } else {
-                p.to_path_buf()
-            }
-        };
-        let anchored = anchor(project_path);
+        let anchored = anchor_to_cwd(project_path, cwd.as_deref());
         if let Some(base_dir) = anchored.parent().filter(|p| p.is_absolute()) {
             map_layer_paths(&mut copy.open_layers, |p| {
-                let abs = anchor(p);
+                let abs = anchor_to_cwd(p, cwd.as_deref());
                 make_path_relative_if_same_root(base_dir, &abs)
             });
             for v in &mut copy.open_vectors {
-                let abs = anchor(&v.path);
+                let abs = anchor_to_cwd(&v.path, cwd.as_deref());
                 v.path = make_path_relative_if_same_root(base_dir, &abs);
             }
         }
@@ -249,13 +250,10 @@ impl ProjectFile {
     /// working directory when `project_path` itself is relative).
     pub(crate) fn load_from(project_path: &Path) -> Result<Self, StorageError> {
         let mut project: Self = read_json_limited(project_path, MAX_PROJECT_FILE_BYTES)?;
-        let anchored = if project_path.is_absolute() {
-            project_path.to_path_buf()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            cwd.join(project_path)
-        } else {
-            project_path.to_path_buf()
-        };
+        let cwd = (!project_path.is_absolute())
+            .then(|| std::env::current_dir().ok())
+            .flatten();
+        let anchored = anchor_to_cwd(project_path, cwd.as_deref());
         if let Some(base_dir) = anchored.parent().filter(|p| !p.as_os_str().is_empty()) {
             map_layer_paths(&mut project.open_layers, |p| {
                 resolve_project_path(base_dir, p)

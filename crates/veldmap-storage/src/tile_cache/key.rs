@@ -24,9 +24,9 @@ pub enum TileBlobEncoding {
     /// Raw upstream encoded image bytes (PNG/JPEG/WebP from live tile servers).
     #[default]
     EncodedImage = 0,
-    /// Lossless QOI-encoded 8-bit display RGBA tiles (Slice 3A-1b).
+    /// Lossless QOI-encoded 8-bit display RGBA tiles.
     Qoi = 1,
-    /// Byte-shuffled LZ4 scientific/categorical tile payloads (Slice 3B).
+    /// Byte-shuffled LZ4 scientific/categorical tile payloads.
     Lz4Raw = 2,
 }
 

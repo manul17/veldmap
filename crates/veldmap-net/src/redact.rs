@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use crate::url::split_authority_and_userinfo;
+use crate::url::{split_authority_and_userinfo, split_url_query_fragment};
 
 /// Percent-encode a secret string into both uppercase and lowercase hex forms
 /// for URL substitution and redaction matching.
@@ -83,19 +83,24 @@ pub(crate) fn redact_text_many(text: &str, secrets: &[EncodedSecret]) -> String 
     out
 }
 
-/// Extract an [`EncodedSecret`] from a custom HTTP header `(name, value)`:
-/// strips common auth scheme prefixes (`Bearer `, `Basic `, `Token `) so raw
-/// tokens are redacted even if logged without the prefix, and avoids registering
-/// tiny non-sensitive values (`< 6` bytes) from generic non-auth headers.
-pub(crate) fn extract_header_secret(header_name: &str, value: &str) -> Option<EncodedSecret> {
+/// Unconditionally extract an [`EncodedSecret`] from an explicit credential
+/// value (such as [`crate::StacAuth::ApiKey`]), stripping common auth scheme
+/// prefixes (`Bearer `, `Basic `, `Token `) regardless of header name or length.
+pub(crate) fn extract_explicit_header_secret(value: &str) -> Option<EncodedSecret> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
     let token = strip_auth_scheme_prefix(trimmed).unwrap_or(trimmed);
-    if token.is_empty() {
-        return None;
-    }
+    (!token.is_empty()).then(|| EncodedSecret::new(token.to_owned()))
+}
+
+/// Extract an [`EncodedSecret`] from a custom HTTP header `(name, value)`:
+/// strips common auth scheme prefixes (`Bearer `, `Basic `, `Token `) so raw
+/// tokens are redacted even if logged without the prefix, and avoids registering
+/// tiny non-sensitive values (`< 6` bytes) from generic non-auth headers.
+pub(crate) fn extract_header_secret(header_name: &str, value: &str) -> Option<EncodedSecret> {
+    let secret = extract_explicit_header_secret(value)?;
     let lower_name = header_name.trim().to_ascii_lowercase();
     let is_auth_header = matches!(
         lower_name.as_str(),
@@ -109,10 +114,10 @@ pub(crate) fn extract_header_secret(header_name: &str, value: &str) -> Option<En
         || lower_name.contains("token")
         || lower_name.contains("key")
         || lower_name.contains("secret");
-    if !is_auth_header && token.len() < 6 {
+    if !is_auth_header && secret.raw().len() < 6 {
         return None;
     }
-    Some(EncodedSecret::new(token.to_owned()))
+    Some(secret)
 }
 
 fn strip_auth_scheme_prefix(value: &str) -> Option<&str> {
@@ -138,6 +143,15 @@ fn is_valid_url_scheme(scheme: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
+fn redact_query_preserving_fragment(s: &str) -> String {
+    let (base, query, frag) = split_url_query_fragment(s);
+    match (query, frag) {
+        (Some(_), Some(f)) => format!("{base}?<redacted>#{f}"),
+        (Some(_), None) => format!("{base}?<redacted>"),
+        (None, _) => s.to_owned(),
+    }
+}
+
 /// Redact `user:pass@` authority credentials and `?query` strings from a URL
 /// or URL template so inline secrets never appear in `Debug` output, logs, or
 /// UI tooltips.
@@ -147,10 +161,7 @@ pub fn sanitize_url_for_display(url: &str) -> String {
         .find("://")
         .filter(|&idx| is_valid_url_scheme(&trimmed[..idx]));
     let Some(scheme_idx) = scheme_end else {
-        return match trimmed.split_once('?') {
-            Some((base, _)) => format!("{base}?<redacted>"),
-            None => trimmed.to_owned(),
-        };
+        return redact_query_preserving_fragment(trimmed);
     };
 
     let scheme_prefix = &trimmed[..scheme_idx + 3];
@@ -161,13 +172,7 @@ pub fn sanitize_url_for_display(url: &str) -> String {
         None => parts.host_port.to_owned(),
     };
 
-    let sanitized_tail = match parts.tail.split_once('?') {
-        Some((path, query_and_frag)) => match query_and_frag.split_once('#') {
-            Some((_, frag)) => format!("{path}?<redacted>#{frag}"),
-            None => format!("{path}?<redacted>"),
-        },
-        None => parts.tail.to_owned(),
-    };
+    let sanitized_tail = redact_query_preserving_fragment(parts.tail);
 
     format!("{scheme_prefix}{sanitized_authority}{sanitized_tail}")
 }
@@ -288,6 +293,30 @@ mod tests {
         assert_eq!(
             sanitize_urls_in_text("failed—https://u:p@host.test/0/0/0.png?token=secret"),
             "failed—https://<redacted>@host.test/0/0/0.png?<redacted>"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_for_display_preserves_fragments_and_ignores_question_marks_in_fragments() {
+        // With scheme: `#fragment` containing `?` must not be mis-redacted.
+        assert_eq!(
+            sanitize_url_for_display("https://tiles.example.com/map#section?foo=bar"),
+            "https://tiles.example.com/map#section?foo=bar"
+        );
+        // With scheme: `?query#fragment` redacts query and preserves `#fragment`.
+        assert_eq!(
+            sanitize_url_for_display("https://u:p@tiles.example.com/map?token=secret#layer1"),
+            "https://<redacted>@tiles.example.com/map?<redacted>#layer1"
+        );
+        // Without scheme: `#fragment` containing `?` must not be mis-redacted.
+        assert_eq!(
+            sanitize_url_for_display("/tiles/map#section?foo=bar"),
+            "/tiles/map#section?foo=bar"
+        );
+        // Without scheme: `?query#fragment` redacts query and preserves `#fragment`.
+        assert_eq!(
+            sanitize_url_for_display("/tiles/map?token=secret#layer1"),
+            "/tiles/map?<redacted>#layer1"
         );
     }
 }

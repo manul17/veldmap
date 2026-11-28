@@ -68,9 +68,13 @@ fn fs_categorical(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let sample_uv = tile.uv_rect.xy + in.uv * tile.uv_rect.zw;
+    let sample_uv = clamp(
+        tile.uv_rect.xy + in.uv * tile.uv_rect.zw,
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+    );
     let dims = textureDimensions(tile_tex, 0);
-    let max_coord = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    let max_coord = max(vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1), vec2<i32>(0, 0));
     let coord = clamp(
         vec2<i32>(floor(sample_uv * vec2<f32>(dims))),
         vec2<i32>(0, 0),

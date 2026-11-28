@@ -8,15 +8,15 @@ use veldmap_core::sync::CancelToken;
 use crate::RasterError;
 use crate::pipeline::{PixelLayout, SampleType};
 
-use super::super::ycbcr::YCbCrParams;
-use super::budget::{IfdParseBudget, admit_ifd_budget, preflight_and_prefetch_ifd};
-use super::tag_ids::{
+use super::super::tag_ids::{
     TAG_BITS_PER_SAMPLE, TAG_COLOR_MAP, TAG_COMPRESSION, TAG_EXTRA_SAMPLES, TAG_IMAGE_LENGTH,
     TAG_IMAGE_WIDTH, TAG_JPEG_TABLES, TAG_PHOTOMETRIC, TAG_PLANAR_CONFIG, TAG_PREDICTOR,
     TAG_REFERENCE_BLACK_WHITE, TAG_ROWS_PER_STRIP, TAG_SAMPLE_FORMAT, TAG_SAMPLES_PER_PIXEL,
     TAG_STRIP_BYTE_COUNTS, TAG_STRIP_OFFSETS, TAG_TILE_BYTE_COUNTS, TAG_TILE_LENGTH,
     TAG_TILE_OFFSETS, TAG_TILE_WIDTH, TAG_YCBCR_COEFFICIENTS, TAG_YCBCR_SUBSAMPLING,
 };
+use super::super::ycbcr::YCbCrParams;
+use super::budget::{IfdParseBudget, admit_ifd_budget, preflight_and_prefetch_ifd};
 use super::wire::{IfdDirectory, SinglePassIfdReader};
 use super::{CachedIfd, Photometric, PlanarConfig, TiffCompression, TiffPredictor};
 
@@ -77,6 +77,14 @@ fn parse_color_map(
     Ok(Arc::from(lut))
 }
 
+fn find_alpha_channel(extra_samples: &[u16], base_count: usize, spp: usize) -> Option<usize> {
+    extra_samples
+        .iter()
+        .position(|&v| v == 1 || v == 2)
+        .map(|idx| base_count + idx)
+        .filter(|&ch| ch < spp)
+}
+
 fn resolve_pixel_layout(
     photometric: Photometric,
     samples_per_pixel: u16,
@@ -99,11 +107,7 @@ fn resolve_pixel_layout(
                 Ok((PixelLayout::named(2), 1))
             } else {
                 let base_count = spp.saturating_sub(extra_samples.len()).max(1);
-                let alpha_ch = extra_samples
-                    .iter()
-                    .position(|&v| v == 1 || v == 2)
-                    .map(|idx| base_count + idx)
-                    .filter(|&ch| ch < spp);
+                let alpha_ch = find_alpha_channel(extra_samples, base_count, spp);
                 let data_bands = if alpha_ch.is_some() {
                     samples_per_pixel.saturating_sub(1).max(1)
                 } else {
@@ -121,11 +125,7 @@ fn resolve_pixel_layout(
             if spp == 3 {
                 return Ok((PixelLayout::named(3), 3));
             }
-            let alpha_ch = extra_samples
-                .iter()
-                .position(|&v| v == 1 || v == 2)
-                .map(|idx| 3 + idx)
-                .filter(|&ch| ch < spp);
+            let alpha_ch = find_alpha_channel(extra_samples, 3, spp);
             let layout = PixelLayout::rgb(spp, alpha_ch);
             let data_bands = if alpha_ch.is_some() {
                 samples_per_pixel.saturating_sub(1).max(3)

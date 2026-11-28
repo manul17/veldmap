@@ -1,14 +1,16 @@
-//! Stateless runtime access parameters and borrowed source views shared across
-//! TIFF chunk decoding, display stretching, and cursor pixel probing.
+//! Stateless runtime access parameters, borrowed source views, and
+//! stream/display policy helpers shared across TIFF chunk decoding, display
+//! stretching, remote COG range planning, and cursor pixel probing.
 
 use std::sync::Arc;
 
 use veldmap_core::io::ByteSource;
-use veldmap_core::tile::SourceId;
+use veldmap_core::tile::{BandKey, PixelFormat, SourceId, TileStreamSpec};
 
 use crate::RasterError;
+use crate::pipeline::{DisplayMapping, SampleType};
 
-use super::ifd::{CachedIfd, TiffByteOrder};
+use super::ifd::{CachedIfd, Photometric, PlanarConfig, TiffByteOrder};
 
 /// Shared stateless raw-chunk I/O access parameters borrowed by chunk readers,
 /// stretch samplers, and cursor probes.
@@ -70,4 +72,84 @@ pub(super) fn find_ifd(ifds: &[CachedIfd], image: usize) -> Result<&CachedIfd, R
     ifds.iter()
         .find(|i| i.image == image)
         .ok_or_else(|| RasterError::Decode(format!("TIFF IFD {image} is not cached")))
+}
+
+/// Build the default unstretched [`DisplayMapping`] for `ifd`, inverting
+/// photometric `WhiteIsZero` samples after raw nodata checks.
+pub(super) fn identity_display_mapping(ifd: &CachedIfd, nodata: Option<f64>) -> DisplayMapping {
+    DisplayMapping::identity(nodata).with_invert(ifd.photometric == Photometric::WhiteIsZero)
+}
+
+/// Return whether Display RGBA8 rendering requires percentile stretching
+/// (true for >8-bit / non-U8 non-palette rasters).
+pub(super) const fn needs_display_stretch(ifd: &CachedIfd) -> bool {
+    !matches!(ifd.sample_type, SampleType::U8) && !matches!(ifd.photometric, Photometric::Palette)
+}
+
+/// TIFF planes sampled for display percentile stretching (`&[0]` for
+/// chunky or 1-color planar, `&[0, 1, 2]` for 3-color planar).
+pub(super) const fn stretch_planes(ifd: &CachedIfd) -> &'static [usize] {
+    match (ifd.planar, ifd.pixel_layout.colors()) {
+        (PlanarConfig::Planar, 3) => &[0, 1, 2],
+        _ => &[0],
+    }
+}
+
+/// Resolve `band` into a validated `0..samples_per_pixel` band index for `ifd`.
+pub(super) fn resolve_band_index(ifd: &CachedIfd, band: BandKey) -> Result<usize, RasterError> {
+    let idx = match band {
+        BandKey::Display => 0usize,
+        BandKey::Index(i) => usize::from(i),
+        BandKey::NamedHash(_) => {
+            return Err(RasterError::Decode(
+                "named band hash is not supported by TiffSource".to_owned(),
+            ));
+        }
+    };
+    if idx >= usize::from(ifd.samples_per_pixel) {
+        return Err(RasterError::Decode(format!(
+            "band index {idx} out of range for TIFF with {} samples/pixel",
+            ifd.samples_per_pixel
+        )));
+    }
+    Ok(idx)
+}
+
+/// Return the planar (`PlanarConfiguration = 2`) source planes required
+/// for non-palette Display RGBA8 rendering, avoiding heap allocation.
+pub(super) const fn planar_display_planes(ifd: &CachedIfd) -> ([usize; 4], usize) {
+    match (ifd.pixel_layout.colors(), ifd.alpha_channel()) {
+        (1, None) => ([0, 0, 0, 0], 1),
+        (1, Some(a)) => ([0, a, 0, 0], 2),
+        (_, None) => ([0, 1, 2, 0], 3),
+        (_, Some(a)) => ([0, 1, 2, a], 4),
+    }
+}
+
+/// Resolve the TIFF planes read for `spec`, shared across
+/// [`super::chunk_reader::TiffChunkReader`] and remote COG byte-range
+/// planners so plane selection never diverges.
+pub(super) fn planes_for_stream(
+    ifd: &CachedIfd,
+    spec: TileStreamSpec,
+) -> Result<Vec<usize>, RasterError> {
+    match spec.format {
+        PixelFormat::Rgba8UnormSrgb => {
+            if ifd.planar == PlanarConfig::Chunky {
+                return Ok(vec![0]);
+            }
+            if ifd.photometric == Photometric::Palette {
+                return Ok(match ifd.alpha_channel() {
+                    Some(a) => vec![0, a],
+                    None => vec![0],
+                });
+            }
+            let (planes, len) = planar_display_planes(ifd);
+            Ok(planes[..len].to_vec())
+        }
+        PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => {
+            let band_idx = resolve_band_index(ifd, spec.band)?;
+            Ok(vec![ifd.band_plane(band_idx)])
+        }
+    }
 }

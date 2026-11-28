@@ -69,7 +69,10 @@ fn lz4_raw_round_trips_scientific_and_categorical_formats() {
 fn lz4_raw_enforces_header_bounds_format_and_corruption_guards() {
     let rgba_tile =
         DecodedTile::try_new(4, 4, PixelFormat::Rgba8UnormSrgb, vec![0u8; 64]).expect("rgba");
-    assert!(encode_lz4_raw_tile(&rgba_tile, MAX_CACHED_TILE_DECODED_BYTES).is_err());
+    assert!(matches!(
+        encode_lz4_raw_tile(&rgba_tile, MAX_CACHED_TILE_DECODED_BYTES),
+        Err(RasterError::Encode(_))
+    ));
 
     let small = DecodedTile::try_new(8, 8, PixelFormat::R32Float, vec![0u8; 256]).expect("ok");
     assert!(matches!(

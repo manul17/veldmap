@@ -8,6 +8,7 @@ mod actions;
 mod dialogs;
 mod fonts;
 mod png_export;
+mod restore_tracker;
 mod session_sync;
 mod swipe;
 mod viewport_bridge;
@@ -24,8 +25,9 @@ use veldmap_core::geo::{Camera, FootprintBounds};
 use veldmap_core::sync::Wakeup;
 use veldmap_storage::detect_memory_budget;
 
+use crate::format;
 use crate::gpu_tiles::UploadChannelClosed;
-use crate::layers::{LayerSummary, OverlayEdit};
+use crate::layers::LayerSummary;
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::scene::{SceneRepaintHint, SceneState};
 use crate::stac::{AuthTrust, StacSession};
@@ -38,8 +40,7 @@ use crate::storage::settings::AppSettings;
 use crate::ui;
 use crate::ui::crs_picker::{CrsPickerState, show_crs_picker_window};
 use crate::ui::export_png::{ExportPngUiAction, ExportPngWindowInputs, show_export_png_window};
-use crate::ui::format;
-use crate::ui::hud::{self, SwipeHudAction};
+use crate::ui::hud;
 use crate::ui::layers::LayersPanelState;
 use crate::ui::measure::{MeasureUiState, show_measure_window};
 use crate::ui::settings::{SettingsTab, SettingsWindowState, show_settings_window};
@@ -51,10 +52,10 @@ use crate::ui::workbench::{WorkbenchInputs, WorkbenchTab, show_workbench_panel};
 use dialogs::DialogHost;
 use fonts::build_font_definitions;
 use png_export::PngExportController;
-use session_sync::SessionRestoreTracker;
+use restore_tracker::SessionRestoreTracker;
 use swipe::SwipeState;
 use viewport_bridge::{GlobePaintCallback, GpuFaultState, install_wgpu_resources, viewport_pixels};
-use viewport_input::{ViewportEvent, ViewportInteraction, ViewportToolMode};
+use viewport_input::{ViewportInputCtx, ViewportInteraction, ViewportToolMode};
 
 const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(4);
 const PNG_GPU_POLL_INTERVAL: Duration = Duration::from_millis(8);
@@ -562,6 +563,24 @@ impl VeldmapApp {
         self.set_status_notice(format!("Copied {label}: {text}"));
     }
 
+    fn handle_viewport_collapsed(&mut self, frame: &eframe::Frame) -> bool {
+        let was_positive = self.viewport.viewport_rect().is_some();
+        self.scene.on_viewport_collapsed();
+        self.viewport.clear_viewport();
+        let mut needs_repaint = false;
+        if let Some(err) = self
+            .png_export
+            .abort_unsubmitted_capture("Viewport is collapsed; cannot capture screenshot.")
+        {
+            self.set_status_notice(err);
+            needs_repaint = true;
+        }
+        if was_positive {
+            viewport_bridge::release_viewport_resources(frame);
+        }
+        needs_repaint
+    }
+
     fn show_globe_viewport(
         &mut self,
         ctx: &egui::Context,
@@ -593,12 +612,9 @@ impl VeldmapApp {
                 if rect.is_positive() {
                     viewport_rect = Some(rect);
                     let vp = viewport_pixels(ctx, rect);
-                    let width_px = vp.width_px;
-                    let height_px = vp.height_px;
-                    let aspect = vp.aspect;
                     let ppp = ctx.pixels_per_point().max(0.5);
                     let height_pt = f64::from(rect.height()).max(1.0);
-                    self.viewport.record_viewport(rect, height_px, aspect);
+                    self.viewport.record_viewport(rect, vp.height_px, vp.aspect);
 
                     // Open the Copy Coordinates popup strictly on clean
                     // secondary clicks over the globe (never over painted HUD
@@ -614,65 +630,12 @@ impl VeldmapApp {
                         None
                     };
 
-                    let mut copied_choice: Option<(&'static str, String)> = None;
-                    let menu_cursor = self.context_menu_geo;
-                    let center_geo = self.camera.center();
-                    egui::Popup::menu(&response)
-                        .id(response.id.with("globe_coord_context_menu"))
-                        .at_pointer_fixed()
-                        .open_memory(open_coord_menu)
-                        .show(|ui| {
-                            if let Some((lat, lon)) = menu_cursor {
-                                ui.label(
-                                    egui::RichText::new("Copy Cursor Coordinates")
-                                        .strong()
-                                        .small(),
-                                );
-                                if ui.button("Decimal Degrees (DD)").clicked() {
-                                    copied_choice =
-                                        Some(("Cursor DD", format::format_signed_dd(lat, lon)));
-                                    ui.close();
-                                }
-                                if ui.button("Degrees Minutes Seconds (DMS)").clicked() {
-                                    copied_choice =
-                                        Some(("Cursor DMS", format::format_dms(lat, lon)));
-                                    ui.close();
-                                }
-                                if ui.button("MGRS").clicked() {
-                                    copied_choice =
-                                        Some(("Cursor MGRS", format::format_mgrs_copy(lat, lon)));
-                                    ui.close();
-                                }
-                                ui.separator();
-                            }
-                            ui.label(
-                                egui::RichText::new("Copy Center Coordinates")
-                                    .strong()
-                                    .small(),
-                            );
-                            if ui.button("Center DD").clicked() {
-                                copied_choice = Some((
-                                    "Center DD",
-                                    format::format_signed_dd(center_geo.0, center_geo.1),
-                                ));
-                                ui.close();
-                            }
-                            if ui.button("Center DMS").clicked() {
-                                copied_choice = Some((
-                                    "Center DMS",
-                                    format::format_dms(center_geo.0, center_geo.1),
-                                ));
-                                ui.close();
-                            }
-                            if ui.button("Center MGRS").clicked() {
-                                copied_choice = Some((
-                                    "Center MGRS",
-                                    format::format_mgrs_copy(center_geo.0, center_geo.1),
-                                ));
-                                ui.close();
-                            }
-                        });
-                    if let Some((label, text)) = copied_choice {
+                    if let Some((label, text)) = hud::show_coord_context_menu(
+                        &response,
+                        open_coord_menu,
+                        self.context_menu_geo,
+                        self.camera.center(),
+                    ) {
                         self.copy_coord_to_clipboard(ctx, label, text);
                         viewport_needs_repaint = true;
                     }
@@ -684,48 +647,24 @@ impl VeldmapApp {
 
                     let tool_mode = self.active_viewport_tool();
                     if let Some(ev) = self.viewport.handle_viewport_input(
-                        ctx,
                         &mut self.camera,
-                        &response,
-                        rect,
-                        height_pt,
-                        tool_mode,
-                        swipe_divider_x,
+                        ViewportInputCtx {
+                            ctx,
+                            response: &response,
+                            rect,
+                            tool_mode,
+                            swipe_divider_x,
+                        },
                     ) {
-                        match ev {
-                            ViewportEvent::MeasurePoint(clicked_pt) => {
-                                self.scene.mutate_measure(|m| m.add_point(clicked_pt));
-                                self.panels.measure.clear_notice();
-                            }
-                            ViewportEvent::AoiBox { bbox, finished } => {
-                                if finished {
-                                    self.scene.mutate_stac(|s| {
-                                        s.set_aoi_bbox(bbox, "Drawn Box".to_owned())
-                                    });
-                                    self.set_viewport_tool(ViewportToolMode::Navigate, None);
-                                } else {
-                                    self.scene.mutate_stac(|s| s.set_aoi_preview_bbox(bbox));
-                                }
-                            }
-                            ViewportEvent::AoiBoxCancelled => {
-                                self.set_viewport_tool(ViewportToolMode::Navigate, None);
-                            }
-                            ViewportEvent::SwipeSplitT { split_t, finished } => {
-                                self.restore_tracker.clear_pending_swipe();
-                                self.swipe.set_split_t(split_t);
-                                if finished {
-                                    self.persist_session_snapshot(false, &[]);
-                                }
-                            }
-                        }
+                        self.apply_viewport_event(ev);
                     }
 
                     let m_per_pt = self.camera.metres_per_pixel(height_pt);
                     let show_graticule = self.storage.settings().show_graticule;
                     let snapshot = self.scene.snapshot_for_frame(
                         self.camera,
-                        width_px,
-                        height_px,
+                        vp.width_px,
+                        vp.height_px,
                         ppp,
                         show_graticule,
                     );
@@ -780,18 +719,7 @@ impl VeldmapApp {
                     self.viewport
                         .set_hud_rects(scale_rect, attr_rect, colorbar_rect);
                 } else {
-                    let was_positive = self.viewport.viewport_rect().is_some();
-                    self.scene.on_viewport_collapsed();
-                    self.viewport.clear_viewport();
-                    if let Some(err) = self.png_export.abort_unsubmitted_capture(
-                        "Viewport is collapsed; cannot capture screenshot.",
-                    ) {
-                        self.set_status_notice(err);
-                        viewport_needs_repaint = true;
-                    }
-                    if was_positive {
-                        viewport_bridge::release_viewport_resources(frame);
-                    }
+                    viewport_needs_repaint |= self.handle_viewport_collapsed(frame);
                 }
             });
 
@@ -808,40 +736,7 @@ impl VeldmapApp {
             );
             self.viewport.set_swipe_bar_rect(Some(bar_rect));
             if let Some(act) = action {
-                match act {
-                    SwipeHudAction::SetLeft(id) => {
-                        self.restore_tracker.clear_pending_swipe();
-                        let mut changed = self.swipe.set_left_layer(id);
-                        if let Some(lid) = id {
-                            changed |= self.scene.edit_overlay(lid, OverlayEdit::SetVisible(true));
-                        }
-                        if changed {
-                            self.persist_session_snapshot(false, &[]);
-                            viewport_needs_repaint = true;
-                        }
-                    }
-                    SwipeHudAction::SetRight(id) => {
-                        self.restore_tracker.clear_pending_swipe();
-                        let mut changed = self.swipe.set_right_layer(id);
-                        if let Some(lid) = id {
-                            changed |= self.scene.edit_overlay(lid, OverlayEdit::SetVisible(true));
-                        }
-                        if changed {
-                            self.persist_session_snapshot(false, &[]);
-                            viewport_needs_repaint = true;
-                        }
-                    }
-                    SwipeHudAction::Swap => {
-                        self.restore_tracker.clear_pending_swipe();
-                        self.swipe.swap_sides();
-                        self.persist_session_snapshot(false, &[]);
-                        viewport_needs_repaint = true;
-                    }
-                    SwipeHudAction::Close => {
-                        self.set_viewport_tool(ViewportToolMode::Navigate, None);
-                        viewport_needs_repaint = true;
-                    }
-                }
+                viewport_needs_repaint |= self.apply_swipe_action(act);
             }
         } else {
             self.viewport.set_swipe_bar_rect(None);

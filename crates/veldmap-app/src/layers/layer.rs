@@ -65,6 +65,49 @@ struct ReloadState {
     cancel: Option<CancelToken>,
 }
 
+impl ReloadState {
+    const fn is_in_progress(&self) -> bool {
+        self.in_progress
+    }
+
+    const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    const fn matches_seq(&self, seq: u64) -> bool {
+        self.seq == seq
+    }
+
+    fn begin(&mut self, cancel: CancelToken) -> (u64, Option<CancelToken>) {
+        let old_cancel = self.cancel.replace(cancel);
+        self.seq = self.seq.saturating_add(1);
+        self.in_progress = true;
+        (self.seq, old_cancel)
+    }
+
+    fn clear_active(&mut self) {
+        self.in_progress = false;
+        self.cancel = None;
+    }
+
+    fn take_cancel(&mut self) -> Option<CancelToken> {
+        self.cancel.take()
+    }
+}
+
+/// Private initializer bundle unifying local and remote `SingleRaster`
+/// construction without a long positional parameter list.
+struct SingleLayerInit {
+    id: LayerId,
+    name: String,
+    origin: LayerOrigin,
+    source: Arc<dyn RasterSource>,
+    frame: Frame,
+    options: LayerInitOptions,
+    is_scl: bool,
+    relaid: u64,
+}
+
 /// Input parameters for constructing a remote Cloud-Optimized GeoTIFF
 /// [`OverlayLayer`] via [`OverlayLayer::from_remote_source`].
 pub(super) struct RemoteLayerSpec {
@@ -105,20 +148,17 @@ pub(super) struct OverlayLayer {
 }
 
 impl OverlayLayer {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Private constructor unifies local and remote SingleRaster layer initialization."
-    )]
-    fn from_single_parts(
-        id: LayerId,
-        name: String,
-        origin: LayerOrigin,
-        source: Arc<dyn RasterSource>,
-        frame: Frame,
-        mut options: LayerInitOptions,
-        is_scl: bool,
-        relaid: u64,
-    ) -> Self {
+    fn from_single_parts(init: SingleLayerInit) -> Self {
+        let SingleLayerInit {
+            id,
+            name,
+            origin,
+            source,
+            frame,
+            mut options,
+            is_scl,
+            relaid,
+        } = init;
         let desc = source.description();
         if is_scl && options.style.is_none() {
             // Explicitly request `PixelFormat::R8Uint` + `Sentinel2Scl` for
@@ -185,16 +225,16 @@ impl OverlayLayer {
         relaid: u64,
     ) -> Self {
         let name = display_name_from_path(&path);
-        Self::from_single_parts(
+        Self::from_single_parts(SingleLayerInit {
             id,
             name,
-            LayerOrigin::Local { path },
+            origin: LayerOrigin::Local { path },
             source,
             frame,
             options,
-            false,
+            is_scl: false,
             relaid,
-        )
+        })
     }
 
     #[cfg(test)]
@@ -204,21 +244,21 @@ impl OverlayLayer {
         source: Arc<dyn RasterSource>,
         frame: Frame,
     ) -> Self {
-        Self::from_single_parts(
+        Self::from_single_parts(SingleLayerInit {
             id,
-            "SCL".to_owned(),
-            LayerOrigin::Local { path },
+            name: "SCL".to_owned(),
+            origin: LayerOrigin::Local { path },
             source,
             frame,
-            LayerInitOptions {
+            options: LayerInitOptions {
                 visible: true,
                 opacity: 1.0,
                 crs_override: None,
                 style: None,
             },
-            true,
-            1,
-        )
+            is_scl: true,
+            relaid: 1,
+        })
     }
 
     /// Construct a remote Cloud-Optimized GeoTIFF overlay layer. Remote layers
@@ -231,19 +271,19 @@ impl OverlayLayer {
             spec.title
         };
         let is_scl = spec.meta.is_scl;
-        Self::from_single_parts(
-            spec.id,
+        Self::from_single_parts(SingleLayerInit {
+            id: spec.id,
             name,
-            LayerOrigin::Remote {
+            origin: LayerOrigin::Remote {
                 meta: spec.meta,
                 range: spec.range_source,
             },
-            spec.source,
-            spec.frame,
-            spec.options,
+            source: spec.source,
+            frame: spec.frame,
+            options: spec.options,
             is_scl,
-            spec.relaid,
-        )
+            relaid: spec.relaid,
+        })
     }
 
     /// Construct a multi-asset GPU Band Math / RGB Composite overlay layer.
@@ -497,7 +537,7 @@ impl OverlayLayer {
         Some(style.scientific_mut())
     }
 
-    pub(super) fn apply_band_stats_ready(&mut self, band: BandKey, stats: BandStats) -> bool {
+    pub(super) fn apply_band_stats_ready(&mut self, band: BandKey, stats: Arc<BandStats>) -> bool {
         let Some(sci) = self.matching_scientific_style_mut(band) else {
             return false;
         };
@@ -537,34 +577,30 @@ impl OverlayLayer {
         }
     }
 
-    pub(super) fn persist_entry(&self) -> Option<OverlayPersistEntry> {
+    pub(super) fn persist_entry(&self) -> OverlayPersistEntry {
         match &self.kind {
-            LayerKind::SingleRaster { asset, .. } => {
-                if let Some(path) = asset.local_path() {
-                    Some(OverlayPersistEntry::LocalRaster {
-                        path: path.to_path_buf(),
-                        visible: self.visible,
-                        opacity: self.opacity,
-                        crs_override: asset.geo().crs_override().cloned(),
-                        style: self.saved_style(),
-                    })
-                } else {
-                    let meta = asset.remote_meta()?;
-                    Some(OverlayPersistEntry::RemoteCog {
-                        canonical_url: meta.canonical_url.clone(),
-                        title: self.name.clone(),
-                        auth_mode: meta.auth_mode,
-                        external_bands: meta.external_bands.clone(),
-                        is_scl: meta.is_scl,
-                        stac_item_href: meta.stac_item_href.clone(),
-                        asset_key: meta.asset_key.clone(),
-                        visible: self.visible,
-                        opacity: self.opacity,
-                        style: self.saved_style(),
-                    })
-                }
-            }
-            LayerKind::BandMath(bm) => Some(OverlayPersistEntry::BandMath {
+            LayerKind::SingleRaster { asset, .. } => match asset.origin() {
+                LayerOrigin::Local { path } => OverlayPersistEntry::LocalRaster {
+                    path: path.clone(),
+                    visible: self.visible,
+                    opacity: self.opacity,
+                    crs_override: asset.geo().crs_override().cloned(),
+                    style: self.saved_style(),
+                },
+                LayerOrigin::Remote { meta, .. } => OverlayPersistEntry::RemoteCog {
+                    canonical_url: meta.canonical_url.clone(),
+                    title: self.name.clone(),
+                    auth_mode: meta.auth_mode,
+                    external_bands: meta.external_bands.clone(),
+                    is_scl: meta.is_scl,
+                    stac_item_href: meta.stac_item_href.clone(),
+                    asset_key: meta.asset_key.clone(),
+                    visible: self.visible,
+                    opacity: self.opacity,
+                    style: self.saved_style(),
+                },
+            },
+            LayerKind::BandMath(bm) => OverlayPersistEntry::BandMath {
                 title: self.name.clone(),
                 visible: self.visible,
                 opacity: self.opacity,
@@ -575,7 +611,7 @@ impl OverlayLayer {
                     .collect(),
                 scl: bm.scl.as_ref().map(RasterAsset::persist_band_asset),
                 style: bm.style.to_spec(),
-            }),
+            },
         }
     }
 
@@ -707,37 +743,33 @@ impl OverlayLayer {
     }
 
     pub(super) fn is_active(&self) -> bool {
-        self.visible && !self.reload.in_progress
+        self.visible && !self.reload.is_in_progress()
     }
 
     pub(super) fn is_reloading(&self) -> bool {
-        self.reload.in_progress
+        self.reload.is_in_progress()
     }
 
     pub(super) fn begin_reload(&mut self, cancel: CancelToken) -> ReloadPrep {
-        let old_cancel = self.reload.cancel.replace(cancel);
-        self.reload.seq = self.reload.seq.saturating_add(1);
-        self.reload.in_progress = true;
+        let (reload_seq, old_cancel) = self.reload.begin(cancel);
         self.clear_wanted();
         ReloadPrep {
-            reload_seq: self.reload.seq,
+            reload_seq,
             old_source: self.primary_asset().source_id(),
             old_cancel,
         }
     }
 
     pub(super) fn abort_reload(&mut self) {
-        self.reload.in_progress = false;
-        self.reload.cancel = None;
+        self.reload.clear_active();
     }
 
     pub(super) fn matches_reload_seq(&self, seq: u64) -> bool {
-        self.reload.seq == seq
+        self.reload.matches_seq(seq)
     }
 
     pub(super) fn fail_reload(&mut self, error: String) {
-        self.reload.in_progress = false;
-        self.reload.cancel = None;
+        self.reload.clear_active();
         self.last_error = Some(error);
     }
 
@@ -767,7 +799,7 @@ impl OverlayLayer {
             relaid,
         );
         replacement.pin_root = self.pin_root;
-        replacement.reload.seq = self.reload.seq;
+        replacement.reload.seq = self.reload.seq();
         if let LayerKind::SingleRaster { asset, .. } = &mut replacement.kind {
             asset.geo_mut().set_crs_override_epoch(old_epoch);
         }
@@ -776,7 +808,7 @@ impl OverlayLayer {
     }
 
     pub(super) fn take_reload_cancel(&mut self) -> Option<CancelToken> {
-        self.reload.cancel.take()
+        self.reload.take_cancel()
     }
 
     #[cfg(test)]

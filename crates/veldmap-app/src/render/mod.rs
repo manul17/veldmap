@@ -31,9 +31,9 @@ mod vector_pack;
 mod viewport;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use crate::colormap::{CategoricalPaletteId, ColormapId};
+pub use crate::band_math::BandMathFormula;
 #[cfg(any(test, feature = "test-support"))]
-pub use crate::layers::BandMathFormula;
+pub use crate::colormap::{CategoricalPaletteId, ColormapId};
 pub use bind_groups::TileBindGroupCache;
 pub use globe::{GlobeRenderer, OffscreenReadback};
 #[cfg(any(test, feature = "test-support"))]

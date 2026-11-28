@@ -60,24 +60,38 @@ fn krueger_beta(ellipsoid: Ellipsoid) -> [f64; 4] {
     ]
 }
 
+/// Tangent of the conformal latitude `tau' = tan(chi)` for geodetic latitude `phi`.
+fn conformal_tan(ellipsoid: Ellipsoid, phi: f64) -> f64 {
+    let e = ellipsoid.eccentricity_sq().sqrt();
+    let tau = phi.tan();
+    let sigma = (e * (e * tau / tau.hypot(1.0)).atanh()).sinh();
+    tau * sigma.hypot(1.0) - sigma * tau.hypot(1.0)
+}
+
+/// Dimensionless rectifying meridian arc (`M(lat) / rectifying_radius`) from
+/// the equator to `lat_deg` along the central meridian using precomputed
+/// forward Krueger coefficients `alpha`.
+fn meridian_arc_rad_with_alpha(ellipsoid: Ellipsoid, lat_deg: f64, alpha: &[f64; 4]) -> f64 {
+    if lat_deg == 0.0 {
+        return 0.0;
+    }
+    let xi0 = conformal_tan(ellipsoid, lat_deg.to_radians()).atan();
+    let mut arc = xi0;
+    for (j, a) in alpha.iter().enumerate() {
+        let k = 2.0 * (j as f64 + 1.0);
+        arc += a * (k * xi0).sin();
+    }
+    arc
+}
+
 /// Dimensionless rectifying meridian arc (`M(lat) / rectifying_radius`) from
 /// the equator to `lat_deg` along the central meridian.
 fn meridian_arc_rad(ellipsoid: Ellipsoid, lat_deg: f64) -> f64 {
     if lat_deg == 0.0 {
         return 0.0;
     }
-    let phi = lat_deg.to_radians();
-    let e = ellipsoid.eccentricity_sq().sqrt();
-    let tau = phi.tan();
-    let sigma = (e * (e * tau / tau.hypot(1.0)).atanh()).sinh();
-    let tau_c = tau * sigma.hypot(1.0) - sigma * tau.hypot(1.0);
-    let xi0 = tau_c.atan();
-    let mut arc = xi0;
-    for (j, a) in krueger_alpha(ellipsoid).iter().enumerate() {
-        let k = 2.0 * (j as f64 + 1.0);
-        arc += a * (k * xi0).sin();
-    }
-    arc
+    let alpha = krueger_alpha(ellipsoid);
+    meridian_arc_rad_with_alpha(ellipsoid, lat_deg, &alpha)
 }
 
 fn geodetic_from_conformal(e: f64, tau_c: f64, rounds: u32) -> f64 {
@@ -168,7 +182,7 @@ impl Projection {
     /// in the projection's native linear units.
     pub fn from_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
         match self {
-            Self::Transverse { system, .. } => system.from_geodetic(lat_deg, lon_deg),
+            Self::Transverse { system, .. } => system.project_from_geodetic(lat_deg, lon_deg),
             Self::WebMercator => web_mercator_xy_unchecked(
                 lat_deg.clamp(-WEB_MERCATOR_LIMIT_DEG, WEB_MERCATOR_LIMIT_DEG),
                 lon_deg,
@@ -190,7 +204,7 @@ impl Projection {
         }
         let (x, y) = match self {
             Self::WebMercator => web_mercator_from_geodetic_strict(lat_deg, lon_deg)?,
-            Self::Transverse { system, .. } => system.from_geodetic(lat_deg, lon_deg),
+            Self::Transverse { system, .. } => system.project_from_geodetic(lat_deg, lon_deg),
             Self::Proj4(proj) => proj.transform_from_wgs84_geodetic(lat_deg, lon_deg),
         };
         (x.is_finite() && y.is_finite()).then_some((x, y))
@@ -285,7 +299,7 @@ const UTM_FALSE_NORTHING_SOUTH: f64 = 10_000_000.0;
 
 impl System {
     /// WGS84 UTM zone (`number` in `1..=60`).
-    pub fn utm(number: u32, south: bool) -> Self {
+    pub(in crate::geo) fn utm(number: u32, south: bool) -> Self {
         Self {
             datum: WGS84_DATUM,
             central_meridian_deg: f64::from(number) * 6.0 - 183.0,
@@ -298,7 +312,7 @@ impl System {
     }
 
     /// Six-degree Gauss-Kruger zone on Pulkovo 1942 (`zone` in `1..=32`).
-    pub fn gauss_kruger(zone: u32) -> Self {
+    pub(super) fn gauss_kruger(zone: u32) -> Self {
         Self {
             datum: PULKOVO_1942,
             central_meridian_deg: f64::from(zone) * 6.0 - 3.0,
@@ -311,7 +325,7 @@ impl System {
     }
 
     /// Local MSK-61 (Rostov oblast) 3-degree zone (`1..=3`) on Pulkovo 1942.
-    pub fn msk61(zone: u32) -> Option<Self> {
+    pub(super) fn msk61(zone: u32) -> Option<Self> {
         let central_meridian_deg = match zone {
             1 => 37.983_333_333_33,
             2 => 40.983_333_333_33,
@@ -330,7 +344,7 @@ impl System {
     }
 
     /// Look up a transverse projection system by EPSG (or MSK-61 `633610x`) code.
-    pub fn from_epsg(code: u32) -> Option<Self> {
+    pub(super) fn from_epsg(code: u32) -> Option<Self> {
         if let Some(zone) = code
             .checked_sub(UTM_NORTH_EPSG_BASE)
             .filter(|z| UTM_ZONES.contains(z))
@@ -367,7 +381,7 @@ impl System {
     }
 
     /// Human-readable description of this Transverse Mercator system.
-    pub fn label(&self) -> String {
+    pub(super) fn label(&self) -> String {
         if self.datum.is_wgs84()
             && self.origin_lat_deg == 0.0
             && (self.scale - 0.9996).abs() < 1e-12
@@ -420,28 +434,25 @@ impl System {
 
     /// Convert WGS84 `(lat_deg, lon_deg)` to projected `(easting, northing)`
     /// in this system's linear units (`unit_to_metres`).
-    pub fn from_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
-        let (lat_deg, lon_deg) = self.datum.from_wgs84(lat_deg, lon_deg);
+    pub(in crate::geo) fn project_from_geodetic(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
+        let (lat_deg, lon_deg) = self.datum.shift_from_wgs84(lat_deg, lon_deg);
         let ellipsoid = self.datum.ellipsoid;
         let phi = lat_deg.to_radians();
         let lam = (lon_deg - self.central_meridian_deg).to_radians();
 
-        let e = ellipsoid.eccentricity_sq().sqrt();
-        let tau = phi.tan();
-        let sigma = (e * (e * tau / tau.hypot(1.0)).atanh()).sinh();
-        let tau_c = tau * sigma.hypot(1.0) - sigma * tau.hypot(1.0);
-
+        let tau_c = conformal_tan(ellipsoid, phi);
         let xi = tau_c.atan2(lam.cos());
         let eta = (lam.sin() / tau_c.hypot(lam.cos())).asinh();
 
+        let alpha = krueger_alpha(ellipsoid);
         let (mut x, mut y) = (xi, eta);
-        for (j, a) in krueger_alpha(ellipsoid).iter().enumerate() {
+        for (j, a) in alpha.iter().enumerate() {
             let k = 2.0 * (j as f64 + 1.0);
             x += a * (k * xi).sin() * (k * eta).cosh();
             y += a * (k * xi).cos() * (k * eta).sinh();
         }
 
-        let m0 = meridian_arc_rad(ellipsoid, self.origin_lat_deg);
+        let m0 = meridian_arc_rad_with_alpha(ellipsoid, self.origin_lat_deg, &alpha);
         let radius = self.scale * rectifying_radius(ellipsoid);
         let unit = self.safe_unit_to_metres();
         (
@@ -453,7 +464,7 @@ impl System {
     /// Convert projected `(easting, northing)` in this system's linear units
     /// to WGS84 `(lat_deg, lon_deg)`, unwound onto the continuous longitude
     /// branch around `central_meridian_deg`.
-    pub fn to_geodetic(&self, easting: f64, northing: f64) -> (f64, f64) {
+    pub(in crate::geo) fn to_geodetic(self, easting: f64, northing: f64) -> (f64, f64) {
         let ellipsoid = self.datum.ellipsoid;
         let unit = self.safe_unit_to_metres();
         let easting_m = easting * unit;

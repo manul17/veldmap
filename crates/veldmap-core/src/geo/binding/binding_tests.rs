@@ -42,7 +42,7 @@ fn projected_and_axial_tie_grid_fraction_inverse_round_trip() {
     ];
     let grid = TieGrid::new(&ties).expect("valid axial grid");
     assert!(grid.is_axial());
-    let gframe = Frame::from_grid(grid);
+    let gframe = Frame::from_grid_with_crs(grid, None);
     let (glat, glon) = gframe.geodetic(0.25, 0.75);
     let (gfx, gfy) = gframe.fraction_at(glat, glon).expect("inside tie grid");
     assert!((gfx - 0.25).abs() < 1e-9);
@@ -77,7 +77,7 @@ fn non_axial_tie_grid_extrapolates_pixel_is_point_borders_and_unwinds_antimeridi
     let grid = TieGrid::new(&ties).expect("valid non-axial antimeridian grid");
     assert!(grid.is_dense());
     assert!(!grid.is_axial());
-    let frame = Frame::from_grid(grid);
+    let frame = Frame::from_grid_with_crs(grid, None);
 
     // Interior and extrapolated border points (fx = 0.01, fy = 0.98) must round-trip.
     for (fx, fy) in [(0.5, 0.5), (0.2, 0.8), (0.01, 0.02), (0.99, 0.98)] {
@@ -253,7 +253,7 @@ fn pole_touching_pixel_is_point_tie_grid_is_measurable_and_clamps_outer_half_pix
         "midpoint row check should measure equatorial width, got {}",
         grid.widest_spans_m().0
     );
-    let frame = Frame::from_grid(grid);
+    let frame = Frame::from_grid_with_crs(grid, None);
     assert!(frame.measurable());
 
     // Outer extrapolated corners clamp cleanly to ±90 deg instead of folding over the pole.

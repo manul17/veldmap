@@ -305,7 +305,7 @@ fn remote_cog_streams_via_http_range_prefetch_and_excludes_local_session() {
     mgr.begin_open_remote_cog(RemoteCogRequest {
         url,
         title: "Test Remote COG".to_owned(),
-        auth_mode: crate::stac::StacCogAuthMode::None,
+        auth_mode: crate::layers::StacCogAuthMode::None,
         extra_headers: Vec::new(),
         external_bands: Vec::new(),
         is_scl: false,

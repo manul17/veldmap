@@ -24,7 +24,7 @@ fn format_to_tag(format: PixelFormat) -> Result<u8, RasterError> {
         PixelFormat::R32Float => Ok(1),
         PixelFormat::R8Uint => Ok(2),
         PixelFormat::R16Uint => Ok(3),
-        PixelFormat::Rgba8UnormSrgb => Err(RasterError::Decode(
+        PixelFormat::Rgba8UnormSrgb => Err(RasterError::Encode(
             "Lz4Raw codec is for scientific/categorical formats; use QOI for Rgba8UnormSrgb"
                 .to_owned(),
         )),
@@ -116,7 +116,7 @@ pub fn encode_lz4_raw_tile(
     out[16..20].copy_from_slice(&valid_w.to_le_bytes());
     out[20..24].copy_from_slice(&valid_h.to_le_bytes());
     let written = lz4_flex::block::compress_into(src, &mut out[HEADER_LEN..])
-        .map_err(|e| RasterError::Decode(format!("Lz4Raw compression failed: {e}")))?;
+        .map_err(|e| RasterError::Encode(format!("Lz4Raw compression failed: {e}")))?;
     out.truncate(HEADER_LEN + written);
     Ok(out)
 }

@@ -9,25 +9,17 @@
 mod budget;
 mod parse;
 mod tag_decode;
-mod tag_ids;
 mod wire;
 
 use std::sync::Arc;
 
-use veldmap_core::tile::{BandKey, PixelFormat, TileStreamSpec};
-
 use crate::RasterError;
-use crate::pipeline::{DisplayMapping, PixelLayout, SampleType};
+use crate::pipeline::{PixelLayout, SampleType};
 
 use super::ycbcr::YCbCrParams;
 
 pub(super) use budget::IfdParseBudget;
 pub(super) use parse::parse_cached_ifd;
-pub(super) use tag_ids::{
-    TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
-    TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, TAG_MODEL_TRANSFORMATION,
-    TAG_NEW_SUBFILE_TYPE,
-};
 pub(super) use wire::{IfdDirectory, SinglePassIfdReader, TiffByteOrder};
 
 /// Maximum uncompressed byte size admitted for any single TIFF strip/tile,
@@ -181,12 +173,6 @@ pub(super) struct CachedIfd {
 }
 
 impl CachedIfd {
-    /// Build the default unstretched [`DisplayMapping`] for this IFD, inverting
-    /// photometric `WhiteIsZero` samples after raw nodata checks.
-    pub(super) fn identity_display_mapping(&self, nodata: Option<f64>) -> DisplayMapping {
-        DisplayMapping::identity(nodata).with_invert(self.photometric == Photometric::WhiteIsZero)
-    }
-
     /// Approximate heap bytes retained by this cached IFD's offset/count/table arrays.
     pub(super) fn table_bytes(&self) -> u64 {
         let offsets_bytes = (self.offsets.len() as u64).saturating_mul(8);
@@ -314,81 +300,6 @@ impl CachedIfd {
     /// Explicit alpha channel index within a pixel, if present.
     pub(super) const fn alpha_channel(&self) -> Option<usize> {
         self.pixel_layout.alpha_channel()
-    }
-
-    /// Return whether Display RGBA8 rendering requires percentile stretching
-    /// (true for >8-bit / non-U8 non-palette rasters).
-    pub(super) const fn needs_display_stretch(&self) -> bool {
-        !matches!(self.sample_type, SampleType::U8)
-            && !matches!(self.photometric, Photometric::Palette)
-    }
-
-    /// TIFF planes sampled for display percentile stretching (`&[0]` for
-    /// chunky or 1-color planar, `&[0, 1, 2]` for 3-color planar).
-    pub(super) const fn stretch_planes(&self) -> &'static [usize] {
-        match (self.planar, self.pixel_layout.colors()) {
-            (PlanarConfig::Planar, 3) => &[0, 1, 2],
-            _ => &[0],
-        }
-    }
-
-    /// Resolve `band` into a validated `0..samples_per_pixel` band index.
-    pub(super) fn resolve_band_index(&self, band: BandKey) -> Result<usize, RasterError> {
-        let idx = match band {
-            BandKey::Display => 0usize,
-            BandKey::Index(i) => usize::from(i),
-            BandKey::NamedHash(_) => {
-                return Err(RasterError::Decode(
-                    "named band hash is not supported by TiffSource".to_owned(),
-                ));
-            }
-        };
-        if idx >= usize::from(self.samples_per_pixel) {
-            return Err(RasterError::Decode(format!(
-                "band index {idx} out of range for TIFF with {} samples/pixel",
-                self.samples_per_pixel
-            )));
-        }
-        Ok(idx)
-    }
-
-    /// Resolve the TIFF planes read for `spec`, shared across
-    /// [`super::chunk_reader::TiffChunkReader`] and remote COG byte-range
-    /// planners so plane selection never diverges.
-    pub(super) fn planes_for_stream(
-        &self,
-        spec: TileStreamSpec,
-    ) -> Result<Vec<usize>, RasterError> {
-        match spec.format {
-            PixelFormat::Rgba8UnormSrgb => {
-                if self.planar == PlanarConfig::Chunky {
-                    return Ok(vec![0]);
-                }
-                if self.photometric == Photometric::Palette {
-                    return Ok(match self.alpha_channel() {
-                        Some(a) => vec![0, a],
-                        None => vec![0],
-                    });
-                }
-                let (planes, len) = self.planar_display_planes();
-                Ok(planes[..len].to_vec())
-            }
-            PixelFormat::R32Float | PixelFormat::R8Uint | PixelFormat::R16Uint => {
-                let band_idx = self.resolve_band_index(spec.band)?;
-                Ok(vec![self.band_plane(band_idx)])
-            }
-        }
-    }
-
-    /// Return the planar (`PlanarConfiguration = 2`) source planes required
-    /// for non-palette Display RGBA8 rendering, avoiding heap allocation.
-    pub(super) const fn planar_display_planes(&self) -> ([usize; 4], usize) {
-        match (self.pixel_layout.colors(), self.alpha_channel()) {
-            (1, None) => ([0, 0, 0, 0], 1),
-            (1, Some(a)) => ([0, a, 0, 0], 2),
-            (_, None) => ([0, 1, 2, 0], 3),
-            (_, Some(a)) => ([0, 1, 2, a], 4),
-        }
     }
 
     /// Validate a chunk's uncompressed size, compression-bomb cap, and backing

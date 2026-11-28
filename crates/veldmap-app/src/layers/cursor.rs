@@ -10,17 +10,49 @@ use veldmap_core::sync::{CancelToken, Wakeup, lock_unpoisoned};
 use veldmap_core::tile::{BandKey, PixelFormat, SourceId};
 use veldmap_raster::{BandSample, DecodeJob, DecodeJobKey, RasterSource};
 
+use crate::band_math::BandMathFormula;
 use crate::colormap::{CategoricalPaletteId, sentinel2_scl_class_name};
 
+use super::LayerId;
 use super::asset::{RasterAsset, has_affine_scaling};
 use super::band_math::{
-    BandChannelSample, BandMathFormula, BandMathReadout, MAX_SCL_MASK_CLASSES, is_scl_class_masked,
+    BandChannelSample, BandMathReadout, is_scl_class_masked, scl_cpu_maskable_nodata_class,
 };
 use super::layer::{LayerKind, OverlayLayer};
 use super::runtime::OverlayRuntime;
 use super::stack::LayerStack;
-use super::style::LayerStyle;
-use super::{CursorReadout, CursorReadoutValue, LayerId};
+
+/// Classified value returned by a zoom-invariant CPU cursor probe.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CursorReadoutValue {
+    Rgba([u8; 4]),
+    Scalar {
+        raw: f64,
+        physical: f64,
+    },
+    Categorical {
+        class_id: u16,
+        class_name: Option<&'static str>,
+    },
+    BandMath(BandMathReadout),
+    Nodata,
+    Pending,
+    Unavailable,
+}
+
+/// Zoom-invariant CPU cursor readout for the topmost visible overlay covering
+/// the cursor position.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CursorReadout {
+    pub(crate) layer_name: String,
+    pub(crate) is_remote: bool,
+    pub(crate) pixel: (u32, u32),
+    pub(crate) source_pixel_size_m: Option<(f64, f64)>,
+    pub(crate) units: Option<String>,
+    pub(crate) has_affine_scaling: bool,
+    pub(crate) log10_db: bool,
+    pub(crate) value: CursorReadoutValue,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProbeKey {
@@ -254,11 +286,7 @@ fn make_band_probe_spec(
 ) -> BandMathBandProbeSpec {
     let spec = asset.meta().spec;
     let nodata_class_lt_32 = is_scl
-        .then(|| {
-            LayerStyle::categorical_nodata_value(asset.source().description(), spec.band)
-                .filter(|&nd| nd < MAX_SCL_MASK_CLASSES)
-                .map(|nd| nd as u16)
-        })
+        .then(|| scl_cpu_maskable_nodata_class(asset))
         .flatten();
     BandMathBandProbeSpec {
         label: asset.label().to_owned(),
@@ -557,11 +585,7 @@ impl CursorProber {
             }
         };
 
-        let pool = if is_remote {
-            &runtime.remote_pool
-        } else {
-            &runtime.fast_pool
-        };
+        let pool = runtime.pool_for_source(is_remote);
         runtime.try_submit_guarded(pool, job, false, || {
             let mut state = lock_unpoisoned(&self.cache);
             if state.active_key == Some(probe_key) {

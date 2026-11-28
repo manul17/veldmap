@@ -1,10 +1,11 @@
+use std::path::PathBuf;
+
 use super::*;
 use crate::colormap::ColormapId;
 use crate::layers::{
     BandAssetPersistEntry, BandMathFormula, BandMathPreset, BandMathStyleSpec, CrsOverride,
-    LayerStyleSpec, OverlayPersistEntry, StretchPreset,
+    LayerStyleSpec, OverlayPersistEntry, StacCogAuthMode, StretchPreset,
 };
-use crate::stac::StacCogAuthMode;
 
 #[test]
 fn session_restore_tracker_preserves_local_remote_and_band_math_across_offline_failures() {

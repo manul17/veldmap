@@ -14,12 +14,13 @@ use veldmap_core::geo::{ParsedLocation, parse_location};
 
 use crate::basemap::BasemapStatusSnapshot;
 use crate::display_name_from_path;
+use crate::format;
 use crate::storage::session::{CameraBookmark, MAX_BOOKMARKS};
 use crate::storage::settings::BasemapSelection;
 
 use super::basemap::{BasemapUiAction, show_toolbar_controls};
 use super::widgets::submitted_with_enter;
-use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR, format};
+use super::{ERROR_TEXT_COLOR, WARN_TEXT_COLOR};
 
 /// User intent emitted by the top workstation toolbar and applied by
 /// `VeldmapApp`.

@@ -16,9 +16,20 @@ use veldmap_net::HttpRangeSource;
 use veldmap_raster::{ExternalBandMeta, PyramidMeta, RasterSource};
 
 use crate::gpu_tiles::tile_format_bytes;
-use crate::stac::StacCogAuthMode;
 
 use super::{BandAssetPersistEntry, CrsOverride};
+
+/// Authentication policy for opening a remote Cloud-Optimized GeoTIFF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StacCogAuthMode {
+    /// Zero-auth public scene (built-in sample scenes).
+    None,
+    /// Inherit auth mode & catalog origin from the STAC search that produced
+    /// the displayed result list (decoupled from the live preset dropdown).
+    FromSearchResult,
+    /// Explicit user opt-in on a manually entered Direct COG URL.
+    DirectCustom,
+}
 
 /// Cohesive georeferencing, CRS override, and frustum-culling state for one
 /// [`RasterAsset`].
@@ -221,9 +232,15 @@ pub(super) struct RasterAsset {
     stream: LayerStream,
 }
 
+/// Return whether `(scale, offset)` declares a non-identity affine scaling
+/// (`scale != 1` or `offset != 0`).
+pub(super) fn is_non_identity_affine(scale: f64, offset: f64) -> bool {
+    (scale - 1.0).abs() > 1e-12 || offset.abs() > 1e-12
+}
+
 /// Return whether `info` declares a non-identity affine scaling (`scale != 1` or `offset != 0`).
 pub(super) fn has_affine_scaling(info: &veldmap_raster::BandInfo) -> bool {
-    (info.scale - 1.0).abs() > 1e-12 || info.offset.abs() > 1e-12
+    is_non_identity_affine(info.scale, info.offset)
 }
 
 impl RasterAsset {
@@ -278,6 +295,10 @@ impl RasterAsset {
         &self.label
     }
 
+    pub(super) fn origin(&self) -> &LayerOrigin {
+        &self.origin
+    }
+
     pub(super) fn local_path(&self) -> Option<&Path> {
         match &self.origin {
             LayerOrigin::Local { path } => Some(path.as_path()),
@@ -292,13 +313,6 @@ impl RasterAsset {
     pub(super) fn remote_url(&self) -> Option<&str> {
         match &self.origin {
             LayerOrigin::Remote { meta, .. } => Some(meta.display_url.as_str()),
-            LayerOrigin::Local { .. } => None,
-        }
-    }
-
-    pub(super) fn remote_meta(&self) -> Option<&RemoteAssetMeta> {
-        match &self.origin {
-            LayerOrigin::Remote { meta, .. } => Some(meta),
             LayerOrigin::Local { .. } => None,
         }
     }
@@ -379,6 +393,17 @@ impl RasterAsset {
             .description()
             .band_info(self.meta().spec.band)
             .and_then(|b| b.units.clone())
+    }
+
+    /// Return the integer nodata value declared for this asset's active band,
+    /// if finite and representable as `u32`.
+    pub(super) fn categorical_nodata_value(&self) -> Option<u32> {
+        self.source
+            .description()
+            .band_info(self.meta().spec.band)
+            .and_then(|b| b.nodata)
+            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= f64::from(u32::MAX))
+            .map(|v| v.round() as u32)
     }
 
     pub(super) fn set_active_stream(&mut self, spec: TileStreamSpec) -> Result<bool, String> {

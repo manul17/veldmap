@@ -106,12 +106,6 @@ impl SourceId {
     }
 }
 
-impl From<&SourceFingerprint> for SourceId {
-    fn from(fingerprint: &SourceFingerprint) -> Self {
-        Self::from_fingerprint(fingerprint)
-    }
-}
-
 /// Deterministic, `Copy` band selector avoiding heap allocations in `TileKey`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BandKey {

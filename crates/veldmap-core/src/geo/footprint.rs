@@ -1,4 +1,6 @@
-//! Spherical scene footprint framing (`FootprintBounds`, `frame_coords`).
+//! Spherical scene footprint framing (`FootprintBounds`, `frame_visit`).
+
+use glam::DVec3;
 
 use super::geodesy;
 
@@ -11,21 +13,46 @@ pub struct FootprintBounds {
     pub radius_deg: f64,
 }
 
-/// Compute the spherical framing circle enclosing an iterator of `(lat, lon)`
-/// degree coordinates, or `None` if empty.
-pub(in crate::geo) fn frame_coords(
-    coords: impl Iterator<Item = (f64, f64)> + Clone,
+/// Compute the spherical framing circle enclosing all `(lat, lon)` degree
+/// coordinates emitted by `visit` in two streaming passes with zero heap
+/// allocation, or `None` if empty.
+pub(in crate::geo) fn frame_visit(
+    mut visit: impl FnMut(&mut dyn FnMut(f64, f64)),
 ) -> Option<FootprintBounds> {
-    let first = coords.clone().next()?;
-    let (lat, lon) = geodesy::spherical_centroid(coords.clone()).unwrap_or(first);
-    let radius_deg = coords
-        .map(|point| geodesy::separation((lat, lon), point))
-        .fold(0.0, f64::max);
+    let mut first: Option<(f64, f64)> = None;
+    let mut sum = DVec3::ZERO;
+    visit(&mut |lat, lon| {
+        if first.is_none() {
+            first = Some((lat, lon));
+        }
+        sum += geodesy::unit(lat, lon);
+    });
+    let first = first?;
+    let (lat, lon) = if sum.length() > 1e-9 {
+        geodesy::angles(sum.normalize())
+    } else {
+        first
+    };
+    let mut radius_deg = 0.0_f64;
+    visit(&mut |p_lat, p_lon| {
+        radius_deg = radius_deg.max(geodesy::separation((lat, lon), (p_lat, p_lon)));
+    });
 
     Some(FootprintBounds {
         lat,
         lon: geodesy::unwind(0.0, lon),
         radius_deg,
+    })
+}
+
+/// Compute the spherical framing circle enclosing an iterator of `(lat, lon)`
+/// degree coordinates, or `None` if empty.
+#[cfg(test)]
+fn frame_coords(coords: impl Iterator<Item = (f64, f64)> + Clone) -> Option<FootprintBounds> {
+    frame_visit(|emit| {
+        for (lat, lon) in coords.clone() {
+            emit(lat, lon);
+        }
     })
 }
 

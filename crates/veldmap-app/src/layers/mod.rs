@@ -24,21 +24,20 @@ mod summary;
 use std::path::{Path, PathBuf};
 
 use veldmap_core::geo::FootprintBounds;
-use veldmap_core::tile::TileStreamSpec;
-use veldmap_raster::{BandStats, ExternalBandMeta};
+use veldmap_raster::ExternalBandMeta;
 
-use crate::colormap::{CategoricalPaletteId, ColormapId};
-use crate::stac::StacCogAuthMode;
-
-pub use band_math::BandMathFormula;
+pub(crate) use crate::band_math::BandMathFormula;
+pub(crate) use asset::StacCogAuthMode;
 pub(crate) use band_math::{
     BandChannelSample, BandMathPreset, BandMathReadout, BandMathStyleSpec, BandMathSummary,
 };
 pub(crate) use crs_override::CrsOverride;
+pub(crate) use cursor::{CursorReadout, CursorReadoutValue};
 pub(crate) use manager::{
     OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayManagerDeps, OverlayMutation,
 };
-pub(crate) use style::{ColorbarInfo, LayerBandOption, LayerStyleSpec, StretchPreset, TrackKind};
+pub(crate) use style::{ColorbarInfo, LayerStyleSpec, StretchPreset, TrackKind};
+pub(crate) use summary::{CategoricalSummary, LayerSummary, ScientificSummary};
 
 /// Unique identifier for a loaded overlay layer in [`stack::LayerStack`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,7 +86,7 @@ pub(crate) struct RemoteCogRequest {
     pub(crate) extra_headers: Vec<(String, String)>,
     pub(crate) external_bands: Vec<ExternalBandMeta>,
     /// When `true`, explicitly opens the asset on the `R8Uint` track with
-    /// [`CategoricalPaletteId::Sentinel2Scl`].
+    /// [`crate::colormap::CategoricalPaletteId::Sentinel2Scl`].
     pub(crate) is_scl: bool,
     pub(crate) stac_item_href: Option<String>,
     pub(crate) asset_key: Option<String>,
@@ -163,62 +162,6 @@ pub(crate) struct LocalBandMathSpec {
     pub(crate) scl: Option<LocalBandMathInput>,
 }
 
-/// Read-only scientific track summary projected into [`LayerSummary`].
-#[derive(Clone, Debug)]
-pub(crate) struct ScientificSummary {
-    pub(crate) preset: StretchPreset,
-    pub(crate) min: f64,
-    pub(crate) max: f64,
-    pub(crate) colormap: ColormapId,
-    pub(crate) invert_colormap: bool,
-    pub(crate) units: Option<String>,
-    pub(crate) scale: f64,
-    pub(crate) offset: f64,
-    pub(crate) stats: Option<BandStats>,
-    pub(crate) stats_loading: bool,
-}
-
-/// Read-only categorical track summary projected into [`LayerSummary`].
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CategoricalSummary {
-    pub(crate) palette: CategoricalPaletteId,
-    pub(crate) has_source_color_map: bool,
-    pub(crate) nodata_value: Option<u32>,
-}
-
-/// Read-only summary of an overlay layer rendered in the Layer List UI.
-#[derive(Clone, Debug)]
-pub(crate) struct LayerSummary {
-    pub(crate) id: LayerId,
-    pub(crate) name: String,
-    pub(crate) path: PathBuf,
-    pub(crate) is_remote: bool,
-    pub(crate) remote_url: Option<String>,
-    pub(crate) visible: bool,
-    pub(crate) opacity: f32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) source_pixel_size_m: Option<(f64, f64)>,
-    pub(crate) footprint: Option<FootprintBounds>,
-    pub(crate) in_flight: usize,
-    pub(crate) pass_active: bool,
-    pub(crate) reloading: bool,
-    pub(crate) crs_label: String,
-    pub(crate) datum_warning: Option<String>,
-    pub(crate) sample_info: String,
-    pub(crate) detail_limit_level: u8,
-    pub(crate) can_override_crs: bool,
-    pub(crate) has_crs_override: bool,
-    pub(crate) last_error: Option<String>,
-    pub(crate) can_move_up: bool,
-    pub(crate) can_move_down: bool,
-    pub(crate) active_spec: TileStreamSpec,
-    pub(crate) band_options: Vec<LayerBandOption>,
-    pub(crate) scientific: Option<ScientificSummary>,
-    pub(crate) categorical: Option<CategoricalSummary>,
-    pub(crate) band_math: Option<BandMathSummary>,
-}
-
 /// Constituent local or remote asset snapshot inside
 /// [`OverlayPersistEntry::BandMath`].
 #[derive(Clone, Debug)]
@@ -273,38 +216,6 @@ pub(crate) enum OverlayPersistEntry {
         scl: Option<BandAssetPersistEntry>,
         style: BandMathStyleSpec,
     },
-}
-
-/// Classified value returned by a zoom-invariant CPU cursor probe.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum CursorReadoutValue {
-    Rgba([u8; 4]),
-    Scalar {
-        raw: f64,
-        physical: f64,
-    },
-    Categorical {
-        class_id: u16,
-        class_name: Option<&'static str>,
-    },
-    BandMath(BandMathReadout),
-    Nodata,
-    Pending,
-    Unavailable,
-}
-
-/// Zoom-invariant CPU cursor readout for the topmost visible overlay covering
-/// the cursor position.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct CursorReadout {
-    pub(crate) layer_name: String,
-    pub(crate) is_remote: bool,
-    pub(crate) pixel: (u32, u32),
-    pub(crate) source_pixel_size_m: Option<(f64, f64)>,
-    pub(crate) units: Option<String>,
-    pub(crate) has_affine_scaling: bool,
-    pub(crate) log10_db: bool,
-    pub(crate) value: CursorReadoutValue,
 }
 
 /// Asynchronous result of a background local or remote raster open or reload

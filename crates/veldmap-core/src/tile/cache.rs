@@ -262,7 +262,8 @@ impl<K: Clone + Eq + Hash, V> TileCache<K, V> {
     }
 
     /// Remove `key` from the cache in O(1), returning `(value, byte_size)`.
-    pub fn remove(&mut self, key: &K) -> Option<(V, usize)> {
+    #[cfg(test)]
+    fn remove(&mut self, key: &K) -> Option<(V, usize)> {
         let (_, value, byte_size) = self.remove_entry(key)?;
         Some((value, byte_size))
     }
@@ -418,13 +419,13 @@ impl<V> TileCache<TileKey, V> {
     }
 
     /// Read-only check whether `key` or any of its coarser ancestors along
-    /// [`TileKey::parent`] is currently cached (without mutating LRU order).
+    /// `TileKey::parent` is currently cached (without mutating LRU order).
     pub fn has_carrier(&self, key: &TileKey) -> bool {
         self.find_carrier_slot(key).is_some()
     }
 
     /// Find the finest cached tile covering `key` (either `key` itself or its
-    /// nearest cached coarser ancestor via [`TileKey::parent`]), touch that
+    /// nearest cached coarser ancestor via `TileKey::parent`), touch that
     /// carrier and all of its cached ancestors up to the root, and return
     /// `(carrier_key, &value)`.
     ///

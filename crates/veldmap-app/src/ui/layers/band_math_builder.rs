@@ -206,10 +206,7 @@ pub(super) fn show_band_math_builder(
             }
         });
 
-        let slot_names: &[&str] = match state.formula {
-            BandMathFormula::RgbComposite => &["Red", "Green", "Blue"],
-            _ => &["Band A", "Band B"],
-        };
+        let slot_names = state.formula.slot_names();
         for (i, slot_name) in slot_names.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(*slot_name).small());

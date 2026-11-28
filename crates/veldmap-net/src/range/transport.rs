@@ -47,15 +47,13 @@ pub(super) struct RangeFetchRequest<'a> {
     pub(super) max_retries: usize,
     pub(super) mode: RangeFetchMode<'a>,
     #[cfg(any(test, feature = "test-support"))]
-    pub(super) request_counter: Option<&'a AtomicU64>,
+    pub(super) request_counter: &'a AtomicU64,
 }
 
 pub(super) struct RangeFetchResponse {
     pub(super) total_len: u64,
     pub(super) strong_etag: Option<String>,
     pub(super) body: Vec<u8>,
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) requests_made: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -114,8 +112,6 @@ fn handle_416_open_probe(headers: &HeaderMap) -> Result<RangeFetchResponse, Rang
             total_len: 0,
             strong_etag: etag,
             body: Vec::new(),
-            #[cfg(any(test, feature = "test-support"))]
-            requests_made: 0,
         });
     }
     Err(RangeTransportError::HttpStatus {
@@ -308,8 +304,6 @@ async fn read_range_body(
         total_len,
         strong_etag,
         body,
-        #[cfg(any(test, feature = "test-support"))]
-        requests_made: 0,
     })
 }
 
@@ -346,9 +340,7 @@ async fn execute_range_attempt(
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(counter) = req_cfg.request_counter {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
+    req_cfg.request_counter.fetch_add(1, Ordering::Relaxed);
 
     let resp_res = tokio::select! {
         biased;
@@ -404,31 +396,15 @@ pub(super) async fn fetch_range_http(
     };
 
     let mut attempt = 0usize;
-    #[cfg(any(test, feature = "test-support"))]
-    let mut requests_made = 0u64;
     loop {
         if cancel.is_cancelled() {
             return Err(RangeTransportError::Cancelled);
         }
 
         match execute_range_attempt(req_cfg, &range_hdr, cancel).await {
-            AttemptOutcome::Done(resp) => {
-                #[cfg(any(test, feature = "test-support"))]
-                let resp = {
-                    requests_made += 1;
-                    RangeFetchResponse {
-                        requests_made,
-                        ..resp
-                    }
-                };
-                return Ok(resp);
-            }
+            AttemptOutcome::Done(resp) => return Ok(resp),
             AttemptOutcome::Fatal(err) => return Err(err),
             AttemptOutcome::Retry { sleep_backoff, err } => {
-                #[cfg(any(test, feature = "test-support"))]
-                {
-                    requests_made += 1;
-                }
                 if attempt >= req_cfg.max_retries || cancel.is_cancelled() {
                     return Err(err);
                 }

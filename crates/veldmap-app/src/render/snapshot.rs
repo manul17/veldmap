@@ -7,9 +7,9 @@ use std::sync::Arc;
 use veldmap_core::geo::{Camera, Frame, VectorMesh};
 use veldmap_core::tile::{QuadTileId, QuadtreeConfig, SourceId, TileKey, VisibleTile, traverse};
 
+use crate::band_math::BandMathFormula;
 use crate::colormap::{CategoricalPaletteId, ColormapId};
 use crate::gpu_tiles::{GpuTile, GpuTileCache};
-use crate::layers::BandMathFormula;
 
 use super::graticule::adaptive_grid_step_deg;
 use super::scratch::ScratchDemand;

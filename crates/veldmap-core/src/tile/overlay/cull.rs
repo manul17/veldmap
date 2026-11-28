@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 
-use crate::geo::{Ball, CullFrustum, Frame, SEMI_MAJOR_M, sag, unwind};
+use crate::geo::{Ball, CullFrustum, Frame, sag};
 
 use super::super::pyramid::{cell_image_rect, grid_dim, level_size};
 use super::grid::{FrameGridSpec, sample_frame_grid};
@@ -174,26 +174,7 @@ pub(super) fn compute_cell_ball(
     );
 
     let max_subcell_diag_deg = sag::max_subcell_arc_deg(&normals, CULL_PROBE_SIDE);
-    let mut par_sag_m = 0.0_f64;
-    let check_parallel_step = |p0: (f64, f64), p1: (f64, f64), acc: &mut f64| {
-        let dlon = (unwind(p0.1, p1.1) - p0.1).abs().min(180.0);
-        let max_lat = p0.0.abs().max(p1.0.abs()).min(90.0);
-        let r_par = SEMI_MAJOR_M * max_lat.to_radians().cos();
-        let sag = r_par * (1.0 - (dlon * 0.5).to_radians().cos());
-        *acc = (*acc).max(sag);
-    };
-
-    for row in 0..CULL_PROBE_SIDE {
-        for col in 0..CULL_PROBE_SIDE {
-            let idx = row * CULL_PROBE_SIDE + col;
-            if col + 1 < CULL_PROBE_SIDE {
-                check_parallel_step(seen[idx], seen[idx + 1], &mut par_sag_m);
-            }
-            if row + 1 < CULL_PROBE_SIDE {
-                check_parallel_step(seen[idx], seen[idx + CULL_PROBE_SIDE], &mut par_sag_m);
-            }
-        }
-    }
+    let par_sag_m = sag::max_parallel_sag_m(&seen, CULL_PROBE_SIDE);
 
     let bulge_m = sag::subcell_bulge_m(max_subcell_diag_deg);
     Ball::over(&points).widened(bulge_m + par_sag_m)

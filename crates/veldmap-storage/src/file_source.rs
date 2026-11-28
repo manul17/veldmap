@@ -48,13 +48,16 @@ fn open_regular_file(path: &Path) -> Result<(File, Metadata), StorageError> {
     Ok((file, meta))
 }
 
-/// Safely read a regular UTF-8 text file up to `max_bytes` without a TOCTOU
+/// Safely read raw bytes from a regular file up to `max_bytes` without a TOCTOU
 /// window between metadata size checking and reading.
 ///
 /// Rejects directories, FIFOs, and device nodes before and after `File::open`,
 /// checks `file.metadata().len() <= max_bytes`, and caps the actual read via
 /// [`std::io::Read::take`] so a file growing concurrently cannot exhaust RAM.
-pub fn read_regular_file_utf8_limited(path: &Path, max_bytes: u64) -> Result<String, StorageError> {
+pub(crate) fn read_regular_file_bytes_limited(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>, StorageError> {
     use std::io::Read;
 
     let (file, meta) = open_regular_file(path)?;
@@ -76,6 +79,17 @@ pub fn read_regular_file_utf8_limited(path: &Path, max_bytes: u64) -> Result<Str
             limit_bytes: max_bytes,
         });
     }
+    Ok(bytes)
+}
+
+/// Safely read a regular UTF-8 text file up to `max_bytes` without a TOCTOU
+/// window between metadata size checking and reading.
+///
+/// Rejects directories, FIFOs, and device nodes before and after `File::open`,
+/// checks `file.metadata().len() <= max_bytes`, and caps the actual read via
+/// [`std::io::Read::take`] so a file growing concurrently cannot exhaust RAM.
+pub fn read_regular_file_utf8_limited(path: &Path, max_bytes: u64) -> Result<String, StorageError> {
+    let bytes = read_regular_file_bytes_limited(path, max_bytes)?;
     String::from_utf8(bytes)
         .map_err(|err| StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, err)))
 }

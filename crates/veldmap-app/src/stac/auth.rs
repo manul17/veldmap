@@ -3,19 +3,8 @@
 
 use veldmap_net::{StacAuth, same_http_origin};
 
+use crate::layers::StacCogAuthMode;
 use crate::storage::settings::StacSettings;
-
-/// Authentication policy for opening a remote COG from the Cloud / STAC panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StacCogAuthMode {
-    /// Zero-auth public scene (built-in sample scenes).
-    None,
-    /// Inherit auth mode & catalog origin from the STAC search that produced
-    /// the displayed result list (decoupled from the live preset dropdown).
-    FromSearchResult,
-    /// Explicit user opt-in on a manually entered Direct COG URL.
-    DirectCustom,
-}
 
 /// Return `true` if `url` already carries a cloud presigned-URL signature query
 /// parameter (AWS S3, Azure SAS, GCS) so we never double-sign or attach
@@ -74,7 +63,7 @@ pub(super) fn resolve_cog_auth(
 /// Normalize `mode` against whether the active STAC search used custom auth so
 /// public zero-auth catalog assets persist strictly as [`StacCogAuthMode::None`]
 /// and never accidentally inherit custom credentials on reload.
-pub(crate) const fn effective_persisted_auth_mode(
+pub(super) const fn effective_persisted_auth_mode(
     mode: StacCogAuthMode,
     result_uses_custom_auth: bool,
 ) -> StacCogAuthMode {

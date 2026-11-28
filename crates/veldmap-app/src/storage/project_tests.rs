@@ -1,8 +1,9 @@
 use veldmap_storage::test_support::TestTempDir;
 
 use super::*;
-use crate::layers::{BandAssetPersistEntry, BandMathStyleSpec, OverlayPersistEntry};
-use crate::stac::StacCogAuthMode;
+use crate::layers::{
+    BandAssetPersistEntry, BandMathStyleSpec, OverlayPersistEntry, StacCogAuthMode,
+};
 
 #[test]
 fn project_path_detection_distinguishes_veldmap_project_from_generic_json() {

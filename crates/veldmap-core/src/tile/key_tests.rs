@@ -204,7 +204,6 @@ fn grid_dims_sub_rect_and_coarsest_first_tie_breaking_are_deterministic() {
     let fp = SourceFingerprint::from_digest([0xAB; 32]);
     let fp_id = SourceId::from_fingerprint(&fp);
     assert_ne!(fp_id, SourceId::BUNDLED_BASEMAP);
-    assert_eq!(SourceId::from(&fp), fp_id);
 }
 
 #[test]

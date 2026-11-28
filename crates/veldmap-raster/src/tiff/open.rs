@@ -20,12 +20,17 @@ use super::gdal_meta::{GdalMetadata, parse_gdal_metadata, parse_gdal_nodata};
 use super::georef::{ParsedGeoref, RawGeoTiffTags, parse_georef};
 use super::ifd::{
     CachedIfd, IfdDirectory, IfdParseBudget, MAX_SINGLE_CHUNK_BYTES, Photometric,
-    SinglePassIfdReader, TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS,
-    TAG_GEO_DOUBLE_PARAMS, TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT,
-    TAG_MODEL_TRANSFORMATION, TAG_NEW_SUBFILE_TYPE, is_overview, parse_cached_ifd,
+    SinglePassIfdReader, is_overview, parse_cached_ifd,
 };
 use super::stretch::{BandStatsCache, StretchCache};
-use super::view::{RawTiffAccess, uniform_display_nodata};
+use super::tag_ids::{
+    TAG_GDAL_METADATA, TAG_GDAL_NODATA, TAG_GEO_ASCII_PARAMS, TAG_GEO_DOUBLE_PARAMS,
+    TAG_GEO_KEY_DIRECTORY, TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, TAG_MODEL_TRANSFORMATION,
+    TAG_NEW_SUBFILE_TYPE,
+};
+use super::view::{
+    RawTiffAccess, identity_display_mapping, needs_display_stretch, uniform_display_nodata,
+};
 use super::{MAX_IFDS, TiffSource};
 
 const BASE_METADATA_TAGS: &[u16] = &[
@@ -370,8 +375,8 @@ fn build_bands_and_stretch(
     {
         display.nodata = Some(nd);
     }
-    let initial_mapping = (!base_ifd.needs_display_stretch())
-        .then(|| base_ifd.identity_display_mapping(display_nodata));
+    let initial_mapping = (!needs_display_stretch(base_ifd))
+        .then(|| identity_display_mapping(base_ifd, display_nodata));
     BandsAndStretch {
         bands,
         per_band_nodata,
@@ -390,18 +395,6 @@ impl TiffSource {
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
         Self::open_with_options(byte_source, fingerprint, None, &[], budget, cancel)
-    }
-
-    /// Open a GeoTIFF/BigTIFF/COG with optional external [`crate::SidecarGeoref`]
-    /// (`.tfw`/`.wld` and/or `.prj` sidecar).
-    pub fn open_with_sidecar(
-        byte_source: Arc<dyn ByteSource>,
-        fingerprint: SourceFingerprint,
-        sidecar: Option<crate::sidecar::SidecarGeoref>,
-        budget: &MemoryBudget,
-        cancel: &CancelToken,
-    ) -> Result<Self, RasterError> {
-        Self::open_with_options(byte_source, fingerprint, sidecar, &[], budget, cancel)
     }
 
     /// Open a GeoTIFF/BigTIFF/COG with optional sidecar georeferencing and

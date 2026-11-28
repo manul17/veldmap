@@ -181,6 +181,18 @@ impl DecodeBudgetTracker {
         Ok(())
     }
 
+    fn grant_lease(&self, state: &mut TrackerState, bytes: u64) -> BudgetLease {
+        state.active_bytes += bytes;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            state.peak_bytes = state.peak_bytes.max(state.active_bytes);
+        }
+        BudgetLease {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        }
+    }
+
     fn try_reserve_unchecked(&self, bytes: u64) -> Option<BudgetLease> {
         let mut state = lock_unpoisoned(&self.inner.state);
         if !state.waiters.is_empty()
@@ -188,15 +200,7 @@ impl DecodeBudgetTracker {
         {
             return None;
         }
-        state.active_bytes += bytes;
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            state.peak_bytes = state.peak_bytes.max(state.active_bytes);
-        }
-        Some(BudgetLease {
-            inner: Arc::clone(&self.inner),
-            bytes,
-        })
+        Some(self.grant_lease(&mut state, bytes))
     }
 
     /// Attempt to reserve `bytes` immediately without blocking.
@@ -257,18 +261,11 @@ impl DecodeBudgetTracker {
             {
                 state.waiters.pop_front();
                 waiter_guard.ticket = None;
-                state.active_bytes += bytes;
-                #[cfg(any(test, feature = "test-support"))]
-                {
-                    state.peak_bytes = state.peak_bytes.max(state.active_bytes);
-                }
+                let lease = self.grant_lease(&mut state, bytes);
                 if !state.waiters.is_empty() {
                     self.inner.cvar.notify_all();
                 }
-                return Ok(BudgetLease {
-                    inner: Arc::clone(&self.inner),
-                    bytes,
-                });
+                return Ok(lease);
             }
             state = crate::sync::wait_unpoisoned(&self.inner.cvar, state);
         }

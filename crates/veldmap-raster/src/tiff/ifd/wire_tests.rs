@@ -1,10 +1,10 @@
 use veldmap_core::io::testing::{CountingByteSource, MemoryByteSource};
 
-use super::super::is_overview;
-use super::super::tag_ids::{
+use super::super::super::tag_ids::{
     TAG_COMPRESSION, TAG_GDAL_METADATA, TAG_IMAGE_WIDTH, TAG_MODEL_PIXEL_SCALE,
     TAG_NEW_SUBFILE_TYPE, TAG_TILE_OFFSETS,
 };
+use super::super::is_overview;
 use super::*;
 
 fn put_u16(buf: &mut Vec<u8>, order: TiffByteOrder, v: u16) {

@@ -17,11 +17,9 @@ use veldmap_net::sanitize_url_for_display;
 use veldmap_raster::ExternalBandMeta;
 
 use crate::layers::BandMathPreset;
+pub(crate) use crate::layers::StacCogAuthMode;
 
-pub(crate) use auth::{
-    AuthTrust, StacCogAuthMode, effective_persisted_auth_mode, resolve_persisted_cog_auth,
-    sanitize_imported_auth_mode,
-};
+pub(crate) use auth::{AuthTrust, resolve_persisted_cog_auth, sanitize_imported_auth_mode};
 pub(crate) use session::{StacCatalogPreset, StacSearchRequest, StacSession};
 
 /// URL string wrapper whose [`fmt::Debug`] implementation delegates to

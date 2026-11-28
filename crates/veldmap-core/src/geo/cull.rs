@@ -20,7 +20,7 @@ pub struct Ball {
 impl Ball {
     /// Construct a bounding sphere centered at the AABB midpoint of `points`
     /// (in ECEF metres).
-    pub fn over(points: &[DVec3]) -> Self {
+    pub(crate) fn over(points: &[DVec3]) -> Self {
         if points.is_empty() {
             return Self {
                 centre: DVec3::ZERO,
@@ -66,7 +66,7 @@ impl CullFrustum {
     /// Extract the four side frustum planes, the Reverse-Z near plane, and the
     /// exact WGS84 ellipsoidal tangent horizon plane from a rotation-only
     /// `DMat4` view-projection matrix and `f64` eye in ECEF metres.
-    pub fn new(view_proj: &DMat4, eye: DVec3) -> Self {
+    pub(in crate::geo) fn new(view_proj: &DMat4, eye: DVec3) -> Self {
         let (row0, row1, row2, row3) = (
             view_proj.row(0),
             view_proj.row(1),

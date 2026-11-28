@@ -74,6 +74,10 @@ impl Default for Camera {
 
 const NORTH_ALIGNED_DOT: f64 = 1.0 - 1e-12;
 
+fn half_fov_tan() -> f64 {
+    (FOV_Y_DEG * 0.5).to_radians().tan()
+}
+
 fn sanitize_aspect(aspect: f64) -> f64 {
     if aspect.is_finite() && aspect > 0.0 {
         aspect
@@ -122,7 +126,7 @@ impl Camera {
     /// Vertical focal length in pixels for a viewport of `height_px` physical
     /// pixels, derived from the camera's active vertical field of view.
     pub(crate) fn focal_length_px(&self, height_px: f64) -> f64 {
-        (height_px * 0.5) / (FOV_Y_DEG * 0.5).to_radians().tan()
+        (height_px * 0.5) / half_fov_tan()
     }
 
     /// Clockwise heading of the top of the viewport from geographic North in
@@ -167,8 +171,7 @@ impl Camera {
     /// Surface metres per pixel along the vertical axis at viewport center
     /// (true nadir ground sample distance: `2 * height_m * tan(fov_y / 2) / height_px`).
     pub fn metres_per_pixel(&self, height_px: f64) -> f64 {
-        let half_tan = (FOV_Y_DEG * 0.5).to_radians().tan();
-        (2.0 * self.height_m * half_tan) / height_px.max(1.0)
+        (2.0 * self.height_m * half_fov_tan()) / height_px.max(1.0)
     }
 
     /// Rotation-only infinite Reverse-Z view-projection matrix in `f64`
@@ -198,7 +201,7 @@ impl Camera {
         self.flight = None;
 
         let span = 2.0 * self.visible_deg();
-        let turn = (self.up * -dx + self.side() * -dy) * span;
+        let turn = (self.up * -dx + self.basis().0 * -dy) * span;
         let angle_deg = turn.length();
         if angle_deg <= 0.0 {
             return;
@@ -406,7 +409,7 @@ impl Camera {
     /// coordinates `(x, y)` where `(0, 0)` is top-left and `(1, 1)` is
     /// bottom-right. Non-positive or non-finite `aspect` falls back to `1.0`,
     /// matching [`Camera::view_projection`].
-    pub fn ray(&self, x: f64, y: f64, aspect: f64) -> (DVec3, DVec3) {
+    fn ray(&self, x: f64, y: f64, aspect: f64) -> (DVec3, DVec3) {
         let aspect = sanitize_aspect(aspect);
         let (right, above) = frame_offset((x - 0.5) * aspect, 0.5 - y);
         (self.eye_ecef(), self.look(right, above))
@@ -438,10 +441,6 @@ impl Camera {
             lon_deg,
             height_m: self.height_m,
         }
-    }
-
-    fn side(&self) -> DVec3 {
-        self.up.cross(self.at).normalize()
     }
 
     fn settle(&mut self) {
@@ -489,7 +488,7 @@ impl Camera {
 }
 
 fn frame_offset(right_share: f64, above_share: f64) -> (f64, f64) {
-    let half = (FOV_Y_DEG * 0.5).to_radians().tan();
+    let half = half_fov_tan();
     (2.0 * right_share * half, 2.0 * above_share * half)
 }
 

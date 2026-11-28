@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 
 use crate::export::CartographicOverlaySpec;
-use crate::layers::{BandMathAssetOpenSpec, CrsOverride, RemoteBandMathRequest, RemoteCogRequest};
+use crate::format;
+use crate::layers::{
+    BandMathAssetOpenSpec, CrsOverride, LayerId, OverlayEdit, RemoteBandMathRequest,
+    RemoteCogRequest,
+};
 use crate::measure::{MeasureMode, MeasureSession};
 use crate::stac::{AuthTrust, StacSession};
 use crate::storage::project::is_project_path;
@@ -15,7 +19,7 @@ use crate::storage::session::SavedCameraPose;
 use crate::storage::settings::BasemapSelection;
 use crate::ui::basemap::BasemapUiAction;
 use crate::ui::crs_picker::CrsPickerAction;
-use crate::ui::format;
+use crate::ui::hud::SwipeHudAction;
 use crate::ui::layers::{EditPersist, LayerUiAction};
 use crate::ui::measure::MeasureAction;
 use crate::ui::settings::{SettingsAction, SettingsTab};
@@ -25,8 +29,8 @@ use crate::ui::workbench::WorkbenchTab;
 use crate::vectors::VectorLayerId;
 
 use super::VeldmapApp;
-use super::dialogs::{DialogSpawnError, FileDialogEvent};
-use super::viewport_input::ViewportToolMode;
+use super::dialogs::{DialogKind, DialogSpawnError, FileDialogEvent};
+use super::viewport_input::{ViewportEvent, ViewportToolMode};
 
 impl VeldmapApp {
     /// Open a user-initiated batch of local paths (drag-and-drop, native file
@@ -93,25 +97,13 @@ impl VeldmapApp {
             .dialogs
             .spawn_save_project("workspace.veldmap.json", project, frame)
         {
-            let msg = match err {
-                DialogSpawnError::Busy => "Another file dialog is already open.",
-                DialogSpawnError::SpawnFailed => {
-                    "Unable to open native save dialog on this system."
-                }
-            };
-            self.set_status_notice(msg.to_owned());
+            self.set_status_notice(err.notice(DialogKind::Save).to_owned());
         }
     }
 
     pub(super) fn trigger_open_project_dialog(&mut self, frame: &eframe::Frame) {
         if let Err(err) = self.dialogs.spawn_open_project(frame) {
-            let msg = match err {
-                DialogSpawnError::Busy => "Another file dialog is already open.",
-                DialogSpawnError::SpawnFailed => {
-                    "Unable to open native file dialog on this system."
-                }
-            };
-            self.set_status_notice(msg.to_owned());
+            self.set_status_notice(err.notice(DialogKind::Open).to_owned());
         }
     }
 
@@ -120,13 +112,7 @@ impl VeldmapApp {
             .dialogs
             .spawn_pick_png_export_path("veldmap_export.png", frame)
         {
-            let msg = match err {
-                DialogSpawnError::Busy => "Another file dialog is already open.",
-                DialogSpawnError::SpawnFailed => {
-                    "Unable to open native save dialog on this system."
-                }
-            };
-            self.set_status_notice(msg.to_owned());
+            self.set_status_notice(err.notice(DialogKind::Save).to_owned());
         }
     }
 
@@ -243,10 +229,10 @@ impl VeldmapApp {
                     needs_repaint = true;
                 }
                 LayerUiAction::EditRaster { id, edit, persist } => {
-                    let was_persistable = self.scene.overlays().is_layer_persistable(id);
+                    let exists = self.scene.overlays().has_layer(id);
                     let changed = self.scene.edit_overlay(id, edit);
                     needs_repaint |= changed;
-                    if was_persistable {
+                    if exists {
                         session_dirty |= match persist {
                             EditPersist::OnChange => changed,
                             EditPersist::OnCommit(commit) => commit,
@@ -254,11 +240,11 @@ impl VeldmapApp {
                     }
                 }
                 LayerUiAction::SetStream(id, spec) => {
-                    let persistable = self.scene.overlays().is_layer_persistable(id);
+                    let exists = self.scene.overlays().has_layer(id);
                     match self.scene.set_overlay_stream(id, spec) {
                         Ok(changed) => {
                             needs_repaint |= changed;
-                            if persistable {
+                            if exists {
                                 session_dirty |= changed;
                             }
                         }
@@ -727,13 +713,9 @@ impl VeldmapApp {
                         self.dialogs
                             .spawn_save_geojson("measurement.geojson", payload, frame)
                 {
-                    let msg = match err {
-                        DialogSpawnError::Busy => "Another file dialog is already open.",
-                        DialogSpawnError::SpawnFailed => {
-                            "Unable to open native save dialog on this system."
-                        }
-                    };
-                    self.panels.measure.set_notice(msg.to_owned());
+                    self.panels
+                        .measure
+                        .set_notice(err.notice(DialogKind::Save).to_owned());
                 }
                 true
             }
@@ -746,6 +728,67 @@ impl VeldmapApp {
                     self.open_workbench_tab(WorkbenchTab::CloudStac);
                     self.set_status_notice("Measured polygon set as STAC AOI.".to_owned());
                 }
+                true
+            }
+        }
+    }
+
+    pub(super) fn apply_viewport_event(&mut self, ev: ViewportEvent) {
+        match ev {
+            ViewportEvent::MeasurePoint(clicked_pt) => {
+                self.scene.mutate_measure(|m| m.add_point(clicked_pt));
+                self.panels.measure.clear_notice();
+            }
+            ViewportEvent::AoiBox { bbox, finished } => {
+                if finished {
+                    self.scene
+                        .mutate_stac(|s| s.set_aoi_bbox(bbox, "Drawn Box".to_owned()));
+                    self.set_viewport_tool(ViewportToolMode::Navigate, None);
+                } else {
+                    self.scene.mutate_stac(|s| s.set_aoi_preview_bbox(bbox));
+                }
+            }
+            ViewportEvent::AoiBoxCancelled => {
+                self.set_viewport_tool(ViewportToolMode::Navigate, None);
+            }
+            ViewportEvent::SwipeSplitT { split_t, finished } => {
+                self.restore_tracker.clear_pending_swipe();
+                self.swipe.set_split_t(split_t);
+                if finished {
+                    self.persist_session_snapshot(false, &[]);
+                }
+            }
+        }
+    }
+
+    fn set_swipe_side(&mut self, is_left: bool, id: Option<LayerId>) -> bool {
+        self.restore_tracker.clear_pending_swipe();
+        let mut changed = if is_left {
+            self.swipe.set_left_layer(id)
+        } else {
+            self.swipe.set_right_layer(id)
+        };
+        if let Some(lid) = id {
+            changed |= self.scene.edit_overlay(lid, OverlayEdit::SetVisible(true));
+        }
+        if changed {
+            self.persist_session_snapshot(false, &[]);
+        }
+        changed
+    }
+
+    pub(super) fn apply_swipe_action(&mut self, act: SwipeHudAction) -> bool {
+        match act {
+            SwipeHudAction::SetLeft(id) => self.set_swipe_side(true, id),
+            SwipeHudAction::SetRight(id) => self.set_swipe_side(false, id),
+            SwipeHudAction::Swap => {
+                self.restore_tracker.clear_pending_swipe();
+                self.swipe.swap_sides();
+                self.persist_session_snapshot(false, &[]);
+                true
+            }
+            SwipeHudAction::Close => {
+                self.set_viewport_tool(ViewportToolMode::Navigate, None);
                 true
             }
         }

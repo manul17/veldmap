@@ -14,7 +14,6 @@ use veldmap_raster::{
 };
 
 use crate::colormap::{CategoricalPaletteId, ColormapId};
-use crate::render::DrawOverlayTrack;
 
 /// High-level track classification for a selectable raster stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +74,7 @@ enum BandStatsState {
         job_id: u64,
         cancel: CancelToken,
     },
-    Ready(Box<BandStats>),
+    Ready(Arc<BandStats>),
     /// Stats job completed and confirmed no finite samples (or unsupported).
     Empty,
 }
@@ -108,6 +107,15 @@ impl Default for ScientificStyle {
     }
 }
 
+/// Ensure `max` is strictly greater than `min` with a scale-appropriate floor.
+pub(super) fn ensure_non_degenerate_max(min: f64, max: f64) -> f64 {
+    if max > min {
+        max
+    } else {
+        min + min.abs().max(1.0) * 1e-6
+    }
+}
+
 /// Validate, non-degenerate-clamp, and compare a requested stretch `[min, max]`
 /// against `(cur_min, cur_max)`. Returns `Some((lo, hi))` only when finite and
 /// meaningfully different from the current bounds.
@@ -120,11 +128,8 @@ pub(super) fn normalize_stretch_range(
     if !min.is_finite() || !max.is_finite() {
         return None;
     }
-    let (lo, hi) = if max > min {
-        (min, max)
-    } else {
-        (min, min + min.abs().max(1.0) * 1e-6)
-    };
+    let lo = min;
+    let hi = ensure_non_degenerate_max(min, max);
     let eps = lo.abs().max(hi.abs()).max(1e-30) * 1e-12;
     if (cur_min - lo).abs() <= eps && (cur_max - hi).abs() <= eps {
         return None;
@@ -133,7 +138,7 @@ pub(super) fn normalize_stretch_range(
 }
 
 impl ScientificStyle {
-    pub(super) fn stats(&self) -> Option<&BandStats> {
+    pub(super) fn stats(&self) -> Option<&Arc<BandStats>> {
         match &self.stats_state {
             BandStatsState::Ready(stats) => Some(stats),
             _ => None,
@@ -169,11 +174,11 @@ impl ScientificStyle {
 
     /// Apply newly computed [`BandStats`] to the stretch bounds unless the user
     /// already pinned a custom range, cancelling any superseded in-flight token.
-    pub(super) fn apply_ready(&mut self, stats: BandStats) {
+    pub(super) fn apply_ready(&mut self, stats: Arc<BandStats>) {
         if let BandStatsState::Loading { cancel, .. } = &self.stats_state {
             cancel.cancel();
         }
-        self.stats_state = BandStatsState::Ready(Box::new(stats));
+        self.stats_state = BandStatsState::Ready(stats);
         if !self.custom_range_applied {
             self.recompute_bounds_from_stats();
         }
@@ -379,6 +384,10 @@ impl LayerStyle {
         self.custom_color_map.is_some()
     }
 
+    pub(super) fn custom_color_map(&self) -> Option<&Arc<[[u8; 4]]>> {
+        self.custom_color_map.as_ref()
+    }
+
     pub(super) fn band_options(&self) -> &[LayerBandOption] {
         &self.band_options
     }
@@ -408,43 +417,6 @@ impl LayerStyle {
         }
         self.categorical.palette = palette;
         true
-    }
-
-    pub(super) fn categorical_nodata_value(desc: &RasterDescription, band: BandKey) -> Option<u32> {
-        desc.band_info(band)
-            .and_then(|b| b.nodata)
-            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= f64::from(u32::MAX))
-            .map(|v| v.round() as u32)
-    }
-
-    pub(super) fn draw_track(
-        &self,
-        source: &dyn RasterSource,
-        spec: TileStreamSpec,
-    ) -> DrawOverlayTrack {
-        let desc = source.description();
-        let band_info = desc.band_info(spec.band);
-        match spec.format {
-            PixelFormat::Rgba8UnormSrgb => DrawOverlayTrack::Display,
-            PixelFormat::R32Float => {
-                let (scale, offset) = band_info.map_or((1.0, 0.0), |b| (b.scale, b.offset));
-                DrawOverlayTrack::Scientific {
-                    scale: scale as f32,
-                    offset: offset as f32,
-                    stretch_min: self.scientific.min as f32,
-                    stretch_max: self.scientific.max as f32,
-                    log10_db: self.scientific.preset.is_log10_db(),
-                    colormap: self.scientific.colormap,
-                    invert_colormap: self.scientific.invert_colormap,
-                }
-            }
-            PixelFormat::R8Uint | PixelFormat::R16Uint => DrawOverlayTrack::Categorical {
-                source: source.source_id(),
-                palette: self.categorical.palette,
-                custom_color_map: self.custom_color_map.clone(),
-                nodata_value: Self::categorical_nodata_value(desc, spec.band),
-            },
-        }
     }
 
     pub(super) fn saved_style(

@@ -16,7 +16,7 @@ use super::super::stack::{LayerStack, OverlayLayer};
 use super::prefetch_coalesced_ranges;
 
 enum BandStatsOutcome {
-    Ready(Box<BandStats>),
+    Ready(Arc<BandStats>),
     Empty,
     Cancelled,
 }
@@ -40,11 +40,42 @@ fn compute_band_stats_outcome(
     }
     let ctx = rt.decode_context(cancel);
     match source.band_stats(band, &ctx) {
-        Ok(Some(stats)) => BandStatsOutcome::Ready(Box::new(stats)),
+        Ok(Some(stats)) => BandStatsOutcome::Ready(Arc::new(stats)),
         Ok(None) => BandStatsOutcome::Empty,
         Err(RasterError::Cancelled) => BandStatsOutcome::Cancelled,
         Err(_) if cancel.is_cancelled() => BandStatsOutcome::Cancelled,
         Err(_) => BandStatsOutcome::Empty,
+    }
+}
+
+fn build_stats_decode_job(
+    source: Arc<dyn RasterSource>,
+    rt: Arc<OverlayRuntime>,
+    cancel: CancelToken,
+    pin: Option<veldmap_net::PrefetchPin>,
+    guard: StatsCompletionGuard,
+) -> DecodeJob {
+    let source_id = guard.source_id;
+    let band = guard.band;
+    let layer_tag = guard.layer_id.0;
+    let job_cancel = cancel.clone();
+    DecodeJob {
+        key: DecodeJobKey::BandStats {
+            source: source_id,
+            band,
+            layer_tag,
+        },
+        queued_bytes: 16 * 1024,
+        cancel,
+        work: Box::new(move || {
+            let _pin = pin;
+            guard.finish(compute_band_stats_outcome(
+                &rt,
+                source.as_ref(),
+                band,
+                &job_cancel,
+            ));
+        }),
     }
 }
 
@@ -154,28 +185,9 @@ fn spawn_remote_band_stats(
         // Route remote band_stats strictly to `remote_pool` (never `fast_pool`).
         // On rejection, send `Cancelled` rather than silently disarming so
         // `BandStatsState` returns to `NotRequested` and retries cleanly.
-        let job_rt = Arc::clone(&rt);
-        let job_cancel = cancel.clone();
         let reject_tx = guard.tx.clone();
         let reject_wakeup = Arc::clone(&guard.wakeup);
-        let job = DecodeJob {
-            key: DecodeJobKey::BandStats {
-                source: source_id,
-                band,
-                layer_tag: id.0,
-            },
-            queued_bytes: 16 * 1024,
-            cancel,
-            work: Box::new(move || {
-                let _pin = pin;
-                guard.finish(compute_band_stats_outcome(
-                    &job_rt,
-                    source.as_ref(),
-                    band,
-                    &job_cancel,
-                ));
-            }),
-        };
+        let job = build_stats_decode_job(source, Arc::clone(&rt), cancel, pin, guard);
         let disarm_on_reject = Arc::clone(&disarmed);
         let _ = rt.try_submit_guarded(&rt.remote_pool, job, true, move || {
             disarm_on_reject.store(true, Ordering::Release);
@@ -193,9 +205,6 @@ fn spawn_remote_band_stats(
 
 fn submit_direct_band_stats(params: StatsJobParams) -> bool {
     let StatsJobParams {
-        id,
-        source_id,
-        band,
         source,
         cancel,
         rt,
@@ -204,32 +213,10 @@ fn submit_direct_band_stats(params: StatsJobParams) -> bool {
         ..
     } = params;
     let is_remote = source.is_remote();
-    let job_rt = Arc::clone(&rt);
-    let job_cancel = cancel.clone();
-    let job = DecodeJob {
-        key: DecodeJobKey::BandStats {
-            source: source_id,
-            band,
-            layer_tag: id.0,
-        },
-        queued_bytes: 16 * 1024,
-        cancel,
-        work: Box::new(move || {
-            guard.finish(compute_band_stats_outcome(
-                &job_rt,
-                source.as_ref(),
-                band,
-                &job_cancel,
-            ));
-        }),
-    };
+    let job = build_stats_decode_job(source, Arc::clone(&rt), cancel, None, guard);
     // Preserve pool isolation (`docs/decisions.md` §11): a remote source
     // without an async prefetch handle still routes to `remote_pool`.
-    let pool = if is_remote {
-        &rt.remote_pool
-    } else {
-        &rt.fast_pool
-    };
+    let pool = rt.pool_for_source(is_remote);
     let disarm_on_reject = Arc::clone(&disarmed);
     rt.try_submit_guarded(pool, job, true, move || {
         disarm_on_reject.store(true, Ordering::Release);
@@ -325,7 +312,7 @@ impl BandStatsTracker {
                         if layer
                             .single_asset()
                             .is_some_and(|a| a.source_id() == msg.source_id)
-                            && layer.apply_band_stats_ready(msg.band, (*stats).clone())
+                            && layer.apply_band_stats_ready(msg.band, Arc::clone(&stats))
                         {
                             changed = true;
                         }

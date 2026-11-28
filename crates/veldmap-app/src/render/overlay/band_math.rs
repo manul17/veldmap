@@ -7,6 +7,7 @@ use std::sync::Arc;
 use veldmap_core::glam::DVec3;
 use veldmap_core::tile::PixelFormat;
 
+use crate::band_math::clamp_rgb_gamma;
 use crate::colormap::ColormapId;
 use crate::gpu_tiles::GpuTile;
 
@@ -85,100 +86,82 @@ pub(super) struct BandMathUniformCtx<'a> {
     pub(super) height: u32,
 }
 
-pub(super) fn push_band_math_uniforms(
-    ctx: &BandMathUniformCtx<'_>,
+fn push_mrt_uniforms(
+    meshes: &OverlayMeshPool,
     arena: &mut DynamicUniformArena,
-    layer_id: u64,
+    eye: DVec3,
     bm: &DrawBandMathLayer,
-    use_mrt: bool,
-    opacity: f32,
-    swipe: Option<ResolvedSwipe>,
-) -> PreparedBandMath {
-    let meshes = ctx.meshes;
-    let snapshot = ctx.snapshot;
-    let eye = ctx.eye;
-    let width = ctx.width;
-    let height = ctx.height;
-    let has_required_bands = bm.bands.len() >= bm.formula.required_bands();
-    let projected_scissor = has_required_bands
-        .then(|| compute_band_math_scissor_rect(&snapshot.camera, width, height, bm))
-        .flatten();
-    let scissor = match (projected_scissor, swipe) {
-        (Some(proj), Some(sw)) => sw
-            .scissor_for_layer(layer_id, width, height)
-            .and_then(|half| intersect_scissor_rects(proj, half)),
-        (proj, None) => proj,
-        (None, _) => None,
-    };
-    if scissor.is_none() {
-        return PreparedBandMath {
-            scissor: None,
-            mrt_patch_offsets: None,
-            per_band_offsets: Vec::new(),
-            mask_offsets: Vec::new(),
-            composite_offset: None,
-            colormap: bm.colormap,
-        };
+) -> Vec<Option<u32>> {
+    let first = &bm.bands[0];
+    let mut offsets = Vec::with_capacity(first.patches.len());
+    for (patch_idx, patch) in first.patches.iter().enumerate() {
+        let off = meshes.peek(&patch.mesh_key).map(|mesh| {
+            let offset_eye = (mesh.origin_ecef_m - eye).as_vec3().to_array();
+            let mut uv_rects = [[0.0f32; 4]; 4];
+            let mut scale_offsets = [[1.0f32, 0.0, 0.0, 0.0]; 4];
+            let mut mip_counts = [1u32; 4];
+            for (b_idx, band) in bm.bands.iter().take(4).enumerate() {
+                if let Some(bp) = band.patches.get(patch_idx) {
+                    uv_rects[b_idx] = bp.uv_rect;
+                    let (sc, of) = sanitize_scale_offset(band.scale, band.offset);
+                    scale_offsets[b_idx] = [sc, of, 0.0, 0.0];
+                    mip_counts[b_idx] = bp.texture.mip_level_count.max(1);
+                }
+            }
+            arena.push(&ScratchMrtPatchUniform {
+                offset_eye,
+                nan_bits: QUIET_NAN_BITS,
+                uv_rects,
+                scale_offsets,
+                mip_counts,
+            })
+        });
+        offsets.push(off);
     }
+    offsets
+}
 
-    let (mrt_patch_offsets, per_band_offsets) = if use_mrt {
-        let first = &bm.bands[0];
-        let mut offsets = Vec::with_capacity(first.patches.len());
-        for (patch_idx, patch) in first.patches.iter().enumerate() {
+fn push_per_band_uniforms(
+    meshes: &OverlayMeshPool,
+    arena: &mut DynamicUniformArena,
+    eye: DVec3,
+    bm: &DrawBandMathLayer,
+) -> Vec<Vec<Option<u32>>> {
+    let mut all_band_offs = Vec::with_capacity(bm.bands.len());
+    for band in &bm.bands {
+        let (sc, of) = sanitize_scale_offset(band.scale, band.offset);
+        let mut b_offs = Vec::with_capacity(band.patches.len());
+        for patch in &band.patches {
             let off = meshes.peek(&patch.mesh_key).map(|mesh| {
                 let offset_eye = (mesh.origin_ecef_m - eye).as_vec3().to_array();
-                let mut uv_rects = [[0.0f32; 4]; 4];
-                let mut scale_offsets = [[1.0f32, 0.0, 0.0, 0.0]; 4];
-                let mut mip_counts = [1u32; 4];
-                for (b_idx, band) in bm.bands.iter().take(4).enumerate() {
-                    if let Some(bp) = band.patches.get(patch_idx) {
-                        uv_rects[b_idx] = bp.uv_rect;
-                        let (sc, of) = sanitize_scale_offset(band.scale, band.offset);
-                        scale_offsets[b_idx] = [sc, of, 0.0, 0.0];
-                        mip_counts[b_idx] = bp.texture.mip_level_count.max(1);
-                    }
-                }
-                arena.push(&ScratchMrtPatchUniform {
+                arena.push(&ScratchSinglePatchUniform {
                     offset_eye,
-                    nan_bits: QUIET_NAN_BITS,
-                    uv_rects,
-                    scale_offsets,
-                    mip_counts,
+                    scale: sc,
+                    uv_rect: patch.uv_rect,
+                    offset: of,
+                    mip_count: patch.texture.mip_level_count.max(1),
+                    has_nodata: 0,
+                    nodata_value: 0,
                 })
             });
-            offsets.push(off);
+            b_offs.push(off);
         }
-        (Some(offsets), Vec::new())
-    } else {
-        let mut all_band_offs = Vec::with_capacity(bm.bands.len());
-        for band in &bm.bands {
-            let (sc, of) = sanitize_scale_offset(band.scale, band.offset);
-            let mut b_offs = Vec::with_capacity(band.patches.len());
-            for patch in &band.patches {
-                let off = meshes.peek(&patch.mesh_key).map(|mesh| {
-                    let offset_eye = (mesh.origin_ecef_m - eye).as_vec3().to_array();
-                    arena.push(&ScratchSinglePatchUniform {
-                        offset_eye,
-                        scale: sc,
-                        uv_rect: patch.uv_rect,
-                        offset: of,
-                        mip_count: patch.texture.mip_level_count.max(1),
-                        has_nodata: 0,
-                        nodata_value: 0,
-                    })
-                });
-                b_offs.push(off);
-            }
-            all_band_offs.push(b_offs);
-        }
-        (None, all_band_offs)
-    };
+        all_band_offs.push(b_offs);
+    }
+    all_band_offs
+}
 
-    let mut mask_offsets = Vec::new();
+fn push_mask_uniforms(
+    meshes: &OverlayMeshPool,
+    arena: &mut DynamicUniformArena,
+    eye: DVec3,
+    bm: &DrawBandMathLayer,
+) -> (Vec<Option<u32>>, bool) {
     let has_active_mask = bm
         .scl
         .as_ref()
         .is_some_and(|m| bm.scl_mask_enabled && !m.patches.is_empty());
+    let mut mask_offsets = Vec::new();
     if has_active_mask && let Some(scl) = &bm.scl {
         let has_nodata = u32::from(scl.nodata_value.is_some());
         let nodata_value = scl.nodata_value.unwrap_or(0);
@@ -199,18 +182,21 @@ pub(super) fn push_band_math_uniforms(
             mask_offsets.push(off);
         }
     }
+    (mask_offsets, has_active_mask)
+}
 
+fn push_composite_uniform(
+    arena: &mut DynamicUniformArena,
+    bm: &DrawBandMathLayer,
+    opacity: f32,
+    has_active_mask: bool,
+) -> u32 {
     let (stretch_min, stretch_inv_range) = safe_inv_range(bm.stretch_min, bm.stretch_max);
     let (r_min, r_inv) = safe_inv_range(bm.rgb_min[0], bm.rgb_max[0]);
     let (g_min, g_inv) = safe_inv_range(bm.rgb_min[1], bm.rgb_max[1]);
     let (b_min, b_inv) = safe_inv_range(bm.rgb_min[2], bm.rgb_max[2]);
-    let safe_gamma = if bm.rgb_gamma.is_finite() {
-        bm.rgb_gamma.clamp(0.2, 4.0)
-    } else {
-        1.0
-    };
-    let inv_gamma = 1.0 / safe_gamma;
-    let composite_offset = arena.push(&BandMathCompositeUniform {
+    let inv_gamma = 1.0 / clamp_rgb_gamma(bm.rgb_gamma);
+    arena.push(&BandMathCompositeUniform {
         opacity,
         mode: bm.formula.shader_mode(),
         stretch_min,
@@ -221,7 +207,50 @@ pub(super) fn push_band_math_uniforms(
         scl_mask_enabled: u32::from(has_active_mask),
         scl_mask_bits: bm.scl_mask_bits,
         _pad0: 0,
-    });
+    })
+}
+
+pub(super) fn push_band_math_uniforms(
+    ctx: &BandMathUniformCtx<'_>,
+    arena: &mut DynamicUniformArena,
+    layer_id: u64,
+    bm: &DrawBandMathLayer,
+    use_mrt: bool,
+    opacity: f32,
+    swipe: Option<ResolvedSwipe>,
+) -> PreparedBandMath {
+    let has_required_bands = bm.bands.len() >= bm.formula.required_bands();
+    let projected_scissor = has_required_bands
+        .then(|| compute_band_math_scissor_rect(&ctx.snapshot.camera, ctx.width, ctx.height, bm))
+        .flatten();
+    let scissor = match (projected_scissor, swipe) {
+        (Some(proj), Some(sw)) => sw
+            .scissor_for_layer(layer_id, ctx.width, ctx.height)
+            .and_then(|half| intersect_scissor_rects(proj, half)),
+        (proj, None) => proj,
+        (None, _) => None,
+    };
+    if scissor.is_none() {
+        return PreparedBandMath {
+            scissor: None,
+            mrt_patch_offsets: None,
+            per_band_offsets: Vec::new(),
+            mask_offsets: Vec::new(),
+            composite_offset: None,
+            colormap: bm.colormap,
+        };
+    }
+
+    let (mrt_patch_offsets, per_band_offsets) = if use_mrt {
+        (
+            Some(push_mrt_uniforms(ctx.meshes, arena, ctx.eye, bm)),
+            Vec::new(),
+        )
+    } else {
+        (None, push_per_band_uniforms(ctx.meshes, arena, ctx.eye, bm))
+    };
+    let (mask_offsets, has_active_mask) = push_mask_uniforms(ctx.meshes, arena, ctx.eye, bm);
+    let composite_offset = push_composite_uniform(arena, bm, opacity, has_active_mask);
 
     PreparedBandMath {
         scissor,

@@ -106,6 +106,41 @@ pub(super) struct ScratchTargetPool {
     allocated: Option<AllocatedScratch>,
 }
 
+fn create_dummy_1x1_view(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    format: wgpu::TextureFormat,
+    texel_bytes: &[u8],
+) -> wgpu::TextureView {
+    let size = wgpu::Extent3d {
+        width: 1,
+        height: 1,
+        depth_or_array_layers: 1,
+    };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        tex.as_image_copy(),
+        texel_bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(texel_bytes.len() as u32),
+            rows_per_image: Some(1),
+        },
+        size,
+    );
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 impl ScratchTargetPool {
     pub(super) fn new(
         device: &wgpu::Device,
@@ -132,65 +167,20 @@ impl ScratchTargetPool {
             }],
         });
 
-        let dummy_float_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("scratch 1x1 dummy R32Float"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            dummy_float_tex.as_image_copy(),
+        let dummy_float_view = create_dummy_1x1_view(
+            device,
+            queue,
+            "scratch 1x1 dummy R32Float",
+            wgpu::TextureFormat::R32Float,
             &QUIET_NAN_BITS.to_ne_bytes(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
         );
-        let dummy_float_view = dummy_float_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let dummy_mask_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("scratch 1x1 dummy R8Uint"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            dummy_mask_tex.as_image_copy(),
+        let dummy_mask_view = create_dummy_1x1_view(
+            device,
+            queue,
+            "scratch 1x1 dummy R8Uint",
+            wgpu::TextureFormat::R8Uint,
             &[MASK_UNCOVERED_SENTINEL],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(1),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
         );
-        let dummy_mask_view = dummy_mask_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         Self {
             _nan_clear_buffer: nan_clear_buffer,

@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use veldmap_core::geo::{Camera, CustomTmParams};
+use veldmap_core::geo::Camera;
 use veldmap_net::sanitize_url_for_persistence;
 use veldmap_raster::ExternalBandMeta;
 use veldmap_storage::{
@@ -13,12 +13,14 @@ use veldmap_storage::{
 };
 
 use crate::clamp_opacity;
-use crate::colormap::{CategoricalPaletteId, ColormapId};
 use crate::layers::{
-    BandAssetPersistEntry, BandMathFormula, BandMathPreset, BandMathStyleSpec, CrsOverride,
-    LayerStyleSpec, OverlayPersistEntry, StretchPreset, TrackKind,
+    BandAssetPersistEntry, CrsOverride, LayerStyleSpec, OverlayPersistEntry, StacCogAuthMode,
 };
-use crate::stac::StacCogAuthMode;
+
+use super::wire::{
+    SavedBandMathStyle, SavedCrsOverride, SavedExternalBandMeta, SavedLayerStyle,
+    WireStacCogAuthMode, deserialize_lossy_opt,
+};
 
 /// Current on-disk schema version for `session.json` (tagged `open_layers`,
 /// sanitized remote COGs & `BandMath`, vector `outline_only`, and `swipe`).
@@ -30,21 +32,6 @@ const MAX_RECENT_FILES: usize = 16;
 /// Maximum number of camera bookmarks kept in `session.json`.
 pub(crate) const MAX_BOOKMARKS: usize = 64;
 
-/// Forward-compatible `Option<T>` deserializer for string-encoded style enums:
-/// unknown variants written by newer versions fall back to `None` instead of
-/// failing the entire `session.json` load into `.corrupt`.
-fn deserialize_lossy_opt<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: for<'a> Deserialize<'a>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw.and_then(|s| {
-        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&s);
-        T::deserialize(de).ok()
-    }))
-}
-
 fn default_true() -> bool {
     true
 }
@@ -55,334 +42,6 @@ fn default_one_f32() -> f32 {
 
 fn default_half_f32() -> f32 {
     0.5
-}
-
-macro_rules! wire_enum {
-    ($wire:ident <-> $domain:ident { $($variant:ident),+ $(,)? }) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        pub(crate) enum $wire {
-            $($variant,)+
-        }
-
-        impl From<$domain> for $wire {
-            fn from(value: $domain) -> Self {
-                match value {
-                    $($domain::$variant => Self::$variant,)+
-                }
-            }
-        }
-
-        impl From<$wire> for $domain {
-            fn from(value: $wire) -> Self {
-                match value {
-                    $($wire::$variant => Self::$variant,)+
-                }
-            }
-        }
-    };
-}
-
-wire_enum!(WireTrackKind <-> TrackKind {
-    Display,
-    Scientific,
-    Categorical,
-});
-
-wire_enum!(WireStretchPreset <-> StretchPreset {
-    Percentile2_98,
-    MinMax,
-    Log10Db,
-    Custom,
-});
-
-wire_enum!(WireColormapId <-> ColormapId {
-    Grayscale,
-    Viridis,
-    Inferno,
-    Plasma,
-    Turbo,
-    RdBu,
-    RdYlGn,
-    BrBG,
-    Terrain,
-});
-
-wire_enum!(WireCategoricalPaletteId <-> CategoricalPaletteId {
-    SourceColorMap,
-    Sentinel2Scl,
-    DistinctClasses,
-});
-
-wire_enum!(WireStacCogAuthMode <-> StacCogAuthMode {
-    None,
-    FromSearchResult,
-    DirectCustom,
-});
-
-wire_enum!(WireBandMathFormula <-> BandMathFormula {
-    NormalizedDiff,
-    Difference,
-    Ratio,
-    RgbComposite,
-});
-
-wire_enum!(WireBandMathPreset <-> BandMathPreset {
-    TrueColor,
-    Ndvi,
-    Ndwi,
-    Nbr,
-    Ndsi,
-    FalseColorNir,
-    Swir,
-    CustomNormalizedDiff,
-    CustomDifference,
-    CustomRatio,
-    CustomRgb,
-});
-
-/// Forward-compatible `session.json` wire proxy for [`LayerStyleSpec`].
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-struct SavedLayerStyle {
-    band_index: Option<u16>,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
-    track: Option<WireTrackKind>,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
-    stretch_preset: Option<WireStretchPreset>,
-    stretch_min: Option<f64>,
-    stretch_max: Option<f64>,
-    #[serde(default)]
-    custom_stretch_range: bool,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
-    colormap: Option<WireColormapId>,
-    invert_colormap: bool,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
-    categorical_palette: Option<WireCategoricalPaletteId>,
-}
-
-impl From<&LayerStyleSpec> for SavedLayerStyle {
-    fn from(spec: &LayerStyleSpec) -> Self {
-        Self {
-            band_index: spec.band_index,
-            track: spec.track.map(WireTrackKind::from),
-            stretch_preset: spec.stretch_preset.map(WireStretchPreset::from),
-            stretch_min: spec.stretch_min,
-            stretch_max: spec.stretch_max,
-            custom_stretch_range: spec.custom_stretch_range,
-            colormap: spec.colormap.map(WireColormapId::from),
-            invert_colormap: spec.invert_colormap,
-            categorical_palette: spec.categorical_palette.map(WireCategoricalPaletteId::from),
-        }
-    }
-}
-
-impl From<&SavedLayerStyle> for LayerStyleSpec {
-    fn from(saved: &SavedLayerStyle) -> Self {
-        Self {
-            band_index: saved.band_index,
-            track: saved.track.map(TrackKind::from),
-            stretch_preset: saved.stretch_preset.map(StretchPreset::from),
-            stretch_min: saved.stretch_min,
-            stretch_max: saved.stretch_max,
-            custom_stretch_range: saved.custom_stretch_range,
-            colormap: saved.colormap.map(ColormapId::from),
-            invert_colormap: saved.invert_colormap,
-            categorical_palette: saved.categorical_palette.map(CategoricalPaletteId::from),
-        }
-    }
-}
-
-/// Persisted per-band radiometric metadata (`scale`, `offset`, `nodata`, `unit`).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct SavedExternalBandMeta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) scale: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) offset: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) nodata: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unit: Option<String>,
-}
-
-impl From<&ExternalBandMeta> for SavedExternalBandMeta {
-    fn from(m: &ExternalBandMeta) -> Self {
-        Self {
-            scale: m.scale.filter(|v| v.is_finite()),
-            offset: m.offset.filter(|v| v.is_finite()),
-            nodata: m.nodata.filter(|v| v.is_finite()),
-            unit: m.unit.clone(),
-        }
-    }
-}
-
-impl From<&SavedExternalBandMeta> for ExternalBandMeta {
-    fn from(m: &SavedExternalBandMeta) -> Self {
-        Self {
-            scale: m.scale.filter(|v| v.is_finite()),
-            offset: m.offset.filter(|v| v.is_finite()),
-            nodata: m.nodata.filter(|v| v.is_finite()),
-            unit: m.unit.clone(),
-        }
-    }
-}
-
-/// Minimal serde proxy preserving the exact flat `session.json` wire format
-/// (`{"kind": "...", ...}`) for [`CrsOverride`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum SavedCrsOverride {
-    Epsg { code: u32 },
-    Wkt { wkt: String },
-    Proj { proj: String },
-    CustomTm(CustomTmParams),
-}
-
-impl From<&CrsOverride> for SavedCrsOverride {
-    fn from(ov: &CrsOverride) -> Self {
-        match ov {
-            CrsOverride::Epsg(code) => Self::Epsg { code: *code },
-            CrsOverride::Wkt(wkt) => Self::Wkt { wkt: wkt.clone() },
-            CrsOverride::Proj(proj) => Self::Proj { proj: proj.clone() },
-            CrsOverride::CustomTm(params) => Self::CustomTm(params.clone()),
-        }
-    }
-}
-
-impl From<&SavedCrsOverride> for CrsOverride {
-    fn from(saved: &SavedCrsOverride) -> Self {
-        match saved {
-            SavedCrsOverride::Epsg { code } => Self::Epsg(*code),
-            SavedCrsOverride::Wkt { wkt } => Self::Wkt(wkt.clone()),
-            SavedCrsOverride::Proj { proj } => Self::Proj(proj.clone()),
-            SavedCrsOverride::CustomTm(params) => Self::CustomTm(params.clone()),
-        }
-    }
-}
-
-/// Persisted style payload for a `BandMath` layer.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct SavedBandMathStyle {
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
-    preset: Option<WireBandMathPreset>,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
-    formula: Option<WireBandMathFormula>,
-    recipe_label: String,
-    #[serde(deserialize_with = "deserialize_lossy_opt")]
-    colormap: Option<WireColormapId>,
-    invert_colormap: bool,
-    stretch_min: f64,
-    stretch_max: f64,
-    rgb_min: [f64; 3],
-    rgb_max: [f64; 3],
-    default_rgb_min: [f64; 3],
-    default_rgb_max: [f64; 3],
-    rgb_gamma: f32,
-    scl_mask_enabled: bool,
-    scl_mask_bits: u32,
-}
-
-impl Default for SavedBandMathStyle {
-    fn default() -> Self {
-        Self {
-            preset: Some(WireBandMathPreset::Ndvi),
-            formula: Some(WireBandMathFormula::NormalizedDiff),
-            recipe_label: "NDVI".to_owned(),
-            colormap: Some(WireColormapId::RdYlGn),
-            invert_colormap: false,
-            stretch_min: -0.2,
-            stretch_max: 0.85,
-            rgb_min: [0.0; 3],
-            rgb_max: [0.35; 3],
-            default_rgb_min: [0.0; 3],
-            default_rgb_max: [0.35; 3],
-            rgb_gamma: 1.0,
-            scl_mask_enabled: false,
-            scl_mask_bits: 0,
-        }
-    }
-}
-
-impl From<&BandMathStyleSpec> for SavedBandMathStyle {
-    fn from(spec: &BandMathStyleSpec) -> Self {
-        Self {
-            preset: Some(WireBandMathPreset::from(spec.preset)),
-            formula: Some(WireBandMathFormula::from(spec.formula)),
-            recipe_label: spec.recipe_label.clone(),
-            colormap: Some(WireColormapId::from(spec.colormap)),
-            invert_colormap: spec.invert_colormap,
-            stretch_min: spec.stretch_min,
-            stretch_max: spec.stretch_max,
-            rgb_min: spec.rgb_min,
-            rgb_max: spec.rgb_max,
-            default_rgb_min: spec.default_rgb_range.0,
-            default_rgb_max: spec.default_rgb_range.1,
-            rgb_gamma: spec.rgb_gamma,
-            scl_mask_enabled: spec.scl_mask_enabled,
-            scl_mask_bits: spec.scl_mask_bits,
-        }
-    }
-}
-
-impl SavedBandMathStyle {
-    fn sanitize(&mut self) {
-        let defaults = Self::default();
-        if !self.stretch_min.is_finite() {
-            self.stretch_min = defaults.stretch_min;
-        }
-        if !self.stretch_max.is_finite() {
-            self.stretch_max = defaults.stretch_max;
-        }
-        for i in 0..3 {
-            if !self.rgb_min[i].is_finite() {
-                self.rgb_min[i] = defaults.rgb_min[i];
-            }
-            if !self.rgb_max[i].is_finite() {
-                self.rgb_max[i] = defaults.rgb_max[i];
-            }
-            if !self.default_rgb_min[i].is_finite() {
-                self.default_rgb_min[i] = defaults.default_rgb_min[i];
-            }
-            if !self.default_rgb_max[i].is_finite() {
-                self.default_rgb_max[i] = defaults.default_rgb_max[i];
-            }
-        }
-        if !self.rgb_gamma.is_finite() || self.rgb_gamma <= 0.0 {
-            self.rgb_gamma = defaults.rgb_gamma;
-        } else {
-            self.rgb_gamma = self.rgb_gamma.clamp(0.2, 5.0);
-        }
-    }
-
-    pub(crate) fn to_spec(&self) -> BandMathStyleSpec {
-        let preset = self
-            .preset
-            .map_or(BandMathPreset::CustomNormalizedDiff, BandMathPreset::from);
-        let formula = self
-            .formula
-            .map_or_else(|| preset.formula(), BandMathFormula::from);
-        let colormap = self
-            .colormap
-            .map_or_else(|| preset.default_colormap(), ColormapId::from);
-        BandMathStyleSpec {
-            preset,
-            formula,
-            recipe_label: self.recipe_label.clone(),
-            colormap,
-            invert_colormap: self.invert_colormap,
-            stretch_min: self.stretch_min,
-            stretch_max: self.stretch_max,
-            rgb_min: self.rgb_min,
-            rgb_max: self.rgb_max,
-            default_rgb_range: (self.default_rgb_min, self.default_rgb_max),
-            rgb_gamma: self.rgb_gamma,
-            scl_mask_enabled: self.scl_mask_enabled,
-            scl_mask_bits: self.scl_mask_bits,
-        }
-    }
 }
 
 /// Saved local single-raster entry.
@@ -634,8 +293,8 @@ impl SavedBandMathEntry {
     fn sanitize(&mut self) -> bool {
         self.opacity = clamp_opacity(self.opacity);
         self.style.sanitize();
-        let required = self.style.to_spec().formula.required_bands();
-        if self.bands.len() != required {
+        let spec = self.style.to_spec();
+        if self.bands.len() != spec.formula.required_bands() {
             return false;
         }
         if !self.bands.iter_mut().all(SavedBandAssetSource::sanitize) {
@@ -647,7 +306,7 @@ impl SavedBandMathEntry {
             self.scl = None;
         }
         if self.title.trim().is_empty() {
-            self.title = self.style.to_spec().recipe_label;
+            self.title = spec.recipe_label;
         }
         true
     }
@@ -852,26 +511,26 @@ impl SavedLayerEntry {
         }
     }
 
-    /// Downgrade persisted `auth_mode` on remote assets imported from a
-    /// portable `.veldmap.json` project file so cross-origin URLs can never
-    /// inherit or escalate into private `settings.json` credentials on load,
-    /// retry, or subsequent `session.json` restarts.
-    pub(crate) fn sanitize_imported_auth(&mut self, stac_settings: &super::settings::StacSettings) {
+    /// Transform persisted `auth_mode` on every remote asset inside this entry
+    /// using caller-supplied policy `map_mode` (keeping STAC origin-fencing
+    /// rules outside `crate::storage`).
+    pub(crate) fn map_remote_auth_modes(
+        &mut self,
+        mut map_mode: impl FnMut(&str, StacCogAuthMode) -> StacCogAuthMode,
+    ) {
         match self {
             Self::LocalRaster(_) => {}
             Self::RemoteCog(e) => {
-                let safe =
-                    crate::stac::sanitize_imported_auth_mode(&e.url, e.auth_mode(), stac_settings);
-                e.auth_mode = Some(WireStacCogAuthMode::from(safe));
+                let next = map_mode(&e.url, e.auth_mode());
+                e.auth_mode = Some(WireStacCogAuthMode::from(next));
             }
             Self::BandMath(e) => {
                 for src in e.bands.iter_mut().chain(e.scl.iter_mut()) {
                     if let SavedBandAssetSource::Remote { url, auth_mode, .. } = src {
                         let current =
                             auth_mode.map_or(StacCogAuthMode::None, StacCogAuthMode::from);
-                        let safe =
-                            crate::stac::sanitize_imported_auth_mode(url, current, stac_settings);
-                        *auth_mode = Some(WireStacCogAuthMode::from(safe));
+                        let next = map_mode(url, current);
+                        *auth_mode = Some(WireStacCogAuthMode::from(next));
                     }
                 }
             }
@@ -1021,35 +680,43 @@ impl Default for AppSession {
     }
 }
 
+/// Mutable borrow bundle of workspace fields shared between [`AppSession`] and
+/// portable [`super::project::ProjectFile`] normalization.
+pub(super) struct WorkspaceFieldsMut<'a> {
+    pub(super) version: &'a mut u32,
+    pub(super) open_layers: &'a mut Vec<SavedLayerEntry>,
+    pub(super) open_vectors: &'a mut Vec<SavedVectorEntry>,
+    pub(super) bookmarks: &'a mut Vec<CameraBookmark>,
+    pub(super) last_camera: &'a mut Option<SavedCameraPose>,
+    pub(super) swipe: &'a mut Option<SavedSwipeState>,
+}
+
 /// Shared workspace normalization applied identically to both [`AppSession`]
 /// and portable [`super::project::ProjectFile`] instances.
-pub(super) fn normalize_workspace_fields(
-    version: &mut u32,
-    open_layers: &mut Vec<SavedLayerEntry>,
-    open_vectors: &mut Vec<SavedVectorEntry>,
-    bookmarks: &mut Vec<CameraBookmark>,
-    last_camera: &mut Option<SavedCameraPose>,
-    swipe: &mut Option<SavedSwipeState>,
-) {
-    *version = SESSION_SCHEMA_VERSION;
-    open_layers.retain_mut(SavedLayerEntry::sanitize);
-    open_vectors.retain(|v| !v.path.as_os_str().is_empty());
-    for vec_layer in open_vectors.iter_mut() {
+pub(super) fn normalize_workspace_fields(fields: WorkspaceFieldsMut<'_>) {
+    *fields.version = SESSION_SCHEMA_VERSION;
+    fields.open_layers.retain_mut(SavedLayerEntry::sanitize);
+    fields
+        .open_vectors
+        .retain(|v| !v.path.as_os_str().is_empty());
+    for vec_layer in fields.open_vectors.iter_mut() {
         vec_layer.opacity = clamp_opacity(vec_layer.opacity);
     }
-    bookmarks.retain(|b| !b.name.trim().is_empty() && b.pose.is_valid());
-    bookmarks.truncate(MAX_BOOKMARKS);
-    if let Some(cam) = *last_camera
+    fields
+        .bookmarks
+        .retain(|b| !b.name.trim().is_empty() && b.pose.is_valid());
+    fields.bookmarks.truncate(MAX_BOOKMARKS);
+    if let Some(cam) = *fields.last_camera
         && !cam.is_valid()
     {
-        *last_camera = None;
+        *fields.last_camera = None;
     }
-    let layer_count = open_layers.len();
-    if let Some(mut sw) = *swipe {
+    let layer_count = fields.open_layers.len();
+    if let Some(mut sw) = *fields.swipe {
         if sw.normalize(layer_count) {
-            *swipe = Some(sw);
+            *fields.swipe = Some(sw);
         } else {
-            *swipe = None;
+            *fields.swipe = None;
         }
     }
 }
@@ -1058,14 +725,14 @@ impl AppSession {
     /// Normalize bounds, sanitize all remote URLs, deduplicate recent files,
     /// and drop invalid entries.
     pub(super) fn normalize(&mut self) {
-        normalize_workspace_fields(
-            &mut self.version,
-            &mut self.open_layers,
-            &mut self.open_vectors,
-            &mut self.bookmarks,
-            &mut self.last_camera,
-            &mut self.swipe,
-        );
+        normalize_workspace_fields(WorkspaceFieldsMut {
+            version: &mut self.version,
+            open_layers: &mut self.open_layers,
+            open_vectors: &mut self.open_vectors,
+            bookmarks: &mut self.bookmarks,
+            last_camera: &mut self.last_camera,
+            swipe: &mut self.swipe,
+        });
         let mut deduped = Vec::with_capacity(self.recent_files.len().min(MAX_RECENT_FILES));
         for p in self.recent_files.drain(..) {
             if !p.as_os_str().is_empty() && !deduped.contains(&p) {

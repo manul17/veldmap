@@ -1,4 +1,4 @@
-use veldmap_core::geo::{DatumPreset, LinearUnit};
+use veldmap_core::geo::{CustomTmParams, DatumPreset, LinearUnit};
 use veldmap_storage::test_support::TestTempDir;
 
 use super::*;

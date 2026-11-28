@@ -14,6 +14,7 @@
 pub(crate) mod project;
 pub(crate) mod session;
 pub(crate) mod settings;
+mod wire;
 mod worker;
 
 use std::sync::Arc;

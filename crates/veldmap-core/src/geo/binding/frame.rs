@@ -55,6 +55,32 @@ pub struct Frame {
     cached_measurable: bool,
 }
 
+fn valid_pixel_affine(pixel_affine: [f64; 6], width: u32, height: u32) -> bool {
+    width > 0 && height > 0 && pixel_affine.iter().all(|v| v.is_finite())
+}
+
+fn valid_geodetic_sample((lat, lon): (f64, f64)) -> bool {
+    lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat)
+}
+
+fn spans_deg_from_probes(probes: &[(f64, f64); 9]) -> (f64, f64) {
+    let mut span_x = 0.0_f64;
+    for row in 0..3 {
+        let a = probes[row * 3];
+        let b = probes[row * 3 + 1];
+        let c = probes[row * 3 + 2];
+        span_x = span_x.max(geodesy::separation(a, b) + geodesy::separation(b, c));
+    }
+    let mut span_y = 0.0_f64;
+    for col in 0..3 {
+        let a = probes[col];
+        let b = probes[3 + col];
+        let c = probes[6 + col];
+        span_y = span_y.max(geodesy::separation(a, b) + geodesy::separation(b, c));
+    }
+    (span_x, span_y)
+}
+
 impl Frame {
     fn from_parts(kind: FrameKind, datum_warning: Option<DatumWarning>) -> Self {
         let mut frame = Self {
@@ -63,11 +89,18 @@ impl Frame {
             cached_ground_spans_m: None,
             cached_measurable: false,
         };
-        let (span_x, span_y) = frame.compute_ground_spans_m();
+        let ((span_x, span_y), samples_finite) = frame.compute_ground_spans_and_validity();
         if span_x.is_finite() && span_x > 0.0 && span_y.is_finite() && span_y > 0.0 {
             frame.cached_ground_spans_m = Some((span_x, span_y));
         }
-        frame.cached_measurable = frame.compute_measurable();
+        let det_ok = match &frame.kind {
+            FrameKind::Projected { affine, .. } => {
+                let det = affine[0] * affine[4] - affine[1] * affine[3];
+                det.is_finite() && det.abs() != 0.0
+            }
+            FrameKind::Grid { .. } => true,
+        };
+        frame.cached_measurable = det_ok && samples_finite && frame.cached_ground_spans_m.is_some();
         frame
     }
 
@@ -108,7 +141,7 @@ impl Frame {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        if width == 0 || height == 0 || !pixel_affine.iter().all(|v| v.is_finite()) {
+        if !valid_pixel_affine(pixel_affine, width, height) {
             return None;
         }
         let across = f64::from(width);
@@ -140,14 +173,14 @@ impl Frame {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        if width == 0 || height == 0 || !pixel_affine.iter().all(|v| v.is_finite()) {
-            return None;
-        }
         match crs {
             CrsSpec::Projected(proj) => {
                 Self::from_pixel_affine(proj.clone(), pixel_affine, width, height)
             }
             CrsSpec::Geographic { .. } | CrsSpec::GeographicProj(_) => {
+                if !valid_pixel_affine(pixel_affine, width, height) {
+                    return None;
+                }
                 let grid = TieGrid::from_geographic_affine(pixel_affine, width, height)?;
                 let frame = Self::from_grid_with_crs(grid, Some(crs));
                 frame.measurable().then_some(frame)
@@ -156,7 +189,7 @@ impl Frame {
     }
 
     /// Wrap a validated [`TieGrid`] on WGS84 as a georeference [`Frame`].
-    pub fn from_grid(grid: TieGrid) -> Self {
+    fn from_grid(grid: TieGrid) -> Self {
         Self::from_parts(
             FrameKind::Grid {
                 grid,
@@ -187,7 +220,7 @@ impl Frame {
 
     /// Wrap a validated [`TieGrid`] on a specific horizontal [`Datum`],
     /// shifting coordinates to/from WGS84 via [`Datum::to_wgs84`] /
-    /// [`Datum::from_wgs84`] (discarding phantom Helmert `Delta h`).
+    /// [`Datum::shift_from_wgs84`] (discarding phantom Helmert `Delta h`).
     fn from_grid_with_datum(grid: TieGrid, datum: Datum, label: impl Into<String>) -> Self {
         Self::from_parts(
             FrameKind::Grid {
@@ -323,7 +356,7 @@ impl Frame {
             }
             FrameKind::Grid { grid, shift, .. } => {
                 let (src_lat, src_lon) = match shift {
-                    GeographicShift::Datum(datum) => datum.from_wgs84(lat_deg, lon_deg),
+                    GeographicShift::Datum(datum) => datum.shift_from_wgs84(lat_deg, lon_deg),
                     GeographicShift::Proj4(proj) => {
                         let (lon, lat) = proj.transform_from_wgs84_geodetic(lat_deg, lon_deg);
                         (lat, lon)
@@ -356,6 +389,18 @@ impl Frame {
         }
     }
 
+    fn probe_rect_3x3(&self, fx0: f64, fx1: f64, fy0: f64, fy1: f64) -> [(f64, f64); 9] {
+        let xs = [fx0, (fx0 + fx1) * 0.5, fx1];
+        let ys = [fy0, (fy0 + fy1) * 0.5, fy1];
+        let mut probes = [(0.0_f64, 0.0_f64); 9];
+        for row in 0..3 {
+            for col in 0..3 {
+                probes[row * 3 + col] = self.geodetic(xs[col], ys[row]);
+            }
+        }
+        probes
+    }
+
     /// Probe a `3 x 3` grid over normalized rectangle `[fx0, fx1] x [fy0, fy1]`
     /// in a single 9-point pass, returning the widest horizontal and vertical
     /// great-circle arc spans in degrees.
@@ -366,53 +411,44 @@ impl Frame {
         fy0: f64,
         fy1: f64,
     ) -> (f64, f64) {
-        let xs = [fx0, (fx0 + fx1) * 0.5, fx1];
-        let ys = [fy0, (fy0 + fy1) * 0.5, fy1];
-        let mut probes = [(0.0_f64, 0.0_f64); 9];
-        for row in 0..3 {
-            for col in 0..3 {
-                probes[row * 3 + col] = self.geodetic(xs[col], ys[row]);
-            }
-        }
-        let mut span_x = 0.0_f64;
-        for row in 0..3 {
-            let a = probes[row * 3];
-            let b = probes[row * 3 + 1];
-            let c = probes[row * 3 + 2];
-            span_x = span_x.max(geodesy::separation(a, b) + geodesy::separation(b, c));
-        }
-        let mut span_y = 0.0_f64;
-        for col in 0..3 {
-            let a = probes[col];
-            let b = probes[3 + col];
-            let c = probes[6 + col];
-            span_y = span_y.max(geodesy::separation(a, b) + geodesy::separation(b, c));
-        }
-        (span_x, span_y)
+        spans_deg_from_probes(&self.probe_rect_3x3(fx0, fx1, fy0, fy1))
     }
 
-    fn compute_ground_spans_m(&self) -> (f64, f64) {
+    fn compute_ground_spans_and_validity(&self) -> ((f64, f64), bool) {
+        const CORNERS: [(f64, f64); 4] = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)];
+        const PROBE_CORNER_CENTER_INDICES: [usize; 5] = [0, 2, 6, 8, 4];
+
         match &self.kind {
             FrameKind::Projected {
                 system: Projection::WebMercator,
                 affine,
             } => {
-                let (center_lat, _) = self.geodetic(0.5, 0.5);
-                let scale = center_lat.to_radians().cos().abs().max(1e-6);
-                (
+                let center = self.geodetic(0.5, 0.5);
+                let scale = center.0.to_radians().cos().abs().max(1e-6);
+                let spans = (
                     affine[0].hypot(affine[3]) * scale,
                     affine[1].hypot(affine[4]) * scale,
-                )
+                );
+                let samples_finite = valid_geodetic_sample(center)
+                    && CORNERS
+                        .into_iter()
+                        .all(|(fx, fy)| valid_geodetic_sample(self.geodetic(fx, fy)));
+                (spans, samples_finite)
             }
             FrameKind::Projected {
                 system: sys @ Projection::Transverse { .. },
                 affine,
             } => {
                 let unit = sys.unit_to_metres();
-                (
+                let spans = (
                     affine[0].hypot(affine[3]) * unit,
                     affine[1].hypot(affine[4]) * unit,
-                )
+                );
+                let samples_finite = CORNERS
+                    .into_iter()
+                    .chain(std::iter::once((0.5, 0.5)))
+                    .all(|(fx, fy)| valid_geodetic_sample(self.geodetic(fx, fy)));
+                (spans, samples_finite)
             }
             FrameKind::Projected {
                 system: Projection::Proj4(proj),
@@ -421,20 +457,30 @@ impl Frame {
                 let unit = proj.unit_to_metres();
                 let nominal_x = affine[0].hypot(affine[3]) * unit;
                 let nominal_y = affine[1].hypot(affine[4]) * unit;
-                let (deg_x, deg_y) = self.probe_rect_spans_deg(0.0, 1.0, 0.0, 1.0);
+                let probes = self.probe_rect_3x3(0.0, 1.0, 0.0, 1.0);
+                let (deg_x, deg_y) = spans_deg_from_probes(&probes);
                 let probed_x = deg_x.to_radians() * geodesy::SEMI_MAJOR_M;
                 let probed_y = deg_y.to_radians() * geodesy::SEMI_MAJOR_M;
-                (
+                let spans = (
                     if probed_x > 0.0 { probed_x } else { nominal_x },
                     if probed_y > 0.0 { probed_y } else { nominal_y },
-                )
+                );
+                let samples_finite = PROBE_CORNER_CENTER_INDICES
+                    .into_iter()
+                    .all(|i| valid_geodetic_sample(probes[i]));
+                (spans, samples_finite)
             }
             FrameKind::Grid { grid, .. } => {
                 let (widest_x, widest_y) = grid.widest_spans_m();
-                let (deg_x, deg_y) = self.probe_rect_spans_deg(0.0, 1.0, 0.0, 1.0);
+                let probes = self.probe_rect_3x3(0.0, 1.0, 0.0, 1.0);
+                let (deg_x, deg_y) = spans_deg_from_probes(&probes);
                 let probed_x = deg_x.to_radians() * geodesy::SEMI_MAJOR_M;
                 let probed_y = deg_y.to_radians() * geodesy::SEMI_MAJOR_M;
-                (probed_x.max(widest_x), probed_y.max(widest_y))
+                let spans = (probed_x.max(widest_x), probed_y.max(widest_y));
+                let samples_finite = PROBE_CORNER_CENTER_INDICES
+                    .into_iter()
+                    .all(|i| valid_geodetic_sample(probes[i]));
+                (spans, samples_finite)
             }
         }
     }
@@ -458,22 +504,6 @@ impl Frame {
     /// maps corners and center to finite geodetic coordinates.
     pub fn measurable(&self) -> bool {
         self.cached_measurable
-    }
-
-    fn compute_measurable(&self) -> bool {
-        if let FrameKind::Projected { affine, .. } = &self.kind {
-            let det = affine[0] * affine[4] - affine[1] * affine[3];
-            if !det.is_finite() || det.abs() == 0.0 {
-                return false;
-            }
-        }
-        let samples_finite = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)]
-            .into_iter()
-            .all(|(fx, fy)| {
-                let (lat, lon) = self.geodetic(fx, fy);
-                lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat)
-            });
-        samples_finite && self.cached_ground_spans_m.is_some()
     }
 
     /// Select the sharpest raster pyramid level whose finer pixel axis is no

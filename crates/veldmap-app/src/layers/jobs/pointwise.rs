@@ -348,11 +348,7 @@ fn submit_direct_pointwise_job(
     let guard = PointwiseFlightGuard::new(Arc::clone(runtime), tile_key, job_id);
     // Preserve pool isolation (`docs/decisions.md` §11): a remote source
     // without an async prefetch handle still routes to `remote_pool`.
-    let pool = if source.is_remote() {
-        &runtime.remote_pool
-    } else {
-        &runtime.fast_pool
-    };
+    let pool = runtime.pool_for_source(source.is_remote());
     let job = DecodeJob {
         key: DecodeJobKey::Tile(tile_key),
         queued_bytes: tile_format_bytes(RASTER_TILE_SIZE, tile_key.format),

@@ -28,18 +28,6 @@ impl GlobeScheme {
     }
 }
 
-impl From<GlobeScheme> for PlanetaryScheme {
-    fn from(scheme: GlobeScheme) -> Self {
-        scheme.into_planetary()
-    }
-}
-
-impl From<GlobeScheme> for TileScheme {
-    fn from(scheme: GlobeScheme) -> Self {
-        scheme.into_tile_scheme()
-    }
-}
-
 /// Coarsest-zero planetary tiling scheme (excludes `TileScheme::RasterPyramid`
 /// so planetary quadtree arithmetic can never invert finest-zero raster levels).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -90,18 +78,12 @@ impl PlanetaryScheme {
 
     /// Return the coarser parent `(level - 1, x >> 1, y >> 1)`, or `None` at
     /// `level == 0`.
-    pub const fn parent(self, level: u8, x: u32, y: u32) -> Option<(u8, u32, u32)> {
+    pub(super) const fn parent(self, level: u8, x: u32, y: u32) -> Option<(u8, u32, u32)> {
         if level == 0 {
             None
         } else {
             Some((level - 1, x >> 1, y >> 1))
         }
-    }
-}
-
-impl From<PlanetaryScheme> for TileScheme {
-    fn from(scheme: PlanetaryScheme) -> Self {
-        scheme.into_tile_scheme()
     }
 }
 
@@ -141,7 +123,7 @@ impl TileScheme {
     /// toward `z = 0`, whereas `RasterPyramid { max_level }` walks
     /// `level -> level + 1` toward `max_level`, so ancestor lookups and LRU
     /// ancestor touches never invert.
-    pub const fn parent(self, level: u8, x: u32, y: u32) -> Option<(u8, u32, u32)> {
+    pub(super) const fn parent(self, level: u8, x: u32, y: u32) -> Option<(u8, u32, u32)> {
         match self {
             Self::RasterPyramid { max_level } => {
                 if level >= max_level {

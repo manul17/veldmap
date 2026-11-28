@@ -27,6 +27,16 @@ pub(super) struct ReloadRequest {
     pub(super) cancel: CancelToken,
 }
 
+/// Completed outcome of a background overlay open.
+pub(super) struct OpenedPayload {
+    pub(super) epoch: u64,
+    pub(super) path: PathBuf,
+    pub(super) fly_to: bool,
+    pub(super) options: LayerInitOptions,
+    pub(super) restore_id: Option<u64>,
+    pub(super) outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
+}
+
 /// Completed outcome of a background overlay reload.
 pub(super) struct ReloadedPayload {
     pub(super) id: LayerId,
@@ -51,14 +61,7 @@ pub(super) enum OverlayIoCmd {
 
 /// Results posted back from the overlay I/O worker to `OverlayManager`.
 pub(super) enum OverlayIoResult {
-    Opened {
-        epoch: u64,
-        path: PathBuf,
-        fly_to: bool,
-        options: LayerInitOptions,
-        restore_id: Option<u64>,
-        outcome: Result<(Arc<dyn RasterSource>, Frame), OpenRasterError>,
-    },
+    Opened(OpenedPayload),
     Reloaded(ReloadedPayload),
 }
 
@@ -86,14 +89,14 @@ fn handle_io_cmd(cmd: OverlayIoCmd, runtime: &OverlayRuntime, res_tx: &Sender<Ov
             if cancel.is_cancelled() {
                 return;
             }
-            let _ = res_tx.send(OverlayIoResult::Opened {
+            let _ = res_tx.send(OverlayIoResult::Opened(OpenedPayload {
                 epoch,
                 path,
                 fly_to,
                 options,
                 restore_id,
                 outcome,
-            });
+            }));
             (runtime.wakeup)();
         }
         OverlayIoCmd::Reload(ReloadRequest {

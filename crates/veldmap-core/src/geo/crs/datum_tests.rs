@@ -17,7 +17,7 @@ fn helmert_coordinate_frame_and_position_vector_conventions_agree() {
             ground_m(cf_wgs, pv_wgs) < 1e-6,
             "conventions diverged: {cf_wgs:?} vs {pv_wgs:?}"
         );
-        let back_pv = pv.from_wgs84(pv_wgs.0, pv_wgs.1);
+        let back_pv = pv.shift_from_wgs84(pv_wgs.0, pv_wgs.1);
         assert!(ground_m(back_pv, (lat, lon)) < 1e-3);
     }
 }
@@ -60,7 +60,7 @@ fn the_datum_shift_and_its_reverse_converge_where_it_is_fitted() {
         (43.1, 131.9),
     ] {
         let (there_lat, there_lon) = PULKOVO_1942.to_wgs84(lat, lon);
-        let back = PULKOVO_1942.from_wgs84(there_lat, there_lon);
+        let back = PULKOVO_1942.shift_from_wgs84(there_lat, there_lon);
         assert!(ground_m(back, (lat, lon)) < 1e-3);
     }
 }
@@ -75,7 +75,7 @@ fn a_shifted_datum_on_the_same_ellipsoid_still_moves() {
     let moved = nudged.to_wgs84(here.0, here.1);
     assert!((ground_m(moved, here) - 100.0).abs() < 0.5);
 
-    let back = nudged.from_wgs84(moved.0, moved.1);
+    let back = nudged.shift_from_wgs84(moved.0, moved.1);
     assert!(ground_m(back, here) < 1e-3);
 }
 
@@ -104,7 +104,7 @@ fn near_pole_geodetic_and_datum_roundtrips_avoid_singularity() {
         );
 
         let shifted = PULKOVO_1942.to_wgs84(lat_deg, 37.0);
-        let back = PULKOVO_1942.from_wgs84(shifted.0, shifted.1);
+        let back = PULKOVO_1942.shift_from_wgs84(shifted.0, shifted.1);
         assert!(back.0.is_finite() && back.1.is_finite());
         let err_m = (back.0 - lat_deg).abs().to_radians() * WGS84.semi_major_m;
         assert!(err_m < 1e-2, "near-pole lat {lat_deg} drifted by {err_m} m");

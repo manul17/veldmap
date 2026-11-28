@@ -11,7 +11,8 @@ use crate::geo::{
 };
 
 use super::geometry::{
-    geodetic_tile_bounds, lerp_f64, sample_tile_surface, tile_lon_bounds, web_mercator_y_bounds,
+    geodetic_tile_bounds, lerp_f64, polar_cap_point, polar_cap_uv_bounds, tile_lon_bounds,
+    web_mercator_y_bounds,
 };
 use super::key::QuadTileId;
 use super::scheme::{GlobeScheme, PlanetaryScheme};
@@ -66,13 +67,11 @@ impl Default for QuadtreeConfig {
 }
 
 impl QuadtreeConfig {
-    /// Configuration for a `Geodetic` basemap with given `max_tex_level` and
-    /// adaptive Polar Stereographic caps (`z = 0` default texture cap).
-    pub const fn geodetic(max_tex_level: u8) -> Self {
+    const fn with_scheme(scheme: GlobeScheme, max_tex_level: u8, max_geom_level: u8) -> Self {
         Self {
-            scheme: GlobeScheme::Geodetic,
+            scheme,
             max_tex_level,
-            max_geom_level: 16,
+            max_geom_level,
             polar_max_tex_level: DEFAULT_POLAR_MAX_TEX_LEVEL,
             polar_max_geom_level: 14,
             grid_cells: DEFAULT_GRID_CELLS,
@@ -82,19 +81,15 @@ impl QuadtreeConfig {
         }
     }
 
+    /// Configuration for a `Geodetic` basemap with given `max_tex_level` and
+    /// adaptive Polar Stereographic caps (`z = 0` default texture cap).
+    pub const fn geodetic(max_tex_level: u8) -> Self {
+        Self::with_scheme(GlobeScheme::Geodetic, max_tex_level, 16)
+    }
+
     /// Configuration for a `WebMercator` basemap with given `max_tex_level`.
     pub const fn web_mercator(max_tex_level: u8) -> Self {
-        Self {
-            scheme: GlobeScheme::WebMercator,
-            max_tex_level,
-            max_geom_level: 17,
-            polar_max_tex_level: DEFAULT_POLAR_MAX_TEX_LEVEL,
-            polar_max_geom_level: 14,
-            grid_cells: DEFAULT_GRID_CELLS,
-            tile_px: DEFAULT_TILE_PX,
-            max_geom_sse_px: 0.5,
-            max_tex_sse_px: 1.5,
-        }
+        Self::with_scheme(GlobeScheme::WebMercator, max_tex_level, 17)
     }
 
     /// Configuration for a main-globe `scheme` (`Geodetic` or `WebMercator`)
@@ -225,16 +220,19 @@ fn sample_web_mercator_grid(
 
 fn sample_polar_cap_grid(
     id: QuadTileId,
+    north: bool,
     samples: &mut [DVec3; 25],
     sample_units: &mut [DVec3; 25],
 ) -> Option<()> {
+    let (n, _) = id.checked_grid_dims()?;
+    let (u0, u1, v0, v1) = polar_cap_uv_bounds(id.x, id.y, n);
     let mut idx = 0usize;
     for row in 0..5u32 {
-        let t = f64::from(row) * 0.25;
+        let v = lerp_f64(v0, v1, f64::from(row) * 0.25);
         for col in 0..5u32 {
-            let s = f64::from(col) * 0.25;
-            let sample = sample_tile_surface(id, s, t)?;
-            let (ecef, unit) = WGS84.surface_ecef_and_normal(sample.lat_deg, sample.lon_deg);
+            let u = lerp_f64(u0, u1, f64::from(col) * 0.25);
+            let (lat_deg, lon_deg, _, _) = polar_cap_point(north, u, v);
+            let (ecef, unit) = WGS84.surface_ecef_and_normal(lat_deg, lon_deg);
             sample_units[idx] = unit;
             samples[idx] = ecef;
             idx += 1;
@@ -257,8 +255,8 @@ fn describe_tile_with_samples(id: QuadTileId, config: &QuadtreeConfig) -> Option
             0.0,
             sample_web_mercator_grid(id, grid_cells, &mut samples, &mut sample_units)?,
         ),
-        PlanetaryScheme::PolarCap { .. } => {
-            sample_polar_cap_grid(id, &mut samples, &mut sample_units)?;
+        PlanetaryScheme::PolarCap { north } => {
+            sample_polar_cap_grid(id, north, &mut samples, &mut sample_units)?;
             (0.0, 0.0)
         }
     };

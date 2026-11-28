@@ -6,9 +6,8 @@
 
 use eframe::egui;
 
+use crate::format;
 use crate::measure::{MeasureMode, MeasureSummary};
-
-use super::format;
 
 /// Action emitted by the Measure tool window and applied by `VeldmapApp`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

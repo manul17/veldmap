@@ -414,6 +414,22 @@ impl GlobeRenderer {
         }
     }
 
+    fn record_vector_and_graticule_tail<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        snapshot: &'a DrawSnapshot,
+    ) {
+        self.vector.record_pass(
+            pass,
+            &self.pipelines.vector,
+            self.viewport.uniform_arena(),
+            snapshot,
+        );
+        if snapshot.show_graticule {
+            self.record_graticule_pass(pass, snapshot);
+        }
+    }
+
     fn record_offscreen_passes(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -575,15 +591,7 @@ impl GlobeRenderer {
                 post_pass.set_scissor_rect(0, 0, target.width, target.height);
             }
             if layer_cursor == overlay_len && has_tail {
-                self.vector.record_pass(
-                    &mut post_pass,
-                    &self.pipelines.vector,
-                    self.viewport.uniform_arena(),
-                    snapshot,
-                );
-                if snapshot.show_graticule {
-                    self.record_graticule_pass(&mut post_pass, snapshot);
-                }
+                self.record_vector_and_graticule_tail(&mut post_pass, snapshot);
                 tail_drawn = true;
             }
         }
@@ -593,15 +601,7 @@ impl GlobeRenderer {
         if has_tail && !tail_drawn {
             let mut post_pass = begin_color_load_pass(encoder, &target.color_srgb_view);
             post_pass.set_bind_group(0, self.viewport.camera_bind_group(), &[]);
-            self.vector.record_pass(
-                &mut post_pass,
-                &self.pipelines.vector,
-                self.viewport.uniform_arena(),
-                snapshot,
-            );
-            if snapshot.show_graticule {
-                self.record_graticule_pass(&mut post_pass, snapshot);
-            }
+            self.record_vector_and_graticule_tail(&mut post_pass, snapshot);
         }
     }
 }

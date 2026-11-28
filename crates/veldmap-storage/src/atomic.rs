@@ -15,6 +15,9 @@ use crate::paths::append_path_suffix;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
+/// Maximum persisted settings/state JSON size (`16 MiB`) enforced by
+/// [`read_json_or_default_with_backup`] before buffering into RAM.
+const MAX_DEFAULT_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
 fn parent_and_file_name(target: &Path) -> Result<(PathBuf, &std::ffi::OsStr), StorageError> {
     let parent = target
@@ -92,13 +95,6 @@ pub fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageErro
     write_atomic_impl(path, bytes, false)
 }
 
-/// Atomically and durably write `bytes` to `path` with owner-only permissions
-/// (`0600` on Unix; on Windows, relies on parent user-profile directory ACLs)
-/// for configuration files that may store API keys.
-fn write_atomic_durable_private(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-    write_atomic_impl(path, bytes, true)
-}
-
 fn create_unique_temp(
     path: &Path,
     private: bool,
@@ -160,13 +156,21 @@ fn write_atomic_impl(path: &Path, bytes: &[u8], private: bool) -> Result<(), Sto
     Ok(())
 }
 
+fn write_json_impl<T: Serialize>(
+    path: &Path,
+    value: &T,
+    private: bool,
+) -> Result<(), StorageError> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    write_atomic_impl(path, &bytes, private)
+}
+
 /// Serialize `value` as pretty JSON and persist it via atomic durable write
 /// with standard user permissions (suitable for sanitized user-exported project
 /// files such as `.veldmap.json`).
 pub fn write_json_durable<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
-    let mut bytes = serde_json::to_vec_pretty(value)?;
-    bytes.push(b'\n');
-    write_atomic_durable(path, &bytes)
+    write_json_impl(path, value, false)
 }
 
 /// Serialize `value` as pretty JSON and persist it via private atomic durable
@@ -175,9 +179,7 @@ pub fn write_json_durable_private<T: Serialize>(
     path: &Path,
     value: &T,
 ) -> Result<(), StorageError> {
-    let mut bytes = serde_json::to_vec_pretty(value)?;
-    bytes.push(b'\n');
-    write_atomic_durable_private(path, &bytes)
+    write_json_impl(path, value, true)
 }
 
 /// Read and deserialize a bounded regular UTF-8 JSON file without renaming it
@@ -190,13 +192,23 @@ pub fn read_json_limited<T: DeserializeOwned>(
     Ok(serde_json::from_str(&text)?)
 }
 
-/// Read JSON from `path`, returning `T::default()` if the file does not exist.
-fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, StorageError> {
-    match fs::read(path) {
+fn read_json_or_default_limited<T: DeserializeOwned + Default>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<T, StorageError> {
+    match crate::file_source::read_regular_file_bytes_limited(path, max_bytes) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
-        Err(err) => Err(StorageError::Io(err)),
+        Err(StorageError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(T::default())
+        }
+        Err(err) => Err(err),
     }
+}
+
+/// Read bounded regular-file JSON from `path`, returning `T::default()` if the
+/// file does not exist.
+fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, StorageError> {
+    read_json_or_default_limited(path, MAX_DEFAULT_JSON_BYTES)
 }
 
 /// Read JSON from `path`, falling back to `T::default()` when missing or

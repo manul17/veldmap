@@ -1,112 +1,38 @@
 //! Domain model for multi-band analytical Band Math & RGB Composite layers
-//! (`BandMathFormula`, `BandMathPreset`, `BandMathStyle`, `BandMathLayerData`),
-//! shared between GPU scratch/composite rendering and zoom-invariant CPU cursor
-//! readouts so physical-space formulas never diverge.
+//! (`BandMathPreset`, `BandMathStyle`, `BandMathLayerData`), shared between
+//! GPU scratch/composite rendering and zoom-invariant CPU cursor readouts so
+//! physical-space formulas never diverge.
 
+use crate::band_math::{BandMathFormula, clamp_rgb_gamma};
 use crate::colormap::{ColormapId, DEFAULT_SCL_MASK_BITS};
 
 use super::asset::RasterAsset;
-use super::style::normalize_stretch_range;
-
-/// Epsilon guarding division-by-zero in `(A - B) / (A + B)` and `A / B`
-/// across both GPU (`band_math_composite.wgsl`) and CPU (`CursorProber`).
-const BAND_MATH_DIV_EPS: f64 = 1e-6;
+use super::style::{ensure_non_degenerate_max, normalize_stretch_range};
 
 /// Upper exclusive bound on discrete `SCL` class IDs representable in the
 /// 32-bit `scl_mask_bits` bitmask (`0..32`).
-pub(super) const MAX_SCL_MASK_CLASSES: u32 = 32;
+const MAX_SCL_MASK_CLASSES: u32 = 32;
 
-/// Mathematical band-combination mode evaluated in canonical physical
-/// `raw * scale + offset` space.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BandMathFormula {
-    /// Normalized difference `(A - B) / (A + B)` (NDVI, NDWI, NBR, NDSI).
-    NormalizedDiff,
-    /// Physical difference `A - B`.
-    Difference,
-    /// Physical ratio `A / B`.
-    Ratio,
-    /// 3-channel physical RGB composite `(R, G, B)`.
-    RgbComposite,
+/// Return the nodata value to discard in GPU `SCL` mask rasterization.
+///
+/// Maskable `SCL` class IDs (`0..32`, notably class `0` = ESA "No Data"
+/// declared as `GDAL_NODATA = 0` on Sentinel-2 COGs) are NOT discarded so
+/// `scl_mask_bits` controls them while `255u` stays strictly the
+/// uncovered-footprint sentinel.
+pub(super) fn scl_gpu_nodata_value(asset: &RasterAsset) -> Option<u32> {
+    asset
+        .categorical_nodata_value()
+        .filter(|&nd| nd >= MAX_SCL_MASK_CLASSES)
 }
 
-impl BandMathFormula {
-    pub(crate) const ALL: [Self; 4] = [
-        Self::NormalizedDiff,
-        Self::Difference,
-        Self::Ratio,
-        Self::RgbComposite,
-    ];
-
-    /// Number of float input bands required by this formula (`2` for scalar
-    /// modes, `3` for RGB composite).
-    pub(crate) const fn required_bands(self) -> usize {
-        match self {
-            Self::NormalizedDiff | Self::Difference | Self::Ratio => 2,
-            Self::RgbComposite => 3,
-        }
-    }
-
-    /// Numeric shader mode ID matching `band_math_composite.wgsl`.
-    pub(crate) const fn shader_mode(self) -> u32 {
-        match self {
-            Self::NormalizedDiff => 0,
-            Self::Difference => 1,
-            Self::Ratio => 2,
-            Self::RgbComposite => 3,
-        }
-    }
-
-    /// Return whether this formula produces a 1-channel scalar output styled
-    /// via colormap LUT (as opposed to a 3-channel RGB composite).
-    pub(crate) const fn is_scalar(self) -> bool {
-        !matches!(self, Self::RgbComposite)
-    }
-
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::NormalizedDiff => "Normalized Diff (A−B)/(A+B)",
-            Self::Difference => "Difference (A − B)",
-            Self::Ratio => "Ratio (A / B)",
-            Self::RgbComposite => "RGB Composite (R, G, B)",
-        }
-    }
-
-    pub(crate) const fn short_label(self) -> &'static str {
-        match self {
-            Self::NormalizedDiff => "Index",
-            Self::Difference => "A − B",
-            Self::Ratio => "A / B",
-            Self::RgbComposite => "RGB",
-        }
-    }
-
-    /// Evaluate a scalar formula on two physical `f64` values, preserving valid
-    /// `0.0` inputs while returning `None` on non-finite values or near-zero
-    /// denominators.
-    pub(crate) fn evaluate_scalar(self, a: f64, b: f64) -> Option<f64> {
-        if !a.is_finite() || !b.is_finite() {
-            return None;
-        }
-        let val = match self {
-            Self::NormalizedDiff => {
-                let denom = a + b;
-                if denom.abs() < BAND_MATH_DIV_EPS {
-                    return None;
-                }
-                (a - b) / denom
-            }
-            Self::Difference => a - b,
-            Self::Ratio => {
-                if b.abs() < BAND_MATH_DIV_EPS {
-                    return None;
-                }
-                a / b
-            }
-            Self::RgbComposite => return None,
-        };
-        val.is_finite().then_some(val)
-    }
+/// Complementary CPU cursor readout helper: when an `SCL` asset declares a
+/// maskable class ID (`< 32`) as TIFF/STAC nodata, return it so CPU cursor
+/// readouts preserve that class on `BandSample::Nodata` matching GPU masking.
+pub(super) fn scl_cpu_maskable_nodata_class(asset: &RasterAsset) -> Option<u16> {
+    asset
+        .categorical_nodata_value()
+        .filter(|&nd| nd < MAX_SCL_MASK_CLASSES)
+        .map(|nd| nd as u16)
 }
 
 /// Curated EO scene recipe presets driving default formulas, stretch ranges,
@@ -282,8 +208,8 @@ impl BandMathStyle {
         {
             style.default_rgb_range = spec.default_rgb_range;
         }
-        if spec.rgb_gamma.is_finite() {
-            style.rgb_gamma = spec.rgb_gamma.clamp(0.2, 4.0);
+        if spec.rgb_gamma.is_finite() && spec.rgb_gamma > 0.0 {
+            style.rgb_gamma = clamp_rgb_gamma(spec.rgb_gamma);
         }
         style.scl_mask_enabled = has_scl && spec.scl_mask_enabled;
         style.scl_mask_bits = spec.scl_mask_bits;
@@ -362,12 +288,10 @@ impl BandMathStyle {
         {
             return false;
         }
-        let gamma = gamma.clamp(0.2, 4.0);
+        let gamma = clamp_rgb_gamma(gamma);
         let mut next_max = max;
         for i in 0..3 {
-            if next_max[i] <= min[i] {
-                next_max[i] = min[i] + min[i].abs().max(1.0) * 1e-6;
-            }
+            next_max[i] = ensure_non_degenerate_max(min[i], next_max[i]);
         }
         if self.rgb_min == min
             && self.rgb_max == next_max

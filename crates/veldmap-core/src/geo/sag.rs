@@ -6,7 +6,7 @@
 
 use glam::DVec3;
 
-use super::geodesy::{FLATTENING, SEMI_MAJOR_M};
+use super::geodesy::{FLATTENING, SEMI_MAJOR_M, unwind};
 
 /// Maximum WGS84 radius-of-curvature ratio relative to `SEMI_MAJOR_M`
 /// (`a / (b^2/a) = 1 / (1 - f)`), keeping spherical chord-sag bounds strictly
@@ -59,6 +59,35 @@ pub(crate) fn max_subcell_arc_deg(sample_units: &[DVec3], side: usize) -> f64 {
         .sqrt()
         .asin()
         .to_degrees()
+}
+
+/// Maximum parallel-circle chord sagitta in metres between horizontally or
+/// vertically adjacent `(lat_deg, lon_deg)` samples of a `side x side`
+/// row-major grid.
+pub(crate) fn max_parallel_sag_m(points: &[(f64, f64)], side: usize) -> f64 {
+    if side < 2 || points.len() < side * side {
+        return 0.0;
+    }
+    let mut par_sag_m = 0.0_f64;
+    let mut check_step = |p0: (f64, f64), p1: (f64, f64)| {
+        let dlon = (unwind(p0.1, p1.1) - p0.1).abs().min(180.0);
+        let max_lat = p0.0.abs().max(p1.0.abs()).min(90.0);
+        let r_par = SEMI_MAJOR_M * max_lat.to_radians().cos();
+        let sag = r_par * (1.0 - (dlon * 0.5).to_radians().cos());
+        par_sag_m = par_sag_m.max(sag);
+    };
+    for row in 0..side {
+        for col in 0..side {
+            let idx = row * side + col;
+            if col + 1 < side {
+                check_step(points[idx], points[idx + 1]);
+            }
+            if row + 1 < side {
+                check_step(points[idx], points[idx + side]);
+            }
+        }
+    }
+    par_sag_m
 }
 
 #[cfg(test)]

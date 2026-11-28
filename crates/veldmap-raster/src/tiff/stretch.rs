@@ -8,13 +8,13 @@ use veldmap_core::sync::CancelToken;
 use crate::RasterError;
 use crate::pipeline::{
     BandStats, DisplayMapping, STRETCH_SAMPLES, SingleflightMap, chunk_working_bytes,
-    compute_band_stats, is_data_f64, percentile_stretch, read_native_sample_f64,
+    compute_band_stats, percentile_stretch,
 };
 
 use super::chunk_convert::for_each_band_sample_f64;
 use super::ifd::{CachedIfd, Photometric, PlanarConfig};
 use super::raw_decode::{RawChunkPayload, decode_raw_chunk};
-use super::view::RawTiffAccess;
+use super::view::{RawTiffAccess, identity_display_mapping, needs_display_stretch, stretch_planes};
 
 pub(super) struct StretchCache {
     map: SingleflightMap<(), DisplayMapping>,
@@ -148,23 +148,20 @@ fn push_stretch_samples(
     nodata: Option<f64>,
     values: &mut Vec<f32>,
 ) {
-    let (stride, ch_offset) = ifd.band_stride_offset(band_idx);
-    for at in (0..pixels).step_by(step) {
-        if let Some(v) = read_native_sample_f64(data, ifd.sample_type, at * stride + ch_offset)
-            && is_data_f64(v, nodata)
-        {
+    for_each_band_sample_f64(data, ifd, band_idx, pixels, step, nodata, |sample| {
+        if let Some(v) = sample {
             let f = v as f32;
             if f.is_finite() {
                 values.push(f);
             }
         }
-    }
+    });
 }
 
 fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterError> {
     let ifd = req.stats_ifd;
-    if !ifd.needs_display_stretch() {
-        return Ok(ifd.identity_display_mapping(req.nodata_f64));
+    if !needs_display_stretch(ifd) {
+        return Ok(identity_display_mapping(ifd, req.nodata_f64));
     }
     let colors = ifd.pixel_layout.colors().max(1);
     let mut values = Vec::new();
@@ -200,7 +197,7 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
                     }
                 }
                 PlanarConfig::Planar => {
-                    for &plane in ifd.stretch_planes() {
+                    for &plane in stretch_planes(ifd) {
                         let (_, _, payload) =
                             decode_raw_chunk(req.access, ifd, plane, index, req.cancel)?;
                         let RawChunkPayload::Bytes(data) = payload else {
@@ -226,7 +223,7 @@ fn compute_mapping(req: &StretchRequest<'_>) -> Result<DisplayMapping, RasterErr
     Ok(match percentile_stretch(&mut values) {
         Some((lo, hi)) => DisplayMapping::stretched(lo, hi, req.nodata_f64)
             .with_invert(ifd.photometric == Photometric::WhiteIsZero),
-        None => ifd.identity_display_mapping(req.nodata_f64),
+        None => identity_display_mapping(ifd, req.nodata_f64),
     })
 }
 

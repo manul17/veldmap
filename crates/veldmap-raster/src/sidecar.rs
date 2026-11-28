@@ -4,7 +4,7 @@
 //! Decoders themselves remain pure [`veldmap_core::io::ByteSource`] consumers;
 //! callers load optional sidecars at the filesystem boundary and inject the
 //! resulting [`SidecarGeoref`] / [`GeoPlacement`] into
-//! [`crate::TiffSource::open_with_sidecar`], [`crate::PngSource::open`], or
+//! [`crate::open_raster_with_options`], [`crate::PngSource::open`], or
 //! [`crate::JpegSource::open`].
 
 use std::path::{Path, PathBuf};
@@ -37,7 +37,7 @@ pub struct SidecarGeoref {
 impl SidecarGeoref {
     /// Convert into a [`GeoPlacement`] when an external world-file affine is
     /// present.
-    pub fn into_placement(self) -> Option<GeoPlacement> {
+    pub(crate) fn into_placement(self) -> Option<GeoPlacement> {
         let affine = self.affine?;
         Some(GeoPlacement {
             crs: self

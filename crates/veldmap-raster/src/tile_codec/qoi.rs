@@ -21,7 +21,7 @@ pub fn encode_qoi_rgba8(
     if rgba.len() != expected {
         return Err(RasterError::InvalidDimensions { width, height });
     }
-    qoi::encode_to_vec(rgba, width, height).map_err(|e| RasterError::Decode(e.to_string()))
+    qoi::encode_to_vec(rgba, width, height).map_err(|e| RasterError::Encode(e.to_string()))
 }
 
 /// Decode a lossless QOI-encoded 8-bit `Rgba8UnormSrgb` tile after validating

@@ -323,7 +323,7 @@ impl OverlayManager {
         self.stack
             .layers()
             .iter()
-            .filter_map(|layer| layer.persist_entry().map(|entry| (layer.id(), entry)))
+            .map(|layer| (layer.id(), layer.persist_entry()))
     }
 
     /// Move an existing layer to painter's-order index `target_idx` (used when
@@ -460,10 +460,8 @@ impl OverlayManager {
         }
     }
 
-    pub(crate) fn is_layer_persistable(&self, id: LayerId) -> bool {
-        self.stack
-            .get(id)
-            .is_some_and(|l| l.persist_entry().is_some())
+    pub(crate) fn has_layer(&self, id: LayerId) -> bool {
+        self.stack.get(id).is_some()
     }
 
     /// Remove a layer from [`LayerStack`], cancelling active jobs and returning

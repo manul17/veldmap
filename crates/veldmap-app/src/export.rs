@@ -4,9 +4,8 @@
 //! [`veldmap_raster::encode_png_rgba8`].
 
 use crate::colormap::sample_colormap_srgb;
+use crate::format::{self, compute_scale_bar};
 use crate::layers::ColorbarInfo;
-use crate::ui::format;
-use crate::ui::hud::compute_scale_bar;
 
 /// User-configurable toggles for the Export PNG dialog.
 #[derive(Clone, Debug)]
@@ -33,15 +32,15 @@ impl Default for CartographicExportOptions {
 /// Immutable cartographic overlay specification captured at PNG export trigger
 /// time and rendered on CPU off the UI thread.
 #[derive(Clone, Debug)]
-pub struct CartographicOverlaySpec {
-    pub pixels_per_point: f32,
-    pub m_per_pt: f64,
-    pub heading_deg: f64,
-    pub include_scale_bar: bool,
-    pub include_north_arrow: bool,
-    pub include_colorbar: bool,
-    pub colorbar: Option<ColorbarInfo>,
-    pub caption: Option<String>,
+pub(crate) struct CartographicOverlaySpec {
+    pub(crate) pixels_per_point: f32,
+    pub(crate) m_per_pt: f64,
+    pub(crate) heading_deg: f64,
+    pub(crate) include_scale_bar: bool,
+    pub(crate) include_north_arrow: bool,
+    pub(crate) include_colorbar: bool,
+    pub(crate) colorbar: Option<ColorbarInfo>,
+    pub(crate) caption: Option<String>,
 }
 
 const BG_CARD: [u8; 4] = [11, 19, 32, 204];
@@ -296,10 +295,254 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
     }
 }
 
+struct OverlayMetrics {
+    ppp: f32,
+    width_pt: f32,
+    height_pt: f32,
+    text_scale: i32,
+    margin: i32,
+    border_t: i32,
+}
+
+impl OverlayMetrics {
+    fn from_canvas(width: u32, height: u32, pixels_per_point: f32) -> Self {
+        let ppp = if pixels_per_point.is_finite() {
+            pixels_per_point.clamp(0.75, 4.0)
+        } else {
+            1.0
+        };
+        Self {
+            ppp,
+            width_pt: (width as f32) / ppp,
+            height_pt: (height as f32) / ppp,
+            text_scale: ppp.round().clamp(1.0, 3.0) as i32,
+            margin: (16.0 * ppp).round() as i32,
+            border_t: (1.0 * ppp).round().max(1.0) as i32,
+        }
+    }
+}
+
+fn draw_caption_badge(
+    canvas: &mut Canvas<'_>,
+    spec: &CartographicOverlaySpec,
+    m: &OverlayMetrics,
+) -> i32 {
+    let Some(caption) = spec
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return m.margin;
+    };
+    if m.width_pt < 180.0 || m.height_pt < 90.0 {
+        return m.margin;
+    }
+    let pad_x = (8.0 * m.ppp).round() as i32;
+    let pad_y = (6.0 * m.ppp).round() as i32;
+    let north_reserve = if spec.include_north_arrow {
+        (56.0 * m.ppp).round() as i32 + m.margin
+    } else {
+        0
+    };
+    let max_badge_w = canvas.width - m.margin * 2 - north_reserve;
+    let min_badge_w = 4 * 6 * m.text_scale + pad_x * 2;
+    if max_badge_w < min_badge_w {
+        return m.margin;
+    }
+    let max_chars = ((max_badge_w - pad_x * 2) / (6 * m.text_scale).max(1)).max(1) as usize;
+    let clipped: String = caption.chars().take(max_chars).collect();
+    if !clipped
+        .chars()
+        .any(|c| glyph_5x7(c).iter().any(|&b| b != 0))
+    {
+        return m.margin;
+    }
+    let tw = text_width_px(&clipped, m.text_scale);
+    let box_w = tw + pad_x * 2;
+    let box_h = 7 * m.text_scale + pad_y * 2;
+    canvas.fill_rect(m.margin, m.margin, box_w, box_h, BG_CARD);
+    canvas.stroke_rect(m.margin, m.margin, box_w, box_h, m.border_t, BORDER_SUBTLE);
+    canvas.draw_text(
+        m.margin + pad_x,
+        m.margin + pad_y,
+        &clipped,
+        m.text_scale,
+        INK_PRIMARY,
+    );
+    m.margin + box_h + (8.0 * m.ppp).round() as i32
+}
+
+fn draw_scale_bar(
+    canvas: &mut Canvas<'_>,
+    spec: &CartographicOverlaySpec,
+    m: &OverlayMetrics,
+    top_left_bottom: i32,
+) -> Option<i32> {
+    if !spec.include_scale_bar
+        || !spec.m_per_pt.is_finite()
+        || spec.m_per_pt <= 0.0
+        || m.width_pt < 160.0
+        || m.height_pt < 100.0
+    {
+        return None;
+    }
+    let max_w_pt = (m.width_pt * 0.35).clamp(48.0, 160.0);
+    if spec.m_per_pt * f64::from(max_w_pt) > 10_000_000.0 {
+        return None;
+    }
+    let (label, bar_w_pt) = compute_scale_bar(spec.m_per_pt, max_w_pt);
+    let bar_w_px = (bar_w_pt * m.ppp).round().max(8.0) as i32;
+    let tw = text_width_px(&label, m.text_scale);
+    let pad_x = (10.0 * m.ppp).round() as i32;
+    let content_w = bar_w_px.max(tw);
+    let box_w = (content_w + pad_x * 2).min(canvas.width - m.margin * 2);
+    let box_h = (34.0 * m.ppp).round() as i32;
+    let bx = m.margin;
+    let by = canvas.height - m.margin - box_h;
+
+    if by < top_left_bottom || box_w < bar_w_px + pad_x * 2 {
+        return None;
+    }
+    canvas.fill_rect(bx, by, box_w, box_h, BG_CARD);
+    canvas.stroke_rect(bx, by, box_w, box_h, m.border_t, BORDER_SUBTLE);
+
+    let tick_t = (2.0 * m.ppp).round().max(1.0) as i32;
+    let tick_h = (6.0 * m.ppp).round().max(3.0) as i32;
+    let y_bar = by + box_h - (9.0 * m.ppp).round() as i32;
+    let x0 = bx + (box_w - bar_w_px) / 2;
+    canvas.fill_rect(x0, y_bar, bar_w_px, tick_t, INK_PRIMARY);
+    canvas.fill_rect(x0, y_bar - tick_h + tick_t, tick_t, tick_h, INK_PRIMARY);
+    canvas.fill_rect(
+        x0 + bar_w_px - tick_t,
+        y_bar - tick_h + tick_t,
+        tick_t,
+        tick_h,
+        INK_PRIMARY,
+    );
+
+    let tx = bx + (box_w - tw) / 2;
+    let ty = by + (7.0 * m.ppp).round() as i32;
+    canvas.draw_text(tx, ty, &label, m.text_scale, INK_PRIMARY);
+    Some(by)
+}
+
+fn draw_colorbar(
+    canvas: &mut Canvas<'_>,
+    cb: &ColorbarInfo,
+    m: &OverlayMetrics,
+    top_left_bottom: i32,
+    scale_bar_top: Option<i32>,
+) {
+    if m.width_pt < 240.0 || m.height_pt < 160.0 {
+        return;
+    }
+    let desired_w = ((m.width_pt * 0.28).clamp(180.0, 260.0) * m.ppp).round() as i32;
+    let box_w = desired_w.min(canvas.width - m.margin * 2);
+    let box_h = (56.0 * m.ppp).round() as i32;
+    let bx = m.margin;
+    let bottom_y = scale_bar_top.map_or(canvas.height - m.margin, |top| {
+        top - (8.0 * m.ppp).round() as i32
+    });
+    let by = bottom_y - box_h;
+    if by < top_left_bottom || box_w < (80.0 * m.ppp).round() as i32 {
+        return;
+    }
+
+    canvas.fill_rect(bx, by, box_w, box_h, BG_CARD);
+    canvas.stroke_rect(bx, by, box_w, box_h, m.border_t, BORDER_SUBTLE);
+
+    let pad_x = (8.0 * m.ppp).round() as i32;
+    let unit_suffix = if cb.log10_db {
+        " [dB]".to_owned()
+    } else if let Some(ref u) = cb.units {
+        format!(" [{u}]")
+    } else {
+        String::new()
+    };
+    let max_chars = ((box_w - pad_x * 2) / (6 * m.text_scale).max(1)).max(4) as usize;
+    let title_full = format!("{}{unit_suffix}", cb.title);
+    let title: String = title_full.chars().take(max_chars).collect();
+    canvas.draw_text(
+        bx + pad_x,
+        by + (6.0 * m.ppp).round() as i32,
+        &title,
+        m.text_scale,
+        INK_PRIMARY,
+    );
+
+    let bar_x = bx + pad_x;
+    let bar_y = by + (22.0 * m.ppp).round() as i32;
+    let bar_w = (box_w - pad_x * 2).max(16);
+    let bar_h = (12.0 * m.ppp).round().max(4.0) as i32;
+    for dx in 0..bar_w {
+        let frac = (dx as f32) / ((bar_w - 1).max(1) as f32);
+        let rgb = sample_colormap_srgb(cb.colormap, frac, cb.invert_colormap);
+        canvas.fill_rect(bar_x + dx, bar_y, 1, bar_h, [rgb[0], rgb[1], rgb[2], 255]);
+    }
+    canvas.stroke_rect(bar_x, bar_y, bar_w, bar_h, m.border_t, BORDER_SUBTLE);
+
+    let min_s = format::format_scalar(cb.min);
+    let max_s = format::format_scalar(cb.max);
+    let tick_y = bar_y + bar_h + (5.0 * m.ppp).round() as i32;
+    let min_w = text_width_px(&min_s, m.text_scale);
+    let max_w = text_width_px(&max_s, m.text_scale);
+    canvas.draw_text(bar_x, tick_y, &min_s, m.text_scale, INK_PRIMARY);
+    if min_w + max_w + 4 * m.text_scale <= bar_w {
+        canvas.draw_text(
+            bar_x + bar_w - max_w,
+            tick_y,
+            &max_s,
+            m.text_scale,
+            INK_PRIMARY,
+        );
+    }
+}
+
+fn draw_north_arrow(canvas: &mut Canvas<'_>, heading_deg: f64, m: &OverlayMetrics) {
+    if m.width_pt < 120.0 || m.height_pt < 120.0 {
+        return;
+    }
+    let radius = 24.0 * m.ppp;
+    let cx = (canvas.width as f32) - (m.margin as f32) - radius;
+    let cy = (m.margin as f32) + radius;
+    canvas.fill_circle(cx, cy, radius, BG_CARD);
+    canvas.stroke_circle(cx, cy, radius, (1.2 * m.ppp).max(1.0), BORDER_SUBTLE);
+
+    let heading = if heading_deg.is_finite() {
+        heading_deg
+    } else {
+        0.0
+    };
+    let angle = -(heading as f32).to_radians();
+    let (sin_a, cos_a) = angle.sin_cos();
+    let rot = |dx: f32, dy: f32| -> [f32; 2] {
+        [cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a]
+    };
+
+    let tip_n = rot(0.0, -radius * 0.48);
+    let tip_s = rot(0.0, radius * 0.52);
+    let left = rot(-4.5 * m.ppp, 0.0);
+    let right = rot(4.5 * m.ppp, 0.0);
+    canvas.fill_triangle(tip_n, right, left, NEEDLE_NORTH);
+    canvas.fill_triangle(tip_s, left, right, NEEDLE_SOUTH);
+
+    let n_pos = rot(0.0, -radius * 0.72);
+    let nw = text_width_px("N", m.text_scale);
+    let nh = 7 * m.text_scale;
+    canvas.draw_text(
+        n_pos[0].round() as i32 - nw / 2,
+        n_pos[1].round() as i32 - nh / 2,
+        "N",
+        m.text_scale,
+        INK_PRIMARY,
+    );
+}
+
 /// Composite optional cartographic overlays (metric scale bar, rotated North
 /// arrow, scientific colorbar, and acquisition date/caption pill) directly onto
 /// an sRGB RGBA8 buffer off the UI thread.
-pub fn composite_cartographic_overlays(
+pub(crate) fn composite_cartographic_overlays(
     width: u32,
     height: u32,
     rgba: &mut [u8],
@@ -308,209 +551,17 @@ pub fn composite_cartographic_overlays(
     let Some(mut canvas) = Canvas::new(width, height, rgba) else {
         return;
     };
-    let ppp = if spec.pixels_per_point.is_finite() {
-        spec.pixels_per_point.clamp(0.75, 4.0)
-    } else {
-        1.0
-    };
-    let width_pt = (width as f32) / ppp;
-    let height_pt = (height as f32) / ppp;
-    let text_scale = ppp.round().clamp(1.0, 3.0) as i32;
-    let margin = (16.0 * ppp).round() as i32;
-    let border_t = (1.0 * ppp).round().max(1.0) as i32;
-
-    // 1. Top-left acquisition date / caption badge (placed first so the
-    //    bottom-left colorbar never collides with it on short viewports).
-    let mut top_left_bottom = margin;
-    if let Some(caption) = spec
-        .caption
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && width_pt >= 180.0
-        && height_pt >= 90.0
-    {
-        let pad_x = (8.0 * ppp).round() as i32;
-        let pad_y = (6.0 * ppp).round() as i32;
-        let north_reserve = if spec.include_north_arrow {
-            (56.0 * ppp).round() as i32 + margin
-        } else {
-            0
-        };
-        let max_badge_w = canvas.width - margin * 2 - north_reserve;
-        let min_badge_w = 4 * 6 * text_scale + pad_x * 2;
-        if max_badge_w >= min_badge_w {
-            let max_chars = ((max_badge_w - pad_x * 2) / (6 * text_scale).max(1)).max(1) as usize;
-            let clipped: String = caption.chars().take(max_chars).collect();
-            if clipped
-                .chars()
-                .any(|c| glyph_5x7(c).iter().any(|&b| b != 0))
-            {
-                let tw = text_width_px(&clipped, text_scale);
-                let box_w = tw + pad_x * 2;
-                let box_h = 7 * text_scale + pad_y * 2;
-                canvas.fill_rect(margin, margin, box_w, box_h, BG_CARD);
-                canvas.stroke_rect(margin, margin, box_w, box_h, border_t, BORDER_SUBTLE);
-                canvas.draw_text(
-                    margin + pad_x,
-                    margin + pad_y,
-                    &clipped,
-                    text_scale,
-                    INK_PRIMARY,
-                );
-                top_left_bottom = margin + box_h + (8.0 * ppp).round() as i32;
-            }
-        }
-    }
-
-    // 2. Bottom-left metric scale bar.
-    let mut scale_bar_top: Option<i32> = None;
-    if spec.include_scale_bar
-        && spec.m_per_pt.is_finite()
-        && spec.m_per_pt > 0.0
-        && width_pt >= 160.0
-        && height_pt >= 100.0
-    {
-        let max_w_pt = (width_pt * 0.35).clamp(48.0, 160.0);
-        if spec.m_per_pt * f64::from(max_w_pt) <= 10_000_000.0 {
-            let (label, bar_w_pt) = compute_scale_bar(spec.m_per_pt, max_w_pt);
-            let bar_w_px = (bar_w_pt * ppp).round().max(8.0) as i32;
-            let tw = text_width_px(&label, text_scale);
-            let pad_x = (10.0 * ppp).round() as i32;
-            let content_w = bar_w_px.max(tw);
-            let box_w = (content_w + pad_x * 2).min(canvas.width - margin * 2);
-            let box_h = (34.0 * ppp).round() as i32;
-            let bx = margin;
-            let by = canvas.height - margin - box_h;
-
-            if by >= top_left_bottom && box_w >= bar_w_px + pad_x * 2 {
-                canvas.fill_rect(bx, by, box_w, box_h, BG_CARD);
-                canvas.stroke_rect(bx, by, box_w, box_h, border_t, BORDER_SUBTLE);
-
-                let tick_t = (2.0 * ppp).round().max(1.0) as i32;
-                let tick_h = (6.0 * ppp).round().max(3.0) as i32;
-                let y_bar = by + box_h - (9.0 * ppp).round() as i32;
-                let x0 = bx + (box_w - bar_w_px) / 2;
-                canvas.fill_rect(x0, y_bar, bar_w_px, tick_t, INK_PRIMARY);
-                canvas.fill_rect(x0, y_bar - tick_h + tick_t, tick_t, tick_h, INK_PRIMARY);
-                canvas.fill_rect(
-                    x0 + bar_w_px - tick_t,
-                    y_bar - tick_h + tick_t,
-                    tick_t,
-                    tick_h,
-                    INK_PRIMARY,
-                );
-
-                let tx = bx + (box_w - tw) / 2;
-                let ty = by + (7.0 * ppp).round() as i32;
-                canvas.draw_text(tx, ty, &label, text_scale, INK_PRIMARY);
-                scale_bar_top = Some(by);
-            }
-        }
-    }
-
-    // 3. Scientific colorbar (anchored above the bottom-left scale bar).
+    let metrics = OverlayMetrics::from_canvas(width, height, spec.pixels_per_point);
+    // Place the top-left caption first so bottom-left overlays never collide on short viewports.
+    let top_left_bottom = draw_caption_badge(&mut canvas, spec, &metrics);
+    let scale_bar_top = draw_scale_bar(&mut canvas, spec, &metrics, top_left_bottom);
     if spec.include_colorbar
         && let Some(cb) = &spec.colorbar
-        && width_pt >= 240.0
-        && height_pt >= 160.0
     {
-        let desired_w = ((width_pt * 0.28).clamp(180.0, 260.0) * ppp).round() as i32;
-        let box_w = desired_w.min(canvas.width - margin * 2);
-        let box_h = (56.0 * ppp).round() as i32;
-        let bx = margin;
-        let bottom_y = scale_bar_top.map_or(canvas.height - margin, |top| {
-            top - (8.0 * ppp).round() as i32
-        });
-        let by = bottom_y - box_h;
-        if by >= top_left_bottom && box_w >= (80.0 * ppp).round() as i32 {
-            canvas.fill_rect(bx, by, box_w, box_h, BG_CARD);
-            canvas.stroke_rect(bx, by, box_w, box_h, border_t, BORDER_SUBTLE);
-
-            let pad_x = (8.0 * ppp).round() as i32;
-            let unit_suffix = if cb.log10_db {
-                " [dB]".to_owned()
-            } else if let Some(ref u) = cb.units {
-                format!(" [{u}]")
-            } else {
-                String::new()
-            };
-            let max_chars = ((box_w - pad_x * 2) / (6 * text_scale).max(1)).max(4) as usize;
-            let title_full = format!("{}{unit_suffix}", cb.title);
-            let title: String = title_full.chars().take(max_chars).collect();
-            canvas.draw_text(
-                bx + pad_x,
-                by + (6.0 * ppp).round() as i32,
-                &title,
-                text_scale,
-                INK_PRIMARY,
-            );
-
-            let bar_x = bx + pad_x;
-            let bar_y = by + (22.0 * ppp).round() as i32;
-            let bar_w = (box_w - pad_x * 2).max(16);
-            let bar_h = (12.0 * ppp).round().max(4.0) as i32;
-            for dx in 0..bar_w {
-                let frac = (dx as f32) / ((bar_w - 1).max(1) as f32);
-                let rgb = sample_colormap_srgb(cb.colormap, frac, cb.invert_colormap);
-                canvas.fill_rect(bar_x + dx, bar_y, 1, bar_h, [rgb[0], rgb[1], rgb[2], 255]);
-            }
-            canvas.stroke_rect(bar_x, bar_y, bar_w, bar_h, border_t, BORDER_SUBTLE);
-
-            let min_s = format::format_scalar(cb.min);
-            let max_s = format::format_scalar(cb.max);
-            let tick_y = bar_y + bar_h + (5.0 * ppp).round() as i32;
-            let min_w = text_width_px(&min_s, text_scale);
-            let max_w = text_width_px(&max_s, text_scale);
-            canvas.draw_text(bar_x, tick_y, &min_s, text_scale, INK_PRIMARY);
-            if min_w + max_w + 4 * text_scale <= bar_w {
-                canvas.draw_text(
-                    bar_x + bar_w - max_w,
-                    tick_y,
-                    &max_s,
-                    text_scale,
-                    INK_PRIMARY,
-                );
-            }
-        }
+        draw_colorbar(&mut canvas, cb, &metrics, top_left_bottom, scale_bar_top);
     }
-
-    // 4. Top-right rotated North arrow.
-    if spec.include_north_arrow && width_pt >= 120.0 && height_pt >= 120.0 {
-        let radius = 24.0 * ppp;
-        let cx = (canvas.width as f32) - (margin as f32) - radius;
-        let cy = (margin as f32) + radius;
-        canvas.fill_circle(cx, cy, radius, BG_CARD);
-        canvas.stroke_circle(cx, cy, radius, (1.2 * ppp).max(1.0), BORDER_SUBTLE);
-
-        let heading_deg = if spec.heading_deg.is_finite() {
-            spec.heading_deg
-        } else {
-            0.0
-        };
-        let angle = -(heading_deg as f32).to_radians();
-        let (sin_a, cos_a) = angle.sin_cos();
-        let rot = |dx: f32, dy: f32| -> [f32; 2] {
-            [cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a]
-        };
-
-        let tip_n = rot(0.0, -radius * 0.48);
-        let tip_s = rot(0.0, radius * 0.52);
-        let left = rot(-4.5 * ppp, 0.0);
-        let right = rot(4.5 * ppp, 0.0);
-        canvas.fill_triangle(tip_n, right, left, NEEDLE_NORTH);
-        canvas.fill_triangle(tip_s, left, right, NEEDLE_SOUTH);
-
-        let n_pos = rot(0.0, -radius * 0.72);
-        let nw = text_width_px("N", text_scale);
-        let nh = 7 * text_scale;
-        canvas.draw_text(
-            n_pos[0].round() as i32 - nw / 2,
-            n_pos[1].round() as i32 - nh / 2,
-            "N",
-            text_scale,
-            INK_PRIMARY,
-        );
+    if spec.include_north_arrow {
+        draw_north_arrow(&mut canvas, spec.heading_deg, &metrics);
     }
 }
 

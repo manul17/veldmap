@@ -4,8 +4,8 @@
 use eframe::egui;
 
 use crate::colormap::{DEFAULT_SCL_MASK_BITS, SENTINEL2_SCL_NAMES};
+use crate::format;
 use crate::layers::{BandMathSummary, LayerId, OverlayEdit};
-use crate::ui::format;
 use crate::ui::widgets::{DragCommit, track_drag_commit};
 
 use super::LayerUiAction;

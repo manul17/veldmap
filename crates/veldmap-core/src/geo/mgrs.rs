@@ -367,7 +367,7 @@ pub fn format_wgs84_to_mgrs(lat_deg: f64, lon_deg: f64, precision: u8) -> Option
 
     let south = band_idx < 10;
     let system = System::utm(zone, south);
-    let (easting, northing) = system.from_geodetic(lat_deg, lon);
+    let (easting, northing) = system.project_from_geodetic(lat_deg, lon);
     if !easting.is_finite() || !northing.is_finite() {
         return None;
     }

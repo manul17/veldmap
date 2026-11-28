@@ -236,7 +236,7 @@ impl RangeInner {
                 strong_etag: self.meta.strong_etag.as_deref(),
             },
             #[cfg(any(test, feature = "test-support"))]
-            request_counter: Some(&self.http_requests),
+            request_counter: &self.http_requests,
         };
         let resp = fetch_range_http(&req_cfg, cancel).await?;
         let body = resp.body;
@@ -353,6 +353,8 @@ impl HttpRangeSource {
 
         let client = net.range_client_for(!parsed_headers.is_empty()).clone();
         let host_limiters = net.host_limiters();
+        #[cfg(any(test, feature = "test-support"))]
+        let http_requests = AtomicU64::new(0);
         let req_cfg = RangeFetchRequest {
             client: &client,
             host_limiters: &host_limiters,
@@ -365,7 +367,7 @@ impl HttpRangeSource {
                 probe_len: config.head_probe_bytes.max(1),
             },
             #[cfg(any(test, feature = "test-support"))]
-            request_counter: None,
+            request_counter: &http_requests,
         };
         let resp = fetch_range_http(&req_cfg, &linked_cancel).await?;
 
@@ -406,7 +408,7 @@ impl HttpRangeSource {
             active_pins: Mutex::new(HashMap::new()),
             readahead: Mutex::new(ReadaheadTracker::default()),
             #[cfg(any(test, feature = "test-support"))]
-            http_requests: AtomicU64::new(resp.requests_made),
+            http_requests,
             #[cfg(any(test, feature = "test-support"))]
             bytes_delivered: AtomicU64::new(delivered),
         });

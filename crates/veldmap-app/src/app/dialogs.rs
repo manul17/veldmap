@@ -85,11 +85,32 @@ fn normalize_png_save_path(path: PathBuf) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Native file dialog operation kind used to tailor error notices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DialogKind {
+    Open,
+    Save,
+}
+
 /// Error returned when a native file dialog cannot be spawned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DialogSpawnError {
     Busy,
     SpawnFailed,
+}
+
+impl DialogSpawnError {
+    pub(super) const fn notice(self, kind: DialogKind) -> &'static str {
+        match (self, kind) {
+            (Self::Busy, _) => "Another file dialog is already open.",
+            (Self::SpawnFailed, DialogKind::Open) => {
+                "Unable to open native file dialog on this system."
+            }
+            (Self::SpawnFailed, DialogKind::Save) => {
+                "Unable to open native save dialog on this system."
+            }
+        }
+    }
 }
 
 struct BusyResetGuard {

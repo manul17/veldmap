@@ -2,7 +2,7 @@
 
 use crate::RasterError;
 
-use super::wire::{IfdDirectory, SinglePassIfdReader, field_type_size};
+use super::wire::{IfdDirectory, SinglePassIfdReader, TiffByteOrder, field_type_size};
 
 fn unsigned_elem_size(tag: u16, field_type: u16) -> Result<usize, RasterError> {
     if !matches!(field_type, 1 | 3 | 4 | 13 | 16 | 18) {
@@ -16,6 +16,39 @@ fn unsigned_elem_size(tag: u16, field_type: u16) -> Result<usize, RasterError> {
         ))
     })?;
     Ok(size as usize)
+}
+
+fn for_each_unsigned_value(
+    order: TiffByteOrder,
+    field_type: u16,
+    bytes: &[u8],
+    count: usize,
+    mut visit: impl FnMut(u64) -> Result<(), RasterError>,
+) -> Result<(), RasterError> {
+    match field_type {
+        1 => {
+            for &b in bytes.iter().take(count) {
+                visit(u64::from(b))?;
+            }
+        }
+        3 => {
+            for chunk in bytes.chunks_exact(2).take(count) {
+                visit(u64::from(order.read_u16(chunk)))?;
+            }
+        }
+        4 | 13 => {
+            for chunk in bytes.chunks_exact(4).take(count) {
+                visit(u64::from(order.read_u32(chunk)))?;
+            }
+        }
+        16 | 18 => {
+            for chunk in bytes.chunks_exact(8).take(count) {
+                visit(order.read_u64(chunk))?;
+            }
+        }
+        _ => unreachable!("field_type validated by unsigned_elem_size"),
+    }
+    Ok(())
 }
 
 impl IfdDirectory {
@@ -50,12 +83,13 @@ impl IfdDirectory {
                     "TIFF tag {tag} expected 1 unsigned value, got {count}"
                 )));
             }
-            Ok(match field_type {
-                1 => u64::from(bytes[0]),
-                3 => u64::from(order.read_u16(&bytes[..2])),
-                4 | 13 => u64::from(order.read_u32(&bytes[..4])),
-                16 | 18 => order.read_u64(&bytes[..8]),
-                _ => unreachable!("field_type validated by unsigned_elem_size"),
+            let mut scalar = None;
+            for_each_unsigned_value(order, field_type, bytes, 1, |v| {
+                scalar = Some(v);
+                Ok(())
+            })?;
+            scalar.ok_or_else(|| {
+                RasterError::Decode(format!("TIFF tag {tag} expected 1 unsigned value, got 0"))
             })
         })
     }
@@ -104,35 +138,12 @@ impl IfdDirectory {
         let order = self.byte_order();
         self.with_unsigned_tag(reader, tag, |field_type, bytes, count| {
             let mut out = Vec::with_capacity(count);
-            match field_type {
-                1 => {
-                    for &b in bytes.iter().take(count) {
-                        out.push(u16::from(b));
-                    }
-                }
-                3 => {
-                    for chunk in bytes.chunks_exact(2).take(count) {
-                        out.push(order.read_u16(chunk));
-                    }
-                }
-                4 | 13 => {
-                    for chunk in bytes.chunks_exact(4).take(count) {
-                        let v = order.read_u32(chunk);
-                        out.push(u16::try_from(v).map_err(|_| {
-                            RasterError::Decode(format!("TIFF tag {tag} value {v} overflows u16"))
-                        })?);
-                    }
-                }
-                16 | 18 => {
-                    for chunk in bytes.chunks_exact(8).take(count) {
-                        let v = order.read_u64(chunk);
-                        out.push(u16::try_from(v).map_err(|_| {
-                            RasterError::Decode(format!("TIFF tag {tag} value {v} overflows u16"))
-                        })?);
-                    }
-                }
-                _ => unreachable!("field_type validated by unsigned_elem_size"),
-            }
+            for_each_unsigned_value(order, field_type, bytes, count, |v| {
+                out.push(u16::try_from(v).map_err(|_| {
+                    RasterError::Decode(format!("TIFF tag {tag} value {v} overflows u16"))
+                })?);
+                Ok(())
+            })?;
             Ok(out)
         })
     }
@@ -156,29 +167,10 @@ impl IfdDirectory {
         let order = self.byte_order();
         self.with_unsigned_tag(reader, tag, |field_type, bytes, count| {
             let mut out = Vec::with_capacity(count);
-            match field_type {
-                1 => {
-                    for &b in bytes.iter().take(count) {
-                        out.push(u64::from(b));
-                    }
-                }
-                3 => {
-                    for chunk in bytes.chunks_exact(2).take(count) {
-                        out.push(u64::from(order.read_u16(chunk)));
-                    }
-                }
-                4 | 13 => {
-                    for chunk in bytes.chunks_exact(4).take(count) {
-                        out.push(u64::from(order.read_u32(chunk)));
-                    }
-                }
-                16 | 18 => {
-                    for chunk in bytes.chunks_exact(8).take(count) {
-                        out.push(order.read_u64(chunk));
-                    }
-                }
-                _ => unreachable!("field_type validated by unsigned_elem_size"),
-            }
+            for_each_unsigned_value(order, field_type, bytes, count, |v| {
+                out.push(v);
+                Ok(())
+            })?;
             Ok(out)
         })
     }

@@ -116,6 +116,17 @@ pub(super) enum ViewportEvent {
     SwipeSplitT { split_t: f32, finished: bool },
 }
 
+/// Per-frame viewport geometry and interaction context passed to
+/// [`ViewportInteraction::handle_viewport_input`].
+#[derive(Clone, Copy)]
+pub(super) struct ViewportInputCtx<'a> {
+    pub(super) ctx: &'a egui::Context,
+    pub(super) response: &'a egui::Response,
+    pub(super) rect: egui::Rect,
+    pub(super) tool_mode: ViewportToolMode,
+    pub(super) swipe_divider_x: Option<f32>,
+}
+
 /// Half-width hit radius (logical points) for split-screen swipe divider
 /// hover highlighting, resize cursor, and drag capture.
 pub(super) const SWIPE_HIT_HALF_PT: f32 = 14.0;
@@ -236,15 +247,6 @@ impl ViewportInteraction {
         rect: egui::Rect,
         pos: egui::Pos2,
     ) -> Option<(f64, f64)> {
-        self.probe_pointer(camera, rect, pos)
-    }
-
-    fn probe_pointer(
-        &self,
-        camera: &Camera,
-        rect: egui::Rect,
-        pos: egui::Pos2,
-    ) -> Option<(f64, f64)> {
         let width_pt = f64::from(rect.width()).max(1.0);
         let height_pt = f64::from(rect.height()).max(1.0);
         let nx = f64::from(pos.x - rect.left()) / width_pt;
@@ -271,7 +273,7 @@ impl ViewportInteraction {
                     valid_pos = Some(pos);
                 }
                 over_globe
-                    .then(|| self.probe_pointer(camera, rect, pos))
+                    .then(|| self.probe_screen_pos(camera, rect, pos))
                     .flatten()
             });
             self.cursor_screen_pos = valid_pos;
@@ -373,177 +375,215 @@ impl ViewportInteraction {
         minimal_circular_bbox(&hits)
     }
 
-    /// Apply primary-button orbit dragging, split-screen swipe curtain dragging,
-    /// secondary / `Shift+Primary` manual heading rotation, scroll/pinch
-    /// cursor-anchored zoom, and optional measurement click or AOI box drag
-    /// capture to `camera`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Cohesive per-frame viewport pointer dispatch keeping input state localized."
-    )]
-    pub(super) fn handle_viewport_input(
+    fn handle_swipe_drag(
         &mut self,
-        ctx: &egui::Context,
-        camera: &mut Camera,
-        response: &egui::Response,
-        rect: egui::Rect,
-        height_pt: f64,
-        tool_mode: ViewportToolMode,
-        swipe_divider_x: Option<f32>,
+        input: ViewportInputCtx<'_>,
+        shift_held: bool,
     ) -> Option<ViewportEvent> {
-        let shift_held = ctx.input(|i| i.modifiers.shift);
-        let mut captured_event = None;
-
-        // Split-screen swipe curtain drag capture (within ±SWIPE_HIT_HALF_PT of
-        // divider). An already-started drag continues until release even if
-        // `Shift` is pressed mid-drag so session persistence is never skipped.
-        if tool_mode == ViewportToolMode::Swipe
-            && let Some(div_x) = swipe_divider_x
-        {
-            let width_pt = rect.width().max(1.0);
-            if !self.swipe_dragging
-                && !shift_held
-                && response.drag_started_by(egui::PointerButton::Primary)
-                && let Some(pos) = ctx
-                    .input(|i| i.pointer.press_origin())
-                    .or_else(|| response.interact_pointer_pos())
-                && !self.is_over_hud(pos)
-                && (pos.x - div_x).abs() <= SWIPE_HIT_HALF_PT
-            {
-                self.swipe_dragging = true;
-            }
-            if self.swipe_dragging {
-                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                if response.dragged_by(egui::PointerButton::Primary)
-                    && let Some(pos) = response.interact_pointer_pos()
-                {
-                    let split_t = ((pos.x - rect.left()) / width_pt).clamp(0.0, 1.0);
-                    captured_event = Some(ViewportEvent::SwipeSplitT {
-                        split_t,
-                        finished: false,
-                    });
-                } else if response.drag_stopped_by(egui::PointerButton::Primary)
-                    || !ctx.input(|i| i.pointer.primary_down())
-                {
-                    self.swipe_dragging = false;
-                    let split_t = response
-                        .interact_pointer_pos()
-                        .map_or(((div_x - rect.left()) / width_pt).clamp(0.0, 1.0), |pos| {
-                            ((pos.x - rect.left()) / width_pt).clamp(0.0, 1.0)
-                        });
-                    captured_event = Some(ViewportEvent::SwipeSplitT {
-                        split_t,
-                        finished: true,
-                    });
-                }
-            }
-        } else {
+        let Some(div_x) = input
+            .swipe_divider_x
+            .filter(|_| input.tool_mode == ViewportToolMode::Swipe)
+        else {
             self.swipe_dragging = false;
+            return None;
+        };
+
+        let width_pt = input.rect.width().max(1.0);
+        if !self.swipe_dragging
+            && !shift_held
+            && input.response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pos) = input
+                .ctx
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| input.response.interact_pointer_pos())
+            && !self.is_over_hud(pos)
+            && (pos.x - div_x).abs() <= SWIPE_HIT_HALF_PT
+        {
+            self.swipe_dragging = true;
+        }
+        if !self.swipe_dragging {
+            return None;
         }
 
-        let rotating = response.dragged_by(egui::PointerButton::Secondary)
-            || (!self.swipe_dragging
-                && shift_held
-                && response.dragged_by(egui::PointerButton::Primary));
+        input
+            .ctx
+            .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        if input.response.dragged_by(egui::PointerButton::Primary)
+            && let Some(pos) = input.response.interact_pointer_pos()
+        {
+            let split_t = ((pos.x - input.rect.left()) / width_pt).clamp(0.0, 1.0);
+            Some(ViewportEvent::SwipeSplitT {
+                split_t,
+                finished: false,
+            })
+        } else if input.response.drag_stopped_by(egui::PointerButton::Primary)
+            || !input.ctx.input(|i| i.pointer.primary_down())
+        {
+            self.swipe_dragging = false;
+            let split_t = input.response.interact_pointer_pos().map_or(
+                ((div_x - input.rect.left()) / width_pt).clamp(0.0, 1.0),
+                |pos| ((pos.x - input.rect.left()) / width_pt).clamp(0.0, 1.0),
+            );
+            Some(ViewportEvent::SwipeSplitT {
+                split_t,
+                finished: true,
+            })
+        } else {
+            None
+        }
+    }
 
-        if tool_mode == ViewportToolMode::DrawAoiBox && !shift_held {
-            if response.hovered() || self.aoi_drag_start.is_some() {
-                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-            }
-            if response.drag_started_by(egui::PointerButton::Primary)
-                && let Some(pos) = response.interact_pointer_pos()
-                && !self.is_over_hud(pos)
-            {
-                self.aoi_drag_start = self.probe_pointer(camera, rect, pos);
-            }
-            if let Some(start) = self.aoi_drag_start {
-                if response.dragged_by(egui::PointerButton::Primary)
-                    && let Some(pos) = response.interact_pointer_pos()
-                    && let Some(cur) = self.probe_pointer(camera, rect, pos)
-                {
-                    if let Some(bbox) = aoi_drag_bbox(start, cur) {
-                        captured_event = Some(ViewportEvent::AoiBox {
-                            bbox,
-                            finished: false,
-                        });
-                    }
-                } else if response.drag_stopped_by(egui::PointerButton::Primary)
-                    || !ctx.input(|i| i.pointer.primary_down())
-                {
-                    self.aoi_drag_start = None;
-                    let final_bbox = response
-                        .interact_pointer_pos()
-                        .and_then(|pos| self.probe_pointer(camera, rect, pos))
-                        .and_then(|end| aoi_drag_bbox(start, end));
-                    captured_event = Some(match final_bbox {
-                        Some(bbox) => ViewportEvent::AoiBox {
-                            bbox,
-                            finished: true,
-                        },
-                        None => ViewportEvent::AoiBoxCancelled,
-                    });
-                }
-            }
-        } else if self.aoi_drag_start.take().is_some() {
-            captured_event = Some(ViewportEvent::AoiBoxCancelled);
+    fn handle_aoi_drag(
+        &mut self,
+        camera: &Camera,
+        input: ViewportInputCtx<'_>,
+        shift_held: bool,
+    ) -> Option<ViewportEvent> {
+        if input.tool_mode != ViewportToolMode::DrawAoiBox || shift_held {
+            return self
+                .aoi_drag_start
+                .take()
+                .map(|_| ViewportEvent::AoiBoxCancelled);
         }
 
+        if input.response.hovered() || self.aoi_drag_start.is_some() {
+            input.ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        if input.response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pos) = input.response.interact_pointer_pos()
+            && !self.is_over_hud(pos)
+        {
+            self.aoi_drag_start = self.probe_screen_pos(camera, input.rect, pos);
+        }
+        let start = self.aoi_drag_start?;
+        if input.response.dragged_by(egui::PointerButton::Primary)
+            && let Some(pos) = input.response.interact_pointer_pos()
+            && let Some(cur) = self.probe_screen_pos(camera, input.rect, pos)
+        {
+            aoi_drag_bbox(start, cur).map(|bbox| ViewportEvent::AoiBox {
+                bbox,
+                finished: false,
+            })
+        } else if input.response.drag_stopped_by(egui::PointerButton::Primary)
+            || !input.ctx.input(|i| i.pointer.primary_down())
+        {
+            self.aoi_drag_start = None;
+            let final_bbox = input
+                .response
+                .interact_pointer_pos()
+                .and_then(|pos| self.probe_screen_pos(camera, input.rect, pos))
+                .and_then(|end| aoi_drag_bbox(start, end));
+            Some(match final_bbox {
+                Some(bbox) => ViewportEvent::AoiBox {
+                    bbox,
+                    finished: true,
+                },
+                None => ViewportEvent::AoiBoxCancelled,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn handle_camera_gestures(
+        &self,
+        camera: &mut Camera,
+        input: ViewportInputCtx<'_>,
+        height_pt: f64,
+        rotating: bool,
+    ) {
         if rotating {
-            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            let delta = response.drag_delta();
+            input
+                .ctx
+                .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            let delta = input.response.drag_delta();
             if delta.x != 0.0 {
                 camera.rotate_heading(f64::from(delta.x) * ROTATE_RAD_PER_PT);
             }
-        } else if tool_mode != ViewportToolMode::DrawAoiBox && !self.swipe_dragging {
-            if response.dragged_by(egui::PointerButton::Primary) {
-                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                let delta = response.drag_delta();
+        } else if input.tool_mode != ViewportToolMode::DrawAoiBox && !self.swipe_dragging {
+            if input.response.dragged_by(egui::PointerButton::Primary) {
+                input.ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                let delta = input.response.drag_delta();
                 if delta != egui::Vec2::ZERO {
                     camera.orbit(
                         f64::from(delta.x) / height_pt,
                         f64::from(delta.y) / height_pt,
                     );
                 }
-            } else if response.hovered() {
-                let over_swipe_handle = tool_mode == ViewportToolMode::Swipe
-                    && swipe_divider_x
-                        .is_some_and(|div_x| self.is_hovering_swipe_divider(response, div_x));
-                ctx.set_cursor_icon(if over_swipe_handle {
+            } else if input.response.hovered() {
+                let over_swipe_handle = input.tool_mode == ViewportToolMode::Swipe
+                    && input
+                        .swipe_divider_x
+                        .is_some_and(|div_x| self.is_hovering_swipe_divider(input.response, div_x));
+                input.ctx.set_cursor_icon(if over_swipe_handle {
                     egui::CursorIcon::ResizeHorizontal
-                } else if tool_mode == ViewportToolMode::Measure {
+                } else if input.tool_mode == ViewportToolMode::Measure {
                     egui::CursorIcon::Crosshair
                 } else {
                     egui::CursorIcon::Grab
                 });
             }
         }
+    }
 
-        // Scroll-wheel and trackpad pinch / Ctrl+scroll zoom holding ground under cursor.
-        if response.hovered() {
-            let (scroll_y, zoom_delta) = ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-            let steps = zoom_steps_from_input(scroll_y, zoom_delta);
-            if steps.abs() > 0.0 {
-                let (hold_x, hold_y) = match response.hover_pos() {
-                    Some(pos) => (
-                        f64::from(pos.x - rect.center().x) / height_pt,
-                        f64::from(pos.y - rect.center().y) / height_pt,
-                    ),
-                    None => (0.0, 0.0),
-                };
-                camera.zoom_at(steps, hold_x, hold_y);
-            }
+    fn handle_scroll_zoom(camera: &mut Camera, input: ViewportInputCtx<'_>, height_pt: f64) {
+        if !input.response.hovered() {
+            return;
         }
+        let (scroll_y, zoom_delta) = input
+            .ctx
+            .input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let steps = zoom_steps_from_input(scroll_y, zoom_delta);
+        if steps.abs() > 0.0 {
+            let (hold_x, hold_y) = match input.response.hover_pos() {
+                Some(pos) => (
+                    f64::from(pos.x - input.rect.center().x) / height_pt,
+                    f64::from(pos.y - input.rect.center().y) / height_pt,
+                ),
+                None => (0.0, 0.0),
+            };
+            camera.zoom_at(steps, hold_x, hold_y);
+        }
+    }
+
+    /// Apply primary-button orbit dragging, split-screen swipe curtain dragging,
+    /// secondary / `Shift+Primary` manual heading rotation, scroll/pinch
+    /// cursor-anchored zoom, and optional measurement click or AOI box drag
+    /// capture to `camera`.
+    pub(super) fn handle_viewport_input(
+        &mut self,
+        camera: &mut Camera,
+        input: ViewportInputCtx<'_>,
+    ) -> Option<ViewportEvent> {
+        let shift_held = input.ctx.input(|i| i.modifiers.shift);
+        let height_pt = f64::from(input.rect.height()).max(1.0);
+
+        // Split-screen swipe curtain drag capture (within ±SWIPE_HIT_HALF_PT of
+        // divider). An already-started drag continues until release even if
+        // `Shift` is pressed mid-drag so session persistence is never skipped.
+        let swipe_ev = self.handle_swipe_drag(input, shift_held);
+
+        let rotating = input.response.dragged_by(egui::PointerButton::Secondary)
+            || (!self.swipe_dragging
+                && shift_held
+                && input.response.dragged_by(egui::PointerButton::Primary));
+
+        let aoi_ev = self.handle_aoi_drag(camera, input, shift_held);
+        let captured_event = aoi_ev.or(swipe_ev);
+
+        self.handle_camera_gestures(camera, input, height_pt, rotating);
+        Self::handle_scroll_zoom(camera, input, height_pt);
 
         if captured_event.is_some() {
             return captured_event;
         }
 
-        if tool_mode == ViewportToolMode::Measure
-            && response.clicked_by(egui::PointerButton::Primary)
+        if input.tool_mode == ViewportToolMode::Measure
+            && input.response.clicked_by(egui::PointerButton::Primary)
             && !shift_held
-            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(pos) = input.response.interact_pointer_pos()
             && !self.is_over_hud(pos)
-            && let Some((lat, lon)) = self.probe_pointer(camera, rect, pos)
+            && let Some((lat, lon)) = self.probe_screen_pos(camera, input.rect, pos)
         {
             return Some(ViewportEvent::MeasurePoint(GeoPoint::new(lat, lon)));
         }

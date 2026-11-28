@@ -32,7 +32,7 @@ fn write_atomic_durable_creates_overwrites_and_leaves_no_temp_files() {
 fn private_write_sets_owner_only_mode_and_cleans_up_on_rename_failure() {
     let dir = TestTempDir::new("atomic-private");
     let secret_path = dir.path().join("secret.json");
-    write_atomic_durable_private(&secret_path, b"{\"k\":1}\n").expect("private write");
+    write_atomic_impl(&secret_path, b"{\"k\":1}\n", true).expect("private write");
 
     #[cfg(unix)]
     {
@@ -130,4 +130,51 @@ fn write_json_durable_and_read_json_limited_enforce_limits_without_renaming_corr
         !append_path_suffix(&path, ".corrupt").exists(),
         "read_json_limited must not create a .corrupt backup"
     );
+}
+
+#[test]
+fn read_json_or_default_backs_up_invalid_utf8_and_rejects_oversized_or_non_regular() {
+    #[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct Sample {
+        count: u32,
+    }
+
+    let dir = TestTempDir::new("json-bounded");
+
+    // Invalid UTF-8 bytes must still produce `StorageError::Json` and trigger
+    // `.corrupt` backup in `read_json_or_default_with_backup`.
+    let bad_utf8 = dir.path().join("bad_utf8.json");
+    fs::write(&bad_utf8, [0xFF, 0xFE, 0xFD]).expect("write invalid utf8");
+    assert!(matches!(
+        read_json_or_default::<Sample>(&bad_utf8),
+        Err(StorageError::Json(_))
+    ));
+    let fallback: Sample = read_json_or_default_with_backup(&bad_utf8);
+    assert_eq!(fallback, Sample::default());
+    let backup = append_path_suffix(&bad_utf8, ".corrupt");
+    assert_eq!(
+        fs::read(&backup).expect("invalid utf8 backup preserved"),
+        vec![0xFF, 0xFE, 0xFD]
+    );
+
+    // Non-regular paths (directories) are rejected with `InvalidPath` and
+    // never renamed to `.corrupt`.
+    let sub_dir = dir.path().join("not_a_file.json");
+    fs::create_dir_all(&sub_dir).expect("create dir");
+    assert!(matches!(
+        read_json_or_default::<Sample>(&sub_dir),
+        Err(StorageError::InvalidPath(_))
+    ));
+    let dir_fallback: Sample = read_json_or_default_with_backup(&sub_dir);
+    assert_eq!(dir_fallback, Sample::default());
+    assert!(sub_dir.is_dir(), "directory must not be renamed");
+    assert!(!append_path_suffix(&sub_dir, ".corrupt").exists());
+
+    // Oversized files are rejected with `FileTooLarge`.
+    let big = dir.path().join("big.json");
+    fs::write(&big, b"{\"count\":123456}").expect("write json");
+    assert!(matches!(
+        read_json_or_default_limited::<Sample>(&big, 8),
+        Err(StorageError::FileTooLarge { limit_bytes: 8, .. })
+    ));
 }

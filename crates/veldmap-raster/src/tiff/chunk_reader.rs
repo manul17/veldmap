@@ -23,7 +23,9 @@ use super::chunk_convert::{
 };
 use super::ifd::{CachedIfd, Photometric, PlanarConfig};
 use super::raw_decode::{RawChunkPayload, decode_raw_chunk};
-use super::view::{TiffSourceView, find_ifd};
+use super::view::{
+    TiffSourceView, find_ifd, identity_display_mapping, planar_display_planes, resolve_band_index,
+};
 
 /// Explicitly models the two chunk-reading modes of [`TiffChunkReader`].
 pub(super) enum ChunkReadMode<'a> {
@@ -127,13 +129,13 @@ impl<'a> TiffChunkReader<'a> {
     ) -> Result<Vec<u8>, RasterError> {
         let mapping = self
             .display_mapping
-            .unwrap_or_else(|| ifd.identity_display_mapping(self.view.nodata_f64));
+            .unwrap_or_else(|| identity_display_mapping(ifd, self.view.nodata_f64));
 
         if ifd.photometric == Photometric::Palette {
             return self.decode_palette_display_chunk(ifd, index, pixels, cancel);
         }
         if ifd.planar == PlanarConfig::Planar {
-            let (plane_buf, plane_len) = ifd.planar_display_planes();
+            let (plane_buf, plane_len) = planar_display_planes(ifd);
             let need_planes = &plane_buf[..plane_len];
             let sample_bytes = ifd.sample_type.byte_size();
             let interleaved_spp = need_planes.len();
@@ -218,7 +220,7 @@ impl<'a> TiffChunkReader<'a> {
         pixels: usize,
         cancel: &CancelToken,
     ) -> Result<Vec<u8>, RasterError> {
-        let band = ifd.resolve_band_index(self.spec.band)?;
+        let band = resolve_band_index(ifd, self.spec.band)?;
         let RawChunkPayload::Bytes(data) =
             self.decode_plane(ifd, ifd.band_plane(band), index, cancel)?
         else {
@@ -241,7 +243,7 @@ impl<'a> TiffChunkReader<'a> {
         format: CategoricalFormat,
         cancel: &CancelToken,
     ) -> Result<Vec<u8>, RasterError> {
-        let band = ifd.resolve_band_index(self.spec.band)?;
+        let band = resolve_band_index(ifd, self.spec.band)?;
         let RawChunkPayload::Bytes(data) =
             self.decode_plane(ifd, ifd.band_plane(band), index, cancel)?
         else {
