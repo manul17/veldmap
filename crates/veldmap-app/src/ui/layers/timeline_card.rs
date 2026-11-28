@@ -2,20 +2,23 @@
 //! date scrubber, prev/next stepping, cloud-cover filter, Single / Diff /
 //! Cross-Fade comparison mode selector, reference epoch picker, cross-fade
 //! `blend_t` slider, diff colormap/stretch controls, and shared Band Math /
-//! `SCL` controls.
+//! Single-raster scientific & categorical / `SCL` controls.
 
 use eframe::egui;
 
-use crate::colormap::ColormapId;
 use crate::layers::{
-    BandMathEdit, LayerId, OverlayEdit, TimelineCompareMode, TimelineEdit, TimelineEpochLoadState,
+    LayerId, OverlayEdit, TimelineCompareMode, TimelineEdit, TimelineEpochLoadState,
     TimelineSummary,
 };
 use crate::ui::ERROR_TEXT_COLOR;
-use crate::ui::widgets::paint_colormap_ramp;
+use crate::ui::widgets::{DragCommit, paint_colormap_ramp, track_drag_commit};
 
 use super::LayerUiAction;
-use super::band_math_card::show_band_math_controls;
+use super::band_math_card::show_band_math_controls_with_options;
+use super::style_controls::{
+    MinMaxEvent, show_categorical_controls, show_colormap_picker, show_min_max_drag,
+    show_scientific_controls,
+};
 
 fn show_diff_colormap_and_stretch(
     ui: &mut egui::Ui,
@@ -23,39 +26,18 @@ fn show_diff_colormap_and_stretch(
     tl: &TimelineSummary,
     actions: &mut Vec<LayerUiAction>,
 ) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Diff Ramp").small());
-        egui::ComboBox::from_id_salt(("tl_diff_cmap", id))
-            .selected_text(egui::RichText::new(tl.diff_colormap.label()).small())
-            .width(104.0)
-            .show_ui(ui, |ui| {
-                for cm in ColormapId::ALL {
-                    let selected = cm == tl.diff_colormap;
-                    if ui.selectable_label(selected, cm.label()).clicked() && !selected {
-                        actions.push(LayerUiAction::edit_raster(
-                            id,
-                            OverlayEdit::Timeline(TimelineEdit::SetDiffColormap {
-                                colormap: cm,
-                                invert: tl.diff_invert_colormap,
-                            }),
-                        ));
-                    }
-                }
-            });
-        let mut invert = tl.diff_invert_colormap;
-        if ui
-            .checkbox(&mut invert, egui::RichText::new("Inv").small())
-            .changed()
-        {
+    show_colormap_picker(
+        ui,
+        ("tl_diff_cmap", id),
+        tl.diff_colormap,
+        tl.diff_invert_colormap,
+        |colormap, invert| {
             actions.push(LayerUiAction::edit_raster(
                 id,
-                OverlayEdit::Timeline(TimelineEdit::SetDiffColormap {
-                    colormap: tl.diff_colormap,
-                    invert,
-                }),
+                OverlayEdit::Timeline(TimelineEdit::SetDiffColormap { colormap, invert }),
             ));
-        }
-    });
+        },
+    );
 
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width().max(80.0), 8.0),
@@ -69,38 +51,17 @@ fn show_diff_colormap_and_stretch(
         32,
     );
 
-    let mut min_v = tl.diff_stretch_min;
-    let mut max_v = tl.diff_stretch_max;
-    let step = ((max_v - min_v).abs() * 0.01).clamp(1e-4, 1.0);
-    let mut changed = false;
-    let mut commit = false;
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Δ Range").small());
-        let r_min = ui.add(
-            egui::DragValue::new(&mut min_v)
-                .speed(step)
-                .max_decimals(3)
-                .prefix("min "),
-        );
-        let r_max = ui.add(
-            egui::DragValue::new(&mut max_v)
-                .speed(step)
-                .max_decimals(3)
-                .prefix("max "),
-        );
-        changed |= r_min.changed() || r_max.changed();
-        commit |= r_min.drag_stopped()
-            || r_max.drag_stopped()
-            || r_min.lost_focus()
-            || r_max.lost_focus();
-    });
-    if (changed || commit) && (max_v - min_v).abs() > 1e-9 {
+    if let MinMaxEvent::Drag { min, max, commit } = show_min_max_drag(
+        ui,
+        ("tl_diff_stretch", id),
+        tl.diff_stretch_min,
+        tl.diff_stretch_max,
+        None,
+    ) && (max - min).abs() > 1e-9
+    {
         actions.push(LayerUiAction::edit_raster_drag(
             id,
-            OverlayEdit::Timeline(TimelineEdit::SetDiffStretchRange {
-                min: min_v,
-                max: max_v,
-            }),
+            OverlayEdit::Timeline(TimelineEdit::SetDiffStretchRange { min, max }),
             commit,
         ));
     }
@@ -119,8 +80,9 @@ pub(super) fn show_timeline_controls(
         .position(|&i| i == tl.active_idx)
         .unwrap_or(0);
     let filtered_len = tl.filtered_indices.len();
+    let is_scalar_diff = matches!(tl.compare, TimelineCompareMode::ScalarDiff { .. });
 
-    // Active date badge + cloud % + load state.
+    // Active date badge + cloud % + load state (+ Retry on failure).
     ui.horizontal(|ui| {
         if let Some(ep) = active_epoch {
             ui.strong(egui::RichText::new(&ep.date_label).small())
@@ -135,6 +97,12 @@ pub(super) fn show_timeline_controls(
                 TimelineEpochLoadState::Failed => {
                     ui.colored_label(ERROR_TEXT_COLOR, egui::RichText::new("failed").small())
                         .on_hover_text(ep.error.as_deref().unwrap_or("epoch failed to open"));
+                    if ui.small_button("Retry").clicked() {
+                        actions.push(LayerUiAction::edit_raster(
+                            id,
+                            OverlayEdit::Timeline(TimelineEdit::RetryEpoch(tl.active_idx)),
+                        ));
+                    }
                 }
                 TimelineEpochLoadState::Unloaded | TimelineEpochLoadState::Ready => {}
             }
@@ -158,25 +126,32 @@ pub(super) fn show_timeline_controls(
                 ));
             }
             let mut pos = filtered_pos;
+            let scrub_id = ui.scope_id().with(("tl_scrub", id));
             let slider = ui.add(
                 egui::Slider::new(&mut pos, 0..=filtered_len - 1)
                     .show_value(false)
                     .trailing_fill(true),
             );
-            if slider.changed()
-                && let Some(&target_idx) = tl.filtered_indices.get(pos)
-            {
-                actions.push(LayerUiAction::edit_raster_drag(
-                    id,
-                    OverlayEdit::Timeline(TimelineEdit::SetActiveEpoch(target_idx)),
-                    slider.drag_stopped(),
-                ));
-            } else if slider.drag_stopped() {
-                actions.push(LayerUiAction::edit_raster_drag(
-                    id,
-                    OverlayEdit::Timeline(TimelineEdit::SetActiveEpoch(tl.active_idx)),
-                    true,
-                ));
+            match track_drag_commit(
+                ui,
+                scrub_id,
+                slider.changed(),
+                slider.dragged(),
+                slider.drag_stopped(),
+            ) {
+                DragCommit::None => {}
+                state @ (DragCommit::Preview | DragCommit::Commit) => {
+                    let target_idx = tl
+                        .filtered_indices
+                        .get(pos)
+                        .copied()
+                        .unwrap_or(tl.active_idx);
+                    actions.push(LayerUiAction::edit_raster_drag(
+                        id,
+                        OverlayEdit::Timeline(TimelineEdit::SetActiveEpoch(target_idx)),
+                        matches!(state, DragCommit::Commit),
+                    ));
+                }
             }
             if ui
                 .add_enabled(
@@ -208,17 +183,21 @@ pub(super) fn show_timeline_controls(
                 ));
             }
             if let Some(mut limit) = tl.max_cloud_cover {
+                let cloud_id = ui.scope_id().with(("tl_cloud", id));
                 let r = ui.add(
                     egui::Slider::new(&mut limit, 0.0..=100.0)
                         .suffix("%")
                         .fixed_decimals(0),
                 );
-                if r.changed() || r.drag_stopped() {
-                    actions.push(LayerUiAction::edit_raster_drag(
-                        id,
-                        OverlayEdit::Timeline(TimelineEdit::SetCloudFilter(Some(limit))),
-                        r.drag_stopped(),
-                    ));
+                match track_drag_commit(ui, cloud_id, r.changed(), r.dragged(), r.drag_stopped()) {
+                    DragCommit::None => {}
+                    state @ (DragCommit::Preview | DragCommit::Commit) => {
+                        actions.push(LayerUiAction::edit_raster_drag(
+                            id,
+                            OverlayEdit::Timeline(TimelineEdit::SetCloudFilter(Some(limit))),
+                            matches!(state, DragCommit::Commit),
+                        ));
+                    }
                 }
             }
         });
@@ -241,22 +220,20 @@ pub(super) fn show_timeline_controls(
                     )),
                 ));
             }
-            if tl.supports_scalar_diff {
-                let is_diff = matches!(tl.compare, TimelineCompareMode::ScalarDiff { .. });
-                if ui
-                    .selectable_label(is_diff, egui::RichText::new("Diff (B−A)").small())
+            if tl.supports_scalar_diff
+                && ui
+                    .selectable_label(is_scalar_diff, egui::RichText::new("Diff (B−A)").small())
                     .on_hover_text("Dual-epoch GPU scalar difference (Active B minus Reference A)")
                     .clicked()
-                    && !is_diff
-                {
-                    let ref_idx = tl.compare.ref_idx().unwrap_or(tl.active_idx);
-                    actions.push(LayerUiAction::edit_raster(
-                        id,
-                        OverlayEdit::Timeline(TimelineEdit::SetCompareMode(
-                            TimelineCompareMode::ScalarDiff { ref_idx },
-                        )),
-                    ));
-                }
+                && !is_scalar_diff
+            {
+                let ref_idx = tl.compare.ref_idx().unwrap_or(tl.active_idx);
+                actions.push(LayerUiAction::edit_raster(
+                    id,
+                    OverlayEdit::Timeline(TimelineEdit::SetCompareMode(
+                        TimelineCompareMode::ScalarDiff { ref_idx },
+                    )),
+                ));
             }
             if tl.supports_cross_fade {
                 let is_cf = matches!(tl.compare, TimelineCompareMode::CrossFade { .. });
@@ -284,10 +261,8 @@ pub(super) fn show_timeline_controls(
 
         // Reference epoch (Epoch A) selector when comparing.
         if let Some(ref_idx) = tl.compare.ref_idx() {
-            let ref_label = tl
-                .epochs
-                .get(ref_idx)
-                .map_or("Epoch A", |e| e.date_label.as_str());
+            let ref_epoch = tl.epochs.get(ref_idx);
+            let ref_label = ref_epoch.map_or("Epoch A", |e| e.date_label.as_str());
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Ref (A)").small());
                 egui::ComboBox::from_id_salt(("tl_ref_epoch", id))
@@ -301,29 +276,59 @@ pub(super) fn show_timeline_controls(
                                     None => ep.date_label.clone(),
                                 };
                                 let selected = ep_idx == ref_idx;
-                                if ui.selectable_label(selected, label).clicked() && !selected {
-                                    let next_mode = match tl.compare {
-                                        TimelineCompareMode::ScalarDiff { .. } => {
-                                            TimelineCompareMode::ScalarDiff { ref_idx: ep_idx }
-                                        }
-                                        TimelineCompareMode::CrossFade { blend_t, .. } => {
-                                            TimelineCompareMode::CrossFade {
-                                                ref_idx: ep_idx,
-                                                blend_t,
+                                let is_active = ep_idx == tl.active_idx;
+                                ui.add_enabled_ui(!is_active, |ui| {
+                                    if ui.selectable_label(selected, label).clicked() && !selected {
+                                        let next_mode = match tl.compare {
+                                            TimelineCompareMode::ScalarDiff { .. } => {
+                                                TimelineCompareMode::ScalarDiff { ref_idx: ep_idx }
                                             }
-                                        }
-                                        TimelineCompareMode::Single => TimelineCompareMode::Single,
-                                    };
-                                    actions.push(LayerUiAction::edit_raster(
-                                        id,
-                                        OverlayEdit::Timeline(TimelineEdit::SetCompareMode(
-                                            next_mode,
-                                        )),
-                                    ));
-                                }
+                                            TimelineCompareMode::CrossFade { blend_t, .. } => {
+                                                TimelineCompareMode::CrossFade {
+                                                    ref_idx: ep_idx,
+                                                    blend_t,
+                                                }
+                                            }
+                                            TimelineCompareMode::Single => {
+                                                TimelineCompareMode::Single
+                                            }
+                                        };
+                                        actions.push(LayerUiAction::edit_raster(
+                                            id,
+                                            OverlayEdit::Timeline(TimelineEdit::SetCompareMode(
+                                                next_mode,
+                                            )),
+                                        ));
+                                    }
+                                });
                             }
                         }
                     });
+                if let Some(ep) = ref_epoch {
+                    match ep.load_state {
+                        TimelineEpochLoadState::Loading => {
+                            ui.spinner();
+                        }
+                        TimelineEpochLoadState::Failed => {
+                            ui.colored_label(
+                                ERROR_TEXT_COLOR,
+                                egui::RichText::new("failed").small(),
+                            )
+                            .on_hover_text(
+                                ep.error
+                                    .as_deref()
+                                    .unwrap_or("reference epoch failed to open"),
+                            );
+                            if ui.small_button("Retry").clicked() {
+                                actions.push(LayerUiAction::edit_raster(
+                                    id,
+                                    OverlayEdit::Timeline(TimelineEdit::RetryEpoch(ref_idx)),
+                                ));
+                            }
+                        }
+                        TimelineEpochLoadState::Unloaded | TimelineEpochLoadState::Ready => {}
+                    }
+                }
             });
         }
 
@@ -331,32 +336,37 @@ pub(super) fn show_timeline_controls(
         if let TimelineCompareMode::CrossFade { mut blend_t, .. } = tl.compare {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("A ↔ B").small());
+                let blend_id = ui.scope_id().with(("tl_blend_t", id));
                 let r = ui.add(
                     egui::Slider::new(&mut blend_t, 0.0..=1.0)
                         .fixed_decimals(2)
                         .trailing_fill(true),
                 );
-                if r.changed() || r.drag_stopped() {
-                    actions.push(LayerUiAction::edit_raster_drag(
-                        id,
-                        OverlayEdit::Timeline(TimelineEdit::SetBlendT(blend_t)),
-                        r.drag_stopped(),
-                    ));
+                match track_drag_commit(ui, blend_id, r.changed(), r.dragged(), r.drag_stopped()) {
+                    DragCommit::None => {}
+                    state @ (DragCommit::Preview | DragCommit::Commit) => {
+                        actions.push(LayerUiAction::edit_raster_drag(
+                            id,
+                            OverlayEdit::Timeline(TimelineEdit::SetBlendT(blend_t)),
+                            matches!(state, DragCommit::Commit),
+                        ));
+                    }
                 }
             });
         }
 
         // Diff colormap & stretch range.
-        if matches!(tl.compare, TimelineCompareMode::ScalarDiff { .. }) {
+        if is_scalar_diff {
             show_diff_colormap_and_stretch(ui, id, tl, actions);
         }
     }
 
-    // Shared BandMath / SCL controls when BandMath-backed (remapping emitted
-    // `OverlayEdit::BandMath` into `OverlayEdit::Timeline(TimelineEdit::BandMath)`).
+    // Shared BandMath / SCL controls when BandMath-backed (suppressing
+    // redundant single-epoch colormap/stretch controls while in ScalarDiff
+    // mode, while keeping band labels and SCL cloud/shadow masking visible).
     if let Some(ref bm) = tl.band_math {
         let mut sub_actions = Vec::new();
-        show_band_math_controls(ui, id, bm, &mut sub_actions);
+        show_band_math_controls_with_options(ui, id, bm, !is_scalar_diff, &mut sub_actions);
         for act in sub_actions {
             if let LayerUiAction::EditRaster {
                 id: act_id,
@@ -364,12 +374,34 @@ pub(super) fn show_timeline_controls(
                 persist,
             } = act
             {
-                // When in ScalarDiff mode, suppress redundant single-epoch colormap/stretch
-                // edits if needed, or let them update the underlying BandMath style cleanly.
-                let _ = BandMathEdit::ResetStretch;
                 actions.push(LayerUiAction::EditRaster {
                     id: act_id,
                     edit: OverlayEdit::Timeline(TimelineEdit::BandMath(bm_edit)),
+                    persist,
+                });
+            } else {
+                actions.push(act);
+            }
+        }
+    } else if !is_scalar_diff {
+        // Shared Single-raster scientific / categorical controls for non-BandMath
+        // timelines (e.g. local dated float DEM / SAR / NDVI GeoTIFF folders).
+        let mut sub_actions = Vec::new();
+        if let Some(ref sci) = tl.scientific {
+            show_scientific_controls(ui, id, sci, &mut sub_actions);
+        } else if let Some(cat) = tl.categorical {
+            show_categorical_controls(ui, id, cat, &mut sub_actions);
+        }
+        for act in sub_actions {
+            if let LayerUiAction::EditRaster {
+                id: act_id,
+                edit: OverlayEdit::SingleRaster(sr_edit),
+                persist,
+            } = act
+            {
+                actions.push(LayerUiAction::EditRaster {
+                    id: act_id,
+                    edit: OverlayEdit::Timeline(TimelineEdit::SingleRaster(sr_edit)),
                     persist,
                 });
             } else {

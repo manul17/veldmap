@@ -14,7 +14,7 @@ use std::time::Duration;
 use veldmap_core::budget::MemoryBudget;
 use veldmap_core::geo::Camera;
 use veldmap_core::sync::{CancelToken, Wakeup};
-use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileScheme, TileStreamSpec};
+use veldmap_core::tile::{SourceId, StreamKey, TileKey, TileStreamSpec};
 use veldmap_net::{NetConfig, NetContext};
 use veldmap_raster::{TwoLaneDecodePool, TwoLaneDecodePoolConfig};
 use veldmap_storage::TileDiskCache;
@@ -124,6 +124,9 @@ struct CachedFrameSnapshot {
     /// overlay layers, retained outside [`DrawSnapshot`] for active-frame
     /// upload eviction protection.
     carrier_keys: HashSet<TileKey>,
+    /// Whether `snapshot` contains any visible `PolarCap` tiles (used to avoid
+    /// spurious `DrawSnapshot` rebuilds when off-screen polar rims flush).
+    has_polar_tiles: bool,
 }
 
 /// Coordinates tile caches, bounded GPU uploads, shared two-lane CPU decode
@@ -571,8 +574,7 @@ impl SceneState {
             self.purge_source_caches(evict);
         }
         if outcome.evict_polar_revs {
-            let is_stale_polar =
-                |k: &TileKey| matches!(k.scheme, TileScheme::PolarCap { .. }) && k.decode_rev > 0;
+            let is_stale_polar = crate::basemap::policy::is_harmonic_polar_key;
             self.gpu_tile_cache.remove_where(is_stale_polar);
             self.pending_uploads.clear_where(is_stale_polar);
         }
@@ -645,14 +647,20 @@ impl SceneState {
         if evict_old_polar {
             let basemap = &self.basemap;
             let is_unreachable_polar = |k: &TileKey| {
-                matches!(k.scheme, TileScheme::PolarCap { .. })
-                    && k.decode_rev > 0
+                crate::basemap::policy::is_harmonic_polar_key(k)
                     && !basemap.is_retained_polar_rev(k)
             };
             self.gpu_tile_cache.remove_where(is_unreachable_polar);
             self.pending_uploads.clear_where(is_unreachable_polar);
         }
-        if report.uploaded > 0 || polar_changed || self.overlays.take_reschedule_needed() {
+        let polar_visible = self
+            .cached_snapshot
+            .as_ref()
+            .is_some_and(|c| c.has_polar_tiles);
+        if report.uploaded > 0
+            || (polar_changed && polar_visible)
+            || self.overlays.take_reschedule_needed()
+        {
             self.mark_dirty();
         }
         report
@@ -705,9 +713,9 @@ impl SceneState {
         } else {
             0
         };
-        let overlay_weight =
-            self.overlays
-                .visible_appetite_weight_bytes(&camera, width_px, height_px);
+        let overlay_weight = self
+            .overlays
+            .visible_appetite_weight_bytes(&camera, width_px, height_px);
         // Reserve at least 25% of the combined `< 50%` VRAM appetite ceiling for
         // the basemap whenever overlays are on screen (and 100% when all
         // overlays are off-screen) so multi-band overlay stacks never starve
@@ -748,10 +756,17 @@ impl SceneState {
             basemap_appetite_bytes,
         );
 
+        let has_polar_tiles = snapshot.visible_tex_priorities().any(|(id, _)| {
+            matches!(
+                id.scheme,
+                veldmap_core::tile::PlanetaryScheme::PolarCap { .. }
+            )
+        });
         self.cached_snapshot = Some(CachedFrameSnapshot {
             key,
             snapshot: Arc::clone(&snapshot),
             carrier_keys,
+            has_polar_tiles,
         });
         if let Some(frame) = &mut self.active_frame {
             frame.reconciled = true;

@@ -1,4 +1,4 @@
-//! Virtual offline `z = 0..3` Geodetic/WebMercator + `z = 0` PolarCap basemap
+//! Virtual offline `z = 0..3` Geodetic/WebMercator + `z = 0..1` PolarCap basemap
 //! provider ([`BundledBasemapProvider`]) serving the embedded public-domain
 //! NASA Blue Marble Next Generation asset on the shared `DecodePool`.
 //!
@@ -65,7 +65,7 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Virtual offline `z = 0..3` Geodetic/WebMercator + `z = 0` PolarCap basemap
+/// Virtual offline `z = 0..3` Geodetic/WebMercator + `z = 0..1` PolarCap basemap
 /// tile provider scheduled onto the shared `veldmap-raster` [`DecodePoolHandle`].
 pub(super) struct BundledBasemapProvider {
     pool: DecodePoolHandle,
@@ -243,7 +243,9 @@ impl BundledBasemapProvider {
                     .filter(|k| {
                         let is_base_root =
                             k.is_root_of(SourceId::BUNDLED_BASEMAP) && k.decode_rev == 0;
-                        is_satisfied(k) || failed.contains(k) || (!wanted.contains(k) && !is_base_root)
+                        is_satisfied(k)
+                            || failed.contains(k)
+                            || (!wanted.contains(k) && !is_base_root)
                     })
                     .collect();
                 for k in remove_keys {
@@ -295,17 +297,15 @@ impl BundledBasemapProvider {
     /// prune their failure markers (called on basemap switch before clearing
     /// `PendingUploads` so stale workers cannot race past queue purging).
     pub(super) fn cancel_polar_revs(&self) {
-        let is_polar_rev = |k: &TileKey| {
-            matches!(k.scheme, veldmap_core::tile::TileScheme::PolarCap { .. }) && k.decode_rev > 0
-        };
         let tokens: Vec<CancelToken> = {
             let mut st = lock_unpoisoned(&self.state);
-            st.failed.retain(|k| !is_polar_rev(k));
+            st.failed
+                .retain(|k| !super::policy::is_harmonic_polar_key(k));
             let remove_keys: Vec<TileKey> = st
                 .in_flight
                 .keys()
                 .copied()
-                .filter(is_polar_rev)
+                .filter(super::policy::is_harmonic_polar_key)
                 .collect();
             remove_keys
                 .into_iter()

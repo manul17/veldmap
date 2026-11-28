@@ -45,7 +45,9 @@ pub use stac::{
     StacItem, StacItemFlightCache, StacNextLink, StacNextMethod, StacRasterBandMeta,
     StacSearchQuery, StacSearchResult, StacSortBy,
 };
-pub use url::{is_valid_http_endpoint, same_http_origin, sanitize_url_for_persistence};
+pub use url::{
+    is_https_downgrade, is_valid_http_endpoint, same_http_origin, sanitize_url_for_persistence,
+};
 
 /// Errors produced by live basemap configuration and HTTP streaming pipeline
 /// setup.

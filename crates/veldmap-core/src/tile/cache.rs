@@ -418,12 +418,6 @@ impl<V> TileCache<TileKey, V> {
         self.nodes[carrier_slot].as_ref().map(|n| &n.value)
     }
 
-    /// Read-only check whether `key` or any of its coarser ancestors along
-    /// `TileKey::parent` is currently cached (without mutating LRU order).
-    pub fn has_carrier(&self, key: &TileKey) -> bool {
-        self.find_carrier_slot(key).is_some()
-    }
-
     /// Read-only lookup returning the zoom `level` of the finest cached carrier
     /// covering `key` (exact or coarser ancestor), without mutating LRU order.
     pub fn carrier_level(&self, key: &TileKey) -> Option<u8> {

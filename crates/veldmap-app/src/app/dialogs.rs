@@ -137,6 +137,7 @@ pub(super) struct DialogHost {
     rx: Receiver<FileDialogEvent>,
     busy: Arc<AtomicBool>,
     project_load_seq: Arc<AtomicU64>,
+    shutdown: CancelToken,
     wakeup: Wakeup,
 }
 
@@ -148,8 +149,14 @@ impl DialogHost {
             rx,
             busy: Arc::new(AtomicBool::new(false)),
             project_load_seq: Arc::new(AtomicU64::new(0)),
+            shutdown: CancelToken::new(),
             wakeup,
         }
+    }
+
+    /// Cancel any in-flight background folder scan on application shutdown.
+    pub(super) fn begin_shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     /// Return the latest dispatched project-load sequence number so older slow
@@ -245,10 +252,10 @@ impl DialogHost {
             .set_parent(frame)
             .set_title("Open Dated Raster Folder as Timeline")
             .pick_folder();
+        let cancel = self.shutdown.child_token();
         self.spawn_dialog_future("veldmap-folder-timeline", async move {
             let handle = fut.await?;
             let dir = PathBuf::from(handle);
-            let cancel = CancelToken::new();
             let result = scan_dated_raster_folder(&dir, &cancel);
             Some(FileDialogEvent::TimelineFolderScanned { dir, result })
         })

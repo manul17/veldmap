@@ -58,6 +58,19 @@ pub(super) fn show_band_math_controls(
     bm: &BandMathSummary,
     actions: &mut Vec<LayerUiAction>,
 ) {
+    show_band_math_controls_with_options(ui, layer_id, bm, true, actions);
+}
+
+/// Render Band Math input summaries, optional single-epoch colormap/stretch
+/// controls (`show_style_controls = false` suppresses redundant single-epoch
+/// ramps when a Timeline layer is in `ScalarDiff` mode), and `SCL` mask toggles.
+pub(super) fn show_band_math_controls_with_options(
+    ui: &mut egui::Ui,
+    layer_id: LayerId,
+    bm: &BandMathSummary,
+    show_style_controls: bool,
+    actions: &mut Vec<LayerUiAction>,
+) {
     for input in &bm.inputs {
         let gsd = input
             .source_pixel_size_m
@@ -69,7 +82,7 @@ pub(super) fn show_band_math_controls(
         ui.weak(egui::RichText::new(format!("Mask: {scl_label}")).small());
     }
 
-    if bm.formula.is_scalar() {
+    if show_style_controls && bm.formula.is_scalar() {
         show_colormap_picker(
             ui,
             ("bm_colormap", layer_id),
@@ -104,7 +117,7 @@ pub(super) fn show_band_math_controls(
                 ));
             }
         }
-    } else {
+    } else if show_style_controls {
         // RGB Composite stretch (linked min/max + gamma).
         let mut gamma = bm.rgb_gamma;
         match show_min_max_drag(

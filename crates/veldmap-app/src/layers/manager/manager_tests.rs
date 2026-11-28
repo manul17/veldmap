@@ -1006,7 +1006,6 @@ fn timeline_opens_active_and_adjacent_prefetch_protects_wanted_and_switches_to_d
             diff_stretch_min: None,
             diff_stretch_max: None,
             fly_to: false,
-            restore_id: None,
         })
         .expect("open timeline");
     assert!(mutation.changed && mutation.topology_changed);

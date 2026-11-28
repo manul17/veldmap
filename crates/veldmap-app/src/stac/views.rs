@@ -10,7 +10,7 @@ use veldmap_raster::ExternalBandMeta;
 
 use crate::layers::BandMathPreset;
 
-use super::aoi::{footprint_bounds_from_bbox, polygon_geometry_from_bbox};
+use super::aoi::{footprint_bounds_from_bbox, render_geometry_from_bbox};
 use super::{
     RedactedUrl, SampleRecipeView, SampleSceneView, StacCogAssetView, StacItemView,
     StacRecipeAssetView, StacRecipeView,
@@ -377,7 +377,7 @@ pub(super) fn item_geometry(item: &StacItem) -> Option<GeoJsonGeometry> {
     if let Some(geom) = &item.geometry {
         Some(geom.clone())
     } else {
-        item.bbox.and_then(polygon_geometry_from_bbox)
+        item.bbox.and_then(render_geometry_from_bbox)
     }
 }
 

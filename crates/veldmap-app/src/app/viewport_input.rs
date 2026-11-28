@@ -394,10 +394,7 @@ impl ViewportInteraction {
         }
         let ndc_x = clip.x / clip.w;
         let ndc_y = clip.y / clip.w;
-        ndc_x.is_finite()
-            && ndc_y.is_finite()
-            && ndc_x.abs() <= 1.0
-            && ndc_y.abs() <= 1.0
+        ndc_x.is_finite() && ndc_y.is_finite() && ndc_x.abs() <= 1.0 && ndc_y.abs() <= 1.0
     }
 
     /// Compute `[west, south, east, north]` covering the current visible globe
@@ -447,10 +444,10 @@ impl ViewportInteraction {
             bbox[0] = -180.0;
             bbox[2] = 180.0;
             if north_visible {
-                bbox[3] = 89.9;
+                bbox[3] = 90.0;
             }
             if south_visible {
-                bbox[1] = -89.9;
+                bbox[1] = -90.0;
             }
         }
         Some(bbox)
@@ -735,21 +732,22 @@ mod tests {
         );
 
         // High-latitude globe view where North Pole is visible inside viewport:
-        // must span full [-180, 180] longitude and reach +89.9 deg latitude.
+        // must span full [-180, 180] longitude and reach +90.0 deg latitude.
         let pole_cam = Camera::at(80.0, 60.0, 5_000_000.0);
         let pole_bbox = vp.viewport_bbox(&pole_cam).expect("polar globe bbox");
         assert_eq!(pole_bbox[0], -180.0);
         assert_eq!(pole_bbox[2], 180.0);
-        assert_eq!(pole_bbox[3], 89.9);
+        assert_eq!(pole_bbox[3], 90.0);
 
-        // Rotated continental globe view where North Pole is visible inside
-        // viewport (matching the user's 48.8°N, 65.7°E, Alt = 7404 km, Hdg = -78.8°).
+        // Rotated mid-latitude globe view with visible North Pole.
         let mut rot_cam = Camera::at(48.84, 65.66, 7_404_000.0);
         rot_cam.rotate_heading((-78.8_f64).to_radians());
-        let rot_bbox = vp.viewport_bbox(&rot_cam).expect("rotated polar globe bbox");
+        let rot_bbox = vp
+            .viewport_bbox(&rot_cam)
+            .expect("rotated polar globe bbox");
         assert_eq!(rot_bbox[0], -180.0);
         assert_eq!(rot_bbox[2], 180.0);
-        assert_eq!(rot_bbox[3], 89.9);
+        assert_eq!(rot_bbox[3], 90.0);
 
         // Pole sitting between 0.98 and 1.0 NDC must still be detected cleanly
         // (matching the [0.0, 1.0] radial probe range).
@@ -757,7 +755,27 @@ mod tests {
         let edge_bbox = vp.viewport_bbox(&edge_pole_cam).expect("edge pole bbox");
         assert_eq!(edge_bbox[0], -180.0);
         assert_eq!(edge_bbox[2], 180.0);
-        assert_eq!(edge_bbox[3], 89.9);
+        assert_eq!(edge_bbox[3], 90.0);
+
+        // Zoomed-in directly over the North Pole (5 km altitude): must NEVER
+        // invert south > north when all probes are above 89.9°.
+        let over_north_cam = Camera::at(90.0, 0.0, 5_000.0);
+        let over_north_bbox = vp.viewport_bbox(&over_north_cam).expect("over-pole bbox");
+        assert_eq!(over_north_bbox[0], -180.0);
+        assert_eq!(over_north_bbox[2], 180.0);
+        assert_eq!(over_north_bbox[3], 90.0);
+        assert!(
+            over_north_bbox[1] > 89.9 && over_north_bbox[1] < over_north_bbox[3],
+            "expected non-inverted tight polar cap, got {over_north_bbox:?}"
+        );
+
+        // South Pole visible: full longitude and south == -90.0.
+        let south_cam = Camera::at(-85.0, -30.0, 3_000_000.0);
+        let south_bbox = vp.viewport_bbox(&south_cam).expect("south pole bbox");
+        assert_eq!(south_bbox[0], -180.0);
+        assert_eq!(south_bbox[2], 180.0);
+        assert_eq!(south_bbox[1], -90.0);
+        assert!(south_bbox[3] > south_bbox[1]);
 
         // Deep orbit (80,000 km): 18-step limb bisection reaches close to true
         // ~85.8° horizon angular radius (not falling >6° short).

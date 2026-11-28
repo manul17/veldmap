@@ -184,7 +184,6 @@ pub(crate) struct TimelineOpenRequest {
     pub(crate) diff_stretch_min: Option<f64>,
     pub(crate) diff_stretch_max: Option<f64>,
     pub(crate) fly_to: bool,
-    pub(crate) restore_id: Option<u64>,
 }
 
 /// Owned persistence snapshot of one epoch source inside
@@ -257,6 +256,8 @@ pub(crate) struct TimelineSummary {
     pub(crate) diff_stretch_min: f64,
     pub(crate) diff_stretch_max: f64,
     pub(crate) band_math: Option<BandMathSummary>,
+    pub(crate) scientific: Option<super::ScientificSummary>,
+    pub(crate) categorical: Option<super::CategoricalSummary>,
 }
 
 /// Opened runtime content for one epoch in a `Timeline` layer.
@@ -418,7 +419,12 @@ pub(super) struct TimelineLayerData {
     pub(super) diff_stretch_max: f64,
     pub(super) last_known_footprint: Option<FootprintBounds>,
     pub(super) fly_to_on_first_ready: bool,
-    pub(super) restore_id: Option<u64>,
+    /// All `SourceId`s ever opened by any epoch of this timeline (including
+    /// LRU-evicted epochs whose GPU tiles stay warm for zero-purge scrubbing),
+    /// ensuring layer removal / `clear_all` purges every touched source cleanly.
+    seen_source_ids: Vec<SourceId>,
+    /// All `StreamKey`s ever opened by any epoch of this timeline.
+    seen_stream_keys: Vec<StreamKey>,
     use_seq: u64,
 }
 
@@ -447,19 +453,61 @@ impl TimelineLayerData {
             Some(s) if s.formula.is_scalar() => (-0.5, 0.5),
             _ => (-10.0, 10.0),
         };
-        let compare = match req.compare.unwrap_or(TimelineCompareMode::Single) {
-            TimelineCompareMode::Single => TimelineCompareMode::Single,
-            TimelineCompareMode::ScalarDiff { ref_idx } => TimelineCompareMode::ScalarDiff {
-                ref_idx: ref_idx.min(len.saturating_sub(1)),
-            },
-            TimelineCompareMode::CrossFade { ref_idx, blend_t } => TimelineCompareMode::CrossFade {
-                ref_idx: ref_idx.min(len.saturating_sub(1)),
-                blend_t: if blend_t.is_finite() {
-                    blend_t.clamp(0.0, 1.0)
-                } else {
-                    0.5
-                },
-            },
+        let raw_min = req
+            .diff_stretch_min
+            .filter(|v| v.is_finite())
+            .unwrap_or(default_diff_min);
+        let raw_max = req
+            .diff_stretch_max
+            .filter(|v| v.is_finite())
+            .unwrap_or(default_diff_max);
+        let (diff_stretch_min, diff_stretch_max) = if (raw_max - raw_min).abs() > 1e-12 {
+            if raw_min < raw_max {
+                (raw_min, raw_max)
+            } else {
+                (raw_max, raw_min)
+            }
+        } else {
+            (default_diff_min, default_diff_max)
+        };
+        // Validate compare mode against known BandMath style and epoch count
+        // (for Single timelines where pixel format isn't known until open,
+        // preserve ScalarDiff/CrossFade and gate rendering/readout on ready formats).
+        let compare = if len < 2 {
+            TimelineCompareMode::Single
+        } else {
+            match req.compare.unwrap_or(TimelineCompareMode::Single) {
+                TimelineCompareMode::Single => TimelineCompareMode::Single,
+                TimelineCompareMode::ScalarDiff { ref_idx } => {
+                    if band_math_style
+                        .as_ref()
+                        .is_some_and(|s| !s.formula.is_scalar())
+                    {
+                        TimelineCompareMode::Single
+                    } else {
+                        TimelineCompareMode::ScalarDiff {
+                            ref_idx: ref_idx.min(len - 1),
+                        }
+                    }
+                }
+                TimelineCompareMode::CrossFade { ref_idx, blend_t } => {
+                    if band_math_style
+                        .as_ref()
+                        .is_some_and(|s| s.formula.is_scalar())
+                    {
+                        TimelineCompareMode::Single
+                    } else {
+                        TimelineCompareMode::CrossFade {
+                            ref_idx: ref_idx.min(len - 1),
+                            blend_t: if blend_t.is_finite() {
+                                blend_t.clamp(0.0, 1.0)
+                            } else {
+                                0.5
+                            },
+                        }
+                    }
+                }
+            }
         };
         let epochs = req
             .epochs
@@ -468,7 +516,7 @@ impl TimelineLayerData {
                 label: e.label,
                 date_label: e.date_label,
                 sort_key: e.sort_key,
-                cloud_cover: e.cloud_cover,
+                cloud_cover: e.cloud_cover.filter(|v| v.is_finite()),
                 source: e.source,
                 state: TimelineEpochState::Unloaded,
             })
@@ -487,21 +535,33 @@ impl TimelineLayerData {
                 .map(|v| v.clamp(0.0, 100.0)),
             diff_colormap: req.diff_colormap.unwrap_or(ColormapId::RdBu),
             diff_invert_colormap: req.diff_invert_colormap,
-            diff_stretch_min: req
-                .diff_stretch_min
-                .filter(|v| v.is_finite())
-                .unwrap_or(default_diff_min),
-            diff_stretch_max: req
-                .diff_stretch_max
-                .filter(|v| v.is_finite())
-                .unwrap_or(default_diff_max),
+            diff_stretch_min,
+            diff_stretch_max,
             last_known_footprint: None,
             fly_to_on_first_ready: req.fly_to,
-            restore_id: req.restore_id,
+            seen_source_ids: Vec::new(),
+            seen_stream_keys: Vec::new(),
             use_seq: 1,
         };
         data.clamp_active_to_filter();
+        data.clamp_compare_ref_to_filter();
         data
+    }
+
+    /// Record all `SourceId`s and `StreamKey`s belonging to a newly opened
+    /// epoch so later LRU eviction does not prevent full cache purge on layer
+    /// removal or workspace reset.
+    pub(super) fn record_opened_content(&mut self, content: &TimelineEpochContent) {
+        content.for_each_asset(|a| {
+            let src = a.source_id();
+            if !self.seen_source_ids.contains(&src) {
+                self.seen_source_ids.push(src);
+            }
+            let sk = a.meta().stream_key();
+            if !self.seen_stream_keys.contains(&sk) {
+                self.seen_stream_keys.push(sk);
+            }
+        });
     }
 
     pub(super) fn next_use_seq(&mut self) -> u64 {
@@ -554,6 +614,43 @@ impl TimelineLayerData {
                 .unwrap_or(filtered[0]);
             self.active_idx = nearest;
         }
+    }
+
+    /// Ensure any active comparison reference epoch (`ref_idx`) stays within
+    /// `filtered_indices()` and strictly distinct from `active_idx`, falling
+    /// back to `Single` when fewer than 2 filtered epochs remain.
+    pub(super) fn clamp_compare_ref_to_filter(&mut self) {
+        let Some(ref_idx) = self.compare.ref_idx() else {
+            return;
+        };
+        let filtered = self.filtered_indices();
+        if filtered.len() < 2 {
+            self.compare = TimelineCompareMode::Single;
+            return;
+        }
+        if filtered.contains(&ref_idx) && ref_idx != self.active_idx {
+            return;
+        }
+        let replacement = filtered
+            .iter()
+            .copied()
+            .filter(|&i| i != self.active_idx)
+            .min_by_key(|&i| i.abs_diff(ref_idx))
+            .unwrap_or_else(|| self.pick_default_ref_idx());
+        if replacement == self.active_idx {
+            self.compare = TimelineCompareMode::Single;
+            return;
+        }
+        self.compare = match self.compare {
+            TimelineCompareMode::Single => TimelineCompareMode::Single,
+            TimelineCompareMode::ScalarDiff { .. } => TimelineCompareMode::ScalarDiff {
+                ref_idx: replacement,
+            },
+            TimelineCompareMode::CrossFade { blend_t, .. } => TimelineCompareMode::CrossFade {
+                ref_idx: replacement,
+                blend_t,
+            },
+        };
     }
 
     /// Return the primary rendered epoch indices: `[Some(active_idx), ref_idx_if_distinct]`.
@@ -623,9 +720,22 @@ impl TimelineLayerData {
     }
 
     pub(super) fn is_scalar_diff_ready(&self) -> bool {
-        matches!(self.compare, TimelineCompareMode::ScalarDiff { .. })
-            && self.active_ready_content().is_some()
-            && self.ref_ready_content().is_some()
+        if !matches!(self.compare, TimelineCompareMode::ScalarDiff { .. }) {
+            return false;
+        }
+        match (self.ref_ready_content(), self.active_ready_content()) {
+            (Some(TimelineEpochContent::BandMath(a)), Some(TimelineEpochContent::BandMath(b))) => {
+                a.style.formula.is_scalar() && b.style.formula.is_scalar()
+            }
+            (
+                Some(TimelineEpochContent::Single { asset: a, .. }),
+                Some(TimelineEpochContent::Single { asset: b, .. }),
+            ) => {
+                a.meta().spec.format == PixelFormat::R32Float
+                    && b.meta().spec.format == PixelFormat::R32Float
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn any_ready_content(&self) -> Option<&TimelineEpochContent> {
@@ -672,7 +782,7 @@ impl TimelineLayerData {
     }
 
     pub(super) fn all_source_ids(&self) -> Vec<SourceId> {
-        let mut out = Vec::new();
+        let mut out = self.seen_source_ids.clone();
         for epoch in &self.epochs {
             if let Some(content) = epoch.ready_content() {
                 content.for_each_asset(|a| {
@@ -715,7 +825,7 @@ impl TimelineLayerData {
     }
 
     pub(super) fn all_stream_keys(&self) -> Vec<StreamKey> {
-        let mut out = Vec::new();
+        let mut out = self.seen_stream_keys.clone();
         for epoch in &self.epochs {
             if let Some(content) = epoch.ready_content() {
                 content.for_each_asset(|a| {
@@ -982,9 +1092,69 @@ impl TimelineLayerData {
         if idx >= self.epochs.len() || idx == self.active_idx {
             return false;
         }
+        let prev_active = self.active_idx;
         self.active_idx = idx;
+        // Preserve `active_idx != ref_idx` when scrubbing onto the current
+        // reference epoch by swapping `ref_idx` to the previous active epoch.
+        if self.compare.ref_idx() == Some(idx) {
+            self.compare = match self.compare {
+                TimelineCompareMode::Single => TimelineCompareMode::Single,
+                TimelineCompareMode::ScalarDiff { .. } => TimelineCompareMode::ScalarDiff {
+                    ref_idx: prev_active,
+                },
+                TimelineCompareMode::CrossFade { blend_t, .. } => TimelineCompareMode::CrossFade {
+                    ref_idx: prev_active,
+                    blend_t,
+                },
+            };
+        }
+        // Allow explicit scrub-to-epoch to retry a previously failed epoch.
+        if matches!(
+            self.epochs.get(idx).map(|e| &e.state),
+            Some(TimelineEpochState::Failed(_))
+        ) {
+            self.epochs[idx].state = TimelineEpochState::Unloaded;
+        }
         self.touch_needed_ready();
         true
+    }
+
+    pub(super) fn retry_epoch(&mut self, idx: usize) -> bool {
+        let Some(epoch) = self.epochs.get_mut(idx) else {
+            return false;
+        };
+        if matches!(epoch.state, TimelineEpochState::Failed(_)) {
+            epoch.state = TimelineEpochState::Unloaded;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply a single-raster style mutation across all currently-ready `Single`
+    /// epochs and sync `self.single_style` so newly opened epochs and saved
+    /// sessions inherit the edit.
+    pub(super) fn apply_single_style_edit(
+        &mut self,
+        mut edit: impl FnMut(&mut LayerStyle) -> bool,
+    ) -> bool {
+        if self.band_math_style.is_some() {
+            return false;
+        }
+        let mut changed = false;
+        for epoch in &mut self.epochs {
+            if let Some(TimelineEpochContent::Single { style, .. }) = epoch.ready_content_mut() {
+                changed |= edit(style);
+            }
+        }
+        if changed
+            && let Some(TimelineEpochContent::Single { asset, style }) = self
+                .active_ready_content()
+                .or_else(|| self.any_ready_content())
+        {
+            self.single_style = style.saved_style(asset.source().as_ref(), asset.meta().spec);
+        }
+        changed
     }
 
     pub(super) fn step_epoch(&mut self, delta: i32) -> bool {
@@ -1015,6 +1185,7 @@ impl TimelineLayerData {
         }
         self.max_cloud_cover = next;
         self.clamp_active_to_filter();
+        self.clamp_compare_ref_to_filter();
         self.touch_needed_ready();
         true
     }
@@ -1058,6 +1229,14 @@ impl TimelineLayerData {
             return false;
         }
         self.compare = normalized;
+        if let Some(r) = self.compare.ref_idx()
+            && matches!(
+                self.epochs.get(r).map(|e| &e.state),
+                Some(TimelineEpochState::Failed(_))
+            )
+        {
+            self.epochs[r].state = TimelineEpochState::Unloaded;
+        }
         self.touch_needed_ready();
         true
     }
@@ -1195,6 +1374,49 @@ impl TimelineLayerData {
             }
         });
 
+        let (scientific, categorical) = if band_math.is_none() {
+            match self
+                .active_ready_content()
+                .or_else(|| self.any_ready_content())
+            {
+                Some(TimelineEpochContent::Single { asset, style }) => {
+                    let active_spec = asset.meta().spec;
+                    let desc = asset.source().description();
+                    let active_band_info = desc.band_info(active_spec.band);
+                    let sci = style.scientific();
+                    let scientific = (active_spec.format == PixelFormat::R32Float).then(|| {
+                        let (scale, offset) =
+                            active_band_info.map_or((1.0, 0.0), |b| (b.scale, b.offset));
+                        super::ScientificSummary {
+                            preset: sci.preset,
+                            min: sci.min,
+                            max: sci.max,
+                            colormap: sci.colormap,
+                            invert_colormap: sci.invert_colormap,
+                            units: active_band_info.and_then(|b| b.units.clone()),
+                            scale,
+                            offset,
+                            stats: sci.stats().map(std::sync::Arc::clone),
+                            stats_loading: sci.is_loading(),
+                        }
+                    });
+                    let categorical = matches!(
+                        active_spec.format,
+                        PixelFormat::R8Uint | PixelFormat::R16Uint
+                    )
+                    .then(|| super::CategoricalSummary {
+                        palette: style.categorical_palette(),
+                        has_source_color_map: style.has_source_color_map(),
+                        nodata_value: asset.categorical_nodata_value(),
+                    });
+                    (scientific, categorical)
+                }
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
         TimelineSummary {
             width: dims.map(|(w, _)| w),
             height: dims.map(|(_, h)| h),
@@ -1211,6 +1433,8 @@ impl TimelineLayerData {
             diff_stretch_min: self.diff_stretch_min,
             diff_stretch_max: self.diff_stretch_max,
             band_math,
+            scientific,
+            categorical,
         }
     }
 }
@@ -1255,7 +1479,6 @@ mod tests {
             diff_stretch_min: None,
             diff_stretch_max: None,
             fly_to: false,
-            restore_id: None,
         };
         let mut tl = TimelineLayerData::from_request(req);
         assert_eq!(tl.filtered_indices(), vec![0, 2, 3]);
@@ -1267,5 +1490,34 @@ mod tests {
         assert!(tl.step_epoch(-1));
         assert_eq!(tl.active_idx, 0);
         assert_eq!(tl.adjacent_prefetch_indices(), [None, Some(2)]);
+
+        // Switching to ScalarDiff picks a distinct filtered ref_idx (2 != 0).
+        assert!(tl.set_compare_mode(TimelineCompareMode::ScalarDiff { ref_idx: 0 }));
+        assert_eq!(tl.compare, TimelineCompareMode::ScalarDiff { ref_idx: 2 });
+
+        // Scrubbing active_idx onto ref_idx swaps ref_idx to previous active_idx
+        // so `active_idx != ref_idx` stays invariant.
+        assert!(tl.set_active_epoch(2));
+        assert_eq!(tl.active_idx, 2);
+        assert_eq!(tl.compare, TimelineCompareMode::ScalarDiff { ref_idx: 0 });
+
+        // Tightening cloud filter leaves only epoch 0 (5%) -> compare gracefully
+        // falls back to Single and active_idx snaps to 0.
+        assert!(tl.set_cloud_filter(Some(8.0)));
+        assert_eq!(tl.filtered_indices(), vec![0]);
+        assert_eq!(tl.active_idx, 0);
+        assert_eq!(tl.compare, TimelineCompareMode::Single);
+
+        // Retrying a Failed epoch resets it to Unloaded.
+        tl.epochs[1].state = TimelineEpochState::Failed("network error".to_owned());
+        assert!(tl.retry_epoch(1));
+        assert!(matches!(tl.epochs[1].state, TimelineEpochState::Unloaded));
+
+        // Recording a seen SourceId ensures `all_source_ids` retains evicted sources
+        // while `has_source` only reports currently ready epochs.
+        let evicted_src = SourceId::new(777);
+        tl.seen_source_ids.push(evicted_src);
+        assert!(tl.all_source_ids().contains(&evicted_src));
+        assert!(!tl.has_source(evicted_src));
     }
 }

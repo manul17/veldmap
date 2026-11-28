@@ -413,7 +413,32 @@ fn finish_timeline_layer(
                 ) if bm_a.style.formula.is_scalar() && bm_b.style.formula.is_scalar() => {
                     let (epoch_a, ready_a) = finish_band_math_epoch(bm_a, bands_a, scl_a, ctx);
                     let (epoch_b, ready_b) = finish_band_math_epoch(bm_b, bands_b, scl_b, ctx);
-                    (ready_a && ready_b).then(|| DrawOverlayLayer {
+                    if !ready_b {
+                        return None;
+                    }
+                    if !ready_a {
+                        // Fall back to already-scheduled Epoch B while Epoch A's
+                        // first tiles upload, preventing a blank-frame flash.
+                        return Some(DrawOverlayLayer {
+                            layer_id,
+                            opacity,
+                            content: DrawOverlayContent::BandMath(Box::new(DrawBandMathLayer {
+                                formula: bm_b.style.formula,
+                                colormap: bm_b.style.colormap,
+                                invert_colormap: bm_b.style.invert_colormap,
+                                stretch_min: bm_b.style.stretch_min as f32,
+                                stretch_max: bm_b.style.stretch_max as f32,
+                                rgb_min: bm_b.style.rgb_min.map(|v| v as f32),
+                                rgb_max: bm_b.style.rgb_max.map(|v| v as f32),
+                                rgb_gamma: bm_b.style.rgb_gamma,
+                                scl_mask_enabled: bm_b.style.scl_mask_enabled,
+                                scl_mask_bits: bm_b.style.scl_mask_bits,
+                                bands: epoch_b.bands,
+                                scl: epoch_b.scl,
+                            })),
+                        });
+                    }
+                    Some(DrawOverlayLayer {
                         layer_id,
                         opacity,
                         content: DrawOverlayContent::TemporalDiff(Box::new(
@@ -434,15 +459,33 @@ fn finish_timeline_layer(
                 (
                     TimelineEpochContent::Single { asset: asset_a, .. },
                     PreparedEpochPlan::Single(plan_a),
-                    TimelineEpochContent::Single { asset: asset_b, .. },
+                    TimelineEpochContent::Single {
+                        asset: asset_b,
+                        style: style_b,
+                    },
                     PreparedEpochPlan::Single(plan_b),
                 ) if asset_a.meta().spec.format == PixelFormat::R32Float
                     && asset_b.meta().spec.format == PixelFormat::R32Float =>
                 {
                     let sched_a = finish_single_asset(asset_a, plan_a, ctx);
                     let sched_b = finish_single_asset(asset_b, plan_b, ctx);
-                    if sched_a.patches.is_empty() || sched_b.patches.is_empty() {
+                    if sched_b.patches.is_empty() {
                         return None;
+                    }
+                    if sched_a.patches.is_empty() {
+                        let track = build_draw_track(asset_b, style_b);
+                        return Some(DrawOverlayLayer {
+                            layer_id,
+                            opacity,
+                            content: DrawOverlayContent::Direct {
+                                track,
+                                frame: Arc::clone(asset_b.geo().frame()),
+                                image_width: sched_b.image_width,
+                                image_height: sched_b.image_height,
+                                segments: sched_b.segments,
+                                patches: sched_b.patches,
+                            },
+                        });
                     }
                     let (scale_a, offset_a) = asset_a.band_scale_offset();
                     let (scale_b, offset_b) = asset_b.band_scale_offset();

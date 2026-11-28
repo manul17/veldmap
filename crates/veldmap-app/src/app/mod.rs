@@ -138,6 +138,7 @@ impl Drop for VeldmapApp {
         // 1. Cancel tokens / signal background workers (`overlays`, `vectors`, `basemap`, `stac`, `decode_shutdown`, `NetContext`, `storage`)
         // 2. Close bounded upload queue (`PendingUploads::close`)
         // 3. Join background PNG export, `TwoLaneDecodePool`, `veldmap-remote-io`, overlay/tile-write & vector I/O workers -> shut down `LiveTilePipeline` -> shut down `NetContext` (`tokio::Runtime`) -> join `DiskCacheWorker`
+        self.dialogs.begin_shutdown();
         self.scene.begin_shutdown();
         self.storage.begin_shutdown();
         self.scene.close_uploads();

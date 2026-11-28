@@ -362,6 +362,15 @@ impl SinglePassIfdReader {
         max_total_bytes: u64,
         cancel: &CancelToken,
     ) -> Result<Self, RasterError> {
+        Self::open_with_prefix(source, INITIAL_HEADER_PREFIX_BYTES, max_total_bytes, cancel)
+    }
+
+    pub(in crate::tiff) fn open_with_prefix(
+        source: Arc<dyn ByteSource>,
+        initial_prefix_cap: usize,
+        max_total_bytes: u64,
+        cancel: &CancelToken,
+    ) -> Result<Self, RasterError> {
         if cancel.is_cancelled() {
             return Err(RasterError::Cancelled);
         }
@@ -374,9 +383,8 @@ impl SinglePassIfdReader {
                 "TIFF IFD fetch budget {max_total_bytes} B is smaller than 8 B header"
             )));
         }
-        let prefix_len = file_len
-            .min(INITIAL_HEADER_PREFIX_BYTES as u64)
-            .min(max_total_bytes) as usize;
+        let prefix_cap = (initial_prefix_cap.max(16)) as u64;
+        let prefix_len = file_len.min(prefix_cap).min(max_total_bytes) as usize;
         let mut prefix = vec![0u8; prefix_len];
         source.read_exact_at(0, &mut prefix, cancel)?;
 

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::Method;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
@@ -15,7 +15,8 @@ use crate::http::{BodyReadError, link_cancel_token, parse_custom_headers, read_b
 use crate::limiter::{HostLimiters, record_rate_limit_cooldown};
 use crate::redact::{EncodedSecret, redact_text_many, sanitize_url_for_display};
 use crate::url::{
-    extract_host, is_valid_http_endpoint, same_http_origin, split_url_query_fragment,
+    extract_host, is_https_downgrade, is_valid_http_endpoint, same_http_origin,
+    split_url_query_fragment,
 };
 
 use super::parse::{build_search_payload, parse_search_response, parse_single_item_response};
@@ -33,6 +34,7 @@ const MAX_STAC_ERROR_SNIPPET_BYTES: usize = 512;
 struct PreparedStacRequest {
     url: String,
     host: String,
+    uses_auth: bool,
     custom_headers: Vec<(HeaderName, HeaderValue)>,
     secrets: Vec<EncodedSecret>,
 }
@@ -43,16 +45,30 @@ impl PreparedStacRequest {
     }
 }
 
-fn is_https_downgrade(base_url: &str, target_url: &str) -> bool {
-    let base_is_https = base_url
-        .trim()
-        .get(..8)
-        .is_some_and(|p| p.eq_ignore_ascii_case("https://"));
-    let target_is_http = target_url
-        .trim()
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("http://"));
-    base_is_https && target_is_http
+/// Apply an RFC 7396 JSON Merge Patch (`patch` into `target`), removing keys
+/// whose patch value is `Value::Null`.
+fn apply_json_merge_patch(target: &mut Value, patch: Value) {
+    if let Value::Object(patch_map) = patch {
+        if !target.is_object() {
+            *target = Value::Object(serde_json::Map::new());
+        }
+        if let Some(target_map) = target.as_object_mut() {
+            for (k, v) in patch_map {
+                if v.is_null() {
+                    target_map.remove(&k);
+                } else if let Some(existing) = target_map.get_mut(&k)
+                    && existing.is_object()
+                    && v.is_object()
+                {
+                    apply_json_merge_patch(existing, v);
+                } else {
+                    target_map.insert(k, v);
+                }
+            }
+        }
+    } else {
+        *target = patch;
+    }
 }
 
 fn prepare_request_auth(
@@ -78,10 +94,12 @@ fn prepare_request_auth(
     {
         secrets.push(secret);
     }
+    let uses_auth = !custom_headers.is_empty() || auth.has_credentials();
 
     Ok(PreparedStacRequest {
         url,
         host,
+        uses_auth,
         custom_headers,
         secrets,
     })
@@ -144,12 +162,8 @@ fn prepare_next_request(
                 if let Some(raw_body) = &next_link.body {
                     let patch: Value = serde_json::from_str(raw_body)
                         .map_err(|e| StacError::InvalidJson(prepared.redact(&e.to_string())))?;
-                    if let (Some(base_map), Some(patch_map)) =
-                        (base.as_object_mut(), patch.as_object())
-                    {
-                        for (k, v) in patch_map {
-                            base_map.insert(k.clone(), v.clone());
-                        }
+                    if patch.is_object() {
+                        apply_json_merge_patch(&mut base, patch);
                     }
                 }
                 base
@@ -192,24 +206,25 @@ impl StacClient {
 
     /// Execute an HTTP GET/POST and read the capped response body while owning
     /// the per-host semaphore permit strictly inside this function's lexical
-    /// scope so the permit drops before JSON parsing begins.
+    /// scope so the permit drops before JSON parsing begins. Returns
+    /// `(body_bytes, final_post_redirect_url)`.
     async fn execute_stac_http(
         &self,
         prepared: &PreparedStacRequest,
         method: Method,
         body_bytes: Option<Vec<u8>>,
         cancel: &CancelToken,
-    ) -> Result<Vec<u8>, StacError> {
+    ) -> Result<(Vec<u8>, String), StacError> {
         let _permit = self
             .host_limiters
             .acquire_permit(&prepared.host, cancel)
             .await
             .map_err(|_| StacError::Cancelled)?;
 
-        let client = if prepared.custom_headers.is_empty() {
-            &self.api_client
-        } else {
+        let client = if prepared.uses_auth {
             &self.api_auth_client
+        } else {
+            &self.api_client
         };
         let mut req = client
             .request(method, &prepared.url)
@@ -233,6 +248,7 @@ impl StacClient {
             }
         };
 
+        let final_url = resp.url().as_str().to_owned();
         let status = resp.status();
         let code = status.as_u16();
         if matches!(code, 429 | 503) {
@@ -250,7 +266,7 @@ impl StacClient {
         }
 
         match read_body_capped(&mut resp, MAX_STAC_RESPONSE_BYTES, 16 * 1024, cancel).await {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => Ok((bytes, final_url)),
             Err(BodyReadError::Cancelled) => Err(StacError::Cancelled),
             Err(BodyReadError::TooLarge) => Err(StacError::ResponseTooLarge {
                 limit: MAX_STAC_RESPONSE_BYTES,
@@ -274,13 +290,13 @@ impl StacClient {
         }
 
         let (prepared, body_bytes) = prepare_search_request(catalog, query)?;
-        let raw = self
+        let (raw, final_url) = self
             .execute_stac_http(&prepared, Method::POST, Some(body_bytes), &linked_cancel)
             .await?;
 
         let value: Value = serde_json::from_slice(&raw)
             .map_err(|e| StacError::InvalidJson(prepared.redact(&e.to_string())))?;
-        parse_search_response(&value, &prepared.url)
+        parse_search_response(&value, &final_url)
     }
 
     /// Follow a STAC `links[rel="next"]` pagination link (supporting both
@@ -299,20 +315,21 @@ impl StacClient {
         }
 
         let (prepared, method, body_bytes) = prepare_next_request(catalog, prev_query, next_link)?;
-        let raw = self
+        let (raw, final_url) = self
             .execute_stac_http(&prepared, method, body_bytes, &linked_cancel)
             .await?;
 
         let value: Value = serde_json::from_slice(&raw)
             .map_err(|e| StacError::InvalidJson(prepared.redact(&e.to_string())))?;
-        parse_search_response(&value, &prepared.url)
+        parse_search_response(&value, &final_url)
     }
 
     /// Fetch a single STAC Item JSON document from `item_href` (used to
     /// refresh expired presigned COG asset URLs on HTTP 401/403 restore).
     ///
-    /// When `auth` carries custom headers, uses `NetContext::api_auth_client()`
-    /// which blocks cross-origin redirects and HTTPS downgrades.
+    /// Both `api_client` and `api_auth_client` block HTTPS downgrades; when
+    /// `auth` carries credentials (header or SAS query), uses
+    /// `NetContext::api_auth_client()` which also blocks cross-origin redirects.
     pub async fn fetch_item_async(
         &self,
         item_href: &str,
@@ -325,7 +342,7 @@ impl StacClient {
         }
 
         let prepared = prepare_request_auth(item_href, auth)?;
-        let raw = self
+        let (raw, _) = self
             .execute_stac_http(&prepared, Method::GET, None, &linked_cancel)
             .await?;
 
@@ -338,44 +355,114 @@ impl StacClient {
 /// Bounded maximum entries retained in [`StacItemFlightCache`] per epoch.
 const MAX_ITEM_FLIGHT_CACHE_ENTRIES: usize = 64;
 
+/// Default TTL for cached successful `StacItem` refreshes (`60 s`) so
+/// concurrent bands of a restored recipe or timeline epoch coalesce without
+/// replaying stale presigned asset URLs on long-lived sessions.
+const DEFAULT_ITEM_FLIGHT_TTL: Duration = Duration::from_secs(60);
+
+type ItemFlightKey = (u64, String, [u8; 32]);
+
+#[derive(Clone)]
+enum SlotState {
+    Pending,
+    Settled(Result<Arc<StacItem>, Arc<StacError>>),
+    Aborted,
+}
+
+struct InFlightSlot {
+    notify: Notify,
+    state: Mutex<SlotState>,
+}
+
+impl InFlightSlot {
+    fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+            state: Mutex::new(SlotState::Pending),
+        }
+    }
+
+    fn finish(&self, next: SlotState) {
+        {
+            let mut st = lock_unpoisoned(&self.state);
+            *st = next;
+        }
+        self.notify.notify_waiters();
+    }
+}
+
 #[derive(Clone)]
 enum ItemFlightState {
-    InFlight(Arc<Notify>),
-    Done(Result<Arc<StacItem>, String>),
+    InFlight(Arc<InFlightSlot>),
+    Done {
+        item: Arc<StacItem>,
+        cached_at: Instant,
+    },
 }
 
 /// Panic- and cancel-safe RAII cleanup guard for a leader in
-/// [`StacItemFlightCache`]: removes the `InFlight` slot and wakes all waiting
-/// followers if the leader is cancelled or panics before resolving.
+/// [`StacItemFlightCache`]: removes the `InFlight` slot, marks the slot
+/// `Aborted`, and wakes all waiting followers if the leader is cancelled or
+/// panics before resolving.
 struct ItemFlightLeaderGuard {
     state: Arc<Mutex<ItemFlightCacheInner>>,
-    key: (u64, String),
-    notify: Arc<Notify>,
+    key: ItemFlightKey,
+    slot: Arc<InFlightSlot>,
     settled: bool,
 }
 
 impl ItemFlightLeaderGuard {
-    fn settle(mut self, result: Result<Arc<StacItem>, String>) {
+    fn settle_ok(mut self, item: Arc<StacItem>, ttl: Duration) {
         self.settled = true;
+        let now = Instant::now();
         {
             let mut inner = lock_unpoisoned(&self.state);
             if inner.entries.len() >= MAX_ITEM_FLIGHT_CACHE_ENTRIES {
-                // Only evict completed entries; never evict active `InFlight`
-                // singleflight slots with parked followers.
-                inner
-                    .entries
-                    .retain(|_, state| matches!(state, ItemFlightState::InFlight(_)));
+                // First drop expired completed entries; if still full, evict
+                // completed entries while preserving active `InFlight` slots.
+                inner.entries.retain(|_, state| match state {
+                    ItemFlightState::InFlight(_) => true,
+                    ItemFlightState::Done { cached_at, .. } => {
+                        now.saturating_duration_since(*cached_at) < ttl
+                    }
+                });
+                if inner.entries.len() >= MAX_ITEM_FLIGHT_CACHE_ENTRIES {
+                    inner
+                        .entries
+                        .retain(|_, state| matches!(state, ItemFlightState::InFlight(_)));
+                }
             }
             if matches!(
                 inner.entries.get(&self.key),
-                Some(ItemFlightState::InFlight(n)) if Arc::ptr_eq(n, &self.notify)
+                Some(ItemFlightState::InFlight(s)) if Arc::ptr_eq(s, &self.slot)
             ) {
-                inner
-                    .entries
-                    .insert(self.key.clone(), ItemFlightState::Done(result));
+                inner.entries.insert(
+                    self.key.clone(),
+                    ItemFlightState::Done {
+                        item: Arc::clone(&item),
+                        cached_at: now,
+                    },
+                );
             }
         }
-        self.notify.notify_waiters();
+        self.slot.finish(SlotState::Settled(Ok(item)));
+    }
+
+    fn settle_err(mut self, err: Arc<StacError>) {
+        self.settled = true;
+        {
+            let mut inner = lock_unpoisoned(&self.state);
+            // Never persist `Err` across calls so subsequent manual retries
+            // issue a fresh request; currently parked followers still receive
+            // `err` via `self.slot`.
+            if matches!(
+                inner.entries.get(&self.key),
+                Some(ItemFlightState::InFlight(s)) if Arc::ptr_eq(s, &self.slot)
+            ) {
+                inner.entries.remove(&self.key);
+            }
+        }
+        self.slot.finish(SlotState::Settled(Err(err)));
     }
 }
 
@@ -386,46 +473,64 @@ impl Drop for ItemFlightLeaderGuard {
                 let mut inner = lock_unpoisoned(&self.state);
                 if matches!(
                     inner.entries.get(&self.key),
-                    Some(ItemFlightState::InFlight(n)) if Arc::ptr_eq(n, &self.notify)
+                    Some(ItemFlightState::InFlight(s)) if Arc::ptr_eq(s, &self.slot)
                 ) {
                     inner.entries.remove(&self.key);
                 }
             }
-            self.notify.notify_waiters();
+            self.slot.finish(SlotState::Aborted);
         }
     }
 }
 
 enum FlightSlotRole {
-    Done(Result<Arc<StacItem>, String>),
-    Follower(Arc<Notify>),
-    Leader(Arc<Notify>),
+    Done(Arc<StacItem>),
+    Follower(Arc<InFlightSlot>),
+    Leader(Arc<InFlightSlot>),
 }
 
 #[derive(Default)]
 struct ItemFlightCacheInner {
     last_epoch: u64,
-    entries: HashMap<(u64, String), ItemFlightState>,
+    entries: HashMap<ItemFlightKey, ItemFlightState>,
 }
 
-/// Async singleflight & per-epoch coalescing cache for [`StacClient::fetch_item_async`].
+/// Async singleflight & short-TTL coalescing cache for [`StacClient::fetch_item_async`].
 ///
 /// Deduplicates concurrent `401`/`403` `stac_item_href` refreshes across bands
-/// of a restored `BandMath` recipe (or sibling layers) while respecting each
-/// follower's independent [`CancelToken`] and avoiding lost wakeups or leader
-/// cancellation deadlocks.
-#[derive(Clone, Default)]
+/// of a restored `BandMath` recipe or timeline epoch keyed by
+/// `(scope_epoch, item_href, auth_fingerprint)`, expires cached `Ok` items
+/// after a short TTL (`60 s` by default), never persists errors across retries,
+/// respects each follower's independent [`CancelToken`], and avoids lost
+/// wakeups or leader-cancellation deadlocks.
+#[derive(Clone)]
 pub struct StacItemFlightCache {
     inner: Arc<Mutex<ItemFlightCacheInner>>,
+    ttl: Duration,
+}
+
+impl Default for StacItemFlightCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StacItemFlightCache {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_ttl(DEFAULT_ITEM_FLIGHT_TTL)
     }
 
-    /// Fetch `item_href` at most once per `(scope_epoch, item_href)`, coalescing
-    /// concurrent callers onto one HTTP GET.
+    /// Construct a cache with a custom success-entry TTL.
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ItemFlightCacheInner::default())),
+            ttl,
+        }
+    }
+
+    /// Fetch `item_href` coalesced across concurrent callers sharing the same
+    /// `(scope_epoch, item_href, auth)` triple, serving recent `Ok` results
+    /// within the cache TTL while never poisoning subsequent retries on error.
     pub async fn fetch_item_coalesced_async(
         &self,
         client: &StacClient,
@@ -433,88 +538,96 @@ impl StacItemFlightCache {
         item_href: &str,
         auth: &StacAuth,
         cancel: &CancelToken,
-    ) -> Result<Arc<StacItem>, String> {
-        let key = (scope_epoch, item_href.to_owned());
+    ) -> Result<Arc<StacItem>, Arc<StacError>> {
+        let key: ItemFlightKey = (scope_epoch, item_href.to_owned(), auth.auth_fingerprint());
         loop {
             if cancel.is_cancelled() {
-                return Err(StacError::Cancelled.to_string());
+                return Err(Arc::new(StacError::Cancelled));
             }
+            let now = Instant::now();
             let role = {
                 let mut inner = lock_unpoisoned(&self.inner);
                 if scope_epoch > inner.last_epoch {
                     inner.last_epoch = scope_epoch;
                     // Prune stale completed epochs while preserving active
                     // `InFlight` slots so parked followers always wake cleanly.
-                    inner.entries.retain(|(ep, _), state| {
+                    inner.entries.retain(|(ep, _, _), state| {
                         *ep >= scope_epoch || matches!(state, ItemFlightState::InFlight(_))
                     });
                 }
-                match inner.entries.get(&key).cloned() {
-                    Some(ItemFlightState::Done(res)) => FlightSlotRole::Done(res),
-                    Some(ItemFlightState::InFlight(notify)) => FlightSlotRole::Follower(notify),
-                    None => {
-                        let notify = Arc::new(Notify::new());
+                match inner.entries.get(&key) {
+                    Some(ItemFlightState::Done { item, cached_at })
+                        if now.saturating_duration_since(*cached_at) < self.ttl =>
+                    {
+                        FlightSlotRole::Done(Arc::clone(item))
+                    }
+                    Some(ItemFlightState::InFlight(slot)) => {
+                        FlightSlotRole::Follower(Arc::clone(slot))
+                    }
+                    None | Some(ItemFlightState::Done { .. }) => {
+                        let slot = Arc::new(InFlightSlot::new());
                         inner
                             .entries
-                            .insert(key.clone(), ItemFlightState::InFlight(Arc::clone(&notify)));
-                        FlightSlotRole::Leader(notify)
+                            .insert(key.clone(), ItemFlightState::InFlight(Arc::clone(&slot)));
+                        FlightSlotRole::Leader(slot)
                     }
                 }
             };
 
-            let leader_notify = match role {
-                FlightSlotRole::Done(res) => return res,
-                FlightSlotRole::Follower(notify) => {
-                    let notified = notify.notified();
+            let leader_slot = match role {
+                FlightSlotRole::Done(item) => return Ok(item),
+                FlightSlotRole::Follower(slot) => {
+                    let notified = slot.notify.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
-                    // Re-check state after enabling notification so no wakeup is lost.
+                    // Re-check slot state strictly after enabling notification
+                    // so no leader wakeup can be lost.
                     {
-                        let inner = lock_unpoisoned(&self.inner);
-                        match inner.entries.get(&key) {
-                            Some(ItemFlightState::Done(res)) => return res.clone(),
-                            None => continue,
-                            Some(ItemFlightState::InFlight(current))
-                                if !Arc::ptr_eq(current, &notify) =>
-                            {
-                                continue;
-                            }
-                            Some(ItemFlightState::InFlight(_)) => {}
+                        let st = lock_unpoisoned(&slot.state);
+                        match &*st {
+                            SlotState::Settled(res) => return res.clone(),
+                            SlotState::Aborted => continue,
+                            SlotState::Pending => {}
                         }
                     }
                     tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => return Err(StacError::Cancelled.to_string()),
-                        _ = notified => continue,
+                        _ = cancel.cancelled() => return Err(Arc::new(StacError::Cancelled)),
+                        _ = notified => {}
+                    }
+                    let st = lock_unpoisoned(&slot.state);
+                    match &*st {
+                        SlotState::Settled(res) => return res.clone(),
+                        SlotState::Aborted | SlotState::Pending => continue,
                     }
                 }
-                FlightSlotRole::Leader(notify) => notify,
+                FlightSlotRole::Leader(slot) => slot,
             };
 
-            // We own the singleflight slot as leader with the exact `Notify`
+            // We own the singleflight slot as leader with the exact slot
             // published to any followers.
             let guard = ItemFlightLeaderGuard {
                 state: Arc::clone(&self.inner),
                 key: key.clone(),
-                notify: leader_notify,
+                slot: leader_slot,
                 settled: false,
             };
             match client.fetch_item_async(item_href, auth, cancel).await {
                 Ok(item) => {
                     let arc = Arc::new(item);
-                    guard.settle(Ok(Arc::clone(&arc)));
+                    guard.settle_ok(Arc::clone(&arc), self.ttl);
                     return Ok(arc);
                 }
                 Err(err) if err.is_cancelled() => {
-                    // Drop guard without settling Done so uncancelled followers
-                    // can take over leadership cleanly.
+                    // Drop guard without settling so uncancelled followers can
+                    // take over leadership cleanly.
                     drop(guard);
-                    return Err(err.to_string());
+                    return Err(Arc::new(err));
                 }
                 Err(err) => {
-                    let msg = err.to_string();
-                    guard.settle(Err(msg.clone()));
-                    return Err(msg);
+                    let arc_err = Arc::new(err);
+                    guard.settle_err(Arc::clone(&arc_err));
+                    return Err(arc_err);
                 }
             }
         }

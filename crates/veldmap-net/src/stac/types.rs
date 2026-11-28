@@ -136,6 +136,56 @@ impl StacAuth {
         out
     }
 
+    /// Return whether this auth configuration carries any non-empty credentials
+    /// (header or SAS query token).
+    pub(crate) fn has_credentials(&self) -> bool {
+        !self.extra_headers().is_empty() || self.trimmed_sas_token().is_some()
+    }
+
+    /// Compute a canonical collision-resistant BLAKE3 fingerprint of this auth
+    /// configuration for in-memory singleflight cache partitioning without
+    /// storing plaintext credentials in cache keys.
+    pub(crate) fn auth_fingerprint(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"veldmap-stac-auth-v1\0");
+        match self {
+            Self::None => {
+                h.update(b"none");
+            }
+            Self::Bearer(tok) => {
+                let t = tok.trim();
+                if t.is_empty() {
+                    h.update(b"none");
+                } else {
+                    h.update(b"bearer\0");
+                    h.update(t.as_bytes());
+                }
+            }
+            Self::ApiKey { header_name, value } => {
+                let hn = header_name.trim();
+                let v = value.trim();
+                if hn.is_empty() || v.is_empty() {
+                    h.update(b"none");
+                } else {
+                    h.update(b"apikey\0");
+                    h.update(hn.to_ascii_lowercase().as_bytes());
+                    h.update(b"\0");
+                    h.update(v.as_bytes());
+                }
+            }
+            Self::SasQuery(_) => match self.trimmed_sas_token() {
+                Some(tok) => {
+                    h.update(b"sas\0");
+                    h.update(tok.as_bytes());
+                }
+                None => {
+                    h.update(b"none");
+                }
+            },
+        }
+        *h.finalize().as_bytes()
+    }
+
     /// Return an explicit error-redaction secret for auth modes that may not be
     /// covered by generic header heuristics (`SasQuery`, which is appended to
     /// the URL rather than headers, and `ApiKey`, which may use a short value

@@ -133,3 +133,9 @@ pub const fn bundled_polar_tile_key(id: QuadTileId, decode_rev: u32) -> TileKey 
     key.decode_rev = decode_rev;
     key
 }
+
+/// Return whether `key` is a live-synthesized harmonic `PolarCap` revision
+/// (`decode_rev > 0`, as opposed to the static bundled offline `decode_rev == 0`).
+pub(crate) const fn is_harmonic_polar_key(key: &TileKey) -> bool {
+    matches!(key.scheme, veldmap_core::tile::TileScheme::PolarCap { .. }) && key.decode_rev > 0
+}

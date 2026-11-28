@@ -509,3 +509,177 @@ fn stac_pagination_get_post_merge_origin_guards_and_fetch_item() {
     assert!(matches!(redir_err, StacError::Network(_)));
     assert!(!redir_err.to_string().contains("page-secret"));
 }
+
+#[test]
+fn stac_item_flight_cache_does_not_poison_errors_respects_ttl_and_isolates_auth() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_srv = Arc::clone(&hits);
+
+    let server = MockHttpServer::start(move |req, mut stream, _stop| {
+        let hits = Arc::clone(&hits_srv);
+        async move {
+            let path = req.path_and_query.clone();
+            if path == "/items/RETRYABLE" {
+                let n = hits.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    write_http_response(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        "Content-Type: text/plain\r\n",
+                        b"transient outage",
+                    )
+                    .await;
+                    return;
+                }
+                let body = format!(
+                    r#"{{"type":"Feature","id":"RETRYABLE","properties":{{"datetime":"2025-05-01T10:00:00Z"}},"assets":{{"red":{{"href":"https://storage.example.org/b04.tif?sig=tok_{n}"}}}}}}"#
+                );
+                write_http_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "Content-Type: application/geo+json\r\n",
+                    body.as_bytes(),
+                )
+                .await;
+                return;
+            }
+            if path == "/items/AUTH_ISOLATED" {
+                let has_bearer = req
+                    .header("authorization")
+                    .is_some_and(|v| v == "Bearer secret-a");
+                if !has_bearer {
+                    write_http_response(
+                        &mut stream,
+                        401,
+                        "Unauthorized",
+                        "Content-Type: text/plain\r\n",
+                        b"missing bearer",
+                    )
+                    .await;
+                    return;
+                }
+                let body = r#"{"type":"Feature","id":"AUTH_ISOLATED","properties":{"datetime":"2025-05-01T10:00:00Z"},"assets":{"red":{"href":"https://storage.example.org/b04.tif?sig=authed"}}}"#;
+                write_http_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "Content-Type: application/geo+json\r\n",
+                    body.as_bytes(),
+                )
+                .await;
+                return;
+            }
+            write_http_response(
+                &mut stream,
+                404,
+                "Not Found",
+                "Content-Type: text/plain\r\n",
+                b"not found",
+            )
+            .await;
+        }
+    });
+
+    let net = Arc::new(NetContext::new(NetConfig::default()).expect("net context"));
+    let client = StacClient::new(Arc::clone(&net));
+    let cancel = CancelToken::new();
+    let cache = veldmap_net::StacItemFlightCache::with_ttl(Duration::from_millis(60));
+    let retry_url = format!("http://{}/items/RETRYABLE", server.addr());
+    let auth_url = format!("http://{}/items/AUTH_ISOLATED", server.addr());
+
+    // 1. Transient 503 failure must NOT poison a subsequent retry in the same epoch.
+    let err = net
+        .handle()
+        .block_on(cache.fetch_item_coalesced_async(
+            &client,
+            1,
+            &retry_url,
+            &StacAuth::None,
+            &cancel,
+        ))
+        .expect_err("first 503 fails");
+    assert!(matches!(*err, StacError::HttpStatus { code: 503, .. }));
+
+    let ok1 = net
+        .handle()
+        .block_on(cache.fetch_item_coalesced_async(
+            &client,
+            1,
+            &retry_url,
+            &StacAuth::None,
+            &cancel,
+        ))
+        .expect("retry after 503 succeeds");
+    assert_eq!(
+        ok1.assets[0].href,
+        "https://storage.example.org/b04.tif?sig=tok_1"
+    );
+
+    // 2. Within TTL, second call coalesces to the cached item (no extra HTTP call).
+    let ok_cached = net
+        .handle()
+        .block_on(cache.fetch_item_coalesced_async(
+            &client,
+            1,
+            &retry_url,
+            &StacAuth::None,
+            &cancel,
+        ))
+        .expect("cached hit");
+    assert_eq!(ok_cached.assets[0].href, ok1.assets[0].href);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    // 3. After TTL expires, next call re-fetches a fresh presigned token.
+    std::thread::sleep(Duration::from_millis(80));
+    let ok2 = net
+        .handle()
+        .block_on(cache.fetch_item_coalesced_async(
+            &client,
+            1,
+            &retry_url,
+            &StacAuth::None,
+            &cancel,
+        ))
+        .expect("post-TTL re-fetch succeeds");
+    assert_eq!(
+        ok2.assets[0].href,
+        "https://storage.example.org/b04.tif?sig=tok_2"
+    );
+
+    // 4. Auth-isolated cache keys: anonymous 401 never poisons authenticated call,
+    //    and authenticated Ok never leaks to anonymous caller.
+    let anon_err = net
+        .handle()
+        .block_on(cache.fetch_item_coalesced_async(&client, 1, &auth_url, &StacAuth::None, &cancel))
+        .expect_err("anonymous 401");
+    assert!(matches!(*anon_err, StacError::HttpStatus { code: 401, .. }));
+
+    let authed = net
+        .handle()
+        .block_on(cache.fetch_item_coalesced_async(
+            &client,
+            1,
+            &auth_url,
+            &StacAuth::Bearer("secret-a".to_owned()),
+            &cancel,
+        ))
+        .expect("authenticated call succeeds");
+    assert_eq!(
+        authed.assets[0].href,
+        "https://storage.example.org/b04.tif?sig=authed"
+    );
+
+    let anon_after = net
+        .handle()
+        .block_on(cache.fetch_item_coalesced_async(&client, 1, &auth_url, &StacAuth::None, &cancel))
+        .expect_err("anonymous call must not receive cached authenticated item");
+    assert!(matches!(
+        *anon_after,
+        StacError::HttpStatus { code: 401, .. }
+    ));
+}

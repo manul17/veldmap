@@ -259,7 +259,6 @@ fn show_timeline_builder_bar(
     if state.timeline_mode_idx >= group.available_modes.len() {
         state.timeline_mode_idx = 0;
     }
-    let selected_mode = group.available_modes[state.timeline_mode_idx];
 
     ui.group(|ui| {
         ui.horizontal(|ui| {
@@ -293,6 +292,7 @@ fn show_timeline_builder_bar(
             if state.timeline_mode_idx >= group.available_modes.len() {
                 state.timeline_mode_idx = 0;
             }
+            let selected_mode = group.available_modes[state.timeline_mode_idx];
             egui::ComboBox::from_id_salt("stac_tl_mode")
                 .selected_text(egui::RichText::new(selected_mode.label()).small())
                 .width(126.0)

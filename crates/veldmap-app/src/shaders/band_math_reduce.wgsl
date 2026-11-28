@@ -21,17 +21,6 @@ struct BandMathReduceUniform {
 
 @group(1) @binding(0) var<uniform> params: BandMathReduceUniform;
 
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
-    let x = f32(i32(vid & 1u) * 4 - 1);
-    let y = f32(i32(vid >> 1u) * 4 - 1);
-    return vec4<f32>(x, y, 0.0, 1.0);
-}
-
-fn is_finite_f32(v: f32) -> bool {
-    return (bitcast<u32>(v) & 0x7F800000u) != 0x7F800000u;
-}
-
 @fragment
 fn fs_reduce(@builtin(position) frag_pos: vec4<f32>) -> @location(0) f32 {
     let qnan = bitcast<f32>(params.nan_bits);
@@ -52,7 +41,8 @@ fn fs_reduce(@builtin(position) frag_pos: vec4<f32>) -> @location(0) f32 {
         return qnan;
     }
 
-    // Mode 4: single-band scientific/SAR passthrough (`N = 1`).
+    // Mode 4: single-band scientific/SAR passthrough (`N = 1`, checked before
+    // loading `band1_tex` so the 1x1 dummy texture is never read out of bounds).
     if params.mode == 4u {
         return a;
     }
@@ -62,28 +52,9 @@ fn fs_reduce(@builtin(position) frag_pos: vec4<f32>) -> @location(0) f32 {
         return qnan;
     }
 
-    var val: f32 = qnan;
-    if params.mode == 0u {
-        let denom = a + b;
-        if abs(denom) >= 1e-6 {
-            val = (a - b) / denom;
-        }
-    } else if params.mode == 1u {
-        val = a - b;
-    } else if params.mode == 2u {
-        if abs(b) >= 1e-6 {
-            val = a / b;
-        }
-    } else {
-        // Reserve `band2_tex` binding for future 3-band scalar indices.
-        let c = textureLoad(band2_tex, px, 0).r;
-        if is_finite_f32(c) {
-            val = a + b - c;
-        }
-    }
-
-    if !is_finite_f32(val) {
+    let res = eval_scalar_formula(params.mode, a, b);
+    if !res.valid {
         return qnan;
     }
-    return val;
+    return res.value;
 }

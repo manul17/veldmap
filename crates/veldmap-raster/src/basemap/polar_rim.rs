@@ -137,8 +137,9 @@ impl PolarRimPyramid {
     pub fn sample_harmonic(&self, lon_deg: f64, rho: f64) -> [f32; 3] {
         let u = ((lon_deg + 180.0) / 360.0).rem_euclid(1.0);
         let r = rho.clamp(0.0, 1.0);
-        // Exact isotropic Poisson kernel width near `rho = 1` (`~(1-rho)/(2*pi)`
-        // of the circle) smoothly expanding to `1.0` (global mean) at `rho = 0`.
+        // Approximate isotropic Poisson filter width near `rho = 1`
+        // (`~(1-rho)/(2*pi)` of the circle) smoothly expanding to `1.0`
+        // (global mean) at `rho = 0` via the dyadic mipmap pyramid.
         let frac = (1.0 - r) / (1.0 + r * (2.0 * PI - 1.0));
         let max_lod = (self.levels.len().saturating_sub(1)) as f64;
         let lod = (1.0 + frac * (POLAR_RIM_BINS as f64))
@@ -283,12 +284,10 @@ pub fn render_harmonic_polar_cap_with_mipmaps(
         }
     }
 
-    let mut tile =
-        DecodedTile::try_new(tile_px, tile_px, PixelFormat::Rgba8UnormSrgb, data).map_err(|_| {
-            RasterError::InvalidDimensions {
-                width: tile_px,
-                height: tile_px,
-            }
+    let mut tile = DecodedTile::try_new(tile_px, tile_px, PixelFormat::Rgba8UnormSrgb, data)
+        .map_err(|_| RasterError::InvalidDimensions {
+            width: tile_px,
+            height: tile_px,
         })?;
     generate_tile_mipmaps(&mut tile);
     Ok(tile)
@@ -313,9 +312,15 @@ mod tests {
 
         // At rho = 1.0: exact boundary match on both sides.
         let west_edge = rim.sample_harmonic(-90.0, 1.0);
-        assert!(west_edge[0] > 0.99 && west_edge[2] < 0.01, "west={west_edge:?}");
+        assert!(
+            west_edge[0] > 0.99 && west_edge[2] < 0.01,
+            "west={west_edge:?}"
+        );
         let east_edge = rim.sample_harmonic(90.0, 1.0);
-        assert!(east_edge[2] > 0.99 && east_edge[0] < 0.01, "east={east_edge:?}");
+        assert!(
+            east_edge[2] > 0.99 && east_edge[0] < 0.01,
+            "east={east_edge:?}"
+        );
 
         // At rho = 0.0 (exact pole): exact global mean (0.5, 0, 0.5) regardless of lon.
         let pole_a = rim.sample_harmonic(-90.0, 0.0);

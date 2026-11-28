@@ -1,5 +1,5 @@
 //! Tagged persisted raster layer entries (`local_raster`, `remote_cog`,
-//! `band_math`, and upcoming `timeline`/`dem_mosaic`) shared between
+//! `band_math`, `timeline`, and upcoming `dem_mosaic`) shared between
 //! `session.json` and portable `.veldmap.json` project files.
 
 use std::path::PathBuf;
@@ -541,40 +541,91 @@ impl SavedTimelineEntry {
 
     fn sanitize(&mut self) -> bool {
         self.opacity = clamp_opacity(self.opacity);
-        self.epochs.retain_mut(|e| e.source.sanitize());
+        if let Some(bm) = &mut self.band_math_style {
+            bm.sanitize();
+        }
+        let required_bm_bands = self
+            .band_math_style
+            .as_ref()
+            .map(|s| s.to_spec().formula.required_bands())
+            .or_else(|| {
+                self.recipe_preset
+                    .map(|p| BandMathPreset::from(p).formula().required_bands())
+            });
+
+        let mut kept = Vec::with_capacity(self.epochs.len());
+        let mut index_map: Vec<Option<usize>> = Vec::with_capacity(self.epochs.len());
+        for mut ep in std::mem::take(&mut self.epochs) {
+            ep.cloud_cover = ep
+                .cloud_cover
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 100.0));
+            let bands_ok = match (&ep.source, required_bm_bands) {
+                (SavedTimelineEpochSource::BandMath { bands, .. }, Some(req)) => bands.len() == req,
+                _ => true,
+            };
+            if bands_ok && ep.source.sanitize() {
+                let new_idx = kept.len();
+                kept.push(ep);
+                index_map.push(Some(new_idx));
+            } else {
+                index_map.push(None);
+            }
+        }
+        self.epochs = kept;
         if self.epochs.is_empty() {
             return false;
         }
         let max_idx = self.epochs.len() - 1;
-        self.active_idx = self.active_idx.min(max_idx);
-        self.compare = match self.compare {
-            SavedTimelineCompareMode::Single => SavedTimelineCompareMode::Single,
-            SavedTimelineCompareMode::ScalarDiff { ref_idx } => {
-                SavedTimelineCompareMode::ScalarDiff {
-                    ref_idx: ref_idx.min(max_idx),
-                }
-            }
-            SavedTimelineCompareMode::CrossFade { ref_idx, blend_t } => {
-                SavedTimelineCompareMode::CrossFade {
-                    ref_idx: ref_idx.min(max_idx),
-                    blend_t: if blend_t.is_finite() {
-                        blend_t.clamp(0.0, 1.0)
+        let remap = |old_idx: usize| -> usize {
+            index_map
+                .get(old_idx)
+                .and_then(|&opt| opt)
+                .unwrap_or_else(|| old_idx.min(max_idx))
+        };
+        self.active_idx = remap(self.active_idx);
+        self.compare = if self.epochs.len() < 2 {
+            SavedTimelineCompareMode::Single
+        } else {
+            match self.compare {
+                SavedTimelineCompareMode::Single => SavedTimelineCompareMode::Single,
+                SavedTimelineCompareMode::ScalarDiff { ref_idx } => {
+                    let r = remap(ref_idx);
+                    if r == self.active_idx {
+                        SavedTimelineCompareMode::Single
                     } else {
-                        0.5
-                    },
+                        SavedTimelineCompareMode::ScalarDiff { ref_idx: r }
+                    }
+                }
+                SavedTimelineCompareMode::CrossFade { ref_idx, blend_t } => {
+                    let r = remap(ref_idx);
+                    if r == self.active_idx {
+                        SavedTimelineCompareMode::Single
+                    } else {
+                        SavedTimelineCompareMode::CrossFade {
+                            ref_idx: r,
+                            blend_t: if blend_t.is_finite() {
+                                blend_t.clamp(0.0, 1.0)
+                            } else {
+                                0.5
+                            },
+                        }
+                    }
                 }
             }
         };
-        if let Some(bm) = &mut self.band_math_style {
-            bm.sanitize();
-        }
         self.max_cloud_cover = self
             .max_cloud_cover
             .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, 100.0));
-        if !self.diff_stretch_min.is_finite() || !self.diff_stretch_max.is_finite() {
+        if !self.diff_stretch_min.is_finite()
+            || !self.diff_stretch_max.is_finite()
+            || (self.diff_stretch_max - self.diff_stretch_min).abs() <= 1e-12
+        {
             self.diff_stretch_min = -0.5;
             self.diff_stretch_max = 0.5;
+        } else if self.diff_stretch_min > self.diff_stretch_max {
+            std::mem::swap(&mut self.diff_stretch_min, &mut self.diff_stretch_max);
         }
         if self.title.trim().is_empty() {
             self.title = "Timeline".to_owned();

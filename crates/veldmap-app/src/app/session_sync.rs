@@ -161,7 +161,6 @@ fn build_timeline_open_request(
         diff_stretch_min: Some(entry.diff_stretch_min),
         diff_stretch_max: Some(entry.diff_stretch_max),
         fly_to: false,
-        restore_id: None,
     }
 }
 
@@ -693,24 +692,10 @@ impl VeldmapApp {
                         }
                     }
                 }
-                SceneIoEvent::Raster(OverlayIoEvent::TimelineOpened {
-                    id,
-                    bounds,
-                    fly_to,
-                    restore_id,
-                }) => {
+                SceneIoEvent::Raster(OverlayIoEvent::TimelineOpened { id, bounds, fly_to }) => {
                     tracing::info!(?id, "Timeline initial epoch ready");
                     if fly_to && let Some(b) = bounds {
                         self.focus_footprint(b);
-                    }
-                    if restore_id.is_some() {
-                        let saved_slot = self.restore_tracker.on_opened(
-                            restore_id,
-                            Some(id),
-                            RestoredEntryKind::Timeline,
-                            None,
-                        );
-                        self.place_restored_layer_in_order(id, saved_slot);
                     }
                     session_changed = true;
                 }

@@ -36,21 +36,6 @@ fn adaptive_aoi_chord_deg(geometries: &[GeoJsonGeometry]) -> f64 {
     }
 }
 
-fn rect_polygon(west: f64, south: f64, east: f64, north: f64) -> Polygon {
-    Polygon {
-        exterior: Ring {
-            points: vec![
-                GeoPoint::new(south, west),
-                GeoPoint::new(south, east),
-                GeoPoint::new(north, east),
-                GeoPoint::new(north, west),
-                GeoPoint::new(south, west),
-            ],
-        },
-        holes: Vec::new(),
-    }
-}
-
 /// Build a CCW polar-cap circle along constant latitude `lat_deg` enclosing the
 /// North Pole (`enclose_north = true`, ascending longitude) or South Pole
 /// (`enclose_north = false`, descending longitude) without any interior
@@ -78,18 +63,12 @@ fn polar_cap_circle_polygon(lat_deg: f64, enclose_north: bool, step_deg: f64) ->
 /// constant-latitude parallels using both true spherical arc length
 /// (`lon_span * cos(lat)`) and a `<= 15°` longitude floor so zoomed-in polar
 /// spans never collapse to zero-area 1D geodesics across the pole.
-fn rect_polygon_parallels(
-    west: f64,
-    south: f64,
-    east: f64,
-    north: f64,
-    step_deg: f64,
-) -> Polygon {
+fn rect_polygon_parallels(west: f64, south: f64, east: f64, north: f64, step_deg: f64) -> Polygon {
     let lon_span = (east - west).abs();
     let step = step_deg.max(0.5);
     let parallel_steps = |lat_deg: f64| -> usize {
         if lat_deg.abs() >= 89.8 {
-            // Avoid tiny microscopic chords on clamped pole boundaries (±89.9°).
+            // Avoid subdividing microscopic chords on near-pole boundaries (±89.8°..±90°).
             1
         } else {
             let min_steps = ((lon_span / 15.0).ceil() as usize).clamp(1, 48);
@@ -120,20 +99,21 @@ fn rect_polygon_parallels(
 /// Construct a render-ready constant-latitude parallel geometry for `bbox`.
 ///
 /// - Polar caps (`[-180, south, 180, ~90]` or `[-180, ~-90, 180, north]`)
-///   render as a single closed parallel circle enclosing the pole (zero
-///   interior meridian stroke seam).
+///   render as a single closed CCW parallel circle enclosing the pole (zero
+///   interior meridian stroke seam, tessellated with strict CCW winding so
+///   `> hemisphere` caps never invert onto the opposite pole).
 /// - Full-circle non-polar bands (`> 350°`, including full Earth) split cleanly
 ///   into two non-self-touching halves.
 /// - All other rectangles (including wide `179°..350°` spans) render as a
 ///   single parallel-sampled polygon with no interior seam.
-fn render_geometry_from_bbox(bbox: [f64; 4]) -> Option<GeoJsonGeometry> {
+pub(super) fn render_geometry_from_bbox(bbox: [f64; 4]) -> Option<GeoJsonGeometry> {
     if !bbox.iter().all(|v| v.is_finite()) {
         return None;
     }
     let west = bbox[0].clamp(-180.0, 180.0);
     let east = bbox[2].clamp(-180.0, 180.0);
-    let south = bbox[1].min(bbox[3]).clamp(-89.9, 89.9);
-    let north = bbox[1].max(bbox[3]).clamp(-89.9, 89.9);
+    let south = bbox[1].min(bbox[3]).clamp(-89.9999, 89.9999);
+    let north = bbox[1].max(bbox[3]).clamp(-89.9999, 89.9999);
     if (north - south) <= 1e-9 {
         return None;
     }
@@ -199,41 +179,44 @@ fn render_geometry_from_bbox(bbox: [f64; 4]) -> Option<GeoJsonGeometry> {
     }
 }
 
-/// Construct a closed CCW RFC 7946 WGS84 polygon (or `MultiPolygon` when
-/// crossing the antimeridian `west > east` or spanning `> 120°` in longitude)
-/// from `[west, south, east, north]` so every slice has `< 180°` edges and
-/// unambiguous positive CCW geodesic area on spherical STAC/GeoJSON backends.
+/// Construct an OGC-valid closed CCW RFC 7946 WGS84 polygon (or `MultiPolygon`
+/// split strictly at `±180°` per RFC 7946 §3.1.9 when crossing the antimeridian
+/// `west > east`) from `[west, south, east, north]`.
+///
+/// Parallels are sampled along constant latitude (`<= 15°` steps) so wide
+/// exported GeoJSON/WKT polygons match the rendered parallel bounds without
+/// OGC-invalid shared interior meridian edges.
 pub(super) fn polygon_geometry_from_bbox(bbox: [f64; 4]) -> Option<GeoJsonGeometry> {
     if !bbox.iter().all(|v| v.is_finite()) {
         return None;
     }
     let west = bbox[0].clamp(-180.0, 180.0);
     let east = bbox[2].clamp(-180.0, 180.0);
-    let south = bbox[1].min(bbox[3]).clamp(-89.9, 89.9);
-    let north = bbox[1].max(bbox[3]).clamp(-89.9, 89.9);
+    let south = bbox[1].min(bbox[3]).clamp(-89.9999, 89.9999);
+    let north = bbox[1].max(bbox[3]).clamp(-89.9999, 89.9999);
     if (north - south) <= 1e-9 {
         return None;
     }
 
-    let mut polys: Vec<Polygon> = Vec::with_capacity(4);
-    let mut push_slices = |a: f64, b: f64| {
-        let span = b - a;
-        if span <= 1e-9 {
-            return;
-        }
-        let slices = ((span / 120.0).ceil() as usize).max(1);
-        for i in 0..slices {
-            let s0 = a + span * (i as f64 / slices as f64);
-            let s1 = a + span * ((i + 1) as f64 / slices as f64);
-            polys.push(rect_polygon(s0, south, s1, north));
+    const EXPORT_PARALLEL_STEP_DEG: f64 = 10.0;
+    let mut polys: Vec<Polygon> = Vec::with_capacity(2);
+    let mut push_rect = |a: f64, b: f64| {
+        if (b - a) > 1e-9 {
+            polys.push(rect_polygon_parallels(
+                a,
+                south,
+                b,
+                north,
+                EXPORT_PARALLEL_STEP_DEG,
+            ));
         }
     };
 
     if west <= east {
-        push_slices(west, east);
+        push_rect(west, east);
     } else {
-        push_slices(west, 180.0);
-        push_slices(-180.0, east);
+        push_rect(west, 180.0);
+        push_rect(-180.0, east);
     }
 
     match polys.len() {
@@ -286,6 +269,32 @@ pub(super) fn build_vector_layer(
     stroke_width_px: f32,
     hatch_spacing_px: f32,
 ) -> Option<DrawVectorLayer> {
+    build_vector_layer_inner(
+        id,
+        rev,
+        geometries,
+        fill_color,
+        line_color,
+        stroke_width_px,
+        hatch_spacing_px,
+        false,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Internal helper forwarding DrawVectorLayer style fields"
+)]
+fn build_vector_layer_inner(
+    id: DrawVectorId,
+    rev: u64,
+    geometries: Vec<GeoJsonGeometry>,
+    fill_color: [f32; 4],
+    line_color: [f32; 4],
+    stroke_width_px: f32,
+    hatch_spacing_px: f32,
+    strict_ccw: bool,
+) -> Option<DrawVectorLayer> {
     if geometries.is_empty() {
         return None;
     }
@@ -296,7 +305,11 @@ pub(super) fn build_vector_layer(
             .map(|g| GeoJsonFeature::new(None, g))
             .collect(),
     };
-    let mesh = VectorMesh::from_collection(&fc, chord_deg);
+    let mesh = if strict_ccw {
+        VectorMesh::from_collection_strict_ccw(&fc, chord_deg)
+    } else {
+        VectorMesh::from_collection(&fc, chord_deg)
+    };
     if mesh.is_empty() {
         return None;
     }
@@ -316,6 +329,9 @@ pub(super) fn build_vector_layer(
 #[derive(Default)]
 pub(super) struct AoiState {
     geometry: Option<GeoJsonGeometry>,
+    /// Native `[west, south, east, north]` bbox when the AOI was set via a
+    /// bounding box (sent directly as STAC `"bbox"` instead of `"intersects"`).
+    query_bbox: Option<[f64; 4]>,
     display_bbox: Option<[f64; 4]>,
     label: Option<String>,
     draw: Option<DrawVectorLayer>,
@@ -329,6 +345,10 @@ impl AoiState {
 
     pub(super) fn geometry(&self) -> Option<&GeoJsonGeometry> {
         self.geometry.as_ref()
+    }
+
+    pub(super) const fn query_bbox(&self) -> Option<[f64; 4]> {
+        self.query_bbox
     }
 
     pub(super) fn label(&self) -> Option<&str> {
@@ -353,12 +373,19 @@ impl AoiState {
         let Some(geom) = polygon_geometry_from_bbox(bbox) else {
             return false;
         };
-        let render_geom = render_geometry_from_bbox(bbox).unwrap_or_else(|| geom.clone());
+        let sanitized_bbox = [
+            bbox[0].clamp(-180.0, 180.0),
+            bbox[1].min(bbox[3]).clamp(-90.0, 90.0),
+            bbox[2].clamp(-180.0, 180.0),
+            bbox[1].max(bbox[3]).clamp(-90.0, 90.0),
+        ];
+        let render_geom = render_geometry_from_bbox(sanitized_bbox).unwrap_or_else(|| geom.clone());
         self.preview_draw = None;
-        self.display_bbox = Some(bbox);
+        self.query_bbox = Some(sanitized_bbox);
+        self.display_bbox = Some(sanitized_bbox);
         self.geometry = Some(geom);
         self.label = Some(label);
-        self.draw = build_vector_layer(
+        self.draw = build_vector_layer_inner(
             DrawVectorId::StacAoi,
             rev,
             vec![render_geom],
@@ -366,12 +393,14 @@ impl AoiState {
             STAC_AOI_LINE,
             3.0,
             10.0,
+            true,
         );
         true
     }
 
     pub(super) fn set_geometry(&mut self, geometry: GeoJsonGeometry, label: String, rev: u64) {
         self.preview_draw = None;
+        self.query_bbox = None;
         self.display_bbox = geometry.bbox();
         self.set_geometry_inner(geometry, label, rev);
     }
@@ -396,7 +425,7 @@ impl AoiState {
         let Some(render_geom) = render_geometry_from_bbox(bbox) else {
             return false;
         };
-        self.preview_draw = build_vector_layer(
+        self.preview_draw = build_vector_layer_inner(
             DrawVectorId::StacAoi,
             rev,
             vec![render_geom],
@@ -404,6 +433,7 @@ impl AoiState {
             STAC_AOI_LINE,
             3.0,
             10.0,
+            true,
         );
         true
     }
@@ -422,6 +452,7 @@ impl AoiState {
             return false;
         }
         self.geometry = None;
+        self.query_bbox = None;
         self.display_bbox = None;
         self.label = None;
         self.draw = None;

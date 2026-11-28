@@ -4,7 +4,7 @@
 
 use veldmap_core::geo::FootprintBounds;
 use veldmap_core::tile::{BandKey, PixelFormat};
-use veldmap_raster::{PyramidMeta, SampleType, stream_spec_for_band};
+use veldmap_raster::{SampleType, stream_spec_for_band};
 
 use crate::clamp_opacity;
 
@@ -21,13 +21,12 @@ use super::super::remote_opener::{
     TimelineEpochOpenedData,
 };
 use super::super::stack::{LayerStack, OverlayLayer};
-use super::super::style::{LayerStyle, LayerStyleSpec};
 use super::super::timeline::{TimelineEpochContent, TimelineEpochState, TimelineOpenRequest};
 use super::super::{
     LayerId, LayerInitOptions, LocalBandMathInput, LocalBandMathSpec, OpenOverlayRequest,
     OverlayIoEvent, RemoteBandMathRequest, RemoteCogRequest,
 };
-use super::{BandMathEdit, OverlayManager, OverlayMutation, TimelineEdit, alloc_seq};
+use super::{OverlayManager, OverlayMutation, TimelineEdit, alloc_seq};
 
 fn clone_loaded_input_asset(
     stack: &LayerStack,
@@ -641,159 +640,106 @@ impl OverlayManager {
         edit: TimelineEdit,
     ) -> OverlayMutation {
         match edit {
-            TimelineEdit::BandMath(bm_edit) => match bm_edit {
-                BandMathEdit::SetStretchRange { min, max } => {
-                    self.mutate_layer(id, |l| l.set_stretch_range(min, max))
-                }
-                BandMathEdit::SetColormap { colormap, invert } => {
-                    self.mutate_layer(id, |l| l.set_colormap(colormap, invert))
-                }
-                BandMathEdit::SetRgbStretch { min, max, gamma } => {
-                    self.mutate_layer(id, |l| l.set_band_math_rgb_stretch(min, max, gamma))
-                }
-                BandMathEdit::ResetStretch => {
-                    self.mutate_layer(id, OverlayLayer::reset_band_math_stretch)
-                }
-                BandMathEdit::SetSclEnabled(enabled) => {
-                    let (changed, disabled_streams) =
-                        self.stack.get_mut(id).map_or((false, Vec::new()), |l| {
-                            l.set_band_math_scl_enabled(enabled)
-                        });
-                    for sk in disabled_streams {
-                        self.cancel_stream_if_unused(sk);
-                    }
-                    OverlayMutation {
-                        changed,
-                        topology_changed: changed,
-                        purge_sources: Vec::new(),
-                    }
-                }
-                BandMathEdit::SetSclMaskBits(bits) => {
-                    self.mutate_layer(id, |l| l.set_band_math_scl_mask_bits(bits))
-                }
-            },
-            TimelineEdit::SetBlendT(blend_t) => self.mutate_layer(id, |layer| {
-                if let LayerKind::Timeline(tl) = layer.kind_mut() {
-                    tl.set_blend_t(blend_t)
-                } else {
-                    false
-                }
-            }),
-            TimelineEdit::SetDiffStretchRange { min, max } => self.mutate_layer(id, |layer| {
-                if let LayerKind::Timeline(tl) = layer.kind_mut() {
-                    tl.set_diff_stretch_range(min, max)
-                } else {
-                    false
-                }
-            }),
-            TimelineEdit::SetDiffColormap { colormap, invert } => self.mutate_layer(id, |layer| {
-                if let LayerKind::Timeline(tl) = layer.kind_mut() {
-                    tl.set_diff_colormap(colormap, invert)
-                } else {
-                    false
-                }
-            }),
+            TimelineEdit::SingleRaster(sr_edit) => self.edit_single_raster_layer(id, sr_edit),
+            TimelineEdit::BandMath(bm_edit) => self.edit_band_math_layer(id, bm_edit),
+            TimelineEdit::SetBlendT(blend_t) => {
+                self.mutate_timeline_style(id, |tl| tl.set_blend_t(blend_t))
+            }
+            TimelineEdit::SetDiffStretchRange { min, max } => {
+                self.mutate_timeline_style(id, |tl| tl.set_diff_stretch_range(min, max))
+            }
+            TimelineEdit::SetDiffColormap { colormap, invert } => {
+                self.mutate_timeline_style(id, |tl| tl.set_diff_colormap(colormap, invert))
+            }
             TimelineEdit::SetActiveEpoch(idx) => {
-                let changed = self.stack.get_mut(id).is_some_and(|layer| {
-                    if let LayerKind::Timeline(tl) = layer.kind_mut() {
-                        tl.set_active_epoch(idx)
-                    } else {
-                        false
-                    }
-                });
-                if changed {
-                    self.sync_timeline_epochs(id);
-                }
-                OverlayMutation {
-                    changed,
-                    topology_changed: changed,
-                    purge_sources: Vec::new(),
-                }
+                self.mutate_timeline_and_sync(id, |tl| tl.set_active_epoch(idx))
             }
             TimelineEdit::StepEpoch(delta) => {
-                let changed = self.stack.get_mut(id).is_some_and(|layer| {
-                    if let LayerKind::Timeline(tl) = layer.kind_mut() {
-                        tl.step_epoch(delta)
-                    } else {
-                        false
-                    }
-                });
-                if changed {
-                    self.sync_timeline_epochs(id);
-                }
-                OverlayMutation {
-                    changed,
-                    topology_changed: changed,
-                    purge_sources: Vec::new(),
-                }
+                self.mutate_timeline_and_sync(id, |tl| tl.step_epoch(delta))
+            }
+            TimelineEdit::RetryEpoch(idx) => {
+                self.mutate_timeline_and_sync(id, |tl| tl.retry_epoch(idx))
             }
             TimelineEdit::SetCloudFilter(limit) => {
-                let changed = self.stack.get_mut(id).is_some_and(|layer| {
-                    if let LayerKind::Timeline(tl) = layer.kind_mut() {
-                        tl.set_cloud_filter(limit)
-                    } else {
-                        false
-                    }
-                });
-                if changed {
-                    self.sync_timeline_epochs(id);
-                }
-                OverlayMutation {
-                    changed,
-                    topology_changed: changed,
-                    purge_sources: Vec::new(),
-                }
+                self.mutate_timeline_and_sync(id, |tl| tl.set_cloud_filter(limit))
             }
             TimelineEdit::SetCompareMode(mode) => {
-                let changed = self.stack.get_mut(id).is_some_and(|layer| {
-                    if let LayerKind::Timeline(tl) = layer.kind_mut() {
-                        tl.set_compare_mode(mode)
-                    } else {
-                        false
-                    }
-                });
-                if changed {
-                    self.sync_timeline_epochs(id);
-                }
-                OverlayMutation {
-                    changed,
-                    topology_changed: changed,
-                    purge_sources: Vec::new(),
-                }
+                self.mutate_timeline_and_sync(id, |tl| tl.set_compare_mode(mode))
             }
         }
     }
 
-    fn sync_timeline_epochs(&mut self, id: LayerId) {
+    fn mutate_timeline_style(
+        &mut self,
+        id: LayerId,
+        mut f: impl FnMut(&mut super::super::timeline::TimelineLayerData) -> bool,
+    ) -> OverlayMutation {
+        self.mutate_layer(id, |layer| {
+            if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                f(tl)
+            } else {
+                false
+            }
+        })
+    }
+
+    fn mutate_timeline_and_sync(
+        &mut self,
+        id: LayerId,
+        mut f: impl FnMut(&mut super::super::timeline::TimelineLayerData) -> bool,
+    ) -> OverlayMutation {
+        let changed = self.stack.get_mut(id).is_some_and(|layer| {
+            if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                f(tl)
+            } else {
+                false
+            }
+        });
+        if changed {
+            self.sync_timeline_epochs(id);
+            self.request_band_stats_if_needed(id);
+        }
+        OverlayMutation {
+            changed,
+            topology_changed: changed,
+            purge_sources: Vec::new(),
+        }
+    }
+
+    pub(super) fn sync_timeline_epochs(&mut self, id: LayerId) {
         let mut to_spawn: Vec<TimelineEpochOpenSpec> = Vec::new();
         let mut cancelled_streams = Vec::new();
         let workspace_epoch = self.workspace_epoch;
         let workspace_cancel = self.workspace_cancel.clone();
 
-        if let Some(layer) = self.stack.get_mut(id)
-            && let LayerKind::Timeline(tl) = layer.kind_mut()
-        {
-            cancelled_streams = tl.trim_and_cancel_unneeded();
-            let needed = tl.needed_epoch_indices();
-            for epoch_idx in needed {
-                let Some(epoch) = tl.epochs.get_mut(epoch_idx) else {
-                    continue;
-                };
-                if matches!(epoch.state, TimelineEpochState::Unloaded) {
-                    let open_seq = alloc_seq(&mut self.next_relaid);
-                    let cancel = workspace_cancel.child_token();
-                    epoch.state = TimelineEpochState::Loading {
-                        open_seq,
-                        cancel: cancel.clone(),
+        if let Some(layer) = self.stack.get_mut(id) {
+            if !layer.is_visible() {
+                layer.cancel_timeline_loading();
+                return;
+            }
+            if let LayerKind::Timeline(tl) = layer.kind_mut() {
+                cancelled_streams = tl.trim_and_cancel_unneeded();
+                let needed = tl.needed_epoch_indices();
+                for epoch_idx in needed {
+                    let Some(epoch) = tl.epochs.get_mut(epoch_idx) else {
+                        continue;
                     };
-                    to_spawn.push(TimelineEpochOpenSpec {
-                        workspace_epoch,
-                        layer_id: id,
-                        epoch_idx,
-                        open_seq,
-                        source: epoch.source.clone(),
-                        cancel,
-                    });
+                    if matches!(epoch.state, TimelineEpochState::Unloaded) {
+                        let open_seq = alloc_seq(&mut self.next_relaid);
+                        let cancel = workspace_cancel.child_token();
+                        epoch.state = TimelineEpochState::Loading {
+                            open_seq,
+                            cancel: cancel.clone(),
+                        };
+                        to_spawn.push(TimelineEpochOpenSpec {
+                            workspace_epoch,
+                            layer_id: id,
+                            epoch_idx,
+                            open_seq,
+                            source: epoch.source.clone(),
+                            cancel,
+                        });
+                    }
                 }
             }
         }
@@ -818,36 +764,10 @@ impl OverlayManager {
 
     fn build_single_timeline_epoch_content(
         &mut self,
-        label: String,
-        origin: LayerOrigin,
-        source: std::sync::Arc<dyn veldmap_raster::RasterSource>,
-        frame: veldmap_core::geo::Frame,
-        crs_override: Option<super::super::CrsOverride>,
-        style_spec: Option<&LayerStyleSpec>,
+        mut input: super::super::layer::SingleRasterPartsInput,
     ) -> TimelineEpochContent {
-        let desc = source.description();
-        let preferred_spec = style_spec
-            .and_then(|s| s.resolve_stream_spec(desc))
-            .unwrap_or_else(|| source.default_stream_spec());
-        let meta = source
-            .pyramid_meta(preferred_spec)
-            .or_else(|_| source.pyramid_meta(veldmap_raster::DISPLAY_STREAM_SPEC))
-            .unwrap_or_else(|_| PyramidMeta {
-                source: source.source_id(),
-                spec: veldmap_raster::DISPLAY_STREAM_SPEC,
-                levels: desc.levels.clone(),
-            });
-        let style = LayerStyle::new(source.as_ref(), meta.spec, style_spec);
-        let relaid = alloc_seq(&mut self.next_relaid);
-        let geo = GeoBinding::new(
-            frame,
-            desc.width,
-            desc.height,
-            meta.max_level(),
-            crs_override,
-            relaid,
-        );
-        let asset = RasterAsset::new(label, origin, source, geo, meta);
+        input.relaid = alloc_seq(&mut self.next_relaid);
+        let (asset, style) = super::super::layer::build_single_raster_parts(input);
         TimelineEpochContent::Single {
             asset: Box::new(asset),
             style,
@@ -898,29 +818,40 @@ impl OverlayManager {
                 source,
                 frame,
             } => Ok(self.build_single_timeline_epoch_content(
-                epoch_label,
-                LayerOrigin::Local { path },
-                source,
-                frame,
-                crs_override,
-                saved_single_style.as_ref(),
+                super::super::layer::SingleRasterPartsInput {
+                    name: epoch_label,
+                    origin: LayerOrigin::Local { path },
+                    source,
+                    frame,
+                    crs_override,
+                    style: saved_single_style,
+                    is_scl: false,
+                    relaid: 0,
+                },
             )),
             TimelineEpochOpenedData::RemoteSingle {
                 meta,
                 range_source,
                 source,
                 frame,
-            } => Ok(self.build_single_timeline_epoch_content(
-                epoch_label,
-                LayerOrigin::Remote {
-                    meta,
-                    range: range_source,
-                },
-                source,
-                frame,
-                None,
-                saved_single_style.as_ref(),
-            )),
+            } => {
+                let is_scl = meta.is_scl;
+                Ok(self.build_single_timeline_epoch_content(
+                    super::super::layer::SingleRasterPartsInput {
+                        name: epoch_label,
+                        origin: LayerOrigin::Remote {
+                            meta,
+                            range: range_source,
+                        },
+                        source,
+                        frame,
+                        crs_override: None,
+                        style: saved_single_style,
+                        is_scl,
+                        relaid: 0,
+                    },
+                ))
+            }
             TimelineEpochOpenedData::BandMath { bands, scl } => {
                 let band_assets: Vec<RasterAsset> = bands
                     .into_iter()
@@ -931,7 +862,18 @@ impl OverlayManager {
                     .collect::<Result<_, _>>()?;
                 let scl_asset = scl.and_then(|s| {
                     let relaid = alloc_seq(&mut self.next_relaid);
-                    build_band_asset(s, PixelFormat::R8Uint, relaid).ok()
+                    match build_band_asset(s, PixelFormat::R8Uint, relaid) {
+                        Ok(a) => Some(a),
+                        Err(err) => {
+                            tracing::warn!(
+                                ?layer_id,
+                                epoch_idx,
+                                error = %err,
+                                "Timeline optional SCL mask failed to initialize; continuing without mask"
+                            );
+                            None
+                        }
+                    }
                 });
                 let style = shared_bm_style.unwrap_or_else(|| {
                     BandMathStyle::from_preset(
@@ -949,8 +891,9 @@ impl OverlayManager {
             }
         });
 
-        let mut emit_opened: Option<(Option<FootprintBounds>, bool, Option<u64>)> = None;
+        let mut emit_opened: Option<(Option<FootprintBounds>, bool)> = None;
         let mut evicted_streams = Vec::new();
+        let mut opened_single = false;
         if let Some(layer) = self.stack.get_mut(layer_id)
             && let LayerKind::Timeline(tl) = layer.kind_mut()
             && let Some(epoch) = tl.epochs.get_mut(epoch_idx)
@@ -958,10 +901,12 @@ impl OverlayManager {
         {
             match built {
                 Ok(content) => {
+                    opened_single = matches!(content, TimelineEpochContent::Single { .. });
                     let fp = content.footprint();
                     if tl.last_known_footprint.is_none() {
                         tl.last_known_footprint = fp;
                     }
+                    tl.record_opened_content(&content);
                     let seq = tl.next_use_seq();
                     if let Some(epoch) = tl.epochs.get_mut(epoch_idx) {
                         epoch.state = TimelineEpochState::Ready {
@@ -970,10 +915,9 @@ impl OverlayManager {
                         };
                     }
                     evicted_streams = tl.trim_and_cancel_unneeded();
-                    if tl.fly_to_on_first_ready || tl.restore_id.is_some() {
-                        let fly_to = std::mem::take(&mut tl.fly_to_on_first_ready);
-                        let restore_id = tl.restore_id.take();
-                        emit_opened = Some((tl.footprint(), fly_to, restore_id));
+                    if tl.fly_to_on_first_ready {
+                        tl.fly_to_on_first_ready = false;
+                        emit_opened = Some((tl.footprint(), true));
                     }
                 }
                 Err(err) => {
@@ -986,13 +930,15 @@ impl OverlayManager {
         for sk in evicted_streams {
             self.cancel_stream_if_unused(sk);
         }
+        if opened_single {
+            self.request_band_stats_if_needed(layer_id);
+        }
 
-        if let Some((bounds, fly_to, restore_id)) = emit_opened {
+        if let Some((bounds, fly_to)) = emit_opened {
             events.push(OverlayIoEvent::TimelineOpened {
                 id: layer_id,
                 bounds,
                 fly_to,
-                restore_id,
             });
         }
     }

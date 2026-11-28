@@ -145,8 +145,11 @@ pub(crate) fn scan_dated_raster_folder(
             paths.push(path);
         }
     }
+    /// Hard cap on raw candidate raster files probed in one folder scan so
+    /// accidental selection of a massive unrelated directory stays bounded.
+    const MAX_SCAN_CANDIDATES: usize = 2_000;
     paths.sort();
-    paths.truncate(MAX_FOLDER_TIMELINE_EPOCHS);
+    paths.truncate(MAX_SCAN_CANDIDATES);
 
     if paths.len() < 2 {
         return Err(format!(
@@ -180,6 +183,7 @@ pub(crate) fn scan_dated_raster_folder(
     }
 
     out.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    out.truncate(MAX_FOLDER_TIMELINE_EPOCHS);
     Ok(out)
 }
 

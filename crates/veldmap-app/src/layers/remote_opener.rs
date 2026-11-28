@@ -237,30 +237,6 @@ fn build_remote_asset_meta(
     Ok((trimmed, meta))
 }
 
-fn url_has_presigned_query(url: &str) -> bool {
-    let before_frag = url.split('#').next().unwrap_or(url);
-    let Some((_, query)) = before_frag.split_once('?') else {
-        return false;
-    };
-    query.split('&').any(|pair| {
-        let key = pair.split('=').next().unwrap_or("").trim();
-        key.eq_ignore_ascii_case("sig")
-            || key.eq_ignore_ascii_case("x-amz-signature")
-            || key.eq_ignore_ascii_case("signature")
-            || key.eq_ignore_ascii_case("x-goog-signature")
-    })
-}
-
-fn is_https_downgrade(expected_canonical: &str, candidate: &str) -> bool {
-    let exp_https = expected_canonical
-        .get(..8)
-        .is_some_and(|p| p.eq_ignore_ascii_case("https://"));
-    let cand_http = candidate
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("http://"));
-    exp_https && cand_http
-}
-
 /// Validate a refreshed STAC asset `href` against the persisted canonical URL
 /// and `policy` before retrying `HttpRangeSource::open_async`.
 ///
@@ -279,7 +255,7 @@ pub(super) fn validate_refreshed_asset_href(
     if !is_valid_http_endpoint(trimmed) {
         return Err("refreshed STAC asset href is not a valid http(s) URL".to_owned());
     }
-    if is_https_downgrade(expected_canonical_url, trimmed) {
+    if veldmap_net::is_https_downgrade(expected_canonical_url, trimmed) {
         return Err("refusing HTTPS-to-HTTP downgrade on refreshed STAC asset href".to_owned());
     }
     let Some(refreshed_canonical) = sanitize_url_for_persistence(trimmed) else {
@@ -290,7 +266,7 @@ pub(super) fn validate_refreshed_asset_href(
             "refreshed STAC asset href does not match persisted canonical asset URL".to_owned(),
         );
     }
-    let headers = if url_has_presigned_query(trimmed) {
+    let headers = if crate::stac::url_has_presigned_query(trimmed) {
         Vec::new()
     } else if let Some(origin) = &policy.asset_auth_origin
         && same_http_origin(origin, trimmed)
@@ -364,7 +340,7 @@ async fn open_range_with_optional_refresh(
     {
         Ok(item) => item,
         Err(refresh_err) => {
-            if cancel.is_cancelled() {
+            if refresh_err.is_cancelled() || cancel.is_cancelled() {
                 return Err(Ok(RangeOpenError::Cancelled));
             }
             return Err(Err(format!(
@@ -749,8 +725,16 @@ impl TimelineEpochBandMathCollector {
             },
             None => {
                 self.waiting_scl = false;
-                if let Ok(asset) = res {
-                    self.scl = Some(asset);
+                match res {
+                    Ok(asset) => self.scl = Some(asset),
+                    Err(err) => {
+                        tracing::warn!(
+                            layer_id = ?self.layer_id,
+                            epoch_idx = self.epoch_idx,
+                            error = %err,
+                            "Optional Timeline SCL mask asset failed to open; continuing without cloud mask"
+                        );
+                    }
                 }
                 self.maybe_finish();
             }
@@ -895,18 +879,16 @@ impl RemoteOpenTracker {
         Ok(())
     }
 
-    fn spawn_band_math_asset(
+    fn spawn_validated_band_asset(
         &self,
         runtime: &Arc<OverlayRuntime>,
-        collector: &Arc<Mutex<BandMathOpenCollector>>,
+        workspace_epoch: u64,
         asset: ValidatedBandAsset,
-        slot: Option<usize>,
         net: Option<Arc<NetContext>>,
         cancel: CancelToken,
+        on_done: impl FnOnce(Result<OpenedBandAsset, String>) + Send + 'static,
     ) {
         let open_id = self.alloc_open_id();
-        let epoch = lock_unpoisoned(collector).epoch;
-        let col = Arc::clone(collector);
         match asset {
             ValidatedBandAsset::Local {
                 label,
@@ -935,7 +917,7 @@ impl RemoteOpenTracker {
                                 band_index,
                             })
                             .map_err(|err| format!("{label}: {err}"));
-                        finish_collector_slot(&col, slot, mapped);
+                        on_done(mapped);
                     },
                 );
             }
@@ -951,7 +933,7 @@ impl RemoteOpenTracker {
                 let Some(net) = net else {
                     return;
                 };
-                let refresh = self.build_refresh_ctx(epoch, &meta, refresh_policy);
+                let refresh = self.build_refresh_ctx(workspace_epoch, &meta, refresh_policy);
                 spawn_remote_asset_open(
                     RemoteAssetOpenSpec {
                         net,
@@ -973,11 +955,27 @@ impl RemoteOpenTracker {
                                 band_index,
                             })
                             .map_err(|err| format!("{label}: {err}"));
-                        finish_collector_slot(&col, slot, mapped);
+                        on_done(mapped);
                     },
                 );
             }
         }
+    }
+
+    fn spawn_band_math_asset(
+        &self,
+        runtime: &Arc<OverlayRuntime>,
+        collector: &Arc<Mutex<BandMathOpenCollector>>,
+        asset: ValidatedBandAsset,
+        slot: Option<usize>,
+        net: Option<Arc<NetContext>>,
+        cancel: CancelToken,
+    ) {
+        let epoch = lock_unpoisoned(collector).epoch;
+        let col = Arc::clone(collector);
+        self.spawn_validated_band_asset(runtime, epoch, asset, net, cancel, move |mapped| {
+            finish_collector_slot(&col, slot, mapped);
+        });
     }
 
     /// Queue a non-blocking concurrent multi-asset STAC or heterogeneous
@@ -1089,80 +1087,18 @@ impl RemoteOpenTracker {
         net: Option<Arc<NetContext>>,
         cancel: CancelToken,
     ) {
-        let open_id = self.alloc_open_id();
         let workspace_epoch = lock_unpoisoned(collector).epoch;
         let col = Arc::clone(collector);
-        match asset {
-            ValidatedBandAsset::Local {
-                label,
-                path,
-                crs_override,
-                band_index,
-            } => {
-                let path_for_origin = path.clone();
-                let crs_for_origin = crs_override.clone();
-                spawn_local_band_open(
-                    Arc::clone(runtime),
-                    open_id,
-                    path,
-                    crs_override,
-                    cancel,
-                    move |res| {
-                        let mapped = res
-                            .map(|(source, frame)| OpenedBandAsset {
-                                label: label.clone(),
-                                origin: OpenedBandAssetOrigin::Local {
-                                    path: path_for_origin,
-                                    crs_override: crs_for_origin,
-                                },
-                                source,
-                                frame,
-                                band_index,
-                            })
-                            .map_err(|err| format!("{label}: {err}"));
-                        lock_unpoisoned(&col).on_slot_done(slot, mapped);
-                    },
-                );
-            }
-            ValidatedBandAsset::Remote {
-                label,
-                url,
-                meta,
-                extra_headers,
-                external_bands,
-                refresh_policy,
-                band_index,
-            } => {
-                let Some(net) = net else {
-                    return;
-                };
-                let refresh = self.build_refresh_ctx(workspace_epoch, &meta, refresh_policy);
-                spawn_remote_asset_open(
-                    RemoteAssetOpenSpec {
-                        net,
-                        rt: Arc::clone(runtime),
-                        open_id,
-                        url,
-                        extra_headers,
-                        external_bands,
-                        refresh,
-                        cancel,
-                    },
-                    move |res| {
-                        let mapped = res
-                            .map(|(range_source, source, frame)| OpenedBandAsset {
-                                label: label.clone(),
-                                origin: OpenedBandAssetOrigin::Remote { meta, range_source },
-                                source,
-                                frame,
-                                band_index,
-                            })
-                            .map_err(|err| format!("{label}: {err}"));
-                        lock_unpoisoned(&col).on_slot_done(slot, mapped);
-                    },
-                );
-            }
-        }
+        self.spawn_validated_band_asset(
+            runtime,
+            workspace_epoch,
+            asset,
+            net,
+            cancel,
+            move |mapped| {
+                lock_unpoisoned(&col).on_slot_done(slot, mapped);
+            },
+        );
     }
 
     /// Queue a non-blocking open for one epoch inside a `LayerKind::Timeline`

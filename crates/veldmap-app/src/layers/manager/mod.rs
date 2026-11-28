@@ -95,11 +95,13 @@ pub(crate) enum BandMathEdit {
 pub(crate) enum TimelineEdit {
     SetActiveEpoch(usize),
     StepEpoch(i32),
+    RetryEpoch(usize),
     SetCloudFilter(Option<f32>),
     SetCompareMode(TimelineCompareMode),
     SetBlendT(f32),
     SetDiffStretchRange { min: f64, max: f64 },
     SetDiffColormap { colormap: ColormapId, invert: bool },
+    SingleRaster(SingleRasterEdit),
     BandMath(BandMathEdit),
 }
 
@@ -428,52 +430,68 @@ impl OverlayManager {
             OverlayEdit::SetOpacity(opacity) => {
                 self.mutate_layer(id, |layer| layer.set_opacity(opacity))
             }
-            OverlayEdit::SingleRaster(single_edit) => match single_edit {
-                SingleRasterEdit::StretchPreset(preset) => {
-                    self.mutate_layer(id, |layer| layer.set_stretch_preset(preset))
-                }
-                SingleRasterEdit::StretchRange { min, max } => {
-                    self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
-                }
-                SingleRasterEdit::Colormap { colormap, invert } => {
-                    self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
-                }
-                SingleRasterEdit::CategoricalPalette(palette) => {
-                    self.mutate_layer(id, |layer| layer.set_categorical_palette(palette))
-                }
-            },
-            OverlayEdit::BandMath(bm_edit) => match bm_edit {
-                BandMathEdit::SetStretchRange { min, max } => {
-                    self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
-                }
-                BandMathEdit::SetColormap { colormap, invert } => {
-                    self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
-                }
-                BandMathEdit::SetRgbStretch { min, max, gamma } => {
-                    self.mutate_layer(id, |layer| layer.set_band_math_rgb_stretch(min, max, gamma))
-                }
-                BandMathEdit::ResetStretch => {
-                    self.mutate_layer(id, OverlayLayer::reset_band_math_stretch)
-                }
-                BandMathEdit::SetSclEnabled(enabled) => {
-                    let (changed, disabled_scl_streams) =
-                        self.stack.get_mut(id).map_or((false, Vec::new()), |layer| {
-                            layer.set_band_math_scl_enabled(enabled)
-                        });
-                    for sk in disabled_scl_streams {
-                        self.cancel_stream_if_unused(sk);
-                    }
-                    OverlayMutation {
-                        changed,
-                        topology_changed: changed,
-                        purge_sources: Vec::new(),
-                    }
-                }
-                BandMathEdit::SetSclMaskBits(bits) => {
-                    self.mutate_layer(id, |layer| layer.set_band_math_scl_mask_bits(bits))
-                }
-            },
+            OverlayEdit::SingleRaster(sr_edit) => self.edit_single_raster_layer(id, sr_edit),
+            OverlayEdit::BandMath(bm_edit) => self.edit_band_math_layer(id, bm_edit),
             OverlayEdit::Timeline(tl_edit) => self.edit_timeline_layer(id, tl_edit),
+        }
+    }
+
+    pub(super) fn edit_single_raster_layer(
+        &mut self,
+        id: LayerId,
+        sr_edit: SingleRasterEdit,
+    ) -> OverlayMutation {
+        match sr_edit {
+            SingleRasterEdit::StretchPreset(preset) => {
+                self.mutate_layer(id, |layer| layer.set_stretch_preset(preset))
+            }
+            SingleRasterEdit::StretchRange { min, max } => {
+                self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
+            }
+            SingleRasterEdit::Colormap { colormap, invert } => {
+                self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
+            }
+            SingleRasterEdit::CategoricalPalette(palette) => {
+                self.mutate_layer(id, |layer| layer.set_categorical_palette(palette))
+            }
+        }
+    }
+
+    pub(super) fn edit_band_math_layer(
+        &mut self,
+        id: LayerId,
+        bm_edit: BandMathEdit,
+    ) -> OverlayMutation {
+        match bm_edit {
+            BandMathEdit::SetStretchRange { min, max } => {
+                self.mutate_layer(id, |layer| layer.set_stretch_range(min, max))
+            }
+            BandMathEdit::SetColormap { colormap, invert } => {
+                self.mutate_layer(id, |layer| layer.set_colormap(colormap, invert))
+            }
+            BandMathEdit::SetRgbStretch { min, max, gamma } => {
+                self.mutate_layer(id, |layer| layer.set_band_math_rgb_stretch(min, max, gamma))
+            }
+            BandMathEdit::ResetStretch => {
+                self.mutate_layer(id, OverlayLayer::reset_band_math_stretch)
+            }
+            BandMathEdit::SetSclEnabled(enabled) => {
+                let (changed, disabled_scl_streams) =
+                    self.stack.get_mut(id).map_or((false, Vec::new()), |layer| {
+                        layer.set_band_math_scl_enabled(enabled)
+                    });
+                for sk in disabled_scl_streams {
+                    self.cancel_stream_if_unused(sk);
+                }
+                OverlayMutation {
+                    changed,
+                    topology_changed: changed,
+                    purge_sources: Vec::new(),
+                }
+            }
+            BandMathEdit::SetSclMaskBits(bits) => {
+                self.mutate_layer(id, |layer| layer.set_band_math_scl_mask_bits(bits))
+            }
         }
     }
 
@@ -489,7 +507,7 @@ impl OverlayManager {
             return Err("layer no longer exists".to_owned());
         };
         let Some(asset) = layer.single_asset() else {
-            return Err("band-math layers do not support per-layer CRS overrides".to_owned());
+            return Err("only single-raster layers support per-layer CRS overrides".to_owned());
         };
         let frame = bind_frame_with_override(asset.source().description(), crs_override.as_ref())?;
         let relaid = alloc_seq(&mut self.next_relaid);
@@ -554,11 +572,17 @@ impl OverlayManager {
             if !layer.set_visible(visible) {
                 return OverlayMutation::default();
             }
+            if !visible {
+                layer.cancel_timeline_loading();
+            }
             (layer.all_source_ids(), layer.all_stream_keys())
         };
         if !visible {
             let mut unused_gpu_purge = Vec::new();
             self.release_sources_and_streams(&sources, &stream_keys, None, &mut unused_gpu_purge);
+        } else {
+            self.sync_timeline_epochs(id);
+            self.request_band_stats_if_needed(id);
         }
         OverlayMutation {
             changed: true,
@@ -578,7 +602,7 @@ impl OverlayManager {
             };
             let Some(asset) = layer.single_asset() else {
                 return Err(
-                    "band-math layers do not support switching single-band streams".to_owned(),
+                    "only single-raster layers support switching single-band streams".to_owned(),
                 );
             };
             let prev_stream = asset.meta().stream_key();

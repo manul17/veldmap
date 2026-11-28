@@ -457,7 +457,14 @@ impl StacSettings {
         if self.profiles.len() >= MAX_STAC_PROFILES {
             return false;
         }
-        let next_num = self.profiles.len() + 1;
+        let mut next_num = 1usize;
+        while self
+            .profiles
+            .iter()
+            .any(|p| p.name.trim() == format!("Custom STAC {next_num}"))
+        {
+            next_num += 1;
+        }
         self.profiles.push(StacProfile {
             name: format!("Custom STAC {next_num}"),
             ..StacProfile::default()

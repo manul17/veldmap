@@ -420,18 +420,19 @@ fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
     assert!(layer.set_active_stream(b0_spec).expect("switch b0"));
     assert_eq!(layer.needs_band_stats(), Some(BandKey::Index(0)));
 
+    let source_id = layer.single_asset().expect("single asset").source_id();
     let tok1 = CancelToken::new();
     layer.begin_stats_job(1, tok1.clone());
     assert!(layer.style().scientific().is_loading());
     // Stale job_id cannot clobber active job 1.
-    assert!(!layer.apply_band_stats_empty(BandKey::Index(0), 99));
+    assert!(!layer.apply_band_stats_empty(source_id, BandKey::Index(0), 99));
     assert!(layer.style().scientific().is_loading());
     // Cancelled job resets back to NotRequested (never poisons Empty).
-    assert!(layer.apply_band_stats_cancelled(BandKey::Index(0), 1));
+    assert!(layer.apply_band_stats_cancelled(source_id, BandKey::Index(0), 1));
     assert_eq!(layer.needs_band_stats(), Some(BandKey::Index(0)));
 
     layer.begin_stats_job(2, CancelToken::new());
-    assert!(layer.apply_band_stats_ready(BandKey::Index(0), sample_stats(0.0, 100.0)));
+    assert!(layer.apply_band_stats_ready(source_id, BandKey::Index(0), sample_stats(0.0, 100.0)));
     assert_eq!(
         (
             layer.style().scientific().min,
@@ -471,7 +472,11 @@ fn scientific_band_switch_stats_generation_and_saved_style_transitions() {
         StretchPreset::Percentile2_98
     );
     assert_eq!(layer.needs_band_stats(), Some(BandKey::Index(1)));
-    assert!(layer.apply_band_stats_ready(BandKey::Index(1), sample_stats(500.0, 1000.0)));
+    assert!(layer.apply_band_stats_ready(
+        source_id,
+        BandKey::Index(1),
+        sample_stats(500.0, 1000.0)
+    ));
     assert_eq!(
         (
             layer.style().scientific().min,

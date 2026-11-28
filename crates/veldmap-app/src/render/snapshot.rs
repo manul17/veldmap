@@ -232,25 +232,35 @@ pub(super) fn can_bands_use_mrt(bands: &[DrawScratchBand]) -> bool {
 }
 
 impl DrawBandMathLayer {
+    /// Active input bands consumed by `self.formula`.
+    pub(super) fn active_bands(&self) -> &[DrawScratchBand] {
+        let n = self.formula.required_bands().min(self.bands.len());
+        &self.bands[..n]
+    }
+
     /// Return whether all active float bands share one geodetic grid, image
     /// dimensions, subdivision density, `R32Float` tile format, and identical
     /// patch `cell_rect` list so they can be rasterized in a single MRT render
     /// pass (`2..=4` `R32Float` attachments, fitting `downlevel_defaults()`
     /// `max_color_attachments = 4`).
     pub fn can_use_mrt(&self) -> bool {
-        can_bands_use_mrt(&self.bands)
+        self.bands.len() >= self.formula.required_bands() && can_bands_use_mrt(self.active_bands())
     }
 
     /// Iterate over active warp-mesh patch sets needed for this layer (band 0
-    /// only when `mrt` is `true`, otherwise all float bands, followed by the
-    /// `SCL` mask when enabled).
+    /// only when `mrt` is `true`, otherwise all active float bands, followed by
+    /// the `SCL` mask when enabled).
     pub(super) fn active_warp_patch_sets(
         &self,
         mrt: bool,
     ) -> impl Iterator<Item = WarpPatchSetRef<'_>> {
-        let band_limit = if mrt { 1 } else { self.bands.len() };
-        let bands = self
-            .bands
+        let active = self.active_bands();
+        let band_limit = if mrt {
+            1.min(active.len())
+        } else {
+            active.len()
+        };
+        let bands = active
             .iter()
             .take(band_limit)
             .map(DrawScratchBand::warp_patch_set);
@@ -272,18 +282,23 @@ pub struct DrawBandEpoch {
 }
 
 impl DrawBandEpoch {
-    pub fn can_use_mrt(&self) -> bool {
-        can_bands_use_mrt(&self.bands)
+    pub fn can_use_mrt_for(&self, band_count: usize) -> bool {
+        self.bands.len() >= band_count && can_bands_use_mrt(&self.bands[..band_count])
     }
 
-    pub(super) fn active_warp_patch_sets(
+    pub(super) fn active_warp_patch_sets_for(
         &self,
+        band_count: usize,
         mrt: bool,
         scl_mask_enabled: bool,
     ) -> impl Iterator<Item = WarpPatchSetRef<'_>> {
-        let band_limit = if mrt { 1 } else { self.bands.len() };
-        let bands = self
-            .bands
+        let active = &self.bands[..band_count.min(self.bands.len())];
+        let band_limit = if mrt {
+            1.min(active.len())
+        } else {
+            active.len()
+        };
+        let bands = active
             .iter()
             .take(band_limit)
             .map(DrawScratchBand::warp_patch_set);
@@ -338,10 +353,14 @@ pub struct DrawTemporalDiffLayer {
 }
 
 impl DrawTemporalDiffLayer {
+    pub(super) fn is_valid_scalar(&self) -> bool {
+        self.formula.is_none_or(BandMathFormula::is_scalar)
+    }
+
     pub(super) fn required_input_bands(&self) -> usize {
         self.formula
             .map_or(1, BandMathFormula::required_bands)
-            .clamp(1, 3)
+            .clamp(1, 2)
     }
 
     pub(super) fn shader_mode(&self) -> u32 {
@@ -437,7 +456,11 @@ impl DrawOverlayLayer {
         match &self.content {
             DrawOverlayContent::Direct { .. } => ScratchDemand::NONE,
             DrawOverlayContent::BandMath(bm) => {
-                let float_bands = bm.bands.len().min(4);
+                let req = bm.formula.required_bands();
+                if bm.bands.len() < req {
+                    return ScratchDemand::NONE;
+                }
+                let float_bands = req.min(4);
                 let needs_u8_mask = bm
                     .scl
                     .as_ref()
@@ -449,7 +472,13 @@ impl DrawOverlayLayer {
                 }
             }
             DrawOverlayContent::TemporalDiff(diff) => {
+                if !diff.is_valid_scalar() {
+                    return ScratchDemand::NONE;
+                }
                 let n = diff.required_input_bands();
+                if diff.epoch_a.bands.len() < n || diff.epoch_b.bands.len() < n {
+                    return ScratchDemand::NONE;
+                }
                 let needs_u8_mask = diff.scl_mask_enabled
                     && (diff
                         .epoch_a
@@ -474,6 +503,9 @@ impl DrawOverlayLayer {
                     epoch_b,
                     ..
                 } => {
+                    if epoch_a.bands.len() < 3 && epoch_b.bands.len() < 3 {
+                        return ScratchDemand::NONE;
+                    }
                     let needs_u8_mask = *scl_mask_enabled
                         && (epoch_a.scl.as_ref().is_some_and(|m| !m.patches.is_empty())
                             || epoch_b.scl.as_ref().is_some_and(|m| !m.patches.is_empty()));
@@ -483,11 +515,16 @@ impl DrawOverlayLayer {
                         rgba_targets: 1,
                     }
                 }
-                DrawTemporalCrossFadeSource::DirectDisplay { .. } => ScratchDemand {
-                    float_bands: 0,
-                    needs_u8_mask: false,
-                    rgba_targets: 2,
-                },
+                DrawTemporalCrossFadeSource::DirectDisplay { epoch_a, epoch_b } => {
+                    if epoch_a.patches.is_empty() && epoch_b.patches.is_empty() {
+                        return ScratchDemand::NONE;
+                    }
+                    ScratchDemand {
+                        float_bands: 0,
+                        needs_u8_mask: false,
+                        rgba_targets: 2,
+                    }
+                }
             },
         }
     }
@@ -559,9 +596,12 @@ impl DrawSnapshot {
     /// to screen center under the nadir camera).
     pub(crate) fn visible_tex_priorities(&self) -> impl Iterator<Item = (QuadTileId, f64)> + '_ {
         let eye = self.camera.eye_ecef();
-        self.tiles
-            .iter()
-            .map(move |t| (t.visible.tex_id, t.visible.origin_ecef_m.distance_squared(eye)))
+        self.tiles.iter().map(move |t| {
+            (
+                t.visible.tex_id,
+                t.visible.origin_ecef_m.distance_squared(eye),
+            )
+        })
     }
 
     /// Build a draw snapshot and its referenced GPU carrier tile keys from

@@ -15,11 +15,15 @@ use veldmap_raster::{POLAR_RIM_BINS, PolarRimPyramid, extract_srgb_rim_row};
 /// bursts of high-zoom rim tiles stream in.
 const RIM_REBUILD_DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// Maximum `level_tag` recorded per rim bin (`z = 11` -> `cols = 2048 ==
-/// POLAR_RIM_BINS`). Higher zoom tiles (`z >= 12`) can still populate empty or
-/// coarser bins whose center lies inside the tile, but never overwrite a full
-/// `z = 11` bin with a sub-bin fragment.
-const MAX_RIM_LEVEL_TAG: u8 = 12;
+/// `level_tag` assigned to sub-bin tiles (`z >= 12`, where `cols > POLAR_RIM_BINS`).
+/// Sub-bin tiles can populate empty or coarser (`z <= 10`) bins whose center
+/// falls inside the tile, but never overwrite a full `z = 11` bin or ping-pong
+/// against an already populated sub-bin tile.
+const SUB_BIN_LEVEL_TAG: u8 = 12;
+
+/// `level_tag` assigned to `z = 11` (`cols == 2048 == POLAR_RIM_BINS`), where
+/// each tile covers exactly one full rim bin cleanly.
+const FULL_BIN_Z11_TAG: u8 = 13;
 
 /// Minimum linear-light RGB difference required to mark an equal-level rim bin
 /// update dirty (suppressing redundant rebuilds when LRU-evicted tiles re-decode
@@ -76,7 +80,14 @@ impl PolarRimSide {
         if row.is_empty() || cols == 0 {
             return false;
         }
-        let level_tag = id.level.saturating_add(1).min(MAX_RIM_LEVEL_TAG);
+        let is_sub_bin = id.level > 11;
+        let level_tag = if is_sub_bin {
+            SUB_BIN_LEVEL_TAG
+        } else if id.level == 11 {
+            FULL_BIN_Z11_TAG
+        } else {
+            id.level + 1
+        };
         let bins_f = POLAR_RIM_BINS as f64;
         let cols_f = f64::from(cols);
         let start_f = (f64::from(id.x) / cols_f) * bins_f;
@@ -97,7 +108,14 @@ impl PolarRimSide {
                 continue;
             }
             let (prev_rgb, prev_tag) = self.bins[bin];
-            if level_tag < prev_tag {
+            if is_sub_bin {
+                // Sub-bin fragments (`z >= 12`) only fill empty or coarser
+                // (`z <= 10`) bins; never overwrite full `z = 11` bins or
+                // ping-pong against sibling sub-bin tiles.
+                if prev_tag >= SUB_BIN_LEVEL_TAG {
+                    continue;
+                }
+            } else if level_tag < prev_tag {
                 continue;
             }
 
@@ -282,5 +300,138 @@ impl PolarRimTracker {
             .as_ref()
             .filter(|(rev, _)| *rev == expected_rev)
             .map(|(_, pyr)| Arc::clone(pyr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_solid_tile(rgba: [u8; 4]) -> DecodedTile {
+        let px = 4u32;
+        let mut bytes = Vec::with_capacity((px * px * 4) as usize);
+        for _ in 0..(px * px) {
+            bytes.extend_from_slice(&rgba);
+        }
+        DecodedTile::try_new(
+            px,
+            px,
+            veldmap_core::tile::PixelFormat::Rgba8UnormSrgb,
+            bytes,
+        )
+        .expect("solid tile")
+    }
+
+    #[test]
+    fn z12_sub_bin_fills_coarse_but_never_overwrites_z11_or_ping_pongs() {
+        let mut side = PolarRimSide::default();
+        let row_z10 = vec![Some([0.1, 0.2, 0.3]); 4];
+        let row_z12_a = vec![Some([0.9, 0.1, 0.1]); 4];
+        let row_z12_b = vec![Some([0.1, 0.9, 0.1]); 4];
+        let row_z11 = vec![Some([0.2, 0.4, 0.8]); 4];
+
+        // z=10 (cols=1024) populates bins 0 and 1.
+        assert!(side.ingest_row(
+            QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 10,
+                x: 0,
+                y: 0,
+            },
+            1024,
+            &row_z10
+        ));
+        assert_eq!(side.bins[0].1, 11);
+
+        // z=12 (cols=4096) right half of bin 0 (x=1 covers [0.5, 1.0)) contains
+        // bin_center = 0.5 and upgrades bin 0 from z=10 to SUB_BIN_LEVEL_TAG.
+        assert!(side.ingest_row(
+            QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 12,
+                x: 1,
+                y: 0,
+            },
+            4096,
+            &row_z12_a
+        ));
+        assert_eq!(side.bins[0].1, SUB_BIN_LEVEL_TAG);
+
+        // Another z=12 tile must NOT ping-pong overwrite an already populated sub-bin.
+        assert!(!side.ingest_row(
+            QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 12,
+                x: 1,
+                y: 0,
+            },
+            4096,
+            &row_z12_b
+        ));
+
+        // z=11 (cols=2048, exact 1:1 full bin) upgrades bin 0 to FULL_BIN_Z11_TAG.
+        assert!(side.ingest_row(
+            QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 11,
+                x: 0,
+                y: 0,
+            },
+            2048,
+            &row_z11
+        ));
+        assert_eq!(side.bins[0].1, FULL_BIN_Z11_TAG);
+        assert!((side.bins[0].0[2] - 0.8).abs() < 1e-5);
+
+        // z=12 sub-bin MUST NOT overwrite the full z=11 bin!
+        assert!(!side.ingest_row(
+            QuadTileId {
+                scheme: PlanetaryScheme::WebMercator,
+                level: 12,
+                x: 1,
+                y: 0,
+            },
+            4096,
+            &row_z12_a
+        ));
+        assert_eq!(side.bins[0].1, FULL_BIN_Z11_TAG);
+        assert!((side.bins[0].0[2] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn tracker_debounces_updates_and_ignores_inactive_source() {
+        let tracker = PolarRimTracker::new();
+        let src_a = SourceId::new(101);
+        let src_b = SourceId::new(102);
+        tracker.reset_for_source(Some(src_a));
+
+        let z0 = QuadTileId {
+            scheme: PlanetaryScheme::WebMercator,
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        let tile = make_solid_tile([64, 128, 192, 255]);
+        assert!(!tracker.ingest_live_tile(src_b, z0, &tile));
+        assert!(tracker.ingest_live_tile(src_a, z0, &tile));
+
+        let t0 = Instant::now();
+        let rev1 = tracker.poll_revision(true, t0);
+        assert!(rev1 > 0);
+        assert!(tracker.pyramid_for_revision(true, rev1).is_some());
+        // z=0 touches both North and South poles.
+        assert!(tracker.poll_revision(false, t0) > 0);
+
+        // Second distinct update is debounced until RIM_REBUILD_DEBOUNCE elapses.
+        let tile2 = make_solid_tile([200, 50, 20, 255]);
+        assert!(tracker.ingest_live_tile(src_a, z0, &tile2));
+        assert_eq!(
+            tracker.poll_revision(true, t0 + Duration::from_millis(50)),
+            rev1
+        );
+        let rev2 = tracker.poll_revision(true, t0 + RIM_REBUILD_DEBOUNCE);
+        assert!(rev2 > rev1);
+        assert!(tracker.pyramid_for_revision(true, rev1).is_none());
+        assert!(tracker.pyramid_for_revision(true, rev2).is_some());
     }
 }

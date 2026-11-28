@@ -297,7 +297,6 @@ pub(super) fn build_stac_timeline_request(
         diff_stretch_min: None,
         diff_stretch_max: None,
         fly_to: true,
-        restore_id: None,
     })
 }
 

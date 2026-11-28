@@ -43,17 +43,6 @@ struct PaletteUniform {
 @group(3) @binding(0) var rgba0_tex: texture_2d<f32>;
 @group(3) @binding(1) var rgba1_tex: texture_2d<f32>;
 
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
-    let x = f32(i32(vid & 1u) * 4 - 1);
-    let y = f32(i32(vid >> 1u) * 4 - 1);
-    return vec4<f32>(x, y, 0.0, 1.0);
-}
-
-fn is_finite_f32(v: f32) -> bool {
-    return (bitcast<u32>(v) & 0x7F800000u) != 0x7F800000u;
-}
-
 fn srgb_to_linear_channel(c: f32) -> f32 {
     let s = clamp(c, 0.0, 1.0);
     return select(s / 12.92, pow((s + 0.055) / 1.055, 2.4), s > 0.04045);
@@ -109,8 +98,8 @@ fn load_rgba_safe(tex: texture_2d<f32>, px: vec2<i32>) -> vec4<f32> {
 }
 
 /// Premultiplied-safe cross-fade between two straight-alpha linear colors:
-/// - Both opaque (`a0 = 1, a1 = 1`): `mix(rgb0, rgb1, t)` with `alpha = opacity`
-///   (0% basemap bleed-through).
+/// - Both opaque (`a0 = 1, a1 = 1`): `mix(rgb0, rgb1, t)` with `alpha = 1.0`
+///   (caller multiplies outer `opacity`, yielding 0% basemap bleed-through).
 /// - Single-valid pixel: graceful fade without darkening or double-premultiplication.
 fn cross_fade_straight(c0: vec4<f32>, c1: vec4<f32>, blend_t: f32) -> vec4<f32> {
     let t = clamp(blend_t, 0.0, 1.0);
@@ -192,20 +181,11 @@ fn fs_composite(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32
         if !is_finite_f32(b) {
             discard;
         }
-        if params.mode == 0u {
-            let denom = a + b;
-            if abs(denom) < 1e-6 {
-                discard;
-            }
-            val = (a - b) / denom;
-        } else if params.mode == 1u {
-            val = a - b;
-        } else {
-            if abs(b) < 1e-6 {
-                discard;
-            }
-            val = a / b;
+        let res = eval_scalar_formula(params.mode, a, b);
+        if !res.valid {
+            discard;
         }
+        val = res.value;
     }
 
     // Optional dual-epoch scalar diff: `formula(B, mask_B) - reduced_A`.

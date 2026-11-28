@@ -228,7 +228,7 @@ fn push_band_epoch_uniforms(
     scl_mask_enabled: bool,
     use_mrt: bool,
 ) -> PreparedBandEpoch {
-    let (mrt_patch_offsets, per_band_offsets) = if use_mrt {
+    let (mrt_patch_offsets, per_band_offsets) = if use_mrt && bands.len() >= 2 {
         (
             Some(push_mrt_uniforms(meshes, arena, eye, bands)),
             Vec::new(),
@@ -333,7 +333,7 @@ pub(super) fn push_band_math_uniforms(
     opacity: f32,
     swipe: Option<ResolvedSwipe>,
 ) -> PreparedBandMath {
-    let has_required_bands = bm.bands.len() >= bm.formula.required_bands();
+    let has_required_bands = opacity > 0.001 && bm.bands.len() >= bm.formula.required_bands();
     let projected_scissor = has_required_bands
         .then(|| compute_band_math_scissor_rect(&ctx.snapshot.camera, ctx.width, ctx.height, bm))
         .flatten();
@@ -351,7 +351,7 @@ pub(super) fn push_band_math_uniforms(
         ctx.meshes,
         arena,
         ctx.eye,
-        &bm.bands,
+        bm.active_bands(),
         bm.scl.as_ref(),
         bm.scl_mask_enabled,
         use_mrt,
@@ -392,15 +392,18 @@ pub(super) fn push_temporal_diff_uniforms(
     swipe: Option<ResolvedSwipe>,
 ) -> PreparedTemporalDiff {
     let n = diff.required_input_bands();
-    let ready = diff.epoch_a.bands.len() >= n && diff.epoch_b.bands.len() >= n;
+    let ready = opacity > 0.001
+        && diff.is_valid_scalar()
+        && diff.epoch_a.bands.len() >= n
+        && diff.epoch_b.bands.len() >= n;
     let projected = ready
         .then(|| {
             let sets = diff
                 .epoch_a
-                .active_warp_patch_sets(false, diff.scl_mask_enabled)
+                .active_warp_patch_sets_for(n, false, diff.scl_mask_enabled)
                 .chain(
                     diff.epoch_b
-                        .active_warp_patch_sets(false, diff.scl_mask_enabled),
+                        .active_warp_patch_sets_for(n, false, diff.scl_mask_enabled),
                 );
             compute_patch_sets_scissor_rect(&ctx.snapshot.camera, ctx.width, ctx.height, sets)
         })
@@ -474,44 +477,48 @@ pub(super) fn push_temporal_cross_fade_uniforms(
     opacity: f32,
     swipe: Option<ResolvedSwipe>,
 ) -> PreparedTemporalCrossFade {
-    let projected = match &cf.source {
-        DrawTemporalCrossFadeSource::BandMathRgb {
-            scl_mask_enabled,
-            epoch_a,
-            epoch_b,
-            ..
-        } => {
-            let a_ready = epoch_a.bands.len() >= 3;
-            let b_ready = epoch_b.bands.len() >= 3;
-            if !a_ready && !b_ready {
-                None
-            } else {
-                let sets_a = a_ready
-                    .then(|| epoch_a.active_warp_patch_sets(false, *scl_mask_enabled))
-                    .into_iter()
-                    .flatten();
-                let sets_b = b_ready
-                    .then(|| epoch_b.active_warp_patch_sets(false, *scl_mask_enabled))
-                    .into_iter()
-                    .flatten();
-                compute_patch_sets_scissor_rect(
-                    &ctx.snapshot.camera,
-                    ctx.width,
-                    ctx.height,
-                    sets_a.chain(sets_b),
-                )
+    let projected = if opacity <= 0.001 {
+        None
+    } else {
+        match &cf.source {
+            DrawTemporalCrossFadeSource::BandMathRgb {
+                scl_mask_enabled,
+                epoch_a,
+                epoch_b,
+                ..
+            } => {
+                let a_ready = epoch_a.bands.len() >= 3;
+                let b_ready = epoch_b.bands.len() >= 3;
+                if !a_ready && !b_ready {
+                    None
+                } else {
+                    let sets_a = a_ready
+                        .then(|| epoch_a.active_warp_patch_sets_for(3, false, *scl_mask_enabled))
+                        .into_iter()
+                        .flatten();
+                    let sets_b = b_ready
+                        .then(|| epoch_b.active_warp_patch_sets_for(3, false, *scl_mask_enabled))
+                        .into_iter()
+                        .flatten();
+                    compute_patch_sets_scissor_rect(
+                        &ctx.snapshot.camera,
+                        ctx.width,
+                        ctx.height,
+                        sets_a.chain(sets_b),
+                    )
+                }
             }
-        }
-        DrawTemporalCrossFadeSource::DirectDisplay { epoch_a, epoch_b } => {
-            if epoch_a.patches.is_empty() && epoch_b.patches.is_empty() {
-                None
-            } else {
-                compute_patch_sets_scissor_rect(
-                    &ctx.snapshot.camera,
-                    ctx.width,
-                    ctx.height,
-                    [epoch_a.warp_patch_set(), epoch_b.warp_patch_set()],
-                )
+            DrawTemporalCrossFadeSource::DirectDisplay { epoch_a, epoch_b } => {
+                if epoch_a.patches.is_empty() && epoch_b.patches.is_empty() {
+                    None
+                } else {
+                    compute_patch_sets_scissor_rect(
+                        &ctx.snapshot.camera,
+                        ctx.width,
+                        ctx.height,
+                        [epoch_a.warp_patch_set(), epoch_b.warp_patch_set()],
+                    )
+                }
             }
         }
     };
@@ -855,14 +862,14 @@ pub(super) fn record_scratch_passes<'a>(
         meshes,
         encoder,
         scissor,
-        &bm.bands,
+        bm.active_bands(),
         bm.scl.as_ref(),
         &prepared.epoch,
         ctx,
     )
 }
 
-/// Record the 2-step dual-epoch scalar diff scratch pipeline:
+/// Record the 3-step dual-epoch scalar diff scratch pipeline:
 /// 1. Rasterize Epoch A (`b0..bN` -> `scratch[0..N]`, `SCL_A` -> `mask`).
 /// 2. Reduce Epoch A via the non-overlapping read-only `reduce_bind_group(N)`
 ///    into `scratch[N]` (baking masked/uncovered pixels to quiet-NaN).
@@ -878,6 +885,9 @@ pub(super) fn record_temporal_diff_scratch_passes<'a>(
     let (Some(scissor), Some(reduce_offset)) = (prepared.scissor, prepared.reduce_offset) else {
         return false;
     };
+    if !diff.is_valid_scalar() {
+        return false;
+    }
     let n = diff.required_input_bands();
     let float_views = ctx.scratch.float_views();
     if diff.epoch_a.bands.len() < n || diff.epoch_b.bands.len() < n || float_views.len() <= n {
@@ -976,11 +986,11 @@ pub(super) fn record_temporal_cross_fade_scratch_passes<'a>(
                 return false;
             };
 
-            // 1. Rasterize Epoch A (or clear to quiet-NaN if not yet loaded) and
-            //    bake stretched RGB + mask into `rgba_scratch[0]` (`blend: None`).
-            let has_a = epoch_a.bands.len() >= 3;
-            if has_a {
-                let _ = record_band_epoch_scratch(
+            // 1. Rasterize Epoch A and bake stretched RGB + mask into
+            //    `rgba_scratch[0]` (`blend: None`), or leave `rgba_scratch[0]`
+            //    transparent if Epoch A is not yet loaded.
+            let baked_a = epoch_a.bands.len() >= 3
+                && record_band_epoch_scratch(
                     meshes,
                     encoder,
                     scissor,
@@ -989,7 +999,6 @@ pub(super) fn record_temporal_cross_fade_scratch_passes<'a>(
                     prep_a,
                     ctx,
                 );
-            }
             {
                 let attachments = [color_clear_attachment(
                     &rgba_views[0],
@@ -1000,7 +1009,7 @@ pub(super) fn record_temporal_cross_fade_scratch_passes<'a>(
                     "temporal-crossfade BandMath RGB Epoch A bake",
                     &attachments,
                 );
-                if has_a {
+                if baked_a {
                     pass.set_scissor_rect(sx, sy, sw, sh);
                     pass.set_pipeline(&ctx.pipelines.composite_rgba_bake);
                     pass.set_bind_group(0, scratch_bg, &[]);
@@ -1017,8 +1026,8 @@ pub(super) fn record_temporal_cross_fade_scratch_passes<'a>(
             }
 
             // 2. Rasterize Epoch B into `scratch[0..3]` + `mask` (or quiet-NaN clear).
-            if epoch_b.bands.len() >= 3 {
-                record_band_epoch_scratch(
+            let wrote_b = epoch_b.bands.len() >= 3
+                && record_band_epoch_scratch(
                     meshes,
                     encoder,
                     scissor,
@@ -1027,7 +1036,7 @@ pub(super) fn record_temporal_cross_fade_scratch_passes<'a>(
                     prep_b,
                     ctx,
                 );
-            } else {
+            if !wrote_b {
                 clear_float_scratch_to_nan(encoder, scissor, 3, ctx);
             }
             true

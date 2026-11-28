@@ -1,8 +1,8 @@
 //! Non-blocking zoom-invariant CPU cursor pixel readout (`CursorProber`)
 //! supporting Display RGBA8, Scientific raw+physical `f64` values with units,
-//! Categorical discrete class IDs (with ESA Sentinel-2 `SCL` class names), and
-//! multi-asset `BandMath` readouts (computed index + constituent physical band
-//! values + optional `SCL` class & mask status).
+//! Categorical discrete class IDs (with ESA Sentinel-2 `SCL` class names),
+//! multi-asset `BandMath` readouts, and dual-epoch `Timeline` scalar diff
+//! (`Δ = B - A`) readouts.
 
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +23,18 @@ use super::layer::{LayerKind, OverlayLayer};
 use super::runtime::OverlayRuntime;
 use super::stack::LayerStack;
 use super::style::LayerStyle;
-use super::timeline::{TimelineCompareMode, TimelineEpochContent, TimelineLayerData};
+use super::timeline::{
+    TimelineCompareMode, TimelineEpoch, TimelineEpochContent, TimelineLayerData,
+};
+
+/// Per-epoch scalar sample state inside [`TemporalDiffReadout`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DiffEpochSample {
+    Value(f64),
+    Masked,
+    Nodata,
+    Unavailable,
+}
 
 /// Zoom-invariant dual-epoch scalar difference readout (`Δ = B - A`) for a
 /// `Timeline` layer in `ScalarDiff` comparison mode.
@@ -32,11 +43,9 @@ pub(crate) struct TemporalDiffReadout {
     pub(crate) formula_label: String,
     pub(crate) label_a: String,
     pub(crate) label_b: String,
-    pub(crate) value_a: Option<f64>,
-    pub(crate) value_b: Option<f64>,
+    pub(crate) sample_a: DiffEpochSample,
+    pub(crate) sample_b: DiffEpochSample,
     pub(crate) delta: Option<f64>,
-    pub(crate) masked_a: bool,
-    pub(crate) masked_b: bool,
     pub(crate) has_unavailable: bool,
 }
 
@@ -209,13 +218,30 @@ fn asset_pixel_at(asset: &RasterAsset, lat_deg: f64, lon_deg: f64) -> Option<(u3
     Some((px, py))
 }
 
-fn timeline_probe_content(tl: &TimelineLayerData) -> Option<&TimelineEpochContent> {
+fn content_is_remote(content: &TimelineEpochContent) -> bool {
+    let mut remote = false;
+    content.for_each_asset(|a| remote |= a.is_remote());
+    remote
+}
+
+fn timeline_probe_epoch(tl: &TimelineLayerData) -> Option<(&TimelineEpoch, &TimelineEpochContent)> {
+    let pick = |idx: usize| {
+        tl.epochs
+            .get(idx)
+            .and_then(|e| e.ready_content().map(|c| (e, c)))
+    };
     match tl.compare {
-        TimelineCompareMode::CrossFade { blend_t, .. } if blend_t < 0.5 => {
-            tl.ref_ready_content().or_else(|| tl.active_ready_content())
+        TimelineCompareMode::CrossFade {
+            ref_idx, blend_t, ..
+        } if blend_t < 0.5 && ref_idx != tl.active_idx => {
+            pick(ref_idx).or_else(|| pick(tl.active_idx))
         }
-        _ => tl.active_ready_content(),
+        _ => pick(tl.active_idx),
     }
+}
+
+fn timeline_probe_content(tl: &TimelineLayerData) -> Option<&TimelineEpochContent> {
+    timeline_probe_epoch(tl).map(|(_, c)| c)
 }
 
 fn layer_pixel_at(layer: &OverlayLayer, lat_deg: f64, lon_deg: f64) -> Option<(u32, u32)> {
@@ -292,12 +318,14 @@ fn build_readout(
             value,
         },
         LayerKind::Timeline(tl) => {
-            let date_tag = tl
-                .active_epoch()
-                .map(|e| format!(" [{}]", e.date_label))
-                .unwrap_or_default();
-            let display_name = format!("{}{date_tag}", layer.name());
             if tl.is_scalar_diff_ready() {
+                let date_tag = tl
+                    .active_epoch()
+                    .map(|e| format!(" [{}]", e.date_label))
+                    .unwrap_or_default();
+                let display_name = format!("{}{date_tag}", layer.name());
+                let diff_is_remote = tl.ref_ready_content().is_some_and(content_is_remote)
+                    || tl.active_ready_content().is_some_and(content_is_remote);
                 let units = tl.active_ready_content().and_then(|c| match c {
                     TimelineEpochContent::BandMath(bm) => bm.output_units(),
                     TimelineEpochContent::Single { asset, .. } => asset
@@ -308,7 +336,7 @@ fn build_readout(
                 });
                 return CursorReadout {
                     layer_name: display_name,
-                    is_remote,
+                    is_remote: diff_is_remote,
                     pixel,
                     source_pixel_size_m: tl.source_pixel_size_m(),
                     units,
@@ -317,22 +345,33 @@ fn build_readout(
                     value,
                 };
             }
-            match timeline_probe_content(tl) {
-                Some(TimelineEpochContent::Single { asset, style }) => {
-                    build_single_readout(display_name, is_remote, asset, style, pixel, value)
+            match timeline_probe_epoch(tl) {
+                Some((epoch, content)) => {
+                    let display_name = format!("{} [{}]", layer.name(), epoch.date_label);
+                    let epoch_is_remote = content_is_remote(content);
+                    match content {
+                        TimelineEpochContent::Single { asset, style } => build_single_readout(
+                            display_name,
+                            epoch_is_remote,
+                            asset,
+                            style,
+                            pixel,
+                            value,
+                        ),
+                        TimelineEpochContent::BandMath(bm) => CursorReadout {
+                            layer_name: display_name,
+                            is_remote: epoch_is_remote,
+                            pixel,
+                            source_pixel_size_m: bm.source_pixel_size_m(),
+                            units: bm.output_units(),
+                            has_affine_scaling: false,
+                            log10_db: false,
+                            value,
+                        },
+                    }
                 }
-                Some(TimelineEpochContent::BandMath(bm)) => CursorReadout {
-                    layer_name: display_name,
-                    is_remote,
-                    pixel,
-                    source_pixel_size_m: bm.source_pixel_size_m(),
-                    units: bm.output_units(),
-                    has_affine_scaling: false,
-                    log10_db: false,
-                    value,
-                },
                 None => CursorReadout {
-                    layer_name: display_name,
+                    layer_name: layer.name().to_owned(),
                     is_remote,
                     pixel,
                     source_pixel_size_m: tl.source_pixel_size_m(),
@@ -538,11 +577,7 @@ struct TemporalDiffProbeJobSpec {
 }
 
 enum EpochScalarEval {
-    Value {
-        value: Option<f64>,
-        masked: bool,
-        has_unavailable: bool,
-    },
+    Sample(DiffEpochSample),
     Cancelled,
 }
 
@@ -570,6 +605,7 @@ fn eval_diff_epoch_scalar(
         }
     }
     let mut masked = false;
+    let mut mask_unavailable = false;
     if spec.scl_mask_enabled
         && let Some(scl) = &spec.scl
         && let Some((px, py)) = scl.pixel
@@ -584,27 +620,28 @@ fn eval_diff_epoch_scalar(
                     .is_some_and(|c| is_scl_class_masked(true, spec.scl_mask_bits, c));
             }
             Err(err) if err.is_cancelled() => return EpochScalarEval::Cancelled,
-            Ok(BandSample::Unavailable) | Err(_) => has_unavailable = true,
+            Ok(BandSample::Unavailable) | Err(_) => mask_unavailable = true,
             _ => {}
         }
     }
-    let value = if masked {
-        None
-    } else {
-        match spec.formula {
-            None => vals.first().copied().flatten(),
-            Some(formula) if vals.len() >= 2 => match (vals[0], vals[1]) {
-                (Some(v0), Some(v1)) => formula.evaluate_scalar(v0, v1),
-                _ => None,
-            },
-            Some(_) => None,
-        }
-    };
-    EpochScalarEval::Value {
-        value,
-        masked,
-        has_unavailable,
+    if masked {
+        return EpochScalarEval::Sample(DiffEpochSample::Masked);
     }
+    if has_unavailable || mask_unavailable {
+        return EpochScalarEval::Sample(DiffEpochSample::Unavailable);
+    }
+    let value = match spec.formula {
+        None => vals.first().copied().flatten(),
+        Some(formula) if vals.len() >= 2 => match (vals[0], vals[1]) {
+            (Some(v0), Some(v1)) => formula.evaluate_scalar(v0, v1),
+            _ => None,
+        },
+        Some(_) => None,
+    };
+    EpochScalarEval::Sample(match value {
+        Some(v) => DiffEpochSample::Value(v),
+        None => DiffEpochSample::Nodata,
+    })
 }
 
 fn sample_temporal_diff_pixel(
@@ -613,31 +650,26 @@ fn sample_temporal_diff_pixel(
     cancel: &CancelToken,
     probe_guard: CursorProbeGuard,
 ) {
-    let EpochScalarEval::Value {
-        value: value_a,
-        masked: masked_a,
-        has_unavailable: unavail_a,
-    } = eval_diff_epoch_scalar(rt, &spec.epoch_a, cancel)
+    let EpochScalarEval::Sample(sample_a) = eval_diff_epoch_scalar(rt, &spec.epoch_a, cancel)
     else {
         probe_guard.clear_transient();
         return;
     };
-    let EpochScalarEval::Value {
-        value: value_b,
-        masked: masked_b,
-        has_unavailable: unavail_b,
-    } = eval_diff_epoch_scalar(rt, &spec.epoch_b, cancel)
+    let EpochScalarEval::Sample(sample_b) = eval_diff_epoch_scalar(rt, &spec.epoch_b, cancel)
     else {
         probe_guard.clear_transient();
         return;
     };
-    let has_unavailable = unavail_a || unavail_b;
-    if value_a.is_none() && value_b.is_none() && !masked_a && !masked_b && has_unavailable {
+    let has_unavailable = matches!(sample_a, DiffEpochSample::Unavailable)
+        || matches!(sample_b, DiffEpochSample::Unavailable);
+    if matches!(sample_a, DiffEpochSample::Unavailable)
+        && matches!(sample_b, DiffEpochSample::Unavailable)
+    {
         probe_guard.resolve(CursorReadoutValue::Unavailable);
         return;
     }
-    let delta = match (value_a, value_b) {
-        (Some(a), Some(b)) => {
+    let delta = match (sample_a, sample_b) {
+        (DiffEpochSample::Value(a), DiffEpochSample::Value(b)) => {
             let d = b - a;
             d.is_finite().then_some(d)
         }
@@ -647,11 +679,9 @@ fn sample_temporal_diff_pixel(
         formula_label: spec.formula_label,
         label_a: spec.label_a,
         label_b: spec.label_b,
-        value_a,
-        value_b,
+        sample_a,
+        sample_b,
         delta,
-        masked_a,
-        masked_b,
         has_unavailable,
     }));
 }
@@ -964,7 +994,7 @@ impl CursorProber {
                     };
                     let ref_asset = content_b.reference_asset();
                     let ref_spec = ref_asset.meta().spec;
-                    let is_remote = tl.is_remote();
+                    let is_remote = content_is_remote(content_a) || content_is_remote(content_b);
                     let job_spec = TemporalDiffProbeJobSpec {
                         formula_label,
                         label_a,

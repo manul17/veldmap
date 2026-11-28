@@ -1,8 +1,8 @@
 //! Raster overlay subsystem: ordered multi-asset local & remote COG overlay
-//! stack (`SingleRaster` + `BandMath`), two-lane `StreamKey`-scoped scheduling
-//! with offloaded QOI + byte-shuffled LZ4 disk caching, non-blocking
-//! local/remote single & multi-asset open/reload I/O, background band
-//! statistics, and typed zoom-invariant CPU cursor readouts.
+//! stack (`SingleRaster`, `BandMath`, and multi-temporal `Timeline`), two-lane
+//! `StreamKey`-scoped scheduling with offloaded QOI + byte-shuffled LZ4 disk
+//! caching, non-blocking local/remote single & multi-asset open/reload I/O,
+//! background band statistics, and typed zoom-invariant CPU cursor readouts.
 
 mod asset;
 mod band_math;
@@ -36,7 +36,7 @@ pub(crate) use band_math::{
     BandChannelSample, BandMathPreset, BandMathReadout, BandMathStyleSpec, BandMathSummary,
 };
 pub(crate) use crs_override::CrsOverride;
-pub(crate) use cursor::{CursorReadout, CursorReadoutValue};
+pub(crate) use cursor::{CursorReadout, CursorReadoutValue, DiffEpochSample};
 pub(crate) use manager::{
     BandMathEdit, OverlayEdit, OverlayFrameCtx, OverlayManager, OverlayManagerDeps,
     OverlayMutation, SingleRasterEdit, TimelineEdit,
@@ -323,6 +323,5 @@ pub(crate) enum OverlayIoEvent {
         id: LayerId,
         bounds: Option<FootprintBounds>,
         fly_to: bool,
-        restore_id: Option<u64>,
     },
 }

@@ -252,7 +252,7 @@ impl BandStatsTracker {
         let Some(band) = layer.needs_band_stats() else {
             return;
         };
-        let Some(asset) = layer.single_asset() else {
+        let Some(asset) = layer.stats_target_asset() else {
             return;
         };
         let id = layer.id();
@@ -309,10 +309,12 @@ impl BandStatsTracker {
             match msg.outcome {
                 BandStatsOutcome::Ready(stats) => {
                     for layer in stack.layers_mut() {
-                        if layer
-                            .single_asset()
-                            .is_some_and(|a| a.source_id() == msg.source_id)
-                            && layer.apply_band_stats_ready(msg.band, Arc::clone(&stats))
+                        if layer.has_single_source(msg.source_id)
+                            && layer.apply_band_stats_ready(
+                                msg.source_id,
+                                msg.band,
+                                Arc::clone(&stats),
+                            )
                         {
                             changed = true;
                         }
@@ -320,21 +322,18 @@ impl BandStatsTracker {
                 }
                 BandStatsOutcome::Empty => {
                     if let Some(layer) = stack.get_mut(msg.layer_id)
-                        && layer
-                            .single_asset()
-                            .is_some_and(|a| a.source_id() == msg.source_id)
-                        && layer.apply_band_stats_empty(msg.band, msg.job_id)
+                        && layer.has_single_source(msg.source_id)
+                        && layer.apply_band_stats_empty(msg.source_id, msg.band, msg.job_id)
                     {
                         changed = true;
                     }
                 }
                 BandStatsOutcome::Cancelled => {
                     if let Some(layer) = stack.get_mut(msg.layer_id)
-                        && layer
-                            .single_asset()
-                            .is_some_and(|a| a.source_id() == msg.source_id)
+                        && layer.has_single_source(msg.source_id)
                     {
-                        let _ = layer.apply_band_stats_cancelled(msg.band, msg.job_id);
+                        let _ =
+                            layer.apply_band_stats_cancelled(msg.source_id, msg.band, msg.job_id);
                     }
                 }
             }

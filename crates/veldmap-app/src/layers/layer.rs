@@ -151,6 +151,76 @@ pub(super) struct OverlayLayer {
     reload: ReloadState,
 }
 
+/// Shared single-raster asset + style builder used by both
+/// [`OverlayLayer::from_single_parts`] and `Timeline` single-epoch opens so
+/// `is_scl` (`PixelFormat::R8Uint` + `Sentinel2Scl`), preferred stream spec,
+/// `PyramidMeta`, and `GeoBinding` stay strictly consistent.
+pub(super) struct SingleRasterPartsInput {
+    pub(super) name: String,
+    pub(super) origin: LayerOrigin,
+    pub(super) source: Arc<dyn RasterSource>,
+    pub(super) frame: Frame,
+    pub(super) crs_override: Option<CrsOverride>,
+    pub(super) style: Option<LayerStyleSpec>,
+    pub(super) is_scl: bool,
+    pub(super) relaid: u64,
+}
+
+pub(super) fn build_single_raster_parts(
+    input: SingleRasterPartsInput,
+) -> (RasterAsset, LayerStyle) {
+    let SingleRasterPartsInput {
+        name,
+        origin,
+        source,
+        frame,
+        crs_override,
+        mut style,
+        is_scl,
+        relaid,
+    } = input;
+    let desc = source.description();
+    if is_scl && style.is_none() {
+        // Explicitly request `PixelFormat::R8Uint` + `Sentinel2Scl` for
+        // ESA SCL assets (`U8 BlackIsZero` otherwise defaults to Display).
+        style = Some(LayerStyleSpec {
+            band_index: Some(0),
+            track: Some(TrackKind::Categorical),
+            categorical_palette: Some(CategoricalPaletteId::Sentinel2Scl),
+            ..LayerStyleSpec::default()
+        });
+    }
+    let preferred_spec = style
+        .as_ref()
+        .and_then(|s| s.resolve_stream_spec(desc))
+        .unwrap_or_else(|| {
+            if is_scl {
+                stream_spec_for_band(BandKey::Index(0), PixelFormat::R8Uint)
+            } else {
+                source.default_stream_spec()
+            }
+        });
+    let meta = source
+        .pyramid_meta(preferred_spec)
+        .or_else(|_| source.pyramid_meta(veldmap_raster::DISPLAY_STREAM_SPEC))
+        .unwrap_or_else(|_| PyramidMeta {
+            source: source.source_id(),
+            spec: veldmap_raster::DISPLAY_STREAM_SPEC,
+            levels: desc.levels.clone(),
+        });
+    let layer_style = LayerStyle::new(source.as_ref(), meta.spec, style.as_ref());
+    let geo = GeoBinding::new(
+        frame,
+        desc.width,
+        desc.height,
+        meta.max_level(),
+        crs_override,
+        relaid,
+    );
+    let asset = RasterAsset::new(name, origin, source, geo, meta);
+    (asset, layer_style)
+}
+
 impl OverlayLayer {
     fn from_single_parts(init: SingleLayerInit) -> Self {
         let SingleLayerInit {
@@ -159,51 +229,21 @@ impl OverlayLayer {
             origin,
             source,
             frame,
-            mut options,
+            options,
             is_scl,
             relaid,
         } = init;
-        let desc = source.description();
-        if is_scl && options.style.is_none() {
-            // Explicitly request `PixelFormat::R8Uint` + `Sentinel2Scl` for
-            // ESA SCL assets (`U8 BlackIsZero` otherwise defaults to Display).
-            options.style = Some(LayerStyleSpec {
-                band_index: Some(0),
-                track: Some(TrackKind::Categorical),
-                categorical_palette: Some(CategoricalPaletteId::Sentinel2Scl),
-                ..LayerStyleSpec::default()
-            });
-        }
-        let preferred_spec = options
-            .style
-            .as_ref()
-            .and_then(|s| s.resolve_stream_spec(desc))
-            .unwrap_or_else(|| {
-                if is_scl {
-                    stream_spec_for_band(BandKey::Index(0), PixelFormat::R8Uint)
-                } else {
-                    source.default_stream_spec()
-                }
-            });
-        let meta = source
-            .pyramid_meta(preferred_spec)
-            .or_else(|_| source.pyramid_meta(veldmap_raster::DISPLAY_STREAM_SPEC))
-            .unwrap_or_else(|_| PyramidMeta {
-                source: source.source_id(),
-                spec: veldmap_raster::DISPLAY_STREAM_SPEC,
-                levels: desc.levels.clone(),
-            });
-        let style = LayerStyle::new(source.as_ref(), meta.spec, options.style.as_ref());
-        let geo = GeoBinding::new(
-            frame,
-            desc.width,
-            desc.height,
-            meta.max_level(),
-            options.crs_override,
-            relaid,
-        );
         let pin_root = matches!(origin, LayerOrigin::Local { .. });
-        let asset = RasterAsset::new(name.clone(), origin, source, geo, meta);
+        let (asset, style) = build_single_raster_parts(SingleRasterPartsInput {
+            name: name.clone(),
+            origin,
+            source,
+            frame,
+            crs_override: options.crs_override,
+            style: options.style,
+            is_scl,
+            relaid,
+        });
 
         Self {
             id,
@@ -532,68 +572,162 @@ impl OverlayLayer {
         }
     }
 
+    /// Return the active single-raster [`RasterAsset`] that should receive
+    /// background band statistics (`SingleRaster` or active ready `Single`
+    /// epoch of a `Timeline`).
+    pub(super) fn stats_target_asset(&self) -> Option<&RasterAsset> {
+        match &self.kind {
+            LayerKind::SingleRaster { asset, .. } => Some(asset),
+            LayerKind::Timeline(tl) => match tl.active_ready_content() {
+                Some(super::timeline::TimelineEpochContent::Single { asset, .. }) => Some(asset),
+                _ => None,
+            },
+            LayerKind::BandMath(_) => None,
+        }
+    }
+
+    pub(super) fn has_single_source(&self, source_id: SourceId) -> bool {
+        match &self.kind {
+            LayerKind::SingleRaster { asset, .. } => asset.source_id() == source_id,
+            LayerKind::Timeline(tl) => tl.epochs.iter().any(|e| {
+                matches!(
+                    e.ready_content(),
+                    Some(super::timeline::TimelineEpochContent::Single { asset, .. })
+                        if asset.source_id() == source_id
+                )
+            }),
+            LayerKind::BandMath(_) => false,
+        }
+    }
+
     pub(super) fn needs_band_stats(&self) -> Option<BandKey> {
         if !self.is_active() {
             return None;
         }
+        let check = |asset: &RasterAsset, style: &LayerStyle| {
+            let spec = asset.meta().spec;
+            (spec.format == PixelFormat::R32Float && style.scientific().needs_stats())
+                .then_some(spec.band)
+        };
         match &self.kind {
-            LayerKind::SingleRaster { asset, style, .. } => {
-                let spec = asset.meta().spec;
-                if spec.format == PixelFormat::R32Float && style.scientific().needs_stats() {
-                    Some(spec.band)
-                } else {
-                    None
+            LayerKind::SingleRaster { asset, style, .. } => check(asset, style),
+            LayerKind::Timeline(tl) => match tl.active_ready_content() {
+                Some(super::timeline::TimelineEpochContent::Single { asset, style }) => {
+                    check(asset, style)
                 }
-            }
-            LayerKind::BandMath(_) | LayerKind::Timeline(_) => None,
+                _ => None,
+            },
+            LayerKind::BandMath(_) => None,
         }
     }
 
     pub(super) fn begin_stats_job(&mut self, job_id: u64, cancel: CancelToken) {
-        if let LayerKind::SingleRaster { style, .. } = &mut self.kind {
-            style.scientific_mut().begin_loading(job_id, cancel);
+        match &mut self.kind {
+            LayerKind::SingleRaster { style, .. } => {
+                style.scientific_mut().begin_loading(job_id, cancel);
+            }
+            LayerKind::Timeline(tl) => {
+                if let Some(epoch) = tl.epochs.get_mut(tl.active_idx)
+                    && let Some(super::timeline::TimelineEpochContent::Single { style, .. }) =
+                        epoch.ready_content_mut()
+                {
+                    style.scientific_mut().begin_loading(job_id, cancel);
+                }
+            }
+            LayerKind::BandMath(_) => {}
         }
     }
 
     pub(super) fn cancel_stats_job(&mut self) {
-        if let LayerKind::SingleRaster { style, .. } = &mut self.kind {
-            style.scientific_mut().cancel_loading();
+        match &mut self.kind {
+            LayerKind::SingleRaster { style, .. } => {
+                style.scientific_mut().cancel_loading();
+            }
+            LayerKind::Timeline(tl) => {
+                for epoch in &mut tl.epochs {
+                    if let Some(super::timeline::TimelineEpochContent::Single { style, .. }) =
+                        epoch.ready_content_mut()
+                    {
+                        style.scientific_mut().cancel_loading();
+                    }
+                }
+            }
+            LayerKind::BandMath(_) => {}
         }
     }
 
-    fn matching_scientific_style_mut(&mut self, band: BandKey) -> Option<&mut ScientificStyle> {
-        let LayerKind::SingleRaster { asset, style, .. } = &mut self.kind else {
-            return None;
-        };
-        if asset.meta().spec.band != band || asset.meta().spec.format != PixelFormat::R32Float {
-            return None;
+    fn apply_scientific_stats_for_source(
+        &mut self,
+        source_id: SourceId,
+        band: BandKey,
+        mut apply: impl FnMut(&mut ScientificStyle) -> bool,
+    ) -> bool {
+        match &mut self.kind {
+            LayerKind::SingleRaster { asset, style, .. } => {
+                if asset.source_id() == source_id
+                    && asset.meta().spec.band == band
+                    && asset.meta().spec.format == PixelFormat::R32Float
+                {
+                    apply(style.scientific_mut())
+                } else {
+                    false
+                }
+            }
+            LayerKind::Timeline(tl) => {
+                let mut changed = false;
+                for epoch in &mut tl.epochs {
+                    if let Some(super::timeline::TimelineEpochContent::Single { asset, style }) =
+                        epoch.ready_content_mut()
+                        && asset.source_id() == source_id
+                        && asset.meta().spec.band == band
+                        && asset.meta().spec.format == PixelFormat::R32Float
+                    {
+                        changed |= apply(style.scientific_mut());
+                    }
+                }
+                changed
+            }
+            LayerKind::BandMath(_) => false,
         }
-        Some(style.scientific_mut())
     }
 
-    pub(super) fn apply_band_stats_ready(&mut self, band: BandKey, stats: Arc<BandStats>) -> bool {
-        let Some(sci) = self.matching_scientific_style_mut(band) else {
-            return false;
-        };
-        sci.apply_ready(stats);
-        true
+    pub(super) fn apply_band_stats_ready(
+        &mut self,
+        source_id: SourceId,
+        band: BandKey,
+        stats: Arc<BandStats>,
+    ) -> bool {
+        self.apply_scientific_stats_for_source(source_id, band, |sci| {
+            sci.apply_ready(Arc::clone(&stats));
+            true
+        })
     }
 
-    pub(super) fn apply_band_stats_empty(&mut self, band: BandKey, job_id: u64) -> bool {
-        self.matching_scientific_style_mut(band)
-            .is_some_and(|sci| sci.apply_empty(job_id))
+    pub(super) fn apply_band_stats_empty(
+        &mut self,
+        source_id: SourceId,
+        band: BandKey,
+        job_id: u64,
+    ) -> bool {
+        self.apply_scientific_stats_for_source(source_id, band, |sci| sci.apply_empty(job_id))
     }
 
-    pub(super) fn apply_band_stats_cancelled(&mut self, band: BandKey, job_id: u64) -> bool {
-        self.matching_scientific_style_mut(band)
-            .is_some_and(|sci| sci.apply_cancelled(job_id))
+    pub(super) fn apply_band_stats_cancelled(
+        &mut self,
+        source_id: SourceId,
+        band: BandKey,
+        job_id: u64,
+    ) -> bool {
+        self.apply_scientific_stats_for_source(source_id, band, |sci| sci.apply_cancelled(job_id))
     }
 
     /// Switch a single-raster layer's active stream (`Display` / `Scientific` /
     /// `Categorical` + band index). Returns `true` if the active stream changed.
     pub(super) fn set_active_stream(&mut self, spec: TileStreamSpec) -> Result<bool, String> {
         let LayerKind::SingleRaster { asset, style } = &mut self.kind else {
-            return Err("band-math layers do not support switching single-band streams".to_owned());
+            return Err(
+                "only single-raster layers support switching single-band streams".to_owned(),
+            );
         };
         let changed = asset.set_active_stream(spec)?;
         if changed {
@@ -698,7 +832,8 @@ impl OverlayLayer {
     pub(super) fn set_stretch_preset(&mut self, preset: super::StretchPreset) -> bool {
         match &mut self.kind {
             LayerKind::SingleRaster { style, .. } => style.set_stretch_preset(preset),
-            LayerKind::BandMath(_) | LayerKind::Timeline(_) => false,
+            LayerKind::Timeline(tl) => tl.apply_single_style_edit(|s| s.set_stretch_preset(preset)),
+            LayerKind::BandMath(_) => false,
         }
     }
 
@@ -707,14 +842,15 @@ impl OverlayLayer {
             LayerKind::SingleRaster { style, .. } => style.set_stretch_range(min, max),
             LayerKind::BandMath(bm) => bm.style.set_stretch_range(min, max),
             LayerKind::Timeline(tl) => {
-                let changed = tl
-                    .band_math_style
-                    .as_mut()
-                    .is_some_and(|s| s.set_stretch_range(min, max));
-                if changed {
-                    let _ = tl.sync_band_math_style_to_epochs();
+                if let Some(s) = tl.band_math_style.as_mut() {
+                    let changed = s.set_stretch_range(min, max);
+                    if changed {
+                        let _ = tl.sync_band_math_style_to_epochs();
+                    }
+                    changed
+                } else {
+                    tl.apply_single_style_edit(|s| s.set_stretch_range(min, max))
                 }
-                changed
             }
         }
     }
@@ -728,14 +864,15 @@ impl OverlayLayer {
             LayerKind::SingleRaster { style, .. } => style.set_colormap(colormap, invert),
             LayerKind::BandMath(bm) => bm.style.set_colormap(colormap, invert),
             LayerKind::Timeline(tl) => {
-                let changed = tl
-                    .band_math_style
-                    .as_mut()
-                    .is_some_and(|s| s.set_colormap(colormap, invert));
-                if changed {
-                    let _ = tl.sync_band_math_style_to_epochs();
+                if let Some(s) = tl.band_math_style.as_mut() {
+                    let changed = s.set_colormap(colormap, invert);
+                    if changed {
+                        let _ = tl.sync_band_math_style_to_epochs();
+                    }
+                    changed
+                } else {
+                    tl.apply_single_style_edit(|s| s.set_colormap(colormap, invert))
                 }
-                changed
             }
         }
     }
@@ -743,7 +880,10 @@ impl OverlayLayer {
     pub(super) fn set_categorical_palette(&mut self, palette: CategoricalPaletteId) -> bool {
         match &mut self.kind {
             LayerKind::SingleRaster { style, .. } => style.set_categorical_palette(palette),
-            LayerKind::BandMath(_) | LayerKind::Timeline(_) => false,
+            LayerKind::Timeline(tl) => {
+                tl.apply_single_style_edit(|s| s.set_categorical_palette(palette))
+            }
+            LayerKind::BandMath(_) => false,
         }
     }
 
@@ -894,7 +1034,8 @@ impl OverlayLayer {
             LayerKind::BandMath(bm) => band_math_intersects(bm, frustum),
             LayerKind::Timeline(tl) => {
                 for idx in tl.render_epoch_indices().into_iter().flatten() {
-                    if let Some(content) = tl.epochs.get_mut(idx).and_then(|e| e.ready_content_mut())
+                    if let Some(content) =
+                        tl.epochs.get_mut(idx).and_then(|e| e.ready_content_mut())
                     {
                         let hit = match content {
                             super::timeline::TimelineEpochContent::Single { asset, .. } => {

@@ -178,6 +178,22 @@ pub(crate) fn same_url_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
+/// Return whether navigating from `from_url` to `to_url` downgrades `https://`
+/// to `http://`.
+pub fn is_https_downgrade(from_url: &str, to_url: &str) -> bool {
+    let from_is_https = from_url
+        .trim()
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"https://"));
+    let to_is_http = to_url
+        .trim()
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"http://"));
+    from_is_https && to_is_http
+}
+
 /// Return whether two HTTP(S) URLs share the exact same `(scheme, host, port)`
 /// origin (normalizing default ports `http -> 80` and `https -> 443`).
 pub fn same_http_origin(a: &str, b: &str) -> bool {

@@ -22,7 +22,7 @@ pub(crate) use crate::layers::StacCogAuthMode;
 
 pub(crate) use auth::{
     AuthTrust, build_stac_item_refresh_policy, resolve_persisted_cog_auth,
-    sanitize_imported_auth_mode,
+    sanitize_imported_auth_mode, url_has_presigned_query,
 };
 pub(crate) use session::{
     StacCatalogPreset, StacProfileView, StacSearchRequest, StacSession, StacSortOption,

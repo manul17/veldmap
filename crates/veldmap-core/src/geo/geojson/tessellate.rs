@@ -18,6 +18,25 @@ use crate::geo::shapes::{
 impl VectorMesh {
     /// Build a subdivided WGS84 globe mesh from a [`GeoJsonFeatureCollection`].
     pub fn from_collection(collection: &GeoJsonFeatureCollection, max_chord_deg: f64) -> Self {
+        Self::build_collection(collection, max_chord_deg, false)
+    }
+
+    /// Build a subdivided WGS84 globe mesh from a guaranteed-CCW RFC 7946
+    /// [`GeoJsonFeatureCollection`] without applying the `< 45°` compact-side
+    /// CW-legacy heuristic (allowing `> hemisphere` polar rings whose vertices
+    /// cluster around the opposite pole to triangulate on their true CCW side).
+    pub fn from_collection_strict_ccw(
+        collection: &GeoJsonFeatureCollection,
+        max_chord_deg: f64,
+    ) -> Self {
+        Self::build_collection(collection, max_chord_deg, true)
+    }
+
+    fn build_collection(
+        collection: &GeoJsonFeatureCollection,
+        max_chord_deg: f64,
+        strict_ccw: bool,
+    ) -> Self {
         let max_chord_deg = if max_chord_deg.is_finite() {
             max_chord_deg.clamp(0.1, 10.0)
         } else {
@@ -28,7 +47,13 @@ impl VectorMesh {
         let mut earcut = Earcut::new();
 
         for feature in &collection.features {
-            tessellate_geometry(&feature.geometry, max_chord_deg, &mut earcut, &mut raw);
+            tessellate_geometry(
+                &feature.geometry,
+                max_chord_deg,
+                strict_ccw,
+                &mut earcut,
+                &mut raw,
+            );
         }
 
         let clusters = build_rtc_clusters(raw);
@@ -39,6 +64,7 @@ impl VectorMesh {
 fn tessellate_geometry(
     geom: &GeoJsonGeometry,
     max_chord_deg: f64,
+    strict_ccw: bool,
     earcut: &mut Earcut<f64>,
     raw: &mut RawPrimitives,
 ) {
@@ -64,11 +90,11 @@ fn tessellate_geometry(
             }
         }
         GeoJsonGeometry::Polygon(poly) => {
-            tessellate_polygon(poly, max_chord_deg, earcut, raw);
+            tessellate_polygon(poly, max_chord_deg, strict_ccw, earcut, raw);
         }
         GeoJsonGeometry::MultiPolygon(polys) => {
             for poly in polys {
-                tessellate_polygon(poly, max_chord_deg, earcut, raw);
+                tessellate_polygon(poly, max_chord_deg, strict_ccw, earcut, raw);
             }
         }
     }
@@ -93,6 +119,7 @@ fn append_polyline(pts: &[GeoPoint], max_chord_deg: f64, raw: &mut RawPrimitives
 fn tessellate_polygon(
     poly: &Polygon,
     max_chord_deg: f64,
+    strict_ccw: bool,
     earcut: &mut Earcut<f64>,
     raw: &mut RawPrimitives,
 ) {
@@ -125,7 +152,14 @@ fn tessellate_polygon(
         .iter()
         .map(|p| geodesy::unit(p.lat, p.lon))
         .collect();
-    triangulate_spherical_polygon(&ext_units, &holes_units, max_chord_deg, earcut, raw);
+    triangulate_spherical_polygon(
+        &ext_units,
+        &holes_units,
+        max_chord_deg,
+        strict_ccw,
+        earcut,
+        raw,
+    );
 }
 
 fn emit_closed_ring_lines(ring: &[GeoPoint], raw: &mut RawPrimitives) {

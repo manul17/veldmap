@@ -180,7 +180,7 @@ fn build_redirect_policy(same_origin_only: bool) -> reqwest::redirect::Policy {
             && let Some(first) = attempt.previous().first()
             && !same_url_origin(first, attempt.url())
         {
-            return attempt.error("refused cross-origin redirect with custom auth headers");
+            return attempt.error("refused cross-origin redirect with auth credentials");
         }
         attempt.follow()
     })

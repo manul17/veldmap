@@ -386,7 +386,10 @@ impl BasemapManager {
                 // bundled Blue Marble while `live_pipeline_error` surfaces the
                 // `"Live unavailable"` toolbar badge.
                 if let Some(pipeline) = &self.live_pipeline {
-                    let prev_id = self.active_live_spec.as_ref().map(LiveBasemapSpec::source_id);
+                    let prev_id = self
+                        .active_live_spec
+                        .as_ref()
+                        .map(LiveBasemapSpec::source_id);
                     let next_id = spec.as_ref().map(LiveBasemapSpec::source_id);
                     self.active_live_spec = spec.clone();
                     if prev_id != next_id {

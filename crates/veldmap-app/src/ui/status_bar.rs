@@ -152,25 +152,23 @@ fn format_cursor_readout(readout: &CursorReadout) -> (String, String) {
             text
         }
         CursorReadoutValue::TemporalDiff(td) => {
-            let fmt_opt = |v: Option<f64>, masked: bool| {
-                if masked {
-                    "masked".to_owned()
-                } else {
-                    match v {
-                        Some(x) => format::format_scalar(x),
-                        None => "nodata".to_owned(),
-                    }
-                }
+            let fmt_sample = |s: crate::layers::DiffEpochSample| match s {
+                crate::layers::DiffEpochSample::Value(x) => format::format_scalar(x),
+                crate::layers::DiffEpochSample::Masked => "masked".to_owned(),
+                crate::layers::DiffEpochSample::Nodata => "nodata".to_owned(),
+                crate::layers::DiffEpochSample::Unavailable => "n/a".to_owned(),
             };
             hover_extra = Some(format!(
                 "A ({}): {}\nB ({}): {} @ ({},{})",
                 td.label_a,
-                fmt_opt(td.value_a, td.masked_a),
+                fmt_sample(td.sample_a),
                 td.label_b,
-                fmt_opt(td.value_b, td.masked_b),
+                fmt_sample(td.sample_b),
                 readout.pixel.0,
                 readout.pixel.1
             ));
+            let any_masked = matches!(td.sample_a, crate::layers::DiffEpochSample::Masked)
+                || matches!(td.sample_b, crate::layers::DiffEpochSample::Masked);
             match td.delta {
                 Some(d) => {
                     let sign = if d > 0.0 { "+" } else { "" };
@@ -185,7 +183,7 @@ fn format_cursor_readout(readout: &CursorReadout) -> (String, String) {
                         format::format_scalar(d)
                     )
                 }
-                None if td.masked_a || td.masked_b => format!("{}: [masked]", td.formula_label),
+                None if any_masked => format!("{}: [masked]", td.formula_label),
                 None if td.has_unavailable => format!("{}: n/a", td.formula_label),
                 None => format!("{}: nodata", td.formula_label),
             }

@@ -137,24 +137,24 @@ impl StacCatalogPreset {
     }
 
     /// Build a [`StacSearchQuery`] honoring preset-specific filter rules.
-    fn build_search_query(
-        self,
-        aoi_geometry: Option<GeoJsonGeometry>,
-        datetime_input: &str,
-        filter_clouds: bool,
-        max_cloud_cover: f32,
-        sort_by: StacSortOption,
-        limit: usize,
-    ) -> StacSearchQuery {
-        let dt = datetime_input.trim();
+    ///
+    /// Uses native STAC `"bbox"` when the AOI originated from a bounding box
+    /// (avoiding OGC touching-polygon issues and spherical geodesic bow on wide
+    /// boxes), and `"intersects"` for drawn/imported arbitrary geometries.
+    fn build_search_query(self, aoi: &AoiState, request: &StacSearchRequest) -> StacSearchQuery {
+        let dt = request.datetime_input.trim();
         let temporal = self.supports_temporal_and_cloud_filters();
+        let (bbox, intersects) = match aoi.query_bbox() {
+            Some(b) => (Some(b), None),
+            None => (None, aoi.geometry().cloned()),
+        };
         StacSearchQuery {
-            bbox: None,
-            intersects: aoi_geometry,
+            bbox,
+            intersects,
             datetime: (temporal && !dt.is_empty()).then(|| dt.to_owned()),
-            max_cloud_cover: (temporal && filter_clouds).then_some(max_cloud_cover),
-            sort_by: temporal.then(|| sort_by.to_net_sort()).flatten(),
-            limit,
+            max_cloud_cover: (temporal && request.filter_clouds).then_some(request.max_cloud_cover),
+            sort_by: temporal.then(|| request.sort_by.to_net_sort()).flatten(),
+            limit: request.limit,
         }
     }
 }
@@ -182,6 +182,10 @@ struct SearchDoneMsg {
     outcome: Result<StacSearchResult, String>,
 }
 
+/// Hard bound on paginated STAC page fetches per search session so a server
+/// emitting infinite distinct empty-page cursors cannot loop unboundedly.
+const MAX_STAC_PAGES: usize = 50;
+
 /// Domain controller for STAC catalog search, bounded pagination, AOI
 /// management, and globe scene footprint overlays.
 pub(crate) struct StacSession {
@@ -199,6 +203,9 @@ pub(crate) struct StacSession {
     last_catalog: Option<StacCatalogConfig>,
     last_query: Option<StacSearchQuery>,
     next_link: Option<StacNextLink>,
+    visited_next_cursors: std::collections::HashSet<(String, u8, Option<String>, bool)>,
+    pages_fetched: usize,
+    truncated_at_cap: bool,
     item_views: Vec<StacItemView>,
     timeline_groups: Vec<StacTimelineGroupView>,
     result_uses_custom_auth: bool,
@@ -210,6 +217,14 @@ pub(crate) struct StacSession {
     rev: u64,
     footprints_draw: Option<DrawVectorLayer>,
     highlight_draw: Option<DrawVectorLayer>,
+}
+
+fn next_link_cursor_key(link: &StacNextLink) -> (String, u8, Option<String>, bool) {
+    let method_tag = match link.method {
+        veldmap_net::StacNextMethod::Get => 0,
+        veldmap_net::StacNextMethod::Post => 1,
+    };
+    (link.href.clone(), method_tag, link.body.clone(), link.merge)
 }
 
 impl StacSession {
@@ -230,6 +245,9 @@ impl StacSession {
             last_catalog: None,
             last_query: None,
             next_link: None,
+            visited_next_cursors: std::collections::HashSet::new(),
+            pages_fetched: 0,
+            truncated_at_cap: false,
             item_views: Vec::new(),
             timeline_groups: Vec::new(),
             result_uses_custom_auth: false,
@@ -258,7 +276,8 @@ impl StacSession {
     /// Borrow a read-only snapshot for the Cloud / STAC UI tab.
     pub(crate) fn view_snapshot(&self, stac_settings: &StacSettings) -> StacViewSnapshot<'_> {
         let count = self.items().len();
-        let reached_page_cap = count >= MAX_STAC_PAGINATED_ITEMS && self.next_link.is_some();
+        let reached_page_cap = count >= MAX_STAC_PAGINATED_ITEMS
+            && (self.next_link.is_some() || self.truncated_at_cap);
         let can_load_more =
             self.next_link.is_some() && !self.searching && count < MAX_STAC_PAGINATED_ITEMS;
         let custom_profiles = stac_settings
@@ -490,6 +509,9 @@ impl StacSession {
         self.last_catalog = None;
         self.last_query = None;
         self.next_link = None;
+        self.visited_next_cursors.clear();
+        self.pages_fetched = 0;
+        self.truncated_at_cap = false;
         self.item_views.clear();
         self.timeline_groups.clear();
         self.result_uses_custom_auth = false;
@@ -520,14 +542,7 @@ impl StacSession {
             .preset
             .to_catalog_config(&request.collection_override, stac_settings)?;
         let uses_custom_auth = request.preset.is_custom();
-        let query = request.preset.build_search_query(
-            self.aoi.geometry().cloned(),
-            &request.datetime_input,
-            request.filter_clouds,
-            request.max_cloud_cover,
-            request.sort_by,
-            request.limit,
-        );
+        let query = request.preset.build_search_query(&self.aoi, request);
 
         if let Some(prev) = self.active_cancel.take() {
             prev.cancel();
@@ -582,6 +597,15 @@ impl StacSession {
         let Some(next_link) = self.next_link.clone() else {
             return Ok(());
         };
+        if self.pages_fetched >= MAX_STAC_PAGES {
+            self.next_link = None;
+            return Ok(());
+        }
+        let cursor_key = next_link_cursor_key(&next_link);
+        if !self.visited_next_cursors.insert(cursor_key) {
+            self.next_link = None;
+            return Ok(());
+        }
         let (Some(catalog), Some(prev_query)) =
             (self.last_catalog.clone(), self.last_query.clone())
         else {
@@ -660,21 +684,26 @@ impl StacSession {
                     if msg.append
                         && let Some(existing) = &mut self.last_result
                     {
+                        self.pages_fetched = self.pages_fetched.saturating_add(1);
                         if let Some(m) = result.matched {
                             existing.matched = Some(m);
                         }
-                        let mut added = false;
                         for item in result.items {
-                            if existing.items.len() >= MAX_STAC_PAGINATED_ITEMS {
-                                break;
-                            }
                             if !existing.items.iter().any(|e| e.id == item.id) {
+                                if existing.items.len() >= MAX_STAC_PAGINATED_ITEMS {
+                                    self.truncated_at_cap = true;
+                                    break;
+                                }
                                 self.item_views.push(build_item_view(&item));
                                 existing.items.push(item);
-                                added = true;
                             }
                         }
-                        self.next_link = if added { next_link } else { None };
+                        self.next_link = next_link.filter(|link| {
+                            self.pages_fetched < MAX_STAC_PAGES
+                                && !self
+                                    .visited_next_cursors
+                                    .contains(&next_link_cursor_key(link))
+                        });
                         if self.selected_idx.is_none() && !existing.items.is_empty() {
                             self.selected_idx = Some(0);
                         }
@@ -683,6 +712,9 @@ impl StacSession {
                         self.rebuild_footprints();
                         self.rebuild_highlight();
                     } else {
+                        self.visited_next_cursors.clear();
+                        self.pages_fetched = 1;
+                        self.truncated_at_cap = result.items.len() > MAX_STAC_PAGINATED_ITEMS;
                         result.items.truncate(MAX_STAC_PAGINATED_ITEMS);
                         self.selected_idx = (!result.items.is_empty()).then_some(0);
                         self.hovered_idx = None;

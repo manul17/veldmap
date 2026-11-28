@@ -4,7 +4,7 @@
 //! Stores the opaque source image as compact `Rgb8` with a linear-light mip
 //! pyramid and serves `256 x 256` `Rgba8UnormSrgb` tiles for:
 //! - `PlanetaryScheme::Geodetic` (`z = 0..=3`, `2 x 1` root up to `16 x 8` tiles)
-//! - `PlanetaryScheme::PolarCap { north }` (`z = 0`, reprojected via the
+//! - `PlanetaryScheme::PolarCap { north }` (`z = 0..=1`, reprojected via the
 //!   elliptical square-to-disk Polar Stereographic mapping matching the
 //!   `±85.05112878 deg` cap geometry)
 //! - `PlanetaryScheme::WebMercator` (`z = 0..=3`, mip-filtered per row to avoid
@@ -88,12 +88,13 @@ pub struct BundledBasemapConfig {
 
 impl BundledBasemapConfig {
     /// Default bundled basemap tiling configuration (`256 px`, `max_level = 3`,
-    /// `polar_max_level = 2` so `PolarCap` preserves full perimeter detail up
-    /// to `1024 x 1024` across `±85.05112878°`).
+    /// `polar_max_level = 1` so `PolarCap` renders a `2 x 2` (`512 x 512`)
+    /// square whose `2048`-texel perimeter matches `POLAR_RIM_BINS = 2048` 1:1
+    /// across `±85.05112878°`).
     pub const DEFAULT: Self = Self {
         tile_px: 256,
         max_level: 3,
-        polar_max_level: 2,
+        polar_max_level: 1,
     };
 }
 

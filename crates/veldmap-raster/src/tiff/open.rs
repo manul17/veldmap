@@ -515,12 +515,21 @@ pub fn read_tiff_datetime(
     byte_source: Arc<dyn ByteSource>,
     cancel: &CancelToken,
 ) -> Option<String> {
-    const HEADER_CAP_BYTES: u64 = 64 * 1024;
-    let mut reader = SinglePassIfdReader::open(byte_source, HEADER_CAP_BYTES, cancel).ok()?;
+    const INITIAL_PREFIX_BYTES: usize = 4096;
+    const MAX_IFD_PROBE_BYTES: u64 = 128 * 1024;
+    const MAX_DATETIME_TAG_BYTES: u64 = 1024;
+    let mut reader = SinglePassIfdReader::open_with_prefix(
+        byte_source,
+        INITIAL_PREFIX_BYTES,
+        MAX_IFD_PROBE_BYTES,
+        cancel,
+    )
+    .ok()?;
     let first_ifd = reader.first_ifd;
     let mut base_dir = reader.read_directory(first_ifd, cancel).ok()?;
+    let tag_cap = reader.remaining_fetch_budget().min(MAX_DATETIME_TAG_BYTES);
     base_dir
-        .prefetch_tags(&mut reader, &[TAG_DATETIME], HEADER_CAP_BYTES, cancel)
+        .prefetch_tags(&mut reader, &[TAG_DATETIME], tag_cap, cancel)
         .ok()?;
     let raw = base_dir.read_ascii_opt(&reader, TAG_DATETIME);
     let trimmed = raw.trim().trim_end_matches('\0').trim();
@@ -572,5 +581,133 @@ mod tests {
             Some(PlacementCrs::Resolved { .. })
         ));
         assert!(trouble_ok.is_none());
+    }
+
+    struct VecByteSource(Vec<u8>);
+
+    impl ByteSource for VecByteSource {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        fn read_at(
+            &self,
+            offset: u64,
+            buf: &mut [u8],
+            _cancel: &CancelToken,
+        ) -> Result<usize, veldmap_core::io::IoError> {
+            let start = usize::try_from(offset).unwrap_or(self.0.len());
+            if start >= self.0.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.0.len() - start);
+            buf[..n].copy_from_slice(&self.0[start..start + n]);
+            Ok(n)
+        }
+    }
+
+    fn build_eof_ifd_classic_tiff(pad_bytes: usize, big_endian: bool, dt: Option<&str>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let write_u16 = |b: &mut Vec<u8>, v: u16| {
+            b.extend_from_slice(&if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            });
+        };
+        let write_u32 = |b: &mut Vec<u8>, v: u32| {
+            b.extend_from_slice(&if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            });
+        };
+        buf.extend_from_slice(if big_endian { b"MM" } else { b"II" });
+        write_u16(&mut buf, 42);
+        let ifd_offset = (8 + pad_bytes) as u32;
+        write_u32(&mut buf, ifd_offset);
+        buf.resize(8 + pad_bytes, 0);
+
+        if let Some(dt_str) = dt {
+            let mut ascii = dt_str.as_bytes().to_vec();
+            ascii.push(0);
+            let value_offset = ifd_offset + 2 + 12 + 4;
+            write_u16(&mut buf, 1);
+            write_u16(&mut buf, TAG_DATETIME);
+            write_u16(&mut buf, 2); // ASCII
+            write_u32(&mut buf, ascii.len() as u32);
+            if ascii.len() <= 4 {
+                let mut inline = [0u8; 4];
+                inline[..ascii.len()].copy_from_slice(&ascii);
+                buf.extend_from_slice(&inline);
+                write_u32(&mut buf, 0);
+            } else {
+                write_u32(&mut buf, value_offset);
+                write_u32(&mut buf, 0);
+                buf.extend_from_slice(&ascii);
+            }
+        } else {
+            write_u16(&mut buf, 0);
+            write_u32(&mut buf, 0);
+        }
+        buf
+    }
+
+    fn build_eof_ifd_bigtiff(pad_bytes: usize, dt: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&43u16.to_le_bytes());
+        buf.extend_from_slice(&8u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        let ifd_offset = (16 + pad_bytes) as u64;
+        buf.extend_from_slice(&ifd_offset.to_le_bytes());
+        buf.resize(16 + pad_bytes, 0);
+
+        let mut ascii = dt.as_bytes().to_vec();
+        ascii.push(0);
+        let value_offset = ifd_offset + 8 + 20 + 8;
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&TAG_DATETIME.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+        buf.extend_from_slice(&(ascii.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&value_offset.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&ascii);
+        buf
+    }
+
+    #[test]
+    fn read_tiff_datetime_handles_eof_ifd_beyond_64k_classic_bigtiff_and_big_endian() {
+        let cancel = CancelToken::new();
+
+        let classic_le = build_eof_ifd_classic_tiff(128 * 1024, false, Some("2025:07:14 08:15:00"));
+        assert_eq!(
+            read_tiff_datetime(Arc::new(VecByteSource(classic_le)), &cancel).as_deref(),
+            Some("2025:07:14 08:15:00")
+        );
+
+        let classic_be = build_eof_ifd_classic_tiff(96 * 1024, true, Some("2024:11:03 19:45:10"));
+        assert_eq!(
+            read_tiff_datetime(Arc::new(VecByteSource(classic_be)), &cancel).as_deref(),
+            Some("2024:11:03 19:45:10")
+        );
+
+        let bigtiff = build_eof_ifd_bigtiff(128 * 1024, "2026:01:22 12:00:00");
+        assert_eq!(
+            read_tiff_datetime(Arc::new(VecByteSource(bigtiff)), &cancel).as_deref(),
+            Some("2026:01:22 12:00:00")
+        );
+
+        let missing = build_eof_ifd_classic_tiff(96 * 1024, false, None);
+        assert_eq!(
+            read_tiff_datetime(Arc::new(VecByteSource(missing)), &cancel),
+            None
+        );
+
+        let empty_dt = build_eof_ifd_classic_tiff(64, false, Some("   "));
+        assert_eq!(
+            read_tiff_datetime(Arc::new(VecByteSource(empty_dt)), &cancel),
+            None
+        );
     }
 }

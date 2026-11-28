@@ -158,7 +158,6 @@ impl VeldmapApp {
                             diff_stretch_min: None,
                             diff_stretch_max: None,
                             fly_to: true,
-                            restore_id: None,
                         };
                         match self.scene.open_timeline(req) {
                             Ok(_) => {

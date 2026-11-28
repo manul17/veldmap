@@ -228,14 +228,36 @@ fn earth_scale_bbox_aoi_tessellates_compactly_and_splits_global_spans() {
         polar_tris > 20 && polar_tris < 30_000,
         "expected compact global/polar AOI mesh, got {polar_tris}"
     );
-    // Exported GeoJSON for polar [-180, 20, 180, 89.9] splits into <=120° slices
-    // so every ring is non-degenerate CCW (never a zero-area ±180° slit).
+    // Exported GeoJSON for polar [-180, 20, 180, 89.9] is a single OGC-valid
+    // parallel-sampled Polygon (no touching 120° MultiPolygon seams).
     let polar_json = session.export_aoi_geojson().expect("polar geojson");
-    assert!(polar_json.contains("\"MultiPolygon\""));
+    assert!(polar_json.contains("\"Polygon\""));
+    assert!(!polar_json.contains("\"MultiPolygon\""));
 
-    // Zoomed-in high-latitude polar cap [-180, 88.2, 180, 89.9] must NEVER
-    // collapse to 0 fill triangles.
-    assert!(session.set_aoi_bbox([-180.0, 88.2, 180.0, 89.9], "Viewport".to_owned()));
+    // >Hemisphere North polar cap [-180, -56, 180, 90.0] must triangulate the
+    // northern ~75% of Earth (NOT invert into Antarctica via the <45° CW shortcut).
+    assert!(session.set_aoi_bbox([-180.0, -56.0, 180.0, 90.0], "Viewport".to_owned()));
+    layers.clear();
+    session.push_draw_layers(&mut layers);
+    assert_eq!(layers.len(), 1);
+    let max_z = layers[0]
+        .mesh
+        .clusters
+        .iter()
+        .flat_map(|c| {
+            c.fill_vertices
+                .iter()
+                .map(move |v| c.origin_ecef_m.z + f64::from(v.rel_pos[2]))
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        max_z > 6_000_000.0,
+        "expected >hemisphere North polar cap to reach North Pole (z > 6e6), got max_z={max_z}"
+    );
+
+    // Near-pole zoomed-in cap [-180, 89.96, 180, 90.0] (within 11 km of pole)
+    // must NOT be silently dropped as degenerate.
+    assert!(session.set_aoi_bbox([-180.0, 89.96, 180.0, 90.0], "Viewport".to_owned()));
     layers.clear();
     session.push_draw_layers(&mut layers);
     assert_eq!(layers.len(), 1);
@@ -243,6 +265,26 @@ fn earth_scale_bbox_aoi_tessellates_compactly_and_splits_global_spans() {
     assert!(
         tight_polar_tris > 20 && tight_polar_tris < 10_000,
         "expected valid zoomed-in polar cap mesh, got {tight_polar_tris}"
+    );
+
+    // South Pole >hemisphere cap [-180, -90.0, 180, 56.0] must reach South Pole.
+    assert!(session.set_aoi_bbox([-180.0, -90.0, 180.0, 56.0], "Viewport".to_owned()));
+    layers.clear();
+    session.push_draw_layers(&mut layers);
+    assert_eq!(layers.len(), 1);
+    let min_z = layers[0]
+        .mesh
+        .clusters
+        .iter()
+        .flat_map(|c| {
+            c.fill_vertices
+                .iter()
+                .map(move |v| c.origin_ecef_m.z + f64::from(v.rel_pos[2]))
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        min_z < -6_000_000.0,
+        "expected >hemisphere South polar cap to reach South Pole (z < -6e6), got min_z={min_z}"
     );
 
     // Full-Earth [-180, -89.9, 180, 89.9] stays compact and exports cleanly.
@@ -256,9 +298,14 @@ fn earth_scale_bbox_aoi_tessellates_compactly_and_splits_global_spans() {
         "expected compact full-Earth AOI mesh, got {earth_tris}"
     );
 
-    // Wide non-polar bbox [-110, 20, 110, 80] (220° > 180°) splits into <=120°
-    // exported slices so RFC 7946 winding never flips clockwise.
+    // Wide non-polar bbox [-110, 20, 110, 80] exports as a single OGC-valid
+    // parallel-sampled Polygon; only antimeridian crossings split at ±180°.
     assert!(session.set_aoi_bbox([-110.0, 20.0, 110.0, 80.0], "Wide".to_owned()));
     let wide_json = session.export_aoi_geojson().expect("wide geojson");
-    assert!(wide_json.contains("\"MultiPolygon\""));
+    assert!(wide_json.contains("\"Polygon\""));
+    assert!(!wide_json.contains("\"MultiPolygon\""));
+
+    assert!(session.set_aoi_bbox([170.0, -20.0, -170.0, 20.0], "Antimeridian".to_owned()));
+    let anti_json = session.export_aoi_geojson().expect("antimeridian geojson");
+    assert!(anti_json.contains("\"MultiPolygon\""));
 }

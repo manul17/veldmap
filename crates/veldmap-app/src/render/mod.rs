@@ -108,9 +108,17 @@ pub const BAND_MATH_SCRATCH_MRT_WGSL: &str = concat!(
 /// Embedded WGSL source for nearest-neighbor `R8Uint` `SCL` mask scratch rasterization.
 pub const BAND_MATH_MASK_WGSL: &str = include_str!("../shaders/band_math_mask.wgsl");
 /// Embedded WGSL source for Epoch A scalar reduction in dual-epoch temporal diffing.
-pub const BAND_MATH_REDUCE_WGSL: &str = include_str!("../shaders/band_math_reduce.wgsl");
+pub const BAND_MATH_REDUCE_WGSL: &str = concat!(
+    include_str!("../shaders/band_math_common.wgsl"),
+    "\n",
+    include_str!("../shaders/band_math_reduce.wgsl"),
+);
 /// Embedded WGSL source for fullscreen screen-space Band Math + `SCL` mask + colormap compositing.
-pub const BAND_MATH_COMPOSITE_WGSL: &str = include_str!("../shaders/band_math_composite.wgsl");
+pub const BAND_MATH_COMPOSITE_WGSL: &str = concat!(
+    include_str!("../shaders/band_math_common.wgsl"),
+    "\n",
+    include_str!("../shaders/band_math_composite.wgsl"),
+);
 /// Embedded WGSL source for depth-less post-body draped vector geometry.
 pub const VECTOR_WGSL: &str = include_str!("../shaders/vector.wgsl");
 /// Embedded WGSL source for 1:1 nearest-neighbor offscreen compositing.

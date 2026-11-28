@@ -75,11 +75,15 @@ fn shoelace_area_2d(pts: &[[f64; 2]]) -> f64 {
 /// every ring vertex.
 ///
 /// For compact polygons (`max_angle_deg < 45 deg` around centroid), the smaller
-/// side is always treated as interior (tolerating legacy CW local GeoJSONs).
-/// For wide, continental, hemispheric, and `> hemisphere` polygons
-/// (`max_angle_deg >= 45 deg`), strict RFC 7946 CCW winding selects the
-/// exterior pole (`shoelace_area > 0`).
-fn choose_stereographic_center(exterior: &[DVec3], holes: &[Vec<DVec3>]) -> DVec3 {
+/// side is treated as interior when `strict_ccw` is `false` (tolerating legacy
+/// CW local GeoJSONs). When `strict_ccw` is `true` (guaranteed-CCW RFC 7946
+/// rings such as >hemisphere polar caps) or `max_angle_deg >= 45 deg`, strict
+/// RFC 7946 CCW winding selects the exterior pole (`shoelace_area > 0`).
+fn choose_stereographic_center(
+    exterior: &[DVec3],
+    holes: &[Vec<DVec3>],
+    strict_ccw: bool,
+) -> DVec3 {
     let sum: DVec3 = exterior.iter().copied().sum();
     let centroid = if sum.length_squared() > 1e-12 {
         sum.normalize()
@@ -87,13 +91,15 @@ fn choose_stereographic_center(exterior: &[DVec3], holes: &[Vec<DVec3>]) -> DVec
         exterior[0]
     };
 
-    let max_angle_deg = exterior
-        .iter()
-        .map(|u| u.dot(centroid).clamp(-1.0, 1.0).acos().to_degrees())
-        .fold(0.0_f64, f64::max);
+    if !strict_ccw {
+        let max_angle_deg = exterior
+            .iter()
+            .map(|u| u.dot(centroid).clamp(-1.0, 1.0).acos().to_degrees())
+            .fold(0.0_f64, f64::max);
 
-    if max_angle_deg < 45.0 {
-        return centroid;
+        if max_angle_deg < 45.0 {
+            return centroid;
+        }
     }
 
     // Build candidate projection poles `p_out` (so `center = -p_out`).
@@ -322,6 +328,7 @@ pub(super) fn triangulate_spherical_polygon(
     exterior: &[DVec3],
     holes: &[Vec<DVec3>],
     max_chord_deg: f64,
+    strict_ccw: bool,
     earcut: &mut Earcut<f64>,
     raw: &mut RawPrimitives,
 ) {
@@ -330,7 +337,7 @@ pub(super) fn triangulate_spherical_polygon(
         return;
     }
 
-    let frame = StereoFrame::new(choose_stereographic_center(exterior, holes));
+    let frame = StereoFrame::new(choose_stereographic_center(exterior, holes, strict_ccw));
     let mut projected = project_rings_to_stereo(exterior, holes, frame);
 
     let mut tri_idx: Vec<usize> = Vec::new();
